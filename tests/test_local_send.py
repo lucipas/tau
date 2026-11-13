@@ -97,6 +97,44 @@ class _FakeRunningNode:
             ],
         }
 
+    def send_group_edit(self, group, message_id, text, **kwargs):
+        self.calls.append(
+            ("edit_group", group, message_id, text, kwargs.get("target_sent_at"))
+        )
+        if self.behaviour.get("edit_group") == "partial":
+            return {
+                "ok": False,
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": "ab" * 16,
+                        "to_name": "alice",
+                        "ok": False,
+                        "error": "offline",
+                        "id": "e-1",
+                    }
+                ],
+            }
+        return {
+            "ok": True,
+            "group": group,
+            "target": message_id,
+            "id": "e-1",
+            "cancelled_queued": [],
+            "results": [
+                {
+                    "to": "ab" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "edited": True,
+                    "id": "e-1",
+                }
+            ],
+        }
+
     def send_edit(self, target, message_id, text, **kwargs):
         self.calls.append(("edit", target, message_id, text))
         return {"ok": True, "target": message_id, "edited": True, "id": "e-1"}
@@ -451,6 +489,65 @@ def test_dispatch_group_retract_leaves_console_legs_until_drop_op(tmp_path):
     )
     assert result["ok"] is True
     assert bridge.deleted_groups == [("ab" * 16, 100.0)]
+
+
+def test_dispatch_group_edit_runs_on_the_serving_node(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    node = _FakeRunningNode(config)
+    result = cli._dispatch_local_send(
+        node,
+        op="edit_group",
+        group="ab" * 16,
+        message_id="m-10",
+        text="group fixed",
+        target_sent_at=100.0,
+    )
+    assert result["ok"] is True
+    assert node.calls == [
+        ("edit_group", "ab" * 16, "m-10", "group fixed", 100.0)
+    ]
+
+    partial = _FakeRunningNode(config, behaviour={"edit_group": "partial"})
+    result = cli._dispatch_local_send(
+        partial,
+        op="edit_group",
+        group="ab" * 16,
+        message_id="m-10",
+        text="group fixed",
+        target_sent_at=100.0,
+    )
+    assert result["ok"] is False
+
+
+def test_dispatch_group_ops_accept_leg_timeout(tmp_path):
+    # A fan-out client forwards its per-leg bound as `leg_timeout` in
+    # the request (the reply wait stays unbounded, so the operation
+    # timeout cannot travel as `timeout` — send_running swallows that
+    # keyword).  Both fan-out ops must accept it, or the dispatch
+    # raises on the unexpected keyword and the CLI path breaks.
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    node = _FakeRunningNode(config)
+    result = cli._dispatch_local_send(
+        node,
+        op="edit_group",
+        group="ab" * 16,
+        message_id="m-10",
+        text="group fixed",
+        target_sent_at=100.0,
+        leg_timeout=5.0,
+    )
+    assert result["ok"] is True
+    result = cli._dispatch_local_send(
+        node,
+        op="retract_group",
+        group="ab" * 16,
+        message_id="m-10",
+        target_sent_at=100.0,
+        leg_timeout=5.0,
+    )
+    assert result["ok"] is True
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")

@@ -418,6 +418,7 @@ def encode_group_message(
     renamed_from: Optional[List[str]] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
+    edited_at: Optional[float] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -443,6 +444,11 @@ def encode_group_message(
     ``expires_at`` is an optional sender-set expiry (epoch seconds),
     exactly like a direct message: the receiver shows the deadline and
     purges the message once it passes.
+
+    ``edited_at`` is the signed send time of the edit that rewrote
+    this text (epoch seconds): a re-queued edited leg carries it, so
+    the recipient stores it as the record's ``edited_at`` and a
+    replayed older edit cannot rewind it.  ``None`` omits it.
     """
     payload = {
         "type": "group_message",
@@ -475,6 +481,13 @@ def encode_group_message(
     cleaned_expires_at = _clean_expires_at(expires_at)
     if cleaned_expires_at is not None:
         payload["expires_at"] = cleaned_expires_at
+    if edited_at is not None:
+        try:
+            edited_value = float(edited_at)
+        except (TypeError, ValueError, OverflowError):
+            edited_value = None
+        if edited_value is not None and math.isfinite(edited_value):
+            payload["edited_at"] = edited_value
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -521,6 +534,22 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
             topic_sent_at = None
         if topic_sent_at is not None and not math.isfinite(topic_sent_at):
             topic_sent_at = None
+    raw_edited_at = payload.get("edited_at")
+    edited_at = None
+    if (
+        raw_edited_at is not None
+        and isinstance(raw_edited_at, (int, float))
+        and not isinstance(raw_edited_at, bool)
+    ):
+        # A re-queued edited leg carries the edit's send time, so the
+        # recipient initializes its edit ordering state; absent — or
+        # garbage — means the text was never edited.
+        try:
+            edited_at = float(raw_edited_at)
+        except OverflowError:
+            edited_at = None
+        if edited_at is not None and not math.isfinite(edited_at):
+            edited_at = None
     return {
         "text": text,
         "sent_at": sent_at,
@@ -534,6 +563,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "renamed_from": _clean_renamed_from(payload.get("renamed_from")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),
+        "edited_at": edited_at,
     }
 
 
@@ -878,6 +908,9 @@ def edit_dict(
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
     signature: Optional[str] = None,
+    group: Optional[str] = None,
+    target_author: Optional[str] = None,
+    target_sent_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The ``/tau/dm/edit`` payload as a dict, unsigned unless signed.
 
@@ -886,6 +919,13 @@ def edit_dict(
     payload without ``"sig"`` and attaches the base64 signature, so
     the receiver can verify attribution against the link identity
     independently of the transport.
+
+    ``group`` / ``target_author`` / ``target_sent_at`` name the group
+    message being edited, when the target is one: group messages
+    carry a different wire id per recipient leg, so the target id
+    alone only matches the author's sent record.  A receiver that
+    does not hold the target id can resolve its own copy from this
+    context instead (see :func:`tau.node.TauNode._handle_dm_edit`).
     """
     target = _clean_message_id(target)
     payload: Dict[str, Any] = {
@@ -898,6 +938,16 @@ def edit_dict(
     }
     if message_id:
         payload["id"] = message_id
+    if group is not None:
+        payload["group"] = _clean_hexhash(group, "group")
+    if target_author is not None:
+        payload["target_author"] = _clean_hexhash(target_author, "target_author")
+    if target_sent_at is not None:
+        if not isinstance(target_sent_at, (int, float)) or isinstance(
+            target_sent_at, bool
+        ):
+            raise ProtocolError("target_sent_at must be a number")
+        payload["target_sent_at"] = target_sent_at
     if signature is not None:
         payload["sig"] = signature
     return payload
@@ -910,6 +960,9 @@ def encode_edit(
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
     signature: Optional[str] = None,
+    group: Optional[str] = None,
+    target_author: Optional[str] = None,
+    target_sent_at: Optional[float] = None,
 ) -> bytes:
     """Encode a DM edit for the ``/tau/dm/edit`` request.
 
@@ -924,6 +977,9 @@ def encode_edit(
             message_id=message_id,
             sent_at=sent_at,
             signature=signature,
+            group=group,
+            target_author=target_author,
+            target_sent_at=target_sent_at,
         ),
         max_bytes=MAX_REQUEST_BYTES,
     )
@@ -961,12 +1017,48 @@ def parse_edit(raw: Any) -> Dict[str, Any]:
             raise ProtocolError(
                 "edit signature is not valid base64"
             ) from exc
+    # Group context is advisory: it lets a receiver resolve its own
+    # copy of a group message when the target id is not one it holds.
+    # Malformed context is dropped, never a reason to reject the
+    # edit — the target id alone is still a valid edit.
+    group = payload.get("group")
+    if not isinstance(group, str):
+        group = None
+    else:
+        try:
+            group = _clean_hexhash(group, "group")
+        except ProtocolError:
+            group = None
+    target_author = payload.get("target_author")
+    if not isinstance(target_author, str):
+        target_author = None
+    else:
+        try:
+            target_author = _clean_hexhash(target_author, "target_author")
+        except ProtocolError:
+            target_author = None
+    target_sent_at = payload.get("target_sent_at")
+    if not isinstance(target_sent_at, (int, float)) or isinstance(
+        target_sent_at, bool
+    ):
+        target_sent_at = None
+    else:
+        # A send time must convert to a finite float: an oversized integer
+        # overflows float() later, and a non-finite one names no message.
+        try:
+            if not math.isfinite(float(target_sent_at)):
+                target_sent_at = None
+        except OverflowError:
+            target_sent_at = None
     return {
         "target": target,
         "text": text,
         "sent_at": sent_at,
         "id": message_id,
         "sig": signature,
+        "group": group,
+        "target_author": target_author,
+        "target_sent_at": target_sent_at,
     }
 
 

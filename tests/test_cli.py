@@ -5727,7 +5727,7 @@ def test_edit_rejects_unknown_or_ambiguous_message(tmp_path, capsys, monkeypatch
     assert _FakeReactNode.instances == []
 
 
-def test_edit_refuses_a_group_message(tmp_path, capsys, monkeypatch):
+def test_edit_refuses_a_received_group_message(tmp_path, capsys, monkeypatch):
     data_dir = tmp_path / "node"
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
     sender = RNS.Identity()
@@ -5754,7 +5754,7 @@ def test_edit_refuses_a_group_message(tmp_path, capsys, monkeypatch):
 
     code = cli.main(["edit", "--data-dir", str(data_dir), "g-1", "fixed"])
     assert code == cli._EXIT_ERROR
-    assert "group messages cannot be edited" in capsys.readouterr().err
+    assert "not sent by this node" in capsys.readouterr().err
     assert _FakeReactNode.instances == []
 
 
@@ -6067,6 +6067,207 @@ def test_retract_refuses_group_message_without_leg_send_time(
     _FakeRetractNode.instances.clear()
 
     code = cli.main(["retract", "--data-dir", str(data_dir), "m-10"])
+    assert code == cli._EXIT_ERROR
+    assert "no leg send time" in capsys.readouterr().err
+    assert _FakeRetractNode.instances == []
+
+
+def _seed_sent_group_message(tmp_path):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "group typo",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "team",
+            "leg_ids": ["m-10", "m-11"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    return data_dir, recipient_hash
+
+
+def test_edit_sends_group_edit_to_every_member(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, recipient_hash = _seed_sent_group_message(tmp_path)
+
+    class _GroupEditNode(_FakeRetractNode):
+        def send_group_edit(
+            self,
+            group,
+            message_id,
+            text,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+        ):
+            self.sent.append((group, message_id, text, target_sent_at))
+            return {
+                "ok": True,
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "edited": True,
+                        "id": "e-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _GroupEditNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "group fixed"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited your group message" in out
+    assert "alice" in out
+    node = _FakeRetractNode.instances[0]
+    assert node.started is False
+    assert node.sent == [("ab" * 16, "m-10", "group fixed", 100.0)]
+
+
+def test_edit_keeps_group_copy_when_a_member_is_unreachable(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, recipient_hash = _seed_sent_group_message(tmp_path)
+
+    class _PartialEditNode(_FakeRetractNode):
+        def send_group_edit(
+            self,
+            group,
+            message_id,
+            text,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+        ):
+            self.sent.append((group, message_id, text, target_sent_at))
+            return {
+                "ok": False,
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "ok": False,
+                        "error": "no path to peer",
+                        "id": "e-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _PartialEditNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "group fixed"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "reached only some members" in err
+    assert "retry `tau edit`" in err
+    # The local sent copy is kept, so the edit stays retryable.
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    outbox = Inbox(config.inbox_path).list_messages(direction="out")
+    kept = next(m for m in outbox if m["id"] == "m-10")
+    assert kept["text"] == "group typo"
+    assert "edited_at" not in kept
+
+
+def test_edit_reports_when_the_local_copy_could_not_update(
+    tmp_path, capsys, monkeypatch
+):
+    # Every member received the edit, but the node's own copies did not
+    # update: the CLI must report it instead of a silent success, so
+    # the edit stays retryable.
+    data_dir, recipient_hash = _seed_sent_group_message(tmp_path)
+
+    class _StaleLocalNode(_FakeRetractNode):
+        def send_group_edit(
+            self,
+            group,
+            message_id,
+            text,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+        ):
+            self.sent.append((group, message_id, text, target_sent_at))
+            return {
+                "ok": False,
+                "local_errors": ["sent copy not updated: disk full"],
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "edited": True,
+                        "id": "e-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _StaleLocalNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "group fixed"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "local copy could not be updated" in err
+    assert "disk full" in err
+    assert "retry `tau edit`" in err
+
+
+def test_edit_refuses_group_message_without_leg_send_time(
+    tmp_path, capsys, monkeypatch
+):
+    # A group message sent before group edits landed carries no
+    # shared leg send time, so no context can name it for the members.
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "team",
+            "leg_ids": ["m-10"],
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "fixed"])
     assert code == cli._EXIT_ERROR
     assert "no leg send time" in capsys.readouterr().err
     assert _FakeRetractNode.instances == []

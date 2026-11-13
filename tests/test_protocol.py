@@ -500,6 +500,47 @@ def test_edit_roundtrip():
     assert isinstance(parsed["sent_at"], float)
 
 
+def test_edit_roundtrip_with_group_context():
+    from tau.protocol import encode_edit, parse_edit
+
+    data = encode_edit(
+        "leg-1",
+        "fixed text",
+        message_id="edit-1",
+        group="ab" * 16,
+        target_author="cd" * 16,
+        target_sent_at=100.0,
+    )
+    parsed = parse_edit(data)
+    assert parsed["target"] == "leg-1"
+    assert parsed["text"] == "fixed text"
+    assert parsed["group"] == "ab" * 16
+    assert parsed["target_author"] == "cd" * 16
+    assert parsed["target_sent_at"] == 100.0
+
+
+def test_parse_edit_drops_malformed_group_context():
+    from tau.protocol import encode, parse_edit
+
+    parsed = parse_edit(
+        encode(
+            {
+                "type": "dm_edit",
+                "target": "msg-1",
+                "text": "fixed",
+                "sent_at": 30.0,
+                "group": "not-a-hash",
+                "target_author": 42,
+                "target_sent_at": "soon",
+            }
+        )
+    )
+    assert parsed["group"] is None
+    assert parsed["target_author"] is None
+    assert parsed["target_sent_at"] is None
+    assert parsed["target"] == "msg-1"
+
+
 def test_parse_edit_rejects_wrong_shape():
     from tau.protocol import encode_edit, parse_edit
 

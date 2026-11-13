@@ -294,6 +294,12 @@ class OutboxEntry:
     # the send had a single leg, or the entry predates this field —
     # and the enqueue time is the send time.
     sent_at: Optional[float] = None
+    # The signed send time of the edit that rewrote this entry's text
+    # (``tau edit --group`` cancelling and re-queueing a leg): the
+    # recipient stores it as the record's ``edited_at``, so a replayed
+    # older edit cannot rewind it (see ``TauNode.send_group_edit``).
+    # ``None`` means the text was never edited — the common case.
+    edited_at: Optional[float] = None
 
     @property
     def to_hex(self) -> str:
@@ -363,6 +369,7 @@ class OutboxEntry:
             "message_expires_at": self.message_expires_at,
             "send_after": self.send_after,
             "sent_at": self.sent_at,
+            "edited_at": self.edited_at,
         }
         if self.group_id is not None:
             payload["group"] = {
@@ -480,6 +487,20 @@ class OutboxEntry:
                 sent_at = None
             if sent_at is not None and not math.isfinite(sent_at):
                 sent_at = None
+        edited_at = raw.get("edited_at")
+        if isinstance(edited_at, bool) or not isinstance(
+            edited_at, (int, float)
+        ):
+            # An entry written before the field existed, or a corrupt
+            # value: the text was never edited.
+            edited_at = None
+        else:
+            try:
+                edited_at = float(edited_at)
+            except (OverflowError, ValueError):
+                edited_at = None
+            if edited_at is not None and not math.isfinite(edited_at):
+                edited_at = None
         return cls(
             id=message_id,
             to=destination,
@@ -509,6 +530,7 @@ class OutboxEntry:
             message_expires_at=message_expires_at,
             send_after=send_after,
             sent_at=sent_at,
+            edited_at=edited_at,
             in_reply_to=in_reply_to,
         )
 
@@ -1213,6 +1235,7 @@ class Mailbox:
         in_reply_to: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
         sent_at: Optional[float] = None,
+        edited_at: Optional[float] = None,
     ) -> OutboxEntry:
         """Queue *text* for delivery to destination *to*.
 
@@ -1230,6 +1253,12 @@ class Mailbox:
         the timestamp every copy carries on the wire.  A group fan-out
         passes its shared send time so all legs agree; otherwise the
         enqueue time is the send time.
+
+        ``edited_at`` is the signed send time of the edit that rewrote
+        this text (epoch seconds): a group edit re-queueing a leg
+        passes its edit time, so the recipient stores it as the
+        record's ``edited_at`` and a replayed older edit cannot
+        rewind it.
         """
         if len(to) != _DESTINATION_BYTES:
             raise MailboxError("destination hash must be 16 bytes")
@@ -1312,6 +1341,18 @@ class Mailbox:
                 raise MailboxError("sent_at must be a finite number") from exc
             if not math.isfinite(sent_at_value):
                 raise MailboxError("sent_at must be a finite number")
+        edited_at_value: Optional[float] = None
+        if edited_at is not None:
+            if isinstance(edited_at, bool) or not isinstance(
+                edited_at, (int, float)
+            ):
+                raise MailboxError("edited_at must be a finite number")
+            try:
+                edited_at_value = float(edited_at)
+            except (OverflowError, ValueError) as exc:
+                raise MailboxError("edited_at must be a finite number") from exc
+            if not math.isfinite(edited_at_value):
+                raise MailboxError("edited_at must be a finite number")
         with self._transaction():
             existing = self._outbox.get(entry_id)
             if existing is not None:
@@ -1351,6 +1392,7 @@ class Mailbox:
                 message_expires_at=expires_at,
                 send_after=send_after_value,
                 sent_at=sent_at_value,
+                edited_at=edited_at_value,
                 in_reply_to=reply_to,
             )
             self._outbox[entry.id] = entry
@@ -1585,10 +1627,18 @@ class Mailbox:
                     and float(edited_at) <= float(stored)
                 ):
                     return
+            previous = dict(record)
             record["text"] = normalize_message(text)
             if edited_at is not None:
                 record["edited_at"] = float(edited_at)
-            self.save()
+            try:
+                self.save()
+            except Exception:
+                # Do not keep an unpersisted edit in memory: a retry must
+                # see the old record and be able to apply the edit again.
+                record.clear()
+                record.update(previous)
+                raise
 
     def sent_record(self, message_id: str) -> Optional[Dict[str, Any]]:
         """A copy of one sent record, or ``None`` when unknown."""
@@ -2409,6 +2459,7 @@ def seal_message(
     expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
+    edited_at: Optional[float] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
@@ -2421,6 +2472,10 @@ def seal_message(
     without trusting whichever peer happened to hold it.  ``expires_at``
     (when given) travels inside that signed envelope, so a holder cannot
     extend a disappearing message's deadline.
+    ``edited_at`` (when given) is the signed send time of the edit
+    that rewrote this text; it travels inside the same signed
+    envelope, so a relayed copy initializes the recipient's edit
+    ordering state exactly like a direct one.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -2514,6 +2569,16 @@ def seal_message(
         if not math.isfinite(expires_at):
             raise MailboxError("expires_at must be a finite number")
         inner["expires_at"] = expires_at
+    if edited_at is not None:
+        if isinstance(edited_at, bool) or not isinstance(edited_at, (int, float)):
+            raise MailboxError("edited_at must be a finite number")
+        try:
+            edited_at_value = float(edited_at)
+        except (OverflowError, ValueError) as exc:
+            raise MailboxError("edited_at must be a finite number") from exc
+        if not math.isfinite(edited_at_value):
+            raise MailboxError("edited_at must be a finite number")
+        inner["edited_at"] = edited_at_value
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         inner["in_reply_to"] = reply_to
@@ -2722,6 +2787,19 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise MailboxError("sealed message expires_at is invalid") from exc
         if not math.isfinite(expires_at):
             raise MailboxError("sealed message expires_at is invalid")
+    edited_at = payload.get("edited_at")
+    # A sealed copy of an edited leg carries the edit's send time so
+    # the recipient initializes its edit ordering state; absent — or
+    # garbage — means the text was never edited.
+    if isinstance(edited_at, bool) or not isinstance(edited_at, (int, float)):
+        edited_at = None
+    else:
+        try:
+            edited_at = float(edited_at)
+        except OverflowError:
+            edited_at = None
+        if edited_at is not None and not math.isfinite(edited_at):
+            edited_at = None
     try:
         in_reply_to = clean_in_reply_to(payload.get("in_reply_to"))
     except ProtocolError as exc:
@@ -2734,6 +2812,7 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "kind": kind,
         "sent_at": sent_at,
         "expires_at": expires_at,
+        "edited_at": edited_at,
         "in_reply_to": in_reply_to,
     }
     group_raw = payload.get("group")
