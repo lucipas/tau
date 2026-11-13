@@ -180,6 +180,9 @@ class FakeNode:
         self.sent = []
         self.group_sent = []
         self.group_reactions = []
+        self.group_retractions = []
+        self.group_retract_failures = {}
+        self.group_retract_cancelled = []
         self.group_refusals = set()
         self.groups = GroupStore(groups_path)
         self.groups.create(
@@ -430,6 +433,59 @@ class FakeNode:
             "reaction": reaction,
             "cleared": not reaction,
             "id": "react-1",
+            "results": results,
+        }
+
+    def send_group_retraction(
+        self,
+        group,
+        message_id,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        target_sent_at=None,
+    ):
+        # Mirrors send_group_reaction, but a retract is live-only: a
+        # member in group_retract_failures answers with that error
+        # instead of a delivery, and queued legs are reported back in
+        # group_retract_cancelled.
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        self.group_retractions.append(
+            (group["name"], message_id, target_sent_at)
+        )
+        names = {PEER_HASH: "alice", BOB_HASH: "bob"}
+        results = []
+        for member in group["members"]:
+            if member in self.group_retract_failures:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "ok": False,
+                        "error": self.group_retract_failures[member],
+                        "id": "retract-1",
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "delivered": True,
+                        "deleted": True,
+                        "id": "retract-1",
+                        "rtt": 0.009,
+                    }
+                )
+        return {
+            "ok": all(result.get("delivered") for result in results),
+            "v": 1,
+            "group": group["id"],
+            "name": group["name"],
+            "target": message_id,
+            "id": "retract-1",
+            "cancelled_queued": list(self.group_retract_cancelled),
             "results": results,
         }
 
@@ -8439,7 +8495,191 @@ def test_retract_message_endpoint_reports_peer_without_a_copy(bridge, node):
     assert node.inbox.export_document()["messages"] == []
 
 
-def test_retract_message_endpoint_rejects_inbound_group_and_queued(bridge, node):
+def _sent_group_console_entries(
+    bridge,
+    node,
+    group_id,
+    *,
+    sent_at=1000.0,
+    second_status="delivered",
+    second_wire_id="wire-bob",
+):
+    # One inbox record for the whole send, like TauNode._record_sent:
+    # its id is the first leg id, the rest in leg_ids.
+    node.inbox.append(
+        {
+            "id": "wire-alice",
+            "leg_ids": ["wire-alice", second_wire_id],
+            "leg_sent_at": sent_at,
+            "destination": "",
+            "direction": "out",
+            "from": "tester",
+            "text": "hello",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": sent_at,
+            "received_at": sent_at + 1.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "wire-alice", to=bytes.fromhex(PEER_HASH), text="hello", sent_at=sent_at
+    )
+    node.mailbox.record_sent(
+        second_wire_id,
+        to=bytes.fromhex(BOB_HASH),
+        text="hello",
+        sent_at=sent_at,
+    )
+    entries = []
+    for member, name, wire_id, status in (
+        (PEER_HASH, "alice", "wire-alice", "delivered"),
+        (BOB_HASH, "bob", second_wire_id, second_status),
+    ):
+        entries.append(
+            bridge._append_message(
+                direction="out",
+                peer=member,
+                peer_name=name,
+                text="hello",
+                sent_at=sent_at,
+                received_at=sent_at + 1.0,
+                status=status,
+                wire_id=wire_id,
+                group=group_id,
+                group_name="crew",
+            )
+        )
+    return entries
+
+
+def test_retract_message_endpoint_retracts_group_message(bridge, node):
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(bridge, node, crew["id"])
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/retract",
+        method="POST",
+        body={"id": entries[0]["id"]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["retracted"] == {
+        "id": entries[0]["id"],
+        "wire_id": "wire-alice",
+    }
+    assert payload["retracted_ids"] == [entry["id"] for entry in entries]
+    assert payload["deleted"] is True
+    assert payload["group"] == crew["id"]
+    assert payload["cancelled_queued"] == []
+    assert [result["to"] for result in payload["results"]] == [
+        PEER_HASH,
+        BOB_HASH,
+    ]
+    assert node.group_retractions == [("crew", "wire-alice", 1000.0)]
+    # Every leg leaves the feed, the inbox and the sent records.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+    assert node.mailbox.sent_record("wire-alice") is None
+    assert node.mailbox.sent_record("wire-bob") is None
+    retracted_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_deleted"
+    ]
+    assert [event["message_id"] for event in retracted_events] == [
+        entry["id"] for entry in entries
+    ]
+
+
+def test_retract_message_endpoint_keeps_group_bubbles_on_partial_fanout(
+    bridge, node
+):
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(bridge, node, crew["id"])
+    node.group_retract_failures = {BOB_HASH: "no route to peer"}
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/retract",
+        method="POST",
+        body={"id": entries[0]["id"]},
+    )
+    assert status == 502
+    assert "bob" in payload["error"]["message"]
+    assert "no route to peer" in payload["error"]["message"]
+    assert "retry the retract" in payload["error"]["message"]
+    # A failed retract never erases the local copies: both bubbles
+    # stay, so the members still holding the message stay retryable.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [
+        entry["id"] for entry in entries
+    ]
+    assert len(node.inbox.export_document()["messages"]) == 1
+    assert node.mailbox.sent_record("wire-alice") is not None
+    assert node.mailbox.sent_record("wire-bob") is not None
+
+
+def test_retract_message_endpoint_cancels_queued_group_leg(bridge, node):
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(
+        bridge,
+        node,
+        crew["id"],
+        second_status="queued",
+        second_wire_id="mail-bob-1",
+    )
+    node.group_retract_cancelled = ["mail-bob-1"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/retract",
+        method="POST",
+        body={"id": entries[0]["id"]},
+    )
+    assert status == 200
+    assert payload["cancelled_queued"] == ["mail-bob-1"]
+    # The queued leg is cancelled by the retract itself, so its bubble
+    # goes with the delivered one.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+    assert node.mailbox.sent_record("mail-bob-1") is None
+
+
+def test_retract_message_endpoint_rejects_unknown_group(bridge, node):
+    _sent_console_entry(bridge, node, wire_id="wire-1", group="ab" * 16)
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "unknown group" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_rejects_group_message_with_no_wire_id(
+    bridge, node
+):
+    crew = node.groups.list_groups()[0]
+    for member, name in ((PEER_HASH, "alice"), (BOB_HASH, "bob")):
+        bridge._append_message(
+            direction="out",
+            peer=member,
+            peer_name=name,
+            text="hello",
+            sent_at=1000.0,
+            received_at=1001.0,
+            status="failed",
+            wire_id=None,
+            group=crew["id"],
+            group_name="crew",
+        )
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "never delivered" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_rejects_inbound_and_queued(bridge, node):
     # A received message is not ours to retract.
     bridge.record_inbound(
         {
@@ -8457,18 +8697,10 @@ def test_retract_message_endpoint_rejects_inbound_group_and_queued(bridge, node)
     assert status == 400
     assert "only your own sent" in payload["error"]["message"]
 
-    # Group messages cannot be retracted in v1.
-    _sent_console_entry(bridge, node, wire_id="wire-2", group="ab" * 16)
-    status, _, payload = _json(
-        bridge, "/api/messages/retract", method="POST", body={"id": 2}
-    )
-    assert status == 400
-    assert "group messages cannot be retracted" in payload["error"]["message"]
-
     # Still queued: cancel it from the outbox instead.
     _sent_console_entry(bridge, node, wire_id="wire-3", status="queued")
     status, _, payload = _json(
-        bridge, "/api/messages/retract", method="POST", body={"id": 3}
+        bridge, "/api/messages/retract", method="POST", body={"id": 2}
     )
     assert status == 400
     assert "still queued" in payload["error"]["message"]
@@ -8481,7 +8713,7 @@ def test_retract_message_endpoint_rejects_inbound_group_and_queued(bridge, node)
         to=bytes.fromhex(PEER_HASH), text="hello", message_id="wire-4"
     )
     status, _, payload = _json(
-        bridge, "/api/messages/retract", method="POST", body={"id": 4}
+        bridge, "/api/messages/retract", method="POST", body={"id": 3}
     )
     assert status == 400
     assert "still queued" in payload["error"]["message"]

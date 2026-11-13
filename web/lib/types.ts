@@ -385,10 +385,34 @@ export interface EditMessageResponse {
 export interface RetractMessageResponse {
   ok: boolean;
   retracted: { id: number; wire_id?: string | null };
+  // Every console id removed by a group retract: one per leg. A DM
+  // retract removes only `retracted.id`, so this is absent there.
+  retracted_ids?: number[];
   // Whether the peer had a copy to delete; false is not an error.
+  // For a group retract, whether every member the retract reached
+  // deleted their copy.
   deleted: boolean;
   // The retract's own wire id, when the peer answered one.
   id?: string | null;
+  // Per-member results of a group retract, as the node reports them.
+  results?: GroupMemberResult[];
+  // Queued legs the group retract cancelled, by outbox id.
+  cancelled_queued?: string[];
+  // The group a group retract fanned out to.
+  group?: string;
+}
+
+// One leg of a group fan-out, as the node reports it.
+export interface GroupMemberResult {
+  to: string;
+  to_name?: string;
+  delivered?: boolean;
+  deleted?: boolean;
+  queued?: boolean;
+  ok?: boolean;
+  error?: string;
+  id?: string | null;
+  rtt?: number | null;
 }
 
 // POST /api/messages/forward: the forwarded copy, as recorded by the

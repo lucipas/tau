@@ -810,7 +810,6 @@ function MessageBubble({
           ) : null}
           {onRetract &&
           outbound &&
-          !message.group &&
           !message.file &&
           message.wire_id &&
           message.status !== "queued" ? (
