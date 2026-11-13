@@ -6430,6 +6430,97 @@ def test_message_history_load_caps_and_drops_invalid_entries(node, tmp_path):
         bridge.stop()
 
 
+def test_message_history_load_drops_sent_retracted_entries(node, tmp_path):
+    """A CLI retract that ran while `tau serve` was down leaves a
+    durable marker; the bridge drops the outbound entry carrying it
+    when it loads, so a restarted console never resurrects the
+    retracted message — while an inbound entry reusing the same wire
+    id, an unretracted outbound entry, and a group leg with a
+    different send time all survive."""
+    from tau.mailbox import Mailbox
+
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    mailbox.record_sent_retraction("gone-dm")
+    mailbox.record_sent_group_retraction("ab" * 16, 1100.0)
+
+    dm = _stored_message(1, "retracted dm", direction="out")
+    dm["wire_id"] = "gone-dm"
+    kept_dm = _stored_message(2, "kept dm", direction="out")
+    kept_dm["wire_id"] = "kept-dm"
+    inbound = _stored_message(3, "kept inbound")
+    inbound["wire_id"] = "gone-dm"
+    leg = _stored_message(4, "retracted group leg", direction="out")
+    leg["group"] = "ab" * 16
+    leg["sent_at"] = 1100.0
+    leg["wire_id"] = "leg-1"
+    other_leg = _stored_message(5, "kept group leg", direction="out")
+    other_leg["group"] = "ab" * 16
+    other_leg["sent_at"] = 1200.0
+    other_leg["wire_id"] = "leg-2"
+    (tmp_path / "messages.json").write_text(
+        json.dumps(
+            {
+                "messages": [dm, kept_dm, inbound, leg, other_leg],
+                "next_message_id": 6,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        assert [m["text"] for m in bridge.messages()] == [
+            "kept dm",
+            "kept inbound",
+            "kept group leg",
+        ]
+        # The purge is persisted, so the dropped entries never come back.
+        stored = json.loads(
+            (tmp_path / "messages.json").read_text(encoding="utf-8")
+        )
+        assert [m["text"] for m in stored["messages"]] == [
+            "kept dm",
+            "kept inbound",
+            "kept group leg",
+        ]
+    finally:
+        bridge.stop()
+
+
+def test_bridge_start_reconciles_sent_retracted_after_load(node, tmp_path):
+    """A marker written after the load-time check but before the bridge
+    starts (a one-shot CLI retract landing in the startup window) is
+    applied when the bridge starts, so the retracted message is not
+    served for the whole session."""
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    entry = _stored_message(
+        1, "retracted in the startup window", direction="out"
+    )
+    entry["wire_id"] = "gone-dm"
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": [entry], "next_message_id": 2}),
+        encoding="utf-8",
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    try:
+        assert [m["text"] for m in bridge.messages()] == [
+            "retracted in the startup window"
+        ]
+        # A one-shot CLI retract lands after the load-time check.
+        Mailbox(tmp_path / "mailbox.json").record_sent_retraction("gone-dm")
+        bridge.start()
+        assert bridge.messages() == []
+        stored = json.loads(
+            (tmp_path / "messages.json").read_text(encoding="utf-8")
+        )
+        assert stored["messages"] == []
+    finally:
+        bridge.stop()
+
+
 def test_message_history_load_recomputes_excerpt_hash(node, tmp_path):
     """A stored excerpt hash is never trusted on load: the hash is
     derived from the stored text, so a hand-edited history that

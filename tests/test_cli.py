@@ -5848,6 +5848,9 @@ def test_retract_sends_to_the_recipient_and_deletes_the_local_copy(
     # So is the sent record: `tau messages --sent` must not keep
     # showing the retracted text.
     assert Mailbox(config.mailbox_path).sent_list() == []
+    # The retraction is recorded durably, so the bridge drops the
+    # console's outbound entry when it loads after a serve-down retract.
+    assert Mailbox(config.mailbox_path).is_sent_retracted("m-9") is True
 
 
 def test_retract_reports_when_the_peer_had_no_copy(
@@ -5954,6 +5957,12 @@ def test_retract_sends_group_retract_and_deletes_the_local_copy(
     # So are the sent records for every leg: `tau messages --sent`
     # must not keep showing the retracted text.
     assert Mailbox(config.mailbox_path).sent_list() == []
+    # The group retraction is recorded durably, so the bridge drops
+    # the console's outbound legs when it loads after a serve-down
+    # retract; a single leg id never matches on its own.
+    mailbox = Mailbox(config.mailbox_path)
+    assert mailbox.is_sent_group_retracted("ab" * 16, 100.0) is True
+    assert mailbox.is_sent_retracted("m-10") is False
 
 
 def test_retract_keeps_group_copy_when_a_member_is_unreachable(
@@ -6023,6 +6032,12 @@ def test_retract_keeps_group_copy_when_a_member_is_unreachable(
     outbox = Inbox(config.inbox_path).list_messages(direction="out")
     assert {m["id"] for m in outbox} == {"m-9", "m-10"}
     assert len(Mailbox(config.mailbox_path).sent_list()) == 1
+    # No marker either: a partial fan-out keeps the console legs, so
+    # the retract stays retryable.
+    assert (
+        Mailbox(config.mailbox_path).is_sent_group_retracted("ab" * 16, 100.0)
+        is False
+    )
 
 
 def test_retract_refuses_group_message_without_leg_send_time(
