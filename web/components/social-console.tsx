@@ -132,7 +132,11 @@ export function SocialConsole() {
         setReplyTarget((current) =>
           current?.hash === submittedReply ? null : current,
         );
-        setPostLaterSeconds(null);
+        // Clear the delay only if it still belongs to this post; a delay
+        // picked while the request was pending must survive.
+        setPostLaterSeconds((current) =>
+          current === submittedDelay ? null : current,
+        );
         // Show the queue the post just joined, so the scheduled post is
         // visible and cancellable instead of disappearing into the file.
         setShowSaved(false);
