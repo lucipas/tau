@@ -4827,6 +4827,9 @@ def _print_heard_table(
 
 
 def cmd_heard(args: argparse.Namespace) -> int:
+    duration = max(0.0, float(getattr(args, "duration", 15.0)))
+    if not math.isfinite(duration):
+        raise ValueError("--duration must be a finite number of seconds")
     config = _make_config(args, announce_interval=0.0)
 
     def on_foreign(record: Dict[str, Any]) -> None:
@@ -4839,7 +4842,6 @@ def cmd_heard(args: argparse.Namespace) -> int:
 
     node = TauNode(config, name=config.name, on_foreign=on_foreign)
     node.start(announce=False)
-    duration = max(0.0, float(getattr(args, "duration", 15.0)))
     stop = threading.Event()
     previous_handlers = _install_stop_handlers(stop)
     try:
