@@ -8155,6 +8155,15 @@ def cmd_group_rename(args: argparse.Namespace) -> int:
 
 
 def cmd_group_send(args: argparse.Namespace) -> int:
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None and getattr(args, "no_queue", False):
+        # Reject the conflict before reading input, so an invalid
+        # command never blocks waiting on stdin.
+        print(
+            "error: --delay cannot be combined with --no-queue",
+            file=sys.stderr,
+        )
+        return 2
     text = _read_message(args)
     config = _make_config(args)
     expires_at = None
@@ -8162,14 +8171,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     if expire_text is not None:
         expires_at = time.time() + _parse_duration(expire_text)
     send_after = None
-    delay_text = getattr(args, "delay", None)
     if delay_text is not None:
-        if getattr(args, "no_queue", False):
-            print(
-                "error: --delay cannot be combined with --no-queue",
-                file=sys.stderr,
-            )
-            return 2
         delay = _parse_duration(delay_text, flag="--delay")
         if delay > MAX_MAIL_TTL - 3600.0:
             print(
