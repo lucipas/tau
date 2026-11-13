@@ -5593,41 +5593,43 @@ def _dispatch_local_send(
     node: TauNode, *, bridge: Any = None, **request: Any
 ) -> Dict[str, Any]:
     """Serve one local send-socket request: a DM send, a retraction, a
-    group retraction, or an edit.
+    group retraction, an edit, or a console-copy drop.
 
-    The socket carries all four, distinguished by ``op``: ``"send"`` (the
-    default, so older one-shot clients keep working) runs
-    :func:`_send_local_message`, while ``"retract"``, ``"retract_group"``
-    and ``"edit"`` run the retraction, the group retraction and the edit
-    on the serving node, so ``tau retract`` and ``tau edit`` work while
-    ``tau serve`` holds the data directory.
+    The socket carries them all, distinguished by ``op``: ``"send"``
+    (the default, so older one-shot clients keep working) runs
+    :func:`_send_local_message`, while ``"retract"``,
+    ``"retract_group"`` and ``"edit"`` run the retraction, the group
+    retraction and the edit on the serving node, so ``tau retract``
+    and ``tau edit`` work while ``tau serve`` holds the data
+    directory.
 
-    With a console bridge attached, a retract that succeeds also drops
-    the serving console's copy of the sent message: the peer deleted
-    their copy and the CLI deletes the local inbox copy next, so the
-    feed must match the inbox — otherwise the console keeps showing a
-    message that is gone on both sides, including after a restart.
-    A group retract drops the legs only when the fan-out reached every
-    member (``ok``), mirroring the CLI, which keeps its copy on a
-    partial fan-out so the retract stays retryable.  The console drop
-    is best-effort and never fails the retract itself: the retraction
-    already succeeded on the wire, so a console failure only logs —
-    the entry stays, exactly as before this change.
+    ``"drop_console_copy"`` and ``"drop_console_group"`` drop the
+    serving console's copy of a retracted sent message.  The CLI sends
+    them only after its own inbox delete succeeds, so the console
+    never loses a copy while the inbox still holds one — a retract
+    used to drop the console copy inside the ``"retract"`` op, before
+    the CLI deleted its inbox copy, so a failing inbox delete left
+    the console copy gone while the inbox record was restored.  The
+    drop is best-effort and never fails the retract itself: the
+    retraction already succeeded on the wire, so a console failure
+    only logs — the entry stays, exactly as before this change.
     """
     op = request.pop("op", "send")
     if op == "retract":
-        result = _retract_local_message(node, **request)
-        _drop_sent_console_copy(bridge, request.get("message_id"))
-        return result
+        return _retract_local_message(node, **request)
     if op == "retract_group":
-        result = _retract_group_local_message(node, **request)
-        if result.get("ok"):
-            _drop_sent_console_group(
-                bridge,
-                request.get("group"),
-                request.get("target_sent_at"),
-            )
-        return result
+        return _retract_group_local_message(node, **request)
+    if op == "drop_console_copy":
+        # Sent by the CLI only after its inbox delete succeeded.
+        _drop_sent_console_copy(bridge, request.get("message_id"))
+        return {"ok": True}
+    if op == "drop_console_group":
+        _drop_sent_console_group(
+            bridge,
+            request.get("group"),
+            request.get("target_sent_at"),
+        )
+        return {"ok": True}
     if op == "edit":
         return _edit_local_message(node, **request)
     if op == "send":
@@ -5853,6 +5855,44 @@ def _retract_group_via_running_node(
         raise NodeError(
             "the running node stopped answering mid-retract; retry the retract"
         ) from exc
+
+
+def _drop_console_copy_via_running_node(
+    config: TauConfig,
+    *,
+    message_id: Optional[str] = None,
+    group: Optional[str] = None,
+    target_sent_at: Optional[float] = None,
+) -> None:
+    """Ask the serving node to drop its console copy of a retracted send.
+
+    Called only after the local inbox delete succeeded.  Best-effort:
+    the retract already succeeded on the wire, so a failure here only
+    logs and never fails the retract.  The durable sent-retraction
+    marker (see Mailbox.record_sent_retraction) heals a missed drop
+    at the next serve start.
+    """
+    from .local_send import send_running
+
+    try:
+        if group is None:
+            send_running(
+                config.data_dir,
+                op="drop_console_copy",
+                message_id=message_id,
+            )
+        else:
+            send_running(
+                config.data_dir,
+                op="drop_console_group",
+                group=group,
+                target_sent_at=target_sent_at,
+            )
+    except Exception:
+        log.warning(
+            "could not drop retracted message from the serving console",
+            exc_info=True,
+        )
 
 
 def _edit_via_running_node(
@@ -8354,7 +8394,8 @@ def _retract_group_message(
         )
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
-    if _send_routes_via_running_node(config):
+    via_running_node = _send_routes_via_running_node(config)
+    if via_running_node:
         # A serving node owns the data directory: retract through it
         # instead of starting a second Reticulum instance on the same
         # identity — a second instance exits when it cannot bind the
@@ -8469,6 +8510,13 @@ def _retract_group_message(
             "group retract delivered but the local copy could not be deleted:"
             f" {exc}"
         ) from exc
+    if via_running_node:
+        # The inbox copy is gone, so the serving console may drop its legs.
+        _drop_console_copy_via_running_node(
+            config,
+            group=group_id,
+            target_sent_at=float(leg_sent_at),
+        )
     # The sent record lives in mailbox.json, not the inbox: drop it
     # too, or `tau messages --sent` keeps showing the retracted text.
     # Each leg has its own sent record, so drop every leg id.
@@ -8515,7 +8563,8 @@ def cmd_retract(args: argparse.Namespace) -> int:
         )
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
-    if _send_routes_via_running_node(config):
+    via_running_node = _send_routes_via_running_node(config)
+    if via_running_node:
         # A serving node owns the data directory: retract through it
         # instead of starting a second Reticulum instance on the same
         # identity — a second instance exits when it cannot bind the
@@ -8569,6 +8618,11 @@ def cmd_retract(args: argparse.Namespace) -> int:
             "retract delivered but the local copy could not be deleted:"
             f" {exc}"
         ) from exc
+    if via_running_node:
+        # The inbox copy is gone, so the serving console may drop its own.
+        _drop_console_copy_via_running_node(
+            config, message_id=str(target["id"])
+        )
     # The sent record lives in mailbox.json, not the inbox: drop it
     # too, or `tau messages --sent` keeps showing the retracted text.
     # Only after the retract and the inbox delete succeeded, so a

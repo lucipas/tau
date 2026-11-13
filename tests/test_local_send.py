@@ -309,7 +309,11 @@ def test_group_retract_uses_running_node(tmp_path, capsys, monkeypatch):
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
-def test_dispatch_retract_drops_sent_console_copy(tmp_path):
+def test_dispatch_retract_leaves_console_copy_until_drop_op(tmp_path):
+    # The retract op no longer drops the console copy: the CLI deletes
+    # its inbox copy first and only then asks the serving node to drop
+    # the console entry (finding 3 of issue #330). A dispatch retract
+    # on its own must leave the console copy alone.
     config = TauConfig.resolve(data_dir=tmp_path)
     config.prepare()
     node = _FakeRunningNode(config)
@@ -318,8 +322,31 @@ def test_dispatch_retract_drops_sent_console_copy(tmp_path):
         node, bridge=bridge, op="retract", target="alice", message_id="m-9"
     )
     assert result["deleted"] is True
+    assert bridge.deleted_wire_ids == []
+    assert bridge.deleted_groups == []
+    result = cli._dispatch_local_send(
+        node, bridge=bridge, op="drop_console_copy", message_id="m-9"
+    )
+    assert result["ok"] is True
     assert bridge.deleted_wire_ids == ["m-9"]
     assert bridge.deleted_groups == []
+
+
+def test_dispatch_drop_console_copy_without_bridge_is_a_noop(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    node = _FakeRunningNode(config)
+    result = cli._dispatch_local_send(
+        node, op="drop_console_copy", message_id="m-9"
+    )
+    assert result["ok"] is True
+    result = cli._dispatch_local_send(
+        node,
+        op="drop_console_group",
+        group="ab" * 16,
+        target_sent_at=100.0,
+    )
+    assert result["ok"] is True
 
 
 def test_dispatch_retract_without_bridge_is_a_noop(tmp_path):
@@ -345,12 +372,15 @@ def test_dispatch_retract_failure_leaves_console_copy(tmp_path):
     assert bridge.deleted_groups == []
 
 
-def test_dispatch_group_retract_drops_legs_only_on_full_fanout(tmp_path):
+def test_dispatch_group_retract_leaves_console_legs_until_drop_op(tmp_path):
+    # Like the DM retract: the group retract op no longer drops the
+    # console legs — the CLI asks for the drop only after its inbox
+    # delete succeeds, and only on a full fan-out.
     config = TauConfig.resolve(data_dir=tmp_path)
     config.prepare()
     node = _FakeRunningNode(config)
     bridge = _FakeBridge()
-    cli._dispatch_local_send(
+    result = cli._dispatch_local_send(
         node,
         bridge=bridge,
         op="retract_group",
@@ -358,7 +388,8 @@ def test_dispatch_group_retract_drops_legs_only_on_full_fanout(tmp_path):
         message_id="m-10",
         target_sent_at=100.0,
     )
-    assert bridge.deleted_groups == [("ab" * 16, 100.0)]
+    assert result["ok"] is True
+    assert bridge.deleted_groups == []
 
     partial = _FakeRunningNode(config, behaviour={"retract_group": "partial"})
     bridge = _FakeBridge()
@@ -372,6 +403,16 @@ def test_dispatch_group_retract_drops_legs_only_on_full_fanout(tmp_path):
     )
     assert result["ok"] is False
     assert bridge.deleted_groups == []
+
+    result = cli._dispatch_local_send(
+        node,
+        bridge=bridge,
+        op="drop_console_group",
+        group="ab" * 16,
+        target_sent_at=100.0,
+    )
+    assert result["ok"] is True
+    assert bridge.deleted_groups == [("ab" * 16, 100.0)]
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
@@ -445,6 +486,92 @@ def test_retract_via_running_node_drops_console_copy(tmp_path, capsys, monkeypat
         assert bridge.messages() == []
         persisted = json.loads(bridge._messages_path.read_text(encoding="utf-8"))
         assert persisted["messages"] == []
+    finally:
+        server.stop()
+    assert not server.path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_retract_via_running_node_keeps_console_copy_when_inbox_delete_fails(
+    tmp_path, capsys, monkeypatch
+):
+    # Regression test (finding 3 of issue #330): the console copy used
+    # to be dropped inside the retract op, before the CLI deleted its
+    # inbox copy — a failing inbox delete left the console copy gone
+    # while the inbox record was restored. The drop now happens only
+    # after the inbox delete succeeds, so a failure keeps the console
+    # entry (a retry heals both sides).
+    import RNS
+
+    from tau.identity import destination_hash
+    from tau.inbox import InboxError
+    from tau.peers import PeerRegistry
+    from tau.webapi import WebBridge
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    config.prepare()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "sent hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-9",
+            "direction": "out",
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
+    node = _FakeRunningNode(config)
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge._append_message(
+        direction="out",
+        peer=recipient_hash.hex(),
+        peer_name="alice",
+        text="sent hello",
+        sent_at=10.0,
+        received_at=20.0,
+        status="delivered",
+        wire_id="m-9",
+    )
+    assert len(bridge.messages()) == 1
+    server = SendServer(
+        data_dir,
+        lambda **request: cli._dispatch_local_send(
+            node, bridge=bridge, **request
+        ),
+    )
+    try:
+        assert send_server_available(data_dir)
+        _FakeLocalNode.instances.clear()
+        monkeypatch.setattr(cli, "TauNode", _FakeLocalNode)
+
+        def _failing_delete(self, message_id):
+            raise InboxError("disk full")
+
+        monkeypatch.setattr(cli.Inbox, "delete", _failing_delete)
+        assert cli.main(["retract", "--data-dir", str(data_dir), "m-9"]) != 0
+        assert "local copy could not be deleted" in capsys.readouterr().err
+        assert _FakeLocalNode.instances == []
+        assert node.calls == [("retract", recipient_hash.hex(), "m-9")]
+        # The inbox record is still there — and so is the console copy.
+        assert Inbox(config.inbox_path).list_messages(direction="out") != []
+        assert len(bridge.messages()) == 1
+        assert bridge.messages()[0]["wire_id"] == "m-9"
     finally:
         server.stop()
     assert not server.path.exists()
