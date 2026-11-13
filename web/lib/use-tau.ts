@@ -573,27 +573,6 @@ export function useTau() {
     setHeldMail(result.held);
   }, []);
 
-  useEffect(() => {
-    if (connection !== "live") return;
-    async function tick() {
-      // The endpoints are independent: a failure on one must not stop
-      // the others from updating their state. Each is a side panel: a
-      // failed poll leaves the last known values in place instead of
-      // flashing an error.
-      await Promise.allSettled([
-        refreshOutbox(),
-        refreshHeldMail(),
-        refreshGroups(),
-        refreshSettings(),
-      ]);
-    }
-    void tick();
-    const timer = setInterval(() => void tick(), 15000);
-    return () => {
-      clearInterval(timer);
-    };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings]);
-
   const allowlistSeq = useRef(0);
 
   // Allow-list requests can resolve out of order: only the newest
@@ -614,25 +593,30 @@ export function useTau() {
     applyAllowlist(requestId, result);
   }, [applyAllowlist]);
 
-  // The allow-list only changes through this console or the CLI, and
-  // CLI changes do not apply to the running node until it restarts —
-  // so a load on connect plus a refresh after each action is enough;
-  // no polling interval like the outbox needs.
   useEffect(() => {
     if (connection !== "live") return;
-    let disposed = false;
-    async function load() {
-      try {
-        await refreshAllowlist();
-      } catch {
-        if (disposed) return;
-      }
+    async function tick() {
+      // The endpoints are independent: a failure on one must not stop
+      // the others from updating their state. Each is a side panel: a
+      // failed poll leaves the last known values in place instead of
+      // flashing an error.
+      // The allow-list polls here too: another console tab writes
+      // through the same live API, so a change made there would
+      // otherwise leave this section stale behind the rest.
+      await Promise.allSettled([
+        refreshOutbox(),
+        refreshHeldMail(),
+        refreshGroups(),
+        refreshSettings(),
+        refreshAllowlist(),
+      ]);
     }
-    void load();
+    void tick();
+    const timer = setInterval(() => void tick(), 15000);
     return () => {
-      disposed = true;
+      clearInterval(timer);
     };
-  }, [connection, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     async (target: string) => {

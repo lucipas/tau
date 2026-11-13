@@ -1447,3 +1447,99 @@ describe("useTau pinned view", () => {
     expect(result.current.pinnedMessages).toEqual([]);
   });
 });
+
+describe("useTau allowlist polling", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function mockAllowlistPoll(first: unknown, second: unknown) {
+    let allowlistCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path === "/api/allowlist") {
+        allowlistCalls += 1;
+        return allowlistCalls === 1
+          ? Promise.resolve(first)
+          : Promise.resolve(second);
+      }
+      if (path === "/api/peers") {
+        return Promise.resolve({ peers: [], count: 0 });
+      }
+      if (path === "/api/outbox") {
+        return Promise.resolve({ outbox: [], count: 0, held_for_others: 0 });
+      }
+      return Promise.resolve({ groups: [], count: 0 });
+    });
+    return () => allowlistCalls;
+  }
+
+  it("loads the allow-list on connect and refreshes it on the 15s poll", async () => {
+    const first = { enabled: false, entries: [] };
+    const second = {
+      enabled: true,
+      entries: [{ destination: PEER_HASH, name: "alice" }],
+    };
+    const allowlistCalls = mockAllowlistPoll(first, second);
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+
+    // A snapshot takes the hook live, which starts the poll tick.
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot() });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.allowlist).toEqual(first);
+
+    // A change made from another tab (same live API) shows up on
+    // the next 15s tick, like the other side panels.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+    expect(allowlistCalls()).toBe(2);
+    expect(result.current.allowlist).toEqual(second);
+  });
+
+  it("keeps the last list when a poll fails", async () => {
+    const first = { enabled: false, entries: [] };
+    let allowlistCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path === "/api/allowlist") {
+        allowlistCalls += 1;
+        return allowlistCalls === 1
+          ? Promise.resolve(first)
+          : Promise.reject(new Error("bridge down"));
+      }
+      if (path === "/api/peers") {
+        return Promise.resolve({ peers: [], count: 0 });
+      }
+      if (path === "/api/outbox") {
+        return Promise.resolve({ outbox: [], count: 0, held_for_others: 0 });
+      }
+      return Promise.resolve({ groups: [], count: 0 });
+    });
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot() });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.allowlist).toEqual(first);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+    expect(allowlistCalls).toBe(2);
+    expect(result.current.allowlist).toEqual(first);
+  });
+});
