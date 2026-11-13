@@ -6,6 +6,7 @@ import { apiGet, apiPost } from "./api";
 import type {
   TanAuthor,
   TanAuthorsResponse,
+  TanCancelScheduledResponse,
   TanExportDocument,
   TanFollow,
   TanFollowingResponse,
@@ -23,6 +24,9 @@ import type {
   TanRulesUpdateResponse,
   TanPinnedResponse,
   TanSavedResponse,
+  TanScheduleResponse,
+  TanScheduledPost,
+  TanScheduledResponse,
   TanSuggestResponse,
   TanSuggestion,
   TanSyncResponse,
@@ -30,7 +34,9 @@ import type {
   TanVerifyReport,
 } from "./types";
 
-const POLL_INTERVAL_MS = 5000;
+// The feed poll cadence, shared with the console's Scheduled view so a
+// post the serving node publishes disappears from the queue promptly.
+export const TAN_POLL_INTERVAL_MS = 5000;
 // Suggestion ranking scans the whole cache, so it refreshes on a slower
 // cadence than the feed and stays off the feed's poll critical path.
 const SUGGEST_INTERVAL_MS = 60000;
@@ -77,6 +83,10 @@ export function useTan() {
   const [pinned, setPinned] = useState<TanPost[]>([]);
   const [pinnedLoading, setPinnedLoading] = useState(false);
   const [pinnedHasMore, setPinnedHasMore] = useState(false);
+  // Queued Tan posts waiting for their publish time; loaded on demand
+  // like the saved and pinned lists.
+  const [scheduled, setScheduled] = useState<TanScheduledPost[]>([]);
+  const [scheduledLoading, setScheduledLoading] = useState(false);
   const [all, setAll] = useState(false);
   // Which ranking the feed shows: the chronological timeline, or the
   // most-liked posts. The top view ignores the following/everything
@@ -168,7 +178,7 @@ export function useTan() {
     if (
       !supersede &&
       pending !== null &&
-      Date.now() - pending.startedAt < POLL_INTERVAL_MS * 2
+      Date.now() - pending.startedAt < TAN_POLL_INTERVAL_MS * 2
     ) {
       return false;
     }
@@ -342,7 +352,7 @@ export function useTan() {
         disposed = true;
       };
     }
-    const timer = setInterval(() => void tick(false), POLL_INTERVAL_MS);
+    const timer = setInterval(() => void tick(false), TAN_POLL_INTERVAL_MS);
     return () => {
       disposed = true;
       clearInterval(timer);
@@ -724,6 +734,74 @@ export function useTan() {
     },
     [load, reloadSaved, refreshPinnedIfLoaded, runRefreshes],
   );
+
+  // Scheduled posts change only through this client's schedule/cancel
+  // actions (or the CLI), so they load on demand instead of on every
+  // poll tick. The queue is small, so one fetch covers the whole list.
+  const scheduledGenerationRef = useRef(0);
+  // Whether the scheduled list has been loaded at least once. A
+  // schedule refreshes it only then, so scheduling from the composer
+  // does not pay for a list nobody has opened.
+  const scheduledLoadedRef = useRef(false);
+
+  const loadScheduled = useCallback(async () => {
+    const generation = ++scheduledGenerationRef.current;
+    setScheduledLoading(true);
+    try {
+      const result = await apiGet<TanScheduledResponse>("/api/tan/scheduled");
+      if (scheduledGenerationRef.current !== generation) return;
+      setScheduled(result.scheduled);
+      scheduledLoadedRef.current = true;
+    } finally {
+      if (scheduledGenerationRef.current === generation) {
+        setScheduledLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshScheduledIfLoaded = useCallback(async () => {
+    // A load already in flight may have captured the queue before this
+    // schedule, so refresh then too; the newer request supersedes it.
+    if (scheduledLoadedRef.current || scheduledGenerationRef.current > 0) {
+      await loadScheduled();
+    }
+  }, [loadScheduled]);
+
+  const schedulePost = useCallback(
+    async (text: string, sendIn: number, replyTo?: string) => {
+      setPosting(true);
+      try {
+        await apiPost<TanScheduleResponse>("/api/tan/schedule", {
+          text,
+          send_in: sendIn,
+          ...(replyTo ? { reply_to: replyTo } : {}),
+        });
+        // The post is already queued: a failed list refresh must not
+        // reject, or the composer keeps the draft and a retry duplicates it.
+        try {
+          await refreshScheduledIfLoaded();
+        } catch {
+          setError("post scheduled, but the scheduled list could not refresh");
+        }
+      } finally {
+        setPosting(false);
+      }
+    },
+    [refreshScheduledIfLoaded],
+  );
+
+  const cancelScheduled = useCallback(async (id: string) => {
+    await apiPost<TanCancelScheduledResponse>("/api/tan/cancel-scheduled", {
+      id,
+    });
+    // A list load that started before this cancel must not restore the
+    // card: advance the generation so its response is discarded, and
+    // clear the loading flag it would otherwise leave set.
+    scheduledGenerationRef.current += 1;
+    setScheduledLoading(false);
+    setScheduled((previous) => previous.filter((post) => post.id !== id));
+  }, []);
+
   const openThread = useCallback(
     async (ref: string) => {
       // The ref goes in the ref first: `load` reads it synchronously,
@@ -1045,6 +1123,11 @@ export function useTan() {
     loadMorePinned,
     pin,
     unpin,
+    scheduled,
+    scheduledLoading,
+    loadScheduled,
+    schedulePost,
+    cancelScheduled,
     all,
     setAll,
     view,

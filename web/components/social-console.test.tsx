@@ -22,6 +22,7 @@ const mockTan = vi.hoisted(() => ({
 // touch either.
 vi.mock("@/lib/use-tan", () => ({
   useTan: vi.fn(() => mockTan.current),
+  TAN_POLL_INTERVAL_MS: 5000,
 }));
 
 import { useTan } from "@/lib/use-tan";
