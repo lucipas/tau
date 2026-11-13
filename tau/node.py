@@ -6676,11 +6676,15 @@ class TauNode:
         edited text, so an offline member still gets the message,
         already edited.  The live edit still goes out to every
         member, so a copy that reached them another way is
-        rewritten.  Returns a per-member result list; ``ok`` is true
-        only when every member received the edit and the local copies
-        were updated (see ``local_errors``).  A failed leg
-        reports an ``error`` instead of queueing: like DM edits and
-        group retracts, group edits are live-only in v1.
+        rewritten — except a member whose still-scheduled leg was
+        cancelled but could not be re-queued: they get no live edit,
+        so the replacement text stays out of their hands until the
+        message is sent (or re-scheduled), and the leg is reported
+        as a re-queue failure.  Returns a per-member result list;
+        ``ok`` is true only when every member received the edit and
+        the local copies were updated (see ``local_errors``).  A
+        failed leg reports an ``error`` instead of queueing: like DM
+        edits and group retracts, group edits are live-only in v1.
 
         The sender's own copies update only on a full fan-out: the
         inbox record and every leg's sent record take the new text,
@@ -6742,6 +6746,11 @@ class TauNode:
         # carries the edited text, so they get no live edit (see the
         # fan-out below).
         scheduled_members: Dict[str, str] = {}
+        # Members whose still-scheduled leg was cancelled but could
+        # not be re-queued: they get no live edit below — the
+        # replacement text must not reach them before the scheduled
+        # time, and the leg is already reported in requeue_failed.
+        requeue_failed_scheduled: Set[str] = set()
         for entry in self.mailbox.outbox_list():
             if (
                 entry.group_id == group["id"]
@@ -6778,6 +6787,8 @@ class TauNode:
                         if entry.is_scheduled():
                             scheduled_members[entry.to_hex] = entry.to_name
                     except MailboxError as queue_exc:
+                        if entry.is_scheduled():
+                            requeue_failed_scheduled.add(entry.to_hex)
                         requeue_failed.append(
                             {
                                 "to": entry.to_hex,
@@ -6809,6 +6820,14 @@ class TauNode:
                         "id": edit_id,
                     }
                 )
+                continue
+            if member in requeue_failed_scheduled:
+                # Their still-scheduled leg was cancelled and the
+                # re-queue failed, so the message itself is gone
+                # and the live edit must not hand them the
+                # replacement text before the scheduled time.  The
+                # requeue_failed entry already in the results
+                # reports the failure, so nothing more is added.
                 continue
             # One deadline bounds each leg, exactly as in
             # send_group_message: the stages of a single delivery
