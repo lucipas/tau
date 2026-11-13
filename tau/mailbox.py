@@ -1585,10 +1585,18 @@ class Mailbox:
                     and float(edited_at) <= float(stored)
                 ):
                     return
+            previous = dict(record)
             record["text"] = normalize_message(text)
             if edited_at is not None:
                 record["edited_at"] = float(edited_at)
-            self.save()
+            try:
+                self.save()
+            except Exception:
+                # Do not keep an unpersisted edit in memory: a retry must
+                # see the old record and be able to apply the edit again.
+                record.clear()
+                record.update(previous)
+                raise
 
     def sent_record(self, message_id: str) -> Optional[Dict[str, Any]]:
         """A copy of one sent record, or ``None`` when unknown."""

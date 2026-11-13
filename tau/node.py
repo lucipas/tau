@@ -2932,6 +2932,18 @@ class TauNode:
             return response_error(
                 "not_sender", "only the message's sender may edit it"
             )
+        if is_group:
+            # Like a group retract, an edit must come from a current
+            # member: a removed member, or one whose retained copy
+            # outlived its membership, may not rewrite it.  A missing
+            # roster fails closed.
+            pinned = pinned_group(self.groups, record.get("group") or "")
+            if pinned is None or caller_hash not in (
+                pinned.get("members") or []
+            ):
+                return response_error(
+                    "not_a_member", "sender is not a group member"
+                )
         edit_sent_at = edit.get("sent_at")
         if edit_sent_at is None:
             # The signed sent_at is the edit's ordering key.  Falling
@@ -6200,11 +6212,13 @@ class TauNode:
         different wire ids (see :meth:`_handle_dm_edit`).
 
         A leg still queued in the outbox when the edit runs is
-        cancelled first, so an offline member never receives a
-        message that was already edited — the live edit still goes
-        out to them, so a copy that reached them another way is
+        cancelled and re-queued under the same leg id carrying the
+        edited text, so an offline member still gets the message,
+        already edited.  The live edit still goes out to every
+        member, so a copy that reached them another way is
         rewritten.  Returns a per-member result list; ``ok`` is true
-        only when every member received the edit.  A failed leg
+        only when every member received the edit and the local copies
+        were updated (see ``local_errors``).  A failed leg
         reports an ``error`` instead of queueing: like DM edits and
         group retracts, group edits are live-only in v1.
 
@@ -6241,6 +6255,7 @@ class TauNode:
             # 502 / a misleading "peer offline" suffix.
             raise ValueError("group has no other members to edit for")
         cancelled: List[str] = []
+        requeue_failed: List[Dict[str, Any]] = []
         for entry in self.mailbox.outbox_list():
             if (
                 entry.group_id == group["id"]
@@ -6248,6 +6263,37 @@ class TauNode:
             ):
                 if self.mailbox.remove_outbox(entry.id):
                     cancelled.append(entry.id)
+                    # Re-queue the cancelled leg under its own id with the
+                    # edited text, so an offline member still receives the
+                    # message (edited) instead of losing it entirely.
+                    try:
+                        self.mailbox.enqueue(
+                            to=entry.to,
+                            text=cleaned,
+                            to_name=entry.to_name,
+                            kind=entry.kind,
+                            message_id=entry.id,
+                            expires_at=entry.message_expires_at,
+                            group={
+                                "id": entry.group_id,
+                                "name": entry.group_name,
+                                "creator": entry.group_creator,
+                                "members": list(entry.group_members),
+                            },
+                            sent_at=entry.wire_sent_at,
+                            send_after=entry.send_after,
+                            in_reply_to=entry.in_reply_to,
+                        )
+                    except MailboxError as queue_exc:
+                        requeue_failed.append(
+                            {
+                                "to": entry.to_hex,
+                                "to_name": entry.to_name,
+                                "ok": False,
+                                "error": f"could not re-queue: {queue_exc}",
+                                "id": entry.id,
+                            }
+                        )
         edit_id = generate_message_id()
         payload = edit_dict(
             target_id,
@@ -6263,7 +6309,7 @@ class TauNode:
             raise NodeError("could not sign edit")
         payload["sig"] = base64.b64encode(signature).decode("ascii")
         payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
-        results: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = list(requeue_failed)
         for member in members:
             # One deadline bounds each leg, exactly as in
             # send_group_message: the stages of a single delivery
@@ -6350,6 +6396,7 @@ class TauNode:
                     }
                 )
         all_ok = all(result.get("delivered") for result in results)
+        local_errors: List[str] = []
         if all_ok:
             # Every member received the edit: update this node's own
             # copies too, so the editor sees the new text under the
@@ -6375,6 +6422,7 @@ class TauNode:
                 )
             except InboxError as exc:
                 log.warning("Could not record sent group edit: %s", exc)
+                local_errors.append(f"inbox copy not updated: {exc}")
             for leg_id in leg_ids:
                 try:
                     self.mailbox.update_sent_text(
@@ -6384,8 +6432,10 @@ class TauNode:
                     )
                 except MailboxError as exc:
                     log.warning("Could not update sent group edit: %s", exc)
+                    local_errors.append(f"sent copy not updated: {exc}")
         return {
-            "ok": all_ok,
+            "ok": all_ok and not local_errors,
+            "local_errors": local_errors,
             "v": PROTOCOL_VERSION,
             "group": group["id"],
             "name": group["name"],
