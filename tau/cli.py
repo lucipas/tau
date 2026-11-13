@@ -5589,19 +5589,40 @@ def _edit_local_message(
     )
 
 
+def _edit_group_local_message(
+    node: TauNode,
+    *,
+    group: str,
+    message_id: str,
+    text: str,
+    target_sent_at: float,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Edit one group message on the running node, for the local send server."""
+    return node.send_group_edit(
+        group,
+        message_id,
+        text,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+        target_sent_at=float(target_sent_at),
+    )
+
+
 def _dispatch_local_send(
     node: TauNode, *, bridge: Any = None, **request: Any
 ) -> Dict[str, Any]:
     """Serve one local send-socket request: a DM send, a retraction, a
-    group retraction, an edit, or a console-copy drop.
+    group retraction, an edit, a group edit, or a console-copy drop.
 
     The socket carries them all, distinguished by ``op``: ``"send"``
     (the default, so older one-shot clients keep working) runs
     :func:`_send_local_message`, while ``"retract"``,
-    ``"retract_group"`` and ``"edit"`` run the retraction, the group
-    retraction and the edit on the serving node, so ``tau retract``
-    and ``tau edit`` work while ``tau serve`` holds the data
-    directory.
+    ``"retract_group"``, ``"edit"`` and ``"edit_group"`` run the
+    retraction, the group retraction, the edit and the group edit on
+    the serving node, so ``tau retract`` and ``tau edit`` work while
+    ``tau serve`` holds the data directory.
 
     ``"drop_console_copy"`` and ``"drop_console_group"`` drop the
     serving console's copy of a retracted sent message.  The CLI sends
@@ -5632,6 +5653,8 @@ def _dispatch_local_send(
         return {"ok": True}
     if op == "edit":
         return _edit_local_message(node, **request)
+    if op == "edit_group":
+        return _edit_group_local_message(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
@@ -5854,6 +5877,37 @@ def _retract_group_via_running_node(
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
+
+
+def _edit_group_via_running_node(
+    config: TauConfig,
+    group_id: str,
+    message_id: str,
+    text: str,
+    target_sent_at: float,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Edit a group message through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="edit_group",
+            group=group_id,
+            message_id=message_id,
+            text=text,
+            target_sent_at=target_sent_at,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-edit; retry the edit"
         ) from exc
 
 
@@ -8554,6 +8608,146 @@ def _retract_group_message(
     return _EXIT_OK
 
 
+def _edit_group_message(
+    args: argparse.Namespace,
+    config: TauConfig,
+    inbox: Inbox,
+    registry: PeerRegistry,
+    target: Dict[str, Any],
+    cleaned: str,
+) -> int:
+    """Edit a sent group message, fanning out to every member.
+
+    Queued legs are cancelled by the fan-out (see
+    :meth:`tau.node.TauNode.send_group_edit`), so a member whose
+    leg never left never receives the message.  The local sent copy
+    updates only when every member received the edit: a partial
+    fan-out keeps it, so the user can retry the members still
+    holding the old text — re-sending is idempotent, and a member
+    who already applied a newer edit answers ``edited`` False.
+    """
+    group_id = target.get("group") or ""
+    if not group_id:
+        raise NodeError("that group message has no group to edit in")
+    leg_sent_at = target.get("leg_sent_at")
+    if leg_sent_at is None:
+        raise NodeError(
+            "that group message was sent before group edits landed; "
+            "it carries no leg send time, so it cannot be edited"
+        )
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    via_running_node = _send_routes_via_running_node(config)
+    if via_running_node:
+        # A serving node owns the data directory: edit through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
+        try:
+            response = _edit_group_via_running_node(
+                config,
+                group_id,
+                str(target["id"]),
+                cleaned,
+                float(leg_sent_at),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except NodeError as exc:
+            # Edits ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable member is
+            # a plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver group edit: {exc} "
+                "(edits need the members online in v1)"
+            ) from exc
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_group_edit(
+                    group_id,
+                    str(target["id"]),
+                    cleaned,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                    target_sent_at=float(leg_sent_at),
+                )
+            except NodeError as exc:
+                # Edits ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable member
+                # is a plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver group edit: {exc} "
+                    "(edits need the members online in v1)"
+                ) from exc
+        finally:
+            node.stop()
+
+    results = response.get("results") or []
+    failed = [r for r in results if not r.get("delivered")]
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "group": group_id,
+                "ok": bool(response.get("ok")),
+                "cancelled_queued": response.get("cancelled_queued") or [],
+                "results": results,
+                "id": response.get("id"),
+            },
+            True,
+        )
+    else:
+        for result in results:
+            member = result.get("to") or ""
+            peer = registry.get(member)
+            name = peer.display_name if peer is not None else short_hash(member)
+            if result.get("delivered"):
+                if result.get("edited"):
+                    print(
+                        f"edited your group message "
+                        f"{_safe_id_prefix(str(target['id']))} for {name}"
+                    )
+                else:
+                    print(
+                        f"edit was not applied to {name}'s copy of "
+                        f"{_safe_id_prefix(str(target['id']))} "
+                        "(unknown message, or a newer edit already applied)"
+                    )
+            else:
+                print(
+                    f"could not edit for {name}: "
+                    f"{result.get('error') or 'unknown error'}"
+                )
+        for leg_id in response.get("cancelled_queued") or []:
+            # The leg is gone from this node's outbox, so no further
+            # attempt goes out from here — but a sealed copy already
+            # held by another peer may still arrive if the edit does
+            # not reach that member (the same caveat as
+            # `tau outbox cancel`).
+            print(
+                f"cancelled queued leg {_safe_id_prefix(str(leg_id))} — "
+                "no further delivery attempts from this node; a sealed "
+                "copy already held by another peer may still arrive"
+            )
+    if failed:
+        # Keep the local sent copy: the failed members still hold the
+        # old text, and the record carries the leg ids and send time a
+        # retry needs.  A failed edit never rewrites the local copy.
+        raise NodeError(
+            "group edit reached only some members: "
+            + "; ".join(
+                f"{short_hash(str(r.get('to') or ''))}: "
+                f"{r.get('error') or 'unknown error'}"
+                for r in failed
+            )
+            + "; retry `tau edit` when they are online"
+        )
+    return _EXIT_OK
+
+
 def cmd_retract(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -8707,9 +8901,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if not target.get("id"):
         raise NodeError("that message has no id to edit")
     if target.get("kind") == "group":
-        raise NodeError(
-            "group messages cannot be edited; send a new message instead"
-        )
+        if target.get("direction") != "out":
+            raise NodeError(
+                "that message was not sent by this node;"
+                " only your own sent messages can be edited"
+            )
+        return _edit_group_message(args, config, inbox, registry, target, cleaned)
     if target.get("kind") == "file":
         raise NodeError("a file record has no text to edit")
     if target.get("direction") != "out":

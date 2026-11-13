@@ -748,6 +748,192 @@ def test_send_group_retraction_needs_the_shared_send_time(tmp_path):
         node.send_group_retraction("crew", "leg-1")
 
 
+def test_send_group_edit_fans_out_one_signed_payload(tmp_path, monkeypatch):
+    import base64
+
+    from tau.protocol import REQUEST_DM_EDIT, edit_unsigned_bytes, parse_edit
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    # The sender's own record: id is the first leg id, with every leg
+    # listed, so the fan-out can update the sent records afterwards.
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1", "leg-2"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent("leg-1", to=alice.destination_hash, text="typo here")
+    node.mailbox.record_sent("leg-2", to=bob.destination_hash, text="typo here")
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append((peer_arg, path, payload))
+        return {"ok": True, "edited": True, "group_edit": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+
+    assert response["ok"] is True
+    assert response["group"] == group["id"]
+    assert response["target"] == "leg-1"
+    # Both members got a leg; this node never edits for itself.
+    assert {r["to"] for r in response["results"]} == {
+        alice.hexhash,
+        bob.hexhash,
+    }
+    assert all(r.get("delivered") for r in response["results"])
+    assert all(r.get("edited") for r in response["results"])
+    assert len(calls) == 2
+    assert all(path == REQUEST_DM_EDIT for _, path, _ in calls)
+    # One signed payload, one edit id, for every leg.
+    assert calls[0][2] == calls[1][2]
+    payload = parse_edit(calls[0][2])
+    assert payload["target"] == "leg-1"
+    assert payload["text"] == "fixed here"
+    assert payload["group"] == group["id"]
+    assert payload["target_author"] == node.destination.hexhash
+    assert payload["target_sent_at"] == 100.0
+    assert payload["id"] == response["id"]
+    assert node.identity.validate(
+        base64.b64decode(payload["sig"]),
+        edit_unsigned_bytes(calls[0][2]),
+    )
+    # The sender's own copies took the new text too.
+    entry = node.inbox.list_messages(direction="out")[0]
+    assert entry["text"] == "fixed here"
+    assert entry["edited_at"]
+    sent = {record["id"]: record for record in node.mailbox.sent_list()}
+    assert sent["leg-1"]["text"] == "fixed here"
+    assert sent["leg-2"]["text"] == "fixed here"
+
+
+def test_send_group_edit_reports_failed_leg_and_keeps_the_local_copy(
+    tmp_path, monkeypatch
+):
+    node, _, alice, bob = _group_reaction_node(tmp_path)
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "crew",
+            "leg_ids": ["leg-1", "leg-2"],
+            "leg_sent_at": 100.0,
+        }
+    )
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NotAllowedError("peer rejected the request: not allowed")
+        return {"ok": True, "edited": True, "group_edit": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+
+    assert response["ok"] is False
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    assert by_to[bob.hexhash].get("error") == "not_allowed"
+    # The local copy is untouched, so the edit stays retryable.
+    entry = node.inbox.list_messages(direction="out")[0]
+    assert entry["text"] == "typo here"
+    assert "edited_at" not in entry
+
+
+def test_send_group_edit_reports_member_without_group_edit(
+    tmp_path, monkeypatch
+):
+    # An older member answers the DM edit ok but never saw the
+    # group context: it kept its copy, so the leg is not delivered
+    # and the sender keeps its own copy for a retry.
+    node, _, alice, bob = _group_reaction_node(tmp_path)
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            return {"ok": True, "edited": False, "_rtt": 0.004}
+        return {"ok": True, "edited": True, "group_edit": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+
+    assert response["ok"] is False
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    assert by_to[bob.hexhash].get("delivered") is None
+    assert (
+        by_to[bob.hexhash].get("error") == "member runs a version without group edit"
+    )
+
+
+def test_send_group_edit_cancels_queued_legs(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    # Bob's leg never left: it sits in the outbox with the shared
+    # send time of the original fan-out.
+    node.mailbox.enqueue(
+        to=bob.destination_hash,
+        text="typo here",
+        message_id="bob-leg-1",
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": list(group["members"]),
+        },
+        sent_at=100.0,
+    )
+    assert node.mailbox.get_outbox("bob-leg-1") is not None
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append(peer_arg.hexhash)
+        return {"ok": True, "edited": False, "group_edit": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+
+    # The queued leg is gone, so Bob never receives the message — and
+    # the live edit still went out to him, so a copy that reached
+    # him another way is rewritten.
+    assert response["cancelled_queued"] == ["bob-leg-1"]
+    assert node.mailbox.get_outbox("bob-leg-1") is None
+    assert response["ok"] is True
+    assert set(calls) == {alice.hexhash, bob.hexhash}
+
+
+def test_send_group_edit_needs_the_shared_send_time(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    with pytest.raises(NodeError, match="shared send time"):
+        node.send_group_edit("crew", "leg-1", "fixed here")
+
+
 def test_send_group_message_records_leg_sent_at(tmp_path, monkeypatch):
     node, _, _, _ = _group_reaction_node(tmp_path)
 

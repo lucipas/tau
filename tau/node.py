@@ -2787,7 +2787,7 @@ class TauNode:
         remote_identity: Optional[RNS.Identity],
         requested_at: float,
     ) -> bytes:
-        """Apply a signed edit for a DM this node received."""
+        """Apply a signed edit for a DM — or a group message — this node received."""
         try:
             edit = parse_edit(data)
         except ProtocolError as exc:
@@ -2850,9 +2850,51 @@ class TauNode:
             caller_name = peer.display_name if peer is not None else caller_hash[:8]
 
         target_id = edit["target"]
+        group_id = edit.get("group")
+        target_author = edit.get("target_author")
+        target_sent_at = edit.get("target_sent_at")
+        has_group_context = (
+            group_id is not None
+            and target_author is not None
+            and target_sent_at is not None
+        )
         try:
             record = self.inbox.resolve(target_id)
         except ValueError:
+            record = None
+        if record is not None and record.get("id") == target_id:
+            # An exact id match: a DM edit, or a group edit naming
+            # this node's own leg id (the sender's record id is one
+            # leg's id, so it can match one member's copy directly).
+            pass
+        elif has_group_context:
+            # Group legs carry a different wire id per recipient, so
+            # the target id alone only matches the author's sent
+            # record — never this node's copy.  Resolve this node's
+            # copy from the signed group context instead (see
+            # _handle_retract): the context is covered by the
+            # signature verified above, so a relay cannot retarget
+            # the edit onto a different message.  Reload first: a
+            # copy imported by another process may have landed after
+            # this node's in-memory copy was read.
+            try:
+                self.inbox.reload()
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not read inbox: {exc}"
+                )
+            record = self.inbox.find_group_message(
+                group_id, target_author, target_sent_at
+            )
+            if record is None:
+                return response_ok(
+                    target=target_id,
+                    edited=False,
+                    received_at=received_at,
+                    group_edit=True,
+                )
+            target_id = str(record["id"])
+        else:
             # An unknown id answers ok with edited: false, so a retried
             # edit is safe (idempotent) — the sender can retry with the
             # same id and it will apply when the message arrives.
@@ -2861,15 +2903,13 @@ class TauNode:
                 edited=False,
                 received_at=received_at,
             )
-        if record.get("id") != target_id:
-            # resolve() also matches unique prefixes; an edit must name
-            # the full id, so a prefix match is not an edit target.
-            return response_ok(
-                target=target_id,
-                edited=False,
-                received_at=received_at,
-            )
-        if record.get("kind") == "group":
+        is_group = record.get("kind") == "group"
+        # Every ok answer on the group path carries group_edit, so the
+        # sender can tell a member that understood the group context
+        # from an older member that answered a DM edit ok while
+        # keeping its copy (see send_group_edit).
+        group_flag = {"group_edit": True} if is_group else {}
+        if is_group and not has_group_context:
             # A group message has a different id on every member's
             # copy, so one edit cannot name them all; refuse instead of
             # rewriting a single member's copy.
@@ -2912,19 +2952,31 @@ class TauNode:
                 target=target_id,
                 edited=False,
                 received_at=received_at,
+                **group_flag,
             )
         try:
             # The ownership and ordering checks above read a snapshot;
             # the inbox repeats them atomically so racing edits cannot
-            # apply out of order.
-            applied = self.inbox.apply_edit(
-                target_id,
-                edit["text"],
-                edited_at=effective_at,
-                direction="in",
-                destination=caller_hash,
-                newer_than_existing=True,
-            )
+            # apply out of order.  A group leg is identified by its own
+            # id here — the handler already verified it is the author's
+            # message to this member — so the inbox must not re-check
+            # direction/destination, which refuses group records.
+            if is_group:
+                applied = self.inbox.apply_edit(
+                    target_id,
+                    edit["text"],
+                    edited_at=effective_at,
+                    newer_than_existing=True,
+                )
+            else:
+                applied = self.inbox.apply_edit(
+                    target_id,
+                    edit["text"],
+                    edited_at=effective_at,
+                    direction="in",
+                    destination=caller_hash,
+                    newer_than_existing=True,
+                )
         except InboxError as exc:
             # Do not acknowledge an edit that was not stored, so the
             # sender can retry with the same id and it will apply then.
@@ -2939,6 +2991,7 @@ class TauNode:
                 target=target_id,
                 edited=False,
                 received_at=received_at,
+                **group_flag,
             )
         # The inbox record is updated; a serving console keeps its own
         # copy of the message, so tell it to show the new text too —
@@ -2968,6 +3021,7 @@ class TauNode:
             target=target_id,
             edited=True,
             received_at=received_at,
+            **group_flag,
         )
 
 
@@ -5928,6 +5982,39 @@ class TauNode:
         payload["sig"] = base64.b64encode(signature).decode("ascii")
         return encode(payload, max_bytes=MAX_REQUEST_BYTES), retract_id, sent_at
 
+    def _resolve_group_for_fanout(
+        self, group: Union[str, Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Resolve a group record for a fan-out (retract, edit, ...).
+
+        *group* is a group id, id prefix, name, or group record.
+        An exact id resolves exactly: a retired id reaches its
+        retained roster, never a same-named live group — the name
+        fallback in find() must not hijack a fan-out to another
+        group's members (see GroupStore.get_retired).  An unresolved
+        32-hex id (e.g. retired before retained records existed)
+        must not fall back to a live group that merely shares its
+        name.  Only a hex string can be an id: a 32-character
+        non-hex name still resolves through find().  ValueError,
+        like find(): this is an unknown group, not a delivery
+        failure, and the CLI reports the two differently.
+        """
+        if not isinstance(group, str):
+            return group
+        record = self.groups.get(group)
+        if record is None:
+            record = self.groups.get_retired(group)
+        if record is None:
+            stripped = group.strip()
+            if len(stripped) == 32:
+                try:
+                    bytes.fromhex(stripped)
+                except ValueError:
+                    pass
+                else:
+                    raise ValueError(f"unknown group: {group!r}")
+        return record if record is not None else self.groups.find(group)
+
     def send_group_retraction(
         self,
         group: Union[str, Dict[str, Any]],
@@ -5971,31 +6058,7 @@ class TauNode:
                 "messages sent before group retracts landed carry no "
                 "leg send time, so this one cannot be retracted"
             )
-        if isinstance(group, str):
-            # Resolve an exact id exactly: a retired id reaches its
-            # retained roster, never a same-named live group — the
-            # name fallback in find() must not hijack a retract to
-            # another group's members (see GroupStore.get_retired).
-            record = self.groups.get(group)
-            if record is None:
-                record = self.groups.get_retired(group)
-            if record is None:
-                # An unresolved 32-hex id (e.g. retired before retained
-                # records existed) must not fall back to a live group
-                # that merely shares its name.  Only a hex string can
-                # be an id: a 32-character non-hex name still resolves
-                # through find().  ValueError, like find(): this is an
-                # unknown group, not a delivery failure, and the CLI
-                # reports the two differently.
-                stripped = group.strip()
-                if len(stripped) == 32:
-                    try:
-                        bytes.fromhex(stripped)
-                    except ValueError:
-                        pass
-                    else:
-                        raise ValueError(f"unknown group: {group!r}")
-            group = record if record is not None else self.groups.find(group)
+        group = self._resolve_group_for_fanout(group)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         if not members:
@@ -6115,6 +6178,223 @@ class TauNode:
             "results": results,
         }
 
+    def send_group_edit(
+        self,
+        group: Union[str, Dict[str, Any]],
+        message_id: str,
+        text: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+        target_sent_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan an edit of a group message out to every member.
+
+        *group* is a group id, id prefix, name, or group record.
+        The edit is built and signed once — one edit id — and the
+        same bytes go to every member except this node, one leg per
+        member with the same per-leg timeout a group send uses, so
+        one slow member cannot starve the rest.  The payload carries
+        the signed group context (group, author, shared send time),
+        so each member resolves its own copy even though legs carry
+        different wire ids (see :meth:`_handle_dm_edit`).
+
+        A leg still queued in the outbox when the edit runs is
+        cancelled first, so an offline member never receives a
+        message that was already edited — the live edit still goes
+        out to them, so a copy that reached them another way is
+        rewritten.  Returns a per-member result list; ``ok`` is true
+        only when every member received the edit.  A failed leg
+        reports an ``error`` instead of queueing: like DM edits and
+        group retracts, group edits are live-only in v1.
+
+        The sender's own copies update only on a full fan-out: the
+        inbox record and every leg's sent record take the new text,
+        guarded so an older edit never rewinds a newer one.  A
+        partial fan-out keeps the local copy, so the user can retry
+        the members still holding the old text — re-sending is
+        idempotent, and a member who already applied a newer edit
+        answers ``edited`` False.
+        """
+        cleaned = normalize_message(text)
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("edit target must be a message id of 1-64 characters")
+        if (
+            target_sent_at is None
+            or isinstance(target_sent_at, bool)
+            or not isinstance(target_sent_at, (int, float))
+        ):
+            raise NodeError(
+                "group edit needs the message's shared send time; "
+                "messages sent before group edits landed carry no "
+                "leg send time, so this one cannot be edited"
+            )
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        group = self._resolve_group_for_fanout(group)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        if not members:
+            # A usage error, not a delivery failure: the console maps
+            # it to a 400 and the CLI prints it plain, instead of a
+            # 502 / a misleading "peer offline" suffix.
+            raise ValueError("group has no other members to edit for")
+        cancelled: List[str] = []
+        for entry in self.mailbox.outbox_list():
+            if (
+                entry.group_id == group["id"]
+                and entry.wire_sent_at == float(target_sent_at)
+            ):
+                if self.mailbox.remove_outbox(entry.id):
+                    cancelled.append(entry.id)
+        edit_id = generate_message_id()
+        payload = edit_dict(
+            target_id,
+            cleaned,
+            message_id=edit_id,
+            group=group["id"],
+            target_author=own_hash,
+            target_sent_at=float(target_sent_at),
+        )
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign edit")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        results: List[Dict[str, Any]] = []
+        for member in members:
+            # One deadline bounds each leg, exactly as in
+            # send_group_message: the stages of a single delivery
+            # share the leg's budget, but one member's leg must not
+            # consume another's.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "ok": False,
+                        "error": "not attempted: group edit time limit reached",
+                        "id": edit_id,
+                    }
+                )
+                continue
+            peer: Optional[Peer] = None
+            try:
+                peer = self.resolve_peer(
+                    member,
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
+                )
+                response = self._request(
+                    peer,
+                    REQUEST_DM_EDIT,
+                    payload_bytes,
+                    _remaining(deadline) or 0.0,
+                    deadline=deadline,
+                )
+                if not response.get("group_edit"):
+                    # An older member answers ok without understanding the
+                    # group context: it kept its copy, so the leg is not
+                    # delivered and the sender must keep its own copy.
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name,
+                            "ok": False,
+                            "error": "member runs a version without group edit",
+                            "id": edit_id,
+                        }
+                    )
+                    continue
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name,
+                        "delivered": True,
+                        "edited": bool(response.get("edited")),
+                        "id": edit_id,
+                        "rtt": response.get("_rtt"),
+                    }
+                )
+            except (NotAllowedError, NotAMemberError) as exc:
+                # The member is online and explicitly refused; an
+                # edit has no outbox to queue into, so the leg
+                # is simply reported as failed.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": "not_allowed"
+                        if isinstance(exc, NotAllowedError)
+                        else "not_a_member",
+                        "id": edit_id,
+                    }
+                )
+            except NodeError as exc:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": str(exc),
+                        "id": edit_id,
+                    }
+                )
+        all_ok = all(result.get("delivered") for result in results)
+        if all_ok:
+            # Every member received the edit: update this node's own
+            # copies too, so the editor sees the new text under the
+            # message in their own inbox and console.  The guard
+            # keeps an overlapping older edit from rewinding a newer
+            # one that already landed locally.  A missing local copy
+            # (pruned since the send) is not a delivery failure.
+            try:
+                record = self.inbox.resolve(target_id)
+            except ValueError:
+                record = None
+            leg_ids = []
+            if record is not None:
+                leg_ids = list(record.get("leg_ids") or [])
+            if not leg_ids:
+                leg_ids = [target_id]
+            try:
+                self.inbox.apply_edit(
+                    target_id,
+                    cleaned,
+                    edited_at=float(payload["sent_at"]),
+                    newer_than_existing=True,
+                )
+            except InboxError as exc:
+                log.warning("Could not record sent group edit: %s", exc)
+            for leg_id in leg_ids:
+                try:
+                    self.mailbox.update_sent_text(
+                        str(leg_id),
+                        cleaned,
+                        edited_at=float(payload["sent_at"]),
+                    )
+                except MailboxError as exc:
+                    log.warning("Could not update sent group edit: %s", exc)
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "group": group["id"],
+            "name": group["name"],
+            "target": target_id,
+            "id": edit_id,
+            "sent_at": float(payload["sent_at"]),
+            "cancelled_queued": cancelled,
+            "results": results,
+        }
 
     def send_edit(
         self,
