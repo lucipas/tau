@@ -9330,6 +9330,54 @@ def test_edit_message_endpoint_refuses_group_message_still_in_the_outbox(
     ]
 
 
+def test_edit_message_endpoint_refuses_group_message_with_trimmed_queued_leg(
+    bridge, node
+):
+    # The queued leg's console entry left the 500-entry history, so
+    # its wire id is no longer among the retained legs — but the
+    # mailbox still holds it, and the edit must still be refused
+    # (see CodeRabbit on #341). The guard scans the mailbox for the
+    # whole logical send (group id plus the shared send time), and
+    # the refused edit leaves the queued leg untouched.
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(
+        bridge,
+        node,
+        crew["id"],
+        second_status="queued",
+        second_wire_id="mail-bob-1",
+    )
+    node.mailbox.enqueue(
+        to=bytes.fromhex(BOB_HASH),
+        text="hello",
+        message_id="mail-bob-1",
+        group={
+            "id": crew["id"],
+            "name": "crew",
+            "creator": PEER_HASH,
+            "members": [PEER_HASH, BOB_HASH],
+        },
+        sent_at=1000.0,
+    )
+    # The queued leg's console entry is gone from the history; only
+    # the delivered leg remains to edit by.
+    bridge._messages.remove(entries[1])
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 400
+    assert "still queued for an offline member" in payload["error"]["message"]
+    assert node.group_edits == []
+    queued = node.mailbox.get_outbox("mail-bob-1")
+    assert queued is not None
+    assert queued.text == "hello"
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == ["hello"]
+
+
 def test_edit_message_endpoint_rejects_unknown_group(bridge, node):
     _sent_console_entry(bridge, node, wire_id="wire-1", group="ab" * 16)
     status, _, payload = _json(
