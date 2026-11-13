@@ -6813,10 +6813,17 @@ class TauNode:
                                     edited_at=entry.edited_at,
                                 )
                             except MailboxError:
-                                # Restore failed too: the leg is gone, so
-                                # keep this call from live-editing the
-                                # member (the failure is reported below).
-                                requeue_failed_scheduled.add(entry.to_hex)
+                                # Restore failed too: the leg itself is
+                                # gone as well as the re-queue.
+                                pass
+                            # Either way this call must not live-edit
+                            # the member: the restored leg (when the
+                            # restore worked) still carries the
+                            # ORIGINAL text, so a live edit here would
+                            # hand them the replacement before the
+                            # scheduled time.  The failure is reported
+                            # below and the edit stays retryable.
+                            requeue_failed_scheduled.add(entry.to_hex)
                         requeue_failed.append(
                             {
                                 "to": entry.to_hex,
@@ -6851,10 +6858,12 @@ class TauNode:
                 continue
             if member in requeue_failed_scheduled:
                 # Their still-scheduled leg was cancelled and the
-                # re-queue failed, so the message itself is gone
-                # and the live edit must not hand them the
-                # replacement text before the scheduled time.  The
-                # requeue_failed entry already in the results
+                # re-queue failed, so the live edit must not hand
+                # them the replacement text before the scheduled
+                # time: the restored leg (when the restore worked)
+                # still carries the original text, and when the
+                # restore failed too the message itself is gone.
+                # The requeue_failed entry already in the results
                 # reports the failure, so nothing more is added.
                 continue
             # One deadline bounds each leg, exactly as in

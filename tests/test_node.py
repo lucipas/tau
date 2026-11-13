@@ -1094,6 +1094,73 @@ def test_send_group_edit_skips_live_edit_when_scheduled_requeue_fails(
     assert node.inbox.list_messages(direction="out")[0]["text"] == "typo here"
 
 
+def test_send_group_edit_restores_failed_scheduled_leg_for_retry(
+    tmp_path, monkeypatch
+):
+    # A scheduled leg whose re-queue fails but whose restore succeeds
+    # must still get no live edit in this call: the restored leg
+    # carries the ORIGINAL text, so a live edit would hand the member
+    # the replacement before the scheduled time.  The retry then finds
+    # the restored leg and re-queues it with the edited text.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message("crew", "typo here", send_after=send_after)
+    assert all(result.get("queued") for result in response["results"])
+    sent_at = response["sent_at"]
+    record = node.inbox.list_messages(direction="out")[0]
+    legs = {
+        leg.to_hex: leg for leg in node.mailbox.outbox_list()
+    }
+    bob_leg = legs[bob.hexhash]
+    real_enqueue = node.mailbox.enqueue
+
+    def _flaky_enqueue(*args, **kwargs):
+        if (
+            kwargs.get("message_id") == bob_leg.id
+            and kwargs.get("text") == "fixed here"
+        ):
+            raise MailboxError("disk full")
+        return real_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(node.mailbox, "enqueue", _flaky_enqueue)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("no live edit may go out for a failed scheduled leg")
+
+    monkeypatch.setattr(node, "_request", _boom)
+    edit = node.send_group_edit(
+        "crew", record["id"], "fixed here", target_sent_at=sent_at
+    )
+
+    # No live edit went out to anyone: Alice's leg re-queued fine, so
+    # she is deferred, while Bob's leg is back in the outbox with its
+    # original text and the failure is reported — with the edited text
+    # never handed to him early.
+    assert edit["ok"] is False
+    by_to = {r["to"]: r for r in edit["results"]}
+    assert by_to[alice.hexhash].get("deferred") is True
+    assert by_to[bob.hexhash].get("error", "").startswith("could not re-queue")
+    restored = node.mailbox.get_outbox(bob_leg.id)
+    assert restored is not None
+    assert restored.text == "typo here"
+    assert restored.send_after is not None and restored.send_after > time.time()
+    # The local copy is untouched, so the edit stays retryable.
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "typo here"
+
+    # Retry with a healthy mailbox: the restored leg is found again
+    # and re-queued carrying the edited text, still with no live edit.
+    monkeypatch.setattr(node.mailbox, "enqueue", real_enqueue)
+    retry = node.send_group_edit(
+        "crew", record["id"], "fixed here", target_sent_at=sent_at
+    )
+    assert retry["ok"] is True
+    retry_by_to = {r["to"]: r for r in retry["results"]}
+    assert retry_by_to[alice.hexhash].get("deferred") is True
+    assert retry_by_to[bob.hexhash].get("deferred") is True
+    assert node.mailbox.get_outbox(bob_leg.id).text == "fixed here"
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "fixed here"
+
+
 def test_send_group_edit_reports_failed_leg_and_keeps_the_local_copy(
     tmp_path, monkeypatch
 ):
