@@ -1692,6 +1692,96 @@ def test_group_store_retirement_lifts_when_roster_returns(tmp_path):
     )
 
 
+def test_group_store_retired_group_record_is_retained(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert grown["id"] != group["id"]
+    # The old id is retired, but its roster is retained for retracts
+    # of messages sent under it — and survives a reload.
+    assert store.get(group["id"]) is None
+    retained = store.get_retired(group["id"])
+    assert retained is not None
+    assert retained["members"] == [OWN_HASH, OTHER_HASH]
+    assert retained["name"] == "weekend"
+    raw = json.loads((tmp_path / "groups.json").read_text())
+    assert [entry["id"] for entry in raw["retired_groups"]] == [group["id"]]
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get_retired(group["id"]) == retained
+    # The retained record is a copy: mutating it must not corrupt the store.
+    retained["members"].append(THIRD_HASH)
+    assert store.get_retired(group["id"])["members"] == [OWN_HASH, OTHER_HASH]
+
+
+def test_pinned_group_falls_back_to_retained_record(tmp_path):
+    from tau.groups import pinned_group
+
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert pinned_group(store, group["id"]) == group
+    store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    # Retired, but still pinned for authorization: the retained
+    # roster is the one messages sent under the id were sent to.
+    retained = pinned_group(store, group["id"])
+    assert retained is not None
+    assert retained["id"] == group["id"]
+    assert retained["members"] == [OWN_HASH, OTHER_HASH]
+    # Nothing pinned at all stays nothing.
+    assert pinned_group(store, "00" * 16) is None
+
+
+def test_group_store_retired_record_drops_when_roster_returns(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert store.get_retired(group["id"]) is not None
+    restored = store.update_members(
+        grown["id"], [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    assert restored["id"] == group["id"]
+    # Live again: no retained record lingers for the id — but the
+    # intermediate roster is now the retired one, so its record is kept.
+    assert store.get_retired(group["id"]) is None
+    raw = json.loads((tmp_path / "groups.json").read_text())
+    assert [entry["id"] for entry in raw["retired_groups"]] == [grown["id"]]
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get_retired(group["id"]) is None
+    assert reloaded.get_retired(grown["id"]) is not None
+
+
+def test_group_store_retired_records_are_capped(tmp_path):
+    from tau.groups import MAX_RETIRED_GROUPS
+
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    retired_ids = []
+    current = group
+    for i in range(MAX_RETIRED_GROUPS + 5):
+        member = f"{i + 1:032x}"
+        nxt = store.update_members(
+            current["id"], [OWN_HASH, member], created_by=OWN_HASH
+        )
+        retired_ids.append(current["id"])
+        current = nxt
+    raw = json.loads((tmp_path / "groups.json").read_text())
+    assert len(raw["retired_groups"]) == MAX_RETIRED_GROUPS
+    assert retired_ids[0] not in [
+        entry["id"] for entry in raw["retired_groups"]
+    ]
+    assert retired_ids[-1] in [
+        entry["id"] for entry in raw["retired_groups"]
+    ]
+    # The oldest forgotten retirement carries no record either.
+    assert store.get_retired(retired_ids[0]) is None
+    assert store.get_retired(retired_ids[-1]) is not None
+
+
 def _learned_group_ids(tmp_path):
     """A member-side store holding a group learned from its creator."""
     store = GroupStore(tmp_path / "groups.json")

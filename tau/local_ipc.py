@@ -30,10 +30,20 @@ _MAX_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 1024 * 1024
 
 # Error types the one-shot path lets reach the caller, re-raised as the same
-# type on the client so both paths treat them identically.
+# type on the client so both paths treat them identically.  ValueError is
+# included: a usage error raised on the serving node (an unknown group on a
+# retract) must reach the caller as that error, not be re-wrapped as a
+# delivery failure.
 _REMOTE_ERRORS = {
     cls.__name__: cls
-    for cls in (NodeError, PeerError, MailboxError, ProtocolError, IdentityError)
+    for cls in (
+        NodeError,
+        PeerError,
+        MailboxError,
+        ProtocolError,
+        IdentityError,
+        ValueError,
+    )
 }
 
 

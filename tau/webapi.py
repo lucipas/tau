@@ -3875,6 +3875,11 @@ class WebBridge:
         self.node.groups.list_groups()
         group = self.node.groups.get(group_id)
         if group is None:
+            # A roster change retires the id, but a message sent under
+            # it still carries it: fan out to the retained historical
+            # roster, never the successor's.
+            group = self.node.groups.get_retired(group_id)
+        if group is None:
             raise ValueError(f"unknown group: {group_id!r}")
         # Resolve the authoritative shared send time from the stored
         # inbox record before fanning out: the console entry's
