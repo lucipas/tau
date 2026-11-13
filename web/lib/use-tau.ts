@@ -626,12 +626,19 @@ export function useTau() {
 
   const addAllowlistPeer = useCallback(
     async (target: string) => {
-      const requestId = ++allowlistSeq.current;
-      const result = await apiPost<AllowlistResponse>("/api/allowlist/add", {
-        target,
-      });
-      applyAllowlist(requestId, result);
-      return result;
+      // Same pending-write guard as the other allow-list writes: a
+      // poll must not supersede this add with a pre-write snapshot.
+      allowlistPending.current++;
+      try {
+        const requestId = ++allowlistSeq.current;
+        const result = await apiPost<AllowlistResponse>("/api/allowlist/add", {
+          target,
+        });
+        applyAllowlist(requestId, result);
+        return result;
+      } finally {
+        allowlistPending.current--;
+      }
     },
     [applyAllowlist],
   );

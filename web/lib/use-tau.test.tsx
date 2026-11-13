@@ -1542,4 +1542,68 @@ describe("useTau allowlist polling", () => {
     expect(allowlistCalls).toBe(2);
     expect(result.current.allowlist).toEqual(first);
   });
+
+  it("does not poll the allow-list while an add is in flight", async () => {
+    const before = { enabled: false, entries: [] };
+    const after = {
+      enabled: false,
+      entries: [{ destination: PEER_HASH, name: "alice" }],
+    };
+    const addGate = deferred<unknown>();
+    let allowlistCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path === "/api/allowlist") {
+        allowlistCalls += 1;
+        return Promise.resolve(before);
+      }
+      if (path === "/api/peers") {
+        return Promise.resolve({ peers: [], count: 0 });
+      }
+      if (path === "/api/outbox") {
+        return Promise.resolve({ outbox: [], count: 0, held_for_others: 0 });
+      }
+      return Promise.resolve({ groups: [], count: 0 });
+    });
+    mockedPost.mockImplementation((path: string) =>
+      path === "/api/allowlist/add"
+        ? addGate.promise
+        : Promise.resolve({}),
+    );
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot() });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.allowlist).toEqual(before);
+    expect(allowlistCalls).toBe(1);
+
+    // Start an add and hold its response: the next poll must skip the
+    // allow-list instead of overwriting the pending add with a
+    // pre-write snapshot.
+    let addPromise: Promise<unknown> = Promise.resolve();
+    act(() => {
+      addPromise = result.current.addAllowlistPeer(PEER_HASH);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+    expect(allowlistCalls).toBe(1);
+
+    // The add resolves with the updated list; the following poll
+    // resumes fetching it.
+    await act(async () => {
+      addGate.resolve(after);
+      await addPromise;
+    });
+    expect(result.current.allowlist).toEqual(after);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+    expect(allowlistCalls).toBe(2);
+  });
 });
