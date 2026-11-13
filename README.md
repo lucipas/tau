@@ -744,7 +744,9 @@ online. A DM still queued in the outbox is cancelled with
 `tau outbox cancel` instead; a queued group leg is cancelled by the
 retract itself. A peer running a version that predates
 retracts rejects the unknown path, so a retract to an old peer fails
-instead of silently succeeding.
+instead of silently succeeding. A peer that predates group retracts
+accepts the DM retract but does not acknowledge the group context, so
+that group leg is reported as failed and the sender keeps its copy.
 
 ### DM edits
 

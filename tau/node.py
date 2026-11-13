@@ -2616,6 +2616,20 @@ class TauNode:
             else:
                 stored = None
             if stored is None:
+                # A group-context marker is keyed by the group, so only a
+                # pinned member of that group may write one: otherwise any
+                # authenticated caller could flood the bounded marker store
+                # and evict real markers.  Checked before anything is
+                # recorded, like the copy-present path.
+                if has_group_context:
+                    pinned = pinned_group(self.groups, group_id)
+                    if pinned is None or caller_hash not in (
+                        pinned.get("members") or []
+                    ):
+                        return response_error(
+                            "not_a_member",
+                            "sender is not a group member",
+                        )
                 # No stored copy to check the sender against — the message
                 # may already be deleted or never have arrived.  Record the
                 # marker anyway: the retract is authenticated, and a copy
@@ -2646,6 +2660,7 @@ class TauNode:
                     target=retract["target"],
                     received_at=received_at,
                     deleted=False,
+                    group_retract=has_group_context,
                 )
             # Only a received record counts: an outgoing record also has the
             # caller's hash in ``destination`` (the recipient), so without the
@@ -2725,6 +2740,7 @@ class TauNode:
                     target=retract["target"],
                     received_at=received_at,
                     deleted=False,
+                    group_retract=has_group_context,
                 )
             # The inbox record is gone; a serving console keeps its own
             # copy of the message, so tell it to drop that too — otherwise
@@ -6000,6 +6016,20 @@ class TauNode:
                     _remaining(deadline) or 0.0,
                     deadline=deadline,
                 )
+                if not response.get("group_retract"):
+                    # An older member answers ok without understanding the
+                    # group context: it kept its copy, so the leg is not
+                    # delivered and the sender must keep its own copy.
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name,
+                            "ok": False,
+                            "error": "member runs a version without group retract",
+                            "id": retract_id,
+                        }
+                    )
+                    continue
                 results.append(
                     {
                         "to": member,
