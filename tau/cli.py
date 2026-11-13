@@ -7374,6 +7374,7 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
             document,
             is_retracted=mailbox.is_retracted,
             is_group_retracted=mailbox.is_group_retracted,
+            pending_group_edit=mailbox.pending_group_edit,
         )
     if _json_mode(args):
         _emit(result, True)

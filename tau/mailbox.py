@@ -112,6 +112,15 @@ MAX_RETRACTED = 4096
 # cap keeps the same earliest-expiry eviction without sharing the
 # per-message marker budget.
 MAX_GROUP_RETRACTED = 1024
+# Pending group-edit markers (see record_group_pending_edit) are rarer —
+# one per edited group message, not per leg — so their own smaller cap
+# keeps the same earliest-expiry eviction without sharing the
+# per-message marker budget.
+MAX_GROUP_PENDING_EDITS = 1024
+# One sender may hold at most this many pending edits: an allow-listed
+# peer flooding the pool with edits for absent copies must not evict
+# another sender's live markers (see _evict_group_pending_edits).
+MAX_GROUP_PENDING_EDITS_PER_SENDER = 64
 # Sent-message history (for read receipts) and queued receipts waiting
 # on an unreachable sender.  Both are small metadata records, capped
 # like the seen set; sent entries also keep the text so `tau messages
@@ -188,6 +197,52 @@ def _parse_retraction_markers(
             continue
         if math.isfinite(until) and until <= latest:
             markers[str(key)] = until
+    return markers
+
+
+def _parse_pending_edit_markers(
+    raw_value: Any, *, retention: float = RETRACTED_RETENTION
+) -> Dict[str, Dict[str, Any]]:
+    """Parse pending group-edit markers from a mailbox document.
+
+    A marker is ``key -> {"text", "edited_at", "until"}``: the
+    replacement text, the edit's signed send time, and the time the
+    marker expires.  Malformed entries — a non-dict value, a non-text
+    body, a non-numeric edit time or expiry, or an expiry past the
+    retention bound (see :func:`_parse_retraction_markers`) — are
+    dropped rather than letting a bad marker rewrite a message or
+    abort the load.
+    """
+    markers: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(raw_value, dict):
+        return markers
+    latest = time.time() + retention + RETRACTED_CLOCK_SKEW_TOLERANCE
+    for key, value in raw_value.items():
+        if not isinstance(value, dict):
+            continue
+        text = value.get("text")
+        edited_at = value.get("edited_at")
+        until = value.get("until")
+        if not isinstance(text, str):
+            continue
+        if (
+            isinstance(edited_at, bool)
+            or not isinstance(edited_at, (int, float))
+            or isinstance(until, bool)
+            or not isinstance(until, (int, float))
+        ):
+            continue
+        try:
+            edited = float(edited_at)
+            expiry = float(until)
+        except OverflowError:
+            continue
+        if math.isfinite(edited) and math.isfinite(expiry) and expiry <= latest:
+            markers[str(key)] = {
+                "text": text,
+                "edited_at": edited,
+                "until": expiry,
+            }
     return markers
 
 
@@ -779,6 +834,17 @@ class Mailbox:
         # _evict_group_retracted).
         self._group_retracted: Dict[str, float] = {}
         self._group_retracted_unknown: Dict[str, float] = {}
+        # Pending group edits, keyed by (sender hash, group id, shared
+        # send time) like the group-retraction markers above, with the
+        # replacement text, the edit's signed send time, and the time
+        # the marker expires (see RETRACTED_RETENTION).  A live edit
+        # answered against a copy this node has not seen yet is
+        # remembered here instead of forgotten: a copy arriving later
+        # — live, relayed, or held — lands already edited, so the old
+        # text never reaches the inbox (see record_group_pending_edit).
+        # Only the newest edit per message is kept: an older edit
+        # never rewinds a newer marker.
+        self._group_pending_edits: Dict[str, Dict[str, Any]] = {}
         # Sent-retraction markers, keyed by message id (DM) or by
         # (group id, shared send time) for a group message (see
         # _sent_group_retraction_key).  The owner recorded them when
@@ -908,6 +974,7 @@ class Mailbox:
             self._group_retracted_unknown = state["group_retracted_unknown"]
             self._sent_retracted = state["sent_retracted"]
             self._sent_group_retracted = state["sent_group_retracted"]
+            self._group_pending_edits = state["group_pending_edits"]
             self._sent = state["sent"]
             self._receipts = state["receipts"]
         log.debug(
@@ -1064,6 +1131,9 @@ class Mailbox:
             raw.get("sent_group_retracted"),
             retention=SENT_RETRACTED_RETENTION,
         )
+        group_pending_edits = _parse_pending_edit_markers(
+            raw.get("group_pending_edits")
+        )
 
         sent: Dict[str, Dict[str, Any]] = {}
         raw_sent = raw.get("sent")
@@ -1162,6 +1232,7 @@ class Mailbox:
             "group_retracted_unknown": group_retracted_unknown,
             "sent_retracted": sent_retracted,
             "sent_group_retracted": sent_group_retracted,
+            "group_pending_edits": group_pending_edits,
             "sent": sent,
             "receipts": receipts,
         }
@@ -1193,6 +1264,10 @@ class Mailbox:
                 ),
                 "sent_retracted": dict(self._sent_retracted),
                 "sent_group_retracted": dict(self._sent_group_retracted),
+                "group_pending_edits": {
+                    key: dict(marker)
+                    for key, marker in self._group_pending_edits.items()
+                },
                 "pending_acks": {
                     holder: list(ids)
                     for holder, ids in self._pending_acks.items()
@@ -2194,6 +2269,115 @@ class Mailbox:
                     return True
             return False
 
+    # -- pending group edits -------------------------------------------
+
+    def record_group_pending_edit(
+        self,
+        sender_hash: str,
+        group_id: str,
+        sent_at: float,
+        text: str,
+        edited_at: float,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Remember an edit for a group message that has not arrived yet.
+
+        The marker is keyed by the logical message — (sender, group,
+        shared send time) — because legs carry different wire ids, so
+        no per-leg id can guard a copy that has not arrived yet.  It
+        lives for the possible delivery lifetime of the message
+        (RETRACTED_RETENTION), like a group-retraction marker, and
+        recording a newer edit replaces the marker.  An older edit
+        never rewinds a newer one: recording it returns False and
+        leaves the marker — including its expiry — untouched, so a
+        replayed older edit cannot extend a stale marker either.
+        Returns True when the marker was recorded or replaced.
+        """
+        timestamp = now if now is not None else time.time()
+        key = _group_retraction_key(sender_hash, group_id, sent_at)
+        with self._transaction():
+            current = self._group_pending_edits.get(key)
+            if (
+                current is not None
+                and timestamp < float(current["until"])
+                and float(edited_at) <= float(current["edited_at"])
+            ):
+                return False
+            self._group_pending_edits[key] = {
+                "text": text,
+                "edited_at": float(edited_at),
+                "until": timestamp + RETRACTED_RETENTION,
+            }
+            self._evict_group_pending_edits(sender_hash)
+            self.save()
+            return True
+
+    def _evict_group_pending_edits(self, sender_hash: str) -> None:
+        """Keep the pending-edit pool within its caps, sender-fairly.
+
+        First the sender that just recorded a marker drops its own
+        earliest-expiry markers past its per-sender share.  Then the
+        global cap is enforced by evicting the earliest-expiry marker
+        of whichever sender holds the most markers, so a flood from one
+        sender never displaces another sender's live marker.
+
+        Call with the transaction held.
+        """
+        pool = self._group_pending_edits
+
+        def owner(key: str) -> str:
+            return key.partition(":")[0]
+
+        own = [key for key in pool if owner(key) == sender_hash]
+        while len(own) > MAX_GROUP_PENDING_EDITS_PER_SENDER:
+            oldest = min(own, key=lambda key: pool[key]["until"])
+            own.remove(oldest)
+            del pool[oldest]
+        while len(pool) > MAX_GROUP_PENDING_EDITS:
+            counts: Dict[str, int] = {}
+            for key in pool:
+                counts[owner(key)] = counts.get(owner(key), 0) + 1
+            heaviest = max(counts, key=lambda s: counts[s])
+            oldest = min(
+                (key for key in pool if owner(key) == heaviest),
+                key=lambda key: pool[key]["until"],
+            )
+            del pool[oldest]
+
+    def pending_group_edit(
+        self,
+        sender_hash: str,
+        group_id: str,
+        sent_at: float,
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """The pending edit for a group message, if one is live.
+
+        Returns a copy of ``{"text", "edited_at"}`` for the newest edit
+        recorded for this logical message, or None when no marker
+        covers it.  An expired marker reads as absent even before
+        :meth:`prune` sweeps it away; a marker for another sender,
+        group, or send time never matches.  A non-numeric send time
+        cannot match a recorded marker.
+        """
+        with self._lock:
+            timestamp = now if now is not None else time.time()
+            try:
+                key = _group_retraction_key(
+                    sender_hash, group_id, float(sent_at)
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+            marker = self._group_pending_edits.get(key)
+            if marker is None or timestamp >= float(marker["until"]):
+                return None
+            return {
+                "text": marker["text"],
+                "edited_at": float(marker["edited_at"]),
+            }
+
     # -- sent-retraction markers -------------------------------------------
 
     def record_sent_retraction(
@@ -2413,6 +2597,13 @@ class Mailbox:
             ]
             for key in dead_sent_group_retracted:
                 del self._sent_group_retracted[key]
+            dead_group_pending_edits = [
+                key
+                for key, marker in self._group_pending_edits.items()
+                if marker["until"] <= timestamp
+            ]
+            for key in dead_group_pending_edits:
+                del self._group_pending_edits[key]
             if (
                 dead_outbox
                 or dead_held
@@ -2426,6 +2617,7 @@ class Mailbox:
                 or dead_group_retracted_unknown
                 or dead_sent_retracted
                 or dead_sent_group_retracted
+                or dead_group_pending_edits
             ):
                 self.save()
             return {
