@@ -9141,7 +9141,6 @@ def test_edit_message_endpoint_edits_group_message(bridge, node):
     )
     assert payload["group"] == crew["id"]
     assert payload["cancelled_queued"] == []
-    assert payload["requeued"] == []
     assert [result["to"] for result in payload["results"]] == [
         PEER_HASH,
         BOB_HASH,
@@ -9230,7 +9229,14 @@ def test_edit_message_endpoint_keeps_group_bubbles_on_partial_fanout(
     ]
 
 
-def test_edit_message_endpoint_requeues_queued_group_leg(bridge, node):
+def test_edit_message_endpoint_refuses_group_message_with_queued_leg(
+    bridge, node
+):
+    # Group edits are live-only: a queued leg is refused outright
+    # instead of cancelled and re-queued — a concurrent mail sweep
+    # could deliver the queued leg with the old text after the edit
+    # was acknowledged (see Qodo on #341). The user cancels the
+    # queued leg from the outbox first, as for a queued DM edit.
     crew = node.groups.list_groups()[0]
     entries = _sent_group_console_entries(
         bridge,
@@ -9239,23 +9245,47 @@ def test_edit_message_endpoint_requeues_queued_group_leg(bridge, node):
         second_status="queued",
         second_wire_id="mail-bob-1",
     )
-    node.group_edit_cancelled = ["mail-bob-1"]
-    node.group_edit_requeued = ["mail-bob-1"]
     status, _, payload = _json(
         bridge,
         "/api/messages/edit",
         method="POST",
         body={"id": entries[0]["id"], "text": "hello again"},
     )
-    # A queued leg must not refuse the edit: the fan-out cancels and
-    # re-queues it with the edited text, so both bubbles update.
-    assert status == 200
-    assert payload["cancelled_queued"] == ["mail-bob-1"]
-    assert payload["requeued"] == ["mail-bob-1"]
+    assert status == 400
+    assert "still queued for an offline member" in payload["error"]["message"]
+    assert "cancel it from the outbox" in payload["error"]["message"]
+    assert node.group_edits == []
     _, _, feed = _json(bridge, "/api/messages")
     assert [entry["text"] for entry in feed["messages"]] == [
-        "hello again",
-        "hello again",
+        "hello",
+        "hello",
+    ]
+
+
+def test_edit_message_endpoint_refuses_group_message_still_in_the_outbox(
+    bridge, node
+):
+    # The bubbles say delivered, but the mailbox still holds a leg:
+    # the outbox check, not just the bubble status, refuses the edit,
+    # or a sweep could deliver the old leg after the edit.
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(bridge, node, crew["id"])
+    node.mailbox.enqueue(
+        to=bytes.fromhex(BOB_HASH), text="hello", message_id="wire-bob"
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 400
+    assert "still queued for an offline member" in payload["error"]["message"]
+    assert node.group_edits == []
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello",
+        "hello",
     ]
 
 

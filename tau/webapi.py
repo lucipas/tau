@@ -3867,11 +3867,15 @@ class WebBridge:
 
         Mirrors ``tau edit --group`` (see
         :meth:`tau.node.TauNode.send_group_edit`): the edit fans out
-        to every member, a leg still queued in the outbox is cancelled
-        and re-queued with the edited text by the fan-out itself, and
-        the local copies update only when every member received it — a
-        partial fan-out keeps the old text, so the members still
-        holding it stay retryable, exactly as on the CLI.
+        to every member, and the local copies update only when every
+        member received it — a partial fan-out keeps the old text, so
+        the members still holding it stay retryable, exactly as on the
+        CLI.  Unlike the CLI, a leg still queued in the outbox is
+        refused outright instead of cancelled and re-queued: edits are
+        live-only, and a concurrent mail sweep could deliver the
+        queued leg with the old text after the edit was acknowledged
+        (see Qodo on #341) — the user cancels the queued leg from the
+        outbox first, as for a queued DM edit.
 
         The console records one history entry per leg, all sharing the
         group's id and the send's shared wire time, so the clicked
