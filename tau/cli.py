@@ -375,6 +375,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     discover.set_defaults(func=cmd_discover)
 
+    heard = subparsers.add_parser(
+        "heard",
+        parents=[common],
+        help="listen for non-tau announces for a while",
+    )
+    heard.add_argument(
+        "--duration",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="how long to listen (default: %(default)s)",
+    )
+    heard.set_defaults(func=cmd_heard)
+
     send = subparsers.add_parser(
         "send",
         parents=[common],
@@ -4786,6 +4800,70 @@ def cmd_discover(args: argparse.Namespace) -> int:
         print()
         _print_peer_table(peers)
         print(f"\n{len(peers)} peer(s) in {duration:.1f}s")
+    return _EXIT_OK
+
+
+def _print_heard_table(
+    records: List[Dict[str, Any]], *, now: Optional[float] = None
+) -> None:
+    if not records:
+        print("No non-tau announces heard.")
+        return
+    timestamp = now if now is not None else time.time()
+    header = ("DESTINATION", "HOPS", "SEEN", "LAST SEEN")
+    table: List[tuple] = [header]
+    for record in records:
+        table.append(
+            (
+                str(record.get("destination") or ""),
+                str(record.get("hops", 0)),
+                str(record.get("count", 1)),
+                _ago(max(0.0, timestamp - float(record.get("last_seen", timestamp)))),
+            )
+        )
+    widths = [max(len(row[i]) for row in table) for i in range(len(header))]
+    for row in table:
+        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+
+
+def cmd_heard(args: argparse.Namespace) -> int:
+    duration = max(0.0, float(getattr(args, "duration", 15.0)))
+    if not math.isfinite(duration):
+        raise ValueError("--duration must be a finite number of seconds")
+    config = _make_config(args, announce_interval=0.0)
+
+    def on_foreign(record: Dict[str, Any]) -> None:
+        if not _json_mode(args):
+            print(
+                f"[{_stamp()}] {record.get('destination')} "
+                f"hops={record.get('hops', 0)}",
+                flush=True,
+            )
+
+    node = TauNode(config, name=config.name, on_foreign=on_foreign)
+    node.start(announce=False)
+    stop = threading.Event()
+    previous_handlers = _install_stop_handlers(stop)
+    try:
+        stop.wait(duration)
+    finally:
+        node.stop()
+        _restore_stop_handlers(previous_handlers)
+
+    heard = node.foreign_announces()
+    if _json_mode(args):
+        _emit(
+            {
+                "heard": heard,
+                "count": len(heard),
+                "duration": duration,
+            },
+            True,
+        )
+    else:
+        print()
+        _print_heard_table(heard)
+        print(f"\n{len(heard)} non-tau announce(s) in {duration:.1f}s")
     return _EXIT_OK
 
 

@@ -73,7 +73,6 @@ from .peers import DESTINATION_HASH_BYTES, Peer, PeerError, PeerRegistry
 from .protocol import (
     APP_NAME,
     ASPECT,
-    ASPECT_FILTER,
     DEFAULT_MESSAGE_KIND,
     MAX_FILE_BYTES,
     MAX_MAIL_REQUEST_BYTES,
@@ -183,6 +182,10 @@ _MAIL_WIRE_LIMIT = MAX_MAIL_REQUEST_BYTES + 2 * 1024
 _RESPONSE_WIRE_LIMIT = MAX_RESPONSE_BYTES + 2 * 1024
 _DEFAULT_LINK_TIMEOUT = 15.0
 _PEER_SAVE_INTERVAL = 5.0
+# A busy mesh can announce far more foreign destinations than this
+# node will ever talk to; the heard record is capped so it cannot
+# grow without bound (see TauNode._record_foreign_announce).
+MAX_FOREIGN_ANNOUNCES = 200
 _PATHFINDER_MAX_HOPS = 128
 _MAIL_INTERVAL = 45.0
 _MAIL_REQUEST_TIMEOUT = 6.0
@@ -382,11 +385,19 @@ def _rns_log(message: str) -> None:
 
 
 class _AnnounceHandler:
-    """Bridge between Reticulum announces and a :class:`TauNode`."""
+    """Bridge between Reticulum announces and a :class:`TauNode`.
+
+    The handler listens to *every* announce aspect: ``aspect_filter``
+    is None, which Reticulum treats as "no filter" (see
+    ``RNS.Transport`` — a set filter only delivers matching announces).
+    :meth:`TauNode._on_announce` does the filtering itself, so tau
+    peers still become peers while announces from other apps are
+    recorded separately instead of being ignored at the transport.
+    """
 
     def __init__(self, node: "TauNode") -> None:
         self.node = node
-        self.aspect_filter = ASPECT_FILTER
+        self.aspect_filter = None
 
     def received_announce(
         self,
@@ -488,6 +499,7 @@ class TauNode:
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_message_record_only: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_peer: Optional[Callable[[Peer], None]] = None,
+        on_foreign: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_delivered: Optional[Callable[[str], None]] = None,
         on_file: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_read: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -511,6 +523,11 @@ class TauNode:
         # though it is in the inbox and marked seen.
         self.on_message_record_only = on_message_record_only
         self.on_peer = on_peer
+        # Called with the record the first time a non-tau destination
+        # is heard (see _record_foreign_announce); repeats of a known
+        # destination do not call it again — unless the cap evicted
+        # the destination first, in which case it is new again.
+        self.on_foreign = on_foreign
         self.on_delivered = on_delivered
         self.on_file = on_file
         self.on_read = on_read
@@ -544,6 +561,12 @@ class TauNode:
 
         self._announce_handler: Optional[_AnnounceHandler] = None
         self._announce_thread: Optional[threading.Thread] = None
+        # Non-tau announces heard since this node started (see
+        # _record_foreign_announce): destination hex hash to its
+        # record, newest first by last sighting.  In-memory only — a
+        # restart clears it — and capped at MAX_FOREIGN_ANNOUNCES.
+        self._foreign_announces: Dict[str, Dict[str, Any]] = {}
+        self._foreign_announces_lock = threading.Lock()
         self._mail_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
         self._mail_round_threads: Set[threading.Thread] = set()
@@ -1181,7 +1204,12 @@ class TauNode:
             return
         try:
             if tau_destination_hash(identity) != announced_hash:
-                log.debug("Ignoring announce with a mismatched destination")
+                # Not a tau destination: another app on the mesh
+                # (LXMF, a sensor, anything else Reticulum carries).
+                # Record it and move on — it is never a peer, never
+                # triggers a mail round, and its app data is never
+                # parsed as a tau announce.
+                self._record_foreign_announce(announced_hash)
                 return
             info = parse_announce(app_data)
             hops = RNS.Transport.hops_to(announced_hash)
@@ -1216,6 +1244,79 @@ class TauNode:
         # to hand it anything queued for it, leave sealed copies of other
         # queued mail with it, and collect anything it holds for us.
         self._spawn_mail_round(peer)
+
+    def _record_foreign_announce(self, announced_hash: bytes) -> None:
+        """Record an announce that is not for a tau destination.
+
+        The announce handler listens to every aspect (see
+        :class:`_AnnounceHandler`), but only ``tau.node`` payloads
+        become peers.  Everything else lands here: a bounded,
+        in-memory record of the broader announce traffic — the view
+        ``rnsd`` shows — with no registry write, no mail round and no
+        peer callback.  A destination heard before only bumps its
+        count and last-seen time; a new one also calls ``on_foreign``
+        once, so a listener can print it live.  A destination the
+        cap already evicted counts as new again when it reappears:
+        its count restarts and ``on_foreign`` fires once more — the
+        record only remembers the newest 200.
+        """
+        try:
+            hops = RNS.Transport.hops_to(announced_hash)
+        except Exception:  # pragma: no cover - transport not up yet
+            hops = 0
+        if hops >= _PATHFINDER_MAX_HOPS:
+            hops = 0
+        now = time.time()
+        key = announced_hash.hex()
+        first_sighting = None
+        with self._foreign_announces_lock:
+            record = self._foreign_announces.get(key)
+            if record is None:
+                record = {
+                    "destination": key,
+                    "hops": hops,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "count": 1,
+                }
+                self._foreign_announces[key] = record
+                first_sighting = dict(record)
+            else:
+                record["hops"] = hops
+                record["last_seen"] = now
+                record["count"] += 1
+            while len(self._foreign_announces) > MAX_FOREIGN_ANNOUNCES:
+                oldest = min(
+                    self._foreign_announces,
+                    key=lambda item: self._foreign_announces[item][
+                        "last_seen"
+                    ],
+                )
+                del self._foreign_announces[oldest]
+        if first_sighting is not None:
+            log.info(
+                "Heard non-tau announce %s at %d hop(s)", key, hops
+            )
+            if self.on_foreign is not None:
+                try:
+                    self.on_foreign(first_sighting)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_foreign callback failed", exc_info=True)
+
+    def foreign_announces(self) -> List[Dict[str, Any]]:
+        """Non-tau announces heard since this node started, newest first.
+
+        Each entry carries the destination hash, hop count, first/last
+        seen times (epoch seconds) and how many times it was heard.
+        In-memory only — a restart clears it.
+        """
+        with self._foreign_announces_lock:
+            records = sorted(
+                (dict(record) for record in self._foreign_announces.values()),
+                key=lambda record: record["last_seen"],
+                reverse=True,
+            )
+        return records
 
     def _spawn_mail_round(self, peer: Peer) -> None:
         """Run a mail round for an announcing peer on its own thread.

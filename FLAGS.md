@@ -17,6 +17,7 @@ Global options may appear before or after the command:
 | `tau init` | Create the data directory, identity and Reticulum config |
 | `tau serve` | Announce this node and answer requests until interrupted |
 | `tau discover` | Listen for announces for `--duration` seconds |
+| `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER [--to PEER ...] TEXT` | Send a message over an encrypted link (queued if the peer is offline; `--to` is repeatable) |
 | `tau send --to PEER --reply-to ID TEXT` | Reply to an earlier message in the conversation, quoting it |
 | `tau react MESSAGE-ID EMOJI` | React to a received message (one emoji or short token; `--clear` retracts) |
@@ -203,7 +204,7 @@ tau send --to alice "hi" --json
 
 `serve` emits one JSON object per line with `--json` (`ready`, `peer`,
 `message` events), which makes it easy to feed into another process.
-`discover`, `peers`, `send`, `ping`, `info` and `id` emit a single JSON object.
+`discover`, `heard`, `peers`, `send`, `ping`, `info` and `id` emit a single JSON object.
 
 ## Tan flags
 

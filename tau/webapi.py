@@ -5,6 +5,7 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    GET  /api/heard        non-tau announces heard since this node started
     POST /api/peers/forget  forget a peer ``{"target": "<name or hash>"}``
                            (optional ``"force": true`` strands queued mail)
     POST /api/peers/verify mark a peer verified ``{"target": "alice"}`` —
@@ -5550,6 +5551,22 @@ class WebBridge:
             )
         return items
 
+    def heard(self) -> List[Dict[str, Any]]:
+        """Non-tau announces heard since this node started, newest first.
+
+        A node-like without the accessor (e.g. in tests) simply has
+        nothing heard, mirroring :meth:`peers` returning [] when the
+        registry cannot be read.
+        """
+        foreign_announces = getattr(self.node, "foreign_announces", None)
+        if foreign_announces is None:
+            return []
+        try:
+            return list(foreign_announces())
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read heard announces", exc_info=True)
+            return []
+
     def set_peer_alias(
         self, destination: str, alias: Optional[str]
     ) -> Dict[str, Any]:
@@ -6606,6 +6623,10 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/peers":
                 peers = self.bridge.peers()
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
+                return
+            if path == "/api/heard":
+                heard = self.bridge.heard()
+                self._send_json({"heard": heard, "count": len(heard)}, head_only)
                 return
             if path == "/api/groups":
                 groups = self.bridge.groups()

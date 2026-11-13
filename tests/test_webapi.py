@@ -669,6 +669,34 @@ def test_peers_endpoint_includes_verification_state(bridge, node):
     assert "verified" not in peer.public_dict()
 
 
+def test_heard_endpoint_lists_foreign_announces(bridge, node):
+    node.foreign_announces = lambda: [
+        {
+            "destination": "ab" * 16,
+            "hops": 2,
+            "first_seen": 1000.0,
+            "last_seen": 2000.0,
+            "count": 3,
+        }
+    ]
+
+    status, _, payload = _json(bridge, "/api/heard")
+    assert status == 200
+    assert payload["count"] == 1
+    assert payload["heard"][0]["destination"] == "ab" * 16
+    assert payload["heard"][0]["count"] == 3
+
+
+def test_heard_endpoint_empty_without_accessor(bridge, node):
+    # A node-like without foreign_announces (like this fixture's
+    # FakeNode) simply has nothing heard.
+    assert not hasattr(node, "foreign_announces")
+
+    status, _, payload = _json(bridge, "/api/heard")
+    assert status == 200
+    assert payload == {"heard": [], "count": 0}
+
+
 def _seed_alias_registry(node, tmp_path):
     """Swap the fake registry for a real one the alias endpoint can use."""
     from tau.peers import PeerRegistry
