@@ -782,16 +782,16 @@ export function useTau() {
       );
       // The forwarded copy is a new outbound entry: append it locally
       // at once, like `send`, and let the SSE event reconcile other tabs.
-      setMessages((previous) => {
-        if (previous.some((entry) => entry.id === result.message.id)) {
-          return previous;
-        }
-        return [...previous, result.message].sort((a, b) => a.id - b.id);
-      });
-      snapshotMax.current = Math.max(
-        snapshotMax.current,
-        result.message.id,
-      );
+      const sent = result.message;
+      if (sent !== null) {
+        setMessages((previous) => {
+          if (previous.some((entry) => entry.id === sent.id)) {
+            return previous;
+          }
+          return [...previous, sent].sort((a, b) => a.id - b.id);
+        });
+        snapshotMax.current = Math.max(snapshotMax.current, sent.id);
+      }
       // A queued forward lands in the outbox; refresh so it shows at
       // once instead of waiting for the next poll. Best-effort: a
       // failed refresh must not report a successful send as failed.
@@ -800,7 +800,9 @@ export function useTau() {
       } catch {
         // The next poll picks the entry up.
       }
-      return result.message;
+      // Null when the forwarded copy went out but was retracted before
+      // the console record landed.
+      return sent;
     },
     [refreshOutbox],
   );
@@ -889,23 +891,31 @@ export function useTau() {
       if (replyTo) body.reply_to = replyTo;
       if (sendIn !== undefined) body.send_in = sendIn;
       const result = await apiPost<SendResponse>("/api/messages", body);
-      setMessages((previous) => {
-      if (previous.some((entry) => entry.id === result.message.id)) {
-        return previous;
+      const sent = result.message;
+      if (sent !== null) {
+        setMessages((previous) => {
+          if (previous.some((entry) => entry.id === sent.id)) {
+            return previous;
+          }
+          return [...previous, sent].sort((a, b) => a.id - b.id);
+        });
+        snapshotMax.current = Math.max(snapshotMax.current, sent.id);
       }
-      return [...previous, result.message].sort((a, b) => a.id - b.id);
-    });
-    snapshotMax.current = Math.max(snapshotMax.current, result.message.id);
-    // A queued send lands in the outbox; refresh so it shows at once
-    // instead of waiting for the next poll. Best-effort: a failed
-    // refresh must not report a successful send as failed.
-    try {
-      await refreshOutbox();
-    } catch {
-      // The next poll picks the entry up.
-    }
-    return result.message;
-  }, [refreshOutbox]);
+      // A queued send lands in the outbox; refresh so it shows at once
+      // instead of waiting for the next poll. Best-effort: a failed
+      // refresh must not report a successful send as failed.
+      try {
+        await refreshOutbox();
+      } catch {
+        // The next poll picks the entry up.
+      }
+      // Null when the send went out but was retracted before the
+      // console record landed: the send succeeded, there is just no
+      // record to show.
+      return sent;
+    },
+    [refreshOutbox],
+  );
 
   const sendGroup = useCallback(
     async (group: string, text: string) => {
@@ -978,14 +988,20 @@ export function useTau() {
       name: file.name,
       data,
     });
-    setMessages((previous) => {
-      if (previous.some((entry) => entry.id === result.message.id)) {
-        return previous;
-      }
-      return [...previous, result.message].sort((a, b) => a.id - b.id);
-    });
-    snapshotMax.current = Math.max(snapshotMax.current, result.message.id);
-    return result.message;
+    const sent = result.message;
+    if (sent !== null) {
+      setMessages((previous) => {
+        if (previous.some((entry) => entry.id === sent.id)) {
+          return previous;
+        }
+        return [...previous, sent].sort((a, b) => a.id - b.id);
+      });
+      snapshotMax.current = Math.max(snapshotMax.current, sent.id);
+    }
+    // Null when the file send went out but was retracted before the
+    // console record landed: the transfer succeeded, there is just no
+    // record to show.
+    return sent;
   }, []);
 
   const ping = useCallback(async (destination: string) => {

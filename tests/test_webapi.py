@@ -927,6 +927,96 @@ def test_send_message_is_recorded_and_published(bridge, node):
     assert any(e["type"] == "message" for e in events)
 
 
+def test_retracted_dm_send_returns_null_message_over_api(bridge, node):
+    # Finding 2 on #330: a retract landing between the node's inbox
+    # store and the bridge append drops nothing yet, so the send's
+    # later append must not resurrect the message. The wire send
+    # already succeeded, so the API still reports that — with no
+    # record to show.
+    wire_id = "0" * 31 + "1"  # first send id from the fake node
+    assert bridge.delete_sent_by_wire_id(wire_id) is None
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"] is None
+    assert payload["response"]["ok"] is True
+    assert node.sent == [("alice", "hi", None)]
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    events = bridge.bus.replay(0)
+    assert not any(e["type"] == "message" for e in events)
+
+
+def test_retracted_group_send_legs_do_not_resurrect(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    # The fake group send shares sent_at 1000.0 across legs.
+    assert bridge.delete_sent_group(group_id, 1000.0) is None
+    messages, response = bridge.send_group_message("crew", "hi all")
+    assert messages == []
+    assert response["ok"] is True
+    assert node.group_sent == [("crew", "hi all")]
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    events = bridge.bus.replay(0)
+    assert not any(e["type"] == "message" for e in events)
+
+
+def test_retracted_sent_id_does_not_hide_later_inbound(bridge):
+    # The outbound retraction set is separate from the inbound
+    # removal set: a peer reusing a retracted sent id must not hide a
+    # later inbound message (the finding-1 lesson on #330).
+    wire_id = "reused-wire-id"
+    assert bridge.delete_sent_by_wire_id(wire_id) is None
+    message = bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello back",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": wire_id,
+        }
+    )
+    assert message is not None
+    assert message["direction"] == "in"
+    assert message["wire_id"] == wire_id
+
+
+def test_deleted_sent_dm_stays_deleted_on_reappend(bridge, node):
+    # Remembering also covers the entry-found case: a duplicate append
+    # for the same wire id after the delete must not resurrect it.
+    message, _ = bridge.send_message("alice", "hi")
+    wire_id = message["wire_id"]
+    assert bridge.delete_sent_by_wire_id(wire_id) is not None
+    again = bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="hi",
+        sent_at=time.time(),
+        received_at=time.time(),
+        status="delivered",
+        wire_id=wire_id,
+    )
+    assert again is None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
+def test_retracted_file_send_does_not_resurrect(bridge, node):
+    wire_id = "0" * 31 + "1"  # first file send id from the fake node
+    assert bridge.delete_sent_by_wire_id(wire_id) is None
+    message, response = bridge.send_file("alice", "notes.txt", b"hello")
+    assert message is None
+    assert response["ok"] is True
+    assert node.sent_files == [("alice", "notes.txt", b"hello")]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
 def test_send_group_message_records_one_entry_per_leg(bridge, node):
     group_id = node.groups.list_groups()[0]["id"]
     status, _, payload = _json(

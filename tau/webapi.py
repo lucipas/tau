@@ -203,6 +203,14 @@ MAX_EXCERPT_HASHES = 8
 # delete), remembered so a delivery callback already in flight when
 # the removal landed cannot append the message back afterwards.
 MAX_REMOVED_WIRE_IDS = 512
+# Retracted outbound sends, remembered so a send whose append is
+# still in flight when the retraction lands cannot resurrect the
+# message afterwards.  Separate from the inbound removal set above:
+# that set suppresses inbound appends, and a peer reusing a retracted
+# sent id must not hide a later inbound message.  DM and file sends
+# key by wire id; group legs key by (group id, shared send time),
+# since legs carry different wire ids.
+MAX_RETRACTED_OUTBOUND = 512
 MAX_EVENT_LOG = 500
 
 # Most likers one /api/tan/likes response carries. The full count is
@@ -824,6 +832,16 @@ class WebBridge:
         # afterwards; record_inbound drops those ids.  An OrderedDict
         # used as a bounded set, like _early_deliveries.
         self._removed_wire_ids: OrderedDict[str, None] = OrderedDict()
+        # Retracted outbound sends (see MAX_RETRACTED_OUTBOUND): a
+        # CLI retract that lands between the node's inbox store and
+        # the bridge's append drops nothing yet, so the id (DM/file)
+        # or the (group, send time) key is remembered here and the
+        # later append skips it instead of resurrecting the message.
+        # OrderedDicts used as bounded sets, like _removed_wire_ids.
+        self._retracted_outbound_ids: OrderedDict[str, None] = OrderedDict()
+        self._retracted_outbound_groups: OrderedDict[
+            Tuple[str, float], None
+        ] = OrderedDict()
         # Verified read receipts whose console record was not appended yet,
         # keyed by (reader, wire id); send_message reconciles them on append.
         self._early_reads: OrderedDict[Tuple[str, str], float] = OrderedDict()
@@ -1179,6 +1197,35 @@ class WebBridge:
         self._removed_wire_ids[wire_id] = None
         while len(self._removed_wire_ids) > MAX_REMOVED_WIRE_IDS:
             self._removed_wire_ids.popitem(last=False)
+
+    def _remember_retracted_outbound_id(self, wire_id: str) -> None:
+        """Remember a retracted outbound DM/file id (caller holds the lock).
+
+        A send whose console append is still in flight when the
+        retraction lands must not append the message afterwards; see
+        :meth:`_append_message`.  Bounded: the oldest ids evict
+        first.  Kept apart from the inbound removal set on purpose:
+        this set only ever suppresses outbound appends, so a peer
+        reusing a retracted sent id cannot hide a later inbound
+        message.
+        """
+        self._retracted_outbound_ids[wire_id] = None
+        while len(self._retracted_outbound_ids) > MAX_RETRACTED_OUTBOUND:
+            self._retracted_outbound_ids.popitem(last=False)
+
+    def _remember_retracted_outbound_group(
+        self, group: str, sent_at: float
+    ) -> None:
+        """Remember a retracted outbound group send (caller holds the lock).
+
+        Keyed by the group id and the send's shared wire time, the
+        same key :meth:`delete_sent_group` matches legs by — legs
+        carry different wire ids, so no single id names the send.
+        Bounded: the oldest keys evict first.
+        """
+        self._retracted_outbound_groups[(group, float(sent_at))] = None
+        while len(self._retracted_outbound_groups) > MAX_RETRACTED_OUTBOUND:
+            self._retracted_outbound_groups.popitem(last=False)
 
     def record_inbound(
         self, record: Dict[str, Any], *, publish: bool = True
@@ -2981,6 +3028,10 @@ class WebBridge:
                 file=file_meta,
                 save=False,
             )
+            if message is None:
+                # A retracted outbound send the import would otherwise
+                # resurrect: the record stays out of the restored feed.
+                continue
             appended.append(message)
         self._save_messages()
         # Live consoles show arrivals from their message events; publish
@@ -3133,7 +3184,15 @@ class WebBridge:
         expires_at: Optional[float] = None,
         send_after: Optional[float] = None,
         reply_to: Optional[str] = None,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Send a DM from the console.
+
+        Returns the console record and the node's send response.  The
+        record is ``None`` when the send was retracted while its
+        console append was still in flight: the wire send already
+        succeeded, so the response still reports that, but there is no
+        record to show — the message no longer exists anywhere.
+        """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
         if not isinstance(text, str) or not text.strip():
@@ -3219,6 +3278,21 @@ class WebBridge:
                 delivered_via="direct" if not queued else None,
                 in_reply_to=in_reply_to,
             )
+            if message is None:
+                # The send was retracted while its console record was
+                # still in flight: the wire send already succeeded, so
+                # report that and no record — there is nothing to
+                # reconcile, publish, or show.  Drop any delivery
+                # report or read receipt that beat the record, as
+                # nothing will consume them (same eviction the group
+                # legs do on a skipped append).
+                with self._lock:
+                    if mail_id is not None:
+                        self._early_deliveries.pop(mail_id, None)
+                    read_key = wire_id or mail_id
+                    if read_key is not None:
+                        self._early_reads.pop((peer.hexhash, read_key), None)
+                return None, response
             # The route read takes the mailbox lock, so fetch it
             # before the bridge lock (same deadlock as record_delivery).
             route = (
@@ -3276,7 +3350,10 @@ class WebBridge:
         machinery as a peer DM.  A leg the member explicitly refused,
         or that could not be queued, is recorded as ``failed`` rather
         than silently dropped, so the sender sees which members did
-        not get the message.
+        not get the message.  A leg retracted while its console
+        record was still in flight is omitted instead: the leg went
+        out (or queued) on the wire, so the response still reports
+        it, but there is no record to show.
         """
         if not isinstance(group, str) or not group.strip():
             raise ValueError("target group is required")
@@ -3350,6 +3427,20 @@ class WebBridge:
                     expires_at=expires_at,
                     wire_id=wire_id,
                 )
+                if message is None:
+                    # This leg was retracted while its console record
+                    # was still in flight: the leg went out (or
+                    # queued) on the wire, so the response still
+                    # reports it, but there is no record to show.
+                    # Drop any delivery report or read receipt that
+                    # beat the record, as nothing will consume them.
+                    with self._lock:
+                        if mail_id is not None:
+                            self._early_deliveries.pop(mail_id, None)
+                        read_key = wire_id or mail_id
+                        if read_key is not None:
+                            self._early_reads.pop((member, read_key), None)
+                    continue
                 with self._lock:
                     if mail_id is not None and mail_id in self._early_deliveries:
                         del self._early_deliveries[mail_id]
@@ -3381,7 +3472,7 @@ class WebBridge:
         data: bytes,
         *,
         timeout: float = 300.0,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Send a file to a peer from the console.
 
         The bytes are staged in a temporary directory under the
@@ -3391,7 +3482,10 @@ class WebBridge:
         entry (name, size, SHA-256) with status ``delivered``; a failed
         transfer raises instead of recording anything, like a failed
         text send.  Files are direct links only in v1, so a refused or
-        unreachable peer fails fast instead of queueing.
+        unreachable peer fails fast instead of queueing.  The record is
+        ``None`` when the file send was retracted while its console
+        append was still in flight: the transfer already succeeded, so
+        the response still reports that, but there is no record to show.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
@@ -3432,6 +3526,12 @@ class WebBridge:
                 wire_id=wire_id,
                 file={"name": clean_name, "size": len(data), "sha256": digest},
             )
+        if message is None:
+            # The file send was retracted while its console record was
+            # still in flight: the transfer already succeeded, so
+            # report that and no record — there is nothing to publish
+            # or show.
+            return None, response
         self.bus.publish({"type": "message", "message": message})
         return message, response
 
@@ -4426,10 +4526,19 @@ class WebBridge:
         deliberately not remembered in the inbound removal set: that
         set suppresses inbound appends, and a peer reusing a retracted
         sent id must not be able to hide a later inbound message.
+        It is remembered in the outbound retraction set instead, so a
+        send whose append is still in flight when the retraction
+        lands cannot resurrect the message afterwards.
         """
         if not isinstance(wire_id, str) or not wire_id:
             return None
         with self._lock:
+            # Remember the id either way: a send still in flight when
+            # the retraction lands has no entry to drop yet, and its
+            # later append would resurrect the message.  Recorded
+            # under the same lock as the append check, so the two
+            # cannot interleave.
+            self._remember_retracted_outbound_id(wire_id)
             removed = next(
                 (
                     message
@@ -4465,6 +4574,9 @@ class WebBridge:
         it, so the bubbles stay retryable.  Returns the delete result
         with every removed console id, or ``None`` when no outbound
         entry matches (the console window may not cover the send).
+        The send key is remembered in the outbound retraction set
+        either way, so legs still in flight when the retraction lands
+        cannot resurrect the message afterwards.
         """
         if not isinstance(group_id, str) or not group_id:
             return None
@@ -4475,6 +4587,12 @@ class WebBridge:
         ):
             return None
         with self._lock:
+            # Remember the send key either way: legs still in flight
+            # when the retraction lands have no entry to drop yet, and
+            # their later appends would resurrect the message.
+            # Recorded under the same lock as the append check, so the
+            # two cannot interleave.
+            self._remember_retracted_outbound_group(group_id, float(sent_at))
             legs = [
                 message
                 for message in self._messages
@@ -5891,6 +6009,23 @@ class WebBridge:
                 # under the same lock as the removal, so the two cannot
                 # interleave.
                 return None
+            if direction == "out":
+                if isinstance(group, str) and group:
+                    # A group leg: keyed by the shared send time,
+                    # like delete_sent_group — legs carry different
+                    # wire ids, so no single id names the send.
+                    if (group, float(sent_at)) in self._retracted_outbound_groups:
+                        return None
+                elif (
+                    wire_id is not None
+                    and wire_id in self._retracted_outbound_ids
+                ):
+                    # The send was retracted while its append was
+                    # still in flight; appending now would resurrect
+                    # it after a successful retraction.  The check
+                    # runs under the same lock as the removal, so the
+                    # two cannot interleave.
+                    return None
             message = {
                 "id": self._next_message_id,
                 "direction": direction,
