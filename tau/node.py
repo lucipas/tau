@@ -6788,7 +6788,35 @@ class TauNode:
                             scheduled_members[entry.to_hex] = entry.to_name
                     except MailboxError as queue_exc:
                         if entry.is_scheduled():
-                            requeue_failed_scheduled.add(entry.to_hex)
+                            # Put the original scheduled leg back so it
+                            # stays discoverable: a retry of this edit
+                            # then finds it again instead of finding
+                            # nothing and sending the member a live
+                            # edit before the scheduled time.
+                            try:
+                                self.mailbox.enqueue(
+                                    to=entry.to,
+                                    text=entry.text,
+                                    to_name=entry.to_name,
+                                    kind=entry.kind,
+                                    message_id=entry.id,
+                                    expires_at=entry.message_expires_at,
+                                    group={
+                                        "id": entry.group_id,
+                                        "name": entry.group_name,
+                                        "creator": entry.group_creator,
+                                        "members": list(entry.group_members),
+                                    },
+                                    sent_at=entry.wire_sent_at,
+                                    send_after=entry.send_after,
+                                    in_reply_to=entry.in_reply_to,
+                                    edited_at=entry.edited_at,
+                                )
+                            except MailboxError:
+                                # Restore failed too: the leg is gone, so
+                                # keep this call from live-editing the
+                                # member (the failure is reported below).
+                                requeue_failed_scheduled.add(entry.to_hex)
                         requeue_failed.append(
                             {
                                 "to": entry.to_hex,
