@@ -5877,7 +5877,8 @@ def _drop_console_copy_via_running_node(
     durable retraction marker is recorded.  Best-effort: the retract
     already succeeded on the wire, so a failure — including a serving
     node too slow to answer within the bound — only logs and never
-    fails the retract.  The marker heals a missed drop at the next
+    fails the retract.  The durable sent-retraction marker (see
+    Mailbox.record_sent_retraction) heals a missed drop at the next
     serve start.
     """
     from .local_send import send_running
@@ -5886,14 +5887,14 @@ def _drop_console_copy_via_running_node(
         if group is None:
             send_running(
                 config.data_dir,
-                reply_timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
+                timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
                 op="drop_console_copy",
                 message_id=message_id,
             )
         else:
             send_running(
                 config.data_dir,
-                reply_timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
+                timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
                 op="drop_console_group",
                 group=group,
                 target_sent_at=target_sent_at,
@@ -8520,6 +8521,13 @@ def _retract_group_message(
             "group retract delivered but the local copy could not be deleted:"
             f" {exc}"
         ) from exc
+    if via_running_node:
+        # The inbox copy is gone, so the serving console may drop its legs.
+        _drop_console_copy_via_running_node(
+            config,
+            group=group_id,
+            target_sent_at=float(leg_sent_at),
+        )
     # The sent record lives in mailbox.json, not the inbox: drop it
     # too, or `tau messages --sent` keeps showing the retracted text.
     # Each leg has its own sent record, so drop every leg id.
@@ -8631,6 +8639,11 @@ def cmd_retract(args: argparse.Namespace) -> int:
             "retract delivered but the local copy could not be deleted:"
             f" {exc}"
         ) from exc
+    if via_running_node:
+        # The inbox copy is gone, so the serving console may drop its own.
+        _drop_console_copy_via_running_node(
+            config, message_id=str(target["id"])
+        )
     # The sent record lives in mailbox.json, not the inbox: drop it
     # too, or `tau messages --sent` keeps showing the retracted text.
     # Only after the retract and the inbox delete succeeded, so a

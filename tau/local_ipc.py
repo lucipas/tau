@@ -113,11 +113,10 @@ class LocalServer:
         self.path.unlink(missing_ok=True)
 
 
-def call_local(path: Path, *, reply_timeout: Optional[float] = None, **request: Any) -> Dict[str, Any]:
+def call_local(path: Path, *, timeout: Optional[float] = None, **request: Any) -> Dict[str, Any]:
     """Send once: a lost reply may mean the request was already handled.
 
-    ``reply_timeout`` bounds the wait for the reply in seconds, on the
-    client side only; it is never sent over the socket.  Without it
+    ``timeout`` bounds the wait for the reply in seconds.  Without it
     the read waits indefinitely — the right default for sends and
     retracts, whose handling can wait on network peers — but a
     best-effort notification (the console-copy drop) must never hang
@@ -129,9 +128,9 @@ def call_local(path: Path, *, reply_timeout: Optional[float] = None, **request: 
             client.connect(str(path))
             client.sendall(json.dumps(request).encode() + b"\n")
             # Handling can wait on network peers. Do not retry on timeout.
-            # A caller that passes `reply_timeout` keeps that bound instead:
+            # A caller that passes `timeout` keeps that bound instead:
             # the reply read then fails with LocalIPCUnavailable.
-            client.settimeout(reply_timeout)
+            client.settimeout(timeout)
             with client.makefile("rb") as stream:
                 response = _read(stream, _MAX_RESPONSE_BYTES)
     except (OSError, ValueError) as exc:
