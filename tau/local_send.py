@@ -17,14 +17,15 @@ class SendServer(LocalServer):
         super().__init__(data_dir, _SEND_SOCKET_NAME, send, thread_name="tau-send")
 
 
-def send_running(data_dir: Path, *, timeout: Optional[float] = None, **request: Any) -> Dict[str, Any]:
+def send_running(data_dir: Path, *, reply_timeout: Optional[float] = None, **request: Any) -> Dict[str, Any]:
     """Send once through the serving node: a lost reply may mean the message was sent.
 
-    ``timeout`` bounds the wait for the reply (see :func:`call_local`);
+    ``reply_timeout`` bounds the client's wait for the reply (see :func:`call_local`);
     without it the read waits indefinitely, as sends and retracts need.
-    It is never part of the request sent over the socket.
+    It is never part of the request sent over the socket; any ``timeout``
+    in *request* is the operation timeout and is forwarded to the server.
     """
-    return call_local(data_dir / _SEND_SOCKET_NAME, timeout=timeout, **request)
+    return call_local(data_dir / _SEND_SOCKET_NAME, reply_timeout=reply_timeout, **request)
 
 
 def send_server_available(data_dir: Path) -> bool:
