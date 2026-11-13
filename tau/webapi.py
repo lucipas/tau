@@ -3813,13 +3813,16 @@ class WebBridge:
         group's id and the send's shared wire time, so the clicked
         entry names the logical message: the fan-out carries that
         shared send time every member needs to resolve their own copy,
-        and on success every leg entry leaves the feed.  An entry
-        recorded before the shared time was stamped still carries a
-        post-delivery timestamp, which simply fails to resolve on the
-        members — the pre-fix behaviour — instead of naming a wrong
-        message.  A failed leg carries no wire id, so the retract
-        names the first leg that has one; a message no leg delivered
-        has nothing to retract.
+        and on success every leg entry leaves the feed.  The shared
+        time is recovered from the stored inbox record before the
+        fan-out: an entry restored from before the shared time was
+        stamped carries its write time instead, which members cannot
+        match — they answer ``delivered`` with ``deleted`` False —
+        so such a message is refused rather than fanned out, or the
+        local copies would go while the members keep the message.
+        A failed leg carries no wire id, so the retract names the
+        first leg that has one; a message no leg delivered has
+        nothing to retract.
         """
         group_id = removed.get("group")
         if not isinstance(group_id, str) or not group_id:
@@ -3873,6 +3876,45 @@ class WebBridge:
         group = self.node.groups.get(group_id)
         if group is None:
             raise ValueError(f"unknown group: {group_id!r}")
+        # Resolve the authoritative shared send time from the stored
+        # inbox record before fanning out: the console entry's
+        # ``sent_at`` is only the shared time when the send stamped
+        # it — a live send, or a restore that found ``leg_sent_at``.
+        # A restored entry from before group retracts landed carries
+        # its write time instead, which members cannot match: they
+        # answer ``delivered`` with ``deleted`` False, and the fan-out
+        # below treats delivery as success, so fanning that out would
+        # delete the local copies while the members keep the message.
+        # Refuse when no stored record names the shared time, exactly
+        # as the CLI refuses (see ``tau.cli._retract_group_message``).
+        # Only this node's own sent record for this group names the
+        # send: resolve() matches the wire id alone, so a record of
+        # another kind must not supply the time.
+        inbox = getattr(self.node, "inbox", None)
+        stored = None
+        if inbox is not None:
+            try:
+                stored = inbox.resolve(target_wire_id)
+            except ValueError:
+                stored = None
+        leg_sent_at = None
+        if (
+            stored is not None
+            and stored.get("direction") == "out"
+            and stored.get("group") == group_id
+        ):
+            leg_sent_at = stored.get("leg_sent_at")
+        if (
+            not isinstance(leg_sent_at, (int, float))
+            or isinstance(leg_sent_at, bool)
+            or not math.isfinite(leg_sent_at)
+        ):
+            raise ValueError(
+                "that group message was sent before group retracts "
+                "landed; it carries no leg send time, so it cannot "
+                "be retracted"
+            )
+        sent_at = float(leg_sent_at)
         response = self.node.send_group_retraction(
             group,
             target_wire_id,
@@ -3905,22 +3947,32 @@ class WebBridge:
             except ValueError:
                 record = None
             if record is not None:
-                # Every leg of the send has its own sent record; the
-                # inbox record names them all, including legs the
-                # feed does not mirror.
-                for leg_id in record.get("leg_ids") or []:
-                    if isinstance(leg_id, str) and leg_id not in wire_ids:
-                        wire_ids.append(leg_id)
-                try:
-                    inbox.delete(str(record["id"]))
-                except InboxError as exc:
-                    # A record that is already gone is fine; any other
-                    # inbox failure leaves the bubbles in place, so
-                    # the retract can be retried.
-                    if str(exc).startswith("could not persist"):
-                        raise OSError(str(exc)) from exc
-                    if not str(exc).startswith("unknown message"):
-                        raise ValueError(str(exc)) from exc
+                # Only this node's own sent record for this group
+                # names the send: resolve() matches the wire id
+                # alone, so after the sent copy is pruned it can
+                # return an inbound record instead — deleting that
+                # would drop a received message.  The legs still go
+                # through discard_sent below either way.
+                if (
+                    record.get("direction") == "out"
+                    and record.get("group") == group_id
+                ):
+                    # Every leg of the send has its own sent record; the
+                    # inbox record names them all, including legs the
+                    # feed does not mirror.
+                    for leg_id in record.get("leg_ids") or []:
+                        if isinstance(leg_id, str) and leg_id not in wire_ids:
+                            wire_ids.append(leg_id)
+                    try:
+                        inbox.delete(str(record["id"]))
+                    except InboxError as exc:
+                        # A record that is already gone is fine; any other
+                        # inbox failure leaves the bubbles in place, so
+                        # the retract can be retried.
+                        if str(exc).startswith("could not persist"):
+                            raise OSError(str(exc)) from exc
+                        if not str(exc).startswith("unknown message"):
+                            raise ValueError(str(exc)) from exc
         # Each leg has its own sent record, so drop every leg id.
         for wire_id in wire_ids:
             self.node.mailbox.discard_sent(wire_id)

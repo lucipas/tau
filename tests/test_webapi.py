@@ -8503,25 +8503,33 @@ def _sent_group_console_entries(
     sent_at=1000.0,
     second_status="delivered",
     second_wire_id="wire-bob",
+    leg_sent_at=None,
+    omit_leg_sent_at=False,
 ):
     # One inbox record for the whole send, like TauNode._record_sent:
-    # its id is the first leg id, the rest in leg_ids.
-    node.inbox.append(
-        {
-            "id": "wire-alice",
-            "leg_ids": ["wire-alice", second_wire_id],
-            "leg_sent_at": sent_at,
-            "destination": "",
-            "direction": "out",
-            "from": "tester",
-            "text": "hello",
-            "kind": "group",
-            "group": group_id,
-            "group_name": "crew",
-            "sent_at": sent_at,
-            "received_at": sent_at + 1.0,
-        }
-    )
+    # its id is the first leg id, the rest in leg_ids.  ``leg_sent_at``
+    # defaults to the entries' time; pass it explicitly to model an
+    # entry whose time drifted from the stored one, or omit it to
+    # model a send from before group retracts landed.
+    if leg_sent_at is None:
+        leg_sent_at = sent_at
+    record = {
+        "id": "wire-alice",
+        "leg_ids": ["wire-alice", second_wire_id],
+        "leg_sent_at": leg_sent_at,
+        "destination": "",
+        "direction": "out",
+        "from": "tester",
+        "text": "hello",
+        "kind": "group",
+        "group": group_id,
+        "group_name": "crew",
+        "sent_at": sent_at,
+        "received_at": sent_at + 1.0,
+    }
+    if omit_leg_sent_at:
+        del record["leg_sent_at"]
+    node.inbox.append(record)
     node.mailbox.record_sent(
         "wire-alice", to=bytes.fromhex(PEER_HASH), text="hello", sent_at=sent_at
     )
@@ -8677,6 +8685,117 @@ def test_retract_message_endpoint_rejects_group_message_with_no_wire_id(
     )
     assert status == 400
     assert "never delivered" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_refuses_group_message_with_no_leg_send_time(
+    bridge, node
+):
+    # A console entry restored from before group retracts landed
+    # carries its write time, which members cannot match: they would
+    # answer delivered with deleted False, and the fan-out would
+    # still drop the local copies.  Refuse instead, and keep the
+    # bubbles, the inbox record and the sent records.
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(
+        bridge, node, crew["id"], omit_leg_sent_at=True
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/retract",
+        method="POST",
+        body={"id": entries[0]["id"]},
+    )
+    assert status == 400
+    assert "no leg send time" in payload["error"]["message"]
+    assert node.group_retractions == []
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [
+        entry["id"] for entry in entries
+    ]
+    assert len(node.inbox.export_document()["messages"]) == 1
+    assert node.mailbox.sent_record("wire-alice") is not None
+    assert node.mailbox.sent_record("wire-bob") is not None
+
+
+def test_retract_message_endpoint_uses_stored_leg_send_time(
+    bridge, node
+):
+    # The entry's time drifted from the stored shared time: the
+    # fan-out must carry the stored time the members can match,
+    # while the cleanup still removes the feed's legs.
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(
+        bridge, node, crew["id"], sent_at=1001.0, leg_sent_at=1000.0
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/retract",
+        method="POST",
+        body={"id": entries[0]["id"]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert node.group_retractions == [("crew", "wire-alice", 1000.0)]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+
+
+def test_retract_message_endpoint_refuses_group_message_when_only_inbound_record_matches(
+    bridge, node
+):
+    # The sent copy is pruned, so resolve() answers the leg id with
+    # an inbound record instead: its time is not this node's shared
+    # send time, so the retract is refused — and the received record
+    # is never deleted.
+    crew = node.groups.list_groups()[0]
+    node.inbox.append(
+        {
+            "id": "wire-alice",
+            "destination": PEER_HASH,
+            "direction": "in",
+            "from": "alice",
+            "text": "hello",
+            "kind": "group",
+            "group": crew["id"],
+            "group_name": "crew",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+        }
+    )
+    entries = []
+    for member, name, wire_id in (
+        (PEER_HASH, "alice", "wire-alice"),
+        (BOB_HASH, "bob", "wire-bob"),
+    ):
+        entries.append(
+            bridge._append_message(
+                direction="out",
+                peer=member,
+                peer_name=name,
+                text="hello",
+                sent_at=1000.0,
+                received_at=1001.0,
+                status="delivered",
+                wire_id=wire_id,
+                group=crew["id"],
+                group_name="crew",
+            )
+        )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/retract",
+        method="POST",
+        body={"id": entries[0]["id"]},
+    )
+    assert status == 400
+    assert "no leg send time" in payload["error"]["message"]
+    assert node.group_retractions == []
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [
+        entry["id"] for entry in entries
+    ]
+    assert len(node.inbox.export_document()["messages"]) == 1
 
 
 def test_retract_message_endpoint_rejects_inbound_and_queued(bridge, node):
