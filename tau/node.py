@@ -5979,6 +5979,11 @@ class TauNode:
             record = self.groups.get(group)
             if record is None:
                 record = self.groups.get_retired(group)
+            if record is None and len(group.strip()) == 32:
+                # An unresolved exact id (e.g. retired before retained
+                # records existed) must not fall back to a live group
+                # that merely shares its name.
+                raise NodeError(f"unknown group: {group!r}")
             group = record if record is not None else self.groups.find(group)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
