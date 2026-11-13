@@ -15,7 +15,7 @@ import type {
   TanSuggestion,
   TanVerifyReport,
 } from "@/lib/types";
-import { useTan } from "@/lib/use-tan";
+import { TAN_POLL_INTERVAL_MS, useTan } from "@/lib/use-tan";
 
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
 import { RulesSection } from "./rules-section";
@@ -67,6 +67,18 @@ export function SocialConsole() {
           : "could not load scheduled posts",
       );
     });
+  }, [showScheduled, tan.loadScheduled]);
+  // While the Scheduled view is open, re-read the queue on the feed's
+  // cadence: the serving node publishes due entries on its own, so a
+  // card would otherwise linger with a past publish time after its post
+  // went out — and cancelling it would 400. A failed refresh keeps the
+  // last good list; the next tick retries.
+  useEffect(() => {
+    if (!showScheduled) return;
+    const timer = setInterval(() => {
+      tan.loadScheduled().catch(() => {});
+    }, TAN_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
   }, [showScheduled, tan.loadScheduled]);
   // Seconds until a composed post publishes, or null to post now. A
   // delay applies to one post only: the next post goes now unless the
@@ -139,6 +151,9 @@ export function SocialConsole() {
         );
         // Show the queue the post just joined, so the scheduled post is
         // visible and cancellable instead of disappearing into the file.
+        // A reply scheduled from an open thread must leave the thread:
+        // the thread view renders first and would hide the queue.
+        tan.closeThread();
         setShowSaved(false);
         setShowPinned(false);
         setShowScheduled(true);

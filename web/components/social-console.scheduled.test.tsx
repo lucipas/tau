@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
@@ -13,6 +13,7 @@ const mockTan = vi.hoisted(() => ({
 
 vi.mock("@/lib/use-tan", () => ({
   useTan: vi.fn(() => mockTan.current),
+  TAN_POLL_INTERVAL_MS: 5000,
 }));
 
 import { useTan } from "@/lib/use-tan";
@@ -223,5 +224,85 @@ describe("SocialConsole scheduled posts", () => {
 
     expect(screen.queryByLabelText("Post later")).toBeNull();
     expect(screen.getByText(/Quoting alice/)).toBeTruthy();
+  });
+
+  it("leaves an open thread when scheduling, so the queue is visible", async () => {
+    const post = makePost({ text: "thread root" });
+    const schedulePost = vi.fn().mockResolvedValue(undefined);
+    const loadScheduled = vi.fn().mockResolvedValue(undefined);
+    const closeThread = vi.fn();
+    const tanWithThread = makeTan({
+      threadRef: post.hash,
+      threadPosts: [post],
+      closeThread,
+      schedulePost,
+      loadScheduled,
+      scheduled: [],
+    });
+    mockedUseTan.mockReturnValue(tanWithThread);
+    const { rerender } = render(<SocialConsole />);
+
+    // Reply to the thread post, then schedule the reply.
+    fireEvent.click(screen.getByTitle("Reply to this post"));
+    fireEvent.change(screen.getByPlaceholderText("Reply to alice…"), {
+      target: { value: "agreed, later" },
+    });
+    fireEvent.change(screen.getByLabelText("Post later"), {
+      target: { value: "3600" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "schedule" }));
+
+    await waitFor(() =>
+      expect(schedulePost).toHaveBeenCalledWith(
+        "agreed, later",
+        3600,
+        post.hash,
+      ),
+    );
+    // The thread view renders first and would hide the queue, so
+    // scheduling closes it.
+    expect(closeThread).toHaveBeenCalledTimes(1);
+    // The mock hook holds the thread open until the test closes it, the
+    // way the real hook's closeThread does; then the queue shows.
+    mockedUseTan.mockReturnValue({
+      ...tanWithThread,
+      threadRef: null,
+      threadPosts: null,
+    });
+    rerender(<SocialConsole />);
+    await waitFor(() =>
+      expect(screen.getByText("No scheduled posts yet")).toBeTruthy(),
+    );
+  });
+
+  it("re-reads the queue while the scheduled view stays open", async () => {
+    vi.useFakeTimers();
+    try {
+      const entry = makeScheduled();
+      const loadScheduled = vi.fn().mockResolvedValue(undefined);
+      mockedUseTan.mockReturnValue(
+        makeTan({ scheduled: [entry], loadScheduled }),
+      );
+      render(<SocialConsole />);
+
+      fireEvent.click(screen.getByRole("button", { name: "scheduled" }));
+      const callsAfterOpen = loadScheduled.mock.calls.length;
+      expect(callsAfterOpen).toBeGreaterThan(0);
+
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
+      });
+      expect(loadScheduled.mock.calls.length).toBeGreaterThan(callsAfterOpen);
+
+      // Leaving the view stops the refresh.
+      fireEvent.click(screen.getByRole("button", { name: "following" }));
+      const callsAfterClose = loadScheduled.mock.calls.length;
+      await act(async () => {
+        vi.advanceTimersByTime(10000);
+      });
+      expect(loadScheduled.mock.calls.length).toBe(callsAfterClose);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

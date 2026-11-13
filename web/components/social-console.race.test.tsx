@@ -86,6 +86,7 @@ const { fakeTan, postA, postB } = vi.hoisted(() => {
 
 vi.mock("@/lib/use-tan", () => ({
   useTan: () => fakeTan,
+  TAN_POLL_INTERVAL_MS: 5000,
 }));
 
 function deferred<T>() {

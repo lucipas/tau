@@ -34,7 +34,9 @@ import type {
   TanVerifyReport,
 } from "./types";
 
-const POLL_INTERVAL_MS = 5000;
+// The feed poll cadence, shared with the console's Scheduled view so a
+// post the serving node publishes disappears from the queue promptly.
+export const TAN_POLL_INTERVAL_MS = 5000;
 // Suggestion ranking scans the whole cache, so it refreshes on a slower
 // cadence than the feed and stays off the feed's poll critical path.
 const SUGGEST_INTERVAL_MS = 60000;
@@ -176,7 +178,7 @@ export function useTan() {
     if (
       !supersede &&
       pending !== null &&
-      Date.now() - pending.startedAt < POLL_INTERVAL_MS * 2
+      Date.now() - pending.startedAt < TAN_POLL_INTERVAL_MS * 2
     ) {
       return false;
     }
@@ -350,7 +352,7 @@ export function useTan() {
         disposed = true;
       };
     }
-    const timer = setInterval(() => void tick(false), POLL_INTERVAL_MS);
+    const timer = setInterval(() => void tick(false), TAN_POLL_INTERVAL_MS);
     return () => {
       disposed = true;
       clearInterval(timer);
@@ -792,6 +794,11 @@ export function useTan() {
     await apiPost<TanCancelScheduledResponse>("/api/tan/cancel-scheduled", {
       id,
     });
+    // A list load that started before this cancel must not restore the
+    // card: advance the generation so its response is discarded, and
+    // clear the loading flag it would otherwise leave set.
+    scheduledGenerationRef.current += 1;
+    setScheduledLoading(false);
     setScheduled((previous) => previous.filter((post) => post.id !== id));
   }, []);
 
