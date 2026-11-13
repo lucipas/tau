@@ -573,27 +573,6 @@ export function useTau() {
     setHeldMail(result.held);
   }, []);
 
-  useEffect(() => {
-    if (connection !== "live") return;
-    async function tick() {
-      // The endpoints are independent: a failure on one must not stop
-      // the others from updating their state. Each is a side panel: a
-      // failed poll leaves the last known values in place instead of
-      // flashing an error.
-      await Promise.allSettled([
-        refreshOutbox(),
-        refreshHeldMail(),
-        refreshGroups(),
-        refreshSettings(),
-      ]);
-    }
-    void tick();
-    const timer = setInterval(() => void tick(), 15000);
-    return () => {
-      clearInterval(timer);
-    };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings]);
-
   const allowlistSeq = useRef(0);
 
   // Allow-list requests can resolve out of order: only the newest
@@ -608,65 +587,93 @@ export function useTau() {
     [],
   );
 
+  // Count of allow-list writes in flight. A poll must not bump the
+  // sequence while one is pending: that would discard the write's
+  // successful response and could apply a pre-write snapshot.
+  const allowlistPending = useRef(0);
+
   const refreshAllowlist = useCallback(async () => {
+    if (allowlistPending.current > 0) return;
     const requestId = ++allowlistSeq.current;
     const result = await apiGet<AllowlistResponse>("/api/allowlist");
     applyAllowlist(requestId, result);
   }, [applyAllowlist]);
 
-  // The allow-list only changes through this console or the CLI, and
-  // CLI changes do not apply to the running node until it restarts —
-  // so a load on connect plus a refresh after each action is enough;
-  // no polling interval like the outbox needs.
   useEffect(() => {
     if (connection !== "live") return;
-    let disposed = false;
-    async function load() {
-      try {
-        await refreshAllowlist();
-      } catch {
-        if (disposed) return;
-      }
+    async function tick() {
+      // The endpoints are independent: a failure on one must not stop
+      // the others from updating their state. Each is a side panel: a
+      // failed poll leaves the last known values in place instead of
+      // flashing an error.
+      // The allow-list polls here too: another console tab writes
+      // through the same live API, so a change made there would
+      // otherwise leave this section stale behind the rest.
+      await Promise.allSettled([
+        refreshOutbox(),
+        refreshHeldMail(),
+        refreshGroups(),
+        refreshSettings(),
+        refreshAllowlist(),
+      ]);
     }
-    void load();
+    void tick();
+    const timer = setInterval(() => void tick(), 15000);
     return () => {
-      disposed = true;
+      clearInterval(timer);
     };
-  }, [connection, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     async (target: string) => {
-      const requestId = ++allowlistSeq.current;
-      const result = await apiPost<AllowlistResponse>("/api/allowlist/add", {
-        target,
-      });
-      applyAllowlist(requestId, result);
-      return result;
+      // Same pending-write guard as the other allow-list writes: a
+      // poll must not supersede this add with a pre-write snapshot.
+      allowlistPending.current++;
+      try {
+        const requestId = ++allowlistSeq.current;
+        const result = await apiPost<AllowlistResponse>("/api/allowlist/add", {
+          target,
+        });
+        applyAllowlist(requestId, result);
+        return result;
+      } finally {
+        allowlistPending.current--;
+      }
     },
     [applyAllowlist],
   );
 
   const removeAllowlistPeer = useCallback(
     async (target: string) => {
-      const requestId = ++allowlistSeq.current;
-      const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
-        target,
-      });
-      applyAllowlist(requestId, result);
-      return result;
+      allowlistPending.current++;
+      try {
+        const requestId = ++allowlistSeq.current;
+        const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
+          target,
+        });
+        applyAllowlist(requestId, result);
+        return result;
+      } finally {
+        allowlistPending.current--;
+      }
     },
     [applyAllowlist],
   );
 
   const setAllowlistEnabled = useCallback(
     async (enabled: boolean) => {
-      const requestId = ++allowlistSeq.current;
-      const result = await apiPost<AllowlistResponse>(
-        "/api/allowlist/set-enabled",
-        { enabled },
-      );
-      applyAllowlist(requestId, result);
-      return result;
+      allowlistPending.current++;
+      try {
+        const requestId = ++allowlistSeq.current;
+        const result = await apiPost<AllowlistResponse>(
+          "/api/allowlist/set-enabled",
+          { enabled },
+        );
+        applyAllowlist(requestId, result);
+        return result;
+      } finally {
+        allowlistPending.current--;
+      }
     },
     [applyAllowlist],
   );
