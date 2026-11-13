@@ -171,7 +171,7 @@ describe("MessageFeed edit", () => {
     expect(screen.queryByTitle("Edit this message")).toBeNull();
   });
 
-  it("shows the edit button only on your own sent DMs", () => {
+  it("shows the edit button only on your own sent messages", () => {
     const onEdit = vi.fn(async () => true);
     const { rerender } = render(
       <MessageFeed
@@ -184,17 +184,8 @@ describe("MessageFeed edit", () => {
     // A received message is the sender's to edit, not this node's.
     expect(screen.queryByTitle("Edit this message")).toBeNull();
 
-    // Group, file, queued, and wire-id-less sent messages cannot be
+    // File, queued, and wire-id-less sent messages cannot be
     // edited from the console either.
-    rerender(
-      <MessageFeed
-        messages={[sent({ group: "crew", group_name: "crew" })]}
-        node={null}
-        live={true}
-        onEdit={onEdit}
-      />,
-    );
-    expect(screen.queryByTitle("Edit this message")).toBeNull();
     rerender(
       <MessageFeed
         messages={[sent({ status: "queued" })]}
@@ -213,6 +204,32 @@ describe("MessageFeed edit", () => {
       />,
     );
     expect(screen.queryByTitle("Edit this message")).toBeNull();
+  });
+
+  it("shows the edit button on your own sent group messages", async () => {
+    const message = sent({ group: "ab".repeat(16), group_name: "crew" });
+    const onEdit = vi.fn(async () => true);
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Edit this message"));
+    const editor = screen.getByLabelText(
+      "Edit message text",
+    ) as HTMLTextAreaElement;
+    expect(editor.value).toBe("hello");
+    fireEvent.change(editor, { target: { value: "fixed here" } });
+    fireEvent.click(screen.getByText("save"));
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(onEdit).toHaveBeenCalledWith(message, "fixed here");
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Edit message text")).toBeNull(),
+    );
   });
 
   it("opens an editor prefilled with the text and saves through onEdit", async () => {

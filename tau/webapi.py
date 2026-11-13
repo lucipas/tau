@@ -3734,11 +3734,12 @@ class WebBridge:
         text locally while the peer keeps the old one would split the
         two histories.
 
-        Only your own sent DMs can be edited: group messages are not
-        editable in v1, a file transfer has no text to edit, and a
-        message still queued has not reached its recipient yet (cancel
-        it from the outbox instead).  Edits ride the live link only, so
-        an unreachable peer is a failure, not a silent queue.
+        Only your own sent messages can be edited: a file transfer
+        has no text to edit, and a message still queued has not
+        reached its recipient yet (cancel it from the outbox instead).
+        A sent group message fans out instead (see
+        :meth:`_edit_group_message`).  Edits ride the live link only,
+        so an unreachable peer is a failure, not a silent queue.
 
         Ordering keeps every failure retryable from the console: the
         edit goes first, so a failed edit never rewrites the local
@@ -3766,8 +3767,16 @@ class WebBridge:
                 raise ValueError(f"unknown message: {target!r}")
             if entry.get("direction") != "out":
                 raise ValueError("only your own sent messages can be edited")
-            if entry.get("group"):
-                raise ValueError("group messages cannot be edited in v1")
+        if entry.get("group"):
+            # The group path takes the lock itself to gather the legs,
+            # so this stays outside the block above: re-entering it
+            # here would deadlock the handler thread.  Queued legs are
+            # refused inside that path: a group edit must not re-queue
+            # an edit for an offline member.
+            return self._edit_group_message(
+                target, entry, cleaned, timeout=timeout
+            )
+        with self._lock:
             if entry.get("file"):
                 raise ValueError("file transfers cannot be edited")
             if entry.get("status") == "queued":
@@ -3846,6 +3855,244 @@ class WebBridge:
             "ok": True,
             "edited": True,
             "message": updated,
+            "id": response.get("id")
+            if isinstance(response.get("id"), str)
+            else None,
+        }
+
+    def _edit_group_message(
+        self, target: int, entry: Dict[str, Any], cleaned: str, *, timeout: float = 20.0
+    ) -> Dict[str, Any]:
+        """Edit one of this node's sent group messages, from the console.
+
+        Mirrors ``tau edit --group`` (see
+        :meth:`tau.node.TauNode.send_group_edit`): the edit fans out
+        to every member, and the local copies update only when every
+        member received it — a partial fan-out keeps the old text, so
+        the members still holding it stay retryable, exactly as on the
+        CLI.  Unlike the CLI, a leg still queued in the outbox is
+        refused outright instead of cancelled and re-queued: edits are
+        live-only, and a concurrent mail sweep could deliver the
+        queued leg with the old text after the edit was acknowledged
+        (see Qodo on #341) — the user cancels the queued leg from the
+        outbox first, as for a queued DM edit.
+
+        The console records one history entry per leg, all sharing the
+        group's id and the send's shared wire time, so the clicked
+        entry names the logical message: the fan-out carries that
+        shared send time every member needs to resolve their own copy,
+        and on success every leg entry takes the new text with an
+        edited marker, through the same ``message_updated`` event an
+        inbound edit uses, so other tabs learn.  The shared time is
+        recovered from the stored inbox record before the fan-out, as
+        in :meth:`_retract_group_message`: an entry restored from
+        before the shared time was stamped carries its write time
+        instead, which members cannot match — so such a message is
+        refused rather than fanned out, or the local copies would
+        update while the members keep the old text.  A failed leg
+        carries no wire id, so the edit names the first leg that has
+        one; a message no leg delivered has nothing to edit.
+        """
+        group_id = entry.get("group")
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError("that group message has no group to edit in")
+        sent_at = entry.get("sent_at")
+        if (
+            not isinstance(sent_at, (int, float))
+            or isinstance(sent_at, bool)
+        ):
+            raise ValueError(
+                "that group message carries no send time to edit by"
+            )
+        try:
+            sent_at = float(sent_at)
+        except (OverflowError, ValueError):
+            raise ValueError(
+                "that group message carries no send time to edit by"
+            ) from None
+        if not math.isfinite(sent_at):
+            raise ValueError(
+                "that group message carries no send time to edit by"
+            )
+        with self._lock:
+            legs = [
+                message
+                for message in self._messages
+                if message.get("direction") == "out"
+                and message.get("group") == group_id
+                and message.get("sent_at") == sent_at
+            ]
+        wire_ids = [
+            leg.get("wire_id")
+            for leg in legs
+            if isinstance(leg.get("wire_id"), str) and leg.get("wire_id")
+        ]
+        if not wire_ids:
+            raise ValueError(
+                "that group message was never delivered to any member, "
+                "so there is nothing to edit"
+            )
+        target_wire_id = entry.get("wire_id")
+        if not isinstance(target_wire_id, str) or not target_wire_id:
+            target_wire_id = wire_ids[0]
+        # Reload the persisted store first: a group created or deleted
+        # by another process (``tau group``) must be seen by this
+        # edit.  Resolve the stored id exactly: the fan-out takes a
+        # record, never a name lookup — a retired id that also matches
+        # a group name must not resolve to that other group and send
+        # the edit to its members.
+        self.node.groups.list_groups()
+        group = self.node.groups.get(group_id)
+        if group is None:
+            # A roster change retires the id, but a message sent under
+            # it still carries it: fan out to the retained historical
+            # roster, never the successor's.
+            group = self.node.groups.get_retired(group_id)
+        if group is None:
+            raise ValueError(f"unknown group: {group_id!r}")
+        # Resolve the authoritative shared send time from the stored
+        # inbox record before fanning out: the console entry's
+        # ``sent_at`` is only the shared time when the send stamped
+        # it — a live send, or a restore that found ``leg_sent_at``.
+        # A restored entry from before group edits landed carries
+        # its write time instead, which members cannot match: they
+        # answer ``delivered`` with ``edited`` False, and the fan-out
+        # below treats delivery as success, so fanning that out would
+        # update the local copies while the members keep the old text.
+        # Refuse when no stored record names the shared time, exactly
+        # as the CLI refuses (see ``tau.cli._edit_group_message``).
+        # Only this node's own sent record for this group names the
+        # send: resolve() matches the wire id alone, so a record of
+        # another kind must not supply the time.
+        inbox = getattr(self.node, "inbox", None)
+        stored = None
+        if inbox is not None:
+            try:
+                stored = inbox.resolve(target_wire_id)
+            except ValueError:
+                stored = None
+        leg_sent_at = None
+        if (
+            stored is not None
+            and stored.get("direction") == "out"
+            and stored.get("group") == group_id
+        ):
+            leg_sent_at = stored.get("leg_sent_at")
+        if (
+            not isinstance(leg_sent_at, (int, float))
+            or isinstance(leg_sent_at, bool)
+            or not math.isfinite(leg_sent_at)
+        ):
+            raise ValueError(
+                "that group message was sent before group edits "
+                "landed; it carries no leg send time, so it cannot "
+                "be edited"
+            )
+        sent_at = float(leg_sent_at)
+        # Group edits are live-only: a leg still queued in the outbox
+        # is refused instead of cancelled and re-queued, which would
+        # store-and-forward an edit to an offline member — and a
+        # concurrent mail sweep could deliver the queued leg with the
+        # old text after the edit was acknowledged (see Qodo on #341).
+        # Check the mailbox for the complete logical send — group id
+        # plus the shared send time, the same predicate
+        # send_group_edit's own cancel loop uses — not just the legs
+        # this console retained: a leg whose entry left the history
+        # still counts.  The console entry's status is not consulted:
+        # it goes stale when a leg is cancelled from the outbox, so it
+        # must not block an edit after the prescribed recovery.
+        queued = [
+            outbox_entry.id
+            for outbox_entry in self.node.mailbox.outbox_list()
+            if outbox_entry.group_id == group_id
+            and outbox_entry.wire_sent_at == sent_at
+        ]
+        if queued:
+            raise ValueError(
+                "this group message is still queued for an offline member; "
+                "cancel it from the outbox first"
+            )
+        # Edit by the record's canonical id: a secondary leg's wire id
+        # does not match the inbox record, so the local update would
+        # silently miss it.
+        canonical_id = stored.get("id")
+        edit_wire_id = (
+            canonical_id
+            if isinstance(canonical_id, str) and canonical_id
+            else target_wire_id
+        )
+        response = self.node.send_group_edit(
+            group,
+            edit_wire_id,
+            cleaned,
+            timeout=timeout,
+            target_sent_at=sent_at,
+        )
+        results = response.get("results") or []
+        failed = [result for result in results if not result.get("delivered")]
+        if failed:
+            # Keep the local copies: the failed members still hold the
+            # old text, and the legs carry the send time a retry needs.
+            # A failed edit never rewrites the local copy.
+            raise NodeError(
+                "group edit reached only some members: "
+                + "; ".join(
+                    f"{result.get('to_name') or short_hash(str(result.get('to') or ''))}: "
+                    f"{result.get('error') or 'unknown error'}"
+                    for result in failed
+                )
+                + "; retry the edit when they are online"
+            )
+        local_errors = response.get("local_errors") or []
+        if local_errors:
+            # The members already hold the new text, but this node's
+            # own copies did not update: keep the old text here so a
+            # retry re-sends the edit (idempotent — a member who
+            # already applied it answers ``edited`` False) and retries
+            # the local update.
+            raise NodeError(
+                "group edit reached every member but the local copies "
+                "could not be updated: "
+                + "; ".join(str(error) for error in local_errors)
+            )
+        # Order by the edit's signed time, not when this request finished,
+        # so two overlapping edits keep their send order.
+        signed_at = response.get("sent_at")
+        if isinstance(signed_at, (int, float)) and not isinstance(signed_at, bool):
+            edited_at = float(signed_at)
+        else:
+            edited_at = time.time()
+        updated: List[Dict[str, Any]] = []
+        for leg in legs:
+            leg_wire_id = leg.get("wire_id")
+            leg_peer = leg.get("peer")
+            if not isinstance(leg_wire_id, str) or not leg_wire_id:
+                continue
+            if not isinstance(leg_peer, str) or not leg_peer:
+                continue
+            changed = self.record_edit(
+                {
+                    "target": leg_wire_id,
+                    "text": cleaned,
+                    "edited_at": edited_at,
+                    "direction": "out",
+                    "destination": leg_peer,
+                }
+            )
+            if changed is not None:
+                updated.append(changed)
+        tapped = next(
+            (entry for entry in updated if entry.get("id") == target),
+            updated[0] if updated else None,
+        )
+        return {
+            "ok": True,
+            "edited": True,
+            "message": tapped,
+            "messages": updated,
+            "group": group_id,
+            "results": results,
+            "cancelled_queued": response.get("cancelled_queued") or [],
             "id": response.get("id")
             if isinstance(response.get("id"), str)
             else None,

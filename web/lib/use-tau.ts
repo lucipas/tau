@@ -738,14 +738,22 @@ export function useTau() {
     // one-sidedly.
     // A late response older than a version already received over the
     // event stream must not rewind the bubble.
-    const edited = result.message;
-    if (result.edited && edited) {
+    // A group edit updates every leg: swap each returned entry, not
+    // just the one the user tapped.
+    const editedEntries = result.messages?.length
+      ? result.messages
+      : result.message
+        ? [result.message]
+        : [];
+    if (result.edited && editedEntries.length > 0) {
+      const byId = new Map(editedEntries.map((entry) => [entry.id, entry]));
       setMessages((previous) =>
-        previous.map((entry) =>
-          entry.id === edited.id && !holdsNewerEdit(entry, edited)
-            ? edited
-            : entry,
-        ),
+        previous.map((entry) => {
+          const replacement = byId.get(entry.id);
+          return replacement && !holdsNewerEdit(entry, replacement)
+            ? replacement
+            : entry;
+        }),
       );
       refreshActiveSearch();
     }

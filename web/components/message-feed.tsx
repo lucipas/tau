@@ -790,7 +790,6 @@ function MessageBubble({
           ) : null}
           {onEdit &&
           outbound &&
-          !message.group &&
           !message.file &&
           message.wire_id &&
           message.status !== "queued" &&

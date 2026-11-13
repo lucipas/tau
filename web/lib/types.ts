@@ -383,6 +383,10 @@ export interface EditMessageResponse {
   edited: boolean;
   // The updated console entry, when it is in this console's history.
   message?: TauMessage | null;
+  // Every updated leg of a group edit: one entry per leg, so the
+  // whole group send swaps in at once. A DM edit carries only
+  // `message`, so this is absent there.
+  messages?: TauMessage[];
   // The edit's own wire id, when the peer answered one.
   id?: string | null;
 }
