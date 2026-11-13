@@ -4832,6 +4832,259 @@ def test_edit_group_unknown_copy_answers_ok_without_editing(tmp_path):
     assert response["group_edit"] is True
 
 
+def _group_edit_before_copy_setup(tmp_path):
+    # A group with no copy of the message in the inbox yet: the live
+    # edit below answers edited False against an absent copy.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    group = node.groups.create(
+        "weekend",
+        [sender_hash, "ab" * 16],
+        created_by=sender_hash,
+    )
+    return node, sender, sender_hash, group
+
+
+def _deliver_old_group_leg(node, sender, sender_hash, group):
+    return call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "group typo",
+            message_id="leg-9",
+            group_id=group["id"],
+            group_name="weekend",
+            creator=sender_hash,
+            members=[sender_hash, "ab" * 16],
+            sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+
+
+def test_group_edit_before_copy_lands_already_edited(tmp_path):
+    # The race in #342: the live edit answers edited False against a
+    # copy this node has not seen yet, and the old leg arrives after
+    # it — a sweep flush that already held it, or a sealed copy a
+    # relay hands over — instead of before it.  The copy must land
+    # already edited, and the re-queued edited leg that follows is a
+    # harmless duplicate.
+    node, sender, sender_hash, group = _group_edit_before_copy_setup(tmp_path)
+    edit = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-1", "group fixed", "edit-1", group=group["id"]
+        ),
+        remote_identity=sender,
+    )
+    assert edit["ok"] is True
+    assert edit["edited"] is False
+    assert edit["group_edit"] is True
+    # The old leg arrives carrying the original text, no edit state.
+    delivered = _deliver_old_group_leg(node, sender, sender_hash, group)
+    assert delivered["ok"] is True
+    assert delivered["duplicate"] is False
+    record = node.inbox.list_messages()[0]
+    assert record["text"] == "group fixed"
+    assert record["edited_at"] == 30.0
+    # The re-queued edited leg that follows is a duplicate now.
+    replayed = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "group fixed",
+            message_id="leg-9",
+            group_id=group["id"],
+            group_name="weekend",
+            creator=sender_hash,
+            members=[sender_hash, "ab" * 16],
+            sent_at=100.0,
+            edited_at=30.0,
+        ),
+        remote_identity=sender,
+    )
+    assert replayed["duplicate"] is True
+    assert node.inbox.list_messages()[0]["text"] == "group fixed"
+
+
+def test_pending_group_edit_keeps_the_newest_edit(tmp_path):
+    # Two edits arrive before the copy: the older one must not win
+    # over the newer one, whichever order they arrive in.
+    node, sender, sender_hash, group = _group_edit_before_copy_setup(tmp_path)
+    newer = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-1", "newer fix", "edit-1", sent_at=40.0,
+            group=group["id"],
+        ),
+        remote_identity=sender,
+    )
+    assert newer["edited"] is False
+    older = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-1", "older fix", "edit-2", sent_at=30.0,
+            group=group["id"],
+        ),
+        remote_identity=sender,
+    )
+    assert older["edited"] is False
+    delivered = _deliver_old_group_leg(node, sender, sender_hash, group)
+    assert delivered["duplicate"] is False
+    record = node.inbox.list_messages()[0]
+    assert record["text"] == "newer fix"
+    assert record["edited_at"] == 40.0
+
+
+def test_pending_group_edit_does_not_rewind_a_newer_copy(tmp_path):
+    # The copy itself can carry a newer edit than the pending marker
+    # — a re-queued leg from an edit this node never saw live — and
+    # the marker must not rewind it.
+    node, sender, sender_hash, group = _group_edit_before_copy_setup(tmp_path)
+    edit = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-1", "first fix", "edit-1", sent_at=30.0,
+            group=group["id"],
+        ),
+        remote_identity=sender,
+    )
+    assert edit["edited"] is False
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "newer fix",
+            message_id="leg-9",
+            group_id=group["id"],
+            group_name="weekend",
+            creator=sender_hash,
+            members=[sender_hash, "ab" * 16],
+            sent_at=100.0,
+            edited_at=200.0,
+        ),
+        remote_identity=sender,
+    )
+    assert delivered["duplicate"] is False
+    record = node.inbox.list_messages()[0]
+    assert record["text"] == "newer fix"
+    assert record["edited_at"] == 200.0
+
+
+def test_pending_group_edit_applies_to_a_relayed_copy(tmp_path):
+    # The same race, but the late old leg arrives through
+    # store-and-forward: a sealed copy a holder hands over must land
+    # already edited too.
+    node, sender, sender_hash, group = _group_edit_before_copy_setup(tmp_path)
+    edit = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-1", "group fixed", "edit-1", group=group["id"]
+        ),
+        remote_identity=sender,
+    )
+    assert edit["edited"] is False
+    message = {
+        "id": "leg-9",
+        "from": sender_hash,
+        "from_name": "alice",
+        "text": "group typo",
+        "sent_at": 100.0,
+        "group": {
+            "id": group["id"],
+            "name": "weekend",
+            "creator": sender_hash,
+            "members": [sender_hash, "ab" * 16],
+        },
+    }
+    assert node._deliver_collected(message) is True
+    record = node.inbox.list_messages()[0]
+    assert record["text"] == "group fixed"
+    assert record["edited_at"] == 30.0
+    assert record["relayed"] is True
+
+
+def test_pending_group_edit_rejects_a_non_author(tmp_path):
+    # An edit signed by someone other than the message's author must
+    # not plant a marker for it — and the copy still lands with its
+    # own text.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    other_hash = destination_hash(other).hex()
+    group = node.groups.create(
+        "weekend",
+        [sender_hash, other_hash, "ab" * 16],
+        created_by=sender_hash,
+    )
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            other, "leg-1", "group fixed", "edit-1", author=sender,
+            group=group["id"],
+        ),
+        remote_identity=other,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert (
+        node.mailbox.pending_group_edit(other_hash, group["id"], 100.0)
+        is None
+    )
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "group typo",
+            message_id="leg-9",
+            group_id=group["id"],
+            group_name="weekend",
+            creator=sender_hash,
+            members=[sender_hash, other_hash, "ab" * 16],
+            sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert delivered["duplicate"] is False
+    assert node.inbox.list_messages()[0]["text"] == "group typo"
+
+
+def test_pending_group_edit_rejects_a_removed_member(tmp_path):
+    # Like a group retract, an edit must come from a current member: a
+    # sender the pinned roster does not name may not plant a marker
+    # for a copy that has not arrived yet.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    other_hash = destination_hash(other).hex()
+    group = node.groups.create(
+        "weekend",
+        [other_hash, "ab" * 16],
+        created_by=other_hash,
+    )
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-1", "group fixed", "edit-1", group=group["id"]
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert (
+        node.mailbox.pending_group_edit(sender_hash, group["id"], 100.0)
+        is None
+    )
+
+
 def test_edit_group_ignores_a_stale_edit(tmp_path):
     node = make_node(tmp_path)
     node.destination = SimpleNamespace(

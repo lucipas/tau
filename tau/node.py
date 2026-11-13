@@ -1957,6 +1957,27 @@ class TauNode:
                             # duplicate so it is not retried.
                             duplicate = True
                         else:
+                            pending = self.mailbox.pending_group_edit(
+                                caller_hash,
+                                group["id"],
+                                message.get("sent_at"),
+                            )
+                            if pending is not None and (
+                                record.get("edited_at") is None
+                                or float(pending["edited_at"])
+                                > float(record["edited_at"])
+                            ):
+                                # A live edit answered against a copy
+                                # this node had not seen yet: the copy
+                                # lands already edited, so the old text
+                                # never reaches the inbox — and the
+                                # re-queued edited leg that follows is
+                                # a harmless duplicate (see
+                                # record_group_pending_edit).  A copy
+                                # that already carries a newer edit
+                                # keeps its own text.
+                                record["text"] = pending["text"]
+                                record["edited_at"] = pending["edited_at"]
                             voided = self.inbox.append_group_message(
                                 record,
                                 group=group["id"],
@@ -2883,23 +2904,95 @@ class TauNode:
             # the edit onto a different message.  Reload first: a
             # copy imported by another process may have landed after
             # this node's in-memory copy was read.
-            try:
-                self.inbox.reload()
-            except InboxError as exc:
-                return response_error(
-                    "storage_failed", f"could not read inbox: {exc}"
+            #
+            # The mailbox transaction is held across the reload, the
+            # resolve, and the marker record below, so a copy landing
+            # concurrently cannot slip between the lookup and the
+            # marker — the delivery paths check the marker inside the
+            # same transaction before they append (see
+            # _handle_group_message).  Lock order is mailbox, then
+            # inbox, everywhere (see _handle_retract).
+            with self.mailbox.transaction():
+                try:
+                    self.inbox.reload()
+                except InboxError as exc:
+                    return response_error(
+                        "storage_failed", f"could not read inbox: {exc}"
+                    )
+                record = self.inbox.find_group_message(
+                    group_id, target_author, target_sent_at
                 )
-            record = self.inbox.find_group_message(
-                group_id, target_author, target_sent_at
-            )
-            if record is None:
-                return response_ok(
-                    target=target_id,
-                    edited=False,
-                    received_at=received_at,
-                    group_edit=True,
-                )
-            target_id = str(record["id"])
+                if record is None:
+                    # No copy yet: the edit is answered edited False,
+                    # but it is not forgotten.  A copy arriving later
+                    # — a sweep flush that already held the old leg,
+                    # or a sealed copy a relay hands over — would
+                    # otherwise store the old text, and the re-queued
+                    # edited leg would then drop as a duplicate of
+                    # it.  Record a pending edit instead, so the copy
+                    # lands already edited (see
+                    # record_group_pending_edit).  Only the message's
+                    # author may plant one, and only a current member
+                    # — a missing roster does not refuse, exactly as
+                    # for a group retract with no copy yet.
+                    if target_author != caller_hash:
+                        return response_error(
+                            "not_sender",
+                            "only the message's sender may edit it",
+                        )
+                    if (
+                        target_sent_at is None
+                        or isinstance(target_sent_at, bool)
+                        or not isinstance(target_sent_at, (int, float))
+                    ):
+                        return response_error(
+                            "invalid_edit",
+                            "group edit is missing the message's "
+                            "shared send time",
+                        )
+                    edit_sent_at = edit.get("sent_at")
+                    if (
+                        edit_sent_at is None
+                        or isinstance(edit_sent_at, bool)
+                        or not isinstance(edit_sent_at, (int, float))
+                    ):
+                        return response_error(
+                            "invalid_edit",
+                            "edit is missing its signed sent_at",
+                        )
+                    pinned = pinned_group(self.groups, group_id)
+                    if pinned is not None and caller_hash not in (
+                        pinned.get("members") or []
+                    ):
+                        return response_error(
+                            "not_a_member",
+                            "sender is not a group member",
+                        )
+                    try:
+                        self.mailbox.record_group_pending_edit(
+                            caller_hash,
+                            group_id,
+                            float(target_sent_at),
+                            edit["text"],
+                            float(edit_sent_at),
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Could not record pending group edit for %s",
+                            target_id[:8],
+                            exc_info=True,
+                        )
+                        return response_error(
+                            "storage_failed",
+                            f"could not record pending edit: {exc}",
+                        )
+                    return response_ok(
+                        target=target_id,
+                        edited=False,
+                        received_at=received_at,
+                        group_edit=True,
+                    )
+                target_id = str(record["id"])
         else:
             # An unknown id answers ok with edited: false, so a retried
             # edit is safe (idempotent) — the sender can retry with the
@@ -4530,6 +4623,24 @@ class TauNode:
                             message["id"],
                         )
                         return False
+                    pending = self.mailbox.pending_group_edit(
+                        message.get("from")
+                        if isinstance(message.get("from"), str)
+                        else "",
+                        pinned["id"],
+                        message.get("sent_at"),
+                    )
+                    if pending is not None and (
+                        record.get("edited_at") is None
+                        or float(pending["edited_at"])
+                        > float(record["edited_at"])
+                    ):
+                        # A live edit answered against a copy this
+                        # node had not seen yet: the relayed copy
+                        # lands already edited, exactly as a direct
+                        # one does (see _handle_group_message).
+                        record["text"] = pending["text"]
+                        record["edited_at"] = pending["edited_at"]
                     voided = self.inbox.append_group_message(
                         record,
                         group=pinned["id"],

@@ -958,6 +958,116 @@ def test_group_retraction_markers_persist_and_expire(tmp_path):
     assert reloaded.is_group_retracted(sender, group, 100.0) is False
 
 
+def test_group_pending_edit_markers_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    sender = "aa" * 32
+    group = "cc" * 16
+    assert box.pending_group_edit(sender, group, 100.0) is None
+
+    recorded_at = time.time()
+    assert (
+        box.record_group_pending_edit(
+            sender, group, 100.0, "fixed here", 150.0, now=recorded_at
+        )
+        is True
+    )
+    assert box.pending_group_edit(sender, group, 100.0) == {
+        "text": "fixed here",
+        "edited_at": 150.0,
+    }
+    # Keyed by (sender, group, send time): any other triple is
+    # unaffected, and a non-numeric send time never matches.
+    assert box.pending_group_edit("bb" * 32, group, 100.0) is None
+    assert box.pending_group_edit(sender, "dd" * 16, 100.0) is None
+    assert box.pending_group_edit(sender, group, 101.0) is None
+    assert box.pending_group_edit(sender, group, "soon") is None
+
+    # An older edit never rewinds the marker — and does not refresh it.
+    assert (
+        box.record_group_pending_edit(
+            sender, group, 100.0, "older text", 140.0, now=recorded_at + 10
+        )
+        is False
+    )
+    assert box.pending_group_edit(sender, group, 100.0) == {
+        "text": "fixed here",
+        "edited_at": 150.0,
+    }
+    # A newer edit replaces it.
+    assert (
+        box.record_group_pending_edit(
+            sender, group, 100.0, "newest text", 160.0, now=recorded_at + 20
+        )
+        is True
+    )
+    assert box.pending_group_edit(sender, group, 100.0) == {
+        "text": "newest text",
+        "edited_at": 160.0,
+    }
+
+    # The marker survives a reload, and lifts once its retention ends
+    # (the newer record refreshed the expiry).
+    reloaded = Mailbox(path)
+    assert reloaded.pending_group_edit(sender, group, 100.0) == {
+        "text": "newest text",
+        "edited_at": 160.0,
+    }
+    assert (
+        reloaded.pending_group_edit(
+            sender, group, 100.0,
+            now=recorded_at + 20 + RETRACTED_RETENTION - 1,
+        )
+        == {"text": "newest text", "edited_at": 160.0}
+    )
+    assert (
+        reloaded.pending_group_edit(
+            sender, group, 100.0,
+            now=recorded_at + 20 + RETRACTED_RETENTION,
+        )
+        is None
+    )
+
+    reloaded.prune(now=recorded_at + 20 + RETRACTED_RETENTION)
+    assert reloaded.pending_group_edit(sender, group, 100.0) is None
+
+
+def test_group_pending_edit_markers_drop_malformed_entries():
+    parsed = mailbox_module._parse_pending_edit_markers(
+        {
+            "good": {
+                "text": "fixed",
+                "edited_at": 150.0,
+                "until": time.time() + 3600,
+            },
+            "not-a-dict": "nope",
+            "bad-text": {
+                "text": 42,
+                "edited_at": 150.0,
+                "until": time.time() + 3600,
+            },
+            "bad-time": {
+                "text": "fixed",
+                "edited_at": "soon",
+                "until": time.time() + 3600,
+            },
+            "bad-until": {
+                "text": "fixed",
+                "edited_at": 150.0,
+                "until": "soon",
+            },
+            "far-future": {
+                "text": "fixed",
+                "edited_at": 150.0,
+                "until": time.time() + 10**12,
+            },
+        }
+    )
+    assert list(parsed) == ["good"]
+    assert parsed["good"]["text"] == "fixed"
+    assert parsed["good"]["edited_at"] == 150.0
+
+
 def test_sent_retraction_markers_persist_and_expire(tmp_path):
     path = tmp_path / "mailbox.json"
     box = Mailbox(path)
