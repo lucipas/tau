@@ -525,7 +525,8 @@ class TauNode:
         self.on_peer = on_peer
         # Called with the record the first time a non-tau destination
         # is heard (see _record_foreign_announce); repeats of a known
-        # destination do not call it again.
+        # destination do not call it again — unless the cap evicted
+        # the destination first, in which case it is new again.
         self.on_foreign = on_foreign
         self.on_delivered = on_delivered
         self.on_file = on_file
@@ -1254,7 +1255,10 @@ class TauNode:
         ``rnsd`` shows — with no registry write, no mail round and no
         peer callback.  A destination heard before only bumps its
         count and last-seen time; a new one also calls ``on_foreign``
-        once, so a listener can print it live.
+        once, so a listener can print it live.  A destination the
+        cap already evicted counts as new again when it reappears:
+        its count restarts and ``on_foreign`` fires once more — the
+        record only remembers the newest 200.
         """
         try:
             hops = RNS.Transport.hops_to(announced_hash)

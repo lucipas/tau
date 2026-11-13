@@ -1454,6 +1454,15 @@ def test_heard_on_empty_air(tmp_path, capsys, monkeypatch):
     assert "No non-tau announces heard." in capsys.readouterr().out
 
 
+def test_heard_rejects_non_finite_duration(tmp_path, capsys, monkeypatch):
+    # A Qodo Fixer commit keeps --duration inf from waiting forever
+    # (and emitting invalid JSON): it must fail before a node starts.
+    monkeypatch.setattr(cli, "TauNode", _FakeHeardNode)
+    code = cli.main(["heard", "--data-dir", str(tmp_path / "node"), "--duration", "inf"])
+    assert code == 1
+    assert "must be a finite number of seconds" in capsys.readouterr().err
+
+
 # -- peers show ---------------------------------------------------------------
 
 def _seed_peer_show(tmp_path):
