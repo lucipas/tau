@@ -611,6 +611,80 @@ def test_send_group_retraction_rejects_unknown_and_solo_groups(tmp_path):
         node.send_group_retraction(solo, "leg-1", target_sent_at=100.0)
 
 
+def test_send_group_retraction_uses_retained_roster_after_roster_change(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    carol = make_peer("carol")
+    node.groups.update_members(
+        group["id"],
+        [alice.hexhash, carol.hexhash, node.destination.hexhash],
+        created_by=alice.hexhash,
+    )
+    # The old id is retired, but a message sent under it still
+    # retracts — to the old roster, never the successor's.
+    assert node.groups.get(group["id"]) is None
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append(peer_arg.hexhash)
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_retraction(
+        group["id"], "leg-1", target_sent_at=100.0
+    )
+
+    assert response["ok"] is True
+    assert response["group"] == group["id"]
+    assert {r["to"] for r in response["results"]} == {
+        alice.hexhash,
+        bob.hexhash,
+    }
+    assert set(calls) == {alice.hexhash, bob.hexhash}
+
+
+def test_send_group_retraction_retired_id_never_resolves_to_namesake(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    carol = make_peer("carol")
+    node.groups.update_members(
+        group["id"],
+        [alice.hexhash, carol.hexhash, node.destination.hexhash],
+        created_by=alice.hexhash,
+    )
+    # A live group whose NAME is the retired id: find() would resolve
+    # the id to this group through the name fallback.
+    node.groups.create(
+        group["id"],
+        [alice.hexhash, carol.hexhash],
+        created_by=alice.hexhash,
+    )
+    assert node.groups.find(group["id"])["name"] == group["id"]
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append(peer_arg.hexhash)
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_retraction(
+        group["id"], "leg-1", target_sent_at=100.0
+    )
+
+    # The retract went to the retired roster (alice and bob), not to
+    # the namesake's members (alice and carol).
+    assert response["ok"] is True
+    assert {r["to"] for r in response["results"]} == {
+        alice.hexhash,
+        bob.hexhash,
+    }
+    assert set(calls) == {alice.hexhash, bob.hexhash}
+
+
 def test_send_group_retraction_needs_the_shared_send_time(tmp_path):
     node, _, _, _ = _group_reaction_node(tmp_path)
     with pytest.raises(NodeError, match="shared send time"):

@@ -5972,7 +5972,14 @@ class TauNode:
                 "leg send time, so this one cannot be retracted"
             )
         if isinstance(group, str):
-            group = self.groups.find(group)
+            # Resolve an exact id exactly: a retired id reaches its
+            # retained roster, never a same-named live group — the
+            # name fallback in find() must not hijack a retract to
+            # another group's members (see GroupStore.get_retired).
+            record = self.groups.get(group)
+            if record is None:
+                record = self.groups.get_retired(group)
+            group = record if record is not None else self.groups.find(group)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         if not members:

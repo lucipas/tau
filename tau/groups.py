@@ -253,6 +253,7 @@ class GroupStore:
         self._lock = threading.Lock()
         self._groups: Dict[str, Dict[str, Any]] = {}
         self._retired: List[str] = []
+        self._retired_groups: Dict[str, Dict[str, Any]] = {}
         self._left: List[Dict[str, Any]] = []
         self._load()
 
@@ -286,6 +287,17 @@ class GroupStore:
                 if entry not in seen:
                     seen.add(entry)
                     self._retired.append(entry)
+        retired_groups = raw.get("retired_groups")
+        self._retired_groups = {}
+        if isinstance(retired_groups, list):
+            for entry in retired_groups:
+                group = _valid_group(entry)
+                # Only a record whose id is still retired is kept: a
+                # roster that came back to life is live again, and a
+                # record from a file that predates retention (or one
+                # whose id was never retired) must not linger.
+                if group is not None and group["id"] in self._retired:
+                    self._retired_groups[group["id"]] = group
         left = raw.get("left")
         self._left = []
         if isinstance(left, list):
@@ -319,6 +331,7 @@ class GroupStore:
             {
                 "groups": list(self._groups.values()),
                 "retired": self._retired,
+                "retired_groups": list(self._retired_groups.values()),
                 "left": self._left,
             },
             mode=0o600,
@@ -326,17 +339,22 @@ class GroupStore:
 
     def _snapshot(
         self,
-    ) -> "tuple[Dict[str, Dict[str, Any]], List[str], List[Dict[str, Any]]]":
+    ) -> "tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Dict[str, Any]], List[Dict[str, Any]]]":
         """In-memory state before a mutation, for rollback on a failed save.
 
         A shallow copy is enough: mutations replace whole records, they
         never edit a stored group dict in place.
         """
-        return (dict(self._groups), list(self._retired), list(self._left))
+        return (
+            dict(self._groups),
+            list(self._retired),
+            dict(self._retired_groups),
+            list(self._left),
+        )
 
     def _restore(
         self,
-        snapshot: "tuple[Dict[str, Dict[str, Any]], List[str], List[Dict[str, Any]]]",
+        snapshot: "tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Dict[str, Any]], List[Dict[str, Any]]]",
     ) -> None:
         """Restore the state captured by :meth:`_snapshot`.
 
@@ -345,10 +363,41 @@ class GroupStore:
         state in place, so a group whose first write failed would stay
         visible until restart.
         """
-        groups, retired, left = snapshot
+        groups, retired, retired_groups, left = snapshot
         self._groups = dict(groups)
         self._retired = list(retired)
+        self._retired_groups = dict(retired_groups)
         self._left = list(left)
+
+    def _retire(self, group: Dict[str, Any]) -> None:
+        """Remember a replaced group's roster for retracts of its messages.
+
+        Called with the lock held, inside a transaction: the id joins
+        ``_retired`` (so a replayed old message cannot re-pin the
+        roster) and the full record joins ``_retired_groups`` (so a
+        message sent under that id can still be retracted — the
+        fan-out needs that exact roster, never the successor's, whose
+        recipients may differ).  The oldest retirement is forgotten
+        first when the cap is hit, record and id together.
+        """
+        group_id = group["id"]
+        if group_id not in self._retired:
+            self._retired.append(group_id)
+            if len(self._retired) > MAX_RETIRED_GROUPS:
+                dropped = self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
+                del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
+                for old_id in dropped:
+                    self._retired_groups.pop(old_id, None)
+        self._retired_groups[group_id] = dict(group)
+
+    def _unretire(self, group_id: str) -> None:
+        """Lift a retirement: the id is live again, so its retained record goes too.
+
+        Called with the lock held, inside a transaction.
+        """
+        if group_id in self._retired:
+            self._retired.remove(group_id)
+        self._retired_groups.pop(group_id, None)
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -441,7 +490,7 @@ class GroupStore:
             if group["id"] in self._retired:
                 # The roster is live again (recreated after a roster
                 # change), so it must not stay retired.
-                self._retired.remove(group["id"])
+                self._unretire(group["id"])
             try:
                 self._save()
             except OSError:
@@ -507,14 +556,11 @@ class GroupStore:
             snapshot = self._snapshot()
             del self._groups[existing["id"]]
             self._groups[new_id] = candidate
-            if existing["id"] not in self._retired:
-                self._retired.append(existing["id"])
-                if len(self._retired) > MAX_RETIRED_GROUPS:
-                    del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
+            self._retire(existing)
             if new_id in self._retired:
                 # The roster is live again (a member re-added restores
                 # the original roster), so it must not stay retired.
-                self._retired.remove(new_id)
+                self._unretire(new_id)
             try:
                 self._save()
             except OSError:
@@ -637,14 +683,11 @@ class GroupStore:
             snapshot = self._snapshot()
             del self._groups[existing["id"]]
             self._groups[new_id] = candidate
-            if existing["id"] not in self._retired:
-                self._retired.append(existing["id"])
-                if len(self._retired) > MAX_RETIRED_GROUPS:
-                    del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
+            self._retire(existing)
             if new_id in self._retired:
                 # The name is live again (renamed back to it), so the
                 # old id must not stay retired.
-                self._retired.remove(new_id)
+                self._unretire(new_id)
             try:
                 self._save()
             except OSError:
@@ -953,10 +996,7 @@ class GroupStore:
             for other in replaced.values():
                 del self._groups[other["id"]]
             for other in predecessors:
-                if other["id"] not in self._retired:
-                    self._retired.append(other["id"])
-                    if len(self._retired) > MAX_RETIRED_GROUPS:
-                        del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
+                self._retire(other)
             if existing is not None:
                 refreshed = False
                 updates: Dict[str, Any] = {}
@@ -1036,7 +1076,7 @@ class GroupStore:
             self._groups[candidate["id"]] = candidate
             if restored and candidate["id"] in self._retired:
                 # A creator restore brings the id back to life.
-                self._retired.remove(candidate["id"])
+                self._unretire(candidate["id"])
             try:
                 self._save()
             except OSError as exc:
@@ -1158,6 +1198,23 @@ class GroupStore:
         """One group by id, or ``None``."""
         with self._lock:
             group = self._groups.get(group_id.lower())
+        return dict(group) if group is not None else None
+
+    def get_retired(self, group_id: str) -> Optional[Dict[str, Any]]:
+        """The retained record of a retired group, or ``None``.
+
+        Reloads from disk first, so a retirement by another process
+        is seen.  Retract paths use this when the live lookup misses:
+        a roster change retires the old id, but messages sent under
+        it still carry it, and the fan-out needs that exact historical
+        roster — never the successor's, whose recipients may differ.
+        This is an exact-id lookup only: a retired id that also
+        matches a live group's name never resolves to that other
+        group.  A group retired before retention landed carries no
+        record and still returns ``None``.
+        """
+        with self._transaction():
+            group = self._retired_groups.get(group_id.lower())
         return dict(group) if group is not None else None
 
     def find(self, query: str) -> Optional[Dict[str, Any]]:
