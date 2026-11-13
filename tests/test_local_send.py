@@ -405,7 +405,7 @@ def test_send_running_timeout_bounds_slow_reply(tmp_path):
         start = time.monotonic()
         with pytest.raises(LocalIPCUnavailable):
             send_running(
-                tmp_path, timeout=0.2, op="send", target="alice", text="hi"
+                tmp_path, reply_timeout=0.2, op="send", target="alice", text="hi"
             )
         assert time.monotonic() - start < 2.0
     finally:
