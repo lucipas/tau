@@ -1290,18 +1290,22 @@ def pinned_group(
     misses, so a retired id that is also another group's name would
     resolve to that group.  Authorization and roster filtering must
     never use the wrong group's roster, so a record whose id does not
-    match the requested id is treated as no roster at all.  Returns
-    ``None`` when nothing is pinned for that exact id.
+    match the requested id is treated as no roster at all.  A retired
+    id falls back to its retained record: a message sent under the
+    old roster is still authorized against the roster it was sent
+    to — otherwise a retract after a roster change could never reach
+    the members still holding the message, even though the sender
+    fanned it out to them.  Returns ``None`` when nothing is pinned
+    for that exact id.
     """
     try:
         group = groups.find(group_id)
     except ValueError:
-        return None
-    if not isinstance(group, dict):
-        return None
-    if str(group.get("id") or "").lower() != str(group_id).lower():
-        return None
-    return group
+        group = None
+    if isinstance(group, dict):
+        if str(group.get("id") or "").lower() == str(group_id).lower():
+            return group
+    return groups.get_retired(group_id)
 
 
 def pinned_rosters(

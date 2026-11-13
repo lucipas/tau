@@ -3767,6 +3767,98 @@ def test_retract_deletes_the_senders_own_group_message(tmp_path):
     assert node.mailbox.is_retracted(sender_hash, "msg-1") is True
 
 
+def test_retract_deletes_group_message_after_rename(tmp_path):
+    # Regression test (CodeRabbit Major on PR #327): the recipient
+    # processed a rename, so the original group left the active store
+    # — but its roster is retained, and the sender's retract must
+    # still authorize against that roster instead of answering
+    # not_a_member.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    members = ["ab" * 16, sender_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    _seed_group_copy(
+        node, group=group, author=sender_hash, sent_at=100.0, message_id="msg-1"
+    )
+    renamed_id = derive_group_id("ab" * 16, "road trip", members)
+    assert (
+        node.groups.record(
+            renamed_id,
+            "road trip",
+            members,
+            creator="ab" * 16,
+            sender="ab" * 16,
+            renamed_from=[group],
+        )
+        is not None
+    )
+    assert node.groups.get(group) is None
+    assert node.groups.get_retired(group) is not None
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_retract_still_refuses_non_member_after_rename(tmp_path):
+    # The retained roster authorizes the members it names — and no
+    # one else.  With no stored copy, the group-context path checks
+    # membership before recording a marker: an outsider still gets
+    # not_a_member after a rename, and no marker is recorded for them.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    outsider = RNS.Identity()
+    members = ["ab" * 16, sender_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    renamed_id = derive_group_id("ab" * 16, "road trip", members)
+    assert (
+        node.groups.record(
+            renamed_id,
+            "road trip",
+            members,
+            creator="ab" * 16,
+            sender="ab" * 16,
+            renamed_from=[group],
+        )
+        is not None
+    )
+    assert node.groups.get_retired(group) is not None
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            outsider,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=sender_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=outsider,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert (
+        node.mailbox.is_group_retracted(
+            destination_hash(outsider).hex(), group, 100.0
+        )
+        is False
+    )
+
+
 def test_retract_resolves_group_copy_by_context(tmp_path):
     # Group sends carry a different wire id per leg: the retract names
     # the author's leg id, not this node's copy.  The signed group

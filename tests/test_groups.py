@@ -1715,6 +1715,25 @@ def test_group_store_retired_group_record_is_retained(tmp_path):
     assert store.get_retired(group["id"])["members"] == [OWN_HASH, OTHER_HASH]
 
 
+def test_pinned_group_falls_back_to_retained_record(tmp_path):
+    from tau.groups import pinned_group
+
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert pinned_group(store, group["id"]) == group
+    store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    # Retired, but still pinned for authorization: the retained
+    # roster is the one messages sent under the id were sent to.
+    retained = pinned_group(store, group["id"])
+    assert retained is not None
+    assert retained["id"] == group["id"]
+    assert retained["members"] == [OWN_HASH, OTHER_HASH]
+    # Nothing pinned at all stays nothing.
+    assert pinned_group(store, "00" * 16) is None
+
+
 def test_group_store_retired_record_drops_when_roster_returns(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
