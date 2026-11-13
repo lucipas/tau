@@ -183,6 +183,11 @@ class FakeNode:
         self.group_retractions = []
         self.group_retract_failures = {}
         self.group_retract_cancelled = []
+        self.group_edits = []
+        self.group_edit_failures = {}
+        self.group_edit_cancelled = []
+        self.group_edit_requeued = []
+        self.group_edit_local_errors = []
         self.group_refusals = set()
         self.groups = GroupStore(groups_path)
         self.groups.create(
@@ -486,6 +491,66 @@ class FakeNode:
             "target": message_id,
             "id": "retract-1",
             "cancelled_queued": list(self.group_retract_cancelled),
+            "results": results,
+        }
+
+    def send_group_edit(
+        self,
+        group,
+        message_id,
+        text,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        target_sent_at=None,
+    ):
+        # Mirrors send_group_retraction, but an edit carries the new
+        # text and the signed edit time: a member in
+        # group_edit_failures answers with that error instead of a
+        # delivery, queued legs are reported back in
+        # group_edit_cancelled / group_edit_requeued, and a local
+        # copy failure is reported in group_edit_local_errors.
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        self.group_edits.append(
+            (group["name"], message_id, target_sent_at, text)
+        )
+        names = {PEER_HASH: "alice", BOB_HASH: "bob"}
+        results = []
+        for member in group["members"]:
+            if member in self.group_edit_failures:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "ok": False,
+                        "error": self.group_edit_failures[member],
+                        "id": "edit-1",
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "delivered": True,
+                        "edited": True,
+                        "id": "edit-1",
+                        "rtt": 0.009,
+                    }
+                )
+        return {
+            "ok": all(result.get("delivered") for result in results)
+            and not self.group_edit_local_errors,
+            "local_errors": list(self.group_edit_local_errors),
+            "v": 1,
+            "group": group["id"],
+            "name": group["name"],
+            "target": message_id,
+            "id": "edit-1",
+            "sent_at": 2000.0,
+            "cancelled_queued": list(self.group_edit_cancelled),
+            "requeued": list(self.group_edit_requeued),
             "results": results,
         }
 
@@ -9052,6 +9117,318 @@ def test_retract_message_endpoint_rejects_inbound_and_queued(bridge, node):
     assert "still queued" in payload["error"]["message"]
 
 
+def test_edit_message_endpoint_edits_group_message(bridge, node):
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(bridge, node, crew["id"])
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["edited"] is True
+    assert payload["message"]["id"] == entries[0]["id"]
+    assert payload["message"]["text"] == "hello again"
+    assert payload["message"]["edited_at"] == 2000.0
+    assert [entry["id"] for entry in payload["messages"]] == [
+        entry["id"] for entry in entries
+    ]
+    assert all(
+        entry["text"] == "hello again" and entry["edited_at"] == 2000.0
+        for entry in payload["messages"]
+    )
+    assert payload["group"] == crew["id"]
+    assert payload["cancelled_queued"] == []
+    assert payload["requeued"] == []
+    assert [result["to"] for result in payload["results"]] == [
+        PEER_HASH,
+        BOB_HASH,
+    ]
+    assert node.group_edits == [("crew", "wire-alice", 1000.0, "hello again")]
+    # Every leg takes the new text with the edited marker.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello again",
+        "hello again",
+    ]
+    assert all(
+        entry["edited_at"] == 2000.0 for entry in feed["messages"]
+    )
+    edited_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert [event["message"]["id"] for event in edited_events] == [
+        entry["id"] for entry in entries
+    ]
+
+
+def test_edit_message_endpoint_edits_group_message_after_roster_change(
+    bridge, node
+):
+    crew = node.groups.list_groups()[0]
+    old_id = crew["id"]
+    # A rename retires the id the message was sent under, with the
+    # same roster: the edit must still fan out to that roster.
+    node.groups.rename(old_id, "road trip", created_by=PEER_HASH)
+    assert node.groups.get(old_id) is None
+    assert node.groups.get_retired(old_id) is not None
+    entries = _sent_group_console_entries(bridge, node, old_id)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["group"] == old_id
+    assert [result["to"] for result in payload["results"]] == [
+        PEER_HASH,
+        BOB_HASH,
+    ]
+    assert node.group_edits == [("crew", "wire-alice", 1000.0, "hello again")]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello again",
+        "hello again",
+    ]
+
+
+def test_edit_message_endpoint_keeps_group_bubbles_on_partial_fanout(
+    bridge, node
+):
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(bridge, node, crew["id"])
+    node.group_edit_failures = {BOB_HASH: "no route to peer"}
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 502
+    assert "bob" in payload["error"]["message"]
+    assert "no route to peer" in payload["error"]["message"]
+    assert "retry the edit" in payload["error"]["message"]
+    # A failed edit never rewrites the local copies: both bubbles
+    # keep the old text, so the members still holding it stay
+    # retryable.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello",
+        "hello",
+    ]
+    assert all("edited_at" not in entry for entry in feed["messages"])
+    assert not [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+
+
+def test_edit_message_endpoint_requeues_queued_group_leg(bridge, node):
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(
+        bridge,
+        node,
+        crew["id"],
+        second_status="queued",
+        second_wire_id="mail-bob-1",
+    )
+    node.group_edit_cancelled = ["mail-bob-1"]
+    node.group_edit_requeued = ["mail-bob-1"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    # A queued leg must not refuse the edit: the fan-out cancels and
+    # re-queues it with the edited text, so both bubbles update.
+    assert status == 200
+    assert payload["cancelled_queued"] == ["mail-bob-1"]
+    assert payload["requeued"] == ["mail-bob-1"]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello again",
+        "hello again",
+    ]
+
+
+def test_edit_message_endpoint_rejects_unknown_group(bridge, node):
+    _sent_console_entry(bridge, node, wire_id="wire-1", group="ab" * 16)
+    status, _, payload = _json(
+        bridge, "/api/messages/edit", method="POST", body={"id": 1, "text": "fixed"}
+    )
+    assert status == 400
+    assert "unknown group" in payload["error"]["message"]
+
+
+def test_edit_message_endpoint_rejects_group_message_with_no_wire_id(
+    bridge, node
+):
+    crew = node.groups.list_groups()[0]
+    for member, name in ((PEER_HASH, "alice"), (BOB_HASH, "bob")):
+        bridge._append_message(
+            direction="out",
+            peer=member,
+            peer_name=name,
+            text="hello",
+            sent_at=1000.0,
+            received_at=1001.0,
+            status="failed",
+            wire_id=None,
+            group=crew["id"],
+            group_name="crew",
+        )
+    status, _, payload = _json(
+        bridge, "/api/messages/edit", method="POST", body={"id": 1, "text": "fixed"}
+    )
+    assert status == 400
+    assert "never delivered" in payload["error"]["message"]
+
+
+def test_edit_message_endpoint_refuses_group_message_with_no_leg_send_time(
+    bridge, node
+):
+    # A console entry restored from before group edits landed
+    # carries its write time, which members cannot match: they would
+    # answer delivered with edited False, and the fan-out would
+    # still update the local copies.  Refuse instead, and keep the
+    # bubbles.
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(
+        bridge, node, crew["id"], omit_leg_sent_at=True
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 400
+    assert "no leg send time" in payload["error"]["message"]
+    assert node.group_edits == []
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello",
+        "hello",
+    ]
+
+
+def test_edit_message_endpoint_uses_stored_leg_send_time(
+    bridge, node
+):
+    # The entry's time drifted from the stored shared time: the
+    # fan-out must carry the stored time the members can match,
+    # while the update still rewrites the feed's legs.
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(
+        bridge, node, crew["id"], sent_at=1001.0, leg_sent_at=1000.0
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert node.group_edits == [("crew", "wire-alice", 1000.0, "hello again")]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello again",
+        "hello again",
+    ]
+
+
+def test_edit_message_endpoint_refuses_group_message_when_only_inbound_record_matches(
+    bridge, node
+):
+    # The sent copy is pruned, so resolve() answers the leg id with
+    # an inbound record instead: its time is not this node's shared
+    # send time, so the edit is refused — and the received record is
+    # never rewritten.
+    crew = node.groups.list_groups()[0]
+    node.inbox.append(
+        {
+            "id": "wire-alice",
+            "destination": PEER_HASH,
+            "direction": "in",
+            "from": "alice",
+            "text": "hello",
+            "kind": "group",
+            "group": crew["id"],
+            "group_name": "crew",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+        }
+    )
+    entries = []
+    for member, name, wire_id in (
+        (PEER_HASH, "alice", "wire-alice"),
+        (BOB_HASH, "bob", "wire-bob"),
+    ):
+        entries.append(
+            bridge._append_message(
+                direction="out",
+                peer=member,
+                peer_name=name,
+                text="hello",
+                sent_at=1000.0,
+                received_at=1001.0,
+                status="delivered",
+                wire_id=wire_id,
+                group=crew["id"],
+                group_name="crew",
+            )
+        )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 400
+    assert "no leg send time" in payload["error"]["message"]
+    assert node.group_edits == []
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello",
+        "hello",
+    ]
+    assert len(node.inbox.export_document()["messages"]) == 1
+
+
+def test_edit_message_endpoint_reports_local_copy_failure_after_group_fanout(
+    bridge, node
+):
+    # Every member received the edit, but this node's own copies did
+    # not update: the bubbles keep the old text so a retry re-sends
+    # the edit and retries the local update.
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(bridge, node, crew["id"])
+    node.group_edit_local_errors = ["sent copy not updated: disk full"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 502
+    assert "local copies" in payload["error"]["message"]
+    assert "disk full" in payload["error"]["message"]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello",
+        "hello",
+    ]
+
+
 def _received_console_entry(bridge, *, text="hello there"):
     bridge.record_inbound(
         {
@@ -10378,7 +10755,8 @@ def test_edit_message_endpoint_rejects_guards(bridge, node):
     assert status == 400
     assert "must not be empty" in payload["error"]["message"]
 
-    # A group message cannot be edited in v1.
+    # A group message under an unknown group is refused by the group
+    # path (the fan-out itself is covered by the group-edit tests).
     bridge._append_message(
         direction="out",
         peer=PEER_HASH,
@@ -10398,7 +10776,7 @@ def test_edit_message_endpoint_rejects_guards(bridge, node):
         body={"id": 3, "text": "fixed"},
     )
     assert status == 400
-    assert "group messages cannot be edited" in payload["error"]["message"]
+    assert "unknown group" in payload["error"]["message"]
 
     # A file record has no text to edit.
     bridge._append_message(
