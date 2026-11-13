@@ -8600,17 +8600,29 @@ def _retract_group_message(
     # too, or `tau messages --sent` keeps showing the retracted text.
     # Each leg has its own sent record, so drop every leg id.
     mailbox = Mailbox(config.mailbox_path)
-    for leg_id in target.get("leg_ids") or [target["id"]]:
-        mailbox.discard_sent(str(leg_id))
-    # Record the retraction durably too, BEFORE telling the serving
-    # console, so the bridge drops the console's outbound legs when
-    # it loads after a retract that ran while `tau serve` was down
-    # (see Mailbox.record_sent_group_retraction) — and so a console
-    # notification that hangs or fails cannot leave the retraction
-    # unrecorded.  Only on a full fan-out: a partial fan-out keeps
-    # the local copy — and the console legs — so the retract stays
-    # retryable.
-    mailbox.record_sent_group_retraction(group_id, float(leg_sent_at))
+    try:
+        for leg_id in target.get("leg_ids") or [target["id"]]:
+            mailbox.discard_sent(str(leg_id))
+        # Record the retraction durably too, BEFORE telling the serving
+        # console, so the bridge drops the console's outbound legs when
+        # it loads after a retract that ran while `tau serve` was down
+        # (see Mailbox.record_sent_group_retraction) — and so a console
+        # notification that hangs or fails cannot leave the retraction
+        # unrecorded.  Only on a full fan-out: a partial fan-out keeps
+        # the local copy — and the console legs — so the retract stays
+        # retryable.
+        mailbox.record_sent_group_retraction(group_id, float(leg_sent_at))
+    except Exception:
+        # The remote retract and inbox delete already succeeded, so the
+        # serving console must still drop its copy even though the
+        # durable record failed; then surface the original failure.
+        if via_running_node:
+            _drop_console_copy_via_running_node(
+                config,
+                group=group_id,
+                target_sent_at=float(leg_sent_at),
+            )
+        raise
     if via_running_node:
         # The inbox copy is gone and the marker is durable, so the
         # serving console may drop its legs now.
@@ -8881,8 +8893,18 @@ def cmd_retract(args: argparse.Namespace) -> int:
     # retraction unrecorded — the marker heals a missed drop at the
     # next serve start.
     mailbox = Mailbox(config.mailbox_path)
-    mailbox.discard_sent(str(target["id"]))
-    mailbox.record_sent_retraction(str(target["id"]))
+    try:
+        mailbox.discard_sent(str(target["id"]))
+        mailbox.record_sent_retraction(str(target["id"]))
+    except Exception:
+        # The remote retract and inbox delete already succeeded, so the
+        # serving console must still drop its copy even though the
+        # durable record failed; then surface the original failure.
+        if via_running_node:
+            _drop_console_copy_via_running_node(
+                config, message_id=str(target["id"])
+            )
+        raise
     if via_running_node:
         # The inbox copy is gone and the marker is durable, so the
         # serving console may drop its own copy now.
