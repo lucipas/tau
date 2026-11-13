@@ -10939,6 +10939,85 @@ def test_delete_message_rollback_survives_append_to_full_log(
         bridge.stop()
 
 
+def test_delete_sent_group_rollback_keeps_all_legs_on_full_log(
+    node, tmp_path, monkeypatch
+):
+    """Rolling back a group delete never evicts a restored leg.
+
+    The group legs are the oldest entries in a full log, and an append
+    refills the log while the strict write is in flight. Every leg must
+    come back, not just the last one restored.
+    """
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        group = "ab" * 16
+        for wire_id, peer in (("leg-1", PEER_HASH), ("leg-2", "ef" * 16)):
+            bridge._append_message(
+                direction="out",
+                peer=peer,
+                peer_name="peer",
+                text="group hello",
+                sent_at=100.0,
+                received_at=101.0,
+                status="delivered",
+                group=group,
+                wire_id=wire_id,
+            )
+        leg_ids = [
+            message["id"]
+            for message in bridge._messages
+            if message.get("group") == group
+        ]
+        # Fill the rest of the bounded log with console-only messages.
+        next_id = max(leg_ids) + 1
+        while len(bridge._messages) < bridge._messages.maxlen:
+            bridge._messages.append(
+                {
+                    "id": next_id,
+                    "direction": "inbound",
+                    "peer": PEER_HASH,
+                    "peer_name": "alice",
+                    "text": f"m{next_id}",
+                    "sent_at": float(next_id),
+                    "received_at": float(next_id),
+                    "status": "received",
+                }
+            )
+            next_id += 1
+        bridge._next_message_id = next_id
+
+        def _append_then_fail(*args, **kwargs):
+            # Two appends refill the log during the failing write.
+            for _ in range(2):
+                bridge._messages.append(
+                    {
+                        "id": bridge._next_message_id,
+                        "direction": "inbound",
+                        "peer": PEER_HASH,
+                        "peer_name": "alice",
+                        "text": "late",
+                        "sent_at": 900.0,
+                        "received_at": 900.0,
+                        "status": "received",
+                    }
+                )
+                bridge._next_message_id += 1
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            "tau.webapi.atomic_write_json", _append_then_fail
+        )
+        with pytest.raises(OSError, match="disk full"):
+            bridge.delete_sent_group(group, 100.0)
+        restored = [m["id"] for m in bridge._messages if m.get("group") == group]
+        assert restored == leg_ids
+        ids = [message["id"] for message in bridge._messages]
+        assert ids == sorted(ids)
+        assert len(ids) == bridge._messages.maxlen
+    finally:
+        bridge.stop()
+
+
 def test_reaction_annotates_matching_history_entry(bridge):
     record = {
         "from": "alice",

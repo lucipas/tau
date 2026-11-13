@@ -4438,24 +4438,37 @@ class WebBridge:
                 self._save_messages_locked(strict=True)
             except Exception:
                 with self._lock:
+                    # A message can arrive while the strict write is in
+                    # flight (the save lock serialises saves, not
+                    # appends), refilling a bounded log. Make room for
+                    # the whole batch up front by evicting the oldest
+                    # entries that are NOT part of this batch, so that
+                    # no restored leg is evicted by a later insertion
+                    # in this same rollback.
+                    if self._messages.maxlen is not None:
+                        overflow = (
+                            len(self._messages)
+                            + len(entries)
+                            - self._messages.maxlen
+                        )
+                        if overflow > 0:
+                            survivors = []
+                            for message in self._messages:
+                                if (
+                                    overflow > 0
+                                    and message.get("id") not in targets
+                                ):
+                                    overflow -= 1
+                                    continue
+                                survivors.append(message)
+                            self._messages.clear()
+                            self._messages.extend(survivors)
                     # Restore in id order, so each entry lands at the
                     # position the single-entry restore would have
-                    # chosen for it.  A message can arrive while the
-                    # strict write is in flight (the save lock
-                    # serialises saves, not appends): with a full log
-                    # the append refills the deque, and insert() on a
-                    # full bounded deque raises instead of restoring
-                    # the entry. Drop the oldest first — the same
-                    # eviction an append would have caused — so the
-                    # restore always lands.
+                    # chosen for it.
                     for target, removed in sorted(
                         entries, key=lambda pair: pair[0]
                     ):
-                        if (
-                            self._messages.maxlen is not None
-                            and len(self._messages) >= self._messages.maxlen
-                        ):
-                            self._messages.popleft()
                         index = next(
                             (
                                 i
