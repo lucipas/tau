@@ -5253,6 +5253,7 @@ class TauNode:
         queue: bool = True,
         in_reply_to: Optional[Dict[str, Any]] = None,
         expires_at: Optional[float] = None,
+        send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -5281,6 +5282,15 @@ class TauNode:
         exactly like a direct message: it travels in every leg's
         payload, a queued leg expires at the same deadline, and the
         receiver purges the message once it passes.
+
+        ``send_after`` schedules the message (epoch seconds), exactly
+        like a direct message: instead of attempting delivery now,
+        every leg is queued with the not-before time and the outbox
+        delivers it once that time arrives — even when the member is
+        reachable.  The scheduled time is local only; each member
+        sees a normal group message, and the legs keep the shared
+        send time, so reactions and retracts still name the logical
+        message.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -5290,6 +5300,31 @@ class TauNode:
                 "group record has no creator; delete it and re-create it"
             )
         normalized = normalize_message(text)
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                )
+            try:
+                send_after = float(send_after)
+            except (OverflowError, ValueError) as exc:
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                ) from exc
+            if not math.isfinite(send_after):
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                )
+        if send_after is not None and not queue:
+            # A scheduled message is queued by definition: with queueing
+            # refused there is nowhere for it to wait until its time, so
+            # refuse the combination before anything is recorded.
+            raise NodeError(
+                "cannot schedule a message without queueing: "
+                "send_after requires queue=True"
+            )
         reply_to = clean_in_reply_to(in_reply_to)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
@@ -5334,6 +5369,56 @@ class TauNode:
             ) from exc
         for member in members:
             message_id = generate_message_id()
+            if send_after is not None:
+                # Scheduled: no delivery attempt now, even when the
+                # member is reachable — the leg leaves the outbox only
+                # once its time arrives (every flush path honours it).
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=bytes.fromhex(member),
+                        text=normalized,
+                        to_name="",
+                        message_id=message_id,
+                        expires_at=expires_at,
+                        group=context,
+                        sent_at=sent_at,
+                        send_after=send_after,
+                        in_reply_to=reply_to,
+                    )
+                except MailboxError as queue_exc:
+                    # A schedule past the message's own expiry is
+                    # rejected at enqueue: report the leg as failed and
+                    # keep going, so the legs already queued are not
+                    # lost with the exception.
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": f"could not queue: {queue_exc}",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.wire_sent_at,
+                )
+                sent_leg_ids.append(entry.id)
+                any_queued = True
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "queued": True,
+                        "id": entry.id,
+                        "expires_at": entry.expires_at,
+                        "send_after": entry.send_after,
+                    }
+                )
+                continue
             payload = encode_group_message(
                 normalized,
                 message_id=message_id,

@@ -444,6 +444,111 @@ def test_send_group_message_uses_one_send_time_for_all_legs(
     assert len(sent_ats) == 1
 
 
+def test_send_group_message_with_send_after_queues_without_delivery(
+    tmp_path, monkeypatch
+):
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    send_after = time.time() + 3600.0
+    response = node.send_group_message("crew", "later", send_after=send_after)
+
+    # No delivery attempt at all — both members are reachable, but
+    # the message is scheduled, not sent.
+    assert calls == []
+    assert response["ok"] is True
+    assert len(response["results"]) == 2
+    assert all(result.get("queued") for result in response["results"])
+    assert all(
+        result.get("send_after") == send_after for result in response["results"]
+    )
+    for result in response["results"]:
+        entry = node.mailbox.get_outbox(result["id"])
+        assert entry is not None
+        assert entry.send_after == send_after
+        assert entry.is_due() is False
+        assert entry.group_id == group["id"]
+    # The shared send time is one value for the whole send, so a
+    # reaction or retract can still name the logical message.
+    sent_ats = {
+        node.mailbox.get_outbox(result["id"]).wire_sent_at
+        for result in response["results"]
+    }
+    assert len(sent_ats) == 1
+    # The sent message is still recorded in local history.
+    sent = node.inbox.list_messages(direction="out")
+    assert len(sent) == 1
+    assert sent[0]["kind"] == "group"
+    assert sent[0]["leg_sent_at"] == response["sent_at"]
+
+
+def test_send_group_message_rejects_nonfinite_send_after(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_group_message("crew", "hi", send_after=float("nan"))
+    with pytest.raises(NodeError):
+        node.send_group_message("crew", "hi", send_after="tomorrow")
+
+
+def test_send_group_message_rejects_scheduled_send_without_queue(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    # queue=False means "do not queue": a scheduled message is queued
+    # by definition, so the combination is refused before anything is
+    # recorded or enqueued.
+    with pytest.raises(NodeError, match="without queueing"):
+        node.send_group_message(
+            "crew", "later", queue=False, send_after=time.time() + 3600.0
+        )
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.inbox.list_messages(direction="out") == []
+
+
+def test_send_group_message_failed_schedule_leaves_no_sent_record(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    # A schedule past the message's own expiry is rejected at enqueue.
+    send_after = time.time() + 3600.0
+    expires_at = time.time() + 60.0
+    response = node.send_group_message(
+        "crew", "never", send_after=send_after, expires_at=expires_at
+    )
+    # Every leg failed to queue, so nothing was recorded or enqueued.
+    assert response["ok"] is False
+    assert all(not result.get("queued") for result in response["results"])
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.inbox.list_messages(direction="out") == []
+
+
+def test_flush_never_delivers_scheduled_group_leg_early(
+    tmp_path, monkeypatch
+):
+    node, _, alice, _ = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message("crew", "later", send_after=send_after)
+    assert all(result.get("queued") for result in response["results"])
+    delivered = []
+    monkeypatch.setattr(
+        node,
+        "_deliver_entry",
+        lambda p, e, timeout, **kwargs: (
+            delivered.append(e.id),
+            True,
+        )[1],
+    )
+    monkeypatch.setattr(
+        node,
+        "_deposit_entry",
+        lambda p, e, timeout, **kwargs: False,
+    )
+    peer = make_peer("alice")
+    node._flush_peer(peer, 1.0, respect_backoff=False)
+    assert delivered == []
+    assert len(node.mailbox.outbox_list()) == 2
+
+
 def test_send_group_reaction_signs_group_context(tmp_path, monkeypatch):
     from tau.protocol import REQUEST_REACT, parse_reaction
 
