@@ -444,6 +444,192 @@ def test_send_group_message_uses_one_send_time_for_all_legs(
     assert len(sent_ats) == 1
 
 
+def test_send_group_message_with_send_after_queues_without_delivery(
+    tmp_path, monkeypatch
+):
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    send_after = time.time() + 3600.0
+    response = node.send_group_message("crew", "later", send_after=send_after)
+
+    # No delivery attempt at all — both members are reachable, but
+    # the message is scheduled, not sent.
+    assert calls == []
+    assert response["ok"] is True
+    assert len(response["results"]) == 2
+    assert all(result.get("queued") for result in response["results"])
+    assert all(
+        result.get("send_after") == send_after for result in response["results"]
+    )
+    for result in response["results"]:
+        entry = node.mailbox.get_outbox(result["id"])
+        assert entry is not None
+        assert entry.send_after == send_after
+        assert entry.is_due() is False
+        assert entry.group_id == group["id"]
+    # The shared send time is one value for the whole send, so a
+    # reaction or retract can still name the logical message.
+    sent_ats = {
+        node.mailbox.get_outbox(result["id"]).wire_sent_at
+        for result in response["results"]
+    }
+    assert len(sent_ats) == 1
+    # The sent message is still recorded in local history.
+    sent = node.inbox.list_messages(direction="out")
+    assert len(sent) == 1
+    assert sent[0]["kind"] == "group"
+    assert sent[0]["leg_sent_at"] == response["sent_at"]
+
+
+def test_send_group_message_scheduled_resolves_unregistered_member(
+    tmp_path, monkeypatch
+):
+    node, group, alice, _ = _group_reaction_node(tmp_path)
+    carol = make_peer("carol")
+    node.groups.update_members(
+        group["id"],
+        [alice.hexhash, carol.hexhash, node.destination.hexhash],
+        created_by=alice.hexhash,
+    )
+    # Carol is in the roster but has never announced, so the sweep
+    # would never visit her: resolve her now, like a direct send does.
+    resolved = []
+
+    def fake_resolve(target, *, timeout=10.0):
+        resolved.append(target)
+        if target == carol.hexhash:
+            # Discovered now: register her, like wait_for_peer does.
+            node.registry.upsert(
+                carol.destination_hash, carol.public_key, name="carol"
+            )
+            return carol
+        found = node.registry.get(bytes.fromhex(target))
+        if found is not None:
+            return found
+        raise NodeError("no announce")
+
+    monkeypatch.setattr(node, "resolve_peer", fake_resolve)
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    send_after = time.time() + 3600.0
+    response = node.send_group_message("crew", "later", send_after=send_after)
+
+    # Still no delivery attempt — only the resolve, for registration.
+    assert calls == []
+    assert response["ok"] is True
+    assert {r["to"] for r in response["results"]} == {
+        alice.hexhash,
+        carol.hexhash,
+    }
+    assert all(result.get("queued") for result in response["results"])
+    assert set(resolved) == {alice.hexhash, carol.hexhash}
+    assert node.registry.get(carol.destination_hash) is not None
+    carol_result = [
+        result for result in response["results"] if result["to"] == carol.hexhash
+    ][0]
+    assert carol_result["to_name"] == "carol"
+    assert carol_result["send_after"] == send_after
+
+
+def test_send_group_message_scheduled_to_undiscovered_member_still_queues(
+    tmp_path, monkeypatch
+):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+
+    def _no_peer(*args, **kwargs):
+        raise NodeError("no announce")
+
+    monkeypatch.setattr(node, "resolve_peer", _no_peer)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("no delivery attempt for a scheduled leg")
+
+    monkeypatch.setattr(node, "_request", _boom)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message("crew", "later", send_after=send_after)
+
+    # A member who cannot be resolved yet still queues: the announce
+    # path registers them and triggers a round when they appear,
+    # exactly as for an unreachable member.
+    assert response["ok"] is True
+    assert all(result.get("queued") for result in response["results"])
+    assert all(result.get("to_name") == "" for result in response["results"])
+    for result in response["results"]:
+        entry = node.mailbox.get_outbox(result["id"])
+        assert entry is not None
+        assert entry.send_after == send_after
+
+
+def test_send_group_message_rejects_nonfinite_send_after(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_group_message("crew", "hi", send_after=float("nan"))
+    with pytest.raises(NodeError):
+        node.send_group_message("crew", "hi", send_after="tomorrow")
+
+
+def test_send_group_message_rejects_scheduled_send_without_queue(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    # queue=False means "do not queue": a scheduled message is queued
+    # by definition, so the combination is refused before anything is
+    # recorded or enqueued.
+    with pytest.raises(NodeError, match="without queueing"):
+        node.send_group_message(
+            "crew", "later", queue=False, send_after=time.time() + 3600.0
+        )
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.inbox.list_messages(direction="out") == []
+
+
+def test_send_group_message_failed_schedule_leaves_no_sent_record(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    # A schedule past the message's own expiry is rejected at enqueue.
+    send_after = time.time() + 3600.0
+    expires_at = time.time() + 60.0
+    response = node.send_group_message(
+        "crew", "never", send_after=send_after, expires_at=expires_at
+    )
+    # Every leg failed to queue, so nothing was recorded or enqueued.
+    assert response["ok"] is False
+    assert all(not result.get("queued") for result in response["results"])
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.inbox.list_messages(direction="out") == []
+
+
+def test_flush_never_delivers_scheduled_group_leg_early(
+    tmp_path, monkeypatch
+):
+    node, _, alice, _ = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message("crew", "later", send_after=send_after)
+    assert all(result.get("queued") for result in response["results"])
+    delivered = []
+    monkeypatch.setattr(
+        node,
+        "_deliver_entry",
+        lambda p, e, timeout, **kwargs: (
+            delivered.append(e.id),
+            True,
+        )[1],
+    )
+    monkeypatch.setattr(
+        node,
+        "_deposit_entry",
+        lambda p, e, timeout, **kwargs: False,
+    )
+    peer = make_peer("alice")
+    node._flush_peer(peer, 1.0, respect_backoff=False)
+    assert delivered == []
+    assert len(node.mailbox.outbox_list()) == 2
+
+
 def test_send_group_reaction_signs_group_context(tmp_path, monkeypatch):
     from tau.protocol import REQUEST_REACT, parse_reaction
 
@@ -818,6 +1004,37 @@ def test_send_group_edit_fans_out_one_signed_payload(tmp_path, monkeypatch):
     sent = {record["id"]: record for record in node.mailbox.sent_list()}
     assert sent["leg-1"]["text"] == "fixed here"
     assert sent["leg-2"]["text"] == "fixed here"
+
+
+def test_send_group_edit_defers_scheduled_legs(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message("crew", "typo here", send_after=send_after)
+    assert all(result.get("queued") for result in response["results"])
+    sent_at = response["sent_at"]
+    record = node.inbox.list_messages(direction="out")[0]
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("no live edit may go out for a scheduled leg")
+
+    monkeypatch.setattr(node, "_request", _boom)
+    edit = node.send_group_edit(
+        "crew", record["id"], "fixed here", target_sent_at=sent_at
+    )
+
+    # No live edit went out: both members are covered by their
+    # re-queued legs, which already carry the edited text — so the
+    # replacement text stays unsent until the scheduled time.
+    assert edit["ok"] is True
+    assert {r["to"] for r in edit["results"]} == {alice.hexhash, bob.hexhash}
+    assert all(r.get("deferred") for r in edit["results"])
+    assert all(r.get("delivered") for r in edit["results"])
+    legs = node.mailbox.outbox_list()
+    assert len(legs) == 2
+    assert all(leg.text == "fixed here" for leg in legs)
+    assert all(leg.send_after == send_after for leg in legs)
+    # The sender's own copies took the new text too.
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "fixed here"
 
 
 def test_send_group_edit_reports_failed_leg_and_keeps_the_local_copy(

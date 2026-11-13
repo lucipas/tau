@@ -4832,6 +4832,13 @@ def test_group_messages_quote_falls_back_to_excerpt(tmp_path, capsys):
     assert "agreed, different leg" in out
 
 
+class _FakeGroupMailbox:
+    """Stand-in mailbox: every queued leg is still queued."""
+
+    def get_outbox(self, message_id):
+        return object()
+
+
 class _FakeGroupSendNode:
     """Stub TauNode for `tau group send`: records the reply reference."""
 
@@ -4842,7 +4849,9 @@ class _FakeGroupSendNode:
 
         self.config = config
         self.groups = GroupStore(config.groups_path)
+        self.mailbox = _FakeGroupMailbox()
         self.sent: list = []
+        self.send_kwargs: list = []
         _FakeGroupSendNode.instances.append(self)
 
     def start(self):
@@ -4853,6 +4862,29 @@ class _FakeGroupSendNode:
 
     def send_group_message(self, group, text, **kwargs):
         self.sent.append((group, text, kwargs.get("in_reply_to")))
+        self.send_kwargs.append(kwargs)
+        if kwargs.get("send_after") is not None:
+            return {
+                "ok": True,
+                "group": group["id"],
+                "name": group["name"],
+                "results": [
+                    {
+                        "to": "cd" * 16,
+                        "to_name": "alice",
+                        "queued": True,
+                        "id": "f" * 32,
+                        "send_after": kwargs["send_after"],
+                    },
+                    {
+                        "to": "ab" * 16,
+                        "to_name": "bob",
+                        "queued": True,
+                        "id": "e" * 32,
+                        "send_after": kwargs["send_after"],
+                    },
+                ],
+            }
         return {
             "ok": True,
             "group": group["id"],
@@ -4940,6 +4972,117 @@ def test_group_send_reply_to_empty_is_an_error(tmp_path, capsys, monkeypatch):
     )
     assert code == 1
     assert "must not be empty" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def _run_group_send(tmp_path, monkeypatch, argv):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    return (
+        cli.main(["group", "send", "--data-dir", str(data_dir), *argv]),
+        group,
+    )
+
+
+def test_parser_group_send_delay():
+    parser = cli.build_parser()
+    args = parser.parse_args(["group", "send", "--delay", "5m", "weekend", "hello"])
+    assert args.delay == "5m"
+
+
+def test_group_send_delay_schedules_without_delivery(
+    tmp_path, capsys, monkeypatch
+):
+    before = time.time()
+    code, _ = _run_group_send(
+        tmp_path, monkeypatch, ["--delay", "2h", "weekend", "later"]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    send_after = node.send_kwargs[0]["send_after"]
+    assert before + 7200 <= send_after <= time.time() + 7200
+    out = capsys.readouterr().out
+    assert "scheduled for alice" in out
+    assert "scheduled for bob" in out
+    assert "sends in" in out
+    assert "it will be delivered at its scheduled time" in out
+
+
+def test_group_send_delay_json_reports_send_after(tmp_path, capsys, monkeypatch):
+    code, _ = _run_group_send(
+        tmp_path, monkeypatch, ["--json", "--delay", "5m", "weekend", "later"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["send_after"] is not None
+    assert payload["send_after"] > time.time()
+    assert all(result.get("send_after") for result in payload["results"])
+
+
+def test_group_send_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
+    code, _ = _run_group_send(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "5m", "--no-queue", "weekend", "hi"],
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
+    code, _ = _run_group_send(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "2h", "--expire", "1h", "weekend", "hi"],
+    )
+    assert code == 2
+    assert "--delay must be shorter than --expire" in capsys.readouterr().err
+    code, _ = _run_group_send(
+        tmp_path, monkeypatch, ["--delay", "soon", "weekend", "hi"]
+    )
+    assert code == 1
+    assert "invalid --delay duration" in capsys.readouterr().err
+    code, _ = _run_group_send(
+        tmp_path, monkeypatch, ["--delay", "30d", "weekend", "hi"]
+    )
+    assert code == 2
+    assert "--delay must be at most 29d23h" in capsys.readouterr().err
+    # 29d fits and queues.
+    code, _ = _run_group_send(
+        tmp_path, monkeypatch, ["--delay", "29d", "weekend", "hi"]
+    )
+    assert code == 0
+
+
+def test_group_send_delay_no_queue_rejects_before_reading_input(
+    tmp_path, capsys, monkeypatch
+):
+    # No message text: reading stdin would block, so the conflict must
+    # be rejected before _read_message runs.
+    class _BlockingStdin:
+        def read(self, *args, **kwargs):
+            raise AssertionError("stdin was read")
+
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr("sys.stdin", _BlockingStdin())
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--delay",
+            "5m",
+            "--no-queue",
+            "weekend",
+        ]
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
     assert _FakeGroupSendNode.instances == []
 
 
@@ -6140,6 +6283,52 @@ def test_edit_sends_group_edit_to_every_member(
     node = _FakeRetractNode.instances[0]
     assert node.started is False
     assert node.sent == [("ab" * 16, "m-10", "group fixed", 100.0)]
+
+
+def test_edit_reports_deferred_scheduled_member(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, recipient_hash = _seed_sent_group_message(tmp_path)
+
+    class _DeferredEditNode(_FakeRetractNode):
+        def send_group_edit(
+            self,
+            group,
+            message_id,
+            text,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+        ):
+            self.sent.append((group, message_id, text, target_sent_at))
+            return {
+                "ok": True,
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": ["m-10"],
+                "requeued": ["m-10"],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "deferred": True,
+                        "edited": False,
+                        "id": "e-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _DeferredEditNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "group fixed"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edit is queued for alice" in out
+    assert "re-queued leg" in out
 
 
 def test_edit_keeps_group_copy_when_a_member_is_unreachable(

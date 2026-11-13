@@ -1435,6 +1435,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="disappearing message: purge it from the receivers' inboxes "
         "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
     )
+    group_send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
     group_send.set_defaults(func=cmd_group_send)
 
     group_send_file = group_sub.add_parser(
@@ -8148,12 +8155,39 @@ def cmd_group_rename(args: argparse.Namespace) -> int:
 
 
 def cmd_group_send(args: argparse.Namespace) -> int:
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None and getattr(args, "no_queue", False):
+        # Reject the conflict before reading input, so an invalid
+        # command never blocks waiting on stdin.
+        print(
+            "error: --delay cannot be combined with --no-queue",
+            file=sys.stderr,
+        )
+        return 2
     text = _read_message(args)
     config = _make_config(args)
     expires_at = None
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
         expires_at = time.time() + _parse_duration(expire_text)
+    send_after = None
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
+        if expires_at is not None and send_after >= expires_at:
+            print(
+                "error: --delay must be shorter than --expire — the "
+                "message would expire before it is sent",
+                file=sys.stderr,
+            )
+            return 2
     delivered_ids: Set[str] = set()
     in_reply_to = None
     if getattr(args, "reply_to", None) is not None:
@@ -8176,6 +8210,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             queue=not getattr(args, "no_queue", False),
             in_reply_to=in_reply_to,
             expires_at=expires_at,
+            send_after=send_after,
         )
         # One-shot send: give reachable members a brief chance to take
         # a queued leg before this process exits.
@@ -8203,6 +8238,8 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
     if expires_at is not None:
         response["expires_at"] = expires_at
+    if send_after is not None:
+        response["send_after"] = send_after
     if _json_mode(args):
         _emit(response, True)
         return exit_code
@@ -8212,10 +8249,16 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     for result in delivered:
         print(f"delivered to {result.get('to_name') or result['to'][:8]}")
     for result in queued:
-        print(
-            f"queued for {result.get('to_name') or result['to'][:8]}"
-            " — they are unreachable right now"
-        )
+        if result.get("send_after"):
+            print(
+                f"scheduled for {result.get('to_name') or result['to'][:8]}"
+                f" — sends in {_ago(result['send_after'] - time.time())}"
+            )
+        else:
+            print(
+                f"queued for {result.get('to_name') or result['to'][:8]}"
+                " — they are unreachable right now"
+            )
     for result in failed:
         print(
             f"failed for {result.get('to_name') or result['to'][:8]}:"
@@ -8223,6 +8266,9 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         )
     if expires_at is not None:
         print(f"disappears in {_ago(expires_at - time.time())}")
+    if queued and all(result.get("send_after") for result in queued):
+        print("  it will be delivered at its scheduled time;")
+        print("  check `tau outbox` for the queue, or just leave a node serving")
     return exit_code
 
 
@@ -8732,7 +8778,15 @@ def _edit_group_message(
             peer = registry.get(member)
             name = peer.display_name if peer is not None else short_hash(member)
             if result.get("delivered"):
-                if result.get("edited"):
+                if result.get("deferred"):
+                    # The member's leg is still scheduled: the edit
+                    # rides the re-queued leg instead of a live edit,
+                    # so the replacement text stays unsent until then.
+                    print(
+                        f"edit is queued for {name} — it goes out with "
+                        "the scheduled message at its time"
+                    )
+                elif result.get("edited"):
                     print(
                         f"edited your group message "
                         f"{_safe_id_prefix(str(target['id']))} for {name}"

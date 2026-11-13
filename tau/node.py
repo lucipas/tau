@@ -5253,6 +5253,7 @@ class TauNode:
         queue: bool = True,
         in_reply_to: Optional[Dict[str, Any]] = None,
         expires_at: Optional[float] = None,
+        send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -5281,6 +5282,15 @@ class TauNode:
         exactly like a direct message: it travels in every leg's
         payload, a queued leg expires at the same deadline, and the
         receiver purges the message once it passes.
+
+        ``send_after`` schedules the message (epoch seconds), exactly
+        like a direct message: instead of attempting delivery now,
+        every leg is queued with the not-before time and the outbox
+        delivers it once that time arrives — even when the member is
+        reachable.  The scheduled time is local only; each member
+        sees a normal group message, and the legs keep the shared
+        send time, so reactions and retracts still name the logical
+        message.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -5290,6 +5300,31 @@ class TauNode:
                 "group record has no creator; delete it and re-create it"
             )
         normalized = normalize_message(text)
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                )
+            try:
+                send_after = float(send_after)
+            except (OverflowError, ValueError) as exc:
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                ) from exc
+            if not math.isfinite(send_after):
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                )
+        if send_after is not None and not queue:
+            # A scheduled message is queued by definition: with queueing
+            # refused there is nowhere for it to wait until its time, so
+            # refuse the combination before anything is recorded.
+            raise NodeError(
+                "cannot schedule a message without queueing: "
+                "send_after requires queue=True"
+            )
         reply_to = clean_in_reply_to(in_reply_to)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
@@ -5334,6 +5369,93 @@ class TauNode:
             ) from exc
         for member in members:
             message_id = generate_message_id()
+            # One deadline bounds each leg, and the budget is per leg:
+            # the stages of a single delivery (resolve, path, link,
+            # response) share the leg's budget instead of each taking
+            # the full timeout, but one member's leg must not consume
+            # another's.  The roster is in sorted-hash order, so who
+            # runs first is arbitrary — with a single fan-out-wide
+            # deadline, an offline member sorted first burned the whole
+            # budget waiting for a path that could never appear, and
+            # every later (reachable) member was queued without an
+            # attempt.  A per-leg deadline reserves the full attempt
+            # window for every member while keeping each leg capped at
+            # ``timeout``.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if send_after is not None:
+                # Scheduled: no delivery attempt now, even when the
+                # member is reachable — the leg leaves the outbox only
+                # once its time arrives (every flush path honours it).
+                # Resolve the member first, like a direct send does: a
+                # roster member this node has never heard from is not
+                # in the registry, and the sweep only visits registry
+                # peers, so without the resolve the leg could sit
+                # undelivered after its time even though Reticulum
+                # already knows the member.  A failed resolve still
+                # queues the leg — the announce path registers the
+                # member and triggers a round when it appears, exactly
+                # as for an unreachable member.
+                peer = None
+                if budget > 0.0:
+                    try:
+                        peer = self.resolve_peer(
+                            member,
+                            timeout=min(
+                                discover_timeout
+                                if discover_timeout is not None
+                                else min(timeout, 10.0),
+                                budget,
+                            ),
+                        )
+                    except NodeError:
+                        peer = None
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=bytes.fromhex(member),
+                        text=normalized,
+                        to_name=peer.display_name if peer is not None else "",
+                        message_id=message_id,
+                        expires_at=expires_at,
+                        group=context,
+                        sent_at=sent_at,
+                        send_after=send_after,
+                        in_reply_to=reply_to,
+                    )
+                except MailboxError as queue_exc:
+                    # A schedule past the message's own expiry is
+                    # rejected at enqueue: report the leg as failed and
+                    # keep going, so the legs already queued are not
+                    # lost with the exception.
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": f"could not queue: {queue_exc}",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.wire_sent_at,
+                )
+                sent_leg_ids.append(entry.id)
+                any_queued = True
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "queued": True,
+                        "id": entry.id,
+                        "expires_at": entry.expires_at,
+                        "send_after": entry.send_after,
+                    }
+                )
+                continue
             payload = encode_group_message(
                 normalized,
                 message_id=message_id,
@@ -5349,20 +5471,6 @@ class TauNode:
                 expires_at=expires_at,
             )
             peer: Optional[Peer] = None
-            # One deadline bounds each leg, and the budget is per leg:
-            # the stages of a single delivery (resolve, path, link,
-            # response) share the leg's budget instead of each taking
-            # the full timeout, but one member's leg must not consume
-            # another's.  The roster is in sorted-hash order, so who
-            # runs first is arbitrary — with a single fan-out-wide
-            # deadline, an offline member sorted first burned the whole
-            # budget waiting for a path that could never appear, and
-            # every later (reachable) member was queued without an
-            # attempt.  A per-leg deadline reserves the full attempt
-            # window for every member while keeping each leg capped at
-            # ``timeout``.
-            deadline = time.monotonic() + timeout
-            budget = _remaining(deadline) or 0.0
             if budget <= 0.0:
                 # Out of time for another attempt — but the leg must
                 # not be dropped to the deadline: queueing is local
@@ -6528,6 +6636,11 @@ class TauNode:
         cancelled: List[str] = []
         requeue_failed: List[Dict[str, Any]] = []
         requeued: List[str] = []
+        # Members whose leg is still scheduled, by hex hash to the
+        # display name on the leg: their re-queued leg already
+        # carries the edited text, so they get no live edit (see the
+        # fan-out below).
+        scheduled_members: Dict[str, str] = {}
         for entry in self.mailbox.outbox_list():
             if (
                 entry.group_id == group["id"]
@@ -6561,6 +6674,8 @@ class TauNode:
                             edited_at=float(payload["sent_at"]),
                         )
                         requeued.append(entry.id)
+                        if entry.is_scheduled():
+                            scheduled_members[entry.to_hex] = entry.to_name
                     except MailboxError as queue_exc:
                         requeue_failed.append(
                             {
@@ -6573,6 +6688,27 @@ class TauNode:
                         )
         results: List[Dict[str, Any]] = list(requeue_failed)
         for member in members:
+            if member in scheduled_members:
+                # Still scheduled: the re-queued leg carries the edited
+                # text and goes out at its time, so no live edit here —
+                # sending one now would hand the member the replacement
+                # text before the scheduled time (the receiver stores
+                # it as a pending edit).  The member counts as covered:
+                # the leg they will receive already carries the edited
+                # text, so the sender's own copies still update — and
+                # the deferred entry keeps them in the results, so the
+                # report names every member.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": scheduled_members[member],
+                        "delivered": True,
+                        "deferred": True,
+                        "edited": False,
+                        "id": edit_id,
+                    }
+                )
+                continue
             # One deadline bounds each leg, exactly as in
             # send_group_message: the stages of a single delivery
             # share the leg's budget, but one member's leg must not
