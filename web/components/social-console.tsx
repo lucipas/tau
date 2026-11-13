@@ -11,6 +11,7 @@ import type {
   TanImportResult,
   TanLiker,
   TanPost,
+  TanScheduledPost,
   TanSuggestion,
   TanVerifyReport,
 } from "@/lib/types";
@@ -54,6 +55,26 @@ export function SocialConsole() {
       );
     });
   }, [showPinned, tan.loadPinned]);
+  // Whether the feed shows the scheduled list instead of the timeline.
+  // Queued posts load on demand, not on the feed's poll tick.
+  const [showScheduled, setShowScheduled] = useState(false);
+  useEffect(() => {
+    if (!showScheduled) return;
+    tan.loadScheduled().catch((caught) => {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "could not load scheduled posts",
+      );
+    });
+  }, [showScheduled, tan.loadScheduled]);
+  // Seconds until a composed post publishes, or null to post now. A
+  // delay applies to one post only: the next post goes now unless the
+  // picker is set again. Quotes never take a delay — the queue format
+  // has no quote field — so picking a quote clears it (see onQuote).
+  const [postLaterSeconds, setPostLaterSeconds] = useState<number | null>(
+    null,
+  );
   // Hashes with a delete request in flight. While one is pending the card
   // shows a disabled state instead of the confirm button, so a second
   // click cannot report the already-deleted post as a failure.
@@ -99,6 +120,24 @@ export function SocialConsole() {
         setQuoteTarget((current) =>
           current?.hash === submittedHash ? null : current,
         );
+        return;
+      }
+      if (postLaterSeconds !== null) {
+        const submittedText = text.trim();
+        const submittedReply = replyTarget?.hash;
+        const submittedDelay = postLaterSeconds;
+        await tan.schedulePost(submittedText, submittedDelay, submittedReply);
+        // Clear only the composer state that still belongs to this post.
+        setText((current) => (current.trim() === submittedText ? "" : current));
+        setReplyTarget((current) =>
+          current?.hash === submittedReply ? null : current,
+        );
+        setPostLaterSeconds(null);
+        // Show the queue the post just joined, so the scheduled post is
+        // visible and cancellable instead of disappearing into the file.
+        setShowSaved(false);
+        setShowPinned(false);
+        setShowScheduled(true);
         return;
       }
       await tan.publish(text.trim(), replyTarget?.hash);
@@ -270,6 +309,30 @@ export function SocialConsole() {
       setDeleting((previous) => {
         const next = new Set(previous);
         next.delete(post.hash);
+        return next;
+      });
+    }
+  }
+
+  // Ids with a cancel request in flight. While one is pending the card
+  // shows a disabled state instead of the cancel button, so a second
+  // click cannot report the already-cancelled post as a failure.
+  const [cancelling, setCancelling] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+
+  async function submitCancelScheduled(post: TanScheduledPost) {
+    if (cancelling.has(post.id)) return;
+    setCancelling((previous) => new Set(previous).add(post.id));
+    setError(null);
+    try {
+      await tan.cancelScheduled(post.id);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not cancel");
+    } finally {
+      setCancelling((previous) => {
+        const next = new Set(previous);
+        next.delete(post.id);
         return next;
       });
     }
@@ -747,6 +810,8 @@ export function SocialConsole() {
                             ? "saved"
                           : showPinned
                             ? "pinned"
+                          : showScheduled
+                            ? "scheduled"
                           : tan.showMentions
                             ? "mentions"
                             : tan.view === "top"
@@ -762,6 +827,8 @@ export function SocialConsole() {
                             ? `${tan.saved.length} post(s)`
                           : showPinned
                             ? `${tan.pinned.length} post(s)`
+                          : showScheduled
+                            ? `${tan.scheduled.length} post(s)`
                           : tan.showMentions
                             ? `${shown.length} post(s)`
                             : `${tan.posts.length} post(s)`}
@@ -782,6 +849,7 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowScheduled(false);
                           tan.setShowMentions(false);
                           tan.setView("timeline");
                           tan.setAll(false);
@@ -790,6 +858,7 @@ export function SocialConsole() {
                           tan.view === "timeline" &&
                           !showSaved &&
                           !showPinned &&
+                          !showScheduled &&
                           !tan.showMentions &&
                           !tan.all
                             ? "bg-signal/15 text-signal"
@@ -803,6 +872,7 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowScheduled(false);
                           tan.setShowMentions(false);
                           tan.setView("timeline");
                           tan.setAll(true);
@@ -811,6 +881,7 @@ export function SocialConsole() {
                           tan.view === "timeline" &&
                           !showSaved &&
                           !showPinned &&
+                          !showScheduled &&
                           !tan.showMentions &&
                           tan.all
                             ? "bg-signal/15 text-signal"
@@ -824,6 +895,7 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowScheduled(false);
                           tan.setShowMentions(false);
                           tan.setView("top");
                         }}
@@ -831,6 +903,7 @@ export function SocialConsole() {
                           tan.view === "top" &&
                           !showSaved &&
                           !showPinned &&
+                          !showScheduled &&
                           !tan.showMentions
                             ? "bg-signal/15 text-signal"
                             : "text-mist"
@@ -843,6 +916,7 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowScheduled(false);
                           tan.setShowMentions(true);
                           tan.setView("timeline");
                         }}
@@ -859,6 +933,7 @@ export function SocialConsole() {
                           tan.setView("timeline");
                           setShowSaved(true);
                           setShowPinned(false);
+                          setShowScheduled(false);
                         }}
                         className={`rounded px-2 py-1 ${
                           showSaved ? "bg-signal/15 text-signal" : "text-mist"
@@ -873,12 +948,28 @@ export function SocialConsole() {
                           tan.setView("timeline");
                           setShowSaved(false);
                           setShowPinned(true);
+                          setShowScheduled(false);
                         }}
                         className={`rounded px-2 py-1 ${
                           showPinned ? "bg-signal/15 text-signal" : "text-mist"
                         }`}
                       >
                         pinned
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          tan.setShowMentions(false);
+                          tan.setView("timeline");
+                          setShowSaved(false);
+                          setShowPinned(false);
+                          setShowScheduled(true);
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          showScheduled ? "bg-signal/15 text-signal" : "text-mist"
+                        }`}
+                      >
+                        scheduled
                       </button>
                     </div>
                     )}
@@ -964,6 +1055,27 @@ export function SocialConsole() {
                             : "load more pinned posts"}
                         </button>
                       ) : null}
+                    </>
+                  )
+                ) : showScheduled && !showingSearch ? (
+                  tan.scheduled.length === 0 ? (
+                    tan.scheduledLoading ? (
+                      <p className="py-8 text-center font-mono text-[11px] text-mist">
+                        loading scheduled posts…
+                      </p>
+                    ) : (
+                      <ScheduledEmptyState />
+                    )
+                  ) : (
+                    <>
+                      {tan.scheduled.map((post) => (
+                        <ScheduledPostCard
+                          key={post.id}
+                          post={post}
+                          onCancel={submitCancelScheduled}
+                          cancelling={cancelling.has(post.id)}
+                        />
+                      ))}
                     </>
                   )
                 ) : showSaved && !showingSearch ? (
@@ -1053,6 +1165,10 @@ export function SocialConsole() {
                       onQuote={(target) => {
                         setReplyTarget(null);
                         setQuoteTarget(target);
+                        // Quotes never take a delay: drop a delay picked
+                        // before the quote so it cannot ride along (and
+                        // the picker is gone anyway).
+                        setPostLaterSeconds(null);
                       }}
                       onDelete={submitDelete}
                       onEdit={submitEdit}
@@ -1134,7 +1250,11 @@ export function SocialConsole() {
                 >
                   <SendIcon className="h-4 w-4" />
                   <span className="hidden sm:inline">
-                    {tan.posting ? "signing…" : "post"}
+                    {tan.posting
+                      ? "signing…"
+                      : postLaterSeconds !== null
+                        ? "schedule"
+                        : "post"}
                   </span>
                 </button>
               </div>
@@ -1153,6 +1273,30 @@ export function SocialConsole() {
                 <span className="font-mono text-[10px] text-mist/60">
                   {text.length}/2000
                 </span>
+                {quoteTarget ? null : (
+                  <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+                    post later
+                    <select
+                      aria-label="Post later"
+                      value={
+                        postLaterSeconds === null
+                          ? ""
+                          : String(postLaterSeconds)
+                      }
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setPostLaterSeconds(value === "" ? null : Number(value));
+                      }}
+                      className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
+                    >
+                      <option value="">now</option>
+                      <option value="1800">in 30 minutes</option>
+                      <option value="3600">in 1 hour</option>
+                      <option value="10800">in 3 hours</option>
+                      <option value="86400">in 24 hours</option>
+                    </select>
+                  </label>
+                )}
               </div>
             </section>
           </div>
@@ -1487,6 +1631,60 @@ function PinnedEmptyState() {
         shared with peers.
       </p>
     </div>
+  );
+}
+
+function ScheduledEmptyState() {
+  return (
+    <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
+      <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
+        🕐
+      </div>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        No scheduled posts yet
+      </h3>
+      <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
+        Pick a delay in the composer to publish a post later. The serving
+        node publishes it when the time comes — the same queue{" "}
+        <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
+          tau tan scheduled
+        </code>{" "}
+        lists.
+      </p>
+    </div>
+  );
+}
+
+function ScheduledPostCard({
+  post,
+  onCancel,
+  cancelling,
+}: {
+  post: TanScheduledPost;
+  onCancel: (post: TanScheduledPost) => void;
+  cancelling: boolean;
+}) {
+  return (
+    <article className="rounded-xl border border-line/70 bg-void/40 px-3 py-2.5">
+      <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-100">
+        {post.text}
+      </p>
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+        <p className="font-mono text-[10px] text-mist">
+          publishes {formatDateTime(post.publish_at)}
+          {post.reply_to ? ` · in reply to ${shortHash(post.reply_to)}` : ""}
+          {post.attempts > 0 ? ` · ${post.attempts} attempt(s)` : ""}
+        </p>
+        <button
+          type="button"
+          onClick={() => void onCancel(post)}
+          disabled={cancelling}
+          className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-rose-400/50 hover:text-rose-300 disabled:opacity-50"
+        >
+          {cancelling ? "cancelling…" : "cancel"}
+        </button>
+      </div>
+    </article>
   );
 }
 

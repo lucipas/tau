@@ -6736,6 +6736,185 @@ def test_tan_quote_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_schedule_post_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    # No Tan app attached: scheduling writes the queue file, like the
+    # CLI, and the serving node publishes due entries later.
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"text": "hello later", "send_in": 3600},
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["text"] == "hello later"
+        assert scheduled["reply_to"] is None
+        assert abs(scheduled["publish_at"] - (time.time() + 3600)) < 5
+
+        # A reply resolves its target to the full hash, like tan_post.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"text": "agreed", "reply_to": post["hash"][:16], "send_in": 60},
+        )
+        assert status == 200
+        assert payload["scheduled"]["reply_to"] == post["hash"]
+
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload["count"] == 2
+        # Soonest first: the 60-second reply precedes the hour-out post.
+        assert [item["text"] for item in payload["scheduled"]] == [
+            "agreed",
+            "hello later",
+        ]
+
+        # Cancelling by id prefix drops only that entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/cancel-scheduled",
+            method="POST",
+            body={"id": scheduled["id"][:8]},
+        )
+        assert status == 200
+        assert payload["cancelled"]["id"] == scheduled["id"]
+        assert payload["deleted_local"] is False
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["text"] == "agreed"
+
+        # Cancelling an unknown id is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/cancel-scheduled",
+            method="POST",
+            body={"id": "zz" * 8},
+        )
+        assert status == 400
+        assert "no scheduled post" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_schedule_post_rejects_bad_requests(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        for body, fragment in [
+            ({"text": "  ", "send_in": 60}, "text"),
+            ({"text": "hello"}, "send_in"),
+            ({"text": "hello", "send_in": 0}, "send_in"),
+            ({"text": "hello", "send_in": -10}, "send_in"),
+            ({"text": "hello", "send_in": 604801}, "send_in"),
+            ({"text": "hello", "send_in": "soon"}, "send_in"),
+            ({"text": "hello", "send_in": True}, "send_in"),
+            ({"text": "hello", "send_in": 60, "reply_to": "cd" * 32}, "unknown post"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/schedule", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+        # Nothing queued by the rejected requests.
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload == {"scheduled": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_tan_cancel_scheduled_post_removes_stored_post(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.scheduled_posts import (
+        ScheduledPost,
+        load_scheduled_posts,
+        new_scheduled_post_id,
+        save_scheduled_posts,
+    )
+    from tau.tangents.tan import TanApp, create_post, deleted_targets, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "already stored", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    # A publish attempt already stored the signed post, so the queue
+    # entry carries its hash — the case the CLI's cancel handles by
+    # removing the stored copy too.
+    queue = load_scheduled_posts(node.config.scheduled_posts_path)
+    entry = ScheduledPost(
+        id=new_scheduled_post_id(),
+        text="already stored",
+        publish_at=time.time() + 3600,
+        created_at=time.time(),
+        post_hash=post["hash"],
+    )
+    save_scheduled_posts(node.config.scheduled_posts_path, queue.with_added(entry))
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/cancel-scheduled",
+            method="POST",
+            body={"id": entry.id},
+        )
+        assert status == 200
+        assert payload["cancelled"]["id"] == entry.id
+        assert payload["deleted_local"] is True
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert payload == {"scheduled": [], "count": 0}
+        # The stored post is hidden by a delete entry, like the CLI's
+        # cancel, and the post itself is still in the store.
+        conn = init_db(node.config.social_db_path)
+        try:
+            assert post["hash"] in deleted_targets(conn)
+        finally:
+            conn.close()
+    finally:
+        bridge.stop()
+
+
 def test_peers_marks_blocked_peers(bridge, node):
     from tau.blocklist import BlockList
 

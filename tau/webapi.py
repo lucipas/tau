@@ -82,6 +82,9 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/following followed authors
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post
+    POST /api/tan/schedule schedule a Tan post for later
+    GET  /api/tan/scheduled queued Tan posts, soonest first
+    POST /api/tan/cancel-scheduled cancel a queued Tan post
     POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
@@ -2320,6 +2323,92 @@ class WebBridge:
             finally:
                 conn.close()
         return app.create_post(text, reply_to=reply_to, publish=True)
+
+    def tan_schedule_post(
+        self, text: str, *, reply_to: Optional[str] = None, send_in: float
+    ) -> Dict[str, Any]:
+        """Queue a Tan post for later, like ``tau tan post --delay``.
+
+        Scheduling needs no attached Tan app — the queue file is the
+        same one the CLI writes, and the serving node publishes due
+        entries when it has an app. Only the reply target needs the
+        store, resolved the same way :meth:`tan_post` resolves it.
+        """
+        from .scheduled_posts import schedule_post
+        from .tangents.tan import MAX_GOSSIP_TTL, resolve_post
+
+        if reply_to is not None:
+            conn = self._tan_conn()
+            try:
+                reply_to = resolve_post(conn, reply_to)["hash"]
+            finally:
+                conn.close()
+        config = self.node.config
+        post = schedule_post(
+            config.scheduled_posts_path,
+            text=text,
+            publish_at=time.time() + float(send_in),
+            reply_to=reply_to,
+            ttl=MAX_GOSSIP_TTL,
+            name=getattr(config, "name", None),
+        )
+        return post.to_dict()
+
+    def tan_scheduled_posts(self) -> List[Dict[str, Any]]:
+        """Queued Tan posts, soonest first (the CLI's ``tan scheduled``)."""
+        from .scheduled_posts import load_scheduled_posts
+
+        queue = load_scheduled_posts(self.node.config.scheduled_posts_path)
+        return [post.to_dict() for post in queue.posts]
+
+    def tan_cancel_scheduled_post(self, prefix: str) -> Dict[str, Any]:
+        """Drop one queued Tan post, like ``tau tan cancel-scheduled``.
+
+        When a publish attempt already stored the signed post locally,
+        the stored copy is removed too — dropping only the queue entry
+        would leave it in the local timeline. Returns the cancelled
+        entry and whether a stored post was removed.
+        """
+        from .scheduled_posts import cancel_scheduled_post
+
+        deleted_local = False
+
+        def _delete_stored(post: Any) -> None:
+            nonlocal deleted_local
+            if post.post_hash is None:
+                return
+            from .tangents.tan import TanApp, TanError
+
+            app = self._tan_app()
+            if app is None:
+                # No serving app (serve without --social): build the
+                # same throwaway app the CLI's cancel uses, so the
+                # stored copy can still be removed.
+                from .identity import load_identity
+
+                identity = load_identity(self.node.config.identity_path)
+                if identity is None:
+                    raise WebBridgeError("no identity; run `tau init` first")
+                app = TanApp(
+                    self.node.config,
+                    identity,
+                    name=getattr(self.node.config, "name", None),
+                )
+
+            try:
+                app.delete(post.post_hash)
+            except TanError as exc:
+                if "has been deleted" not in str(exc):
+                    raise
+            else:
+                deleted_local = True
+
+        post = cancel_scheduled_post(
+            self.node.config.scheduled_posts_path,
+            prefix,
+            on_cancel=_delete_stored,
+        )
+        return {"cancelled": post.to_dict(), "deleted_local": deleted_local}
 
     def tan_react(self, target: str, *, liked: bool) -> Dict[str, Any]:
         app = self._tan_app()
@@ -5555,6 +5644,22 @@ def _valid_send_in(value: Any) -> bool:
     return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL - 3600.0
 
 
+def _valid_schedule_in(value: Any) -> bool:
+    """True when ``value`` is a finite delay in (0, MAX_SCHEDULED_POST_DELAY] seconds.
+
+    The cap mirrors the CLI's ``tau tan post --delay`` limit (7 days).
+    Huge JSON integers overflow ``float()``, so the conversion is guarded
+    here instead of raising past the 400 response.
+    """
+    from .scheduled_posts import MAX_SCHEDULED_POST_DELAY
+
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return False
+    return math.isfinite(seconds) and 0 < seconds <= MAX_SCHEDULED_POST_DELAY
+
+
 def _clamped_timeout(value: Any, default: float) -> float:
     """Clamp a request ``timeout`` to [1.0, 120.0] seconds.
 
@@ -5981,6 +6086,21 @@ class _WebHandler(BaseHTTPRequestHandler):
                 posts = self.bridge.tan_posts(limit=limit)
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
                 return
+            if path == "/api/tan/scheduled":
+                try:
+                    scheduled = self.bridge.tan_scheduled_posts()
+                except Exception:
+                    log.exception("failed to load scheduled Tan posts")
+                    self._send_json(
+                        {"error": {"message": "could not load scheduled posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {"scheduled": scheduled, "count": len(scheduled)}, head_only
+                )
+                return
             if path == "/api/tan/rules":
                 from .tangents.tan import ENTRY_KINDS
 
@@ -6367,6 +6487,73 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "post": post}, head_only)
+                return
+            if path == "/api/tan/schedule":
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                reply_to = body.get("reply_to")
+                if reply_to is not None and (
+                    not isinstance(reply_to, str) or not reply_to.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'reply_to' must be a post hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                send_in = body.get("send_in")
+                if (
+                    not isinstance(send_in, (int, float))
+                    or isinstance(send_in, bool)
+                    or not _valid_schedule_in(send_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'send_in' must be a number of "
+                                "seconds (0 < send_in <= 604800)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    scheduled = self.bridge.tan_schedule_post(
+                        text, reply_to=reply_to, send_in=float(send_in)
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "scheduled": scheduled}, head_only)
+                return
+            if path == "/api/tan/cancel-scheduled":
+                target = body.get("id") or body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.tan_cancel_scheduled_post(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
                 return
             if path == "/api/tan/quote":
                 target = body.get("target") or body.get("hash")

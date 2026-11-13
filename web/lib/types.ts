@@ -668,6 +668,39 @@ export interface TanPostResponse {
   post: TanPost;
 }
 
+// One queued Tan post, waiting for its publish time — the shape of
+// `tau.scheduled_posts.ScheduledPost.to_dict()`.
+export interface TanScheduledPost {
+  id: string;
+  text: string;
+  reply_to: string | null;
+  to: string[];
+  ttl: number;
+  publish_at: number;
+  created_at: number;
+  post_hash: string | null;
+  attempts: number;
+  next_attempt_at: number;
+  paused_at: number;
+  pending_peers: string[];
+}
+
+export interface TanScheduleResponse {
+  ok: boolean;
+  scheduled: TanScheduledPost;
+}
+
+export interface TanScheduledResponse {
+  scheduled: TanScheduledPost[];
+  count: number;
+}
+
+export interface TanCancelScheduledResponse {
+  ok: boolean;
+  cancelled: TanScheduledPost;
+  deleted_local: boolean;
+}
+
 export interface TanSyncResponse {
   ok: boolean;
   sync: {
