@@ -1935,6 +1935,7 @@ class Inbox:
         *,
         is_retracted: Optional[Any] = None,
         is_group_retracted: Optional[Any] = None,
+        pending_group_edit: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Merge every message in an export document into the inbox.
 
@@ -2043,6 +2044,31 @@ class Inbox:
                         }
                     )
                     continue
+                if (
+                    pending_group_edit is not None
+                    and record.get("direction") == "in"
+                    and record.get("kind") == "group"
+                    and isinstance(record.get("destination"), str)
+                    and isinstance(record.get("group"), str)
+                    and isinstance(record.get("sent_at"), (int, float))
+                    and not isinstance(record.get("sent_at"), bool)
+                ):
+                    # An edit answered against this copy before it was
+                    # imported: the imported copy lands already edited,
+                    # as a live delivery does (see _handle_group_message).
+                    # A copy already carrying a newer edit keeps its text.
+                    pending = pending_group_edit(
+                        record["destination"],
+                        record["group"],
+                        record["sent_at"],
+                    )
+                    if pending is not None and (
+                        record.get("edited_at") is None
+                        or float(pending["edited_at"])
+                        > float(record["edited_at"])
+                    ):
+                        record["text"] = pending["text"]
+                        record["edited_at"] = pending["edited_at"]
                 seen.add(key)
                 self._messages.append(record)
                 added.append(record)
