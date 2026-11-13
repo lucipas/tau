@@ -135,6 +135,9 @@ def build_bundle(
         if entry.is_scheduled(timestamp):
             # Not due yet: a scheduled leg must not leave the node early
             # inside a bundle.  It is exported once its time has arrived.
+            # Report it as skipped, like an expired entry, instead of
+            # silently leaving it out of the file.
+            skipped.append({"id": entry.id, "reason": "scheduled — not yet due"})
             continue
         peer = registry.get(entry.to)
         if peer is None or not peer.public_key:

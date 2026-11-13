@@ -411,6 +411,44 @@ def test_bundle_skips_unknown_recipient_and_expired(tmp_path):
     }
 
 
+def test_bundle_skips_scheduled_entry_until_due(tmp_path):
+    sender, recipient, _ = _identities()
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="not yet",
+        to_name="bob",
+        message_id="scheduled-1",
+        send_after=2000.0,
+        now=1000.0,
+    )
+    registry = _registry_with(recipient)
+    document, summary = build_bundle(
+        identity=sender,
+        sender_name="alice",
+        mailbox=mailbox,
+        registry=registry,
+        now=1000.0,
+    )
+    # Not due yet: the scheduled leg must not leave the node early
+    # inside a bundle, and the summary says why it was left out.
+    assert summary["mail"] == 0
+    assert document["mail"] == []
+    assert summary["skipped"] == [
+        {"id": "scheduled-1", "reason": "scheduled — not yet due"}
+    ]
+    # Once its time has arrived, the same entry exports normally.
+    document, summary = build_bundle(
+        identity=sender,
+        sender_name="alice",
+        mailbox=mailbox,
+        registry=registry,
+        now=2000.0,
+    )
+    assert summary["mail"] == 1
+    assert summary["skipped"] == []
+
+
 def test_bundle_export_keeps_group_expiry_and_context(tmp_path):
     sender, recipient, third = _identities()
     sender_hash = destination_hash(sender).hex()

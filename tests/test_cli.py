@@ -5053,6 +5053,39 @@ def test_group_send_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch
     assert code == 0
 
 
+def test_group_send_delay_no_queue_rejects_before_reading_input(
+    tmp_path, capsys, monkeypatch
+):
+    # No message text: reading stdin would block, so the conflict must
+    # be rejected before _read_message runs.
+    class _BlockingStdin:
+        def read(self, *args, **kwargs):
+            raise AssertionError("stdin was read")
+
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr("sys.stdin", _BlockingStdin())
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--delay",
+            "5m",
+            "--no-queue",
+            "weekend",
+        ]
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
 def test_direct_reply_target_still_quotes_received_group_message(tmp_path):
     """Narrowing the DM/group boundary: a *received* group message
     from a peer keeps quoting in a DM to that peer, exactly as before
