@@ -2648,8 +2648,15 @@ class TauNode:
                 try:
                     self._record_retraction(caller_hash, retract["target"])
                     if has_group_context:
+                        # Confirmed only when a pinned roster names the
+                        # caller: a marker for a group with no roster
+                        # goes in the unknown pool, so a flood of such
+                        # retracts cannot evict confirmed markers.
                         self.mailbox.record_group_retraction(
-                            caller_hash, group_id, target_sent_at
+                            caller_hash,
+                            group_id,
+                            target_sent_at,
+                            confirmed=pinned is not None,
                         )
                 except Exception as exc:
                     log.warning(
@@ -2711,7 +2718,10 @@ class TauNode:
                 self._record_retraction(caller_hash, target_id, confirmed=True)
                 if has_group_context:
                     self.mailbox.record_group_retraction(
-                        caller_hash, group_id, target_sent_at
+                        caller_hash,
+                        group_id,
+                        target_sent_at,
+                        confirmed=True,
                     )
             except Exception as exc:
                 log.warning(

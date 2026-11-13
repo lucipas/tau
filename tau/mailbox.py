@@ -724,8 +724,15 @@ class Mailbox:
         # message, not one leg's wire id, so a member that has not
         # received its copy yet records the context here; a copy
         # arriving later — live, relayed, or held — still loses to
-        # it (see is_group_retracted).
+        # it (see is_group_retracted).  Confirmed markers guard a
+        # retraction the node verified — against a stored copy, or
+        # against a pinned roster naming the caller; unknown markers
+        # guard a retract for a group the node has no roster for.
+        # They are separate pools so a flood of unknown-group markers
+        # cannot evict a confirmed retraction (see
+        # _evict_group_retracted).
         self._group_retracted: Dict[str, float] = {}
+        self._group_retracted_unknown: Dict[str, float] = {}
         if self.path is not None:
             self.load()
 
@@ -842,6 +849,7 @@ class Mailbox:
             self._retracted = state["retracted"]
             self._retracted_unknown = state["retracted_unknown"]
             self._group_retracted = state["group_retracted"]
+            self._group_retracted_unknown = state["group_retracted_unknown"]
             self._sent = state["sent"]
             self._receipts = state["receipts"]
         log.debug(
@@ -988,6 +996,9 @@ class Mailbox:
         retracted = _parse_retraction_markers(raw.get("retracted"))
         retracted_unknown = _parse_retraction_markers(raw.get("retracted_unknown"))
         group_retracted = _parse_retraction_markers(raw.get("group_retracted"))
+        group_retracted_unknown = _parse_retraction_markers(
+            raw.get("group_retracted_unknown")
+        )
 
         sent: Dict[str, Dict[str, Any]] = {}
         raw_sent = raw.get("sent")
@@ -1083,6 +1094,7 @@ class Mailbox:
             "retracted": retracted,
             "retracted_unknown": retracted_unknown,
             "group_retracted": group_retracted,
+            "group_retracted_unknown": group_retracted_unknown,
             "sent": sent,
             "receipts": receipts,
         }
@@ -1109,6 +1121,9 @@ class Mailbox:
                 "retracted": dict(self._retracted),
                 "retracted_unknown": dict(self._retracted_unknown),
                 "group_retracted": dict(self._group_retracted),
+                "group_retracted_unknown": dict(
+                    self._group_retracted_unknown
+                ),
                 "pending_acks": {
                     holder: list(ids)
                     for holder, ids in self._pending_acks.items()
@@ -1128,7 +1143,8 @@ class Mailbox:
                 "receipts": len(self._receipts),
                 "retracted": len(self._retracted)
                 + len(self._retracted_unknown)
-                + len(self._group_retracted),
+                + len(self._group_retracted)
+                + len(self._group_retracted_unknown),
             }
 
     # -- outbox ------------------------------------------------------------
@@ -1986,6 +2002,7 @@ class Mailbox:
         group_id: str,
         sent_at: float,
         *,
+        confirmed: bool = False,
         now: Optional[float] = None,
     ) -> None:
         """Remember that *sender_hash* retracted a group message.
@@ -1995,19 +2012,59 @@ class Mailbox:
         no per-leg id can guard a copy that has not arrived yet.  It
         lives for the possible delivery lifetime of the message
         (RETRACTED_RETENTION), like a per-message marker, and
-        recording the same retraction again refreshes it.  Eviction
-        at the cap is earliest-expiry first.
+        recording the same retraction again refreshes it.
+
+        With ``confirmed=True`` the retract was verified — it deleted
+        a stored copy, or a pinned roster named the caller — so the
+        marker goes in the confirmed pool; otherwise it guards a
+        group the node has no roster for.  A confirmed marker is
+        never downgraded by a later unconfirmed record for the same
+        message (a retried retract), and eviction at the cap spends
+        unknown markers first (see :meth:`_evict_group_retracted`),
+        so a flood of unknown-group retracts cannot evict another
+        sender's confirmed marker.
         """
         timestamp = now if now is not None else time.time()
         key = _group_retraction_key(sender_hash, group_id, sent_at)
         with self._transaction():
-            self._group_retracted[key] = timestamp + RETRACTED_RETENTION
-            while len(self._group_retracted) > MAX_GROUP_RETRACTED:
+            if confirmed:
+                self._group_retracted_unknown.pop(key, None)
+                self._group_retracted[key] = timestamp + RETRACTED_RETENTION
+            elif key in self._group_retracted:
+                # Already confirmed (e.g. a retried retract): refresh
+                # the confirmed marker, never downgrade it.
+                self._group_retracted[key] = timestamp + RETRACTED_RETENTION
+            else:
+                self._group_retracted_unknown[key] = (
+                    timestamp + RETRACTED_RETENTION
+                )
+            self._evict_group_retracted()
+            self.save()
+
+    def _evict_group_retracted(self) -> None:
+        """Drop earliest-expiry group markers until the pools fit the cap.
+
+        Unknown-group markers go first: they guard retracts for
+        groups the node has no roster for, while confirmed markers
+        guard retractions the node verified.  Only when no unknown
+        marker remains does a confirmed marker give way.  Call with
+        the transaction held.
+        """
+        while (
+            len(self._group_retracted) + len(self._group_retracted_unknown)
+            > MAX_GROUP_RETRACTED
+        ):
+            if self._group_retracted_unknown:
+                oldest = min(
+                    self._group_retracted_unknown.items(),
+                    key=lambda kv: kv[1],
+                )
+                del self._group_retracted_unknown[oldest[0]]
+            else:
                 oldest = min(
                     self._group_retracted.items(), key=lambda kv: kv[1]
                 )
                 del self._group_retracted[oldest[0]]
-            self.save()
 
     def is_group_retracted(
         self,
@@ -2032,8 +2089,11 @@ class Mailbox:
                 )
             except (TypeError, ValueError, OverflowError):
                 return False
-            until = self._group_retracted.get(key)
-            return until is not None and timestamp < until
+            for pool in (self._group_retracted, self._group_retracted_unknown):
+                until = pool.get(key)
+                if until is not None and timestamp < until:
+                    return True
+            return False
 
     # -- pending fetch acknowledgements --------------------------------------
 
@@ -2136,6 +2196,13 @@ class Mailbox:
             ]
             for key in dead_group_retracted:
                 del self._group_retracted[key]
+            dead_group_retracted_unknown = [
+                key
+                for key, until in self._group_retracted_unknown.items()
+                if until <= timestamp
+            ]
+            for key in dead_group_retracted_unknown:
+                del self._group_retracted_unknown[key]
             if (
                 dead_outbox
                 or dead_held
@@ -2146,6 +2213,7 @@ class Mailbox:
                 or dead_retracted
                 or dead_retracted_unknown
                 or dead_group_retracted
+                or dead_group_retracted_unknown
             ):
                 self.save()
             return {
@@ -2157,7 +2225,8 @@ class Mailbox:
                 "dropped_held": len(dead_dropped),
                 "retracted": len(dead_retracted)
                 + len(dead_retracted_unknown)
-                + len(dead_group_retracted),
+                + len(dead_group_retracted)
+                + len(dead_group_retracted_unknown),
             }
 
 

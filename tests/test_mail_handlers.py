@@ -3905,6 +3905,85 @@ def test_retract_records_group_marker_without_a_pinned_roster(tmp_path):
     assert node.inbox.list_messages() == []
 
 
+def test_unknown_group_retracts_do_not_evict_confirmed_marker(
+    tmp_path, monkeypatch
+):
+    # Regression test (CodeRabbit Major on PR #322): retracts for
+    # groups the node has no roster for land in the unknown pool, so
+    # flooding them cannot evict a confirmed marker — a late copy of
+    # the confirmed retract's message still loses to it.
+    monkeypatch.setattr(mailbox_module, "MAX_GROUP_RETRACTED", 2)
+    from tau.protocol import derive_group_id
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    members = ["ab" * 16, sender_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    _seed_group_copy(
+        node, group=group, author=sender_hash, sent_at=100.0, message_id="msg-1"
+    )
+
+    # Confirmed marker: retract the stored copy.
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            sender,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=sender_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+
+    # Flood with unknown-group retracts from another sender.
+    other = RNS.Identity()
+    other_hash = destination_hash(other).hex()
+    for index, name in enumerate(("g-one", "g-two")):
+        other_group = derive_group_id("ab" * 16, name, members)
+        flood = call_handler(
+            node._handle_retract,
+            signed_retract(
+                other,
+                f"leg-{index}",
+                f"retract-{index}",
+                group=other_group,
+                target_author=other_hash,
+                target_sent_at=200.0 + index,
+            ),
+            remote_identity=other,
+        )
+        assert flood["ok"] is True
+        assert flood["deleted"] is False
+
+    # The confirmed marker survived the flood: a late copy still
+    # loses to it.
+    assert node.mailbox.is_group_retracted(sender_hash, group, 100.0) is True
+    late = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="late-leg-5",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert late["ok"] is True
+    assert late["duplicate"] is True
+    assert node.inbox.list_messages() == []
+
+
 def test_retract_refuses_group_marker_from_non_member(tmp_path):
     # The roster is pinned and does not name the caller: no marker
     # is recorded, so an allow-listed outsider cannot flood the

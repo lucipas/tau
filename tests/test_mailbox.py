@@ -948,6 +948,57 @@ def test_group_retraction_markers_are_capped(tmp_path, monkeypatch):
     assert box.counts()["retracted"] == 2
 
 
+def test_unknown_group_retraction_markers_do_not_evict_confirmed(
+    tmp_path, monkeypatch
+):
+    # Regression test (CodeRabbit Major on PR #322): a flood of
+    # unknown-group retracts must not evict a confirmed marker —
+    # eviction at the cap spends the unknown pool first.
+    monkeypatch.setattr(mailbox_module, "MAX_GROUP_RETRACTED", 3)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    other = "bb" * 32
+    box.record_group_retraction(sender, "cc" * 16, 100.0, confirmed=True, now=1000.0)
+    box.record_group_retraction(sender, "dd" * 16, 100.0, confirmed=True, now=1001.0)
+    assert box.counts()["retracted"] == 2
+    # Two unknown-group markers arrive: the cap spends the unknown
+    # pool first, so both confirmed markers survive and the oldest
+    # unknown marker gives way.
+    box.record_group_retraction(other, "ee" * 16, 100.0, now=1002.0)
+    box.record_group_retraction(other, "ff" * 16, 100.0, now=1003.0)
+    assert box.counts()["retracted"] == 3
+    assert box.is_group_retracted(sender, "cc" * 16, 100.0, now=1003.0) is True
+    assert box.is_group_retracted(sender, "dd" * 16, 100.0, now=1003.0) is True
+    assert box.is_group_retracted(other, "ee" * 16, 100.0, now=1003.0) is False
+    assert box.is_group_retracted(other, "ff" * 16, 100.0, now=1003.0) is True
+    # Promoting an unknown marker to confirmed moves it out of the
+    # unknown pool, so a later flood cannot evict it either.
+    box.record_group_retraction(other, "ff" * 16, 100.0, confirmed=True, now=1004.0)
+    box.record_group_retraction(other, "gg" * 16, 100.0, now=1005.0)
+    assert box.counts()["retracted"] == 3
+    assert box.is_group_retracted(other, "ff" * 16, 100.0, now=1005.0) is True
+    assert box.is_group_retracted(other, "gg" * 16, 100.0, now=1005.0) is False
+    # Both pools survive a reload.
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    assert reloaded.is_group_retracted(sender, "cc" * 16, 100.0, now=1005.0) is True
+    assert reloaded.is_group_retracted(other, "ff" * 16, 100.0, now=1005.0) is True
+
+
+def test_unconfirmed_group_retraction_does_not_downgrade_confirmed(
+    tmp_path, monkeypatch
+):
+    # A retried retract arrives unconfirmed: it refreshes the
+    # confirmed marker instead of moving it to the unknown pool.
+    monkeypatch.setattr(mailbox_module, "MAX_GROUP_RETRACTED", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    box.record_group_retraction(sender, "cc" * 16, 100.0, confirmed=True, now=1000.0)
+    box.record_group_retraction(sender, "cc" * 16, 100.0, now=2000.0)
+    box.record_group_retraction("bb" * 32, "dd" * 16, 100.0, now=2001.0)
+    box.record_group_retraction("bb" * 32, "ee" * 16, 100.0, now=2002.0)
+    assert box.is_group_retracted(sender, "cc" * 16, 100.0, now=2002.0) is True
+
+
 def test_retraction_markers_are_capped(tmp_path, monkeypatch):
     monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 3)
     box = Mailbox(tmp_path / "mailbox.json")
