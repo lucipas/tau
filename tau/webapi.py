@@ -2864,7 +2864,15 @@ class WebBridge:
                 peer=peer_hash or None,
                 peer_name=sanitize_name(peer_name, fallback="unknown"),
                 text=text,
-                sent_at=_as_float(record.get("sent_at")),
+                # A group send's legs share the fan-out's wire time
+                # (``leg_sent_at``); the record's ``sent_at`` is the
+                # later write time, which members cannot match.
+                sent_at=(
+                    _as_float(record.get("leg_sent_at"))
+                    if direction == "out" and isinstance(group, str)
+                    and record.get("leg_sent_at") is not None
+                    else _as_float(record.get("sent_at"))
+                ),
                 received_at=_as_float(record.get("received_at"), default=time.time()),
                 status="received" if direction == "in" else "delivered",
                 group=group if isinstance(group, str) else None,
@@ -3897,6 +3905,12 @@ class WebBridge:
             except ValueError:
                 record = None
             if record is not None:
+                # Every leg of the send has its own sent record; the
+                # inbox record names them all, including legs the
+                # feed does not mirror.
+                for leg_id in record.get("leg_ids") or []:
+                    if isinstance(leg_id, str) and leg_id not in wire_ids:
+                        wire_ids.append(leg_id)
                 try:
                     inbox.delete(str(record["id"]))
                 except InboxError as exc:
