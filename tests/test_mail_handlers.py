@@ -4860,6 +4860,55 @@ def test_edit_group_ignores_a_stale_edit(tmp_path):
     assert node.inbox.list_messages()[0]["text"] == "newer text"
 
 
+def test_group_message_with_edited_at_rejects_older_replayed_edit(tmp_path):
+    # A re-queued edited leg arrives as an ordinary group message
+    # carrying the edit's send time: the record stores it, so a
+    # replayed older edit cannot rewind the text it already carries.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    group = node.groups.create(
+        "weekend",
+        [sender_hash, "ab" * 16],
+        created_by=sender_hash,
+    )
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "fixed here",
+            message_id="leg-9",
+            group_id=group["id"],
+            group_name="weekend",
+            creator=sender_hash,
+            members=[sender_hash, "ab" * 16],
+            sent_at=100.0,
+            edited_at=150.0,
+        ),
+        remote_identity=sender,
+    )
+    assert delivered["ok"] is True
+    assert delivered["duplicate"] is False
+    record = node.inbox.list_messages()[0]
+    assert record["text"] == "fixed here"
+    assert record["edited_at"] == 150.0
+    # The older edit (sent_at 140) replays after the newer one (150):
+    # it must not rewind the record.
+    replayed = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-9", "older text", "edit-2", sent_at=140.0,
+            group=group["id"],
+        ),
+        remote_identity=sender,
+    )
+    assert replayed["ok"] is True
+    assert replayed["edited"] is False
+    assert node.inbox.list_messages()[0]["text"] == "fixed here"
+
+
 def test_edit_group_rejects_a_non_sender(tmp_path):
     node = make_node(tmp_path)
     node.destination = SimpleNamespace(

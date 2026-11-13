@@ -159,6 +159,7 @@ def build_bundle(
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to if group is None else None,
                 kind=getattr(entry, "kind", None) if group is None else None,
+                edited_at=entry.edited_at,
             )
         except MailboxError as exc:
             skipped.append({"id": entry.id, "reason": str(exc)})

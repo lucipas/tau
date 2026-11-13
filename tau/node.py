@@ -1892,6 +1892,12 @@ class TauNode:
             }
             if message.get("in_reply_to") is not None:
                 record["in_reply_to"] = message["in_reply_to"]
+            if message.get("edited_at") is not None:
+                # A re-queued edited leg carries the edit's signed send
+                # time: the record starts life with its edit ordering
+                # state, so a replayed older edit cannot rewind the
+                # text this copy already carries (see _handle_dm_edit).
+                record["edited_at"] = message["edited_at"]
             log.info(
                 "Group message from %s (%s) in %s: %s",
                 caller_name,
@@ -3521,6 +3527,61 @@ class TauNode:
         except TimeoutError:
             return True
 
+    def _queued_version_matches(
+        self,
+        message_id: str,
+        *,
+        text: str,
+        edited_at: Optional[float],
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """True if the outbox still holds this entry with this version.
+
+        The sweep works from a snapshot, so an edit can cancel and
+        re-queue the leg under the same id with new text after the
+        snapshot was taken; the re-queue changes the text (and the
+        edit timestamp), so a delivery holding the earlier version
+        aborts instead of sending stale text — the replacement
+        delivers in a later round.  With ``timeout`` set, a lock wait
+        that times out treats the entry as matching (the same
+        fail-open as :meth:`_still_queued`): the post-delivery
+        removal re-checks before deleting anything.
+        """
+        try:
+            with self.mailbox.transaction(timeout=timeout):
+                current = self.mailbox.get_outbox(message_id)
+                if current is None:
+                    return False
+                return (
+                    current.text == text and current.edited_at == edited_at
+                )
+        except TimeoutError:
+            return True
+
+    def _remove_queued_version(
+        self,
+        message_id: str,
+        *,
+        text: str,
+        edited_at: Optional[float],
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Remove the queued entry only if it still carries this version.
+
+        A replacement that landed while a send was in flight keeps its
+        entry: removing by id alone would delete the edited text the
+        recipient has not seen yet.  Returns False when the entry is
+        gone or a replacement landed; the caller leaves the replacement
+        queued for a later round.
+        """
+        with self.mailbox.transaction(timeout=timeout):
+            current = self.mailbox.get_outbox(message_id)
+            if current is None:
+                return False
+            if current.text != text or current.edited_at != edited_at:
+                return False
+            return self.mailbox.remove_outbox(message_id)
+
     def _current_group_topic(
         self, group_id: Optional[str]
     ) -> Optional[Tuple[str, Optional[float]]]:
@@ -3582,20 +3643,29 @@ class TauNode:
                     return False
         except TimeoutError:
             return False
-        if entry.group_id is not None:
+        # Encode the freshly read entry, not the sweep's snapshot: an
+        # edit can cancel and re-queue the leg under the same id with
+        # new text after the snapshot was taken, and the snapshot's
+        # text would send the original over the edited replacement —
+        # which the post-delivery removal would then delete.  The
+        # fresh read also carries the edit's timestamp, so the
+        # recipient initializes its edit ordering state from it.
+        send_text = fresh.text
+        send_edited_at = fresh.edited_at
+        if fresh.group_id is not None:
             group_kwargs: Dict[str, Any] = dict(
-                message_id=entry.id,
-                sent_at=entry.wire_sent_at,
-                group_id=entry.group_id,
-                group_name=entry.group_name,
-                creator=entry.group_creator,
-                members=entry.group_members,
+                message_id=fresh.id,
+                sent_at=fresh.wire_sent_at,
+                group_id=fresh.group_id,
+                group_name=fresh.group_name,
+                creator=fresh.group_creator,
+                members=fresh.group_members,
                 renamed_from=(
-                    (self.groups.get(entry.group_id) or {}).get("renamed_from")
+                    (self.groups.get(fresh.group_id) or {}).get("renamed_from")
                     or None
                 ),
-                in_reply_to=entry.in_reply_to,
-                expires_at=entry.message_expires_at,
+                in_reply_to=fresh.in_reply_to,
+                expires_at=fresh.message_expires_at,
             )
             # Re-read the topic at retry time, not queue time: a topic
             # set or cleared after queueing travels with the retry, and
@@ -3603,13 +3673,14 @@ class TauNode:
             # time rides along, since it can postdate the queued message.
             # A group that is gone carries no topic at all (None), so
             # the recipient keeps its own rather than being cleared.
-            current = self._current_group_topic(entry.group_id)
+            current = self._current_group_topic(fresh.group_id)
             topic, topic_at = current if current is not None else (None, None)
             try:
                 payload = encode_group_message(
-                    entry.text,
+                    send_text,
                     group_topic=topic,
                     group_topic_sent_at=topic_at,
+                    edited_at=send_edited_at,
                     **group_kwargs,
                 )
             except ProtocolError:
@@ -3618,7 +3689,10 @@ class TauNode:
                 # whole flush round; the recipient keeps its topic.
                 try:
                     payload = encode_group_message(
-                        entry.text, group_topic=None, **group_kwargs
+                        send_text,
+                        group_topic=None,
+                        edited_at=send_edited_at,
+                        **group_kwargs,
                     )
                 except ProtocolError:
                     log.error(
@@ -3629,14 +3703,22 @@ class TauNode:
                     return False
         else:
             payload = encode_message(
-                entry.text,
-                message_id=entry.id,
-                sent_at=entry.wire_sent_at,
-                expires_at=entry.message_expires_at,
-                in_reply_to=entry.in_reply_to,
-                kind=getattr(entry, "kind", None),
+                send_text,
+                message_id=fresh.id,
+                sent_at=fresh.wire_sent_at,
+                expires_at=fresh.message_expires_at,
+                in_reply_to=fresh.in_reply_to,
+                kind=getattr(fresh, "kind", None),
             )
-        if not self._still_queued(entry.id, timeout=_remaining(deadline)):
+        # A replacement can still land after the fresh read: abort the
+        # send instead of delivering the superseded version — the
+        # replacement delivers in a later round.
+        if not self._queued_version_matches(
+            entry.id,
+            text=send_text,
+            edited_at=send_edited_at,
+            timeout=_remaining(deadline),
+        ):
             return False
         via_lxmf = False
         try:
@@ -3671,8 +3753,11 @@ class TauNode:
                     entry.id,
                 )
                 try:
-                    self.mailbox.remove_outbox(
-                        entry.id, timeout=_remaining(deadline)
+                    self._remove_queued_version(
+                        entry.id,
+                        text=send_text,
+                        edited_at=send_edited_at,
+                        timeout=_remaining(deadline),
                     )
                 except TimeoutError:
                     log.warning(
@@ -3684,8 +3769,13 @@ class TauNode:
         except NotAMemberError as exc:
             # Permanent refusal: the recipient will not accept this roster,
             # so stop retrying rather than holding the leg until its TTL.
+            # A replacement that landed mid-flight keeps its entry: the
+            # refusal names this roster, and the next round refuses the
+            # replacement the same way instead of losing it here.
             log.warning("Dropping queued group message %s: %s", entry.id, exc)
-            self.mailbox.remove_outbox(entry.id)
+            self._remove_queued_version(
+                entry.id, text=send_text, edited_at=send_edited_at
+            )
             return False
         except NodeError as exc:
             # An explicit refusal (allow-list, block-list) is final: falling
@@ -3730,7 +3820,23 @@ class TauNode:
                 timeout=_remaining(deadline),
                 via="lxmf" if via_lxmf else "direct",
             )
-            self.mailbox.remove_outbox(entry.id, timeout=_remaining(deadline))
+            removed = self._remove_queued_version(
+                entry.id,
+                text=send_text,
+                edited_at=send_edited_at,
+                timeout=_remaining(deadline),
+            )
+            if not removed:
+                # A replacement landed while the send was in flight:
+                # the receiver holds this version, and the edited
+                # replacement stays queued for a later round instead
+                # of being deleted with it.
+                log.info(
+                    "Delivered queued message %s but a replacement is "
+                    "queued under the same id; leaving it for a later "
+                    "round",
+                    entry.id,
+                )
         except TimeoutError:
             # The delivery is confirmed, so report success; the entry
             # stays queued and a later round re-delivers it (the peer
@@ -3842,20 +3948,27 @@ class TauNode:
             # Without the recipient's public key the message cannot be
             # sealed for anyone else to hold; direct delivery only.
             return False
+        # Seal the freshly read entry, not the sweep's snapshot: an
+        # edit can cancel and re-queue the leg under the same id with
+        # new text after the snapshot was taken, and sealing the
+        # snapshot would leave a holder with the original text — which
+        # the recipient would then store without any edit ordering
+        # state.  The edit's timestamp rides inside the signed
+        # envelope, exactly like a direct delivery.
         sealed_group = None
-        if entry.group_id is not None:
+        if fresh.group_id is not None:
             sealed_group = {
-                "id": entry.group_id,
-                "name": entry.group_name,
-                "creator": entry.group_creator,
-                "members": entry.group_members,
+                "id": fresh.group_id,
+                "name": fresh.group_name,
+                "creator": fresh.group_creator,
+                "members": fresh.group_members,
                 # The lineage rides in the sealed envelope, so an
                 # offline member that receives this copy through
                 # store-and-forward retires the predecessor exactly
                 # as a direct recipient would; the current record is
                 # read at deposit time, like the direct re-send path.
                 "renamed_from": (
-                    (self.groups.get(entry.group_id) or {}).get(
+                    (self.groups.get(fresh.group_id) or {}).get(
                         "renamed_from"
                     )
                     or None
@@ -3865,7 +3978,7 @@ class TauNode:
             # its own set time, so the recipient judges it the same way.
             # A group that is gone carries none: the recipient keeps
             # its own rather than being cleared.
-            current = self._current_group_topic(entry.group_id)
+            current = self._current_group_topic(fresh.group_id)
             if current is not None:
                 sealed_group["topic"], sealed_group["topic_sent_at"] = current
         try:
@@ -3873,24 +3986,32 @@ class TauNode:
                 self.identity,
                 sender_name=self.name,
                 recipient_public_key=recipient.public_key,
-                message_id=entry.id,
-                text=entry.text,
-                sent_at=entry.wire_sent_at,
+                message_id=fresh.id,
+                text=fresh.text,
+                sent_at=fresh.wire_sent_at,
                 group=sealed_group,
-                expires_at=entry.message_expires_at,
-                in_reply_to=entry.in_reply_to,
-                kind=getattr(entry, "kind", None),
+                expires_at=fresh.message_expires_at,
+                in_reply_to=fresh.in_reply_to,
+                kind=getattr(fresh, "kind", None),
+                edited_at=fresh.edited_at,
             )
             payload = build_mail_store(
-                to=entry.to_hex,
-                message_id=entry.id,
+                to=fresh.to_hex,
+                message_id=fresh.id,
                 blob=blob,
-                expires_at=entry.expires_at,
+                expires_at=fresh.expires_at,
             )
         except (MailboxError, ProtocolError) as exc:
             log.debug("Could not seal queued message %s: %s", entry.id, exc)
             return False
-        if not self._still_queued(entry.id, timeout=_remaining(deadline)):
+        # A replacement can still land after the fresh read: do not
+        # deposit the superseded version — it delivers in a later round.
+        if not self._queued_version_matches(
+            entry.id,
+            text=fresh.text,
+            edited_at=fresh.edited_at,
+            timeout=_remaining(deadline),
+        ):
             return False
         try:
             self._request(
@@ -4330,6 +4451,11 @@ class TauNode:
             record["group_name"] = pinned["name"]
         if message.get("in_reply_to") is not None:
             record["in_reply_to"] = message["in_reply_to"]
+        if message.get("edited_at") is not None:
+            # A relayed copy of an edited leg carries the edit's send
+            # time inside its signed envelope: the record starts life
+            # with its edit ordering state, exactly like a direct one.
+            record["edited_at"] = message["edited_at"]
         log.info(
             "Message from %s (%s) via store-and-forward: %s",
             message["from_name"],
@@ -6254,6 +6380,26 @@ class TauNode:
             # it to a 400 and the CLI prints it plain, instead of a
             # 502 / a misleading "peer offline" suffix.
             raise ValueError("group has no other members to edit for")
+        # The edit is built and signed once, before the re-queue below:
+        # the re-queued leg carries the edit's signed send time, so a
+        # recipient that first meets the message through the queue
+        # stores it as the record's ``edited_at`` and a replayed older
+        # edit cannot rewind it.
+        edit_id = generate_message_id()
+        payload = edit_dict(
+            target_id,
+            cleaned,
+            message_id=edit_id,
+            group=group["id"],
+            target_author=own_hash,
+            target_sent_at=float(target_sent_at),
+        )
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign edit")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
         cancelled: List[str] = []
         requeue_failed: List[Dict[str, Any]] = []
         requeued: List[str] = []
@@ -6267,6 +6413,9 @@ class TauNode:
                     # Re-queue the cancelled leg under its own id with the
                     # edited text, so an offline member still receives the
                     # message (edited) instead of losing it entirely.
+                    # The edit's signed send time rides along: the
+                    # recipient initializes its edit ordering state
+                    # from it (see _deliver_entry).
                     try:
                         self.mailbox.enqueue(
                             to=entry.to,
@@ -6284,6 +6433,7 @@ class TauNode:
                             sent_at=entry.wire_sent_at,
                             send_after=entry.send_after,
                             in_reply_to=entry.in_reply_to,
+                            edited_at=float(payload["sent_at"]),
                         )
                         requeued.append(entry.id)
                     except MailboxError as queue_exc:
@@ -6296,21 +6446,6 @@ class TauNode:
                                 "id": entry.id,
                             }
                         )
-        edit_id = generate_message_id()
-        payload = edit_dict(
-            target_id,
-            cleaned,
-            message_id=edit_id,
-            group=group["id"],
-            target_author=own_hash,
-            target_sent_at=float(target_sent_at),
-        )
-        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
-        signature = self.identity.sign(canonical)
-        if signature is None:  # pragma: no cover - identity without private keys
-            raise NodeError("could not sign edit")
-        payload["sig"] = base64.b64encode(signature).decode("ascii")
-        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
         results: List[Dict[str, Any]] = list(requeue_failed)
         for member in members:
             # One deadline bounds each leg, exactly as in

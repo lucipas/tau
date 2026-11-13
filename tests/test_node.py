@@ -935,6 +935,157 @@ def test_send_group_edit_requeues_cancelled_legs_with_edited_text(
     assert set(calls) == {alice.hexhash, bob.hexhash}
 
 
+def test_send_group_edit_requeue_carries_edit_timestamp(tmp_path, monkeypatch):
+    # The re-queued leg carries the edit's signed send time, so a
+    # recipient that first meets the message through the queue stores
+    # it as the record's edited_at — and a replayed older edit cannot
+    # rewind it.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.mailbox.enqueue(
+        to=bob.destination_hash,
+        text="typo here",
+        message_id="bob-leg-1",
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": list(group["members"]),
+        },
+        sent_at=100.0,
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "edited": False,
+            "group_edit": True,
+            "_rtt": 0.004,
+        },
+    )
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+    requeued = node.mailbox.get_outbox("bob-leg-1")
+    assert requeued is not None
+    assert requeued.edited_at == response["sent_at"]
+
+
+def _group_leg_entry(node, group, peer, *, text, leg_id, edited_at=None):
+    return node.mailbox.enqueue(
+        to=peer.destination_hash,
+        text=text,
+        message_id=leg_id,
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": list(group["members"]),
+        },
+        sent_at=100.0,
+        edited_at=edited_at,
+    )
+
+
+def test_deliver_entry_sends_fresh_text_after_edit_requeue(
+    tmp_path, monkeypatch
+):
+    # A background sweep captured the original leg before the edit
+    # replaced it: the delivery must encode the freshly read entry —
+    # the edited text with its edit timestamp — not the snapshot.
+    from tau.protocol import parse_group_message
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="typo here", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+    assert snapshot.text == "typo here"
+    # The edit cancels the leg and re-queues it under the same id.
+    assert node.mailbox.remove_outbox("bob-leg-1") is True
+    _group_leg_entry(
+        node, group, bob, text="fixed here", leg_id="bob-leg-1",
+        edited_at=150.0,
+    )
+    calls = []
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: calls.append(args) or {"ok": True},
+    )
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is True
+    assert len(calls) == 1
+    parsed = parse_group_message(calls[0][2])
+    assert parsed["text"] == "fixed here"
+    assert parsed["edited_at"] == 150.0
+    assert node.mailbox.get_outbox("bob-leg-1") is None
+
+
+def test_deliver_entry_aborts_when_entry_replaced_after_fresh_read(
+    tmp_path, monkeypatch
+):
+    # The edit lands after the fresh read but before the send: the
+    # delivery aborts instead of sending the superseded version, and
+    # the replacement stays queued for a later round.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="typo here", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+    real_get = node.mailbox.get_outbox
+    calls = {"n": 0}
+
+    def flaky_get(message_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # An edit cancels and re-queues the leg mid-delivery.
+            node.mailbox.remove_outbox("bob-leg-1")
+            _group_leg_entry(
+                node, group, bob, text="fixed here", leg_id="bob-leg-1",
+                edited_at=150.0,
+            )
+            return snapshot
+        return real_get(message_id)
+
+    monkeypatch.setattr(node.mailbox, "get_outbox", flaky_get)
+    sent = []
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: sent.append(args) or {"ok": True},
+    )
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    assert sent == []
+    requeued = node.mailbox.get_outbox("bob-leg-1")
+    assert requeued is not None
+    assert requeued.text == "fixed here"
+    assert requeued.edited_at == 150.0
+
+
+def test_deliver_entry_keeps_replacement_when_it_lands_during_send(
+    tmp_path, monkeypatch
+):
+    # The edit lands after the pre-send check but while the request is
+    # in flight: the confirmed delivery stands, but the replacement
+    # must not be deleted with the version that was sent.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    entry = _group_leg_entry(
+        node, group, bob, text="typo here", leg_id="bob-leg-1"
+    )
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        # An edit cancels and re-queues the leg while sending.
+        node.mailbox.remove_outbox("bob-leg-1")
+        _group_leg_entry(
+            node, group, bob, text="fixed here", leg_id="bob-leg-1",
+            edited_at=150.0,
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    assert node._deliver_entry(bob, entry, timeout=1.0) is True
+    requeued = node.mailbox.get_outbox("bob-leg-1")
+    assert requeued is not None
+    assert requeued.text == "fixed here"
+    assert requeued.edited_at == 150.0
+
+
 def test_send_group_edit_needs_the_shared_send_time(tmp_path):
     node, _, _, _ = _group_reaction_node(tmp_path)
     with pytest.raises(NodeError, match="shared send time"):

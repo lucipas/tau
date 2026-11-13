@@ -130,6 +130,35 @@ def test_group_message_roundtrip_with_expiry():
     assert parsed["expires_at"] == 9999.0
 
 
+def test_group_message_roundtrip_with_edited_at():
+    # A re-queued edited leg carries the edit's send time, so the
+    # recipient initializes its edit ordering state from it; an
+    # unedited message omits it, and garbage is dropped, not trusted.
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    payload = encode_group_message(
+        "fixed here",
+        message_id="gm-edited",
+        group_id=group_id,
+        group_name="weekend",
+        creator=OWN_HASH,
+        members=members,
+        sent_at=123.0,
+        edited_at=150.0,
+    )
+    assert parse_group_message(payload)["edited_at"] == 150.0
+    plain = encode_group_message(
+        "plain",
+        message_id="gm-plain",
+        group_id=group_id,
+        group_name="weekend",
+        creator=OWN_HASH,
+        members=members,
+        sent_at=123.0,
+    )
+    assert parse_group_message(plain)["edited_at"] is None
+
+
 def test_group_message_rejects_bad_expiry():
     members = [OWN_HASH, OTHER_HASH]
     group_id = derive_group_id(OWN_HASH, "g", members)

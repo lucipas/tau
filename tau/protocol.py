@@ -418,6 +418,7 @@ def encode_group_message(
     renamed_from: Optional[List[str]] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
+    edited_at: Optional[float] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -443,6 +444,11 @@ def encode_group_message(
     ``expires_at`` is an optional sender-set expiry (epoch seconds),
     exactly like a direct message: the receiver shows the deadline and
     purges the message once it passes.
+
+    ``edited_at`` is the signed send time of the edit that rewrote
+    this text (epoch seconds): a re-queued edited leg carries it, so
+    the recipient stores it as the record's ``edited_at`` and a
+    replayed older edit cannot rewind it.  ``None`` omits it.
     """
     payload = {
         "type": "group_message",
@@ -475,6 +481,13 @@ def encode_group_message(
     cleaned_expires_at = _clean_expires_at(expires_at)
     if cleaned_expires_at is not None:
         payload["expires_at"] = cleaned_expires_at
+    if edited_at is not None:
+        try:
+            edited_value = float(edited_at)
+        except (TypeError, ValueError, OverflowError):
+            edited_value = None
+        if edited_value is not None and math.isfinite(edited_value):
+            payload["edited_at"] = edited_value
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -521,6 +534,22 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
             topic_sent_at = None
         if topic_sent_at is not None and not math.isfinite(topic_sent_at):
             topic_sent_at = None
+    raw_edited_at = payload.get("edited_at")
+    edited_at = None
+    if (
+        raw_edited_at is not None
+        and isinstance(raw_edited_at, (int, float))
+        and not isinstance(raw_edited_at, bool)
+    ):
+        # A re-queued edited leg carries the edit's send time, so the
+        # recipient initializes its edit ordering state; absent — or
+        # garbage — means the text was never edited.
+        try:
+            edited_at = float(raw_edited_at)
+        except OverflowError:
+            edited_at = None
+        if edited_at is not None and not math.isfinite(edited_at):
+            edited_at = None
     return {
         "text": text,
         "sent_at": sent_at,
@@ -534,6 +563,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "renamed_from": _clean_renamed_from(payload.get("renamed_from")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),
+        "edited_at": edited_at,
     }
 
 

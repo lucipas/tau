@@ -268,6 +268,29 @@ def test_sent_record_keeps_edited_at_through_reload(tmp_path):
     assert reloaded.sent_record("m1")["text"] == "newer text"
 
 
+def test_outbox_entry_keeps_edited_at_through_reload(tmp_path):
+    """A re-queued edited leg keeps its edit timestamp across a
+    reload, so a later sweep still delivers the edited version with
+    its ordering state intact."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(
+        to=BOB,
+        text="fixed here",
+        message_id="leg-1",
+        sent_at=100.0,
+        edited_at=150.0,
+    )
+    reloaded = Mailbox(path)
+    entry = reloaded.get_outbox("leg-1")
+    assert entry is not None
+    assert entry.text == "fixed here"
+    assert entry.edited_at == 150.0
+    # An unedited entry carries no timestamp.
+    box.enqueue(to=BOB, text="plain", message_id="leg-2", sent_at=100.0)
+    assert Mailbox(path).get_outbox("leg-2").edited_at is None
+
+
 def test_load_dedupes_duplicate_message_ids(tmp_path):
     """A mailbox.json with duplicate ids keeps the newest copy of each
     and is rewritten on load, so the duplicates do not survive a
@@ -1216,6 +1239,33 @@ def test_seal_and_open_default_kind_is_chat():
         sent_at=4242.0,
     )
     assert open_message(recipient, blob)["kind"] == "chat"
+
+
+def test_seal_and_open_carries_edited_at():
+    # A sealed copy of an edited leg carries the edit's send time
+    # inside the signed envelope, so a relayed copy initializes the
+    # recipient's edit ordering state exactly like a direct one.
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-edited",
+        text="fixed here",
+        sent_at=4242.0,
+        edited_at=4300.0,
+    )
+    message = open_message(recipient, blob)
+    assert message["edited_at"] == 4300.0
+    plain = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-plain",
+        text="hello",
+        sent_at=4242.0,
+    )
+    assert open_message(recipient, plain)["edited_at"] is None
 
 
 def test_seal_and_open_roundtrip_with_reply():
