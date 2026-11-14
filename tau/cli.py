@@ -134,6 +134,8 @@ from .tangents.tan import (
     export_entries,
     follow,
     following,
+    hidden_posts,
+    hide_post,
     import_entries,
     init_db,
     likers,
@@ -159,6 +161,7 @@ from .tangents.tan import (
     timeline,
     top_posts,
     unfollow,
+    unhide_post,
     unmute,
     unmute_keyword,
     unpin_post,
@@ -1916,6 +1919,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_saved.set_defaults(func=cmd_tan_saved)
 
+    tan_hide = tan_sub.add_parser(
+        "hide", parents=[common], help="hide a post from your local views"
+    )
+    tan_hide.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post hash (full hash or unique prefix)"
+    )
+    tan_hide.set_defaults(func=cmd_tan_hide)
+
+    tan_unhide = tan_sub.add_parser(
+        "unhide", parents=[common], help="show a hidden post in local views again"
+    )
+    tan_unhide.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post hash (full hash or unique prefix)"
+    )
+    tan_unhide.set_defaults(func=cmd_tan_unhide)
+
+    tan_hidden = tan_sub.add_parser(
+        "hidden", parents=[common], help="list hidden posts"
+    )
+    tan_hidden.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="maximum posts",
+    )
+    tan_hidden.set_defaults(func=cmd_tan_hidden)
+
     tan_pin = tan_sub.add_parser(
         "pin", parents=[common], help="pin one of your own posts to the top"
     )
@@ -2685,6 +2716,36 @@ def _print_saved_posts(
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"  ♥ {likes}{suffix}")
+
+
+def _print_hidden_posts(
+    posts: Sequence[Dict[str, Any]],
+    *,
+    json_output: bool,
+) -> None:
+    """Print hidden posts, newest hide first."""
+    if json_output:
+        _emit({"hidden": list(posts), "count": len(posts)}, True)
+        return
+    if not posts:
+        print("No hidden posts yet. Try `tau tan hide <hash>`.")
+        return
+    for post in posts:
+        name = post.get("name") or "anonymous"
+        author = short_hash(str(post.get("author", "")))
+        when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        hidden = datetime.fromtimestamp(float(post.get("hidden_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}{' (edited)' if post.get('edited') else ''}")
+        print(f"  hidden {hidden}")
+        if post.get("deleted"):
+            print("  (deleted post)")
+            continue
+        for line in str(post.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
 
 
 def _print_pinned_posts(
@@ -3913,6 +3974,55 @@ def cmd_tan_saved(args: argparse.Namespace) -> int:
         conn.close()
     _print_saved_posts(posts, json_output=json_output)
     return _EXIT_OK
+    return _EXIT_OK
+
+
+def cmd_tan_hide(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        record = hide_post(conn, args.ref)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        if record.get("already_hidden"):
+            when = datetime.fromtimestamp(float(record["hidden_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(f"already hidden {short_hash(str(record['hash']))} at {when}")
+        else:
+            print(f"hidden {short_hash(str(record['hash']))}")
+    return _EXIT_OK
+
+
+def cmd_tan_unhide(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        record = unhide_post(conn, args.ref)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        if record["unhidden"]:
+            print(f"unhidden {short_hash(str(record['hash']))}")
+        else:
+            print(f"was not hidden: {short_hash(str(record['hash']))}")
+    return _EXIT_OK
+
+
+def cmd_tan_hidden(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        posts = hidden_posts(conn, limit=args.limit)
+    finally:
+        conn.close()
+    _print_hidden_posts(posts, json_output=json_output)
     return _EXIT_OK
 
 

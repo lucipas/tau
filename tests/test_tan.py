@@ -51,6 +51,8 @@ from tau.tangents.tan import (
     get_post,
     hash,
     head,
+    hidden_posts,
+    hide_post,
     import_entries,
     init_db,
     is_expired,
@@ -86,6 +88,7 @@ from tau.tangents.tan import (
     timeline,
     top_posts,
     unfollow,
+    unhide_post,
     unmute,
     unmute_keyword,
     unpin_post,
@@ -1088,6 +1091,8 @@ def test_cli_mute_muted_unmute(tmp_path, capsys):
     )
     assert json.loads(capsys.readouterr().out)["unmuted"] is False
 
+
+
     # Names work too, even though bob is not in the peer registry: the
     # name comes from his cached posts, and from the mute record itself.
     assert main(["tan", "mute", "--data-dir", str(data_dir), "--json", "bob"]) == 0
@@ -1106,6 +1111,89 @@ def test_cli_mute_muted_unmute(tmp_path, capsys):
         == 0
     )
     assert json.loads(capsys.readouterr().out)["unmuted"] is True
+
+
+def test_cli_hide_unhide_hidden(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    bob = RNS.Identity()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        bob_post = create_post(conn, bob, "bob says hello", name="bob", now=1000)
+        create_post(conn, bob, "bob again", name="bob", now=1001)
+    finally:
+        conn.close()
+
+    # Hide by prefix; hiding again reports the original hide time.
+    assert (
+        main(
+            [
+                "tan",
+                "hide",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                bob_post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hash"] == bob_post["hash"]
+    assert payload["already_hidden"] is False
+    assert (
+        main(["tan", "hide", "--data-dir", str(data_dir), bob_post["hash"]]) == 0
+    )
+    assert "already hidden" in capsys.readouterr().out
+
+    # The hidden post leaves the timeline; the hidden list shows it.
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--all", "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == [
+        "hello from the cli",
+        "bob again",
+    ]
+    assert main(["tan", "hidden", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["hidden"][0]["hash"] == bob_post["hash"]
+
+    # Unhiding restores the timeline; a second unhide is a clean no-op.
+    assert (
+        main(
+            ["tan", "unhide", "--data-dir", str(data_dir), "--json", bob_post["hash"]]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["unhidden"] is True
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--all", "--json"]) == 0
+    )
+    assert len(json.loads(capsys.readouterr().out)["posts"]) == 3
+    assert (
+        main(
+            ["tan", "unhide", "--data-dir", str(data_dir), "--json", bob_post["hash"]]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["unhidden"] is False
 
 
 def test_export_import_roundtrip(identities, tmp_path):
@@ -4837,6 +4925,356 @@ def test_save_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
     assert saved[0]["hash"] == keep["hash"]
     assert saved[0]["deleted"] is True
     assert saved[0]["text"] == ""
+
+
+def test_hide_post_round_trip(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    first = create_post(conn, bob, "worth hiding", name="bob", now=1000)
+    second = create_post(conn, alice, "mine too", name="alice", now=1001)
+
+    record = hide_post(conn, first["hash"][:16], now=2000)
+    assert record["hash"] == first["hash"]
+    assert record["already_hidden"] is False
+    assert record["hidden_at"] == 2000
+
+    # Hiding again is a no-op that reports the original hide time.
+    again = hide_post(conn, first["hash"], now=3000)
+    assert again["already_hidden"] is True
+    assert again["hidden_at"] == 2000
+
+    hide_post(conn, second["hash"], now=2001)
+    hidden = hidden_posts(conn)
+    assert [post["hash"] for post in hidden] == [second["hash"], first["hash"]]
+    assert hidden[0]["hidden_at"] == 2001
+
+    removed = unhide_post(conn, first["hash"][:16])
+    assert removed == {"hash": first["hash"], "unhidden": True}
+    assert unhide_post(conn, first["hash"]) == {
+        "hash": first["hash"],
+        "unhidden": False,
+    }
+    assert [post["hash"] for post in hidden_posts(conn)] == [second["hash"]]
+
+
+def test_hide_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+
+    with pytest.raises(TanError, match="unknown post"):
+        hide_post(source, "ab" * 32)
+
+    # Only the second post arrives: it is cached but unlinked, so
+    # hiding it would file a post with no verified chain behind it.
+    destination = init_db(tmp_path / "destination.sqlite3")
+    store_post(destination, second)
+    with pytest.raises(TanError, match="has not linked yet"):
+        hide_post(destination, second["hash"])
+
+    # A post its author deleted cannot be hidden.
+    create_delete(source, alice, first["hash"], name="alice", now=1002)
+    with pytest.raises(TanError, match="has been deleted"):
+        hide_post(source, first["hash"])
+    # ... but a post deleted after being hidden stays listed, blanked.
+    keep = create_post(source, bob, "keep me", name="bob", now=1003)
+    hide_post(source, keep["hash"], now=2000)
+    create_delete(source, bob, keep["hash"], name="bob", now=1004)
+    hidden = hidden_posts(source)
+    assert len(hidden) == 1
+    assert hidden[0]["hash"] == keep["hash"]
+    assert hidden[0]["deleted"] is True
+    assert hidden[0]["text"] == ""
+    # ... and unhiding still works after the delete.
+    assert unhide_post(source, keep["hash"]) == {
+        "hash": keep["hash"],
+        "unhidden": True,
+    }
+
+
+def test_hidden_posts_shows_edited_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "original", name="bob", now=1000)
+    hide_post(conn, post["hash"], now=2000)
+
+    # The hidden shelf shows the current text, not the text as hidden.
+    create_edit(conn, bob, post["hash"], "fixed", name="bob", now=1001)
+    hidden = hidden_posts(conn)
+    assert len(hidden) == 1
+    assert hidden[0]["text"] == "fixed"
+    assert hidden[0]["edited"] is True
+
+
+def test_timeline_hides_hidden_posts(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    bob_post = create_post(conn, bob, "from bob", name="bob", now=1000)
+    alice_post = create_post(conn, alice, "from alice", name="alice", now=1001)
+    authors = [bob_post["author"], alice_post["author"]]
+
+    hide_post(conn, bob_post["hash"])
+    assert [post["text"] for post in timeline(conn, authors)] == ["from alice"]
+    assert [post["text"] for post in timeline(conn, include_all=True)] == [
+        "from alice"
+    ]
+    assert timeline(conn, [bob_post["author"]]) == []
+    assert author_timeline(conn, bob_post["author"]) == []
+    # An explicit feed lookup still shows it: hiding is a list-view rule.
+    assert [post["text"] for post in feed(conn, author=bob_post["author"])] == [
+        "from bob"
+    ]
+
+    # Unhiding restores the full timeline.
+    unhide_post(conn, bob_post["hash"])
+    assert [post["text"] for post in timeline(conn, authors)] == [
+        "from alice",
+        "from bob",
+    ]
+
+
+def test_timeline_pages_past_hidden_posts(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "older clean post", name="alice", now=1000)
+    hidden = [
+        create_post(conn, alice, f"hidden {index}", name="alice", now=2000 + index)
+        for index in range(25)
+    ]
+    for post in hidden:
+        hide_post(conn, post["hash"])
+
+    # More hidden posts than one page must not hide the older clean post.
+    items = timeline(conn, include_all=True, limit=5)
+    assert [item["text"] for item in items] == ["older clean post"]
+
+
+def test_author_timeline_pages_past_hidden_posts(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    for index in range(25):
+        post = create_post(
+            conn, alice, f"hidden {index}", name="alice", now=1000 + index
+        )
+        hide_post(conn, post["hash"])
+    create_post(conn, alice, "clean ending", name="alice", now=2000)
+
+    items = author_timeline(conn, author_of(alice), limit=5)
+    assert [item["text"] for item in items] == ["clean ending"]
+
+
+def test_timeline_drops_repost_of_hidden_post(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "hidden words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    hide_post(conn, post["hash"])
+    items = timeline(conn, [author_of(alice)])
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "hidden words" not in json.dumps(items)
+    # Unlike a repost of a muted author's post, a repost of a hidden
+    # post stays hidden in the explicit author view too: hiding is
+    # about the post's words, not the author.
+    items = author_timeline(conn, author_of(alice))
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "hidden words" not in json.dumps(items)
+
+
+def test_search_hides_hidden_posts(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "hello mesh world", name="alice", now=1000)
+    hidden = create_post(conn, bob, "HELLO from bob", name="bob", now=1001)
+
+    hide_post(conn, hidden["hash"])
+    assert [post["text"] for post in search_posts(conn, "hello")] == [
+        "hello mesh world"
+    ]
+    # ... even an explicit author search stays hidden: hiding is
+    # per-post, unlike muting an author.
+    assert search_posts(conn, "hello", author=author_of(bob)) == []
+
+    unhide_post(conn, hidden["hash"])
+    assert [post["text"] for post in search_posts(conn, "hello")] == [
+        "HELLO from bob",
+        "hello mesh world",
+    ]
+
+
+def test_top_posts_hides_hidden_posts(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    popular = create_post(conn, bob, "popular", name="bob", now=1000)
+    other = create_post(conn, alice, "other", name="alice", now=1001)
+    third = create_post(conn, alice, "third", name="alice", now=1002)
+    create_reaction(conn, alice, popular["hash"], liked=True, name="alice", now=1003)
+    create_reaction(conn, carol, popular["hash"], liked=True, name="carol", now=1004)
+
+    assert [post["text"] for post in top_posts(conn, limit=2)] == [
+        "popular",
+        "third",
+    ]
+    hide_post(conn, popular["hash"])
+    # The hidden post drops out and never takes up a result slot.
+    assert [post["text"] for post in top_posts(conn, limit=2)] == [
+        "third",
+        "other",
+    ]
+    unhide_post(conn, popular["hash"])
+    assert [post["text"] for post in top_posts(conn, limit=2)] == [
+        "popular",
+        "third",
+    ]
+
+
+def test_thread_hides_hidden_reply_subtree(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    root = create_post(conn, alice, "root post", name="alice", now=1000)
+    reply = create_reply(conn, bob, root["hash"], "bob replies", name="bob", now=1001)
+    nested = create_reply(
+        conn, carol, reply["hash"], "carol replies to bob", name="carol", now=1002
+    )
+    create_reply(
+        conn, carol, root["hash"], "carol replies to root", name="carol", now=1003
+    )
+
+    hide_post(conn, reply["hash"])
+    entries = thread(conn, root["hash"])
+    assert [entry["text"] for entry in entries] == [
+        "root post",
+        "carol replies to root",
+    ]
+    # The named entry always anchors the thread, even when it is hidden.
+    assert [entry["text"] for entry in thread(conn, reply["hash"])] == [
+        "bob replies",
+        "carol replies to bob",
+    ]
+    # ...while a hidden ancestor above the named entry simply ends the
+    # climb instead of being promoted to the root.
+    assert [entry["text"] for entry in thread(conn, nested["hash"])] == [
+        "carol replies to bob"
+    ]
+
+    unhide_post(conn, reply["hash"])
+    assert [entry["text"] for entry in thread(conn, root["hash"])] == [
+        "root post",
+        "bob replies",
+        "carol replies to bob",
+        "carol replies to root",
+    ]
+
+
+def test_timeline_blanks_hidden_reply_parent_preview(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    parent = create_post(conn, bob, "secret words", name="bob", now=1000)
+    reply = create_reply(conn, alice, parent["hash"], "noted", name="alice", now=1001)
+    hide_post(conn, parent["hash"])
+
+    items = timeline(conn, [author_of(alice)])
+    assert [item["hash"] for item in items] == [reply["hash"]]
+    preview = items[0]["reply_to"]
+    assert preview["hash"] == parent["hash"]
+    assert preview["text"] == ""
+    assert preview["hidden"] is True
+    assert preview["deleted"] is False
+
+
+def test_timeline_blanks_hidden_quote_preview(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    parent = create_post(conn, bob, "secret words", name="bob", now=1000)
+    quote = create_quote(conn, alice, parent["hash"], "quoting bob", name="alice", now=1001)
+    hide_post(conn, parent["hash"])
+
+    items = timeline(conn, [author_of(alice)])
+    assert [item["hash"] for item in items] == [quote["hash"]]
+    preview = items[0]["quoted"]
+    assert preview["hash"] == parent["hash"]
+    assert preview["text"] == ""
+    assert preview["hidden"] is True
+    assert preview["deleted"] is False
+
+
+def test_mentions_hides_hidden_replies(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    mine = create_post(conn, alice, "my post", name="alice", now=1000)
+    reply = create_reply(conn, bob, mine["hash"], "bob replies", name="bob", now=1001)
+    assert [item["text"] for item in mentions(conn, author_of(alice))] == [
+        "bob replies"
+    ]
+
+    hide_post(conn, reply["hash"])
+    assert mentions(conn, author_of(alice)) == []
+
+    unhide_post(conn, reply["hash"])
+    assert [item["text"] for item in mentions(conn, author_of(alice))] == [
+        "bob replies"
+    ]
+
+
+def test_annotated_saved_posts_drops_hidden(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "keep me", name="bob", now=1000)
+    save_post(conn, post["hash"], now=2000)
+
+    hide_post(conn, post["hash"], now=2001)
+    posts, _ = annotated_saved_posts(conn)
+    assert posts == []
+
+    unhide_post(conn, post["hash"])
+    posts, _ = annotated_saved_posts(conn)
+    assert len(posts) == 1
+    assert posts[0]["hash"] == post["hash"]
+
+    # A saved repost of a hidden post drops out too: the repost
+    # carries no text of its own, so hiding the original hides it.
+    original = create_post(conn, bob, "original", name="bob", now=1002)
+    repost = create_repost(conn, alice, original["hash"], name="alice", now=1003)
+    save_post(conn, repost["hash"], now=2003)
+    hide_post(conn, original["hash"], now=2004)
+    posts, _ = annotated_saved_posts(conn)
+    assert [item["hash"] for item in posts] == [post["hash"]]
+
+
+def test_annotated_pinned_posts_drops_hidden(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    mine = create_post(conn, alice, "pin this", name="alice", now=1000)
+    other = create_post(conn, alice, "keep this", name="alice", now=1001)
+    owner = author_of(alice)
+    pin_post(conn, mine["hash"], owner=owner, now=2000)
+    pin_post(conn, other["hash"], owner=owner, now=2001)
+
+    hide_post(conn, mine["hash"], now=2002)
+    posts, _ = annotated_pinned_posts(conn)
+    assert [post["hash"] for post in posts] == [other["hash"]]
+
+    unhide_post(conn, mine["hash"])
+    posts, _ = annotated_pinned_posts(conn)
+    assert [post["hash"] for post in posts] == [other["hash"], mine["hash"]]
+
+
+def test_tags_ignores_hidden_posts(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    first = create_post(conn, alice, "#mesh hello", name="alice", now=1000)
+    create_post(conn, alice, "another #mesh post", name="alice", now=1001)
+    assert tags(conn) == [{"tag": "mesh", "count": 2}]
+
+    hide_post(conn, first["hash"])
+    assert tags(conn) == [{"tag": "mesh", "count": 1}]
+
+    unhide_post(conn, first["hash"])
+    assert tags(conn) == [{"tag": "mesh", "count": 2}]
 
 
 def test_annotated_saved_posts_applies_edits(identities, tmp_path):
