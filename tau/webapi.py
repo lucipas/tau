@@ -6416,8 +6416,6 @@ class WebBridge:
             items = list(self._messages)
         if removed:
             self._save_messages()
-        if limit >= 0:
-            items = items[-limit:]
         # Blocked senders' history stays stored but is hidden locally;
         # unblocking restores the view.  Inbound records carry the
         # sender hash as "destination" (node inbox) or "peer" (console
@@ -6448,6 +6446,10 @@ class WebBridge:
                 or (item.get("peer") or item.get("destination") or "")
                 not in archived
             ]
+        # Hidden entries must not use up the window: slice only after
+        # the blocklist and archive filters have run.
+        if limit >= 0:
+            items = items[-limit:]
         by_target = self._inbox_reactions_by_target()
         pinned_ids = self._inbox_pinned_ids(strict=strict_pins)
         groups = getattr(self.node, "groups", None)
@@ -6739,6 +6741,24 @@ class WebBridge:
         self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
         return dict(counts, revision=self._unread_revision)
 
+    def _drop_archived_unread(self, counts: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove archived conversations from unread counts.
+
+        An archived conversation never lights the badge: its counts are
+        dropped and the total recomputed, like the messages() filter hides
+        its history. Every unread result passes through here so no path
+        can publish a count for an archived peer.
+        """
+        archived = self._archived_set()
+        if archived and counts.get("per_peer"):
+            kept = {
+                destination: unread
+                for destination, unread in counts["per_peer"].items()
+                if destination not in archived
+            }
+            return {"per_peer": kept, "total": sum(kept.values())}
+        return counts
+
     def unread(self) -> Dict[str, Any]:
         """Per-conversation unread counts from the node inbox.
 
@@ -6753,18 +6773,7 @@ class WebBridge:
                     counts = inbox.unread_counts()
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)
-            # An archived conversation never lights the badge: drop its
-            # counts and recompute the total, like the messages() filter
-            # hides its history.
-            archived = self._archived_set()
-            if archived and counts.get("per_peer"):
-                kept = {
-                    destination: unread
-                    for destination, unread in counts["per_peer"].items()
-                    if destination not in archived
-                }
-                counts = {"per_peer": kept, "total": sum(kept.values())}
-            return self._stamp_unread(counts)
+            return self._stamp_unread(self._drop_archived_unread(counts))
 
     def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
         """Advance the inbox read cursor for one conversation, or all.
@@ -6778,7 +6787,7 @@ class WebBridge:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
                 counts = inbox.mark_read(peer=peer)
-            stamped = self._stamp_unread(counts)
+            stamped = self._stamp_unread(self._drop_archived_unread(counts))
         if inbox is not None:
             self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
@@ -9485,6 +9494,36 @@ class _WebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if not head_only:
+            self.wfile.write(body)
+
+    def _send_error(self, status: int, message: str, head_only: bool = False) -> None:
+        self._send_json({"error": {"message": message}}, head_only, status)
+
+
+def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
+    values = query.get(name) or []
+    if not values:
+        return False
+    return values[0].strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_param(
+    query: Dict[str, List[str]],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    values = query.get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+)imum, min(value, maximum))
             self.wfile.write(body)
 
     def _send_error(self, status: int, message: str, head_only: bool = False) -> None:
