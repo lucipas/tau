@@ -622,6 +622,9 @@ export interface TanPost {
   pinned?: boolean;
   pinned_at?: number;
   deleted?: boolean;
+  // Epoch seconds after which the post disappears from display
+  // surfaces; absent when the post never expires.
+  expires_at?: number;
   // Thread entries carry their depth (the root is 0); timeline entries
   // have no depth.
   depth?: number;
@@ -756,6 +759,9 @@ export interface TanScheduledPost {
   next_attempt_at: number;
   paused_at: number;
   pending_peers: string[];
+  // Seconds after publishing before the post disappears; 0 (or
+  // absent on older entries) means it never expires.
+  expires_in?: number;
 }
 
 export interface TanScheduleResponse {

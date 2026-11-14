@@ -2468,7 +2468,13 @@ class WebBridge:
             items = list(self._tan_posts)
         return items[-limit:] if limit >= 0 else items
 
-    def tan_post(self, text: str, *, reply_to: Optional[str] = None) -> Dict[str, Any]:
+    def tan_post(
+        self,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        expires_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
@@ -2480,10 +2486,16 @@ class WebBridge:
                 reply_to = resolve_post(conn, reply_to)["hash"]
             finally:
                 conn.close()
-        return app.create_post(text, reply_to=reply_to, publish=True)
+        expires_at = None
+        if expires_in is not None:
+            expires_at = time.time() + float(expires_in)
+        return app.create_post(
+            text, reply_to=reply_to, publish=True, expires_at=expires_at
+        )
 
     def tan_schedule_post(
-        self, text: str, *, reply_to: Optional[str] = None, send_in: float
+        self, text: str, *, reply_to: Optional[str] = None, send_in: float,
+        expires_in: float = 0.0,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
 
@@ -2511,6 +2523,7 @@ class WebBridge:
             # Validate against the name the serving app publishes with
             # (node.name, refreshed at startup), not the configured name.
             name=getattr(self.node, "name", None),
+            expires_in=float(expires_in),
         )
         return post.to_dict()
 
@@ -7672,8 +7685,32 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                expires_in = body.get("expires_in")
+                if expires_in is not None:
+                    if (
+                        not isinstance(expires_in, (int, float))
+                        or isinstance(expires_in, bool)
+                        or not _valid_expires_in(expires_in)
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'expires_in' must be a number of "
+                                    "seconds between 0 and 30 days"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
-                    post = self.bridge.tan_post(text, reply_to=reply_to)
+                    post = self.bridge.tan_post(
+                        text,
+                        reply_to=reply_to,
+                        expires_in=(
+                            float(expires_in) if expires_in is not None else None
+                        ),
+                    )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
@@ -7718,9 +7755,48 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                expires_in = body.get("expires_in")
+                if expires_in is not None:
+                    # A scheduled post's expiry shares the 7d queue cap
+                    # (see schedule_post): it cannot outlive the furthest
+                    # it may be queued.
+                    if (
+                        not isinstance(expires_in, (int, float))
+                        or isinstance(expires_in, bool)
+                        or not _valid_schedule_in(expires_in)
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'expires_in' must be a number "
+                                    "of seconds (0 < expires_in <= 604800)"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if float(send_in) >= float(expires_in):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'send_in' must be shorter than "
+                                    "'expires_in' — the post would expire before "
+                                    "it is published"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     scheduled = self.bridge.tan_schedule_post(
-                        text, reply_to=reply_to, send_in=float(send_in)
+                        text,
+                        reply_to=reply_to,
+                        send_in=float(send_in),
+                        expires_in=(
+                            float(expires_in) if expires_in is not None else 0.0
+                        ),
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

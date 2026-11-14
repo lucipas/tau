@@ -96,4 +96,24 @@ describe("useTan publish with replies", () => {
       text: "hello",
     });
   });
+
+  it("sends expires_in when publishing a disappearing post", async () => {
+    mockedGet.mockImplementation((path: string) =>
+      routeLoad(path, { posts: [], count: 0 }),
+    );
+    const post = makePost({ expires_at: 4600 });
+    mockedPost.mockResolvedValue({ ok: true, post });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.publish("vanish soon", undefined, 3600);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/posts", {
+      text: "vanish soon",
+      expires_in: 3600,
+    });
+  });
 });

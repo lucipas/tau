@@ -149,6 +149,25 @@ describe("useTan scheduled posts", () => {
     });
   });
 
+  it("passes the expiry when scheduling a disappearing post", async () => {
+    const entry = makeScheduled({ expires_in: 3600 });
+    mockedGet.mockImplementation(routeLoad);
+    mockedPost.mockResolvedValue({ ok: true, scheduled: entry });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([]));
+
+    await act(async () => {
+      await result.current.schedulePost("vanish later", 60, undefined, 3600);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/schedule", {
+      text: "vanish later",
+      send_in: 60,
+      expires_in: 3600,
+    });
+  });
+
   it("cancelling drops the entry from state without a reload", async () => {
     const first = makeScheduled();
     const second = makeScheduled({ id: "e5f6a7b8", text: "second" });

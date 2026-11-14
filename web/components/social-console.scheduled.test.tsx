@@ -179,7 +179,12 @@ describe("SocialConsole scheduled posts", () => {
     fireEvent.click(screen.getByRole("button", { name: "schedule" }));
 
     await waitFor(() =>
-      expect(schedulePost).toHaveBeenCalledWith("hello later", 3600, undefined),
+      expect(schedulePost).toHaveBeenCalledWith(
+        "hello later",
+        3600,
+        undefined,
+        undefined,
+      ),
     );
     // The queue the post just joined opens, so it is visible instead
     // of disappearing into the file.
@@ -257,6 +262,7 @@ describe("SocialConsole scheduled posts", () => {
         "agreed, later",
         3600,
         post.hash,
+        undefined,
       ),
     );
     // The thread view renders first and would hide the queue, so
@@ -304,5 +310,74 @@ describe("SocialConsole scheduled posts", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("publishes the draft with the picked expiry and clears the picker", async () => {
+    const publish = vi.fn().mockResolvedValue(undefined);
+    mockedUseTan.mockReturnValue(makeTan({ publish }));
+    render(<SocialConsole />);
+
+    fireEvent.change(
+      screen.getByPlaceholderText("Write something to the mesh…"),
+      { target: { value: "vanish soon" } },
+    );
+    fireEvent.change(screen.getByLabelText("Post expiry"), {
+      target: { value: "3600" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "post" }));
+
+    await waitFor(() =>
+      expect(publish).toHaveBeenCalledWith("vanish soon", undefined, 3600),
+    );
+    // The expiry applies to one post only: the picker resets.
+    expect(
+      (screen.getByLabelText("Post expiry") as HTMLSelectElement).value,
+    ).toBe("");
+  });
+
+  it("schedules the draft with the picked expiry", async () => {
+    const schedulePost = vi.fn().mockResolvedValue(undefined);
+    const loadScheduled = vi.fn().mockResolvedValue(undefined);
+    mockedUseTan.mockReturnValue(
+      makeTan({ schedulePost, loadScheduled, scheduled: [] }),
+    );
+    render(<SocialConsole />);
+
+    fireEvent.change(
+      screen.getByPlaceholderText("Write something to the mesh…"),
+      { target: { value: "vanish later" } },
+    );
+    fireEvent.change(screen.getByLabelText("Post later"), {
+      target: { value: "3600" },
+    });
+    fireEvent.change(screen.getByLabelText("Post expiry"), {
+      target: { value: "86400" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "schedule" }));
+
+    await waitFor(() =>
+      expect(schedulePost).toHaveBeenCalledWith(
+        "vanish later",
+        3600,
+        undefined,
+        86400,
+      ),
+    );
+    expect(
+      (screen.getByLabelText("Post expiry") as HTMLSelectElement).value,
+    ).toBe("");
+  });
+
+  it("hides the expiry picker while quoting", () => {
+    const post = makePost({ text: "quotable" });
+    mockedUseTan.mockReturnValue(makeTan({ posts: [post] }));
+    render(<SocialConsole />);
+
+    expect(screen.getByLabelText("Post expiry")).toBeTruthy();
+    fireEvent.click(
+      screen.getByTitle("Quote this post with your own comment"),
+    );
+
+    expect(screen.queryByLabelText("Post expiry")).toBeNull();
   });
 });
