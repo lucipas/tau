@@ -1493,6 +1493,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail instead of queueing the message when a member is offline",
     )
     group_send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    group_send.add_argument(
         "--expire",
         metavar="DURATION",
         help="disappearing message: purge it from the receivers' inboxes "
@@ -8724,7 +8731,15 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     failed_legs = [
         r for r in response["results"] if not r.get("delivered") and not r.get("queued")
     ]
-    exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    # --wait outcomes are recorded on the results by the wait path
+    # (see _wait_for_queued_sends), mirroring cmd_send: a waited leg
+    # that is not delivered failed the wait, whether it is still
+    # queued or left the queue without a delivery confirmation.
+    wait_failed = any(
+        result.get("waited") is not None and result.get("delivered") is False
+        for result in response["results"]
+    )
+    exit_code = _EXIT_ERROR if (failed_legs or wait_failed) else _EXIT_OK
     if expires_at is not None:
         response["expires_at"] = expires_at
     if send_after is not None:
@@ -8736,23 +8751,40 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     queued = [r for r in response["results"] if r.get("queued")]
     failed = failed_legs
     for result in delivered:
-        print(f"delivered to {result.get('to_name') or result['to'][:8]}")
+        name = result.get("to_name") or result["to"][:8]
+        waited = result.get("waited")
+        if waited is not None:
+            print(f"delivered to {name} after {waited:.1f}s")
+        else:
+            print(f"delivered to {name}")
     for result in queued:
-        if result.get("send_after"):
+        name = result.get("to_name") or result["to"][:8]
+        if result.get("waited") is not None:
+            print(f"still queued for {name} after {result['waited']:.1f}s")
+        elif result.get("send_after"):
             print(
-                f"scheduled for {result.get('to_name') or result['to'][:8]}"
+                f"scheduled for {name}"
                 f" — sends in {_ago(result['send_after'] - time.time())}"
             )
         else:
             print(
-                f"queued for {result.get('to_name') or result['to'][:8]}"
+                f"queued for {name}"
                 " — they are unreachable right now"
             )
     for result in failed:
-        print(
-            f"failed for {result.get('to_name') or result['to'][:8]}:"
-            f" {result.get('error') or 'unknown error'}"
-        )
+        name = result.get("to_name") or result["to"][:8]
+        if result.get("waited") is not None and not result.get("delivered"):
+            # The leg left the queue while waiting without a delivery
+            # confirmation from this node: cancelled, or delivered by
+            # another process.  Say so instead of claiming delivery.
+            print(f"no longer queued for {name} after {result['waited']:.1f}s")
+            print("  delivery was not confirmed — it may have been cancelled,")
+            print("  or delivered by another process sharing this data directory")
+        else:
+            print(
+                f"failed for {name}:"
+                f" {result.get('error') or 'unknown error'}"
+            )
     if expires_at is not None:
         print(f"disappears in {_ago(expires_at - time.time())}")
     if queued and all(result.get("send_after") for result in queued):
