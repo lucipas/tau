@@ -32,9 +32,8 @@ script) can read what arrives from the mesh and send messages back:
                            ``"expires_in"`` seconds for a disappearing message,
                            ``"send_in"`` seconds to schedule it for later)
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
-                           (one outbound entry per member; replies are peer-DM-only,
-                           ``expires_in`` works for DM and group sends,
-                           ``send_in`` is peer-DM-only)
+                           (one outbound entry per member; ``"reply_to"``,
+                           ``"expires_in"`` and ``"send_in"`` work for DM and group sends)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -3515,6 +3514,45 @@ class WebBridge:
             "excerpt": excerpt_hash(str(quoted.get("text") or "")),
         }
 
+    def _resolve_console_group_reply(
+        self, group_id: str, reply_to: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a console ``reply_to`` wire id to an ``in_reply_to``.
+
+        Same rules as :meth:`_resolve_console_reply`, scoped to the
+        group instead of a peer: the quoted message must be in this
+        group's history in the console — matched by full id or unique
+        prefix — so a reply never dangles at a message from another
+        group or one the console never saw.
+        """
+        if reply_to is None:
+            return None
+        if not isinstance(reply_to, str) or not reply_to.strip():
+            raise ValueError("field 'reply_to' must be a message id")
+        ref = reply_to.strip().lower()
+        with self._lock:
+            matches = [
+                message
+                for message in self._messages
+                if message.get("group") == group_id
+                and isinstance(message.get("wire_id"), str)
+                and str(message["wire_id"]).lower().startswith(ref)
+            ]
+        if not matches:
+            raise ValueError(
+                f"no message {reply_to.strip()!r} in this group to reply to"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"{len(matches)} messages in this group match"
+                f" {reply_to.strip()!r}; use a longer id"
+            )
+        quoted = matches[0]
+        return {
+            "id": str(quoted["wire_id"]),
+            "excerpt": excerpt_hash(str(quoted.get("text") or "")),
+        }
+
     def send_message(
         self,
         target: str,
@@ -3671,6 +3709,8 @@ class WebBridge:
         *,
         timeout: float = 20.0,
         expires_at: Optional[float] = None,
+        send_after: Optional[float] = None,
+        reply_to: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a message to every member of a group from the console.
 
@@ -3679,6 +3719,15 @@ class WebBridge:
         payload, a queued leg expires at the same deadline, and the
         receiver purges the message once it passes.  The outbound feed
         entry carries it too, so the console can show the deadline.
+
+        ``send_after`` schedules the message (epoch seconds), exactly
+        like a direct message: instead of attempting delivery now,
+        every leg is queued with the not-before time and the outbox
+        delivers it once that time arrives.
+
+        ``reply_to`` is a console wire id (full id or unique prefix)
+        of a message in this group's history; it is resolved to the
+        ``in_reply_to`` reference the node carries on every leg.
 
         The group is resolved by id, id prefix, or exact name through
         ``GroupStore.find`` (unknown or ambiguous queries raise
@@ -3707,6 +3756,31 @@ class WebBridge:
             expires_at = float(expires_at)
             if not math.isfinite(expires_at):
                 raise ValueError("expires_at must be a finite number")
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise ValueError("send_after must be a number")
+            send_after = float(send_after)
+            if not math.isfinite(send_after):
+                raise ValueError("send_after must be a finite number")
+            now = time.time()
+            if send_after <= now:
+                # A short relative delay can elapse between the
+                # handler computing its deadline and this check. It is
+                # due now, so it takes the immediate-delivery path.
+                send_after = None
+        if send_after is not None:
+            if send_after > now + MAX_MAIL_TTL - 3600.0:
+                raise ValueError(
+                    "send_after must be at most 29d23h from now (the 30d "
+                    "mail TTL less an hour of delivery slack)"
+                )
+            if expires_at is not None and send_after >= expires_at:
+                raise ValueError(
+                    "send_after must be before the message expiry — the "
+                    "message would expire before it is sent"
+                )
         # Normalise up front so the recorded text is exactly what gets
         # sent: the node normalises again before sending, so this cannot
         # change delivery.
@@ -3716,8 +3790,16 @@ class WebBridge:
         # another process (``tau group``) must be seen by this send.
         self.node.groups.list_groups()
         group_record = self.node.groups.find(group.strip())
+        in_reply_to = self._resolve_console_group_reply(
+            group_record["id"], reply_to
+        )
         response = self.node.send_group_message(
-            group_record, text, timeout=timeout, expires_at=expires_at
+            group_record,
+            text,
+            timeout=timeout,
+            expires_at=expires_at,
+            send_after=send_after,
+            in_reply_to=in_reply_to,
         )
         # Every leg shares one wire send time (the node's send_group_
         # message returns it): record that on each outbound entry, not
@@ -3765,6 +3847,8 @@ class WebBridge:
                     group=group_record["id"],
                     group_name=group_record.get("name") or "",
                     expires_at=expires_at,
+                    send_after=send_after,
+                    in_reply_to=in_reply_to,
                     wire_id=wire_id,
                 )
                 if message is None:
@@ -8527,18 +8611,9 @@ class _WebHandler(BaseHTTPRequestHandler):
         expires_in = body.get("expires_in")
         send_in = body.get("send_in")
         if group is not None:
-            if send_in is not None:
-                self._send_json(
-                    {
-                        "error": {
-                            "message": "group sends do not support 'send_in'"
-                        }
-                    },
-                    head_only,
-                    400,
-                )
-                return
-            self._handle_group_send(body, group, text, timeout, expires_in, head_only)
+            self._handle_group_send(
+                body, group, text, timeout, expires_in, send_in, head_only
+            )
             return
         if not isinstance(target, str) or not target.strip():
             self._send_json(
@@ -8647,12 +8722,11 @@ class _WebHandler(BaseHTTPRequestHandler):
         text: Any,
         timeout: Any,
         expires_in: Any,
+        send_in: Any,
         head_only: bool,
     ) -> None:
         # A group send is addressed by group, not by peer, so the two
-        # forms are exclusive; the node group path supports no reply
-        # quoting, so that is rejected outright instead of silently
-        # dropped.
+        # forms are exclusive.
         if body.get("to") is not None:
             self._send_json(
                 {"error": {"message": "give 'to' or 'group', not both"}},
@@ -8699,16 +8773,56 @@ class _WebHandler(BaseHTTPRequestHandler):
                 )
                 return
             expires_at = time.time() + float(expires_in)
-        if body.get("reply_to") is not None:
+        reply_to = body.get("reply_to")
+        if reply_to is not None and (
+            not isinstance(reply_to, str) or not reply_to.strip()
+        ):
             self._send_json(
-                {"error": {"message": "group sends do not support 'reply_to'"}},
+                {"error": {"message": "field 'reply_to' must be a message id"}},
                 head_only,
                 400,
             )
             return
+        send_after = None
+        if send_in is not None:
+            if (
+                not isinstance(send_in, (int, float))
+                or isinstance(send_in, bool)
+                or not _valid_send_in(send_in)
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'send_in' must be a number of "
+                            "seconds between 0 and 29d23h"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
+            send_after = time.time() + float(send_in)
+            if expires_at is not None and send_after >= expires_at:
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'send_in' must be shorter than "
+                            "'expires_in' — the message would expire before "
+                            "it is sent"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
         try:
             messages, response = self.bridge.send_group_message(
-                group.strip(), text, timeout=timeout, expires_at=expires_at
+                group.strip(),
+                text,
+                timeout=timeout,
+                expires_at=expires_at,
+                send_after=send_after,
+                reply_to=reply_to,
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown

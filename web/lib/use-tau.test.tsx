@@ -1110,6 +1110,43 @@ describe("useTau sendGroup", () => {
     expect(mockedGet).toHaveBeenCalledWith("/api/outbox");
   });
 
+  it("passes expiry, reply and delay through to the group send", async () => {
+    const legs = [
+      makeMessage({ id: 1, peer: PEER_HASH, peer_name: "alice" }),
+    ];
+    mockedPost.mockResolvedValue({
+      ok: true,
+      messages: legs,
+      response: { ok: true, group: GROUP_ID, name: "crew", results: [] },
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot(),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+
+    await act(async () => {
+      await result.current.sendGroup(
+        GROUP_ID,
+        "hi all",
+        3600,
+        "ab".repeat(16),
+        1800,
+      );
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages", {
+      group: GROUP_ID,
+      text: "hi all",
+      expires_in: 3600,
+      reply_to: "ab".repeat(16),
+      send_in: 1800,
+    });
+  });
+
   it("throws naming the failed member but keeps the legs in the feed", async () => {
     const legs = [
       makeMessage({ id: 1, peer: PEER_HASH, peer_name: "alice" }),

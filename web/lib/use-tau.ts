@@ -1101,11 +1101,24 @@ export function useTau() {
   );
 
   const sendGroup = useCallback(
-    async (group: string, text: string) => {
-      const result = await apiPost<SendGroupResponse>("/api/messages", {
-        group,
-        text,
-      });
+    async (
+      group: string,
+      text: string,
+      expiresIn?: number,
+      replyTo?: string,
+      sendIn?: number,
+    ) => {
+      const body: {
+        group: string;
+        text: string;
+        expires_in?: number;
+        reply_to?: string;
+        send_in?: number;
+      } = { group, text };
+      if (expiresIn !== undefined) body.expires_in = expiresIn;
+      if (replyTo) body.reply_to = replyTo;
+      if (sendIn !== undefined) body.send_in = sendIn;
+      const result = await apiPost<SendGroupResponse>("/api/messages", body);
       setMessages((previous) => {
         const fresh = result.messages.filter(
           (entry) => !previous.some((known) => known.id === entry.id),
