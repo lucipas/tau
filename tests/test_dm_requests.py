@@ -533,13 +533,52 @@ def test_cli_accept_failed_append_keeps_request_for_retry(tmp_path, capsys, monk
     calls = []
     original_append = cli.Inbox.append
 
-    def flaky(self, record):
+    def flaky(self, record, **kwargs):
         if not calls:
             calls.append(1)
             raise InboxError("disk full")
-        return original_append(self, record)
+        return original_append(self, record, **kwargs)
 
     monkeypatch.setattr(cli.Inbox, "append", flaky)
+    assert run_cli("messages", "accept-request", "req-1", "--data-dir", str(data_dir)) == 1
+    assert "could not deliver" in capsys.readouterr().err
+    assert len(load_dm_requests(config.dm_requests_path)) == 1
+    assert Mailbox(config.mailbox_path).is_seen("req-1") is False
+    assert Inbox(config.inbox_path).list_messages(limit=None) == []
+    assert run_cli("messages", "accept-request", "req-1", "--data-dir", str(data_dir)) == 0
+    entries = Inbox(config.inbox_path).list_messages(limit=None)
+    assert len(entries) == 1
+    assert entries[0]["id"] == "req-1"
+    assert Mailbox(config.mailbox_path).is_seen("req-1") is True
+    assert load_dm_requests(config.dm_requests_path) == []
+
+
+def test_cli_accept_failed_persist_keeps_request_for_retry(tmp_path, capsys, monkeypatch):
+    # The inbox persist fails on the first accept: the append must
+    # raise instead of reporting success, so no seen marker is left
+    # behind and the retry delivers the held copy.
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    save_allowlist(
+        config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset({ALICE})),
+    )
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", sender=BOB, received_at=now - 60),
+        now=now,
+    )
+    calls = []
+    original_save = cli.Inbox._save
+
+    def flaky_save(self, *, strict=False):
+        if not calls:
+            calls.append(1)
+            raise OSError("disk full")
+        return original_save(self, strict=strict)
+
+    monkeypatch.setattr(cli.Inbox, "_save", flaky_save)
     assert run_cli("messages", "accept-request", "req-1", "--data-dir", str(data_dir)) == 1
     assert "could not deliver" in capsys.readouterr().err
     assert len(load_dm_requests(config.dm_requests_path)) == 1

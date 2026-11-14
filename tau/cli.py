@@ -7775,7 +7775,9 @@ def cmd_messages_accept_request(args: argparse.Namespace) -> int:
 
     Delivery appends to the inbox before marking the id seen, under
     the mailbox transaction, so a failed append leaves no durable
-    seen marker behind and the request stays for a retry; a copy
+    seen marker behind and the request stays for a retry; the append
+    is strict, so a persist failure raises instead of reporting a
+    delivery that never landed on disk.  A copy
     already in the inbox (a previous accept that appended and then
     crashed before marking seen) is not appended twice.  Holding
     the mailbox transaction across both steps is what keeps a
@@ -7859,8 +7861,12 @@ def cmd_messages_accept_request(args: argparse.Namespace) -> int:
                     delivered = True
                 else:
                     try:
-                        inbox.append(record)
-                    except (InboxError, ValueError) as exc:
+                        # Strict: a persist failure raises instead of
+                        # returning normally, so acceptance never marks
+                        # the id seen and drops the request for a copy
+                        # that never landed on disk.
+                        inbox.append(record, strict=True)
+                    except (InboxError, ValueError, OSError) as exc:
                         raise NodeError(
                             f"could not deliver the held message: {exc}"
                         ) from exc
@@ -7871,29 +7877,6 @@ def cmd_messages_accept_request(args: argparse.Namespace) -> int:
             [entry for entry in requests if entry.id != request.id],
         )
     name = _request_sender_label(registry, request.sender)
-    if _json_mode(args):
-        _emit(
-            {
-                "accepted": request.to_dict(),
-                "delivered": delivered,
-                "allowlisted": allowlisted,
-                "skipped": skipped,
-            },
-            True,
-        )
-        return _EXIT_OK
-    short = _safe_id_prefix(request.id)
-    when = _format_message_time(request.received_at)
-    if delivered:
-        state = "delivered to the inbox"
-    else:
-        state = f"not delivered ({skipped})"
-    if allowlisted:
-        print(f"accepted [{short}] from {name} ({when}) — sender allow-listed, message {state}")
-        print("  (a running serve applies the allow-list change when it restarts)")
-    else:
-        print(f"accepted [{short}] from {name} ({when}) — sender already allow-listed, message {state}")
-    return _EXIT_OK
     if _json_mode(args):
         _emit(
             {
