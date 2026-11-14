@@ -4363,8 +4363,10 @@ def hidden_posts(
 
     A post deleted after being hidden stays in the list with its text
     blanked and ``deleted`` set, so the hide is not silently lost.
-    *offset* pages through the list in hide order, so a caller can
-    reach hides older than one page.
+    The list shows each post's current text: an edit that landed
+    after the hide replaces the stored text, the way the saved view
+    shows edited text.  *offset* pages through the list in hide
+    order, so a caller can reach hides older than one page.
     """
     count = max(1, min(int(limit), MAX_HIDDEN_POSTS))
     start = max(0, int(offset))
@@ -4382,10 +4384,14 @@ def hidden_posts(
     for row in rows:
         post = _row_to_post(row)
         post["hidden_at"] = float(row["hidden_at"])
+        records.append(post)
+    annotate_edits(conn, records)
+    for post in records:
         if str(post["hash"]) in deleted:
+            # Edits replace the stored text, so re-blank deleted entries.
             post["deleted"] = True
             post["text"] = ""
-        records.append(post)
+            post["edited"] = False
     return records
 
 
@@ -4408,10 +4414,11 @@ def annotated_pinned_posts(
     matching a muted keyword has its text blanked.  Posts by muted
     authors or matching a muted keyword are dropped from the view —
     muting is display-only, so the pins stay stored and unmuting
-    restores them.  ``exclude_authors`` hides blocked authors' words
-    the same way, and ``exclude_all`` hides everything when the
-    blocklist could not be read.  Each returned post carries ``pinned``
-    and ``pinned_at``.
+    restores them.  Hidden posts are dropped the same way, and a
+    hidden parent keeps its preview text blanked.  ``exclude_authors``
+    hides blocked authors' words the same way, and ``exclude_all``
+    hides everything when the blocklist could not be read.  Each
+    returned post carries ``pinned`` and ``pinned_at``.
 
     Returns ``(posts, next_offset)``: up to *limit* visible posts
     starting at raw offset *offset*, and the raw offset to resume
@@ -4450,17 +4457,20 @@ def annotated_pinned_posts(
                             muted_keywords=keywords,
                             exclude_authors=silenced,
                             blocked_authors=blocked,
+                            hidden_posts=hidden_hashes,
                         ),
                     ),
                     muted_keywords=keywords,
                     exclude_authors=silenced,
                     blocked_authors=blocked,
+                    hidden_posts=hidden_hashes,
                 ),
                 viewer=viewer,
             ),
             muted_keywords=keywords,
             exclude_authors=silenced,
             blocked_authors=blocked,
+            hidden_posts=hidden_hashes,
         )
         for post in batch:
             # Edits replace the stored text, so re-blank deleted entries.
@@ -4473,6 +4483,7 @@ def annotated_pinned_posts(
             for post in batch
             if post["author"] not in silenced and post["author"] not in blocked
         ]
+        batch = without_hidden_posts(batch, hidden_hashes)
         batch = without_muted_keywords(conn, batch, keywords)
         if ruleset is not None:
             batch = apply_display_rules(batch, ruleset)
@@ -5584,18 +5595,6 @@ class TanApp:
                     )
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Tan gossip failed", exc_info=True)
-            finally:
-                self._gossip_slots.release()
-
-        threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
-                  )
-            except Exception:  # pragma: no cover - network dependent
-                log.debug("Tan gossip failed", exc_info=True)
-            finally:
-                self._gossip_slots.release()
-
-        threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
-c_info=True)
             finally:
                 self._gossip_slots.release()
 

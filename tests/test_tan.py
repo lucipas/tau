@@ -4993,6 +4993,20 @@ def test_hide_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
     }
 
 
+def test_hidden_posts_shows_edited_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "original", name="bob", now=1000)
+    hide_post(conn, post["hash"], now=2000)
+
+    # The hidden shelf shows the current text, not the text as hidden.
+    create_edit(conn, bob, post["hash"], "fixed", name="bob", now=1001)
+    hidden = hidden_posts(conn)
+    assert len(hidden) == 1
+    assert hidden[0]["text"] == "fixed"
+    assert hidden[0]["edited"] is True
+
+
 def test_timeline_hides_hidden_posts(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -5220,6 +5234,33 @@ def test_annotated_saved_posts_drops_hidden(identities, tmp_path):
     posts, _ = annotated_saved_posts(conn)
     assert len(posts) == 1
     assert posts[0]["hash"] == post["hash"]
+
+    # A saved repost of a hidden post drops out too: the repost
+    # carries no text of its own, so hiding the original hides it.
+    original = create_post(conn, bob, "original", name="bob", now=1002)
+    repost = create_repost(conn, alice, original["hash"], name="alice", now=1003)
+    save_post(conn, repost["hash"], now=2003)
+    hide_post(conn, original["hash"], now=2004)
+    posts, _ = annotated_saved_posts(conn)
+    assert [item["hash"] for item in posts] == [post["hash"]]
+
+
+def test_annotated_pinned_posts_drops_hidden(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    mine = create_post(conn, alice, "pin this", name="alice", now=1000)
+    other = create_post(conn, alice, "keep this", name="alice", now=1001)
+    owner = author_of(alice)
+    pin_post(conn, mine["hash"], owner=owner, now=2000)
+    pin_post(conn, other["hash"], owner=owner, now=2001)
+
+    hide_post(conn, mine["hash"], now=2002)
+    posts, _ = annotated_pinned_posts(conn)
+    assert [post["hash"] for post in posts] == [other["hash"]]
+
+    unhide_post(conn, mine["hash"])
+    posts, _ = annotated_pinned_posts(conn)
+    assert [post["hash"] for post in posts] == [other["hash"], mine["hash"]]
 
 
 def test_tags_ignores_hidden_posts(identities, tmp_path):
