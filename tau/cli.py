@@ -5733,15 +5733,18 @@ def _reconcile_queued_sends(
 def _wait_for_queued_sends(
     node: TauNode, results: List[Dict[str, Any]], wait: float
 ) -> None:
-    """Wait for each queued result in turn, each with the full budget.
+    """Wait for the queued results in turn, sharing one deadline.
 
     The ``--wait`` handling from :func:`cmd_send`, shared by the local
     send path and the send server so both routes report the same
     result: ``--wait`` replaces the one-shot flush, a direct delivery
     records ``waited: 0.0``, and a queued message still queued at the
     deadline — or one that left the queue without a delivery
-    confirmation from this node — is recorded as not delivered.
+    confirmation from this node — is recorded as not delivered.  All
+    results share a single ``wait`` budget, so a group send with many
+    offline members cannot block for ``wait`` seconds per leg.
     """
+    deadline = time.monotonic() + max(0.0, wait)
     for result in results:
         if not result.get("queued"):
             if result.get("ok", True):
@@ -5749,7 +5752,8 @@ def _wait_for_queued_sends(
                 result["waited"] = 0.0
             continue
         started = time.monotonic()
-        delivered = node.wait_for_delivery(result["id"], timeout=wait)
+        remaining = max(0.0, deadline - started)
+        delivered = node.wait_for_delivery(result["id"], timeout=remaining)
         waited = time.monotonic() - started
         if delivered:
             result.pop("queued", None)
