@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiDownload, apiGet, apiPost, apiPostText, eventsUrl } from "./api";
 import type {
+  AcceptDmRequestResponse,
   AllowlistResponse,
   BlockPeerResponse,
   BridgeInfo,
@@ -12,8 +13,11 @@ import type {
   CancelOutboxResponse,
   ChangeGroupMembersResponse,
   CreateGroupResponse,
+  DeclineDmRequestResponse,
   DeleteGroupResponse,
   DeleteMessageResponse,
+  DmRequestEntry,
+  DmRequestsResponse,
   DoctorResponse,
   DropHeldResponse,
   EditMessageResponse,
@@ -165,6 +169,7 @@ export function useTau() {
   const [settings, setSettings] = useState<NodeSettings | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
+  const [dmRequests, setDmRequests] = useState<DmRequestEntry[]>([]);
   const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [social, setSocial] = useState<SocialInfo | null>(null);
@@ -579,6 +584,17 @@ export function useTau() {
     setHeldMail(result.held);
   }, []);
 
+  const refreshDmRequestsSeq = useRef(0);
+
+  const refreshDmRequests = useCallback(async () => {
+    // Same stale-response guard as the outbox refresh: a slow poll
+    // must not restore a request an accept or decline already removed.
+    const requestId = ++refreshDmRequestsSeq.current;
+    const result = await apiGet<DmRequestsResponse>("/api/messages/requests");
+    if (requestId !== refreshDmRequestsSeq.current) return;
+    setDmRequests(result.requests);
+  }, []);
+
   const allowlistSeq = useRef(0);
 
   // Allow-list requests can resolve out of order: only the newest
@@ -647,6 +663,7 @@ export function useTau() {
       await Promise.allSettled([
         refreshOutbox(),
         refreshHeldMail(),
+        refreshDmRequests(),
         refreshGroups(),
         refreshSettings(),
         refreshAllowlist(),
@@ -657,7 +674,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     (target: string) =>
@@ -1697,6 +1714,58 @@ export function useTau() {
           };
   }, [pinnedMessages, showPinned]);
 
+  const acceptDmRequest = useCallback(
+    async (id: string) => {
+      const result = await apiPost<AcceptDmRequestResponse>(
+        "/api/messages/requests/accept",
+        { id },
+      );
+      // The accept already succeeded: drop the request locally at
+      // once, and treat the follow-up refreshes as best-effort so a
+      // failed GET cannot make a successful accept look like a
+      // failure. The delivered message lands in the feed, so the
+      // messages refresh runs too.
+      const acceptedId = result.accepted.id;
+      setDmRequests((previous) =>
+        previous.filter((entry) => entry.id !== acceptedId),
+      );
+      try {
+        await refreshDmRequests();
+      } catch {
+        // The next poll reconciles.
+      }
+      try {
+        await refreshMessages();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshDmRequests, refreshMessages],
+  );
+
+  const declineDmRequest = useCallback(
+    async (id: string) => {
+      const result = await apiPost<DeclineDmRequestResponse>(
+        "/api/messages/requests/decline",
+        { id },
+      );
+      // Same shape as the accept: the decline already succeeded, so
+      // drop the request locally at once and refresh best-effort.
+      const declinedId = result.declined.id;
+      setDmRequests((previous) =>
+        previous.filter((entry) => entry.id !== declinedId),
+      );
+      try {
+        await refreshDmRequests();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshDmRequests],
+  );
+
   return {
     node,
     peers,
@@ -1716,6 +1785,10 @@ export function useTau() {
     unread,
     outbox,
     heldForOthers,
+    dmRequests,
+    acceptDmRequest,
+    declineDmRequest,
+    refreshDmRequests,
     settings,
     settingsError,
     heldMail,

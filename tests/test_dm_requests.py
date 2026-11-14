@@ -21,6 +21,7 @@ from tau.dm_requests import (
     MAX_DM_REQUESTS,
     DmRequest,
     DmRequestsError,
+    accept_dm_request,
     list_dm_requests,
     load_dm_requests,
     record_dm_request,
@@ -590,6 +591,59 @@ def test_cli_accept_failed_persist_keeps_request_for_retry(tmp_path, capsys, mon
     assert entries[0]["id"] == "req-1"
     assert Mailbox(config.mailbox_path).is_seen("req-1") is True
     assert load_dm_requests(config.dm_requests_path) == []
+
+
+def test_accept_dm_request_helper_shares_cli_semantics(tmp_path):
+    # The shared helper the CLI and the console both call: the same
+    # accept the CLI tests cover, driven directly, with the delivered
+    # inbox record returned for the console feed.
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    save_allowlist(
+        config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset({ALICE})),
+    )
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", sender=BOB, received_at=now - 60),
+        now=now,
+    )
+    acceptance = accept_dm_request(
+        dm_requests_path=config.dm_requests_path,
+        allowlist_path=config.allowlist_path,
+        blocklist_path=config.blocklist_path,
+        inbox=Inbox(config.inbox_path),
+        mailbox=Mailbox(config.mailbox_path),
+        sender_name="bob",
+        ref="req-1",
+    )
+    assert acceptance.delivered is True
+    assert acceptance.allowlisted is True
+    assert acceptance.skipped is None
+    assert acceptance.record is not None
+    assert acceptance.record["id"] == "req-1"
+    assert acceptance.record["from"] == "bob"
+    assert BOB in load_allowlist(config.allowlist_path).allow
+    assert [entry["id"] for entry in Inbox(config.inbox_path).list_messages()] == [
+        "req-1"
+    ]
+    assert load_dm_requests(config.dm_requests_path) == []
+
+
+def test_accept_dm_request_helper_rejects_unknown(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    with pytest.raises(DmRequestsError, match="no DM request"):
+        accept_dm_request(
+            dm_requests_path=config.dm_requests_path,
+            allowlist_path=config.allowlist_path,
+            blocklist_path=config.blocklist_path,
+            inbox=Inbox(config.inbox_path),
+            mailbox=Mailbox(config.mailbox_path),
+            sender_name="bob",
+            ref="nope",
+        )
 
 
 def test_retract_of_held_request_blocks_accept(tmp_path, capsys):

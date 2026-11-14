@@ -45,7 +45,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
-from .allowlist import clean_destination
+from .allowlist import (
+    AllowListError,
+    clean_destination,
+    load_allowlist,
+    save_allowlist,
+)
+from .blocklist import load_blocked_set
+from .inbox import InboxError
 from .protocol import ProtocolError, clean_in_reply_to
 from .util import atomic_write_json
 
@@ -331,3 +338,154 @@ def remove_dm_request(
             path, [entry for entry in stored if entry.id != request.id]
         )
     return request
+
+
+@dataclass
+class DmRequestAcceptance:
+    """The outcome of accepting one held DM request."""
+
+    request: DmRequest
+    delivered: bool
+    allowlisted: bool
+    skipped: Optional[str] = None
+    # The inbox record that was delivered, when one was: the console
+    # mirrors it into its feed, which the inbox append alone cannot
+    # reach.  ``None`` when nothing was delivered.
+    record: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "accepted": self.request.to_dict(),
+            "delivered": self.delivered,
+            "allowlisted": self.allowlisted,
+            "skipped": self.skipped,
+        }
+
+
+def accept_dm_request(
+    *,
+    dm_requests_path: Union[str, Path],
+    allowlist_path: Optional[Union[str, Path]],
+    blocklist_path: Optional[Union[str, Path]],
+    inbox: Any,
+    mailbox: Any,
+    sender_name: str,
+    ref: str,
+    now: Optional[float] = None,
+) -> DmRequestAcceptance:
+    """Allow-list a request's sender and deliver the held message.
+
+    Shared by the CLI (``tau messages accept-request``) and the web
+    console, so the two cannot drift apart on the tricky parts.
+
+    The whole acceptance runs under the requests-store lock: the
+    request is resolved, delivered and removed while holding it, so
+    a concurrent decline (or eviction) cannot take the request away
+    mid-acceptance and leave this command delivering a copy it then
+    silently fails to remove.  The sender is allow-listed first, so
+    a retry of the same message after acceptance is admitted and
+    deduped instead of denied again — but a sender who has since
+    been blocked is refused outright, matching the node's
+    block-before-allow rule for live DMs (and a block-list that
+    cannot be read refuses too, failing closed like the node).
+
+    Delivery appends to the inbox before marking the id seen, under
+    the mailbox transaction, so a failed append leaves no durable
+    seen marker behind and the request stays for a retry; the append
+    is strict, so a persist failure raises instead of reporting a
+    delivery that never landed on disk.  A copy already in the inbox
+    (a previous accept that appended and then crashed before marking
+    seen) is not appended twice.  Holding the mailbox transaction
+    across both steps is what keeps a concurrent live retry from
+    landing a second copy between them — the live delivery path
+    takes the same transaction before it checks the seen set.  The
+    message's own expiry is re-checked against the current time
+    inside that transaction, so a message that expires while
+    acceptance waits is never delivered late.  A message the sender
+    retracted while it was held, or whose own expiry passed while
+    it was held, is not delivered; the sender is still allow-listed
+    and the request is still dropped.
+
+    Raises :class:`DmRequestsError` when the request is unknown, the
+    sender is blocked, the block-list cannot be read, the
+    allow-list cannot be read, or the held message cannot be
+    persisted — in every failure case the request stays held for a
+    retry.
+    """
+    moment = time.time() if now is None else now
+    blocked = load_blocked_set(blocklist_path)
+    if blocked is None:
+        raise DmRequestsError(
+            "block-list is unusable; refusing to accept a request"
+        )
+    with dm_requests_lock(dm_requests_path):
+        requests = list_dm_requests(dm_requests_path, now=moment)
+        request = resolve_dm_request(requests, ref)
+        if request.sender in blocked:
+            raise DmRequestsError(
+                "sender is blocked; decline the request or unblock them first"
+            )
+        try:
+            allowlist = load_allowlist(allowlist_path)
+        except AllowListError as exc:
+            raise DmRequestsError(str(exc)) from exc
+        allowlisted = False
+        if request.sender not in allowlist.allow:
+            allowlist = allowlist.with_added(request.sender)
+            save_allowlist(allowlist_path, allowlist)
+            allowlisted = True
+        delivered = False
+        skipped = None
+        record: Optional[Dict[str, Any]] = None
+        with mailbox.transaction():
+            if request.message_expired(time.time()):
+                skipped = "its own expiry had passed while it was held"
+            elif mailbox.is_retracted(request.sender, request.id):
+                skipped = "the sender retracted it while it was held"
+            elif mailbox.is_seen(request.id):
+                skipped = "it was already delivered"
+            else:
+                record = {
+                    "from": sender_name,
+                    "destination": request.sender,
+                    "text": request.text,
+                    "kind": request.kind,
+                    "sent_at": request.sent_at,
+                    "received_at": request.received_at,
+                    "id": request.id,
+                    "expires_at": request.expires_at,
+                    "direction": "in",
+                }
+                if request.in_reply_to is not None:
+                    record["in_reply_to"] = request.in_reply_to
+                already_stored = inbox.find(request.id, peer=request.sender)
+                if already_stored is not None:
+                    # A previous accept appended the copy but crashed
+                    # before marking it seen: mark it now instead of
+                    # appending a second copy.
+                    mailbox.mark_seen(request.id, now=time.time())
+                    delivered = True
+                else:
+                    try:
+                        # Strict: a persist failure raises instead of
+                        # returning normally, so acceptance never marks
+                        # the id seen and drops the request for a copy
+                        # that never landed on disk.
+                        inbox.append(record, strict=True)
+                    except (InboxError, ValueError, OSError) as exc:
+                        raise DmRequestsError(
+                            f"could not deliver the held message: {exc}"
+                        ) from exc
+                    mailbox.mark_seen(request.id, now=time.time())
+                    delivered = True
+        save_dm_requests(
+            dm_requests_path,
+            [entry for entry in requests if entry.id != request.id],
+        )
+    return DmRequestAcceptance(
+        request=request,
+        delivered=delivered,
+        allowlisted=allowlisted,
+        skipped=skipped,
+        record=record if delivered else None,
+    )

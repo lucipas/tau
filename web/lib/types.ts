@@ -480,6 +480,38 @@ export interface DropHeldResponse {
   dropped: HeldMailEntry & { note: string };
 }
 
+// A DM held for review from a peer outside the allow-list, as
+// `GET /api/messages/requests` returns it.
+export interface DmRequestEntry {
+  id: string;
+  sender: string;
+  sender_name: string;
+  text: string;
+  kind: string;
+  sent_at: number;
+  received_at: number;
+  request_expires_at: number;
+  expires_at?: number;
+  in_reply_to?: { id: string; excerpt?: string } | null;
+}
+
+export interface DmRequestsResponse {
+  requests: DmRequestEntry[];
+  count: number;
+}
+
+export interface AcceptDmRequestResponse {
+  accepted: DmRequestEntry;
+  delivered: boolean;
+  allowlisted: boolean;
+  skipped: string | null;
+  unread?: UnreadCounts;
+}
+
+export interface DeclineDmRequestResponse {
+  declined: DmRequestEntry;
+}
+
 export interface AllowlistEntry {
   destination: string;
   name: string;
