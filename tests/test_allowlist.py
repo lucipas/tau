@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import threading
 import time
 from types import SimpleNamespace
 
@@ -422,6 +423,41 @@ def test_cli_add_on_off_remove_roundtrip(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "off" in out
     assert ALICE not in out
+
+
+def test_cli_concurrent_adds_keep_every_sender(tmp_path, monkeypatch):
+    # Regression test for #369: concurrent `allowlist add` commands
+    # loaded the same snapshot and the last save dropped the earlier
+    # senders.  The slow load overlaps every thread's read, so without
+    # the lock they would all save over the same empty list; with it,
+    # each add reloads under the lock and sees the previous saves.
+    data_dir = tmp_path / "node"
+    senders = [f"{value:02x}" * 16 for value in range(1, 7)]
+    original_load = cli.load_allowlist
+
+    def slow_load(path):
+        result = original_load(path)
+        time.sleep(0.15)
+        return result
+
+    monkeypatch.setattr(cli, "load_allowlist", slow_load)
+    errors = []
+
+    def add(sender):
+        try:
+            assert run_cli("allowlist", "add", sender, "--data-dir", str(data_dir)) == 0
+        except Exception as exc:  # noqa: BLE001 - collected and re-raised below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=add, args=(sender,)) for sender in senders]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30.0)
+    assert not any(thread.is_alive() for thread in threads)
+    assert not errors
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    assert load_allowlist(config.allowlist_path).allow == frozenset(senders)
 
 
 def test_cli_add_resolves_peer_name(tmp_path, capsys):

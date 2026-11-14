@@ -49,6 +49,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 from .allowlist import (
     AllowListError,
+    allowlist_lock,
     clean_destination,
     load_allowlist,
     save_allowlist,
@@ -528,14 +529,20 @@ def accept_dm_request(
             except AllowListError as exc:
                 raise DmRequestsError(str(exc)) from exc
         else:
-            try:
-                allowlist = load_allowlist(allowlist_path)
-            except AllowListError as exc:
-                raise DmRequestsError(str(exc)) from exc
-            if request.sender not in allowlist.allow:
-                allowlist = allowlist.with_added(request.sender)
-                save_allowlist(allowlist_path, allowlist)
-                allowlisted = True
+            # Reload inside the allow-list lock: two accepts (or an
+            # accept racing `tau allowlist add`) must not discard each
+            # other's sender.  This runs under the requests-store lock
+            # already, so the lock order is requests, then allow-list,
+            # everywhere.
+            with allowlist_lock(allowlist_path):
+                try:
+                    allowlist = load_allowlist(allowlist_path)
+                except AllowListError as exc:
+                    raise DmRequestsError(str(exc)) from exc
+                if request.sender not in allowlist.allow:
+                    allowlist = allowlist.with_added(request.sender)
+                    save_allowlist(allowlist_path, allowlist)
+                    allowlisted = True
         delivered = False
         skipped = None
         record: Optional[Dict[str, Any]] = None
