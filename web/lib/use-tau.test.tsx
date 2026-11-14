@@ -1238,6 +1238,47 @@ describe("useTau sendGroup", () => {
   });
 });
 
+describe("useTau forwardMessageToGroup", () => {
+  it("posts the group target and appends one entry per leg", async () => {
+    const legs = [
+      makeMessage({ id: 2, peer: PEER_HASH, peer_name: "alice" }),
+      makeMessage({
+        id: 3,
+        peer: BOB_HASH,
+        peer_name: "bob",
+        status: "queued",
+      }),
+    ];
+    mockedPost.mockResolvedValue({
+      ok: true,
+      messages: legs,
+      response: { ok: true, group: GROUP_ID, name: "crew", results: [] },
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot(),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+
+    let sent: TauMessage[];
+    await act(async () => {
+      sent = await result.current.forwardMessageToGroup(1, GROUP_ID);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/forward", {
+      id: 1,
+      group: GROUP_ID,
+    });
+    expect(sent!).toEqual(legs);
+    expect(result.current.messages).toEqual(legs);
+    // A queued leg lands in the outbox; the forward refreshes it at once.
+    expect(mockedGet).toHaveBeenCalledWith("/api/outbox");
+  });
+});
+
 describe("useTau retractMessage", () => {
   it("posts the console id and drops the bubble at once", async () => {
     const message = makeMessage({

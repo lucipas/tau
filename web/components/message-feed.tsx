@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { API_BASE } from "@/lib/api";
 import { MAX_MESSAGE_CHARS } from "@/lib/constants";
-import type { NodeInfo, Peer, TauMessage } from "@/lib/types";
+import type { NodeInfo, Peer, TauGroup, TauMessage } from "@/lib/types";
 import {
   formatExpiresIn,
   formatFileSize,
@@ -24,12 +24,14 @@ export function MessageFeed({
   messages,
   node,
   peers,
+  groups,
   live,
   onReply,
   onDelete,
   onEdit,
   onRetract,
   onForward,
+  onForwardGroup,
   onReact,
   onPin,
   searching,
@@ -48,6 +50,8 @@ export function MessageFeed({
   // Known peers to offer as forward targets; the picker reports none
   // when the list is empty.
   peers?: Peer[];
+  // Known groups to offer as forward targets, alongside peers.
+  groups?: TauGroup[];
   live: boolean;
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
@@ -56,6 +60,8 @@ export function MessageFeed({
   onEdit?: (message: TauMessage, text: string) => Promise<boolean>;
   onRetract?: (message: TauMessage) => Promise<void>;
   onForward?: (message: TauMessage, to: string) => Promise<void>;
+  // Forward into a group instead: one leg per member, like a group send.
+  onForwardGroup?: (message: TauMessage, group: string) => Promise<void>;
   // `reaction` null retracts the caller's reaction to the message.
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   // `pinned` true pins the message, false unpins it.
@@ -236,11 +242,13 @@ export function MessageFeed({
               messages={quoteContext ?? messages}
               node={node}
               peers={peers}
+              groups={groups}
               onReply={onReply}
               onDelete={onDelete}
               onEdit={onEdit}
               onRetract={onRetract}
               onForward={onForward}
+              onForwardGroup={onForwardGroup}
               onReact={onReact}
               onPin={onPin}
             />
@@ -409,11 +417,13 @@ function MessageBubble({
   messages,
   node,
   peers,
+  groups,
   onReply,
   onDelete,
   onEdit,
   onRetract,
   onForward,
+  onForwardGroup,
   onReact,
   onPin,
 }: {
@@ -421,11 +431,15 @@ function MessageBubble({
   messages: TauMessage[];
   node: NodeInfo | null;
   peers?: Peer[];
+  // Known groups to offer as forward targets, alongside peers.
+  groups?: TauGroup[];
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
   onEdit?: (message: TauMessage, text: string) => Promise<boolean>;
   onRetract?: (message: TauMessage) => Promise<void>;
   onForward?: (message: TauMessage, to: string) => Promise<void>;
+  // Forward into a group instead: one leg per member, like a group send.
+  onForwardGroup?: (message: TauMessage, group: string) => Promise<void>;
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   onPin?: (message: TauMessage, pinned: boolean) => Promise<void>;
 }) {
@@ -553,6 +567,26 @@ function MessageBubble({
       // The bridge records the forwarded copy as a new outbound entry,
       // so it appears in the feed through the SSE stream.
       await onForward(message, to);
+      setForwardOpen(false);
+    } catch (error) {
+      setForwardError(
+        error instanceof Error ? error.message : "forward failed",
+      );
+    } finally {
+      setForwardPending(false);
+      forwardInFlight.current = false;
+    }
+  }
+
+  async function handleForwardGroup(group: string) {
+    if (!onForwardGroup || forwardInFlight.current) return;
+    forwardInFlight.current = true;
+    setForwardPending(true);
+    setForwardError(null);
+    try {
+      // The bridge records one forwarded copy per member, so each leg
+      // appears in the feed through the SSE stream.
+      await onForwardGroup(message, group);
       setForwardOpen(false);
     } catch (error) {
       setForwardError(
@@ -987,25 +1021,39 @@ function MessageBubble({
               outbound ? "justify-end" : ""
             }`}
             role="group"
-            aria-label="Forward to a peer"
+            aria-label="Forward to a peer or group"
           >
-            {(peers ?? []).length === 0 ? (
+            {(peers ?? []).length === 0 && (groups ?? []).length === 0 ? (
               <span className="font-mono text-[10px] text-mist/60">
-                no known peers yet
+                no known peers or groups yet
               </span>
             ) : (
-              (peers ?? []).map((peer) => (
-                <button
-                  key={peer.destination}
-                  type="button"
-                  title={`Forward to ${peer.alias ?? peer.name}`}
-                  disabled={forwardPending}
-                  onClick={() => void handleForward(peer.destination)}
-                  className="rounded-lg border border-line/80 bg-void/60 px-2 py-1 font-mono text-[11px] text-zinc-200 transition hover:border-signal/35 hover:bg-void"
-                >
-                  {peer.alias ?? peer.name}
-                </button>
-              ))
+              <>
+                {(peers ?? []).map((peer) => (
+                  <button
+                    key={peer.destination}
+                    type="button"
+                    title={`Forward to ${peer.alias ?? peer.name}`}
+                    disabled={forwardPending}
+                    onClick={() => void handleForward(peer.destination)}
+                    className="rounded-lg border border-line/80 bg-void/60 px-2 py-1 font-mono text-[11px] text-zinc-200 transition hover:border-signal/35 hover:bg-void"
+                  >
+                    {peer.alias ?? peer.name}
+                  </button>
+                ))}
+                {(groups ?? []).map((group) => (
+                  <button
+                    key={group.id}
+                    type="button"
+                    title={`Forward to group ${group.name}`}
+                    disabled={forwardPending}
+                    onClick={() => void handleForwardGroup(group.id)}
+                    className="rounded-lg border border-signal/30 bg-signal/10 px-2 py-1 font-mono text-[11px] text-signal transition hover:border-signal/50 hover:bg-signal/15"
+                  >
+                    #{group.name}
+                  </button>
+                ))}
+              </>
             )}
           </div>
         ) : null}

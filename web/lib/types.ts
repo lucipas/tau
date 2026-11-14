@@ -482,6 +482,13 @@ export interface ForwardMessageResponse {
   response: Record<string, unknown>;
 }
 
+export interface ForwardGroupMessageResponse {
+  ok: boolean;
+  // One outbound entry per member, like a group send.
+  messages: TauMessage[];
+  response: Record<string, unknown>;
+}
+
 // POST /api/messages/pin: the pinned console id and wire id, plus
 // whether the pin already existed (a re-pin is a no-op, not an error).
 export interface PinMessageResponse {

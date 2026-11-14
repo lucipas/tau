@@ -303,6 +303,7 @@ export function Console() {
               }
               node={tau.node}
               peers={tau.peers}
+              groups={tau.groups}
               live={tau.connection === "live"}
               searching={tau.searchQuery !== null}
               searchQuery={tau.searchQuery}
@@ -338,6 +339,9 @@ export function Console() {
               }}
               onForward={async (message, to) => {
                 await tau.forwardMessage(message.id, to);
+              }}
+              onForwardGroup={async (message, group) => {
+                await tau.forwardMessageToGroup(message.id, group);
               }}
               onReact={async (message, reaction) => {
                 if (!message.wire_id) return;
