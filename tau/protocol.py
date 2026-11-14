@@ -1133,7 +1133,11 @@ def clean_in_reply_to(value: Any) -> Optional[Dict[str, Any]]:
         )
     if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
         raise ProtocolError("in_reply_to sent_at must be a number")
-    if not math.isfinite(float(sent_at)):
+    try:
+        finite = math.isfinite(float(sent_at))
+    except OverflowError:
+        raise ProtocolError("in_reply_to sent_at must be a finite number")
+    if not finite:
         raise ProtocolError("in_reply_to sent_at must be a finite number")
     return {
         "id": message_id,
