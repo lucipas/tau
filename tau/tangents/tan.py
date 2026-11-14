@@ -1915,7 +1915,9 @@ def annotate_reposts(
     when it is cached locally, and is ``None`` when it has not arrived
     yet — a repost is still shown on its own.  A deleted original is
     reported as deleted with its text blanked, so the timeline stays
-    readable without resurfacing removed content.  Top-level posts and
+    readable without resurfacing removed content.  An expired original
+    is reported the same way, with its text blanked and an ``expired``
+    flag, so a live repost cannot resurface disappeared content.  Top-level posts and
     replies get no ``repost_of`` key.
 
     Originals are fetched in one query and their deletion status in a
@@ -1984,13 +1986,17 @@ def annotate_reposts(
         ):
             continue
         is_deleted = (original["hash"], original["author"]) in deleted
+        is_expired_original = is_expired(original)
         post["repost_of"] = {
             "hash": original["hash"],
             "author": original["author"],
             "name": original["name"],
-            "text": "" if is_deleted else original["text"],
+            "text": "" if is_deleted or is_expired_original else original["text"],
             "deleted": is_deleted,
         }
+        if is_expired_original:
+            # Only present when expired, so live previews keep their shape.
+            post["repost_of"]["expired"] = True
         kept.append(post)
     return kept
 

@@ -3372,6 +3372,31 @@ def test_repost_of_deleted_original_blanks_the_text(identities, tmp_path):
         create_repost(conn, bob, post["hash"], name="bob", now=1003)
 
 
+def test_repost_of_expired_original_blanks_the_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    post = create_post(
+        conn, alice, "fading", name="alice", now=now, expires_at=now + 3600
+    )
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=now)
+    _expire_stored_post(conn, post["hash"], at=now - 10)
+
+    # The repost still stands — only the original expired — but its
+    # text is blanked, so a live repost cannot resurface disappeared
+    # content through its summary.
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "",
+        "deleted": False,
+        "expired": True,
+    }
+
+
 def test_repost_of_a_reply(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")

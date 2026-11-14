@@ -2835,8 +2835,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-    # The absolute deadline is taken when the post is created, not here, so
-    # node start-up and the publish request do not eat into the lifetime.
+    expires_at = time.time() + expire_seconds if expire_text is not None else None
 
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
@@ -2886,7 +2885,6 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
-        expires_at = time.time() + expire_seconds if expire_text is not None else None
         post = app.create_post(text, reply_to=reply_to, expires_at=expires_at)
         published = None
     else:
@@ -10012,10 +10010,6 @@ def _cmd_messages_sent(
         else:
             state = entry["state"]
         print(f"[{when}] to {name} — {state}")
-        for line in str(entry.get("text", "")).splitlines() or [""]:
-            print(f"  {line}")
-    return _EXIT_OK
-— {state}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
