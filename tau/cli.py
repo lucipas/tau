@@ -117,6 +117,7 @@ from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     DEFAULT_SUGGEST_LIMIT,
     MAX_GOSSIP_TTL,
+    MAX_TAN_POST_EXPIRY,
     TanApp,
     TanError,
     _author_from_identity,
@@ -1528,6 +1529,17 @@ def build_parser() -> argparse.ArgumentParser:
         "this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — needs a node "
         "serving with --social to publish it",
     )
+    tan_post.add_argument(
+        "--expire",
+        default=None,
+        metavar="DURATION",
+        help="disappearing post: hide it from timelines and searches "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — the "
+        "expiry is signed with the post and starts when it is "
+        "published, not when it is queued; followers on tau releases "
+        "older than this one reject expiring posts and so stop seeing "
+        "the author's later posts",
+    )
     tan_post.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_post.set_defaults(func=cmd_tan_post)
@@ -2780,6 +2792,7 @@ def _publish_local_post(
     to: Optional[List[str]] = None,
     ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
+    expires_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = TanApp(
@@ -2790,7 +2803,7 @@ def _publish_local_post(
     if quote_of is not None:
         post = publisher.quote(quote_of, text)
     else:
-        post = publisher.create_post(text, reply_to=reply_to)
+        post = publisher.create_post(text, reply_to=reply_to, expires_at=expires_at)
     published = publisher.publish(
         post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
     )
@@ -2810,6 +2823,20 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         finally:
             conn.close()
 
+    expire_seconds = 0.0
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        try:
+            expire_seconds = _parse_duration(
+                expire_text,
+                flag="--expire",
+                max_seconds=MAX_TAN_POST_EXPIRY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    expires_at = time.time() + expire_seconds if expire_text is not None else None
+
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
         if getattr(args, "no_publish", False):
@@ -2828,6 +2855,13 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        if expires_at is not None and delay >= expire_seconds:
+            print(
+                "error: --delay must be shorter than --expire — the "
+                "post would expire before it is published",
+                file=sys.stderr,
+            )
+            return 2
         try:
             post = schedule_post(
                 config.scheduled_posts_path,
@@ -2837,6 +2871,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
+                expires_in=expire_seconds,
             )
         except ScheduledPostsError as exc:
             raise NodeError(str(exc)) from exc
@@ -2850,7 +2885,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
-        post = app.create_post(text, reply_to=reply_to)
+        post = app.create_post(text, reply_to=reply_to, expires_at=expires_at)
         published = None
     else:
         node = TauNode(config, name=config.name)
@@ -2866,6 +2901,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
+                expires_at=expires_at,
             )
             post, published = result["post"], result["published"]
         else:
@@ -2884,6 +2920,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
+                    expires_at=expires_at,
                 )
                 post, published = result["post"], result["published"]
             finally:
@@ -2896,6 +2933,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         print(f"{verb} {short_hash(post['hash'])}")
         if reply_to is not None:
             print(f"  in reply to {short_hash(reply_to)}")
+        if expires_at is not None:
+            print(f"  expires in {_ago(expire_seconds)}")
         if published is None:
             print("  stored locally (not published)")
         else:

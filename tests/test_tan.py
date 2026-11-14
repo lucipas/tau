@@ -19,6 +19,7 @@ from tau.tangents.tan import (
     TAN_EXPORT_FORMAT,
     TAN_FEED_PATH,
     TAN_POST_PATH,
+    TAN_VERSION,
     PostError,
     TanApp,
     TanError,
@@ -52,6 +53,7 @@ from tau.tangents.tan import (
     head,
     import_entries,
     init_db,
+    is_expired,
     like_counts,
     likers,
     list_authors,
@@ -3370,6 +3372,31 @@ def test_repost_of_deleted_original_blanks_the_text(identities, tmp_path):
         create_repost(conn, bob, post["hash"], name="bob", now=1003)
 
 
+def test_repost_of_expired_original_blanks_the_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    post = create_post(
+        conn, alice, "fading", name="alice", now=now, expires_at=now + 3600
+    )
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=now)
+    _expire_stored_post(conn, post["hash"], at=now - 10)
+
+    # The repost still stands — only the original expired — but its
+    # text is blanked, so a live repost cannot resurface disappeared
+    # content through its summary.
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "",
+        "deleted": False,
+        "expired": True,
+    }
+
+
 def test_repost_of_a_reply(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -5829,3 +5856,391 @@ def test_timeline_tag_hidden_repost_does_not_consume_limit(identities, tmp_path)
     assert [post["hash"] for post in author_timeline(conn, author_of(carol), tag="meshnet")] == [
         repost["hash"]
     ]
+
+
+# -- disappearing posts -------------------------------------------------------
+
+
+def _expire_stored_post(conn, digest, at=1.0):
+    """Move a stored post's expiry into the past, as if time had passed."""
+    conn.execute("UPDATE posts SET expires_at = ? WHERE hash = ?", (at, digest))
+    conn.commit()
+
+
+def test_create_post_with_expiry_round_trips(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    post = create_post(
+        conn, alice, "here today", name="alice", now=now, expires_at=now + 3600
+    )
+    assert post["expires_at"] == pytest.approx(now + 3600)
+    assert get_post(conn, post["hash"])["expires_at"] == pytest.approx(now + 3600)
+    assert verify_post(post)["hash"] == post["hash"]
+    assert is_expired(post, now=now) is False
+    assert is_expired(post, now=now + 3600) is True
+
+
+def test_create_post_rejects_expiry_at_or_before_creation(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    with pytest.raises(PostError, match="after created_at"):
+        create_post(conn, alice, "dead on arrival", name="alice", now=1000, expires_at=1000)
+    with pytest.raises(PostError, match="after created_at"):
+        create_post(
+            conn, alice, "already gone", name="alice", now=1000, expires_at=999
+        )
+
+
+def test_expiry_is_signed(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    post = create_post(
+        conn, alice, "tamper-evident", name="alice", now=now, expires_at=now + 3600
+    )
+    stretched = dict(post, expires_at=now + 7200)
+    with pytest.raises(PostError, match="hash does not match"):
+        verify_post(stretched)
+    stripped = dict(post)
+    del stripped["expires_at"]
+    with pytest.raises(PostError, match="hash does not match"):
+        verify_post(stripped)
+
+
+def test_post_without_expiry_still_verifies(identities, tmp_path):
+    # A post written before expiry existed carries no expires_at and
+    # must verify exactly as before.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "legacy post", name="alice", now=1000)
+    assert post["expires_at"] is None
+    assert verify_post(post)["hash"] == post["hash"]
+
+    body = {
+        "v": TAN_VERSION,
+        "author": author_of(alice),
+        "key": alice.get_public_key().hex(),
+        "name": "alice",
+        "text": "hand-built legacy",
+        "created_at": 1000.0,
+        "prev": "",
+    }
+    digest = hash(body, previous="")
+    mesg = dict(body, hash=digest, sig=alice.sign(bytes.fromhex(digest)).hex())
+    verified = verify_post(mesg, now=1000)
+    assert verified["expires_at"] is None
+    assert verified["hash"] == digest
+
+
+def test_expired_post_hidden_from_display_but_kept_for_sync(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    live = create_post(conn, alice, "staying live mesh", name="alice", now=now)
+    dying = create_post(
+        conn, alice, "going away mesh", name="alice", now=now + 1,
+        expires_at=now + 3601,
+    )
+    assert [item["hash"] for item in timeline(conn, [live["author"]])] == [
+        dying["hash"],
+        live["hash"],
+    ]
+    _expire_stored_post(conn, dying["hash"], at=now - 10)
+
+    # Every display surface hides it; the sync feed still carries it so
+    # chains stay complete.
+    assert [item["hash"] for item in timeline(conn, [live["author"]])] == [
+        live["hash"]
+    ]
+    assert [item["hash"] for item in timeline(conn, include_all=True)] == [
+        live["hash"]
+    ]
+    assert [item["hash"] for item in author_timeline(conn, live["author"])] == [
+        live["hash"]
+    ]
+    assert [item["hash"] for item in feed(conn, posts_only=True)] == [live["hash"]]
+    assert [item["hash"] for item in feed(conn, author=live["author"], posts_only=True)] == [
+        live["hash"]
+    ]
+    assert [item["hash"] for item in search_posts(conn, "mesh")] == [live["hash"]]
+    assert [item["hash"] for item in top_posts(conn)] == [live["hash"]]
+    assert [tag["tag"] for tag in tags(conn)] == []
+    assert [item["hash"] for item in feed(conn)] == [dying["hash"], live["hash"]]
+    # The row is still stored, only hidden.
+    assert get_post(conn, dying["hash"]) is not None
+
+
+def test_resolve_post_rejects_expired_post(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    post = create_post(
+        conn, alice, "gone soon", name="alice", now=now, expires_at=now + 3600
+    )
+    assert resolve_post(conn, post["hash"])["hash"] == post["hash"]
+    _expire_stored_post(conn, post["hash"], at=now - 10)
+    with pytest.raises(TanError, match="has expired"):
+        resolve_post(conn, post["hash"])
+    with pytest.raises(TanError, match="has expired"):
+        resolve_post(conn, post["hash"][:12])
+
+
+def test_thread_hides_expired_reply_and_rejects_expired_root(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    root = create_post(conn, alice, "root post", name="alice", now=now)
+    reply = create_reply(
+        conn, bob, root["hash"], "short-lived reply", name="bob", now=now,
+        expires_at=now + 3600,
+    )
+    assert [item["hash"] for item in thread(conn, root["hash"])] == [
+        root["hash"],
+        reply["hash"],
+    ]
+    _expire_stored_post(conn, reply["hash"], at=now - 10)
+    assert [item["hash"] for item in thread(conn, root["hash"])] == [root["hash"]]
+    _expire_stored_post(conn, root["hash"], at=now - 10)
+    with pytest.raises(TanError, match="has expired"):
+        thread(conn, root["hash"])
+
+
+def test_reply_to_expired_post_raises(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    post = create_post(
+        conn, alice, "about to go", name="alice", now=now, expires_at=now + 3600
+    )
+    _expire_stored_post(conn, post["hash"], at=now - 10)
+    with pytest.raises(TanError, match="has expired"):
+        create_reply(conn, bob, post["hash"], "too late", name="bob", now=now)
+
+
+def test_reply_with_expiry_round_trips(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    root = create_post(conn, alice, "root post", name="alice", now=now)
+    reply = create_reply(
+        conn, bob, root["hash"], "fading reply", name="bob", now=now,
+        expires_at=now + 3600,
+    )
+    assert reply["expires_at"] == pytest.approx(now + 3600)
+    assert verify_post(reply)["hash"] == reply["hash"]
+    assert [item["hash"] for item in thread(conn, root["hash"])] == [
+        root["hash"],
+        reply["hash"],
+    ]
+
+
+def test_expired_parent_preview_is_blanked(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    parent = create_post(
+        conn, alice, "parent words", name="alice", now=now, expires_at=now + 3600
+    )
+    create_reply(conn, bob, parent["hash"], "child words", name="bob", now=now)
+    authors = [parent["author"], author_of(bob)]
+    shown = timeline(conn, authors)
+    reply = next(item for item in shown if item.get("kind") == "reply")
+    assert reply["reply_to"]["text"] == "parent words"
+    _expire_stored_post(conn, parent["hash"], at=now - 10)
+    shown = timeline(conn, authors)
+    reply = next(item for item in shown if item.get("kind") == "reply")
+    assert reply["reply_to"]["text"] == ""
+    assert reply["reply_to"]["expired"] is True
+
+
+def test_expired_post_dropped_from_saved_and_pinned(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    post = create_post(
+        conn, alice, "save me quick", name="alice", now=now, expires_at=now + 3600
+    )
+    save_post(conn, post["hash"])
+    pin_post(conn, post["hash"], owner=post["author"])
+    assert [item["hash"] for item in saved_posts(conn)] == [post["hash"]]
+    assert [item["hash"] for item in pinned_posts(conn)] == [post["hash"]]
+    _expire_stored_post(conn, post["hash"], at=now - 10)
+    assert saved_posts(conn) == []
+    assert pinned_posts(conn) == []
+
+
+def test_mentions_hide_expired_replies(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    post = create_post(conn, alice, "mention me", name="alice", now=now)
+    reply = create_reply(
+        conn, bob, post["hash"], "hello alice", name="bob", now=now,
+        expires_at=now + 3600,
+    )
+    assert [item["hash"] for item in mentions(conn, post["author"])] == [
+        reply["hash"]
+    ]
+    _expire_stored_post(conn, reply["hash"], at=now - 10)
+    assert mentions(conn, post["author"]) == []
+
+
+def test_init_db_migrates_pre_expiry_store(identities, tmp_path):
+    alice, _ = identities
+    db_path = tmp_path / "tan.sqlite3"
+    conn = init_db(db_path)
+    post = create_post(conn, alice, "legacy row", name="alice", now=1000)
+    conn.execute("ALTER TABLE posts DROP COLUMN expires_at")
+    conn.commit()
+    conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        assert "expires_at" in columns
+        stored = get_post(conn, post["hash"])
+        assert stored is not None
+        assert stored["expires_at"] is None
+        assert verify_post(stored)["hash"] == post["hash"]
+    finally:
+        conn.close()
+
+
+def test_cli_post_expire_stores_expiry(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    before = time.time()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--expire",
+                "1h",
+                "here for an hour",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    expires_at = payload["post"]["expires_at"]
+    assert before + 3600 - 5 <= expires_at <= time.time() + 3600 + 5
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert [item["hash"] for item in timeline(conn, include_all=True)] == [
+            payload["post"]["hash"]
+        ]
+    finally:
+        conn.close()
+
+
+def test_cli_post_expire_rejects_delay_not_shorter_than_expiry(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--delay",
+                "2h",
+                "--expire",
+                "1h",
+                "never arrives",
+            ]
+        )
+        == 2
+    )
+    assert "must be shorter than --expire" in capsys.readouterr().err
+
+
+def test_cli_post_expire_rejects_over_cap(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--expire",
+                "8d",
+                "too long-lived",
+            ]
+        )
+        == 2
+    )
+    assert "at most 1w" in capsys.readouterr().err
+
+
+def test_saved_posts_page_past_expired_saves(identities, tmp_path):
+    # Expired saves are filtered in SQL, before LIMIT/OFFSET, so a page
+    # never comes up short and later saves are never hidden behind the
+    # offset — the failure the first autofix left in place.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    oldest = create_post(conn, alice, "oldest save", name="alice", now=now)
+    dying = create_post(
+        conn, alice, "middle save", name="alice", now=now + 1,
+        expires_at=now + 3601,
+    )
+    newest = create_post(conn, alice, "newest save", name="alice", now=now + 2)
+    save_post(conn, oldest["hash"], now=100.0)
+    save_post(conn, dying["hash"], now=200.0)
+    save_post(conn, newest["hash"], now=300.0)
+    assert [item["hash"] for item in saved_posts(conn)] == [
+        newest["hash"],
+        dying["hash"],
+        oldest["hash"],
+    ]
+    _expire_stored_post(conn, dying["hash"], at=now - 10)
+    assert [item["hash"] for item in saved_posts(conn)] == [
+        newest["hash"],
+        oldest["hash"],
+    ]
+    assert [item["hash"] for item in saved_posts(conn, limit=1, offset=1)] == [
+        oldest["hash"]
+    ]
+
+
+def test_timeline_survives_newest_expired_posts(identities, tmp_path):
+    # CodeRabbit Major on PR #356: when the newest page of posts had
+    # expired, the timeline came back empty even though older live posts
+    # existed — the page was fetched first and expired rows filtered
+    # after LIMIT, so _fill_unmuted read the short page as exhaustion.
+    # Expired rows are now excluded in SQL, before LIMIT, so a page of
+    # expired posts never hides the live ones behind it.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    live = [
+        create_post(conn, alice, f"live {index}", name="alice", now=now + index)
+        for index in range(5)
+    ]
+    dying = [
+        create_post(
+            conn, alice, f"dying {index}", name="alice", now=now + 100 + index,
+            expires_at=now + 3600,
+        )
+        for index in range(25)
+    ]
+    for post in dying:
+        _expire_stored_post(conn, post["hash"], at=now - 10)
+    author = author_of(alice)
+    expected = [item["hash"] for item in reversed(live)]
+    assert [item["hash"] for item in timeline(conn, [author])] == expected
+    assert [item["hash"] for item in author_timeline(conn, author)] == expected
+    assert [item["hash"] for item in feed(conn, posts_only=True)] == expected

@@ -149,6 +149,16 @@ def _clean_retry_at(value: Any) -> float:
     return stamp
 
 
+def _clean_duration(value: Any) -> float:
+    # 0.0 means "no expiry"; a duration is a non-negative span, not a time.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ScheduledPostsError(f"not a duration: {value!r}")
+    seconds = float(value)
+    if seconds < 0 or seconds != seconds or seconds == float("inf"):
+        raise ScheduledPostsError(f"not a duration: {value!r}")
+    return seconds
+
+
 @dataclass(frozen=True)
 class ScheduledPost:
     """One queued Tan post, waiting for its publish time."""
@@ -175,6 +185,10 @@ class ScheduledPost:
     # Destination hashes that still owe delivery after a partial
     # failure; empty means "all of ``to`` (or every peer)".
     pending_peers: Tuple[str, ...] = ()
+    # Seconds the post lives after it is published; 0.0 means it never
+    # expires.  Stored as a duration, not a timestamp: the clock starts
+    # when the post is published, not when it is queued.
+    expires_in: float = 0.0
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -192,6 +206,7 @@ class ScheduledPost:
         object.__setattr__(self, "next_attempt_at", _clean_retry_at(self.next_attempt_at))
         object.__setattr__(self, "paused_at", _clean_retry_at(self.paused_at))
         object.__setattr__(self, "pending_peers", _clean_targets(list(self.pending_peers)))
+        object.__setattr__(self, "expires_in", _clean_duration(self.expires_in))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -207,6 +222,7 @@ class ScheduledPost:
             "next_attempt_at": self.next_attempt_at,
             "paused_at": self.paused_at,
             "pending_peers": list(self.pending_peers),
+            "expires_in": self.expires_in,
         }
 
     @classmethod
@@ -226,6 +242,7 @@ class ScheduledPost:
             next_attempt_at=_clean_retry_at(data.get("next_attempt_at", 0.0)),
             paused_at=_clean_retry_at(data.get("paused_at", 0.0)),
             pending_peers=_clean_targets(data.get("pending_peers")),
+            expires_in=_clean_duration(data.get("expires_in", 0.0)),
         )
 
 
@@ -366,13 +383,16 @@ def schedule_post(
     ttl: int = 3,
     now: Optional[float] = None,
     name: Optional[str] = None,
+    expires_in: float = 0.0,
 ) -> ScheduledPost:
     """Queue a post for *publish_at*; returns the stored entry.
 
     The text gets the same validation as an immediate ``tau tan post``
     (``normalize_message``: non-empty, at most ``MAX_MESSAGE_CHARS``), so
     a post that could never be created is refused here, not on every
-    publish pass.
+    publish pass.  When *expires_in* is given the post disappears from
+    display surfaces that long after it is published; it shares the
+    delay cap — a post cannot outlive the furthest it may be queued.
     """
     try:
         clean_text = normalize_message(text)
@@ -386,8 +406,18 @@ def schedule_post(
     # ``tau.backup`` relies on.)
     from .tangents.tan import PostError, check_post_text_fits
 
+    clean_expires_in = _clean_duration(expires_in)
+    if clean_expires_in > MAX_SCHEDULED_POST_DELAY:
+        raise ScheduledPostsError(
+            "expires_in must be at most 7d (the scheduled-post delay cap)"
+        )
     try:
-        check_post_text_fits(clean_text, name=name, reply_to=reply_to)
+        check_post_text_fits(
+            clean_text,
+            name=name,
+            reply_to=reply_to,
+            expires=clean_expires_in > 0,
+        )
     except PostError as exc:
         raise ScheduledPostsError(str(exc)) from exc
     post = ScheduledPost(
@@ -398,6 +428,7 @@ def schedule_post(
         ttl=_clean_ttl(ttl),
         publish_at=_clean_timestamp(publish_at, "publish_at"),
         created_at=now if now is not None else time.time(),
+        expires_in=clean_expires_in,
     )
     with scheduled_posts_lock(path):
         queue = load_scheduled_posts(path)
@@ -527,7 +558,22 @@ def publish_due_scheduled_posts(
                         else None
                     )
                     if created is None:
-                        created = app.create_post(post.text, reply_to=post.reply_to)
+                        # The expiry clock starts at publish time, not
+                        # queue time: a post queued for days must not
+                        # arrive already dead.  Sample the clock here, not
+                        # at the pass start: lock and target resolution can
+                        # take long enough to eat a short expiry.
+                        create_at = now if now is not None else time.time()
+                        expires_at = (
+                            create_at + post.expires_in
+                            if post.expires_in > 0
+                            else None
+                        )
+                        created = app.create_post(
+                            post.text,
+                            reply_to=post.reply_to,
+                            expires_at=expires_at,
+                        )
                         # Persist the signed post's identity before sending, so
                         # a retry after a crash re-sends it rather than signing
                         # a second copy.
