@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost } from "./api";
+import { casefoldTag } from "./format";
 import type {
   TanAuthor,
   TanAuthorsResponse,
@@ -550,12 +551,26 @@ export function useTan() {
     async (tag: string | null) => {
       const normalized =
         tag !== null && tag.trim() !== ""
-          ? tag.trim().replace(/^#/, "").toLowerCase()
+          ? casefoldTag(tag.trim().replace(/^#/, ""))
           : null;
       if (normalized === tagFilterRef.current) {
+        // Clearing an already-clear filter is not a refresh request:
+        // the view switch that called it loads on its own, so return
+        // without one — and never leave a voided caller holding a
+        // rejection when the load fails.
+        if (normalized === null) return;
         // Re-picking the current tag: setting the same state would
-        // bail out without reloading, so refresh directly.
-        await load();
+        // bail out without reloading, so refresh directly — and report
+        // a failed refresh as a feed error instead of rejecting.
+        try {
+          await load();
+        } catch (caught) {
+          setError(
+            caught instanceof Error
+              ? caught.message
+              : "could not load the feed",
+          );
+        }
         return;
       }
       if (normalized !== null) {
@@ -971,7 +986,10 @@ export function useTan() {
       await apiPost("/api/tan/hide", { target });
       // Hiding drops the post from the feed and from the saved and
       // pinned views server-side, so those refresh too; the hidden
-      // list itself only refreshes when it has been opened.
+      // list itself only refreshes when it has been opened. The tag
+      // counts exclude hidden posts, so refresh the tag list at once,
+      // independently of the refreshes below.
+      void loadTags().catch(() => undefined);
       await runRefreshes([
         load(),
         reloadHidden(),
@@ -981,6 +999,7 @@ export function useTan() {
     },
     [
       load,
+      loadTags,
       reloadHidden,
       refreshPinnedIfLoaded,
       refreshSavedIfLoaded,
@@ -992,7 +1011,10 @@ export function useTan() {
     async (target: string) => {
       await apiPost("/api/tan/unhide", { target });
       // Unhiding restores the post to the feed and to the saved and
-      // pinned views, so those refresh too.
+      // pinned views, so those refresh too. The tag counts include the
+      // restored post again, so refresh the tag list at once,
+      // independently of the refreshes below.
+      void loadTags().catch(() => undefined);
       await runRefreshes([
         load(),
         reloadHidden(),
@@ -1002,6 +1024,7 @@ export function useTan() {
     },
     [
       load,
+      loadTags,
       reloadHidden,
       refreshPinnedIfLoaded,
       refreshSavedIfLoaded,
@@ -1419,6 +1442,9 @@ export function useTan() {
         );
         // The entries are already stored once the POST succeeds, so a feed
         // refresh failure must not turn the import into a reported failure.
+        // The import can bring in new hashtags, so refresh the tag list
+        // at once, independently of the feed reload below.
+        void loadTags().catch(() => undefined);
         try {
           await load();
         } catch (caught) {
@@ -1431,7 +1457,7 @@ export function useTan() {
         setImporting(false);
       }
     },
-    [load],
+    [load, loadTags],
   );
 
   return {
