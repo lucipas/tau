@@ -329,10 +329,14 @@ describe("SocialConsole scheduled posts", () => {
     await waitFor(() =>
       expect(publish).toHaveBeenCalledWith("vanish soon", undefined, 3600),
     );
-    // The expiry applies to one post only: the picker resets.
-    expect(
-      (screen.getByLabelText("Post expiry") as HTMLSelectElement).value,
-    ).toBe("");
+    // The expiry applies to one post only: the picker resets. Poll
+    // for it — the reset runs after the publish resolves, so reading
+    // the select immediately can still see the old value.
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Post expiry") as HTMLSelectElement).value,
+      ).toBe(""),
+    );
   });
 
   it("schedules the draft with the picked expiry", async () => {
@@ -363,9 +367,13 @@ describe("SocialConsole scheduled posts", () => {
         86400,
       ),
     );
-    expect(
-      (screen.getByLabelText("Post expiry") as HTMLSelectElement).value,
-    ).toBe("");
+    // Same polling as the immediate path: the reset runs after the
+    // schedule resolves.
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Post expiry") as HTMLSelectElement).value,
+      ).toBe(""),
+    );
   });
 
   it("hides the expiry picker while quoting", () => {

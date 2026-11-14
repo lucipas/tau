@@ -6799,6 +6799,23 @@ def _valid_send_in(value: Any) -> bool:
     return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL - 3600.0
 
 
+def _valid_tan_expires_in(value: Any) -> bool:
+    """True when ``value`` is a finite Tan post lifetime in (0, 7d] seconds.
+
+    The cap mirrors the CLI's ``tau tan post --expire`` limit
+    (``MAX_TAN_POST_EXPIRY``): a post cannot disappear later than the
+    CLI allows. Huge JSON integers overflow ``float()``, so the
+    conversion is guarded here instead of raising past the 400 response.
+    """
+    from .tangents.tan import MAX_TAN_POST_EXPIRY
+
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return False
+    return math.isfinite(seconds) and 0 < seconds <= MAX_TAN_POST_EXPIRY
+
+
 def _valid_schedule_in(value: Any) -> bool:
     """True when ``value`` is a finite delay in (0, MAX_SCHEDULED_POST_DELAY] seconds.
 
@@ -9137,29 +9154,6 @@ class _WebHandler(BaseHTTPRequestHandler):
 
 
 def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
-    values = query.get(name) or []
-    if not values:
-        return False
-    return values[0].strip().lower() in ("1", "true", "yes", "on")
-
-
-def _int_param(
-    query: Dict[str, List[str]],
-    name: str,
-    *,
-    default: int,
-    minimum: int,
-    maximum: int,
-) -> int:
-    values = query.get(name)
-    if not values:
-        return default
-    try:
-        value = int(values[0])
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(value, maximum))
-t[str, List[str]], name: str) -> bool:
     values = query.get(name) or []
     if not values:
         return False
