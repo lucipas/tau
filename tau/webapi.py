@@ -108,6 +108,9 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/saved    saved posts, newest save first
     POST /api/tan/save     save a post to read later
     POST /api/tan/unsave   remove a post from the saved list
+    GET  /api/tan/hidden   hidden posts, newest hide first
+    POST /api/tan/hide     hide a post from local views
+    POST /api/tan/unhide   remove a post from the hidden list
     GET  /api/tan/pinned   pinned posts, newest pin first
     POST /api/tan/pin      pin one of your own posts
     POST /api/tan/unpin    remove a post from the pinned list
@@ -2636,6 +2639,26 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_hide(self, target: str) -> Dict[str, Any]:
+        # Hides are local-only: no signed entry and no gossip, so the
+        # social app is not needed — the same as `tau tan hide`.
+        from .tangents.tan import hide_post
+
+        conn = self._tan_conn()
+        try:
+            return hide_post(conn, target)
+        finally:
+            conn.close()
+
+    def tan_unhide(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import unhide_post
+
+        conn = self._tan_conn()
+        try:
+            return unhide_post(conn, target)
+        finally:
+            conn.close()
+
     def tan_pin(self, target: str) -> Dict[str, Any]:
         # Pins are local-only: no signed entry and no gossip, so the
         # social app is not needed — the same as `tau tan pin`.
@@ -2702,6 +2725,30 @@ class WebBridge:
                 conn, limit=limit, offset=offset, viewer=viewer, ruleset=ruleset
             )
             annotate_pinned(conn, posts)
+            return {"posts": posts, "next_offset": next_offset}
+        finally:
+            conn.close()
+
+    def tan_hidden(
+        self, *, limit: int = 30, offset: int = 0
+    ) -> Dict[str, Any]:
+        """Hidden posts, newest hide first, with the timeline's annotations.
+
+        Mirrors :func:`tau.cli.cmd_tan_hidden`: the same list the CLI
+        shows — your own hidden posts, including ones deleted after the
+        hide (text blanked) — so the console shows exactly what the CLI
+        shows for the same store. One extra row is fetched to learn
+        whether another page follows, the way the saved view does.
+        """
+        from .tangents.tan import annotate_pinned, annotate_saved, hidden_posts
+
+        conn = self._tan_conn()
+        try:
+            rows = hidden_posts(conn, limit=limit + 1, offset=offset)
+            posts = rows[:limit]
+            annotate_saved(conn, posts)
+            annotate_pinned(conn, posts)
+            next_offset = offset + limit if len(rows) > limit else None
             return {"posts": posts, "next_offset": next_offset}
         finally:
             conn.close()
@@ -6920,6 +6967,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path == "/api/tan/hidden":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                offset = _int_param(
+                    query, "offset", default=0, minimum=0, maximum=100000
+                )
+                try:
+                    result = self.bridge.tan_hidden(limit=limit, offset=offset)
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to load hidden Tan posts")
+                    self._send_json(
+                        {"error": {"message": "could not load hidden posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {
+                        "posts": result["posts"],
+                        "count": len(result["posts"]),
+                        "next_offset": result["next_offset"],
+                    },
+                    head_only,
+                )
+                return
             if path == "/api/tan/pinned":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
                 offset = _int_param(
@@ -7622,6 +7696,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "save": result}, head_only)
+                return
+            if path in ("/api/tan/hide", "/api/tan/unhide"):
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unhide"):
+                        result = self.bridge.tan_unhide(target.strip())
+                    else:
+                        result = self.bridge.tan_hide(target.strip())
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to update a hidden Tan post")
+                    self._send_json(
+                        {"error": {"message": "could not update hidden posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json({"ok": True, "hide": result}, head_only)
                 return
             if path in ("/api/tan/pin", "/api/tan/unpin"):
                 target = body.get("target") or body.get("hash")

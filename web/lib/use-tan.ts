@@ -10,6 +10,7 @@ import type {
   TanExportDocument,
   TanFollow,
   TanFollowingResponse,
+  TanHiddenResponse,
   TanImportResponse,
   TanImportResult,
   TanLikesResponse,
@@ -41,6 +42,9 @@ export const TAN_POLL_INTERVAL_MS = 5000;
 // cadence than the feed and stays off the feed's poll critical path.
 const SUGGEST_INTERVAL_MS = 60000;
 const SAVED_PAGE_SIZE = 100;
+// Hidden posts load the same way as saved ones: the store holds at
+// most 512 hides, so the view pages through them 100 at a time.
+const HIDDEN_PAGE_SIZE = 100;
 // Pinned posts load the same way as saved ones. The shelf holds at
 // most 10 pins, so one page normally covers the whole list.
 const PINNED_PAGE_SIZE = 100;
@@ -80,6 +84,9 @@ export function useTan() {
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
+  const [hidden, setHidden] = useState<TanPost[]>([]);
+  const [hiddenLoading, setHiddenLoading] = useState(false);
+  const [hiddenHasMore, setHiddenHasMore] = useState(false);
   const [pinned, setPinned] = useState<TanPost[]>([]);
   const [pinnedLoading, setPinnedLoading] = useState(false);
   const [pinnedHasMore, setPinnedHasMore] = useState(false);
@@ -695,6 +702,109 @@ export function useTan() {
     }
   }, [reloadPinned]);
 
+  // Hidden posts change only through this client's hide/unhide actions
+  // (or the CLI), so they load on demand instead of on every poll tick,
+  // exactly like saved posts.
+  const hiddenRef = useRef(hidden);
+  useEffect(() => {
+    hiddenRef.current = hidden;
+  }, [hidden]);
+  // The raw offset to resume paging from, as returned by the API.
+  // Expired entries are filtered server-side before the page, so the
+  // next offset must come from the response — the filtered list length
+  // would re-fetch rows already seen.
+  const hiddenNextOffsetRef = useRef<number | null>(null);
+  // Monotonic generation of hidden loads, mirroring the feed's: a newer
+  // load supersedes an older one, so a slow response cannot restore a
+  // post that was unhidden after it started.
+  const hiddenGenerationRef = useRef(0);
+  // Whether the hidden list has been loaded at least once. Actions
+  // refresh it only then, so a hide from the timeline does not pay for
+  // a list nobody has opened.
+  const hiddenLoadedRef = useRef(false);
+
+  const fetchHiddenPage = async (
+    offset: number,
+    limit: number = HIDDEN_PAGE_SIZE,
+  ) => {
+    return apiGet<TanHiddenResponse>(
+      `/api/tan/hidden?limit=${limit}&offset=${offset}`,
+    );
+  };
+
+  const loadHidden = useCallback(async () => {
+    const generation = ++hiddenGenerationRef.current;
+    setHiddenLoading(true);
+    try {
+      const result = await fetchHiddenPage(0);
+      if (hiddenGenerationRef.current !== generation) return;
+      setHidden(result.posts);
+      hiddenNextOffsetRef.current = result.next_offset;
+      setHiddenHasMore(result.next_offset !== null);
+      hiddenLoadedRef.current = true;
+    } finally {
+      if (hiddenGenerationRef.current === generation) {
+        setHiddenLoading(false);
+      }
+    }
+  }, []);
+
+  const loadMoreHidden = useCallback(async () => {
+    const offset = hiddenNextOffsetRef.current;
+    if (offset === null) return;
+    const generation = ++hiddenGenerationRef.current;
+    setHiddenLoading(true);
+    try {
+      const result = await fetchHiddenPage(offset);
+      if (hiddenGenerationRef.current !== generation) return;
+      setHidden((previous) => [...previous, ...result.posts]);
+      hiddenNextOffsetRef.current = result.next_offset;
+      setHiddenHasMore(result.next_offset !== null);
+    } finally {
+      if (hiddenGenerationRef.current === generation) {
+        setHiddenLoading(false);
+      }
+    }
+  }, []);
+
+  // Re-read every page currently shown, paging with the server's
+  // offsets. A hide or unhide shifts the offsets behind the shown
+  // pages, so refreshing only the first page would leave the rest
+  // stale.
+  const reloadHidden = useCallback(async () => {
+    const shown = hiddenRef.current.length;
+    if (shown === 0) return;
+    const generation = ++hiddenGenerationRef.current;
+    setHiddenLoading(true);
+    try {
+      const all: TanPost[] = [];
+      let offset: number | null = 0;
+      while (all.length < shown && offset !== null) {
+        const result = await fetchHiddenPage(
+          offset,
+          Math.min(HIDDEN_PAGE_SIZE, shown - all.length),
+        );
+        if (hiddenGenerationRef.current !== generation) return;
+        all.push(...result.posts);
+        offset = result.next_offset;
+      }
+      if (hiddenGenerationRef.current !== generation) return;
+      setHidden(all);
+      hiddenNextOffsetRef.current = offset;
+      setHiddenHasMore(offset !== null);
+    } finally {
+      if (hiddenGenerationRef.current === generation) {
+        setHiddenLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshHiddenIfLoaded = useCallback(async () => {
+    if (hiddenLoadedRef.current) {
+      await reloadHidden();
+    }
+  }, [reloadHidden]);
+
   const pin = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/pin", { target });
@@ -702,9 +812,16 @@ export function useTan() {
         load(),
         refreshPinnedIfLoaded(),
         refreshSavedIfLoaded(),
+        refreshHiddenIfLoaded(),
       ]);
     },
-    [load, refreshPinnedIfLoaded, refreshSavedIfLoaded, runRefreshes],
+    [
+      load,
+      refreshHiddenIfLoaded,
+      refreshPinnedIfLoaded,
+      refreshSavedIfLoaded,
+      runRefreshes,
+    ],
   );
 
   const unpin = useCallback(
@@ -714,25 +831,97 @@ export function useTan() {
         load(),
         refreshPinnedIfLoaded(),
         refreshSavedIfLoaded(),
+        refreshHiddenIfLoaded(),
       ]);
     },
-    [load, refreshPinnedIfLoaded, refreshSavedIfLoaded, runRefreshes],
+    [
+      load,
+      refreshHiddenIfLoaded,
+      refreshPinnedIfLoaded,
+      refreshSavedIfLoaded,
+      runRefreshes,
+    ],
   );
 
   const save = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/save", { target });
-      await runRefreshes([load(), reloadSaved(), refreshPinnedIfLoaded()]);
+      await runRefreshes([
+        load(),
+        reloadSaved(),
+        refreshPinnedIfLoaded(),
+        refreshHiddenIfLoaded(),
+      ]);
     },
-    [load, reloadSaved, refreshPinnedIfLoaded, runRefreshes],
+    [
+      load,
+      refreshHiddenIfLoaded,
+      reloadSaved,
+      refreshPinnedIfLoaded,
+      runRefreshes,
+    ],
   );
 
   const unsave = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unsave", { target });
-      await runRefreshes([load(), reloadSaved(), refreshPinnedIfLoaded()]);
+      await runRefreshes([
+        load(),
+        reloadSaved(),
+        refreshPinnedIfLoaded(),
+        refreshHiddenIfLoaded(),
+      ]);
     },
-    [load, reloadSaved, refreshPinnedIfLoaded, runRefreshes],
+    [
+      load,
+      refreshHiddenIfLoaded,
+      reloadSaved,
+      refreshPinnedIfLoaded,
+      runRefreshes,
+    ],
+  );
+
+  const hide = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/hide", { target });
+      // Hiding drops the post from the feed and from the saved and
+      // pinned views server-side, so those refresh too; the hidden
+      // list itself only refreshes when it has been opened.
+      await runRefreshes([
+        load(),
+        reloadHidden(),
+        refreshSavedIfLoaded(),
+        refreshPinnedIfLoaded(),
+      ]);
+    },
+    [
+      load,
+      reloadHidden,
+      refreshPinnedIfLoaded,
+      refreshSavedIfLoaded,
+      runRefreshes,
+    ],
+  );
+
+  const unhide = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/unhide", { target });
+      // Unhiding restores the post to the feed and to the saved and
+      // pinned views, so those refresh too.
+      await runRefreshes([
+        load(),
+        reloadHidden(),
+        refreshSavedIfLoaded(),
+        refreshPinnedIfLoaded(),
+      ]);
+    },
+    [
+      load,
+      reloadHidden,
+      refreshPinnedIfLoaded,
+      refreshSavedIfLoaded,
+      runRefreshes,
+    ],
   );
 
   // Scheduled posts change only through this client's schedule/cancel
@@ -952,26 +1141,58 @@ export function useTan() {
       // audit exactly like a post does.
       invalidateVerify();
       await apiPost("/api/tan/like", { target });
-      await Promise.all([load(), refreshSavedIfLoaded(), refreshPinnedIfLoaded()]);
+      await Promise.all([
+        load(),
+        refreshSavedIfLoaded(),
+        refreshPinnedIfLoaded(),
+        refreshHiddenIfLoaded(),
+      ]);
     },
-    [load, invalidateVerify, refreshSavedIfLoaded, refreshPinnedIfLoaded],
+    [
+      load,
+      invalidateVerify,
+      refreshHiddenIfLoaded,
+      refreshSavedIfLoaded,
+      refreshPinnedIfLoaded,
+    ],
   );
 
   const unlike = useCallback(
     async (target: string) => {
       invalidateVerify();
       await apiPost("/api/tan/unlike", { target });
-      await Promise.all([load(), refreshSavedIfLoaded(), refreshPinnedIfLoaded()]);
+      await Promise.all([
+        load(),
+        refreshSavedIfLoaded(),
+        refreshPinnedIfLoaded(),
+        refreshHiddenIfLoaded(),
+      ]);
     },
-    [load, invalidateVerify, refreshSavedIfLoaded, refreshPinnedIfLoaded],
+    [
+      load,
+      invalidateVerify,
+      refreshHiddenIfLoaded,
+      refreshSavedIfLoaded,
+      refreshPinnedIfLoaded,
+    ],
   );
 
   const repost = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/repost", { target });
-      await Promise.all([load(), refreshSavedIfLoaded(), refreshPinnedIfLoaded()]);
+      await Promise.all([
+        load(),
+        refreshSavedIfLoaded(),
+        refreshPinnedIfLoaded(),
+        refreshHiddenIfLoaded(),
+      ]);
     },
-    [load, refreshSavedIfLoaded, refreshPinnedIfLoaded],
+    [
+      load,
+      refreshHiddenIfLoaded,
+      refreshSavedIfLoaded,
+      refreshPinnedIfLoaded,
+    ],
   );
   // Who liked one post, newest like first. Fetched on demand when the
   // liker list is opened, not with the timeline, so the feed payload
@@ -987,9 +1208,20 @@ export function useTan() {
     async (target: string) => {
       invalidateVerify();
       await apiPost("/api/tan/delete", { target });
-      await Promise.all([load(), refreshSavedIfLoaded(), refreshPinnedIfLoaded()]);
+      await Promise.all([
+        load(),
+        refreshSavedIfLoaded(),
+        refreshPinnedIfLoaded(),
+        refreshHiddenIfLoaded(),
+      ]);
     },
-    [load, invalidateVerify, refreshSavedIfLoaded, refreshPinnedIfLoaded],
+    [
+      load,
+      invalidateVerify,
+      refreshHiddenIfLoaded,
+      refreshSavedIfLoaded,
+      refreshPinnedIfLoaded,
+    ],
   );
 
   const editPost = useCallback(
@@ -1116,6 +1348,13 @@ export function useTan() {
     loadMoreSaved,
     save,
     unsave,
+    hidden,
+    hiddenLoading,
+    hiddenHasMore,
+    loadHidden,
+    loadMoreHidden,
+    hide,
+    unhide,
     pinned,
     pinnedLoading,
     pinnedHasMore,

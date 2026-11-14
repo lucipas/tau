@@ -619,6 +619,12 @@ export interface TanSavedResponse {
   next_offset: number | null;
 }
 
+export interface TanHiddenResponse {
+  posts: TanPost[];
+  count: number;
+  next_offset: number | null;
+}
+
 export interface TanPinnedResponse {
   posts: TanPost[];
   count: number;

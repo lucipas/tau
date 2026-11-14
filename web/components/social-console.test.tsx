@@ -681,6 +681,13 @@ describe("SocialConsole muted sidebar", () => {
       loadMoreSaved: vi.fn(),
       save: vi.fn(),
       unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
       all: false,
       setAll: vi.fn(),
       view: "timeline",
@@ -840,6 +847,13 @@ describe("SocialConsole search", () => {
       loadMoreSaved: vi.fn(),
       save: vi.fn(),
       unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
       ...overrides,
     };
   }
@@ -946,6 +960,13 @@ describe("SocialConsole mentions view", () => {
       loadMoreSaved: vi.fn(),
       save: vi.fn(),
       unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
       ...overrides,
     };
   }
@@ -1022,6 +1043,13 @@ describe("SocialConsole pinned view", () => {
       loadMoreSaved: vi.fn(),
       save: vi.fn(),
       unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
       pinned: [],
       pinnedLoading: false,
       pinnedHasMore: false,
@@ -1279,6 +1307,120 @@ describe("SocialConsole authors directory", () => {
   });
 });
 
+
+describe("SocialConsole hidden view", () => {
+  function hookState(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(async () => {}),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
+      pinned: [],
+      pinnedLoading: false,
+      pinnedHasMore: false,
+      loadPinned: vi.fn(),
+      loadMorePinned: vi.fn(),
+      pin: vi.fn(),
+      unpin: vi.fn(),
+      all: false,
+      setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      repost: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("switches the feed to hidden posts and loads them on demand", async () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    const hiddenPost = makePost({
+      hash: "e".repeat(64),
+      text: "regret this",
+    });
+    const state = hookState({ posts: [timelinePost], hidden: [hiddenPost] });
+    mockedUseTan.mockReturnValue(state);
+
+    const { rerender } = render(<SocialConsole />);
+    expect(screen.getByText("timeline post")).toBeTruthy();
+    expect(screen.queryByText("regret this")).toBeNull();
+
+    // A timeline card offers to hide the post.
+    fireEvent.click(screen.getByTitle("Hide this post from your local views"));
+    expect(state.hide).toHaveBeenCalledWith(timelinePost.hash);
+
+    fireEvent.click(screen.getByText("hidden"));
+    await waitFor(() => expect(state.loadHidden).toHaveBeenCalledTimes(1));
+
+    rerender(<SocialConsole />);
+    expect(screen.queryByText("timeline post")).toBeNull();
+    expect(screen.getByText("regret this")).toBeTruthy();
+    // Hidden cards offer to unhide instead of hiding again.
+    expect(screen.queryByTitle("Hide this post from your local views")).toBeNull();
+    fireEvent.click(
+      screen.getByTitle("Show this post in your local views again"),
+    );
+    expect(state.unhide).toHaveBeenCalledWith(hiddenPost.hash);
+
+    fireEvent.click(screen.getByRole("button", { name: "following" }));
+    expect(state.setView).toHaveBeenCalledWith("timeline");
+    expect(state.setAll).toHaveBeenCalledWith(false);
+  });
+
+  it("says there are no hidden posts yet when the hidden list is empty", () => {
+    mockedUseTan.mockReturnValue(hookState({}));
+
+    render(<SocialConsole />);
+    fireEvent.click(screen.getByText("hidden"));
+    expect(screen.getByText("No hidden posts yet")).toBeTruthy();
+  });
+});
 
 describe("PostCard save control", () => {
   function renderCard(post: TanPost, onToggleSave = vi.fn()) {
