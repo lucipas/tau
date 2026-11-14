@@ -351,7 +351,12 @@ export function resolveQuote(
   // replies from senders that predate the reference.
   const ref = message.in_reply_to;
   if (!ref || !ref.id) return null;
-  if (ref.group && ref.author && typeof ref.sent_at === "number") {
+  if (
+    message.group &&
+    ref.group === message.group &&
+    ref.author &&
+    typeof ref.sent_at === "number"
+  ) {
     const logical = messages.filter(
       (entry) =>
         entry.group === ref.group &&
