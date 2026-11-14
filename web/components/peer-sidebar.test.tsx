@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "@/lib/api";
 import type {
+  ArchivedConversation,
   ChangeGroupMembersResponse,
   NodeInfo,
   Peer,
@@ -85,6 +86,10 @@ type SidebarOptions = {
   onBlock?: (destination: string) => void;
   onUnblock?: (destination: string) => void;
   onForgetPeer?: (destination: string, force: boolean) => Promise<void>;
+  onArchivePeer?: (destination: string) => Promise<void>;
+  onUnarchivePeer?: (destination: string) => Promise<void>;
+  archived?: ArchivedConversation[];
+  archivedError?: string | null;
   infos?: Record<string, PeerInfoState>;
   onInfo?: (destination: string) => void;
 };
@@ -137,12 +142,16 @@ function renderSidebar(
       blocks={options.blocks ?? {}}
       verifications={{}}
       unread={unread}
+      archived={options.archived ?? []}
+      archivedError={options.archivedError ?? null}
       selected=""
       onPing={() => {}}
       onInfo={options.onInfo ?? onInfo}
       onForgetPeer={onForgetPeer}
       onBlock={options.onBlock ?? (() => {})}
       onUnblock={options.onUnblock ?? (() => {})}
+      onArchivePeer={options.onArchivePeer ?? (async () => {})}
+      onUnarchivePeer={options.onUnarchivePeer ?? (async () => {})}
       onVerify={() => {}}
       onShowSafetyNumber={() => {}}
       onDismissVerification={() => {}}
@@ -911,5 +920,103 @@ describe("PeerSidebar block and unblock", () => {
     expect(
       screen.getByRole("button", { name: "Block alice" }),
     ).toHaveProperty("disabled", true);
+  });
+});
+
+describe("PeerSidebar archived conversations", () => {
+  const aliceHash = "ab".repeat(16);
+  const bobHash = "cd".repeat(16);
+
+  it("archives a conversation from the peer row without a confirm step", async () => {
+    const onArchivePeer = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), { onArchivePeer });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Archive conversation with alice" }),
+    );
+    await waitFor(() =>
+      expect(onArchivePeer).toHaveBeenCalledWith(aliceHash),
+    );
+  });
+
+  it("hides an archived peer from the list and shows it under archived", async () => {
+    const onUnarchivePeer = vi.fn().mockResolvedValue(undefined);
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        archived: [{ destination: aliceHash, name: "alice", messages: 3 }],
+        onUnarchivePeer,
+      },
+    );
+
+    // Alice's row — including its archive button — is gone from the
+    // live list; bob is still there.
+    expect(
+      screen.queryByRole("button", {
+        name: "Archive conversation with alice",
+      }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Archive conversation with bob" }),
+    ).toBeTruthy();
+    // The archived section carries her with the message count.
+    expect(screen.getByText("archived")).toBeTruthy();
+    expect(screen.getByText(/3 messages/)).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Restore conversation with alice" }),
+    );
+    await waitFor(() =>
+      expect(onUnarchivePeer).toHaveBeenCalledWith(aliceHash),
+    );
+  });
+
+  it("says so when every conversation is archived", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        peers: [
+          makePeer(),
+          makePeer({ destination: bobHash, name: "bob" }),
+        ],
+        archived: [
+          { destination: aliceHash, name: "alice", messages: 1 },
+          { destination: bobHash, name: "bob", messages: 2 },
+        ],
+      },
+    );
+
+    expect(
+      screen.getByText(/Every conversation is archived/),
+    ).toBeTruthy();
+  });
+
+  it("shows an archive failure under the row", async () => {
+    const onArchivePeer = vi
+      .fn()
+      .mockRejectedValue(new Error("archive-list is unusable"));
+    renderSidebar({}, vi.fn(), { onArchivePeer });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Archive conversation with alice" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("archive-list is unusable")).toBeTruthy(),
+    );
+  });
+
+  it("shows a failed archived-list poll in the archived section", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        archived: [],
+        archivedError: "could not load archived",
+      },
+    );
+
+    expect(screen.getByText("could not load archived")).toBeTruthy();
   });
 });

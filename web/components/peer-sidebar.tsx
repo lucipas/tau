@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { ApiError } from "@/lib/api";
 import type {
+  ArchivedConversation,
   BridgeInfo,
   ChangeGroupMembersResponse,
   NodeInfo,
@@ -35,12 +36,16 @@ export function PeerSidebar({
   blocks,
   verifications,
   unread,
+  archived,
+  archivedError,
   selected,
   onPing,
   onInfo,
   onForgetPeer,
   onBlock,
   onUnblock,
+  onArchivePeer,
+  onUnarchivePeer,
   onVerify,
   onShowSafetyNumber,
   onDismissVerification,
@@ -63,12 +68,16 @@ export function PeerSidebar({
   blocks: Record<string, BlockState>;
   verifications: Record<string, VerifyState>;
   unread: Record<string, number>;
+  archived: ArchivedConversation[];
+  archivedError: string | null;
   selected: string;
   onPing: (destination: string) => void;
   onInfo: (destination: string) => void;
   onForgetPeer: (destination: string, force: boolean) => Promise<void>;
   onBlock: (destination: string) => void;
   onUnblock: (destination: string) => void;
+  onArchivePeer: (destination: string) => Promise<void>;
+  onUnarchivePeer: (destination: string) => Promise<void>;
   onVerify: (destination: string) => void;
   onShowSafetyNumber: (destination: string) => void;
   onDismissVerification: (destination: string) => void;
@@ -101,6 +110,10 @@ export function PeerSidebar({
   const [forgetErrors, setForgetErrors] = useState<
     Record<string, { message: string; code?: string; queued?: number }>
   >({});
+  const [archivingId, setArchivingId] = useState<string | null>(null);
+  const [archiveErrors, setArchiveErrors] = useState<Record<string, string>>(
+    {},
+  );
   const forgetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -144,6 +157,37 @@ export function PeerSidebar({
       }));
     } finally {
       setForgettingId(null);
+    }
+  }
+
+  // Archiving only hides the thread — nothing is deleted and restore is
+  // one click in the Archived section — so it needs no confirm step,
+  // but a failed write still surfaces under the row like a forget does.
+  async function runArchive(destination: string, restore: boolean) {
+    setArchivingId(destination);
+    setArchiveErrors((previous) => {
+      const next = { ...previous };
+      delete next[destination];
+      return next;
+    });
+    try {
+      if (restore) {
+        await onUnarchivePeer(destination);
+      } else {
+        await onArchivePeer(destination);
+      }
+    } catch (caught) {
+      setArchiveErrors((previous) => ({
+        ...previous,
+        [destination]:
+          caught instanceof Error
+            ? caught.message
+            : restore
+              ? "could not restore conversation"
+              : "could not archive conversation",
+      }));
+    } finally {
+      setArchivingId(null);
     }
   }
 
@@ -371,6 +415,13 @@ export function PeerSidebar({
   const [confirmBlock, setConfirmBlock] = useState<string | null>(null);
 
 
+  // Archived conversations live in their own section below: the peer
+  // list is the live feed's roster, so a hidden thread never sits in it.
+  const archivedSet = new Set(archived.map((entry) => entry.destination));
+  const activePeers = peers.filter(
+    (peer) => !archivedSet.has(peer.destination),
+  );
+
   return (
     <aside className="flex flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
       <section className="rounded-2xl border border-line/80 bg-panel/60 p-4 shadow-[0_20px_60px_-40px_rgba(0,0,0,0.9)]">
@@ -516,21 +567,30 @@ export function PeerSidebar({
         <div className="flex items-center justify-between">
           <SectionLabel>peers</SectionLabel>
           <span className="rounded-full border border-line bg-void/60 px-2 py-0.5 font-mono text-[10px] text-mist">
-            {peers.length}
+            {activePeers.length}
           </span>
         </div>
 
-        {peers.length === 0 ? (
+        {activePeers.length === 0 ? (
           <div className="mt-3 rounded-xl border border-dashed border-line/80 p-3">
-            <p className="text-xs text-zinc-300">No announces heard yet.</p>
-            <p className="mt-1 text-[11px] leading-relaxed text-mist">
-              Keep this node running, then start another one and announce. Tau
-              stores peers from signed Reticulum announces.
-            </p>
+            {peers.length === 0 ? (
+              <>
+                <p className="text-xs text-zinc-300">No announces heard yet.</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-mist">
+                  Keep this node running, then start another one and announce. Tau
+                  stores peers from signed Reticulum announces.
+                </p>
+              </>
+            ) : (
+              <p className="text-xs text-zinc-300">
+                Every conversation is archived — restore one below to bring it
+                back.
+              </p>
+            )}
           </div>
         ) : (
           <ul className="mt-2 -mx-1 max-h-[46vh] space-y-1 overflow-y-auto px-1 py-1 thin-scroll">
-            {peers.map((peer) => {
+            {activePeers.map((peer) => {
               const ping = pings[peer.destination];
               const info = infos[peer.destination];
               const infoParts: string[] = [];
@@ -730,6 +790,20 @@ export function PeerSidebar({
                         >
                           {verification?.pending ? "verifying…" : "Verify"}
                         </button>
+                      <button
+                        type="button"
+                        disabled={archivingId === peer.destination}
+                        onClick={() =>
+                          void runArchive(peer.destination, false)
+                        }
+                        aria-label={`Archive conversation with ${peer.name}`}
+                        title="Archive this conversation — hides it from the feed; messages keep arriving and restore brings them back"
+                        className="shrink-0 rounded-md border border-line/70 px-1.5 py-1 font-mono text-[10px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                      >
+                        {archivingId === peer.destination
+                          ? "archiving…"
+                          : "archive"}
+                      </button>
                       <button
                         type="button"
                         disabled={forgettingId === peer.destination}
@@ -962,12 +1036,83 @@ export function PeerSidebar({
                         {block.error}
                       </p>
                     ) : null}
+                    {archiveErrors[peer.destination] ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        {archiveErrors[peer.destination]}
+                      </p>
+                    ) : null}
                   </div>
                 </li>
               );
             })}
           </ul>
         )}
+
+        {archived.length > 0 || archivedError ? (
+          <div className="mt-4 border-t border-line/60 pt-3">
+            <div className="flex items-center justify-between">
+              <SectionLabel>archived</SectionLabel>
+              <span className="rounded-full border border-line bg-void/60 px-2 py-0.5 font-mono text-[10px] text-mist">
+                {archived.length}
+              </span>
+            </div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-mist">
+              Hidden from the feed; messages keep arriving. Restore brings
+              the full history back.
+            </p>
+            {archivedError ? (
+              <p className="mt-1.5 font-mono text-[10px] text-rose-300">
+                {archivedError}
+              </p>
+            ) : null}
+            <ul className="mt-2 space-y-1">
+              {archived.map((entry) => {
+                const known = peers.find(
+                  (candidate) => candidate.destination === entry.destination,
+                );
+                const displayName =
+                  known?.alias || entry.name || "unknown";
+                return (
+                  <li key={entry.destination}>
+                    <div className="flex items-center gap-2 rounded-xl border border-transparent px-2.5 py-2 hover:border-line hover:bg-void/40">
+                      <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-void/60 font-mono text-xs uppercase text-signal">
+                        {displayName.slice(0, 1) || "?"}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-xs font-medium text-zinc-200">
+                          {displayName}
+                        </span>
+                        <span className="block truncate font-mono text-[10px] text-mist">
+                          {shortHash(entry.destination, 10)} · {entry.messages}{" "}
+                          message{entry.messages === 1 ? "" : "s"}
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        disabled={archivingId === entry.destination}
+                        onClick={() =>
+                          void runArchive(entry.destination, true)
+                        }
+                        aria-label={`Restore conversation with ${displayName}`}
+                        title="Restore this conversation to the feed"
+                        className="shrink-0 rounded-md border border-signal/50 bg-signal/10 px-2 py-1 font-mono text-[10px] text-signal transition hover:bg-signal/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                      >
+                        {archivingId === entry.destination
+                          ? "restoring…"
+                          : "restore"}
+                      </button>
+                    </div>
+                    {archiveErrors[entry.destination] ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        {archiveErrors[entry.destination]}
+                      </p>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ) : null}
       </section>
 
       <section className="rounded-2xl border border-line/80 bg-panel/60 p-4">

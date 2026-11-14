@@ -3442,6 +3442,206 @@ def test_peers_block_unblock_via_api(tmp_path):
         bridge.stop()
 
 
+def test_conversations_archive_unarchive_via_api(tmp_path):
+    node = FakeNode()
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # Archive by name; the file updates and the list carries it.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/archive",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["archive"]["destination"] == PEER_HASH
+        assert payload["archive"]["name"] == "alice"
+        assert payload["archive"]["archived"] is True
+        assert payload["archive"]["changed"] is True
+        assert json.loads((tmp_path / "archived.json").read_text()) == {
+            "archived": [PEER_HASH]
+        }
+
+        status, _, payload = _json(bridge, "/api/conversations/archived")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["archived"][0]["destination"] == PEER_HASH
+        assert payload["archived"][0]["name"] == "alice"
+        assert payload["archived"][0]["messages"] == 0
+
+        # Re-archiving is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/archive",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 200
+        assert payload["archive"]["changed"] is False
+        assert payload["archive"]["archived"] is True
+
+        # Unarchive by hash prefix.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/unarchive",
+            method="POST",
+            body={"target": PEER_HASH[:8]},
+        )
+        assert status == 200
+        assert payload["archive"]["archived"] is False
+        assert payload["archive"]["changed"] is True
+        assert json.loads((tmp_path / "archived.json").read_text()) == {
+            "archived": []
+        }
+
+        # Unarchiving again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/unarchive",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 200
+        assert payload["archive"]["changed"] is False
+
+        # Unknown peers and missing targets are rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/archive",
+            method="POST",
+            body={"target": "nobody"},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/conversations/archive", method="POST", body={}
+        )
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
+    seeded = [
+        _stored_message(1, "from alice"),
+        _stored_message(2, "to alice", direction="out"),
+        {
+            **_stored_message(3, "from carol"),
+            "peer": OTHER_HASH,
+            "peer_name": "carol",
+        },
+        {
+            **_stored_message(4, "crew hello"),
+            "group": "11" * 16,
+            "group_name": "crew",
+        },
+    ]
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": seeded, "next_message_id": 5}),
+        encoding="utf-8",
+    )
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        _inbound_record(node)
+        _inbound_record(
+            node,
+            destination=OTHER_HASH,
+            **{"from": "carol", "id": "m-2", "received_at": 102.0},
+        )
+        # A group post from alice: same destination as her DM, but it
+        # belongs to the group thread, which archiving must not hide.
+        _inbound_record(
+            node,
+            kind="group",
+            group="11" * 16,
+            **{"from": "alice", "id": "m-3", "received_at": 103.0},
+        )
+
+        assert [m["text"] for m in bridge.messages()] == [
+            "from alice",
+            "to alice",
+            "from carol",
+            "crew hello",
+        ]
+        assert _counts(bridge.unread()) == {
+            "per_peer": {PEER_HASH: 2, OTHER_HASH: 1},
+            "total": 3,
+        }
+
+        result = bridge.archive_conversation("alice")
+        assert result["archived"] is True
+
+        # Both directions of the archived thread hide; the other peer
+        # and the group post — which is never part of an archived
+        # conversation — stay visible.
+        assert [m["text"] for m in bridge.messages()] == [
+            "from carol",
+            "crew hello",
+        ]
+        # Search reuses messages(), so it hides the thread too.
+        assert bridge.messages_search(query="alice") == []
+        assert [m["text"] for m in bridge.messages_search(query="carol")] == [
+            "from carol"
+        ]
+        # The list counts the hidden thread, both directions.
+        listed = bridge.archived_conversations()
+        assert listed["count"] == 1
+        assert listed["archived"][0]["messages"] == 2
+        # The archived thread stops lighting the badge — but alice's
+        # group post still counts, since the group thread stays visible.
+        assert _counts(bridge.unread()) == {
+            "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
+            "total": 2,
+        }
+
+        bridge.unarchive_conversation(PEER_HASH)
+        assert [m["text"] for m in bridge.messages()] == [
+            "from alice",
+            "to alice",
+            "from carol",
+            "crew hello",
+        ]
+        assert _counts(bridge.unread()) == {
+            "per_peer": {PEER_HASH: 2, OTHER_HASH: 1},
+            "total": 3,
+        }
+    finally:
+        bridge.stop()
+
+
+def test_archive_rejects_corrupt_list_but_lists_fail_open(tmp_path):
+    node = FakeNode()
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "archived.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/archive",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        # The list fails open: a corrupt file never hides mail.
+        status, _, payload = _json(bridge, "/api/conversations/archived")
+        assert status == 200
+        assert payload == {"archived": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_archive_without_data_dir(bridge):
+    # A dataless node has no archive-list path: edits are refused, but
+    # the list still answers empty instead of failing the console poll.
+    status, _, payload = _json(
+        bridge, "/api/conversations/archive", method="POST", body={"target": "alice"}
+    )
+    assert status == 503
+    status, _, payload = _json(bridge, "/api/conversations/archived")
+    assert status == 200
+    assert payload == {"archived": [], "count": 0}
+
+
 def test_tan_mute_via_api(tmp_path):
     import RNS
 

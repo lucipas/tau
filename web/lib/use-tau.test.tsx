@@ -1828,3 +1828,185 @@ describe("useTau acceptDmRequest", () => {
     expect(result.current.allowlist).toEqual(secondAllowlist);
   });
 });
+
+describe("useTau archived conversations", () => {
+  const OTHER_HASH = "cd".repeat(16);
+  const archivedList = {
+    archived: [{ destination: PEER_HASH, name: "alice", messages: 2 }],
+    count: 1,
+  };
+
+  function mockArchivedGet(list = archivedList) {
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/conversations/archived"
+        ? Promise.resolve(list)
+        : path === "/api/peers"
+          ? Promise.resolve({ peers: [], count: 0 })
+          : path === "/api/outbox"
+            ? Promise.resolve({ outbox: [], count: 0, held_for_others: 0 })
+            : Promise.resolve({ groups: [], count: 0 }),
+    );
+  }
+
+  it("archives a thread at once and clears its unread badge", async () => {
+    mockArchivedGet({ archived: [], count: 0 });
+    const alice = makePeer();
+    const carol = makePeer({ destination: OTHER_HASH, name: "carol" });
+    const thread = [
+      makeMessage({ id: 1, peer: PEER_HASH, group: undefined, text: "hi" }),
+      makeMessage({
+        id: 2,
+        peer: PEER_HASH,
+        group: undefined,
+        direction: "out",
+        text: "yo",
+      }),
+      makeMessage({
+        id: 3,
+        peer: OTHER_HASH,
+        peer_name: "carol",
+        group: undefined,
+        text: "hey",
+      }),
+    ];
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", {
+        snapshot: {
+          ...makeSnapshot([alice, carol], thread),
+          unread: { per_peer: { [PEER_HASH]: 1 }, total: 1 },
+        },
+      });
+    });
+    await waitFor(() =>
+      expect(result.current.messages.map((m) => m.id)).toEqual([1, 2, 3]),
+    );
+
+    mockArchivedGet();
+    mockedPost.mockResolvedValue({
+      ok: true,
+      archive: {
+        destination: PEER_HASH,
+        name: "alice",
+        archived: true,
+        changed: true,
+      },
+    });
+    await act(async () => {
+      await result.current.archiveConversation(PEER_HASH);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/conversations/archive", {
+      target: PEER_HASH,
+    });
+    // Both directions of the thread drop; the other peer stays.
+    expect(result.current.messages.map((m) => m.id)).toEqual([3]);
+    expect(result.current.unread).toEqual({
+      per_peer: {},
+      total: 0,
+      revision: undefined,
+    });
+    expect(result.current.archivedConversations).toEqual(
+      archivedList.archived,
+    );
+    unmount();
+  });
+
+  it("restores a thread by re-reading the feed", async () => {
+    mockArchivedGet();
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+
+    const restored = makeMessage({
+      id: 1,
+      peer: PEER_HASH,
+      group: undefined,
+      text: "back",
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/messages?limit=200"
+        ? Promise.resolve({ messages: [restored] })
+        : path === "/api/conversations/archived"
+          ? Promise.resolve({ archived: [], count: 0 })
+          : path === "/api/peers"
+            ? Promise.resolve({ peers: [], count: 0 })
+            : path === "/api/outbox"
+              ? Promise.resolve({ outbox: [], count: 0, held_for_others: 0 })
+              : Promise.resolve({ groups: [], count: 0 }),
+    );
+    mockedPost.mockResolvedValue({
+      ok: true,
+      archive: {
+        destination: PEER_HASH,
+        name: "alice",
+        archived: false,
+        changed: true,
+      },
+    });
+    await act(async () => {
+      await result.current.unarchiveConversation(PEER_HASH);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/conversations/unarchive", {
+      target: PEER_HASH,
+    });
+    expect(result.current.messages.map((m) => m.id)).toEqual([1]);
+    expect(result.current.archivedConversations).toEqual([]);
+    unmount();
+  });
+
+  it("drops live messages for an archived peer, keeps the rest", async () => {
+    mockArchivedGet();
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", {
+        snapshot: makeSnapshot([makePeer()], [
+          makeMessage({ id: 1, peer: PEER_HASH, group: undefined }),
+        ]),
+      });
+    });
+    await waitFor(() =>
+      expect(result.current.archivedConversations).toEqual(
+        archivedList.archived,
+      ),
+    );
+
+    // A new arrival for the archived peer stays hidden; one for
+    // another peer lands in the feed. Group posts are never archived.
+    // The snapshot DM from the archived peer is hidden too, once the
+    // archived list lands and reconciles the open views.
+    await act(async () => {
+      source.emit("message", {
+        message: makeMessage({
+          id: 2,
+          peer: PEER_HASH,
+          group: undefined,
+          text: "still hidden",
+        }),
+      });
+      source.emit("message", {
+        message: makeMessage({
+          id: 3,
+          peer: OTHER_HASH,
+          peer_name: "carol",
+          group: undefined,
+          text: "visible",
+        }),
+      });
+      source.emit("message", {
+        message: makeMessage({
+          id: 4,
+          peer: PEER_HASH,
+          text: "group post",
+        }),
+      });
+    });
+    expect(result.current.messages.map((m) => m.id)).toEqual([3, 4]);
+    unmount();
+  });
+});
