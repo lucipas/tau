@@ -5265,6 +5265,49 @@ def test_annotated_pinned_posts_drops_hidden(identities, tmp_path):
     assert [post["hash"] for post in posts] == [other["hash"], mine["hash"]]
 
 
+def test_annotated_saved_posts_continuation_excludes_expired(
+    identities, tmp_path
+):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    dying = create_post(
+        conn, alice, "gone soon", name="alice", now=now, expires_at=now + 3600
+    )
+    live = create_post(conn, alice, "still here", name="alice", now=now + 1)
+    save_post(conn, dying["hash"], now=2000)
+    save_post(conn, live["hash"], now=2001)
+    _expire_stored_post(conn, dying["hash"], at=now - 10)
+
+    # The expired tail must not offer a next page: the only pageable
+    # row is the live save, so the first page ends the list.
+    posts, next_offset = annotated_saved_posts(conn, limit=1)
+    assert [post["hash"] for post in posts] == [live["hash"]]
+    assert next_offset is None
+
+
+def test_annotated_pinned_posts_continuation_excludes_expired(
+    identities, tmp_path
+):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    owner = author_of(alice)
+    now = time.time()
+    dying = create_post(
+        conn, alice, "gone soon", name="alice", now=now, expires_at=now + 3600
+    )
+    live = create_post(conn, alice, "still here", name="alice", now=now + 1)
+    pin_post(conn, dying["hash"], owner=owner, now=2000)
+    pin_post(conn, live["hash"], owner=owner, now=2001)
+    _expire_stored_post(conn, dying["hash"], at=now - 10)
+
+    # The expired tail must not offer a next page: the only pageable
+    # row is the live pin, so the first page ends the list.
+    posts, next_offset = annotated_pinned_posts(conn, limit=1, viewer=owner)
+    assert [post["hash"] for post in posts] == [live["hash"]]
+    assert next_offset is None
+
+
 def test_annotated_hidden_posts_matches_saved_pinned_filtering(
     identities, tmp_path
 ):
