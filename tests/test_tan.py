@@ -23,6 +23,7 @@ from tau.tangents.tan import (
     PostError,
     TanApp,
     TanError,
+    _shelf_pageable_total,
     annotate_edits,
     annotate_pinned,
     annotate_quote_counts,
@@ -32,8 +33,7 @@ from tau.tangents.tan import (
     annotated_hidden_posts,
     annotated_pinned_posts,
     annotated_saved_posts,
-    author_stats,
-    author_timeline,
+    author_stats,    author_timeline,
     create_delete,
     create_edit,
     create_post,
@@ -5284,6 +5284,36 @@ def test_annotated_saved_posts_continuation_excludes_expired(
     posts, next_offset = annotated_saved_posts(conn, limit=1)
     assert [post["hash"] for post in posts] == [live["hash"]]
     assert next_offset is None
+
+
+def test_shelf_pageable_total_counts_only_listable_rows(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    owner = author_of(alice)
+    now = time.time()
+    dying = create_post(
+        conn, alice, "gone soon", name="alice", now=now, expires_at=now + 3600
+    )
+    live = create_post(conn, alice, "still here", name="alice", now=now + 1)
+    save_post(conn, dying["hash"], now=2000)
+    save_post(conn, live["hash"], now=2001)
+    pin_post(conn, dying["hash"], owner=owner, now=2000)
+    pin_post(conn, live["hash"], owner=owner, now=2001)
+    hide_post(conn, dying["hash"], now=2000)
+    hide_post(conn, live["hash"], now=2001)
+    _expire_stored_post(conn, dying["hash"], at=now - 10)
+
+    # The shared predicate counts exactly the rows each list query
+    # can return: the expired entry is gone from every shelf total,
+    # so the totals and the list queries can never drift apart.
+    assert _shelf_pageable_total(conn, "saved_posts") == 1
+    assert _shelf_pageable_total(conn, "pinned_posts") == 1
+    assert _shelf_pageable_total(conn, "hidden_posts") == 1
+    assert len(saved_posts(conn)) == 1
+    assert len(pinned_posts(conn)) == 1
+    assert len(hidden_posts(conn)) == 1
+    with pytest.raises(ValueError):
+        _shelf_pageable_total(conn, "posts")
 
 
 def test_annotated_pinned_posts_continuation_excludes_expired(

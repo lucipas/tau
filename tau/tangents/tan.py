@@ -4055,6 +4055,43 @@ def unsave_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     return {"hash": digest, "unsaved": cursor.rowcount > 0}
 
 
+# Shelf tables whose rows are pageable posts, for the shared
+# pageable-rows predicate below.
+_SHELF_TABLES = frozenset({"saved_posts", "hidden_posts", "pinned_posts"})
+
+
+def _shelf_pageable_sql(table: str) -> str:
+    """Shared FROM/WHERE fragment for a shelf table's pageable rows.
+
+    A shelf row is pageable when its post still exists and has not
+    expired.  The list query and the continuation count for each shelf
+    both build from this fragment, so a filter added here reaches both
+    and the paging total can never drift from the rows the list query
+    can return.
+    """
+    if table not in _SHELF_TABLES:
+        raise ValueError(f"unknown shelf table: {table!r}")
+    return (
+        f"FROM {table} s JOIN posts p ON p.hash = s.hash "
+        "WHERE p.expires_at IS NULL OR p.expires_at > ?"
+    )
+
+
+def _shelf_pageable_total(
+    conn: sqlite3.Connection, table: str, *, now: Optional[float] = None
+) -> int:
+    """Rows the shelf's list query can return, at *now*.
+
+    Uses the same predicate as the list query, so the continuation
+    total counts exactly the rows paging can reach.
+    """
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n {_shelf_pageable_sql(table)}",
+        (float(now if now is not None else time.time()),),
+    ).fetchone()
+    return int(row["n"])
+
+
 def saved_posts(
     conn: sqlite3.Connection,
     *,
@@ -4073,9 +4110,7 @@ def saved_posts(
     # Expired posts are filtered in SQL, before LIMIT/OFFSET, so the raw
     # offset a caller advances by counts exactly the rows it was given.
     rows = conn.execute(
-        "SELECT p.*, s.saved_at FROM saved_posts s "
-        "JOIN posts p ON p.hash = s.hash "
-        "WHERE p.expires_at IS NULL OR p.expires_at > ? "
+        f"SELECT p.*, s.saved_at {_shelf_pageable_sql('saved_posts')} "
         "ORDER BY s.saved_at DESC, s.hash DESC LIMIT ? OFFSET ?",
         (time.time(), count, start),
     ).fetchall()
@@ -4162,14 +4197,10 @@ def annotated_saved_posts(
         kept.extend(batch)
     if len(kept) < limit:
         return kept, None
-    # Count only rows saved_posts can return (same join and expiry
-    # filter), so an expired-only tail does not offer an empty next page.
-    total = conn.execute(
-        "SELECT COUNT(*) AS n FROM saved_posts s "
-        "JOIN posts p ON p.hash = s.hash "
-        "WHERE p.expires_at IS NULL OR p.expires_at > ?",
-        (time.time(),),
-    ).fetchone()["n"]
+    # Count only rows saved_posts can return — same shared predicate
+    # as the list query — so an expired-only tail does not offer an
+    # empty next page.
+    total = _shelf_pageable_total(conn, "saved_posts")
     return kept, raw_offset if raw_offset < int(total) else None
 
 
@@ -4262,14 +4293,10 @@ def annotated_hidden_posts(
         kept.extend(batch)
     if len(kept) < limit:
         return kept, None
-    # Count only rows hidden_posts can return (same join and expiry filter),
-    # so an expired-only tail does not offer an empty next page.
-    total = conn.execute(
-        "SELECT COUNT(*) AS n FROM hidden_posts s "
-        "JOIN posts p ON p.hash = s.hash "
-        "WHERE p.expires_at IS NULL OR p.expires_at > ?",
-        (time.time(),),
-    ).fetchone()["n"]
+    # Count only rows hidden_posts can return — same shared predicate
+    # as the list query — so an expired-only tail does not offer an
+    # empty next page.
+    total = _shelf_pageable_total(conn, "hidden_posts")
     return kept, raw_offset if raw_offset < int(total) else None
 
 
@@ -4368,9 +4395,7 @@ def pinned_posts(
     # Expired posts are filtered in SQL, before LIMIT/OFFSET, so the raw
     # offset a caller advances by counts exactly the rows it was given.
     rows = conn.execute(
-        "SELECT p.*, s.pinned_at FROM pinned_posts s "
-        "JOIN posts p ON p.hash = s.hash "
-        "WHERE p.expires_at IS NULL OR p.expires_at > ? "
+        f"SELECT p.*, s.pinned_at {_shelf_pageable_sql('pinned_posts')} "
         "ORDER BY s.pinned_at DESC, s.hash DESC LIMIT ? OFFSET ?",
         (time.time(), count, start),
     ).fetchall()
@@ -4480,9 +4505,7 @@ def hidden_posts(
     # Expired posts are filtered in SQL, before LIMIT/OFFSET, so the raw
     # offset a caller advances by counts exactly the rows it was given.
     rows = conn.execute(
-        "SELECT p.*, s.hidden_at FROM hidden_posts s "
-        "JOIN posts p ON p.hash = s.hash "
-        "WHERE p.expires_at IS NULL OR p.expires_at > ? "
+        f"SELECT p.*, s.hidden_at {_shelf_pageable_sql('hidden_posts')} "
         "ORDER BY s.hidden_at DESC, s.hash DESC LIMIT ? OFFSET ?",
         (time.time(), count, start),
     ).fetchall()
@@ -4597,14 +4620,10 @@ def annotated_pinned_posts(
         kept.extend(batch)
     if len(kept) < limit:
         return kept, None
-    # Count only rows pinned_posts can return (same join and expiry
-    # filter), so an expired-only tail does not offer an empty next page.
-    total = conn.execute(
-        "SELECT COUNT(*) AS n FROM pinned_posts s "
-        "JOIN posts p ON p.hash = s.hash "
-        "WHERE p.expires_at IS NULL OR p.expires_at > ?",
-        (time.time(),),
-    ).fetchone()["n"]
+    # Count only rows pinned_posts can return — same shared predicate
+    # as the list query — so an expired-only tail does not offer an
+    # empty next page.
+    total = _shelf_pageable_total(conn, "pinned_posts")
     return kept, raw_offset if raw_offset < int(total) else None
 
 
