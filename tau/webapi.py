@@ -2737,10 +2737,13 @@ class WebBridge:
         Mirrors :func:`tau.cli.cmd_tan_hidden`: the same list the CLI
         shows — your own hidden posts, including ones deleted after the
         hide (text blanked) — so the console shows exactly what the CLI
-        shows for the same store. One extra row is fetched to learn
-        whether another page follows, the way the saved view does.
+        shows for the same store.  Muted authors, muted keywords and
+        the display ruleset filter the view the way they filter the
+        saved and pinned views, and pages fill to *limit* visible
+        posts, the way the pinned view does.
         """
         from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import annotate_pinned, annotate_saved, annotated_hidden_posts
 
         blocklist = getattr(self.node, "blocklist", None)
@@ -2756,11 +2759,21 @@ class WebBridge:
                 viewer = (
                     destination_hash(identity).hex() if identity is not None else None
                 )
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
             posts, next_offset = annotated_hidden_posts(
                 conn,
                 limit=limit,
                 offset=offset,
                 viewer=viewer,
+                ruleset=ruleset,
                 exclude_authors=blocked,
                 exclude_all=exclude_all,
             )

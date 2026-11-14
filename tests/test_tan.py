@@ -29,6 +29,7 @@ from tau.tangents.tan import (
     annotate_quotes,
     annotate_reactions,
     annotate_replies,
+    annotated_hidden_posts,
     annotated_pinned_posts,
     annotated_saved_posts,
     author_stats,
@@ -52,6 +53,7 @@ from tau.tangents.tan import (
     hash,
     head,
     hidden_posts,
+    hidden_post_set,
     hide_post,
     import_entries,
     init_db,
@@ -5261,6 +5263,96 @@ def test_annotated_pinned_posts_drops_hidden(identities, tmp_path):
     unhide_post(conn, mine["hash"])
     posts, _ = annotated_pinned_posts(conn)
     assert [post["hash"] for post in posts] == [other["hash"], mine["hash"]]
+
+
+def test_annotated_hidden_posts_matches_saved_pinned_filtering(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    owner = author_of(alice)
+    visible = create_post(conn, alice, "visible one", name="alice", now=1000)
+    muted_author = create_post(conn, bob, "muted author post", name="bob", now=1001)
+    keyword = create_post(conn, alice, "crypto secrets", name="alice", now=1002)
+    plain = create_post(conn, alice, "plain post", name="alice", now=1003)
+    older = create_post(conn, alice, "older post", name="alice", now=1004)
+    for post, when in (
+        (visible, 2000),
+        (muted_author, 2001),
+        (keyword, 2002),
+        (plain, 2003),
+        (older, 2004),
+    ):
+        hide_post(conn, post["hash"], now=when)
+
+    mute(conn, author_of(bob), name="bob")
+    mute_keyword(conn, "crypto")
+
+    # Muted-author and muted-keyword posts drop from the view — the
+    # hides stay stored, so unmuting restores them.
+    posts, next_offset = annotated_hidden_posts(conn, viewer=owner)
+    assert [post["hash"] for post in posts] == [
+        older["hash"],
+        plain["hash"],
+        visible["hash"],
+    ]
+    assert next_offset is None
+
+    unmute(conn, author_of(bob))
+    unmute_keyword(conn, "crypto")
+    posts, _ = annotated_hidden_posts(conn, viewer=owner)
+    assert [post["hash"] for post in posts] == [
+        older["hash"],
+        plain["hash"],
+        keyword["hash"],
+        muted_author["hash"],
+        visible["hash"],
+    ]
+
+    # A ruleset that hides the "post" kind hides every entry.
+    posts, _ = annotated_hidden_posts(
+        conn, viewer=owner, ruleset=Ruleset(kinds=frozenset({"like"}))
+    )
+    assert posts == []
+
+    # Pages fill to the limit even when a blocked entry falls inside
+    # one: two visible posts per page across the five hides.
+    posts, next_offset = annotated_hidden_posts(
+        conn, limit=2, viewer=owner, exclude_authors=[author_of(bob)]
+    )
+    assert [post["hash"] for post in posts] == [older["hash"], plain["hash"]]
+    assert next_offset is not None
+    posts, next_offset = annotated_hidden_posts(
+        conn,
+        limit=2,
+        offset=next_offset,
+        viewer=owner,
+        exclude_authors=[author_of(bob)],
+    )
+    assert [post["hash"] for post in posts] == [keyword["hash"], visible["hash"]]
+    assert next_offset is None
+
+
+def test_annotated_hidden_posts_drops_repost_of_hidden_original(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    owner = author_of(alice)
+    original = create_post(conn, alice, "original words", name="alice", now=1000)
+    repost = create_repost(conn, bob, original["hash"], name="bob", now=1001)
+    hide_post(conn, original["hash"], now=2000)
+    hide_post(conn, repost["hash"], now=2001)
+
+    # The repost carries no text of its own, so it drops while its
+    # original stays hidden — but the hide itself stays stored.
+    posts, _ = annotated_hidden_posts(conn, viewer=owner)
+    assert [post["hash"] for post in posts] == [original["hash"]]
+    assert repost["hash"] in hidden_post_set(conn)
+
+    unhide_post(conn, original["hash"])
+    posts, _ = annotated_hidden_posts(conn, viewer=owner)
+    assert [post["hash"] for post in posts] == [repost["hash"]]
 
 
 def test_tags_ignores_hidden_posts(identities, tmp_path):
