@@ -71,19 +71,15 @@ export function Console() {
 
   function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
-    // A pending reply belongs to a peer conversation: the bridge
-    // rejects replies on group sends, so entering group mode drops it.
-    if (next === "group") {
-      setReplyTo(null);
-    }
     setMode(next);
   }
 
   function handleTargetChange(value: string) {
     // Retargeting the composer invalidates the pending reply: the
     // quoted message belongs to the old conversation, and sending it
-    // to the new peer would only be rejected by the bridge.
-    if (replyTo && value !== (replyTo.peer ?? "")) {
+    // to a different peer or group would be rejected by the bridge.
+    // A group message's conversation is its group; a DM's is its peer.
+    if (replyTo && value !== (replyTo.group ?? replyTo.peer ?? "")) {
       setReplyTo(null);
     }
     setTarget(value);
@@ -254,7 +250,12 @@ export function Console() {
               onClearPinned={tau.clearPinned}
               onReply={(message) => {
                 setReplyTo(message);
-                if (message.peer) {
+                // A group message belongs to its group conversation, even
+                // though it also names a member peer.
+                if (message.group) {
+                  setTarget(message.group);
+                  setMode("group");
+                } else if (message.peer) {
                   setTarget(message.peer);
                   setMode("peer");
                 }
