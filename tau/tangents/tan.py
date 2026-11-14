@@ -427,7 +427,11 @@ def _check_wire_size(post: Dict[str, Any]) -> None:
 
 
 def check_post_text_fits(
-    text: str, *, name: Optional[str] = None, reply_to: Optional[str] = None
+    text: str,
+    *,
+    name: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    expires: bool = False,
 ) -> None:
     """Raise PostError if *text* cannot fit a Tan request once encoded.
 
@@ -437,12 +441,15 @@ def check_post_text_fits(
     later.  Maximum-length placeholders stand in for the author, key,
     chain head and (when *name* is unknown) display name the real post
     will carry, so a text that passes here always fits; one that fails
-    is rejected before it is stored.
+    is rejected before it is stored.  When *expires* is true the post
+    will also carry a float ``expires_at`` instead of ``null``, so a
+    widest-possible timestamp stands in for it.
     """
     try:
         clean_text = normalize_message(text)
     except ProtocolError as exc:
         raise PostError(str(exc)) from exc
+    now = time.time()
     _check_wire_size(
         {
             "v": TAN_VERSION,
@@ -454,10 +461,13 @@ def check_post_text_fits(
                 else "x" * MAX_NAME_LENGTH
             ),
             "text": clean_text,
-            "created_at": round(time.time(), 3),
+            "created_at": round(now, 3),
             "prev": "0" * HASH_HEX_LENGTH,
             "kind": KIND_REPLY if reply_to is not None else KIND_POST,
             "target": reply_to or "",
+            "expires_at": (
+                now + MAX_TAN_POST_EXPIRY + 0.123456789 if expires else None
+            ),
         }
     )
 
@@ -1868,17 +1878,25 @@ def annotate_quotes(
         is_muted = _text_matches_muted_keywords(
             str(parent.get("text") or ""), muted_pattern
         )
+        is_expired_parent = is_expired(parent)
         summary = {
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
-            "text": "" if is_deleted or is_muted else parent["text"],
+            "text": (
+                ""
+                if is_deleted or is_muted or is_expired_parent
+                else parent["text"]
+            ),
             "deleted": is_deleted,
         }
         if is_muted:
             # Only present when muted, so unmuted previews keep their
             # established shape.
             summary["muted"] = True
+        if is_expired_parent:
+            # Only present when expired, so live previews keep their shape.
+            summary["expired"] = True
         post["quoted"] = summary
     return posts
 
@@ -2289,27 +2307,33 @@ def feed(
         if author in excluded:
             return []
         kind_filter = ""
+        expiry_params: List[Any] = []
         if posts_only:
+            # Display only: expired entries are excluded in SQL, before
+            # LIMIT, so a page is never short because of them.  Sync
+            # callers keep them so chains stay complete.
             kind_filter = (
                 f" AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}"
+                " AND (expires_at IS NULL OR expires_at > ?)"
             )
+            expiry_params = [time.time()]
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             f"WHERE author = ? AND linked = 1 AND seq > ?{kind_filter} "
             "ORDER BY seq ASC LIMIT ?",
-            (author, max(0, int(after_seq)), count),
+            (author, max(0, int(after_seq)), *expiry_params, count),
         ).fetchall()
         posts = _public_posts(rows)
-        if posts_only:
-            # Display only: sync callers keep expired entries so chains
-            # stay complete — the entries are hidden, not deleted.
-            posts = _without_expired(posts)
         return annotate_edits(conn, posts) if posts_only else posts
 
     params: List[Any] = []
     where = "linked = 1"
     if posts_only:
-        where += f" AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}"
+        where += (
+            f" AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}"
+            " AND (expires_at IS NULL OR expires_at > ?)"
+        )
+        params.append(time.time())
     if excluded:
         # Display-only exclusion: sync callers leave this unset, so
         # chains stay complete for every author.  One JSON parameter
@@ -2327,10 +2351,6 @@ def feed(
         params,
     ).fetchall()
     posts = _public_posts(rows)
-    if posts_only:
-        # Display only: sync callers keep expired entries so chains
-        # stay complete — the entries are hidden, not deleted.
-        posts = _without_expired(posts)
     return annotate_edits(conn, posts) if posts_only else posts
 
 
@@ -2703,8 +2723,10 @@ def timeline(
         params: List[Any] = list(clean_authors)
         where = (
             f"linked = 1 AND kind IN ({TIMELINE_KINDS_SQL}) "
-            f"AND author IN ({placeholders}) AND {_NOT_DELETED}"
+            f"AND author IN ({placeholders}) AND {_NOT_DELETED} "
+            "AND (expires_at IS NULL OR expires_at > ?)"
         )
+        params.append(time.time())
         if cursor is not None:
             where += " AND created_at < ?"
             params.append(float(cursor))
@@ -2714,7 +2736,7 @@ def timeline(
             "ORDER BY created_at DESC, hash DESC LIMIT ?",
             params,
         ).fetchall()
-        return _without_expired(_public_posts(rows))
+        return _public_posts(rows)
 
     posts = _fill_unmuted(
         conn,
@@ -2796,10 +2818,11 @@ def author_timeline(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             "WHERE author = ? AND linked = 1 AND seq > ? "
             f"AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED} "
+            "AND (expires_at IS NULL OR expires_at > ?) "
             "ORDER BY seq ASC LIMIT ?",
-            (author, max(0, int(cursor)), MAX_FEED_POSTS),
+            (author, max(0, int(cursor)), time.time(), MAX_FEED_POSTS),
         ).fetchall()
-        return _without_expired([_row_to_post_with_meta(row) for row in rows])
+        return [_row_to_post_with_meta(row) for row in rows]
 
     posts = _fill_unmuted(
         conn,
@@ -4118,18 +4141,19 @@ def pinned_posts(
     """
     count = max(1, min(int(limit), MAX_PINNED_POSTS))
     start = max(0, int(offset))
+    # Expired posts are filtered in SQL, before LIMIT/OFFSET, so the raw
+    # offset a caller advances by counts exactly the rows it was given.
     rows = conn.execute(
         "SELECT p.*, s.pinned_at FROM pinned_posts s "
         "JOIN posts p ON p.hash = s.hash "
+        "WHERE p.expires_at IS NULL OR p.expires_at > ? "
         "ORDER BY s.pinned_at DESC, s.hash DESC LIMIT ? OFFSET ?",
-        (count, start),
+        (time.time(), count, start),
     ).fetchall()
     deleted = deleted_targets(conn)
     records: List[Dict[str, Any]] = []
     for row in rows:
         post = _row_to_post(row)
-        if is_expired(post):
-            continue
         post["pinned_at"] = float(row["pinned_at"])
         if str(post["hash"]) in deleted:
             post["deleted"] = True

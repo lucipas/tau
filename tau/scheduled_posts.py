@@ -406,15 +406,20 @@ def schedule_post(
     # ``tau.backup`` relies on.)
     from .tangents.tan import PostError, check_post_text_fits
 
-    try:
-        check_post_text_fits(clean_text, name=name, reply_to=reply_to)
-    except PostError as exc:
-        raise ScheduledPostsError(str(exc)) from exc
     clean_expires_in = _clean_duration(expires_in)
     if clean_expires_in > MAX_SCHEDULED_POST_DELAY:
         raise ScheduledPostsError(
             "expires_in must be at most 7d (the scheduled-post delay cap)"
         )
+    try:
+        check_post_text_fits(
+            clean_text,
+            name=name,
+            reply_to=reply_to,
+            expires=clean_expires_in > 0,
+        )
+    except PostError as exc:
+        raise ScheduledPostsError(str(exc)) from exc
     post = ScheduledPost(
         id=new_scheduled_post_id(),
         text=clean_text,
@@ -555,9 +560,14 @@ def publish_due_scheduled_posts(
                     if created is None:
                         # The expiry clock starts at publish time, not
                         # queue time: a post queued for days must not
-                        # arrive already dead.
+                        # arrive already dead.  Sample the clock here, not
+                        # at the pass start: lock and target resolution can
+                        # take long enough to eat a short expiry.
+                        create_at = now if now is not None else time.time()
                         expires_at = (
-                            at + post.expires_in if post.expires_in > 0 else None
+                            create_at + post.expires_in
+                            if post.expires_in > 0
+                            else None
                         )
                         created = app.create_post(
                             post.text,
