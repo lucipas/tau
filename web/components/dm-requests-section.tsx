@@ -44,6 +44,7 @@ export function DmRequestsSection({
 
   function armConfirm(id: string) {
     setError(null);
+    setNotice(null);
     setConfirmingId(id);
     if (confirmTimer.current) clearTimeout(confirmTimer.current);
     confirmTimer.current = setTimeout(() => setConfirmingId(null), 5000);
@@ -56,6 +57,7 @@ export function DmRequestsSection({
     if (acceptingId !== null || decliningId !== null) return;
     setAcceptingId(id);
     setError(null);
+    setNotice(null);
     try {
       const result = await onAccept(id);
       setNotice(
@@ -77,6 +79,7 @@ export function DmRequestsSection({
     setConfirmingId(null);
     setDecliningId(id);
     setError(null);
+    setNotice(null);
     try {
       await onDecline(id);
       setNotice("declined — the held message was dropped.");

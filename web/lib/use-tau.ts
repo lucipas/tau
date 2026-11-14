@@ -1517,6 +1517,10 @@ export function useTau() {
         // A live update that landed after this GET started is newer than
         // the response, which may predate it: keep the live version.
         if ((liveTouched.current.get(entry.id) ?? 0) > startEpoch) continue;
+        // A deletion that landed while this GET was in flight is already
+        // in removedMessageIds: skip the entry, or the stale response
+        // would put a retracted message back in the feed.
+        if (removedMessageIds.current.has(entry.id)) continue;
         byId.set(entry.id, entry);
       }
       const merged = [...byId.values()].sort((a, b) => a.id - b.id);
@@ -1739,9 +1743,17 @@ export function useTau() {
       } catch {
         // The next poll reconciles.
       }
+      try {
+        // The accept changed the running node's allow-list: refresh
+        // it too, or the panel keeps showing the old list without
+        // the new sender until the next poll.
+        await refreshAllowlist();
+      } catch {
+        // The next poll reconciles.
+      }
       return result;
     },
-    [refreshDmRequests, refreshMessages],
+    [refreshDmRequests, refreshMessages, refreshAllowlist],
   );
 
   const declineDmRequest = useCallback(

@@ -163,7 +163,7 @@ from .dm_requests import (
     remove_dm_request,
 )
 from .backup import BackupError, create_backup
-from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
+from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
     MESSAGES_FILE_NAME,
@@ -3184,12 +3184,21 @@ class WebBridge:
 
         The same list ``tau messages requests`` prints, so the console
         reviews exactly what the CLI reviews.  Names come from the
-        node's live registry, like the rest of the console.
+        node's live registry, like the rest of the console.  Requests
+        from blocked senders are hidden, like the rest of the console
+        hides blocked senders' content: the owner declines those from
+        the CLI.  An unreadable block-list hides everything (fail
+        closed), matching the node.
         """
         config = self.node.config
         registry = getattr(self.node, "registry", None)
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            return []
         requests = []
         for request in list_dm_requests(config.dm_requests_path):
+            if request.sender in blocked:
+                continue
             peer = registry.get(request.sender) if registry is not None else None
             sender_name = (
                 peer.display_name
@@ -8406,6 +8415,15 @@ class _WebHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
+        except WebBridgeError as exc:
+            # A missing inbox or mailbox is a missing capability, not
+            # a rate limit: answer 503, like the other handlers do for
+            # a store write that failed.
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
         self._send_json(result, head_only)
 
     def _handle_decline_dm_request(self, body: Dict[str, Any], head_only: bool) -> None:
@@ -8421,6 +8439,15 @@ class _WebHandler(BaseHTTPRequestHandler):
             result = self.bridge.decline_dm_request(ref)
         except ValueError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except WebBridgeError as exc:
+            # A missing inbox or mailbox is a missing capability, not
+            # a rate limit: answer 503, like the other handlers do for
+            # a store write that failed.
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
             return
         self._send_json(result, head_only)
 

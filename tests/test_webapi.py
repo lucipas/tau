@@ -8939,9 +8939,14 @@ def test_accept_dm_request_endpoint_rejects_unknown_and_blocked(bridge, node):
     )
     assert status == 400
     assert "blocked" in payload["error"]["message"]
-    # Nothing was allow-listed, delivered or removed.
+    # Nothing was allow-listed or delivered. The request stays in the
+    # store, but the console list hides blocked senders, like the rest
+    # of the console hides their content.
     _, _, listed = _json(bridge, "/api/messages/requests")
-    assert listed["count"] == 1
+    assert listed["count"] == 0
+    from tau.dm_requests import list_dm_requests
+
+    assert len(list_dm_requests(node.config.dm_requests_path)) == 1
     assert node.inbox.list_messages() == []
 
 
@@ -8972,6 +8977,88 @@ def test_decline_dm_request_endpoint_drops_request(bridge, node):
     )
     assert status == 400
     assert "no DM request" in payload["error"]["message"]
+
+
+def test_dm_requests_endpoint_hides_blocked_senders(bridge, node):
+    # The console list hides blocked senders' requests, like the rest
+    # of the console hides their content; the CLI can still decline
+    # them, and the store keeps them.
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    _record_dm_request(bridge, request_id="req-2", sender=OTHER_HASH)
+    save_blocklist(
+        node.config.blocklist_path, BlockList(blocked=frozenset({PEER_HASH}))
+    )
+    status, _, payload = _json(bridge, "/api/messages/requests")
+    assert status == 200
+    assert payload["count"] == 1
+    assert [entry["id"] for entry in payload["requests"]] == ["req-2"]
+    from tau.dm_requests import list_dm_requests
+
+    assert len(list_dm_requests(node.config.dm_requests_path)) == 2
+
+
+def test_accept_dm_request_endpoint_store_failure_is_503(
+    bridge, node, monkeypatch
+):
+    # A store write that fails during acceptance is a 503, not a 500
+    # crash: the console reports the failed write instead of a server
+    # error page.
+    import tau.dm_requests as dm_requests_mod
+
+    save_allowlist(
+        node.config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset()),
+    )
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dm_requests_mod, "save_dm_requests", failing_save)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/accept",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 503
+    assert "disk full" in payload["error"]["message"]
+
+
+def test_decline_dm_request_endpoint_store_failure_is_503(
+    bridge, node, monkeypatch
+):
+    import tau.dm_requests as dm_requests_mod
+
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dm_requests_mod, "save_dm_requests", failing_save)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/decline",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 503
+    assert "disk full" in payload["error"]["message"]
+
+
+def test_accept_dm_request_endpoint_without_inbox_is_503(bridge, node):
+    # A missing inbox is a missing capability, not rate limiting: the
+    # endpoint answers 503 instead of the top-level 429.
+    node.inbox = None
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/accept",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 503
+    assert "no message inbox" in payload["error"]["message"]
 
 
 def test_mirror_rejects_removed_wire_id_when_asked(bridge):

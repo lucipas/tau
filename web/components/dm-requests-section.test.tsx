@@ -107,4 +107,26 @@ describe("DmRequestsSection", () => {
     fireEvent.click(screen.getByRole("button", { name: "accept" }));
     expect(await screen.findByText("sender is blocked")).toBeTruthy();
   });
+
+  it("clears the old notice when a later accept fails", async () => {
+    const onAccept = vi
+      .fn()
+      .mockResolvedValueOnce(makeAcceptResult())
+      .mockRejectedValueOnce(new Error("sender is blocked"));
+    renderSection(
+      [makeRequest(), makeRequest({ id: "req-2", sender: "cd".repeat(16) })],
+      { onAccept },
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "accept" })[0]);
+    expect(
+      await screen.findByText(/sender allow-listed, message delivered/),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "accept" })[1]);
+    expect(await screen.findByText("sender is blocked")).toBeTruthy();
+    expect(
+      screen.queryByText(/sender allow-listed, message delivered/),
+    ).toBeNull();
+  });
 });
