@@ -61,8 +61,8 @@ from .config import (
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request,
+    decline_dm_request,
     list_dm_requests,
-    remove_dm_request,
 )
 from .doctor import all_ok, run_checks
 from .identity import (
@@ -1258,6 +1258,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages_decline_request.add_argument(
         "target", metavar="ID", help="request id or unique id prefix"
+    )
+    messages_decline_request.add_argument(
+        "--block",
+        action="store_true",
+        help="also add the sender to the block-list",
     )
     messages_decline_request.set_defaults(func=cmd_messages_decline_request)
 
@@ -7804,21 +7809,39 @@ def cmd_messages_accept_request(args: argparse.Namespace) -> int:
 
 
 def cmd_messages_decline_request(args: argparse.Namespace) -> int:
-    """Drop a held DM request without allow-listing its sender."""
+    """Drop a held DM request without allow-listing its sender.
+
+    The decline itself lives in
+    :func:`tau.dm_requests.decline_dm_request`, shared with the web
+    console — this command only resolves the sender's display name
+    and reports the outcome.
+    """
     config = _make_config(args)
     registry = PeerRegistry(config.peers_path)
+    block = bool(getattr(args, "block", False))
     try:
-        request = remove_dm_request(config.dm_requests_path, args.target)
+        decline = decline_dm_request(
+            dm_requests_path=config.dm_requests_path,
+            blocklist_path=config.blocklist_path,
+            ref=args.target,
+            block=block,
+        )
     except DmRequestsError as exc:
         raise NodeError(str(exc)) from exc
+    request = decline.request
     name = _request_sender_label(registry, request.sender)
     if _json_mode(args):
-        _emit({"declined": request.to_dict()}, True)
+        _emit(decline.to_dict(), True)
         return _EXIT_OK
     short = _safe_id_prefix(request.id)
     when = _format_message_time(request.received_at)
     print(f"declined [{short}] from {name} ({when})")
-    print("  the sender stays outside the allow-list; use `tau block` to block them.")
+    if decline.blocked:
+        print("  blocked the sender — their later messages are dropped, not held.")
+    elif block:
+        print("  the sender was already blocked.")
+    else:
+        print("  the sender stays outside the allow-list; use `tau block` to block them.")
     return _EXIT_OK
 
 

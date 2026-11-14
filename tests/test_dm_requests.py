@@ -14,7 +14,7 @@ import RNS
 
 from tau import cli
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
-from tau.blocklist import BlockList, save_blocklist
+from tau.blocklist import BlockList, load_blocklist, save_blocklist
 from tau.config import TauConfig
 from tau.dm_requests import (
     DM_REQUEST_TTL,
@@ -22,6 +22,7 @@ from tau.dm_requests import (
     DmRequest,
     DmRequestsError,
     accept_dm_request,
+    decline_dm_request,
     list_dm_requests,
     load_dm_requests,
     record_dm_request,
@@ -395,6 +396,129 @@ def test_cli_decline_drops_without_allowing(tmp_path, capsys):
     assert load_dm_requests(config.dm_requests_path) == []
     assert BOB not in load_allowlist(config.allowlist_path).allow
     assert Inbox(config.inbox_path).list_messages(limit=None) == []
+
+
+def test_decline_with_block_adds_sender_to_blocklist(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", received_at=now - 60),
+        now=now,
+    )
+    decline = decline_dm_request(
+        dm_requests_path=config.dm_requests_path,
+        blocklist_path=config.blocklist_path,
+        ref="req-1",
+        block=True,
+    )
+    assert decline.blocked is True
+    assert decline.to_dict()["blocked"] is True
+    assert load_dm_requests(config.dm_requests_path) == []
+    assert BOB in load_blocklist(config.blocklist_path).blocked
+
+
+def test_decline_with_block_already_blocked_reports_not_blocked(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({BOB})))
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", received_at=now - 60),
+        now=now,
+    )
+    decline = decline_dm_request(
+        dm_requests_path=config.dm_requests_path,
+        blocklist_path=config.blocklist_path,
+        ref="req-1",
+        block=True,
+    )
+    assert decline.blocked is False
+    assert BOB in load_blocklist(config.blocklist_path).blocked
+
+
+def test_decline_without_block_leaves_blocklist_alone(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", received_at=now - 60),
+        now=now,
+    )
+    decline = decline_dm_request(
+        dm_requests_path=config.dm_requests_path,
+        blocklist_path=config.blocklist_path,
+        ref="req-1",
+    )
+    assert decline.blocked is False
+    assert load_blocklist(config.blocklist_path).blocked == frozenset()
+
+
+def test_decline_unknown_errors_before_blocking(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    with pytest.raises(DmRequestsError, match="no DM request"):
+        decline_dm_request(
+            dm_requests_path=config.dm_requests_path,
+            blocklist_path=config.blocklist_path,
+            ref="nope",
+            block=True,
+        )
+    assert load_blocklist(config.blocklist_path).blocked == frozenset()
+
+
+def test_cli_decline_with_block_flag(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", received_at=time.time() - 60),
+        now=time.time(),
+    )
+    assert (
+        run_cli(
+            "messages",
+            "decline-request",
+            "req",
+            "--block",
+            "--data-dir",
+            str(data_dir),
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "declined" in out
+    assert "blocked" in out
+    assert load_dm_requests(config.dm_requests_path) == []
+    assert BOB in load_blocklist(config.blocklist_path).blocked
+
+
+def test_cli_decline_with_block_json(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", received_at=time.time() - 60),
+        now=time.time(),
+    )
+    assert (
+        run_cli(
+            "messages",
+            "decline-request",
+            "req",
+            "--block",
+            "--json",
+            "--data-dir",
+            str(data_dir),
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["blocked"] is True
+    assert payload["declined"]["id"] == "req-1"
 
 
 def test_cli_accept_unknown_errors(tmp_path, capsys):

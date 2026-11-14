@@ -61,7 +61,9 @@ script) can read what arrives from the mesh and send messages back:
                            allow-list the sender and deliver the held
                            message into the inbox
     POST /api/messages/requests/decline decline ``{"id": "<request id>"}``:
-                           drop the held request without allow-listing
+                           drop the held request without allow-listing;
+                           ``"block": true`` also adds the sender to
+                           the block-list
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
     GET  /api/backup       download a backup archive of the data directory
@@ -159,8 +161,8 @@ from .allowlist import AllowList, AllowListError, clean_destination
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
+    decline_dm_request as decline_held_dm_request,
     list_dm_requests,
-    remove_dm_request,
 )
 from .backup import BackupError, create_backup
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
@@ -3292,18 +3294,24 @@ class WebBridge:
             result["unread"] = unread
         return result
 
-    def decline_dm_request(self, ref: str) -> Dict[str, Any]:
+    def decline_dm_request(self, ref: str, *, block: bool = False) -> Dict[str, Any]:
         """Drop one held DM request without allow-listing its sender.
 
-        The same drop ``tau messages decline-request`` performs.
+        The same drop ``tau messages decline-request`` performs; with
+        *block* the sender is added to the block-list too.
         Raises ``ValueError`` for an unknown request.
         """
         config = self.node.config
         try:
-            request = remove_dm_request(config.dm_requests_path, ref)
+            decline = decline_held_dm_request(
+                dm_requests_path=config.dm_requests_path,
+                blocklist_path=config.blocklist_path,
+                ref=ref,
+                block=block,
+            )
         except DmRequestsError as exc:
             raise ValueError(str(exc)) from exc
-        return {"declined": request.to_dict()}
+        return decline.to_dict()
 
     def tan_export(self, *, all_authors: bool = False) -> Dict[str, Any]:
         """Return the portable backup document the CLI writes.
@@ -8435,8 +8443,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
+        block = body.get("block", False)
+        if not isinstance(block, bool):
+            self._send_json(
+                {"error": {"message": "field 'block' must be a boolean"}},
+                head_only,
+                400,
+            )
+            return
         try:
-            result = self.bridge.decline_dm_request(ref)
+            result = self.bridge.decline_dm_request(ref, block=block)
         except ValueError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return

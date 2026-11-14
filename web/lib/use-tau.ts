@@ -1757,10 +1757,10 @@ export function useTau() {
   );
 
   const declineDmRequest = useCallback(
-    async (id: string) => {
+    async (id: string, options?: { block?: boolean }) => {
       const result = await apiPost<DeclineDmRequestResponse>(
         "/api/messages/requests/decline",
-        { id },
+        { id, block: options?.block ?? false },
       );
       // Same shape as the accept: the decline already succeeded, so
       // drop the request locally at once and refresh best-effort.
