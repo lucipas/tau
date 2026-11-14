@@ -155,6 +155,29 @@ export interface BlockPeerResponse {
   block: BlockPeerResult;
 }
 
+export interface ArchivedConversation {
+  destination: string;
+  name: string;
+  messages: number;
+}
+
+export interface ArchivedConversationsResponse {
+  archived: ArchivedConversation[];
+  count: number;
+}
+
+export interface ArchiveConversationResult {
+  destination: string;
+  name: string;
+  archived: boolean;
+  changed: boolean;
+}
+
+export interface ArchiveConversationResponse {
+  ok: boolean;
+  archive: ArchiveConversationResult;
+}
+
 export interface InterfaceInfo {
   name: string;
   online: boolean;

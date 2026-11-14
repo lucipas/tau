@@ -97,9 +97,13 @@ describe("Composer group mode", () => {
     expect(onTargetChange).toHaveBeenCalledWith(GROUP_ID);
   });
 
-  it("sends to the group and hides reply and expiry controls", async () => {
+  it("sends to the group with expiry, reply and delay", async () => {
     const onSend = vi.fn();
     const onSendGroup = vi.fn().mockResolvedValue([makeMessage()]);
+    const quoted = makeMessage({
+      wire_id: "ab".repeat(16),
+      text: "hello crew",
+    });
     render(
       <Composer
         peers={peers}
@@ -110,26 +114,41 @@ describe("Composer group mode", () => {
         onModeChange={vi.fn()}
         onSend={onSend}
         onSendGroup={onSendGroup}
+        replyTo={quoted}
       />,
     );
 
     // The group picker lists the group with its member count.
     expect(screen.getByDisplayValue("crew · 2 members")).toBeTruthy();
     expect(screen.getByPlaceholderText("Write something to the group…")).toBeTruthy();
-    // Replies, expiry and scheduling are peer-DM-only; the picker says so instead.
-    expect(screen.queryByLabelText("Message expiry")).toBeNull();
-    expect(screen.queryByLabelText("Send later")).toBeNull();
+    // Replies, expiry and scheduling are offered for groups too.
+    expect(screen.getByText(/replying to/)).toBeTruthy();
+    expect(screen.getByLabelText("Message expiry")).toBeTruthy();
+    expect(screen.getByLabelText("Send later")).toBeTruthy();
     expect(
-      screen.getByText("replies, expiry and scheduling are peer DMs only"),
+      screen.getByText("expiry and schedule apply to every member's copy"),
     ).toBeTruthy();
+    expect(screen.queryByText("peer DMs only")).toBeNull();
 
+    fireEvent.change(screen.getByLabelText("Message expiry"), {
+      target: { value: "3600" },
+    });
+    fireEvent.change(screen.getByLabelText("Send later"), {
+      target: { value: "1800" },
+    });
     fireEvent.change(screen.getByPlaceholderText("Write something to the group…"), {
       target: { value: "hi all" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /send/ }));
+    fireEvent.click(screen.getByRole("button", { name: /schedule/i }));
 
     await waitFor(() => expect(onSendGroup).toHaveBeenCalledTimes(1));
-    expect(onSendGroup).toHaveBeenCalledWith(GROUP_ID, "hi all");
+    expect(onSendGroup).toHaveBeenCalledWith(
+      GROUP_ID,
+      "hi all",
+      3600,
+      "ab".repeat(16),
+      1800,
+    );
     expect(onSend).not.toHaveBeenCalled();
   });
 

@@ -14,6 +14,9 @@ script) can read what arrives from the mesh and send messages back:
     ``{"target": "alice"}`` without recording anything
     POST /api/peers/block   block ``{"target": "<name, hash or prefix>"}``
     POST /api/peers/unblock unblock ``{"target": "<name, hash or prefix>"}``
+    GET  /api/conversations/archived archived DM conversations
+    POST /api/conversations/archive archive ``{"target": "<name, hash or prefix>"}``
+    POST /api/conversations/unarchive unarchive ``{"target": "<name, hash or prefix>"}``
     GET  /api/groups       known group DMs with their member lists
     POST /api/groups       create ``{"name": "...", "members": ["<hash>", ...]}``
     POST /api/groups/delete delete ``{"group": "<id | prefix | name>"}``
@@ -29,9 +32,8 @@ script) can read what arrives from the mesh and send messages back:
                            ``"expires_in"`` seconds for a disappearing message,
                            ``"send_in"`` seconds to schedule it for later)
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
-                           (one outbound entry per member; replies are peer-DM-only,
-                           ``expires_in`` works for DM and group sends,
-                           ``send_in`` is peer-DM-only)
+                           (one outbound entry per member; ``"reply_to"``,
+                           ``"expires_in"`` and ``"send_in"`` work for DM and group sends)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -156,11 +158,18 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
 from .allowlist import AllowList, AllowListError, clean_destination
+from .archive import (
+    ArchiveError,
+    archive_lock,
+    load_archive,
+    load_archived_set,
+    save_archive,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
@@ -172,6 +181,7 @@ from .backup import BackupError, create_backup
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
+    ARCHIVED_FILE_NAME,
     MESSAGES_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
@@ -835,6 +845,7 @@ class WebBridge:
         # Serializes block/unblock read-modify-write cycles so concurrent
         # console requests cannot overwrite each other's changes.
         self._blocklist_lock = threading.Lock()
+        self._archive_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -3503,6 +3514,45 @@ class WebBridge:
             "excerpt": excerpt_hash(str(quoted.get("text") or "")),
         }
 
+    def _resolve_console_group_reply(
+        self, group_id: str, reply_to: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a console ``reply_to`` wire id to an ``in_reply_to``.
+
+        Same rules as :meth:`_resolve_console_reply`, scoped to the
+        group instead of a peer: the quoted message must be in this
+        group's history in the console — matched by full id or unique
+        prefix — so a reply never dangles at a message from another
+        group or one the console never saw.
+        """
+        if reply_to is None:
+            return None
+        if not isinstance(reply_to, str) or not reply_to.strip():
+            raise ValueError("field 'reply_to' must be a message id")
+        ref = reply_to.strip().lower()
+        with self._lock:
+            matches = [
+                message
+                for message in self._messages
+                if message.get("group") == group_id
+                and isinstance(message.get("wire_id"), str)
+                and str(message["wire_id"]).lower().startswith(ref)
+            ]
+        if not matches:
+            raise ValueError(
+                f"no message {reply_to.strip()!r} in this group to reply to"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"{len(matches)} messages in this group match"
+                f" {reply_to.strip()!r}; use a longer id"
+            )
+        quoted = matches[0]
+        return {
+            "id": str(quoted["wire_id"]),
+            "excerpt": excerpt_hash(str(quoted.get("text") or "")),
+        }
+
     def send_message(
         self,
         target: str,
@@ -3659,6 +3709,8 @@ class WebBridge:
         *,
         timeout: float = 20.0,
         expires_at: Optional[float] = None,
+        send_after: Optional[float] = None,
+        reply_to: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a message to every member of a group from the console.
 
@@ -3667,6 +3719,15 @@ class WebBridge:
         payload, a queued leg expires at the same deadline, and the
         receiver purges the message once it passes.  The outbound feed
         entry carries it too, so the console can show the deadline.
+
+        ``send_after`` schedules the message (epoch seconds), exactly
+        like a direct message: instead of attempting delivery now,
+        every leg is queued with the not-before time and the outbox
+        delivers it once that time arrives.
+
+        ``reply_to`` is a console wire id (full id or unique prefix)
+        of a message in this group's history; it is resolved to the
+        ``in_reply_to`` reference the node carries on every leg.
 
         The group is resolved by id, id prefix, or exact name through
         ``GroupStore.find`` (unknown or ambiguous queries raise
@@ -3695,6 +3756,31 @@ class WebBridge:
             expires_at = float(expires_at)
             if not math.isfinite(expires_at):
                 raise ValueError("expires_at must be a finite number")
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise ValueError("send_after must be a number")
+            send_after = float(send_after)
+            if not math.isfinite(send_after):
+                raise ValueError("send_after must be a finite number")
+            now = time.time()
+            if send_after <= now:
+                # A short relative delay can elapse between the
+                # handler computing its deadline and this check. It is
+                # due now, so it takes the immediate-delivery path.
+                send_after = None
+        if send_after is not None:
+            if send_after > now + MAX_MAIL_TTL - 3600.0:
+                raise ValueError(
+                    "send_after must be at most 29d23h from now (the 30d "
+                    "mail TTL less an hour of delivery slack)"
+                )
+            if expires_at is not None and send_after >= expires_at:
+                raise ValueError(
+                    "send_after must be before the message expiry — the "
+                    "message would expire before it is sent"
+                )
         # Normalise up front so the recorded text is exactly what gets
         # sent: the node normalises again before sending, so this cannot
         # change delivery.
@@ -3704,8 +3790,16 @@ class WebBridge:
         # another process (``tau group``) must be seen by this send.
         self.node.groups.list_groups()
         group_record = self.node.groups.find(group.strip())
+        in_reply_to = self._resolve_console_group_reply(
+            group_record["id"], reply_to
+        )
         response = self.node.send_group_message(
-            group_record, text, timeout=timeout, expires_at=expires_at
+            group_record,
+            text,
+            timeout=timeout,
+            expires_at=expires_at,
+            send_after=send_after,
+            in_reply_to=in_reply_to,
         )
         # Every leg shares one wire send time (the node's send_group_
         # message returns it): record that on each outbound entry, not
@@ -3753,6 +3847,8 @@ class WebBridge:
                     group=group_record["id"],
                     group_name=group_record.get("name") or "",
                     expires_at=expires_at,
+                    send_after=send_after,
+                    in_reply_to=in_reply_to,
                     wire_id=wire_id,
                 )
                 if message is None:
@@ -6070,6 +6166,103 @@ class WebBridge:
         """Unblock a peer."""
         return self._edit_blocklist(target, block=False)
 
+    def _archived_path(self) -> Optional[Path]:
+        """This node's archive-list path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "archived_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / ARCHIVED_FILE_NAME
+
+    def _archived_set(self) -> FrozenSet[str]:
+        """Archived destination hashes, failing open like the CLI filter."""
+        return load_archived_set(self._archived_path())
+
+    def _edit_archive(self, target: str, *, archive: bool) -> Dict[str, Any]:
+        """Archive or unarchive one peer's conversation and persist it.
+
+        Mirrors ``tau archive`` / ``tau unarchive``: the target resolves
+        through the registry (name, hash or prefix), the list is reloaded
+        inside the lock so two archive writes racing cannot discard each
+        other's peer, and a corrupt list is a 503 — the owner repairs or
+        removes the file before editing, the same as the block-list.
+        Unlike the block-list there is no cached copy on the node to
+        refresh: every read reloads the file, so the change is visible
+        to the next :meth:`messages` call at once.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer is required")
+        destination = self._resolve_block_target(target.strip())
+        path = self._archived_path()
+        if path is None:
+            raise WebBridgeError("this node has no archive-list path")
+        with self._archive_lock, archive_lock(path):
+            try:
+                current = load_archive(path)
+            except ArchiveError as exc:
+                raise WebBridgeError(
+                    "archive-list on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+            updated = (
+                current.with_added(destination)
+                if archive
+                else current.with_removed(destination)
+            )
+            changed = updated.archived != current.archived
+            if changed:
+                save_archive(path, updated)
+        peer = self.node.registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+            "archived": destination in updated.archived,
+            "changed": changed,
+        }
+
+    def archive_conversation(self, target: str) -> Dict[str, Any]:
+        """Archive a peer's DM conversation, mirroring ``tau archive``."""
+        return self._edit_archive(target, archive=True)
+
+    def unarchive_conversation(self, target: str) -> Dict[str, Any]:
+        """Restore an archived conversation, mirroring ``tau unarchive``."""
+        return self._edit_archive(target, archive=False)
+
+    def archived_conversations(self) -> Dict[str, Any]:
+        """Archived DM conversations, with the console log's message counts.
+
+        Mirrors ``tau archived``: one entry per archived destination hash
+        (destination, display name, message count), sorted by hash.  The
+        count covers the console log's non-group entries for that peer —
+        both directions, since an archived conversation is a thread, not
+        just its inbound half.  A corrupt list fails open to no archived
+        conversations, like the :meth:`messages` filter.
+        """
+        archived = self._archived_set()
+        counts: Dict[str, int] = {}
+        with self._lock:
+            entries = list(self._messages)
+        for entry in entries:
+            if entry.get("group"):
+                continue
+            destination = entry.get("peer") or entry.get("destination") or ""
+            if destination in archived:
+                counts[destination] = counts.get(destination, 0) + 1
+        described = []
+        for destination in sorted(archived):
+            peer = self.node.registry.get(destination)
+            described.append(
+                {
+                    "destination": destination,
+                    "name": peer.display_name if peer is not None else "",
+                    "messages": counts.get(destination, 0),
+                }
+            )
+        return {"archived": described, "count": len(described)}
+
     def groups(self) -> List[Dict[str, Any]]:
         try:
             return [
@@ -6307,8 +6500,6 @@ class WebBridge:
             items = list(self._messages)
         if removed:
             self._save_messages()
-        if limit >= 0:
-            items = items[-limit:]
         # Blocked senders' history stays stored but is hidden locally;
         # unblocking restores the view.  Inbound records carry the
         # sender hash as "destination" (node inbox) or "peer" (console
@@ -6324,6 +6515,25 @@ class WebBridge:
                     item.get("destination") or item.get("peer")
                 )
             ]
+        # Archived conversations stay stored but are hidden locally;
+        # unarchiving restores the view.  Group posts are never part
+        # of an archived conversation, so they pass through untouched.
+        # Inbound records carry the sender hash as "destination" (node
+        # inbox) or "peer" (console log); outbound records carry the
+        # recipient under "peer".
+        archived = self._archived_set()
+        if archived:
+            items = [
+                item
+                for item in items
+                if item.get("group")
+                or (item.get("peer") or item.get("destination") or "")
+                not in archived
+            ]
+        # Hidden entries must not use up the window: slice only after
+        # the blocklist and archive filters have run.
+        if limit >= 0:
+            items = items[-limit:]
         by_target = self._inbox_reactions_by_target()
         pinned_ids = self._inbox_pinned_ids(strict=strict_pins)
         groups = getattr(self.node, "groups", None)
@@ -6619,14 +6829,19 @@ class WebBridge:
         """Per-conversation unread counts from the node inbox.
 
         A node without an inbox (tests, embeds) simply has nothing
-        unread; read state is local to this node either way.
+        unread; read state is local to this node either way.  An
+        archived conversation never lights the badge, so its direct
+        messages are excluded at the source — but the sender's group
+        posts still count, since the group thread stays visible.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
                 try:
-                    counts = inbox.unread_counts()
+                    counts = inbox.unread_counts(
+                        exclude_dm_from=self._archived_set()
+                    )
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)
             return self._stamp_unread(counts)
@@ -6642,7 +6857,9 @@ class WebBridge:
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
-                counts = inbox.mark_read(peer=peer)
+                counts = inbox.mark_read(
+                    peer=peer, exclude_dm_from=self._archived_set()
+                )
             stamped = self._stamp_unread(counts)
         if inbox is not None:
             self.bus.publish({"type": "unread", "unread": stamped})
@@ -7052,6 +7269,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     {"requests": requests, "count": len(requests)}, head_only
                 )
+                return
+            if path == "/api/conversations/archived":
+                try:
+                    result = self.bridge.archived_conversations()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
                 return
             if path == "/api/messages/export":
                 # The full inbox backup goes only to the local machine,
@@ -7529,6 +7754,35 @@ class _WebHandler(BaseHTTPRequestHandler):
                     peer.strip() if isinstance(peer, str) else None
                 )
                 self._send_json({"ok": True, "unread": counts}, head_only)
+                return
+            if path in (
+                "/api/conversations/archive",
+                "/api/conversations/unarchive",
+            ):
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unarchive"):
+                        result = self.bridge.unarchive_conversation(
+                            target.strip()
+                        )
+                    else:
+                        result = self.bridge.archive_conversation(target.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, PeerError) as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "archive": result}, head_only)
                 return
             if path == "/api/messages/import":
                 try:
@@ -8357,18 +8611,9 @@ class _WebHandler(BaseHTTPRequestHandler):
         expires_in = body.get("expires_in")
         send_in = body.get("send_in")
         if group is not None:
-            if send_in is not None:
-                self._send_json(
-                    {
-                        "error": {
-                            "message": "group sends do not support 'send_in'"
-                        }
-                    },
-                    head_only,
-                    400,
-                )
-                return
-            self._handle_group_send(body, group, text, timeout, expires_in, head_only)
+            self._handle_group_send(
+                body, group, text, timeout, expires_in, send_in, head_only
+            )
             return
         if not isinstance(target, str) or not target.strip():
             self._send_json(
@@ -8477,12 +8722,11 @@ class _WebHandler(BaseHTTPRequestHandler):
         text: Any,
         timeout: Any,
         expires_in: Any,
+        send_in: Any,
         head_only: bool,
     ) -> None:
         # A group send is addressed by group, not by peer, so the two
-        # forms are exclusive; the node group path supports no reply
-        # quoting, so that is rejected outright instead of silently
-        # dropped.
+        # forms are exclusive.
         if body.get("to") is not None:
             self._send_json(
                 {"error": {"message": "give 'to' or 'group', not both"}},
@@ -8529,16 +8773,56 @@ class _WebHandler(BaseHTTPRequestHandler):
                 )
                 return
             expires_at = time.time() + float(expires_in)
-        if body.get("reply_to") is not None:
+        reply_to = body.get("reply_to")
+        if reply_to is not None and (
+            not isinstance(reply_to, str) or not reply_to.strip()
+        ):
             self._send_json(
-                {"error": {"message": "group sends do not support 'reply_to'"}},
+                {"error": {"message": "field 'reply_to' must be a message id"}},
                 head_only,
                 400,
             )
             return
+        send_after = None
+        if send_in is not None:
+            if (
+                not isinstance(send_in, (int, float))
+                or isinstance(send_in, bool)
+                or not _valid_send_in(send_in)
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'send_in' must be a number of "
+                            "seconds between 0 and 29d23h"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
+            send_after = time.time() + float(send_in)
+            if expires_at is not None and send_after >= expires_at:
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'send_in' must be shorter than "
+                            "'expires_in' — the message would expire before "
+                            "it is sent"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
         try:
             messages, response = self.bridge.send_group_message(
-                group.strip(), text, timeout=timeout, expires_at=expires_at
+                group.strip(),
+                text,
+                timeout=timeout,
+                expires_at=expires_at,
+                send_after=send_after,
+                reply_to=reply_to,
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown
@@ -9342,3 +9626,4 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
+

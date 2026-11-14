@@ -331,10 +331,12 @@ class FakeNode:
 
     def send_group_message(
         self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
-        expires_at=None,
+        expires_at=None, send_after=None, in_reply_to=None,
     ):
         self.group_sent.append((group["name"], text))
         self.last_group_expires_at = expires_at
+        self.last_group_send_after = send_after
+        self.last_group_in_reply_to = in_reply_to
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -1173,6 +1175,148 @@ def test_send_group_message_accepts_expires_in(bridge, node):
     assert all(m["expires_at"] == expires_at for m in feed["messages"])
 
 
+def test_send_group_message_accepts_send_in(bridge, node):
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "later all", "send_in": 3600},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    send_after = node.last_group_send_after
+    assert send_after is not None
+    assert before + 3590 <= send_after <= time.time() + 3610
+    # Every leg's feed entry carries the scheduled time, like a sent DM.
+    assert all(m["send_after"] == send_after for m in payload["messages"])
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert all(m["send_after"] == send_after for m in feed["messages"])
+
+
+def test_send_group_message_accepts_reply_to(bridge, node):
+    status, _, first = _json(
+        bridge, "/api/messages", method="POST", body={"group": "crew", "text": "hi all"}
+    )
+    assert status == 200
+    quoted_wire_id = first["messages"][0]["wire_id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={
+            "group": "crew",
+            "text": "seconded",
+            "reply_to": quoted_wire_id[:12],
+        },
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert node.last_group_in_reply_to == {
+        "id": quoted_wire_id,
+        "excerpt": hashlib.sha256(b"hi all").hexdigest()[:16],
+    }
+    # Every leg's feed entry carries the quote, like a sent DM.
+    assert all(
+        m["in_reply_to"] == node.last_group_in_reply_to
+        for m in payload["messages"]
+    )
+
+
+def test_send_group_message_reply_to_must_be_in_this_group(bridge, node):
+    # No group message exists yet: any id is unresolvable.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "reply_to": "a" * 8},
+    )
+    assert status == 400
+    assert "no message" in payload["error"]["message"]
+    assert node.group_sent == []
+
+    # A message in another conversation does not count: the peer DM's
+    # wire id must not resolve as a group quote.
+    status, _, dm = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "for alice"},
+    )
+    assert status == 200
+    dm_wire_id = dm["message"]["wire_id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "reply_to": dm_wire_id},
+    )
+    assert status == 400
+    assert "no message" in payload["error"]["message"]
+    assert node.group_sent == []
+
+    # A prefix matching more than one entry is ambiguous: the fake
+    # node reuses one wire id per member across sends, so a second
+    # group send leaves two entries under the same id.
+    status, _, first = _json(
+        bridge, "/api/messages", method="POST", body={"group": "crew", "text": "hi all"}
+    )
+    assert status == 200
+    status, _, _ = _json(
+        bridge, "/api/messages", method="POST", body={"group": "crew", "text": "hi again"}
+    )
+    assert status == 200
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={
+            "group": "crew",
+            "text": "hi",
+            "reply_to": first["messages"][0]["wire_id"],
+        },
+    )
+    assert status == 400
+    assert "use a longer id" in payload["error"]["message"]
+    assert len(node.group_sent) == 2
+
+
+def test_send_group_message_send_in_validation(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "send_in": -5},
+    )
+    assert status == 400
+    assert "send_in" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "send_in": "soon"},
+    )
+    assert status == 400
+    assert "send_in" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={
+            "group": "crew",
+            "text": "hi",
+            "send_in": 3600,
+            "expires_in": 1800,
+        },
+    )
+    assert status == 400
+    assert "send_in" in payload["error"]["message"]
+    assert node.group_sent == []
+
+
 def test_send_group_message_resolves_by_id_and_prefix(bridge, node):
     group_id = node.groups.list_groups()[0]["id"]
     status, _, payload = _json(
@@ -1271,7 +1415,7 @@ def test_send_group_message_validation(bridge, node):
         body={"group": "crew", "text": "hi", "reply_to": "a" * 8},
     )
     assert status == 400
-    assert "reply_to" in payload["error"]["message"]
+    assert "no message" in payload["error"]["message"]
 
     status, _, payload = _json(
         bridge,
@@ -3440,6 +3584,206 @@ def test_peers_block_unblock_via_api(tmp_path):
         assert status == 400
     finally:
         bridge.stop()
+
+
+def test_conversations_archive_unarchive_via_api(tmp_path):
+    node = FakeNode()
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # Archive by name; the file updates and the list carries it.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/archive",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["archive"]["destination"] == PEER_HASH
+        assert payload["archive"]["name"] == "alice"
+        assert payload["archive"]["archived"] is True
+        assert payload["archive"]["changed"] is True
+        assert json.loads((tmp_path / "archived.json").read_text()) == {
+            "archived": [PEER_HASH]
+        }
+
+        status, _, payload = _json(bridge, "/api/conversations/archived")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["archived"][0]["destination"] == PEER_HASH
+        assert payload["archived"][0]["name"] == "alice"
+        assert payload["archived"][0]["messages"] == 0
+
+        # Re-archiving is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/archive",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 200
+        assert payload["archive"]["changed"] is False
+        assert payload["archive"]["archived"] is True
+
+        # Unarchive by hash prefix.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/unarchive",
+            method="POST",
+            body={"target": PEER_HASH[:8]},
+        )
+        assert status == 200
+        assert payload["archive"]["archived"] is False
+        assert payload["archive"]["changed"] is True
+        assert json.loads((tmp_path / "archived.json").read_text()) == {
+            "archived": []
+        }
+
+        # Unarchiving again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/unarchive",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 200
+        assert payload["archive"]["changed"] is False
+
+        # Unknown peers and missing targets are rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/archive",
+            method="POST",
+            body={"target": "nobody"},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/conversations/archive", method="POST", body={}
+        )
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
+    seeded = [
+        _stored_message(1, "from alice"),
+        _stored_message(2, "to alice", direction="out"),
+        {
+            **_stored_message(3, "from carol"),
+            "peer": OTHER_HASH,
+            "peer_name": "carol",
+        },
+        {
+            **_stored_message(4, "crew hello"),
+            "group": "11" * 16,
+            "group_name": "crew",
+        },
+    ]
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": seeded, "next_message_id": 5}),
+        encoding="utf-8",
+    )
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        _inbound_record(node)
+        _inbound_record(
+            node,
+            destination=OTHER_HASH,
+            **{"from": "carol", "id": "m-2", "received_at": 102.0},
+        )
+        # A group post from alice: same destination as her DM, but it
+        # belongs to the group thread, which archiving must not hide.
+        _inbound_record(
+            node,
+            kind="group",
+            group="11" * 16,
+            **{"from": "alice", "id": "m-3", "received_at": 103.0},
+        )
+
+        assert [m["text"] for m in bridge.messages()] == [
+            "from alice",
+            "to alice",
+            "from carol",
+            "crew hello",
+        ]
+        assert _counts(bridge.unread()) == {
+            "per_peer": {PEER_HASH: 2, OTHER_HASH: 1},
+            "total": 3,
+        }
+
+        result = bridge.archive_conversation("alice")
+        assert result["archived"] is True
+
+        # Both directions of the archived thread hide; the other peer
+        # and the group post — which is never part of an archived
+        # conversation — stay visible.
+        assert [m["text"] for m in bridge.messages()] == [
+            "from carol",
+            "crew hello",
+        ]
+        # Search reuses messages(), so it hides the thread too.
+        assert bridge.messages_search(query="alice") == []
+        assert [m["text"] for m in bridge.messages_search(query="carol")] == [
+            "from carol"
+        ]
+        # The list counts the hidden thread, both directions.
+        listed = bridge.archived_conversations()
+        assert listed["count"] == 1
+        assert listed["archived"][0]["messages"] == 2
+        # The archived thread stops lighting the badge — but alice's
+        # group post still counts, since the group thread stays visible.
+        assert _counts(bridge.unread()) == {
+            "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
+            "total": 2,
+        }
+
+        bridge.unarchive_conversation(PEER_HASH)
+        assert [m["text"] for m in bridge.messages()] == [
+            "from alice",
+            "to alice",
+            "from carol",
+            "crew hello",
+        ]
+        assert _counts(bridge.unread()) == {
+            "per_peer": {PEER_HASH: 2, OTHER_HASH: 1},
+            "total": 3,
+        }
+    finally:
+        bridge.stop()
+
+
+def test_archive_rejects_corrupt_list_but_lists_fail_open(tmp_path):
+    node = FakeNode()
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "archived.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/archive",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        # The list fails open: a corrupt file never hides mail.
+        status, _, payload = _json(bridge, "/api/conversations/archived")
+        assert status == 200
+        assert payload == {"archived": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_archive_without_data_dir(bridge):
+    # A dataless node has no archive-list path: edits are refused, but
+    # the list still answers empty instead of failing the console poll.
+    status, _, payload = _json(
+        bridge, "/api/conversations/archive", method="POST", body={"target": "alice"}
+    )
+    assert status == 503
+    status, _, payload = _json(bridge, "/api/conversations/archived")
+    assert status == 200
+    assert payload == {"archived": [], "count": 0}
 
 
 def test_tan_mute_via_api(tmp_path):
@@ -12610,17 +12954,6 @@ def test_send_rejects_send_in_past_expiry(bridge):
         "/api/messages",
         method="POST",
         body={"to": "alice", "text": "hi", "send_in": 7200, "expires_in": 3600},
-    )
-    assert status == 400
-    assert "send_in" in payload["error"]["message"]
-
-
-def test_send_rejects_send_in_for_group(bridge):
-    status, _, payload = _json(
-        bridge,
-        "/api/messages",
-        method="POST",
-        body={"group": "crew", "text": "hi", "send_in": 3600},
     )
     assert status == 400
     assert "send_in" in payload["error"]["message"]

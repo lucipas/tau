@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { useTau } from "@/lib/use-tau";
-import type { TauMessage } from "@/lib/types";
+import type { Peer, TauMessage } from "@/lib/types";
 
 import { BundleSection } from "./bundle-section";
 import { Composer } from "./composer";
@@ -16,6 +16,18 @@ import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
 import { SettingsSection } from "./settings-section";
+
+// Peers whose conversation is not archived: the only peers the console
+// offers as send targets. An archived thread stays hidden until restored.
+function activePeersOf(
+  peers: Peer[],
+  archived: { destination: string }[],
+): Peer[] {
+  return peers.filter(
+    (peer) =>
+      !archived.some((entry) => entry.destination === peer.destination),
+  );
+}
 
 export function Console() {
   const tau = useTau();
@@ -36,6 +48,34 @@ export function Console() {
       setMode("custom");
       return;
     }
+    // An archive from another tab or the CLI hides the selected
+    // conversation: never keep submitting to a hidden thread. Fall back
+    // to a remaining peer, then to a group.
+    if (
+      mode === "peer" &&
+      target &&
+      tau.archivedConversations.some(
+        (entry) => entry.destination === target,
+      )
+    ) {
+      const next = tau.peers.find(
+        (peer) =>
+          !tau.archivedConversations.some(
+            (entry) => entry.destination === peer.destination,
+          ),
+      );
+      if (next) {
+        setTarget(next.destination);
+      } else if (tau.groups.length > 0) {
+        setMode("group");
+        setTarget(tau.groups[0].id);
+      } else {
+        setMode("custom");
+        setTarget("");
+      }
+      setReplyTo(null);
+      return;
+    }
     // A refresh can remove the selected group: never keep submitting its
     // stale id. Fall back to a remaining group, then to a peer.
     if (mode === "group" && !tau.groups.some((group) => group.id === target)) {
@@ -49,9 +89,9 @@ export function Console() {
       }
       if (tau.groups.length > 0) {
         setTarget(tau.groups[0].id);
-      } else if (tau.peers.length > 0) {
+      } else if (activePeersOf(tau.peers, tau.archivedConversations).length > 0) {
         setMode("peer");
-        setTarget(tau.peers[0].destination);
+        setTarget(activePeersOf(tau.peers, tau.archivedConversations)[0].destination);
       } else {
         setMode("custom");
         setTarget("");
@@ -59,31 +99,36 @@ export function Console() {
       return;
     }
     if (!target && !customPicked.current) {
-      if (tau.peers.length > 0) {
+      // Auto-select skips archived conversations: their threads are
+      // hidden until restored.
+      const firstActive = activePeersOf(tau.peers, tau.archivedConversations)[0];
+      if (firstActive) {
         setMode("peer");
-        setTarget(tau.peers[0].destination);
+        setTarget(firstActive.destination);
       } else if (tau.groups.length > 0) {
         setMode("group");
         setTarget(tau.groups[0].id);
+      } else {
+        // Every peer is archived and there are no groups: nothing to
+        // send to, so offer the custom-address mode instead of an
+        // empty peer selection.
+        setMode("custom");
+        setTarget("");
       }
     }
-  }, [tau.peers, tau.groups, tau.groupSwap, target, mode]);
+  }, [tau.peers, tau.groups, tau.groupSwap, tau.archivedConversations, target, mode]);
 
   function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
-    // A pending reply belongs to a peer conversation: the bridge
-    // rejects replies on group sends, so entering group mode drops it.
-    if (next === "group") {
-      setReplyTo(null);
-    }
     setMode(next);
   }
 
   function handleTargetChange(value: string) {
     // Retargeting the composer invalidates the pending reply: the
     // quoted message belongs to the old conversation, and sending it
-    // to the new peer would only be rejected by the bridge.
-    if (replyTo && value !== (replyTo.peer ?? "")) {
+    // to a different peer or group would be rejected by the bridge.
+    // A group message's conversation is its group; a DM's is its peer.
+    if (replyTo && value !== (replyTo.group ?? replyTo.peer ?? "")) {
       setReplyTo(null);
     }
     setTarget(value);
@@ -173,6 +218,8 @@ export function Console() {
             verifications={tau.verifications}
             blocks={tau.blocks}
             unread={tau.unread.per_peer}
+            archived={tau.archivedConversations}
+            archivedError={tau.archivedError}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
@@ -209,6 +256,21 @@ export function Console() {
             }}
             onUnblock={(destination) => {
               void tau.unblockPeer(destination).catch(() => undefined);
+            }}
+            onArchivePeer={async (destination) => {
+              await tau.archiveConversation(destination);
+              // The archived conversation is gone from the feed: clear
+              // the selection and let the auto-select pick the next peer.
+              // Only if it is still selected; the user may have picked
+              // another peer while the archive was pending.
+              if (targetRef.current === destination) {
+                targetRef.current = "";
+                setTarget("");
+                setReplyTo(null);
+              }
+            }}
+            onUnarchivePeer={async (destination) => {
+              await tau.unarchiveConversation(destination);
             }}
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
@@ -254,7 +316,12 @@ export function Console() {
               onClearPinned={tau.clearPinned}
               onReply={(message) => {
                 setReplyTo(message);
-                if (message.peer) {
+                // A group message belongs to its group conversation, even
+                // though it also names a member peer.
+                if (message.group) {
+                  setTarget(message.group);
+                  setMode("group");
+                } else if (message.peer) {
                   setTarget(message.peer);
                   setMode("peer");
                 }
@@ -318,7 +385,7 @@ export function Console() {
               <DoctorSection onRun={tau.runDoctor} />
             </div>
             <Composer
-              peers={tau.peers}
+              peers={activePeersOf(tau.peers, tau.archivedConversations)}
               groups={tau.groups}
               target={target}
               mode={mode}

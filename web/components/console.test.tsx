@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { TauGroup } from "@/lib/types";
+import type { Peer, TauGroup } from "@/lib/types";
 
 import { Console } from "./console";
 
@@ -27,10 +27,10 @@ function makeGroup(id: string, name: string): TauGroup {
   };
 }
 
-function tauState(groups: TauGroup[]) {
+function tauState(groups: TauGroup[], peers: Peer[] = []) {
   return {
     node: null,
-    peers: [],
+    peers,
     groups,
     messages: [],
     unread: { per_peer: {}, total: 0 },
@@ -39,6 +39,7 @@ function tauState(groups: TauGroup[]) {
     bridge: null,
     connection: "live",
     pings: {},
+    infos: {},
     announcing: false,
     send: vi.fn(),
     sendGroup: vi.fn(),
@@ -68,6 +69,11 @@ function tauState(groups: TauGroup[]) {
     acceptDmRequest: vi.fn(),
     declineDmRequest: vi.fn(),
     refreshDmRequests: vi.fn(),
+    archivedConversations: [],
+    archivedError: null,
+    archiveConversation: vi.fn(),
+    unarchiveConversation: vi.fn(),
+    refreshArchived: vi.fn(),
     retryOutbox: vi.fn(),
     ping: vi.fn(),
     announce: vi.fn(),
@@ -150,6 +156,58 @@ describe("Console group target", () => {
     // of falling back to team, the first group in the list.
     await waitFor(() =>
       expect(screen.getByDisplayValue("crew · 1 member")).toBeTruthy(),
+    );
+  });
+});
+
+describe("Console archived target", () => {
+  function makePeer(destination: string, name: string): Peer {
+    return {
+      destination,
+      name,
+      last_seen: Date.now() / 1000,
+      age: 5,
+      hops: 1,
+      protocol: 1,
+    };
+  }
+
+  it("retargets to a remaining peer when the selected conversation is archived", async () => {
+    const alice = makePeer("ab".repeat(16), "alice");
+    const bob = makePeer("cd".repeat(16), "bob");
+    mockedUseTau.mockReturnValue(tauState([], [alice, bob]));
+
+    const { rerender } = render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("alice · abababab")).toBeTruthy(),
+    );
+
+    // Another tab archived the selected conversation; the poll drops it.
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      archivedConversations: [
+        { destination: alice.destination, name: "alice", messages: 2 },
+      ],
+    });
+    rerender(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("bob · cdcdcdcd")).toBeTruthy(),
+    );
+  });
+
+  it("auto-select skips an already-archived peer", async () => {
+    const alice = makePeer("ab".repeat(16), "alice");
+    const bob = makePeer("cd".repeat(16), "bob");
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      archivedConversations: [
+        { destination: alice.destination, name: "alice", messages: 2 },
+      ],
+    });
+
+    render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("bob · cdcdcdcd")).toBeTruthy(),
     );
   });
 });

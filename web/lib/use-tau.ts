@@ -6,6 +6,9 @@ import { apiDownload, apiGet, apiPost, apiPostText, eventsUrl } from "./api";
 import type {
   AcceptDmRequestResponse,
   AllowlistResponse,
+  ArchiveConversationResponse,
+  ArchivedConversation,
+  ArchivedConversationsResponse,
   BlockPeerResponse,
   BridgeInfo,
   BundleExportResponse,
@@ -107,6 +110,11 @@ function holdsNewerEdit(held: TauMessage, incoming: TauMessage): boolean {
   return (held.edited_at ?? 0) > (incoming.edited_at ?? 0);
 }
 
+/** True when a direct message belongs to an archived conversation. Group posts never do. */
+function isArchivedThread(entry: TauMessage, archived: Set<string>): boolean {
+  return !entry.group && archived.has(entry.peer ?? "");
+}
+
 function readEventData<T>(event: Event): T | null {
   try {
     return JSON.parse((event as MessageEvent).data) as T;
@@ -172,6 +180,14 @@ export function useTau() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
   const [dmRequests, setDmRequests] = useState<DmRequestEntry[]>([]);
+  const [archivedConversations, setArchivedConversations] = useState<
+    ArchivedConversation[]
+  >([]);
+  const [archivedError, setArchivedError] = useState<string | null>(null);
+  // Destinations with an archived conversation, for the live feed: a
+  // message that arrives for one (archived from another tab or the CLI)
+  // is dropped on arrival, the same way a blocked sender's is.
+  const archivedDestinations = useRef(new Set<string>());
   const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [social, setSocial] = useState<SocialInfo | null>(null);
@@ -371,6 +387,15 @@ export function useTau() {
       if (payload.unread) applyUnread(payload.unread);
       liveTouched.current.set(message.id, ++liveEpoch.current);
       if (message.id <= snapshotMax.current) return;
+      // A message that arrives for an archived conversation (archived
+      // from another tab or the CLI) stays hidden, like a blocked
+      // sender's: the server's snapshots already filter it, so the
+      // live feed must too. Group posts are never archived.
+      if (
+        !message.group &&
+        archivedDestinations.current.has(message.peer ?? "")
+      )
+        return;
       snapshotMax.current = Math.max(snapshotMax.current, message.id);
       setMessages((previous) => {
         if (previous.some((entry) => entry.id === message.id)) return previous;
@@ -623,6 +648,75 @@ export function useTau() {
     setDmRequests(result.requests);
   }, []);
 
+  const refreshArchivedSeq = useRef(0);
+
+  // Removes archived direct threads from every view that may still hold
+  // them: the feed, the pinned view, search hits, and unread badges.
+  const hideArchivedThreads = useCallback((destinations: Set<string>) => {
+    if (destinations.size === 0) return;
+    const visible = (entry: TauMessage) =>
+      !isArchivedThread(entry, destinations);
+    setMessages((previous) => previous.filter(visible));
+    setPinnedMessages((previous) =>
+      previous === null ? null : previous.filter(visible),
+    );
+    setSearchResults((previous) => previous.filter(visible));
+    setUnread((previous) => {
+      const perPeer = { ...previous.per_peer };
+      let total = previous.total;
+      let changed = false;
+      for (const destination of destinations) {
+        if (!(destination in perPeer)) continue;
+        total = Math.max(0, total - (perPeer[destination] ?? 0));
+        delete perPeer[destination];
+        changed = true;
+      }
+      if (!changed) return previous;
+      return { per_peer: perPeer, total, revision: previous.revision };
+    });
+  }, []);
+
+  const refreshArchived = useCallback(async () => {
+    // Same stale-response guard as the DM-requests refresh: a slow poll
+    // must not restore a conversation an archive or unarchive already
+    // moved. A failed poll leaves the last known list in place instead
+    // of flashing an error.
+    const requestId = ++refreshArchivedSeq.current;
+    try {
+      const result = await apiGet<ArchivedConversationsResponse>(
+        "/api/conversations/archived",
+      );
+      if (requestId !== refreshArchivedSeq.current) return;
+      const previous = archivedDestinations.current;
+      const next = new Set(result.archived.map((entry) => entry.destination));
+      archivedDestinations.current = next;
+      setArchivedConversations(result.archived);
+      setArchivedError(null);
+      // The CLI or another tab can archive or restore a conversation
+      // without this console acting: reconcile the open views with the
+      // new membership, as the local archive and unarchive paths do.
+      hideArchivedThreads(
+        new Set([...next].filter((destination) => !previous.has(destination))),
+      );
+      if ([...previous].some((destination) => !next.has(destination))) {
+        // A restored conversation's history was left out of the feed:
+        // re-read it, and re-run any open search or pinned view.
+        try {
+          await refreshMessages();
+        } catch {
+          // The next snapshot reconciles.
+        }
+        refreshActiveSearch();
+        refreshPinnedView.current?.();
+      }
+    } catch (error) {
+      if (requestId !== refreshArchivedSeq.current) return;
+      setArchivedError(
+        error instanceof Error ? error.message : "could not load archived",
+      );
+    }
+  }, [hideArchivedThreads]);
+
   const allowlistSeq = useRef(0);
 
   // Allow-list requests can resolve out of order: only the newest
@@ -692,6 +786,7 @@ export function useTau() {
         refreshOutbox(),
         refreshHeldMail(),
         refreshDmRequests(),
+        refreshArchived(),
         refreshGroups(),
         refreshSettings(),
         refreshAllowlist(),
@@ -702,7 +797,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshGroups, refreshSettings, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     (target: string) =>
@@ -1006,11 +1101,24 @@ export function useTau() {
   );
 
   const sendGroup = useCallback(
-    async (group: string, text: string) => {
-      const result = await apiPost<SendGroupResponse>("/api/messages", {
-        group,
-        text,
-      });
+    async (
+      group: string,
+      text: string,
+      expiresIn?: number,
+      replyTo?: string,
+      sendIn?: number,
+    ) => {
+      const body: {
+        group: string;
+        text: string;
+        expires_in?: number;
+        reply_to?: string;
+        send_in?: number;
+      } = { group, text };
+      if (expiresIn !== undefined) body.expires_in = expiresIn;
+      if (replyTo) body.reply_to = replyTo;
+      if (sendIn !== undefined) body.send_in = sendIn;
+      const result = await apiPost<SendGroupResponse>("/api/messages", body);
       setMessages((previous) => {
         const fresh = result.messages.filter(
           (entry) => !previous.some((known) => known.id === entry.id),
@@ -1574,6 +1682,9 @@ export function useTau() {
         // in removedMessageIds: skip the entry, or the stale response
         // would put a retracted message back in the feed.
         if (removedMessageIds.current.has(entry.id)) continue;
+        // Likewise a thread archived while this GET was in flight: the
+        // archive already removed it, so the stale response must not.
+        if (isArchivedThread(entry, archivedDestinations.current)) continue;
         byId.set(entry.id, entry);
       }
       const merged = [...byId.values()].sort((a, b) => a.id - b.id);
@@ -1584,6 +1695,52 @@ export function useTau() {
       return merged;
     });
   }, []);
+
+  const archiveConversation = useCallback(
+    async (destination: string) => {
+      const result = await apiPost<ArchiveConversationResponse>(
+        "/api/conversations/archive",
+        { target: destination },
+      );
+      // The archive already succeeded: record the new membership before
+      // anything else reads it, so live messages and in-flight responses
+      // cannot bring the thread back; then drop it from the views at once
+      // (the feed refresh merges and never removes entries). The archived
+      // list re-reads below, and a stale poll is discarded by its sequence.
+      archivedDestinations.current = new Set([
+        ...archivedDestinations.current,
+        destination,
+      ]);
+      hideArchivedThreads(new Set([destination]));
+      await refreshArchived();
+      return result.archive;
+    },
+    [refreshArchived, hideArchivedThreads],
+  );
+
+  const unarchiveConversation = useCallback(
+    async (destination: string) => {
+      const result = await apiPost<ArchiveConversationResponse>(
+        "/api/conversations/unarchive",
+        { target: destination },
+      );
+      // The restore already succeeded: drop the destination from the
+      // membership first, so the feed re-read admits its history. Bumping
+      // the sequence discards any archived-list poll that predates this.
+      const restored = new Set(archivedDestinations.current);
+      restored.delete(destination);
+      archivedDestinations.current = restored;
+      refreshArchivedSeq.current += 1;
+      try {
+        await refreshMessages();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      await refreshArchived();
+      return result.archive;
+    },
+    [refreshArchived, refreshMessages],
+  );
 
   // Download the export document the bridge returns. The anchor
   // click is the download: a blob URL keeps the file local, and the
@@ -1683,7 +1840,9 @@ export function useTau() {
       if (seq !== searchSeq.current) return;
       setSearchResults(
         result.messages.filter(
-          (entry) => !removedMessageIds.current.has(entry.id),
+          (entry) =>
+            !removedMessageIds.current.has(entry.id) &&
+            !isArchivedThread(entry, archivedDestinations.current),
         ),
       );
       setSearchError(null);
@@ -1748,7 +1907,11 @@ export function useTau() {
       // an entry the delete event already dropped.
       setPinnedMessages(
         [...result.messages]
-          .filter((entry) => !removedMessageIds.current.has(entry.id))
+          .filter(
+            (entry) =>
+              !removedMessageIds.current.has(entry.id) &&
+              !isArchivedThread(entry, archivedDestinations.current),
+          )
           .reverse(),
       );
       setPinnedError(null);
@@ -1866,6 +2029,11 @@ export function useTau() {
     acceptDmRequest,
     declineDmRequest,
     refreshDmRequests,
+    archivedConversations,
+    archivedError,
+    archiveConversation,
+    unarchiveConversation,
+    refreshArchived,
     settings,
     settingsError,
     heldMail,
