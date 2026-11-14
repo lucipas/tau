@@ -958,13 +958,14 @@ export function useTan() {
   }, [loadScheduled]);
 
   const schedulePost = useCallback(
-    async (text: string, sendIn: number, replyTo?: string) => {
+    async (text: string, sendIn: number, replyTo?: string, expiresIn?: number) => {
       setPosting(true);
       try {
         await apiPost<TanScheduleResponse>("/api/tan/schedule", {
           text,
           send_in: sendIn,
           ...(replyTo ? { reply_to: replyTo } : {}),
+          ...(expiresIn ? { expires_in: expiresIn } : {}),
         });
         // The post is already queued: a failed list refresh must not
         // reject, or the composer keeps the draft and a retry duplicates it.
@@ -1035,13 +1036,14 @@ export function useTan() {
   }, []);
 
   const publish = useCallback(
-    async (text: string, replyTo?: string) => {
+    async (text: string, replyTo?: string, expiresIn?: number) => {
       invalidateVerify();
       setPosting(true);
       try {
         const result = await apiPost<TanPostResponse>("/api/tan/posts", {
           text,
           ...(replyTo ? { reply_to: replyTo } : {}),
+          ...(expiresIn ? { expires_in: expiresIn } : {}),
         });
         setPosts((previous) => {
           if (previous.some((post) => post.hash === result.post.hash)) {

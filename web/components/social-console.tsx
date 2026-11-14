@@ -98,6 +98,11 @@ export function SocialConsole() {
   const [postLaterSeconds, setPostLaterSeconds] = useState<number | null>(
     null,
   );
+  // Seconds after publishing before a composed post disappears, or
+  // null when it never expires. Like the delay, it applies to one
+  // post only. Quotes never take an expiry — the CLI's quote has no
+  // --expire — so picking a quote clears it too (see onQuote).
+  const [expireSeconds, setExpireSeconds] = useState<number | null>(null);
   // Hashes with a delete request in flight. While one is pending the card
   // shows a disabled state instead of the confirm button, so a second
   // click cannot report the already-deleted post as a failure.
@@ -149,7 +154,13 @@ export function SocialConsole() {
         const submittedText = text.trim();
         const submittedReply = replyTarget?.hash;
         const submittedDelay = postLaterSeconds;
-        await tan.schedulePost(submittedText, submittedDelay, submittedReply);
+        const submittedExpire = expireSeconds;
+        await tan.schedulePost(
+          submittedText,
+          submittedDelay,
+          submittedReply,
+          submittedExpire ?? undefined,
+        );
         // Clear only the composer state that still belongs to this post.
         setText((current) => (current.trim() === submittedText ? "" : current));
         setReplyTarget((current) =>
@@ -159,6 +170,11 @@ export function SocialConsole() {
         // picked while the request was pending must survive.
         setPostLaterSeconds((current) =>
           current === submittedDelay ? null : current,
+        );
+        // Same guard for the expiry: an expiry picked while the
+        // request was pending belongs to the next post, not this one.
+        setExpireSeconds((current) =>
+          current === submittedExpire ? null : current,
         );
         // Show the queue the post just joined, so the scheduled post is
         // visible and cancellable instead of disappearing into the file.
@@ -171,9 +187,14 @@ export function SocialConsole() {
         setShowScheduled(true);
         return;
       }
-      await tan.publish(text.trim(), replyTarget?.hash);
+      const submittedExpire = expireSeconds;
+      await tan.publish(text.trim(), replyTarget?.hash, submittedExpire ?? undefined);
       setText("");
       setReplyTarget(null);
+      // Clear the expiry only if it still belongs to this post.
+      setExpireSeconds((current) =>
+        current === submittedExpire ? null : current,
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not publish");
     }
@@ -1294,6 +1315,9 @@ export function SocialConsole() {
                         // before the quote so it cannot ride along (and
                         // the picker is gone anyway).
                         setPostLaterSeconds(null);
+                        // Quotes never take an expiry either, for the
+                        // same reason.
+                        setExpireSeconds(null);
                       }}
                       onDelete={submitDelete}
                       onEdit={submitEdit}
@@ -1399,28 +1423,50 @@ export function SocialConsole() {
                   {text.length}/2000
                 </span>
                 {quoteTarget ? null : (
-                  <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
-                    post later
-                    <select
-                      aria-label="Post later"
-                      value={
-                        postLaterSeconds === null
-                          ? ""
-                          : String(postLaterSeconds)
-                      }
-                      onChange={(event) => {
-                        const value = event.target.value;
-                        setPostLaterSeconds(value === "" ? null : Number(value));
-                      }}
-                      className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
-                    >
-                      <option value="">now</option>
-                      <option value="1800">in 30 minutes</option>
-                      <option value="3600">in 1 hour</option>
-                      <option value="10800">in 3 hours</option>
-                      <option value="86400">in 24 hours</option>
-                    </select>
-                  </label>
+                  <>
+                    <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+                      post later
+                      <select
+                        aria-label="Post later"
+                        value={
+                          postLaterSeconds === null
+                            ? ""
+                            : String(postLaterSeconds)
+                        }
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setPostLaterSeconds(value === "" ? null : Number(value));
+                        }}
+                        className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
+                      >
+                        <option value="">now</option>
+                        <option value="1800">in 30 minutes</option>
+                        <option value="3600">in 1 hour</option>
+                        <option value="10800">in 3 hours</option>
+                        <option value="86400">in 24 hours</option>
+                      </select>
+                    </label>
+                    <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+                      disappears
+                      <select
+                        aria-label="Post expiry"
+                        value={
+                          expireSeconds === null ? "" : String(expireSeconds)
+                        }
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setExpireSeconds(value === "" ? null : Number(value));
+                        }}
+                        className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
+                      >
+                        <option value="">never</option>
+                        <option value="300">in 5 minutes</option>
+                        <option value="3600">in 1 hour</option>
+                        <option value="86400">in 1 day</option>
+                        <option value="604800">in 7 days</option>
+                      </select>
+                    </label>
+                  </>
                 )}
               </div>
             </section>

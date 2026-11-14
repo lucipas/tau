@@ -7140,6 +7140,67 @@ def test_tan_reply_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_post_via_api_accepts_expires_in(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    init_db(node.config.social_db_path)
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        before = time.time()
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "vanish soon", "expires_in": 3600},
+        )
+        assert status == 200
+        expires_at = payload["post"]["expires_at"]
+        assert expires_at is not None
+        assert before + 3590 <= expires_at <= time.time() + 3610
+
+        # A post without expires_in never expires.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "stays"},
+        )
+        assert status == 200
+        assert payload["post"]["expires_at"] is None
+
+        # Invalid lifetimes are bad requests, not crashes — and queue
+        # nothing.
+        for body, fragment in [
+            ({"text": "x", "expires_in": 0}, "expires_in"),
+            ({"text": "x", "expires_in": -10}, "expires_in"),
+            ({"text": "x", "expires_in": "soon"}, "expires_in"),
+            ({"text": "x", "expires_in": True}, "expires_in"),
+            ({"text": "x", "expires_in": 604801}, "expires_in"),
+            ({"text": "x", "expires_in": 2592001}, "expires_in"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/posts", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "stays",
+            "vanish soon",
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_tan_quote_via_api(tmp_path):
     import RNS
 
@@ -7268,12 +7329,25 @@ def test_tan_schedule_post_via_api(tmp_path):
         assert status == 200
         assert payload["scheduled"]["reply_to"] == post["hash"]
 
+        # An expiry rides along: the post disappears that long after it
+        # is published.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"text": "vanish later", "send_in": 60, "expires_in": 3600},
+        )
+        assert status == 200
+        assert payload["scheduled"]["expires_in"] == 3600
+        assert abs(payload["scheduled"]["publish_at"] - (time.time() + 60)) < 5
+
         status, _, payload = _json(bridge, "/api/tan/scheduled")
         assert status == 200
-        assert payload["count"] == 2
+        assert payload["count"] == 3
         # Soonest first: the 60-second reply precedes the hour-out post.
         assert [item["text"] for item in payload["scheduled"]] == [
             "agreed",
+            "vanish later",
             "hello later",
         ]
 
@@ -7288,7 +7362,7 @@ def test_tan_schedule_post_via_api(tmp_path):
         assert payload["cancelled"]["id"] == scheduled["id"]
         assert payload["deleted_local"] is False
         status, _, payload = _json(bridge, "/api/tan/scheduled")
-        assert payload["count"] == 1
+        assert payload["count"] == 2
         assert payload["scheduled"][0]["text"] == "agreed"
 
         # Cancelling an unknown id is a bad request, not a crash.
@@ -7331,6 +7405,22 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
             ({"text": "hello", "send_in": "soon"}, "send_in"),
             ({"text": "hello", "send_in": True}, "send_in"),
             ({"text": "hello", "send_in": 60, "reply_to": "cd" * 32}, "unknown post"),
+            ({"text": "hello", "send_in": 60, "expires_in": 0}, "expires_in"),
+            ({"text": "hello", "send_in": 60, "expires_in": -10}, "expires_in"),
+            ({"text": "hello", "send_in": 60, "expires_in": "soon"}, "expires_in"),
+            ({"text": "hello", "send_in": 60, "expires_in": True}, "expires_in"),
+            (
+                {"text": "hello", "send_in": 60, "expires_in": 604801},
+                "expires_in",
+            ),
+            (
+                {"text": "hello", "send_in": 3600, "expires_in": 60},
+                "shorter than",
+            ),
+            (
+                {"text": "hello", "send_in": 3600, "expires_in": 3600},
+                "shorter than",
+            ),
         ]:
             status, _, payload = _json(
                 bridge, "/api/tan/schedule", method="POST", body=body
