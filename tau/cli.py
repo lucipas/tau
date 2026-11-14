@@ -8632,6 +8632,17 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Same --wait validation as the peer send path (`cmd_send`).
+    wait = float(getattr(args, "wait", None) or 0.0)
+    if not math.isfinite(wait):
+        print("error: --wait must be a finite number of seconds", file=sys.stderr)
+        return 2
+    if wait < 0:
+        print("error: --wait must not be negative", file=sys.stderr)
+        return 2
+    if getattr(args, "wait", None) is not None and getattr(args, "no_queue", False):
+        print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
+        return 2
     text = _read_message(args)
     config = _make_config(args)
     expires_at = None
@@ -8680,9 +8691,19 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             expires_at=expires_at,
             send_after=send_after,
         )
+        # --wait replaces the one-shot flush: wait for each queued leg
+        # for the requested duration, recording delivered or still
+        # queued outcomes. Only queued legs go to the helper, since it
+        # treats any other leg without an "ok" key as delivered.
+        if wait > 0:
+            _wait_for_queued_sends(
+                node,
+                [result for result in response["results"] if result.get("queued")],
+                wait,
+            )
         # One-shot send: give reachable members a brief chance to take
         # a queued leg before this process exits.
-        if any(result.get("queued") for result in response["results"]):
+        elif any(result.get("queued") for result in response["results"]):
             node.flush_outbox(timeout=3.0, max_peers=5)
             for result in response["results"]:
                 if not result.get("queued"):
