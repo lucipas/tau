@@ -35,6 +35,7 @@ from .config import (
     tcp_listen_endpoints,
     write_rns_config,
 )
+from .dm_requests import DM_REQUEST_TTL, DmRequest, record_dm_request
 from .groups import GroupStore, pinned_group
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -1531,6 +1532,42 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_dm_request(
+        self,
+        message: Dict[str, Any],
+        caller_hash: Optional[str],
+        received_at: float,
+    ) -> None:
+        """Hold a DM denied by the allow-list for owner review.
+
+        Best-effort only: the denial has already been decided, so a
+        failure here must never change the reply the sender gets.  A
+        message with no id cannot be deduped or resolved later, and an
+        anonymous sender has nobody to allow-list on accept, so neither
+        leaves a request behind — both are still denied as before.
+        """
+        message_id = message.get("id")
+        if not caller_hash or not message_id:
+            return
+        try:
+            record_dm_request(
+                self.config.dm_requests_path,
+                DmRequest(
+                    id=message_id,
+                    sender=caller_hash,
+                    text=message["text"],
+                    kind=message["kind"],
+                    sent_at=message.get("sent_at") or 0.0,
+                    received_at=received_at,
+                    request_expires_at=received_at + DM_REQUEST_TTL,
+                    expires_at=message.get("expires_at"),
+                    in_reply_to=message.get("in_reply_to"),
+                ),
+                now=received_at,
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not record DM request", exc_info=True)
+
     def _record_retraction(
         self, sender_hash: str, message_id: str, *, confirmed: bool = False
     ) -> None:
@@ -1727,6 +1764,7 @@ class TauNode:
                 "Message from %s denied by the DM allow-list",
                 caller_hash or "anonymous",
             )
+            self._record_dm_request(message, caller_hash, received_at)
             return response_error(
                 "not_allowed", "sender is not on this node's allow-list"
             )
