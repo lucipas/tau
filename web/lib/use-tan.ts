@@ -542,14 +542,16 @@ export function useTan() {
   // the load effect, which fetches the timeline with `?tag=` instead
   // of the plain timeline. Clearing it returns to the timeline the
   // same way. Picking a tag leaves any search results, and the two
-  // switches stay exclusive.
+  // switches stay exclusive. The stored value is normalised the way
+  // the server normalises it — a leading `#` stripped, casefolded —
+  // so a tag clicked as `#Mesh` matches the sidebar's `#mesh` and
+  // the active-tag toggle compares equal values.
   const setTagFilter = useCallback(
     async (tag: string | null) => {
-      // Tags are stored casefolded without the leading '#', matching
-      // the server and the sidebar, so comparisons with them hold.
-      const cleaned =
-        tag === null ? "" : tag.trim().replace(/^#/, "").toLowerCase();
-      const normalized = cleaned !== "" ? cleaned : null;
+      const normalized =
+        tag !== null && tag.trim() !== ""
+          ? tag.trim().replace(/^#/, "").toLowerCase()
+          : null;
       if (normalized === tagFilterRef.current) {
         // Re-picking the current tag: setting the same state would
         // bail out without reloading, so refresh directly.
@@ -1127,16 +1129,17 @@ export function useTan() {
           ...(replyTo ? { reply_to: replyTo } : {}),
           ...(expiresIn ? { expires_in: expiresIn } : {}),
         });
+        // The post is stored once the POST succeeds: refresh the tag
+        // list at once, independently of the feed reload below, so a
+        // failed feed refresh cannot leave a new tag out of the list.
+        // A failed refresh keeps the old list.
+        void loadTags().catch(() => undefined);
         setPosts((previous) => {
           if (previous.some((post) => post.hash === result.post.hash)) {
             return previous;
           }
           return [result.post, ...previous];
         });
-        // A new post can introduce a tag; refresh the list, keeping
-        // the old one on failure. Started before the feed refresh so a
-        // failed feed refresh cannot skip it.
-        void loadTags().catch(() => undefined);
         await load();
         return result.post;
       } finally {
@@ -1154,6 +1157,9 @@ export function useTan() {
           target,
           text,
         });
+        // The quote is stored once the POST succeeds: refresh the tag
+        // list at once, independently of the feed reload below.
+        void loadTags().catch(() => undefined);
         setPosts((previous) => {
           if (previous.some((post) => post.hash === result.post.hash)) {
             return previous;
@@ -1166,9 +1172,6 @@ export function useTan() {
           // The quote is already published. A failed timeline refresh must
           // not report the publish as failed; the next poll will catch up.
         }
-        // A quote can introduce a tag; refresh the list, keeping the
-        // old one on failure.
-        void loadTags().catch(() => undefined);
         return result.post;
       } finally {
         setPosting(false);
@@ -1300,9 +1303,9 @@ export function useTan() {
     async (target: string) => {
       invalidateVerify();
       await apiPost("/api/tan/delete", { target });
-      // A delete can retire a tag; refresh the list, keeping the old
-      // one on failure. Started before the refreshes below so a failed
-      // feed refresh cannot skip it.
+      // The delete is committed once the POST succeeds: refresh the
+      // tag list at once, independently of the shelf refreshes below,
+      // so a failed refresh cannot leave a retired tag listed.
       void loadTags().catch(() => undefined);
       await Promise.all([
         load(),
@@ -1324,6 +1327,9 @@ export function useTan() {
   const editPost = useCallback(
     async (target: string, text: string) => {
       await apiPost("/api/tan/edit", { target, text });
+      // The edit is committed once the POST succeeds: refresh the tag
+      // list at once, independently of the feed reload below.
+      void loadTags().catch(() => undefined);
       // The edit is already committed. A refresh failure must not make the
       // caller treat the edit as failed, so report it as a feed error instead.
       try {
@@ -1333,9 +1339,6 @@ export function useTan() {
           caught instanceof Error ? caught.message : "could not load the feed",
         );
       }
-      // An edit can introduce or retire a tag; refresh the list,
-      // keeping the old one on failure.
-      void loadTags().catch(() => undefined);
     },
     [load, loadTags],
   );
@@ -1351,8 +1354,8 @@ export function useTan() {
       // alongside the feed.
       await Promise.all([load(), refreshAuthors()]);
       void loadSuggestions().catch(() => undefined);
-      // A sync can bring in posts with new tags; refresh the list,
-      // keeping the old one on failure.
+      // A sync can bring in new tags too; refresh the list, keeping
+      // the old one on failure.
       void loadTags().catch(() => undefined);
       return result.sync;
     } finally {
