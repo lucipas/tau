@@ -8974,6 +8974,32 @@ def test_decline_dm_request_endpoint_drops_request(bridge, node):
     assert "no DM request" in payload["error"]["message"]
 
 
+def test_mirror_rejects_removed_wire_id_when_asked(bridge):
+    # A retraction that landed after a record was stored must not be
+    # mirrored back into the feed: the guarded mirror refuses a wire
+    # id the console already removed, like the live inbound path.
+    record = {
+        "id": "wire-1",
+        "destination": PEER_HASH,
+        "from": "alice",
+        "text": "take this back",
+        "kind": "message",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "direction": "in",
+    }
+    with bridge._lock:
+        bridge._remember_removed_wire_id("wire-1")
+    bridge._mirror_imported_messages([record], reject_removed_wire_id=True)
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    # The import path does not ask for the guard: a restore mirrors
+    # the record regardless, as before.
+    bridge._mirror_imported_messages([record])
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["wire_id"] for entry in feed["messages"]] == ["wire-1"]
+
+
 def _sent_console_entry(bridge, node, *, wire_id="wire-1", **overrides):
     node.inbox.append(
         {

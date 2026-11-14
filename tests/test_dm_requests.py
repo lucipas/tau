@@ -646,6 +646,62 @@ def test_accept_dm_request_helper_rejects_unknown(tmp_path):
         )
 
 
+def test_accept_dm_request_helper_retries_after_failed_persist_on_shared_inbox(
+    tmp_path, monkeypatch
+):
+    # The console reuses the node's Inbox across retries: a failed
+    # strict persist must not leave a phantom copy behind for find to
+    # return, or the retry would mark the id seen and drop the request
+    # for a message that never reached disk.
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    save_allowlist(
+        config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset({ALICE})),
+    )
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", sender=BOB, received_at=now - 60),
+        now=now,
+    )
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    original_save = inbox._save
+    calls = []
+
+    def flaky_save(*args, **kwargs):
+        if not calls:
+            calls.append(1)
+            raise OSError("disk full")
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(inbox, "_save", flaky_save)
+    with pytest.raises(DmRequestsError, match="could not deliver"):
+        accept_dm_request(
+            dm_requests_path=config.dm_requests_path,
+            allowlist_path=config.allowlist_path,
+            blocklist_path=config.blocklist_path,
+            inbox=inbox,
+            mailbox=mailbox,
+            sender_name="bob",
+            ref="req-1",
+        )
+    assert inbox.find("req-1", peer=BOB) is None
+    assert len(load_dm_requests(config.dm_requests_path)) == 1
+    acceptance = accept_dm_request(
+        dm_requests_path=config.dm_requests_path,
+        allowlist_path=config.allowlist_path,
+        blocklist_path=config.blocklist_path,
+        inbox=inbox,
+        mailbox=mailbox,
+        sender_name="bob",
+        ref="req-1",
+    )
+    assert acceptance.delivered is True
+    assert [entry["id"] for entry in inbox.list_messages()] == ["req-1"]
+
+
 def test_retract_of_held_request_blocks_accept(tmp_path, capsys):
     # A sender whose DM is held may still retract it: the signed
     # retract records a marker even though the sender is outside

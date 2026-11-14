@@ -3025,7 +3025,12 @@ class WebBridge:
             result["unread"] = unread
         return result
 
-    def _mirror_imported_messages(self, records: List[Dict[str, Any]]) -> None:
+    def _mirror_imported_messages(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        reject_removed_wire_id: bool = False,
+    ) -> None:
         """Append newly imported inbox records to the console feed.
 
         The feed is the console's own log, not a view of the inbox,
@@ -3035,7 +3040,10 @@ class WebBridge:
         live traffic uses in :meth:`record_inbound`; a disappearing
         message whose deadline already passed is skipped — the feed
         purges it on read anyway — and the log is saved once, not
-        once per entry.
+        once per entry.  With *reject_removed_wire_id* a record whose
+        wire id was removed since it was stored (a retraction that
+        landed after the store) is not mirrored back, like the live
+        inbound path in :meth:`record_inbound`.
         """
         names = {
             item["destination"]: item["name"]
@@ -3119,6 +3127,7 @@ class WebBridge:
                 in_reply_to=record.get("in_reply_to"),
                 file=file_meta,
                 save=False,
+                reject_removed_wire_id=reject_removed_wire_id,
             )
             if message is None:
                 # A retracted outbound send the import would otherwise
@@ -3262,8 +3271,13 @@ class WebBridge:
         ):
             # The message landed in the inbox directly, bypassing the
             # node, so mirror it into the console feed like an import
-            # — otherwise the user accepts and sees nothing change.
-            self._mirror_imported_messages([acceptance.record])
+            # — otherwise the user accepts and sees nothing change.  A
+            # retraction that landed after the helper's check must not
+            # be mirrored back: the removal guard is checked under the
+            # append lock, like the live inbound path.
+            self._mirror_imported_messages(
+                [acceptance.record], reject_removed_wire_id=True
+            )
             unread = self.unread()
             self.bus.publish({"type": "unread", "unread": unread})
             result["unread"] = unread
