@@ -55,6 +55,17 @@ export function SocialConsole() {
       );
     });
   }, [showPinned, tan.loadPinned]);
+  // Whether the feed shows the hidden list instead of the timeline.
+  // Hidden posts load on demand, not on the feed's poll tick.
+  const [showHidden, setShowHidden] = useState(false);
+  useEffect(() => {
+    if (!showHidden) return;
+    tan.loadHidden().catch((caught) => {
+      setError(
+        caught instanceof Error ? caught.message : "could not load hidden posts",
+      );
+    });
+  }, [showHidden, tan.loadHidden]);
   // Whether the feed shows the scheduled list instead of the timeline.
   // Queued posts load on demand, not on the feed's poll tick.
   const [showScheduled, setShowScheduled] = useState(false);
@@ -156,6 +167,7 @@ export function SocialConsole() {
         tan.closeThread();
         setShowSaved(false);
         setShowPinned(false);
+        setShowHidden(false);
         setShowScheduled(true);
         return;
       }
@@ -313,6 +325,26 @@ export function SocialConsole() {
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not pin");
+    }
+  }
+
+  // Hiding drops the post from every local view; unhiding is only
+  // offered from the hidden list, where every post is already hidden.
+  async function submitHide(post: TanPost) {
+    setError(null);
+    try {
+      await tan.hide(post.hash);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not hide");
+    }
+  }
+
+  async function submitUnhide(post: TanPost) {
+    setError(null);
+    try {
+      await tan.unhide(post.hash);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not unhide");
     }
   }
 
@@ -829,6 +861,8 @@ export function SocialConsole() {
                             ? "saved"
                           : showPinned
                             ? "pinned"
+                          : showHidden
+                            ? "hidden"
                           : showScheduled
                             ? "scheduled"
                           : tan.showMentions
@@ -846,6 +880,8 @@ export function SocialConsole() {
                             ? `${tan.saved.length} post(s)`
                           : showPinned
                             ? `${tan.pinned.length} post(s)`
+                          : showHidden
+                            ? `${tan.hidden.length} post(s)`
                           : showScheduled
                             ? `${tan.scheduled.length} post(s)`
                           : tan.showMentions
@@ -868,6 +904,7 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowHidden(false);
                           setShowScheduled(false);
                           tan.setShowMentions(false);
                           tan.setView("timeline");
@@ -877,6 +914,7 @@ export function SocialConsole() {
                           tan.view === "timeline" &&
                           !showSaved &&
                           !showPinned &&
+                          !showHidden &&
                           !showScheduled &&
                           !tan.showMentions &&
                           !tan.all
@@ -891,6 +929,7 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowHidden(false);
                           setShowScheduled(false);
                           tan.setShowMentions(false);
                           tan.setView("timeline");
@@ -900,6 +939,7 @@ export function SocialConsole() {
                           tan.view === "timeline" &&
                           !showSaved &&
                           !showPinned &&
+                          !showHidden &&
                           !showScheduled &&
                           !tan.showMentions &&
                           tan.all
@@ -914,6 +954,7 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowHidden(false);
                           setShowScheduled(false);
                           tan.setShowMentions(false);
                           tan.setView("top");
@@ -922,6 +963,7 @@ export function SocialConsole() {
                           tan.view === "top" &&
                           !showSaved &&
                           !showPinned &&
+                          !showHidden &&
                           !showScheduled &&
                           !tan.showMentions
                             ? "bg-signal/15 text-signal"
@@ -935,6 +977,7 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowHidden(false);
                           setShowScheduled(false);
                           tan.setShowMentions(true);
                           tan.setView("timeline");
@@ -952,6 +995,7 @@ export function SocialConsole() {
                           tan.setView("timeline");
                           setShowSaved(true);
                           setShowPinned(false);
+                          setShowHidden(false);
                           setShowScheduled(false);
                         }}
                         className={`rounded px-2 py-1 ${
@@ -967,6 +1011,7 @@ export function SocialConsole() {
                           tan.setView("timeline");
                           setShowSaved(false);
                           setShowPinned(true);
+                          setShowHidden(false);
                           setShowScheduled(false);
                         }}
                         className={`rounded px-2 py-1 ${
@@ -982,6 +1027,23 @@ export function SocialConsole() {
                           tan.setView("timeline");
                           setShowSaved(false);
                           setShowPinned(false);
+                          setShowHidden(true);
+                          setShowScheduled(false);
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          showHidden ? "bg-signal/15 text-signal" : "text-mist"
+                        }`}
+                      >
+                        hidden
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          tan.setShowMentions(false);
+                          tan.setView("timeline");
+                          setShowSaved(false);
+                          setShowPinned(false);
+                          setShowHidden(false);
                           setShowScheduled(true);
                         }}
                         className={`rounded px-2 py-1 ${
@@ -1030,6 +1092,7 @@ export function SocialConsole() {
                     onRepost={submitRepost}
                     onReply={(target) => setReplyTarget(target)}
                     onDelete={submitDelete}
+                    onHide={submitHide}
                     onOpenThread={(target) => void tan.openThread(target.hash)}
                     deleting={deleting}
                   />
@@ -1056,6 +1119,7 @@ export function SocialConsole() {
                           likersTotal={likersOpen === post.hash ? likersTotal : 0}
                           onToggleSave={toggleSave}
                           onTogglePin={togglePin}
+                          onHide={submitHide}
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
                           deleting={deleting.has(post.hash)}
@@ -1116,6 +1180,7 @@ export function SocialConsole() {
                           onRepost={submitRepost}
                           onToggleSave={toggleSave}
                           onTogglePin={togglePin}
+                          onHide={submitHide}
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
                           deleting={deleting.has(post.hash)}
@@ -1131,6 +1196,45 @@ export function SocialConsole() {
                           {tan.savedLoading
                             ? "loading…"
                             : "load more saved posts"}
+                        </button>
+                      ) : null}
+                    </>
+                  )
+                ) : showHidden && !showingSearch ? (
+                  tan.hidden.length === 0 ? (
+                    tan.hiddenLoading ? (
+                      <p className="py-8 text-center font-mono text-[11px] text-mist">
+                        loading hidden posts…
+                      </p>
+                    ) : (
+                      <HiddenEmptyState />
+                    )
+                  ) : (
+                    <>
+                      {tan.hidden.map((post) => (
+                        <PostCard
+                          key={post.hash}
+                          post={post}
+                          onToggleLike={toggleLike}
+                          onRepost={submitRepost}
+                          onToggleSave={toggleSave}
+                          onTogglePin={togglePin}
+                          onUnhide={submitUnhide}
+                          onReply={(target) => setReplyTarget(target)}
+                          onDelete={submitDelete}
+                          deleting={deleting.has(post.hash)}
+                        />
+                      ))}
+                      {tan.hiddenHasMore ? (
+                        <button
+                          type="button"
+                          onClick={() => void tan.loadMoreHidden()}
+                          disabled={tan.hiddenLoading}
+                          className="w-full rounded-xl border border-line/70 bg-void/40 px-3 py-2.5 text-xs text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                        >
+                          {tan.hiddenLoading
+                            ? "loading…"
+                            : "load more hidden posts"}
                         </button>
                       ) : null}
                     </>
@@ -1151,6 +1255,7 @@ export function SocialConsole() {
                         onRepost={submitRepost}
                         onToggleSave={toggleSave}
                         onTogglePin={togglePin}
+                        onHide={submitHide}
                         onReply={(target) => setReplyTarget(target)}
                         onDelete={submitDelete}
                         deleting={deleting.has(post.hash)}
@@ -1177,6 +1282,7 @@ export function SocialConsole() {
                       likersTotal={likersOpen === post.hash ? likersTotal : 0}
                       onToggleSave={toggleSave}
                       onTogglePin={togglePin}
+                      onHide={submitHide}
                       onReply={(target) => {
                         setQuoteTarget(null);
                         setReplyTarget(target);
@@ -1524,6 +1630,7 @@ function ThreadView({
   onRepost,
   onReply,
   onDelete,
+  onHide,
   onOpenThread,
   deleting,
 }: {
@@ -1534,6 +1641,7 @@ function ThreadView({
   onRepost: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
+  onHide: (post: TanPost) => void;
   onOpenThread: (post: TanPost) => void;
   deleting: ReadonlySet<string>;
 }) {
@@ -1557,6 +1665,7 @@ function ThreadView({
             onRepost={onRepost}
             onReply={onReply}
             onDelete={onDelete}
+            onHide={onHide}
             deleting={deleting.has(post.hash)}
             onOpenThread={onOpenThread}
           />
@@ -1648,6 +1757,24 @@ function PinnedEmptyState() {
         Pin one of your own posts from the timeline to keep it at the top
         of this list. Pins stay on this node — they are never published or
         shared with peers.
+      </p>
+    </div>
+  );
+}
+
+function HiddenEmptyState() {
+  return (
+    <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
+      <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
+        🙈
+      </div>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        No hidden posts yet
+      </h3>
+      <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
+        Hide a post from the timeline to remove it from your local views
+        without muting its author. Hides stay on this node — they are
+        never published or shared with peers.
       </p>
     </div>
   );
@@ -1768,6 +1895,8 @@ export function PostCard({
   likersTotal,
   onToggleSave,
   onTogglePin,
+  onHide,
+  onUnhide,
   onReply,
   onQuote,
   onDelete,
@@ -1792,6 +1921,10 @@ export function PostCard({
   // Pins are own-posts-only, so the button renders only on your own
   // cards; when absent the card shows no pin control.
   onTogglePin?: (post: TanPost) => void;
+  // Hide is offered on visible cards, unhide only on hidden-list
+  // cards; when absent the card shows no hide control.
+  onHide?: (post: TanPost) => void;
+  onUnhide?: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onQuote?: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
@@ -2051,6 +2184,26 @@ export function PostCard({
                 }`}
               >
                 {post.saved ? "★ saved" : "☆ save"}
+              </button>
+            ) : null}
+            {onHide ? (
+              <button
+                type="button"
+                onClick={() => onHide(post)}
+                title="Hide this post from your local views"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-zinc-100"
+              >
+                hide
+              </button>
+            ) : null}
+            {onUnhide ? (
+              <button
+                type="button"
+                onClick={() => onUnhide(post)}
+                title="Show this post in your local views again"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-zinc-100"
+              >
+                unhide
               </button>
             ) : null}
             {onTogglePin && post.own ? (

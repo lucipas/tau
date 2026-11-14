@@ -3399,6 +3399,163 @@ def test_tan_mute_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_hidden_annotates_own_posts_and_respects_blocklist(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import TanApp, create_post, hide_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "my own words", name="tester", now=1000)
+        theirs = create_post(conn, other, "blocked words", name="bob", now=1001)
+        hide_post(conn, mine["hash"])
+        hide_post(conn, theirs["hash"])
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.blocklist = BlockList(blocked=frozenset({destination_hash(other).hex()}))
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The blocked author's hidden post is not shown in full; the
+        # viewer's own hidden post keeps its owner annotation.
+        status, _, payload = _json(bridge, "/api/tan/hidden")
+        assert status == 200
+        assert [item["hash"] for item in payload["posts"]] == [mine["hash"]]
+        assert payload["posts"][0]["own"] is True
+        assert payload["next_offset"] is None
+
+        # An unreadable block-list hides everything, as the timeline does.
+        node.blocklist = BlockList(block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/hidden")
+        assert status == 200
+        assert payload["posts"] == []
+        assert payload["next_offset"] is None
+    finally:
+        bridge.stop()
+
+
+def test_tan_hide_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "hello from tan", name="tester", now=1000)
+        theirs = create_post(conn, other, "bob's update", name="bob", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/hidden")
+        assert status == 200
+        assert payload == {"posts": [], "count": 0, "next_offset": None}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/hide",
+            method="POST",
+            body={"target": theirs["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["hide"]["hash"] == theirs["hash"]
+        assert payload["hide"]["already_hidden"] is False
+        first_hidden_at = payload["hide"]["hidden_at"]
+
+        # The hidden post leaves the timeline at once, and the hidden
+        # list shows it newest first.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
+
+        status, _, payload = _json(bridge, "/api/tan/hidden")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["posts"][0]["hash"] == theirs["hash"]
+        assert payload["posts"][0]["text"] == "bob's update"
+        assert payload["next_offset"] is None
+
+        # Re-hiding is a no-op: the original hide time is kept.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/hide",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 200
+        assert payload["hide"]["already_hidden"] is True
+        assert payload["hide"]["hidden_at"] == first_hidden_at
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unhide",
+            method="POST",
+            body={"target": theirs["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["hide"]["unhidden"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "bob's update",
+            "hello from tan",
+        ]
+
+        # Unhiding again reports that nothing was hidden.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unhide",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert payload["hide"]["unhidden"] is False
+
+        # Hiding your own post works — hiding is per-post, not per-author.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/hide",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 200
+        assert payload["hide"]["hash"] == mine["hash"]
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == ["bob's update"]
+
+        # Unknown refs and missing fields are rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/hide",
+            method="POST",
+            body={"target": "0" * 64},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/hide", method="POST", body={}
+        )
+        assert status == 400
+        assert "field 'target' is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_peers_block_corrupt_list_refuses(tmp_path):
     from tau.config import TauConfig
 

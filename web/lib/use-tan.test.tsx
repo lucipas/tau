@@ -285,6 +285,104 @@ describe("useTan saved posts", () => {
   });
 });
 
+describe("useTan hidden posts", () => {
+  it("loads hidden posts on demand and posts hide/unhide to the API", async () => {
+    const mine = makePost();
+    const hidden = makePost({ hash: "e".repeat(64), text: "regret this" });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/hidden")) {
+        return Promise.resolve({
+          posts: [hidden],
+          count: 1,
+          next_offset: null,
+        });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : otherResponses(path);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // Hidden posts are not part of the feed's poll: nothing loaded yet.
+    expect(result.current.hidden).toEqual([]);
+    expect(
+      mockedGet.mock.calls.some((call) =>
+        String(call[0]).startsWith("/api/tan/hidden"),
+      ),
+    ).toBe(false);
+
+    await act(async () => {
+      await result.current.loadHidden();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/hidden?limit=100&offset=0",
+    );
+    expect(result.current.hidden).toEqual([hidden]);
+
+    await act(async () => {
+      await result.current.hide(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/hide", {
+      target: mine.hash,
+    });
+
+    await act(async () => {
+      await result.current.unhide(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/unhide", {
+      target: mine.hash,
+    });
+  });
+
+  it("pages through older hides with load more", async () => {
+    const secondPage = [makePost({ hash: "f".repeat(64), text: "older" })];
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/hidden")) {
+        // A non-null next_offset means there may be more: the first
+        // page is full, the second holds the one remaining hide.
+        const page = path.endsWith("offset=0")
+          ? Array.from({ length: 100 }, (_, index) =>
+              makePost({
+                hash: `${index}`.padStart(64, "0"),
+                text: `hidden ${index}`,
+              }),
+            )
+          : secondPage;
+        return Promise.resolve({
+          posts: page,
+          count: page.length,
+          next_offset: path.endsWith("offset=0") ? 100 : null,
+        });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [], count: 0 })
+        : otherResponses(path);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([]));
+
+    await act(async () => {
+      await result.current.loadHidden();
+    });
+    expect(result.current.hidden).toHaveLength(100);
+    expect(result.current.hiddenHasMore).toBe(true);
+
+    await act(async () => {
+      await result.current.loadMoreHidden();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/hidden?limit=100&offset=100",
+    );
+    expect(result.current.hidden).toHaveLength(101);
+    expect(result.current.hidden[100]).toEqual(secondPage[0]);
+    expect(result.current.hiddenHasMore).toBe(false);
+  });
+});
+
 describe("useTan pinned posts", () => {
   it("loads pinned posts on demand and posts pin/unpin to the API", async () => {
     const mine = makePost();
