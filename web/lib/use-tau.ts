@@ -1758,10 +1758,22 @@ export function useTau() {
 
   const declineDmRequest = useCallback(
     async (id: string, options?: { block?: boolean }) => {
-      const result = await apiPost<DeclineDmRequestResponse>(
-        "/api/messages/requests/decline",
-        { id, block: options?.block ?? false },
-      );
+      let result: DeclineDmRequestResponse;
+      try {
+        result = await apiPost<DeclineDmRequestResponse>(
+          "/api/messages/requests/decline",
+          { id, block: options?.block ?? false },
+        );
+      } catch (error) {
+        // A block step can fail after the request was already dropped on
+        // the server, so reconcile the list before surfacing the error.
+        try {
+          await refreshDmRequests();
+        } catch {
+          // The next poll reconciles.
+        }
+        throw error;
+      }
       // Same shape as the accept: the decline already succeeded, so
       // drop the request locally at once and refresh best-effort.
       const declinedId = result.declined.id;
