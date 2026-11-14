@@ -4255,7 +4255,14 @@ def annotated_hidden_posts(
         kept.extend(batch)
     if len(kept) < limit:
         return kept, None
-    total = conn.execute("SELECT COUNT(*) AS n FROM hidden_posts").fetchone()["n"]
+    # Count only rows hidden_posts can return (same join and expiry filter),
+    # so an expired-only tail does not offer an empty next page.
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM hidden_posts s "
+        "JOIN posts p ON p.hash = s.hash "
+        "WHERE p.expires_at IS NULL OR p.expires_at > ?",
+        (time.time(),),
+    ).fetchone()["n"]
     return kept, raw_offset if raw_offset < int(total) else None
 
 
