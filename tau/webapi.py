@@ -4304,6 +4304,11 @@ class WebBridge:
                 raise ValueError(f"unknown message: {target!r}")
             if entry.get("direction") != "out":
                 raise ValueError("only your own sent messages can be edited")
+            if entry.get("file"):
+                # Before the group dispatch below: a group file leg
+                # carries both fields, and the group path would refuse
+                # it with a misleading leg-timing error instead.
+                raise ValueError("file transfers cannot be edited")
         if entry.get("group"):
             # The group path takes the lock itself to gather the legs,
             # so this stays outside the block above: re-entering it
@@ -4314,8 +4319,6 @@ class WebBridge:
                 target, entry, cleaned, timeout=timeout
             )
         with self._lock:
-            if entry.get("file"):
-                raise ValueError("file transfers cannot be edited")
             if entry.get("status") == "queued":
                 # An edit answered "not found" would let the queued
                 # copy arrive later with the old text, so cancellation
@@ -4688,6 +4691,11 @@ class WebBridge:
                 raise ValueError(
                     "only your own sent messages can be retracted"
                 )
+            if removed.get("file"):
+                # Before the group dispatch below: a group file leg
+                # carries both fields, and the group path would refuse
+                # it with a misleading leg-timing error instead.
+                raise ValueError("file transfers cannot be retracted")
         if removed.get("group"):
             # The group path takes the lock itself to gather the legs,
             # so this stays outside the block above: re-entering it
@@ -4696,8 +4704,6 @@ class WebBridge:
                 target, removed, timeout=timeout
             )
         with self._lock:
-            if removed.get("file"):
-                raise ValueError("file transfers cannot be retracted")
             if removed.get("status") == "queued":
                 # A retract answered "not found" would let the queued
                 # copy arrive later, so cancellation has to go through

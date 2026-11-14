@@ -14062,6 +14062,66 @@ def test_send_group_file_endpoint_rejects_bad_requests(bridge):
         assert fragment in payload["error"]["message"]
 
 
+def test_edit_message_endpoint_rejects_group_file_leg(bridge, node):
+    # A group file leg carries both `group` and `file`: the file guard
+    # must run before the group dispatch, or the group edit path
+    # refuses it with a misleading leg-timing error instead.
+    messages, _ = bridge.send_group_file("crew", "notes.txt", b"hello mesh")
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": messages[0]["id"], "text": "fixed"},
+    )
+    assert status == 400
+    assert "file transfers cannot be edited" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_rejects_group_file_leg(bridge, node):
+    messages, _ = bridge.send_group_file("crew", "notes.txt", b"hello mesh")
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/retract",
+        method="POST",
+        body={"id": messages[0]["id"]},
+    )
+    assert status == 400
+    assert "file transfers cannot be retracted" in payload["error"]["message"]
+
+
+def test_react_endpoint_rejects_group_file_leg(bridge, node):
+    # The Qodo autofix on this PR blocks reactions to a group file
+    # leg: there is no message copy for members to resolve it against.
+    messages, _ = bridge.send_group_file("crew", "notes.txt", b"hello mesh")
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": messages[0]["wire_id"], "reaction": "👍"},
+    )
+    assert status == 400
+    assert "cannot be reacted to" in payload["error"]["message"]
+
+
+def test_group_reply_to_a_file_leg_is_refused(bridge, node):
+    # The Qodo autofix on this PR excludes file legs from group
+    # reply resolution, so quoting a group file is refused instead
+    # of dangling at a transfer the members hold no message for.
+    messages, _ = bridge.send_group_file("crew", "notes.txt", b"hello mesh")
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={
+            "group": "crew",
+            "text": "seconded",
+            "reply_to": messages[0]["wire_id"][:12],
+        },
+    )
+    assert status == 400
+    assert "no message" in payload["error"]["message"]
+
+
 def test_other_endpoints_keep_the_json_body_cap(bridge):
     # The same oversized body to /api/messages must still be refused.
     status, _, payload = _json(
