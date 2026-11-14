@@ -477,6 +477,12 @@ def accept_dm_request(
                 }
                 if request.in_reply_to is not None:
                     record["in_reply_to"] = request.in_reply_to
+                # A copy the inbox holds only in memory — a live
+                # append whose save failed and was ignored — is not a
+                # delivered copy: reload from disk so `find` only
+                # trusts what landed there.  (Lock order is mailbox,
+                # then inbox, everywhere.)
+                inbox.reload()
                 already_stored = inbox.find(request.id, peer=request.sender)
                 if already_stored is not None:
                     # A previous accept appended the copy but crashed

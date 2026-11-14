@@ -1121,9 +1121,18 @@ class Inbox:
         back, and another process committing between that read and
         write would have its entries overwritten.  Under the flock the
         purge write is serialised with every other commit.
+
+        A missing file means no message was ever persisted — a load
+        leaves the cache untouched, so the reload clears the message
+        list itself: a copy held only in memory (a persist that never
+        landed) must not survive as if it were stored.  Reactions
+        and read cursors are left alone: a reload can run after a
+        record reported success, and only the message list is ever
+        trusted as proof of delivery.
         """
         with self._transaction():
-            pass
+            if self.path is not None and not self.path.exists():
+                self._messages = []
 
     def _stamp_read_ids(
         self, message_ids: List[str], *, at: Optional[float] = None
