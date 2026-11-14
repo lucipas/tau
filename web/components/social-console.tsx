@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-import { formatDateTime, shortHash } from "@/lib/format";
+import { casefoldTag, formatDateTime, shortHash } from "@/lib/format";
 import type {
   TanAuthor,
   TanExportDocument,
@@ -265,7 +265,18 @@ export function SocialConsole() {
   // instead. Clicking the active tag again clears the filter. The tag
   // counts cover the whole store, so applying one also widens the
   // scope to everything — otherwise the count could promise posts
-  // the following-only feed hides.
+  // the following-only feed hides. The scope it widens from is saved,
+  // so clearing the tag (here or from the chip) restores it instead
+  // of stranding the reader on everything.
+  const scopeBeforeTagRef = useRef<boolean | null>(null);
+
+  function restoreScopeBeforeTag() {
+    if (scopeBeforeTagRef.current !== null) {
+      tan.setAll(scopeBeforeTagRef.current);
+      scopeBeforeTagRef.current = null;
+    }
+  }
+
   function submitTagFilter(tag: string) {
     setShowSaved(false);
     setShowPinned(false);
@@ -274,7 +285,15 @@ export function SocialConsole() {
     tan.setShowMentions(false);
     tan.setView("timeline");
     tan.closeThread();
-    if (tan.tagFilter !== tag) tan.setAll(true);
+    if (tan.tagFilter !== tag) {
+      // Applying a tag: remember the scope only while no tag is
+      // active, so switching tags keeps the scope the first tag
+      // widened from.
+      if (tan.tagFilter === null) scopeBeforeTagRef.current = tan.all;
+      tan.setAll(true);
+    } else {
+      restoreScopeBeforeTag();
+    }
     void tan.setTagFilter(tan.tagFilter === tag ? null : tag);
   }
 
@@ -987,7 +1006,10 @@ export function SocialConsole() {
                     !showScheduled ? (
                     <button
                       type="button"
-                      onClick={() => void tan.setTagFilter(null)}
+                      onClick={() => {
+                        restoreScopeBeforeTag();
+                        void tan.setTagFilter(null);
+                      }}
                       title="clear the tag filter"
                       className="rounded-lg border border-signal/50 bg-signal/10 px-2 py-1 font-mono text-[11px] text-signal transition hover:border-signal/70"
                     >
@@ -1050,6 +1072,17 @@ export function SocialConsole() {
                       <button
                         type="button"
                         onClick={() => {
+                          // Tapping Top while it is already selected must
+                          // refresh the feed: setView is a no-op then, and
+                          // Top does not poll.
+                          const alreadyTop =
+                            tan.view === "top" &&
+                            !showSaved &&
+                            !showPinned &&
+                            !showHidden &&
+                            !showScheduled &&
+                            !tan.showMentions &&
+                            tan.tagFilter === null;
                           setShowSaved(false);
                           setShowPinned(false);
                           setShowHidden(false);
@@ -1057,6 +1090,15 @@ export function SocialConsole() {
                           tan.setShowMentions(false);
                           tan.setView("top");
                           void tan.setTagFilter(null);
+                          if (alreadyTop) {
+                            tan.refresh().catch((caught) => {
+                              setError(
+                                caught instanceof Error
+                                  ? caught.message
+                                  : "could not load the feed",
+                              );
+                            });
+                          }
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.view === "top" &&
@@ -2014,7 +2056,7 @@ function PostText({
     const index = match.index ?? 0;
     if (index > lastIndex) parts.push(text.slice(lastIndex, index));
     const tag = match[1].replace(/-+$/, "");
-    const normalized = tag.toLowerCase();
+    const normalized = casefoldTag(tag);
     if (WHOLE_TAG_PATTERN.test(normalized)) {
       parts.push(
         <button

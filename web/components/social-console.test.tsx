@@ -1639,6 +1639,28 @@ describe("PostCard hashtags", () => {
     expect(onTag).toHaveBeenCalledWith("mesh");
   });
 
+  it("casefolds a hashtag before filtering", () => {
+    const onTag = vi.fn();
+    render(
+      <PostCard
+        post={makePost({ text: "hello #Straße" })}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+        onTag={onTag}
+      />,
+    );
+
+    // Python casefold maps ß to ss, so the clicked tag matches the
+    // sidebar's canonical "strasse" — toLowerCase alone would pass
+    // "straße" and the toggle would never compare equal.
+    fireEvent.click(screen.getByTitle("show #strasse posts"));
+    expect(onTag).toHaveBeenCalledTimes(1);
+    expect(onTag).toHaveBeenCalledWith("strasse");
+  });
+
   it("leaves a hashtag the server would reject as plain text", () => {
     const onTag = vi.fn();
     render(
@@ -1797,5 +1819,39 @@ describe("SocialConsole tags sidebar", () => {
     expect(closeThread).toHaveBeenCalledTimes(1);
     expect(setTagFilter).toHaveBeenCalledTimes(1);
     expect(setTagFilter).toHaveBeenCalledWith("mesh");
+  });
+
+  it("restores the following scope when the tag filter is cleared from the chip", () => {
+    const { setTagFilter } = setTanWithTags({ all: false });
+    const setAll = mockTan.current.setAll as Mock;
+    const { rerender } = render(<SocialConsole />);
+
+    // Applying the tag widens the scope to everything.
+    fireEvent.click(screen.getByRole("button", { name: "#mesh · 3" }));
+    expect(setAll).toHaveBeenCalledWith(true);
+    expect(setTagFilter).toHaveBeenCalledWith("mesh");
+
+    // The hook would now report the filter as active; clearing it
+    // from the chip restores the scope the tag widened from.
+    mockTan.current.tagFilter = "mesh";
+    rerender(<SocialConsole />);
+    fireEvent.click(screen.getByRole("button", { name: "#mesh ✕" }));
+    expect(setAll).toHaveBeenLastCalledWith(false);
+    expect(setTagFilter).toHaveBeenCalledWith(null);
+  });
+
+  it("restores the following scope when the active tag is toggled off", () => {
+    const { setTagFilter } = setTanWithTags({ all: false });
+    const setAll = mockTan.current.setAll as Mock;
+    const { rerender } = render(<SocialConsole />);
+
+    fireEvent.click(screen.getByRole("button", { name: "#mesh · 3" }));
+    expect(setAll).toHaveBeenCalledWith(true);
+
+    mockTan.current.tagFilter = "mesh";
+    rerender(<SocialConsole />);
+    fireEvent.click(screen.getByRole("button", { name: "#mesh · 3" }));
+    expect(setAll).toHaveBeenLastCalledWith(false);
+    expect(setTagFilter).toHaveBeenCalledWith(null);
   });
 });
