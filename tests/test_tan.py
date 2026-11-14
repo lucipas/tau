@@ -6183,3 +6183,64 @@ def test_cli_post_expire_rejects_over_cap(tmp_path, capsys):
         == 2
     )
     assert "at most 1w" in capsys.readouterr().err
+
+
+def test_saved_posts_page_past_expired_saves(identities, tmp_path):
+    # Expired saves are filtered in SQL, before LIMIT/OFFSET, so a page
+    # never comes up short and later saves are never hidden behind the
+    # offset — the failure the first autofix left in place.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    oldest = create_post(conn, alice, "oldest save", name="alice", now=now)
+    dying = create_post(
+        conn, alice, "middle save", name="alice", now=now + 1,
+        expires_at=now + 3601,
+    )
+    newest = create_post(conn, alice, "newest save", name="alice", now=now + 2)
+    save_post(conn, oldest["hash"], now=100.0)
+    save_post(conn, dying["hash"], now=200.0)
+    save_post(conn, newest["hash"], now=300.0)
+    assert [item["hash"] for item in saved_posts(conn)] == [
+        newest["hash"],
+        dying["hash"],
+        oldest["hash"],
+    ]
+    _expire_stored_post(conn, dying["hash"], at=now - 10)
+    assert [item["hash"] for item in saved_posts(conn)] == [
+        newest["hash"],
+        oldest["hash"],
+    ]
+    assert [item["hash"] for item in saved_posts(conn, limit=1, offset=1)] == [
+        oldest["hash"]
+    ]
+
+
+def test_timeline_survives_newest_expired_posts(identities, tmp_path):
+    # CodeRabbit Major on PR #356: when the newest page of posts had
+    # expired, the timeline came back empty even though older live posts
+    # existed — the page was fetched first and expired rows filtered
+    # after LIMIT, so _fill_unmuted read the short page as exhaustion.
+    # Expired rows are now excluded in SQL, before LIMIT, so a page of
+    # expired posts never hides the live ones behind it.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    now = time.time()
+    live = [
+        create_post(conn, alice, f"live {index}", name="alice", now=now + index)
+        for index in range(5)
+    ]
+    dying = [
+        create_post(
+            conn, alice, f"dying {index}", name="alice", now=now + 100 + index,
+            expires_at=now + 3600,
+        )
+        for index in range(25)
+    ]
+    for post in dying:
+        _expire_stored_post(conn, post["hash"], at=now - 10)
+    author = author_of(alice)
+    expected = [item["hash"] for item in reversed(live)]
+    assert [item["hash"] for item in timeline(conn, [author])] == expected
+    assert [item["hash"] for item in author_timeline(conn, author)] == expected
+    assert [item["hash"] for item in feed(conn, posts_only=True)] == expected

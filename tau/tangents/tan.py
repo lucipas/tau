@@ -3965,18 +3965,19 @@ def saved_posts(
     """
     count = max(1, min(int(limit), MAX_SAVED_POSTS))
     start = max(0, int(offset))
+    # Expired posts are filtered in SQL, before LIMIT/OFFSET, so the raw
+    # offset a caller advances by counts exactly the rows it was given.
     rows = conn.execute(
         "SELECT p.*, s.saved_at FROM saved_posts s "
         "JOIN posts p ON p.hash = s.hash "
+        "WHERE p.expires_at IS NULL OR p.expires_at > ? "
         "ORDER BY s.saved_at DESC, s.hash DESC LIMIT ? OFFSET ?",
-        (count, start),
+        (time.time(), count, start),
     ).fetchall()
     deleted = deleted_targets(conn)
     records: List[Dict[str, Any]] = []
     for row in rows:
         post = _row_to_post(row)
-        if is_expired(post):
-            continue
         post["saved_at"] = float(row["saved_at"])
         if str(post["hash"]) in deleted:
             post["deleted"] = True
