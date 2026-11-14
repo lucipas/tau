@@ -4985,7 +4985,11 @@ class WebBridge:
             messages, response = self.send_group_message(
                 group.strip(), forwarded, timeout=timeout
             )
-            return {"ok": True, "messages": messages, "response": response}
+            return {
+                "ok": bool(response.get("ok", True)),
+                "messages": messages,
+                "response": response,
+            }
         message, response = self.send_message(
             to.strip(), forwarded, timeout=timeout
         )

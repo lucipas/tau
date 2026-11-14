@@ -1007,10 +1007,9 @@ export function useTau() {
           if (fresh.length === 0) return previous;
           return [...previous, ...fresh].sort((a, b) => a.id - b.id);
         });
-        snapshotMax.current = Math.max(
-          snapshotMax.current,
-          ...sent.map((entry) => entry.id),
-        );
+        // Do not advance snapshotMax here: the legs are not a complete
+        // view up to their highest id, and an inbound message recorded
+        // between two legs must still be accepted from its SSE event.
       }
       // A queued leg lands in the outbox; refresh so it shows at once
       // instead of waiting for the next poll. Best-effort: a failed
@@ -1019,6 +1018,39 @@ export function useTau() {
         await refreshOutbox();
       } catch {
         // The next poll picks the entry up.
+      }
+      if (!result.ok) {
+        // Same summary as `sendGroup`: the legs are already in the feed
+        // with their own statuses, so name the members who missed it
+        // and those who already have it (or a queued copy).
+        const legs = (result.response.results as Array<
+          Record<string, unknown>
+        >) ?? [];
+        const failed = legs.filter((leg) => !leg.delivered && !leg.queued);
+        const deliveredNames = legs
+          .filter((leg) => leg.delivered)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const queuedNames = legs
+          .filter((leg) => leg.queued)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const names = failed.map((leg) =>
+          String(leg.to_name || leg.to || "a member").slice(0, 8),
+        );
+        const already = [
+          ...(deliveredNames.length > 0
+            ? [`${deliveredNames.join(", ")} already received this`]
+            : []),
+          ...(queuedNames.length > 0
+            ? [`${queuedNames.join(", ")} have a copy queued`]
+            : []),
+        ].join("; ");
+        throw new Error(
+          names.length > 0
+            ? already.length > 0
+              ? `could not forward to ${names.join(", ")} — ${already}`
+              : `could not forward to ${names.join(", ")}`
+            : "could not forward to the group",
+        );
       }
       return sent;
     },
