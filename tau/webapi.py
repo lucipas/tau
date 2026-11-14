@@ -51,7 +51,8 @@ script) can read what arrives from the mesh and send messages back:
                            retract out to every member of your sent group
                            message, then drop the local copies too
                            (``tau retract`` from the console)
-    POST /api/messages/forward forward ``{"id": <console message id>, "to": "<peer>"}``:
+    POST /api/messages/forward forward ``{"id": <console message id>, "to": "<peer>"}``
+                           (or ``"group": "<name>"`` to fan it out to a group):
                            send the message on as a new DM prefixed with
                            ``Forwarded from <name>:`` (``tau forward`` from
                            the console)
@@ -4865,32 +4866,48 @@ class WebBridge:
         }
 
     def forward_message(
-        self, target: int, to: str, *, timeout: float = 20.0
+        self,
+        target: int,
+        to: Optional[str] = None,
+        *,
+        timeout: float = 20.0,
+        group: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Forward one stored DM to another peer, from the console.
+        """Forward one stored DM to another peer or into a group, from the
+        console.
 
         Mirrors ``tau forward``: the forwarded text is the original
         prefixed with one attribution line, so the recipient sees who
         said it on any transport with no protocol change.  Delivery
-        reuses :meth:`send_message` wholesale — the forward is a new
-        message, so it carries no expiry, kind, or reply chain from the
-        original, and the new outbound entry appears in the feed like
-        any other send.
+        reuses :meth:`send_message` wholesale for a peer target — or
+        :meth:`send_group_message` for a group target, fanning out one
+        leg per member.  Either way the forward is a new message, so it
+        carries no expiry, kind, or reply chain from the original, and
+        the new outbound entry appears in the feed like any other send.
 
-        Same guards as the CLI: group messages cannot be forwarded
-        (they would leak the group's text to a nonmember), file
-        transfers cannot be forwarded (they have no text), and a
-        received message from a blocked peer cannot be forwarded.  An
-        unreadable block-list fails closed for received messages,
-        matching the CLI.  Forwarding your own sent message attributes
-        it as "you"; a received message is re-resolved against the
-        registry so a newer alias wins, falling back to the name
-        recorded when the message arrived.
+        Exactly one of ``to`` and ``group`` is required.  Same guards
+        as the CLI: group messages cannot be forwarded (they would leak
+        the group's text to a nonmember), file transfers cannot be
+        forwarded (they have no text), and a received message from a
+        blocked peer cannot be forwarded.  An unreadable block-list
+        fails closed for received messages, matching the CLI.
+        Forwarding your own sent message attributes it as "you"; a
+        received message is re-resolved against the registry so a newer
+        alias wins, falling back to the name recorded when the message
+        arrived.
         """
         if not isinstance(target, int) or isinstance(target, bool) or target < 1:
             raise ValueError("message id is required")
-        if not isinstance(to, str) or not to.strip():
+        if to is not None and (not isinstance(to, str) or not to.strip()):
             raise ValueError("target peer is required")
+        if group is not None and (
+            not isinstance(group, str) or not group.strip()
+        ):
+            raise ValueError("target group is required")
+        if (to is None) == (group is None):
+            raise ValueError(
+                "exactly one of 'to' and 'group' is required"
+            )
         with self._lock:
             entry = next(
                 (
@@ -4964,7 +4981,18 @@ class WebBridge:
                 f"message is too long to forward "
                 f"({len(forwarded)} > {MAX_MESSAGE_CHARS} characters)"
             )
-        message, response = self.send_message(to.strip(), forwarded, timeout=timeout)
+        if group is not None:
+            messages, response = self.send_group_message(
+                group.strip(), forwarded, timeout=timeout
+            )
+            return {
+                "ok": bool(response.get("ok", True)),
+                "messages": messages,
+                "response": response,
+            }
+        message, response = self.send_message(
+            to.strip(), forwarded, timeout=timeout
+        )
         return {"ok": True, "message": message, "response": response}
 
     def pin_message(self, target: int) -> Dict[str, Any]:
@@ -9152,9 +9180,30 @@ class _WebHandler(BaseHTTPRequestHandler):
             )
             return
         to = body.get("to")
-        if not isinstance(to, str) or not to.strip():
+        group = body.get("group")
+        if to is not None and (not isinstance(to, str) or not to.strip()):
             self._send_json(
-                {"error": {"message": "field 'to' is required"}},
+                {"error": {"message": "field 'to' must be a peer name"}},
+                head_only,
+                400,
+            )
+            return
+        if group is not None and (
+            not isinstance(group, str) or not group.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'group' must be a group name"}},
+                head_only,
+                400,
+            )
+            return
+        if (to is None) == (group is None):
+            self._send_json(
+                {
+                    "error": {
+                        "message": "exactly one of 'to' and 'group' is required"
+                    }
+                },
                 head_only,
                 400,
             )
@@ -9162,7 +9211,10 @@ class _WebHandler(BaseHTTPRequestHandler):
         timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
         try:
             result = self.bridge.forward_message(
-                target, to.strip(), timeout=timeout
+                target,
+                to.strip() if isinstance(to, str) else None,
+                timeout=timeout,
+                group=group.strip() if isinstance(group, str) else None,
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)

@@ -5410,6 +5410,18 @@ def test_parser_forward_arguments():
     assert multi.to == ["alice", "bob"]
     assert multi.wait == 5.0
 
+    group = parser.parse_args(["forward", "--group", "weekend", "abcdef12"])
+    assert group.to is None
+    assert group.group == "weekend"
+    assert group.message == "abcdef12"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["forward", "abcdef12"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["forward", "--to", "bob", "--group", "weekend", "abcdef12"]
+        )
+
 
 def test_forward_sends_attributed_text(tmp_path, capsys, monkeypatch):
     data_dir, _ = _seed_reply_conversation(tmp_path)
@@ -5421,6 +5433,42 @@ def test_forward_sends_attributed_text(tmp_path, capsys, monkeypatch):
     assert target == "bob"
     assert text == "Forwarded from alice:\noriginal thought"
     assert "delivered to bob" in capsys.readouterr().out
+
+
+def test_forward_to_group_fans_out_attributed_text(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.groups import GroupStore
+
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    store = GroupStore(config.groups_path)
+    store.create("weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        ["forward", "--data-dir", str(tmp_path / "node"), "--group", "weekend", "aaaa"]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.sent) == 1
+    group, text, _ = node.sent[0]
+    assert group["name"] == "weekend"
+    assert text == "Forwarded from alice:\noriginal thought"
+    assert "delivered to alice" in capsys.readouterr().out
+
+
+def test_forward_to_group_unknown_group_is_an_error(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        ["forward", "--data-dir", str(tmp_path / "node"), "--group", "nope", "aaaa"]
+    )
+    assert code == 1
+    assert "unknown group" in capsys.readouterr().err
 
 
 def test_forward_prefers_registry_alias_for_sender_label(

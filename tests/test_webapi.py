@@ -10768,6 +10768,65 @@ def test_forward_message_endpoint_forwards_received_message(bridge, node):
     assert [entry["id"] for entry in feed["messages"]] == [1, 2]
 
 
+def test_forward_message_endpoint_forwards_to_group(bridge, node):
+    from tau.blocklist import BlockList
+
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList())
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "group": "crew"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert "message" not in payload
+    assert [entry["text"] for entry in payload["messages"]] == [
+        "Forwarded from alice:\nhello there",
+        "Forwarded from alice:\nhello there",
+    ]
+    assert all(entry["group_name"] == "crew" for entry in payload["messages"])
+    assert node.group_sent == [("crew", "Forwarded from alice:\nhello there")]
+    # The original stays in the feed, plus one entry per member leg.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [1, 2, 3]
+
+
+def test_forward_message_endpoint_rejects_both_or_neither_target(bridge, node):
+    from tau.blocklist import BlockList
+
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList())
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1},
+    )
+    assert status == 400
+    assert "exactly one of 'to' and 'group'" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice", "group": "crew"},
+    )
+    assert status == 400
+    assert "exactly one of 'to' and 'group'" in payload["error"]["message"]
+
+    # An unknown group is a plain 400, like an unknown peer.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "group": "nope"},
+    )
+    assert status == 400
+    assert "unknown group" in payload["error"]["message"]
+
+
 def test_forward_message_endpoint_attributes_own_message_as_you(bridge, node):
     _sent_console_entry(bridge, node)
     status, _, payload = _json(
@@ -10885,7 +10944,7 @@ def test_forward_message_endpoint_rejects_unknown_and_bad_input(bridge, node):
         bridge, "/api/messages/forward", method="POST", body={"id": 1}
     )
     assert status == 400
-    assert "field 'to'" in payload["error"]["message"]
+    assert "exactly one of 'to' and 'group'" in payload["error"]["message"]
     assert node.sent == []
 
 

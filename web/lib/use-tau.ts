@@ -25,6 +25,7 @@ import type {
   DropHeldResponse,
   EditMessageResponse,
   ForgetPeerResponse,
+  ForwardGroupMessageResponse,
   ForwardMessageResponse,
   GroupsResponse,
   HeldMailEntry,
@@ -985,6 +986,72 @@ export function useTau() {
       }
       // Null when the forwarded copy went out but was retracted before
       // the console record landed.
+      return sent;
+    },
+    [refreshOutbox],
+  );
+
+  const forwardMessageToGroup = useCallback(
+    async (id: number, group: string) => {
+      const result = await apiPost<ForwardGroupMessageResponse>(
+        "/api/messages/forward",
+        { id, group },
+      );
+      // One forwarded copy per member: append them locally at once,
+      // like `sendGroup`, and let the SSE event reconcile other tabs.
+      const sent = result.messages;
+      if (sent.length > 0) {
+        setMessages((previous) => {
+          const known = new Set(previous.map((entry) => entry.id));
+          const fresh = sent.filter((entry) => !known.has(entry.id));
+          if (fresh.length === 0) return previous;
+          return [...previous, ...fresh].sort((a, b) => a.id - b.id);
+        });
+        // Do not advance snapshotMax here: the legs are not a complete
+        // view up to their highest id, and an inbound message recorded
+        // between two legs must still be accepted from its SSE event.
+      }
+      // A queued leg lands in the outbox; refresh so it shows at once
+      // instead of waiting for the next poll. Best-effort: a failed
+      // refresh must not report a successful send as failed.
+      try {
+        await refreshOutbox();
+      } catch {
+        // The next poll picks the entry up.
+      }
+      if (!result.ok) {
+        // Same summary as `sendGroup`: the legs are already in the feed
+        // with their own statuses, so name the members who missed it
+        // and those who already have it (or a queued copy).
+        const legs = (result.response.results as Array<
+          Record<string, unknown>
+        >) ?? [];
+        const failed = legs.filter((leg) => !leg.delivered && !leg.queued);
+        const deliveredNames = legs
+          .filter((leg) => leg.delivered)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const queuedNames = legs
+          .filter((leg) => leg.queued)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const names = failed.map((leg) =>
+          String(leg.to_name || leg.to || "a member").slice(0, 8),
+        );
+        const already = [
+          ...(deliveredNames.length > 0
+            ? [`${deliveredNames.join(", ")} already received this`]
+            : []),
+          ...(queuedNames.length > 0
+            ? [`${queuedNames.join(", ")} have a copy queued`]
+            : []),
+        ].join("; ");
+        throw new Error(
+          names.length > 0
+            ? already.length > 0
+              ? `could not forward to ${names.join(", ")} — ${already}`
+              : `could not forward to ${names.join(", ")}`
+            : "could not forward to the group",
+        );
+      }
       return sent;
     },
     [refreshOutbox],
@@ -2055,6 +2122,7 @@ export function useTau() {
     editMessage,
     retractMessage,
     forwardMessage,
+    forwardMessageToGroup,
     sendGroup,
     sendFile,
     ping,

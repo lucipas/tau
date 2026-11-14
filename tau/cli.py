@@ -469,14 +469,19 @@ def build_parser() -> argparse.ArgumentParser:
     forward = subparsers.add_parser(
         "forward",
         parents=[common],
-        help="forward a stored message to a peer",
+        help="forward a stored message to a peer or a group",
     )
-    forward.add_argument(
+    forward_target = forward.add_mutually_exclusive_group(required=True)
+    forward_target.add_argument(
         "--to",
         action="append",
-        required=True,
         metavar="NAME|HASH",
         help="peer name or destination hash (repeatable: forward to several peers)",
+    )
+    forward_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: forward into the group instead of to a peer",
     )
     forward.add_argument(
         "message",
@@ -6606,13 +6611,15 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
-    """Forward a stored message to another peer, attributed to its sender.
+    """Forward a stored message to another peer or into a group, attributed
+    to its sender.
 
     The forwarded text is the original prefixed with one attribution
     line, so the recipient sees who said it on any transport with no
-    protocol change.  Delivery reuses :func:`cmd_send` wholesale — the
-    forward is a new message, so it carries no expiry, kind, or reply
-    chain from the original.
+    protocol change.  Delivery reuses :func:`cmd_send` wholesale for a
+    peer target — or :func:`cmd_group_send` for a group target, fanning
+    out one leg per member.  Either way the forward is a new message,
+    so it carries no expiry, kind, or reply chain from the original.
     """
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -6674,7 +6681,11 @@ def cmd_forward(args: argparse.Namespace) -> int:
         )
     # `cmd_send` reads its text from `args.message`; hand it the
     # attributed text and let it own delivery, queueing, and output.
+    # A group target takes the group-send path instead: the same
+    # attributed text, fanned out one leg per member.
     args.message = forwarded
+    if getattr(args, "group", None):
+        return cmd_group_send(args)
     return cmd_send(args)
 
 
@@ -8621,6 +8632,17 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Same --wait validation as the peer send path (`cmd_send`).
+    wait = float(getattr(args, "wait", None) or 0.0)
+    if not math.isfinite(wait):
+        print("error: --wait must be a finite number of seconds", file=sys.stderr)
+        return 2
+    if wait < 0:
+        print("error: --wait must not be negative", file=sys.stderr)
+        return 2
+    if getattr(args, "wait", None) is not None and getattr(args, "no_queue", False):
+        print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
+        return 2
     text = _read_message(args)
     config = _make_config(args)
     expires_at = None
@@ -8669,9 +8691,19 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             expires_at=expires_at,
             send_after=send_after,
         )
+        # --wait replaces the one-shot flush: wait for each queued leg
+        # for the requested duration, recording delivered or still
+        # queued outcomes. Only queued legs go to the helper, since it
+        # treats any other leg without an "ok" key as delivered.
+        if wait > 0:
+            _wait_for_queued_sends(
+                node,
+                [result for result in response["results"] if result.get("queued")],
+                wait,
+            )
         # One-shot send: give reachable members a brief chance to take
         # a queued leg before this process exits.
-        if any(result.get("queued") for result in response["results"]):
+        elif any(result.get("queued") for result in response["results"]):
             node.flush_outbox(timeout=3.0, max_peers=5)
             for result in response["results"]:
                 if not result.get("queued"):

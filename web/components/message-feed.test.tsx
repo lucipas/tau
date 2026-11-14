@@ -552,12 +552,14 @@ describe("MessageFeed forward", () => {
     );
 
     fireEvent.click(screen.getByLabelText("Forward this message"));
-    expect(screen.getByLabelText("Forward to a peer")).toBeTruthy();
+    expect(screen.getByLabelText("Forward to a peer or group")).toBeTruthy();
     fireEvent.click(screen.getByTitle("Forward to bob"));
     expect(onForward).toHaveBeenCalledTimes(1);
     expect(onForward).toHaveBeenCalledWith(message, "cd".repeat(16));
     await waitFor(() =>
-      expect(screen.queryByLabelText("Forward to a peer")).toBeNull(),
+      expect(
+        screen.queryByLabelText("Forward to a peer or group"),
+      ).toBeNull(),
     );
   });
 
@@ -599,23 +601,83 @@ describe("MessageFeed forward", () => {
     await waitFor(() =>
       expect(screen.getByText("forward failed: boom")).toBeTruthy(),
     );
-    expect(screen.getByLabelText("Forward to a peer")).toBeTruthy();
+    expect(screen.getByLabelText("Forward to a peer or group")).toBeTruthy();
   });
 
-  it("says so when there are no known peers", () => {
+  it("says so when there are no known peers or groups", () => {
     const onForward = vi.fn(async () => {});
     render(
       <MessageFeed
         messages={[makeMessage()]}
         node={null}
         peers={[]}
+        groups={[]}
         live={true}
         onForward={onForward}
       />,
     );
     fireEvent.click(screen.getByLabelText("Forward this message"));
-    expect(screen.getByText("no known peers yet")).toBeTruthy();
+    expect(screen.getByText("no known peers or groups yet")).toBeTruthy();
     expect(onForward).not.toHaveBeenCalled();
+  });
+
+  it("opens a group picker and forwards to the picked group", async () => {
+    const message = makeMessage();
+    const onForwardGroup = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        peers={[]}
+        groups={[
+          {
+            id: "ab".repeat(16),
+            name: "weekend",
+            members: [],
+            created_at: 1000,
+          },
+        ]}
+        live={true}
+        onForward={vi.fn(async () => {})}
+        onForwardGroup={onForwardGroup}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText("Forward this message"));
+    expect(screen.getByLabelText("Forward to a peer or group")).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Forward to group weekend"));
+    expect(onForwardGroup).toHaveBeenCalledTimes(1);
+    expect(onForwardGroup).toHaveBeenCalledWith(message, "ab".repeat(16));
+    await waitFor(() =>
+      expect(
+        screen.queryByLabelText("Forward to a peer or group"),
+      ).toBeNull(),
+    );
+  });
+
+  it("offers groups alongside peers in the same picker", () => {
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        peers={peers}
+        groups={[
+          {
+            id: "ab".repeat(16),
+            name: "weekend",
+            members: [],
+            created_at: 1000,
+          },
+        ]}
+        live={true}
+        onForward={vi.fn(async () => {})}
+        onForwardGroup={vi.fn(async () => {})}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText("Forward this message"));
+    expect(screen.getByTitle("Forward to bob")).toBeTruthy();
+    expect(screen.getByText("#weekend")).toBeTruthy();
   });
 });
 
