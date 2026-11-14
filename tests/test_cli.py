@@ -5278,7 +5278,11 @@ def test_group_send_wait_delivers_while_waiting(
     )
     assert code == 0
     node = _FakeGroupSendNode.instances[0]
-    assert node.wait_calls == [("f" * 32, 5.0), ("e" * 32, 5.0)]
+    # The legs share one 5s deadline: the second leg gets whatever
+    # budget remains, never a fresh 5s.
+    assert [call[0] for call in node.wait_calls] == ["f" * 32, "e" * 32]
+    assert node.wait_calls[0][1] == pytest.approx(5.0, abs=0.05)
+    assert 0 < node.wait_calls[1][1] <= node.wait_calls[0][1]
     out = capsys.readouterr().out
     assert "delivered to alice after" in out
     assert "delivered to bob after" in out
@@ -5314,7 +5318,11 @@ def test_group_send_wait_times_out_with_nonzero_exit(
     )
     assert code == 1
     node = _FakeGroupSendNode.instances[0]
-    assert node.wait_calls == [("f" * 32, 5.0), ("e" * 32, 5.0)]
+    # The legs share one 5s deadline: the second leg gets whatever
+    # budget remains, never a fresh 5s.
+    assert [call[0] for call in node.wait_calls] == ["f" * 32, "e" * 32]
+    assert node.wait_calls[0][1] == pytest.approx(5.0, abs=0.05)
+    assert 0 < node.wait_calls[1][1] <= node.wait_calls[0][1]
     out = capsys.readouterr().out
     assert "still queued for alice after" in out
     assert "still queued for bob after" in out
@@ -5596,7 +5604,11 @@ def test_forward_to_group_waits_for_queued_legs(
     )
     assert code == 0
     node = _FakeGroupSendNode.instances[0]
-    assert node.wait_calls == [("f" * 32, 5.0), ("e" * 32, 5.0)]
+    # The legs share one 5s deadline: the second leg gets whatever
+    # budget remains, never a fresh 5s.
+    assert [call[0] for call in node.wait_calls] == ["f" * 32, "e" * 32]
+    assert node.wait_calls[0][1] == pytest.approx(5.0, abs=0.05)
+    assert 0 < node.wait_calls[1][1] <= node.wait_calls[0][1]
     assert "delivered to alice" in capsys.readouterr().out
 
 
