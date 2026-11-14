@@ -187,10 +187,14 @@ export function SocialConsole() {
         setShowScheduled(true);
         return;
       }
-      await tan.publish(text.trim(), replyTarget?.hash, expireSeconds ?? undefined);
+      const submittedExpire = expireSeconds;
+      await tan.publish(text.trim(), replyTarget?.hash, submittedExpire ?? undefined);
       setText("");
       setReplyTarget(null);
-      setExpireSeconds(null);
+      // Clear the expiry only if it still belongs to this post.
+      setExpireSeconds((current) =>
+        current === submittedExpire ? null : current,
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not publish");
     }
