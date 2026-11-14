@@ -1092,6 +1092,7 @@ export function SocialConsole() {
                     onRepost={submitRepost}
                     onReply={(target) => setReplyTarget(target)}
                     onDelete={submitDelete}
+                    onHide={submitHide}
                     onOpenThread={(target) => void tan.openThread(target.hash)}
                     deleting={deleting}
                   />
@@ -1629,6 +1630,7 @@ function ThreadView({
   onRepost,
   onReply,
   onDelete,
+  onHide,
   onOpenThread,
   deleting,
 }: {
@@ -1639,6 +1641,7 @@ function ThreadView({
   onRepost: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
+  onHide: (post: TanPost) => void;
   onOpenThread: (post: TanPost) => void;
   deleting: ReadonlySet<string>;
 }) {
@@ -1662,6 +1665,7 @@ function ThreadView({
             onRepost={onRepost}
             onReply={onReply}
             onDelete={onDelete}
+            onHide={onHide}
             deleting={deleting.has(post.hash)}
             onOpenThread={onOpenThread}
           />
