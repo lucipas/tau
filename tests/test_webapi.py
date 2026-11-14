@@ -20,7 +20,7 @@ import RNS
 from tau import cli
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
 from tau.backup import MANIFEST_NAME, restore_backup
-from tau.blocklist import BlockList
+from tau.blocklist import BlockList, save_blocklist
 from tau.config import TauConfig
 from tau.groups import GroupStore
 from tau.identity import destination_hash, load_identity
@@ -157,6 +157,9 @@ class FakeNode:
             identity_path=data_dir / "identity",
             social_db_path=data_dir / "social.db",
             tan_rules_path=data_dir / "tan-rules.json",
+            dm_requests_path=data_dir / "dm-requests.json",
+            allowlist_path=data_dir / "allowlist.json",
+            blocklist_path=data_dir / "blocklist.json",
         )
         self._allowlist = AllowList()
         self._allowlist_lock = threading.RLock()
@@ -8839,6 +8842,249 @@ def test_delete_message_endpoint_rejects_unknown_and_bad_ids(bridge):
     )
     assert status == 400
     assert "field 'id'" in payload["error"]["message"]
+
+
+def _record_dm_request(bridge, *, request_id="req-1", sender=PEER_HASH, now=None):
+    from tau.dm_requests import DM_REQUEST_TTL, DmRequest, record_dm_request
+
+    moment = time.time() if now is None else now
+    record_dm_request(
+        bridge.node.config.dm_requests_path,
+        DmRequest(
+            id=request_id,
+            sender=sender,
+            text="hello, let me in",
+            kind="message",
+            sent_at=moment - 1,
+            received_at=moment,
+            request_expires_at=moment + DM_REQUEST_TTL,
+        ),
+        now=moment,
+    )
+
+
+def test_dm_requests_endpoint_lists_held_requests(bridge):
+    status, _, payload = _json(bridge, "/api/messages/requests")
+    assert status == 200
+    assert payload == {"requests": [], "count": 0}
+
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    _record_dm_request(bridge, request_id="req-2", sender=OTHER_HASH)
+    status, _, payload = _json(bridge, "/api/messages/requests")
+    assert status == 200
+    assert payload["count"] == 2
+    assert [entry["id"] for entry in payload["requests"]] == ["req-1", "req-2"]
+    # The sender's display name comes from the node's registry; an
+    # unknown peer falls back to the short hash.
+    assert payload["requests"][0]["sender_name"] == "alice"
+    assert payload["requests"][1]["sender_name"] == OTHER_HASH[:8]
+
+
+def test_accept_dm_request_endpoint_delivers_and_allowlists(bridge, node):
+    save_allowlist(
+        node.config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset()),
+    )
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/accept",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 200
+    assert payload["accepted"]["id"] == "req-1"
+    assert payload["delivered"] is True
+    assert payload["allowlisted"] is True
+    assert payload["skipped"] is None
+    # The sender is allow-listed, the request is gone, the message is
+    # in the inbox and mirrored into the console feed.
+    assert PEER_HASH in load_allowlist(node.config.allowlist_path).allow
+    _, _, listed = _json(bridge, "/api/messages/requests")
+    assert listed == {"requests": [], "count": 0}
+    assert [entry["id"] for entry in node.inbox.list_messages()] == ["req-1"]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["wire_id"] for entry in feed["messages"]] == ["req-1"]
+    assert feed["messages"][0]["text"] == "hello, let me in"
+
+
+def test_accept_dm_request_endpoint_rejects_unknown_and_blocked(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/accept",
+        method="POST",
+        body={"id": "nope"},
+    )
+    assert status == 400
+    assert "no DM request" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/accept",
+        method="POST",
+        body={},
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    save_blocklist(
+        node.config.blocklist_path, BlockList(blocked=frozenset({PEER_HASH}))
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/accept",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 400
+    assert "blocked" in payload["error"]["message"]
+    # Nothing was allow-listed or delivered. The request stays in the
+    # store, but the console list hides blocked senders, like the rest
+    # of the console hides their content.
+    _, _, listed = _json(bridge, "/api/messages/requests")
+    assert listed["count"] == 0
+    from tau.dm_requests import list_dm_requests
+
+    assert len(list_dm_requests(node.config.dm_requests_path)) == 1
+    assert node.inbox.list_messages() == []
+
+
+def test_decline_dm_request_endpoint_drops_request(bridge, node):
+    save_allowlist(
+        node.config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset()),
+    )
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/decline",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 200
+    assert payload["declined"]["id"] == "req-1"
+    _, _, listed = _json(bridge, "/api/messages/requests")
+    assert listed == {"requests": [], "count": 0}
+    assert PEER_HASH not in load_allowlist(node.config.allowlist_path).allow
+    assert node.inbox.list_messages() == []
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/decline",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 400
+    assert "no DM request" in payload["error"]["message"]
+
+
+def test_dm_requests_endpoint_hides_blocked_senders(bridge, node):
+    # The console list hides blocked senders' requests, like the rest
+    # of the console hides their content; the CLI can still decline
+    # them, and the store keeps them.
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    _record_dm_request(bridge, request_id="req-2", sender=OTHER_HASH)
+    save_blocklist(
+        node.config.blocklist_path, BlockList(blocked=frozenset({PEER_HASH}))
+    )
+    status, _, payload = _json(bridge, "/api/messages/requests")
+    assert status == 200
+    assert payload["count"] == 1
+    assert [entry["id"] for entry in payload["requests"]] == ["req-2"]
+    from tau.dm_requests import list_dm_requests
+
+    assert len(list_dm_requests(node.config.dm_requests_path)) == 2
+
+
+def test_accept_dm_request_endpoint_store_failure_is_503(
+    bridge, node, monkeypatch
+):
+    # A store write that fails during acceptance is a 503, not a 500
+    # crash: the console reports the failed write instead of a server
+    # error page.
+    import tau.dm_requests as dm_requests_mod
+
+    save_allowlist(
+        node.config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset()),
+    )
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dm_requests_mod, "save_dm_requests", failing_save)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/accept",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 503
+    assert "disk full" in payload["error"]["message"]
+
+
+def test_decline_dm_request_endpoint_store_failure_is_503(
+    bridge, node, monkeypatch
+):
+    import tau.dm_requests as dm_requests_mod
+
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dm_requests_mod, "save_dm_requests", failing_save)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/decline",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 503
+    assert "disk full" in payload["error"]["message"]
+
+
+def test_accept_dm_request_endpoint_without_inbox_is_503(bridge, node):
+    # A missing inbox is a missing capability, not rate limiting: the
+    # endpoint answers 503 instead of the top-level 429.
+    node.inbox = None
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/accept",
+        method="POST",
+        body={"id": "req-1"},
+    )
+    assert status == 503
+    assert "no message inbox" in payload["error"]["message"]
+
+
+def test_mirror_rejects_removed_wire_id_when_asked(bridge):
+    # A retraction that landed after a record was stored must not be
+    # mirrored back into the feed: the guarded mirror refuses a wire
+    # id the console already removed, like the live inbound path.
+    record = {
+        "id": "wire-1",
+        "destination": PEER_HASH,
+        "from": "alice",
+        "text": "take this back",
+        "kind": "message",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "direction": "in",
+    }
+    with bridge._lock:
+        bridge._remember_removed_wire_id("wire-1")
+    bridge._mirror_imported_messages([record], reject_removed_wire_id=True)
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    # The import path does not ask for the guard: a restore mirrors
+    # the record regardless, as before.
+    bridge._mirror_imported_messages([record])
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["wire_id"] for entry in feed["messages"]] == ["wire-1"]
 
 
 def _sent_console_entry(bridge, node, *, wire_id="wire-1", **overrides):

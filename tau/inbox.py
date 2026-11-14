@@ -749,16 +749,30 @@ class Inbox:
         ignored, so a caller that must not acknowledge unstored state
         (accepting a held DM request) never reports a delivery that
         never landed on disk.  The live delivery path keeps the
-        default, so a failed persist there never breaks delivery.
+        default, so a failed persist there never breaks delivery.  A
+        failed strict persist also restores the in-memory state, so a
+        retry re-attempts the store instead of finding a phantom copy.
         """
         entry = _valid_record(record)
         if entry is None:
             raise ValueError("inbox record needs text")
         with self._transaction():
-            entry["seq"] = self._next_seq()
-            self._messages.append(entry)
-            self._messages = _retain(self._messages)
-            self._save(strict=strict)
+            previous_messages = list(self._messages)
+            try:
+                entry["seq"] = self._next_seq()
+                self._messages.append(entry)
+                self._messages = _retain(self._messages)
+                self._save(strict=strict)
+            except OSError:
+                # A failed strict persist must not leave the record in
+                # memory: a later find would treat the unpersisted copy
+                # as delivered — a web retry reuses this Inbox, so an
+                # accept retried after a failed persist would mark the
+                # id seen and drop the request for a message that never
+                # reached disk, and a restart would lose it outright.
+                # Restore and re-raise, like append_group_message.
+                self._messages = previous_messages
+                raise
         return entry
 
     def add_note(self, text: str, *, sender_name: str, destination: str) -> Dict[str, Any]:
@@ -1107,9 +1121,18 @@ class Inbox:
         back, and another process committing between that read and
         write would have its entries overwritten.  Under the flock the
         purge write is serialised with every other commit.
+
+        A missing file means no message was ever persisted — a load
+        leaves the cache untouched, so the reload clears the message
+        list itself: a copy held only in memory (a persist that never
+        landed) must not survive as if it were stored.  Reactions
+        and read cursors are left alone: a reload can run after a
+        record reported success, and only the message list is ever
+        trusted as proof of delivery.
         """
         with self._transaction():
-            pass
+            if self.path is not None and not self.path.exists():
+                self._messages = []
 
     def _stamp_read_ids(
         self, message_ids: List[str], *, at: Optional[float] = None

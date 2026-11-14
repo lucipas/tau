@@ -8,6 +8,7 @@ import type { TauMessage } from "@/lib/types";
 import { BundleSection } from "./bundle-section";
 import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
+import { DmRequestsSection } from "./dm-requests-section";
 import { DoctorSection } from "./doctor-section";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
@@ -283,6 +284,13 @@ export function Console() {
                 }
               }}
             />
+            <div className="mt-4">
+              <DmRequestsSection
+                requests={tau.dmRequests}
+                onAccept={tau.acceptDmRequest}
+                onDecline={tau.declineDmRequest}
+              />
+            </div>
             {/* Stays mounted when the queue empties so a retry's result
                 line survives the last entry leaving; it renders nothing
                 itself when there is nothing to show. */}

@@ -1676,3 +1676,77 @@ describe("useTau allowlist polling", () => {
     expect(allowlistCalls).toBeGreaterThanOrEqual(2);
   });
 });
+
+describe("useTau acceptDmRequest", () => {
+  it("does not let a stale messages refresh resurrect a retracted message, and refreshes the allow-list", async () => {
+    const msg = makeMessage({ id: 2, text: "held hello" });
+    const firstAllowlist = { enabled: true, entries: [] };
+    const secondAllowlist = {
+      enabled: true,
+      entries: [{ destination: PEER_HASH, name: "alice" }],
+    };
+    let allowlistCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path === "/api/allowlist") {
+        allowlistCalls += 1;
+        return Promise.resolve(
+          allowlistCalls === 1 ? firstAllowlist : secondAllowlist,
+        );
+      }
+      if (path === "/api/messages/requests") {
+        return Promise.resolve({ requests: [], count: 0 });
+      }
+      if (path === "/api/messages?limit=200") {
+        // A stale response that still carries the retracted message.
+        return Promise.resolve({ messages: [msg], count: 1 });
+      }
+      if (path === "/api/peers") {
+        return Promise.resolve({ peers: [], count: 0 });
+      }
+      if (path === "/api/outbox") {
+        return Promise.resolve({ outbox: [], count: 0, held_for_others: 0 });
+      }
+      return Promise.resolve({ groups: [], count: 0 });
+    });
+    mockedPost.mockResolvedValue({
+      accepted: {
+        id: "req-1",
+        sender: PEER_HASH,
+        sender_name: "alice",
+        text: "held hello",
+        kind: "message",
+        sent_at: 1000,
+        received_at: 1000,
+        request_expires_at: 1000 + 7 * 24 * 60 * 60,
+      },
+      delivered: true,
+      allowlisted: true,
+      skipped: null,
+    });
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], [msg]) });
+    });
+    expect(result.current.messages).toEqual([msg]);
+
+    // The message is retracted while the accept's refresh is in flight.
+    await act(async () => {
+      source.emit("message_deleted", { message_id: 2 });
+    });
+    expect(result.current.messages).toEqual([]);
+
+    await act(async () => {
+      await result.current.acceptDmRequest("req-1");
+    });
+
+    // The stale refresh must not put the retracted message back.
+    expect(result.current.messages).toEqual([]);
+    // The accept changed the running node's allow-list, so the panel
+    // must refresh instead of waiting for the next 15s poll.
+    expect(allowlistCalls).toBeGreaterThanOrEqual(2);
+    expect(result.current.allowlist).toEqual(secondAllowlist);
+  });
+});

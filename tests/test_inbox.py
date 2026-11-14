@@ -2055,6 +2055,31 @@ def test_append_group_message_save_failure_restores_state(tmp_path, monkeypatch)
     assert kept[0]["reaction"] == "👍"
 
 
+def test_append_strict_save_failure_restores_state(tmp_path, monkeypatch):
+    # A failed strict persist raises and leaves no phantom behind: a
+    # later find must not treat the unpersisted copy as delivered, or
+    # a retry would mark it seen for a message that never reached
+    # disk. The retry re-attempts the store instead.
+    inbox = Inbox(tmp_path / "inbox.json")
+    original_save = inbox._save
+    calls = []
+
+    def flaky_save(*args, **kwargs):
+        if not calls:
+            calls.append(1)
+            raise OSError("disk full")
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(inbox, "_save", flaky_save)
+    with pytest.raises(OSError):
+        inbox.append(_record(id="msg-1"), strict=True)
+    assert inbox.find("msg-1") is None
+    assert inbox.list_messages() == []
+    inbox.append(_record(id="msg-1"), strict=True)
+    assert inbox.find("msg-1") is not None
+    assert [entry["id"] for entry in inbox.list_messages()] == ["msg-1"]
+
+
 def test_resolve_ambiguous_prefix(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="abcdef01" + "0" * 24))

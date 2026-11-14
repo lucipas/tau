@@ -55,6 +55,13 @@ script) can read what arrives from the mesh and send messages back:
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
+    GET  /api/messages/requests list DMs held for review from peers
+                           outside the allow-list
+    POST /api/messages/requests/accept accept ``{"id": "<request id>"}``:
+                           allow-list the sender and deliver the held
+                           message into the inbox
+    POST /api/messages/requests/decline decline ``{"id": "<request id>"}``:
+                           drop the held request without allow-listing
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
     GET  /api/backup       download a backup archive of the data directory
@@ -148,9 +155,15 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
-from .allowlist import AllowListError, clean_destination
+from .allowlist import AllowList, AllowListError, clean_destination
+from .dm_requests import (
+    DmRequestsError,
+    accept_dm_request as accept_held_dm_request,
+    list_dm_requests,
+    remove_dm_request,
+)
 from .backup import BackupError, create_backup
-from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
+from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
     MESSAGES_FILE_NAME,
@@ -3012,7 +3025,12 @@ class WebBridge:
             result["unread"] = unread
         return result
 
-    def _mirror_imported_messages(self, records: List[Dict[str, Any]]) -> None:
+    def _mirror_imported_messages(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        reject_removed_wire_id: bool = False,
+    ) -> None:
         """Append newly imported inbox records to the console feed.
 
         The feed is the console's own log, not a view of the inbox,
@@ -3022,7 +3040,10 @@ class WebBridge:
         live traffic uses in :meth:`record_inbound`; a disappearing
         message whose deadline already passed is skipped — the feed
         purges it on read anyway — and the log is saved once, not
-        once per entry.
+        once per entry.  With *reject_removed_wire_id* a record whose
+        wire id was removed since it was stored (a retraction that
+        landed after the store) is not mirrored back, like the live
+        inbound path in :meth:`record_inbound`.
         """
         names = {
             item["destination"]: item["name"]
@@ -3106,6 +3127,7 @@ class WebBridge:
                 in_reply_to=record.get("in_reply_to"),
                 file=file_meta,
                 save=False,
+                reject_removed_wire_id=reject_removed_wire_id,
             )
             if message is None:
                 # A retracted outbound send the import would otherwise
@@ -3156,6 +3178,132 @@ class WebBridge:
                     message["reactions"], rosters.get(group_id)
                 )
             self.bus.publish({"type": "message", "message": message})
+
+    def dm_requests(self) -> List[Dict[str, Any]]:
+        """Held DM requests, oldest first, with the sender's display name.
+
+        The same list ``tau messages requests`` prints, so the console
+        reviews exactly what the CLI reviews.  Names come from the
+        node's live registry, like the rest of the console.  Requests
+        from blocked senders are hidden, like the rest of the console
+        hides blocked senders' content: the owner declines those from
+        the CLI.  An unreadable block-list hides everything (fail
+        closed), matching the node.
+        """
+        config = self.node.config
+        registry = getattr(self.node, "registry", None)
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            return []
+        requests = []
+        for request in list_dm_requests(config.dm_requests_path):
+            if request.sender in blocked:
+                continue
+            peer = registry.get(request.sender) if registry is not None else None
+            sender_name = (
+                peer.display_name
+                if peer is not None
+                else short_hash(request.sender)
+            )
+            requests.append({**request.to_dict(), "sender_name": sender_name})
+        return requests
+
+    def accept_dm_request(self, ref: str) -> Dict[str, Any]:
+        """Accept one held DM request: allow-list the sender, deliver the message.
+
+        The acceptance itself is
+        :func:`tau.dm_requests.accept_dm_request`, shared with the
+        CLI — this method only resolves the sender's display name,
+        mirrors a delivered message into the console feed, and tells
+        other consoles the unread counts changed.  Raises
+        ``ValueError`` for an unknown request, a blocked sender, an
+        unreadable block-list, or a delivery that could not be
+        persisted.
+        """
+        config = self.node.config
+        registry = getattr(self.node, "registry", None)
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise WebBridgeError("this node has no message inbox")
+        mailbox = getattr(self.node, "mailbox", None)
+        if mailbox is None:
+            raise WebBridgeError("this node has no mailbox")
+
+        def sender_name(sender: str) -> str:
+            # Resolved under the request-store lock, from the request
+            # actually accepted.
+            peer = registry.get(sender) if registry is not None else None
+            return peer.display_name if peer is not None else short_hash(sender)
+
+        def allow_sender(sender: str) -> bool:
+            # Changes the running node's allow-list, so the sender is
+            # admitted at once and the console's view and the saved
+            # file stay in step.  Returns whether the sender was added.
+            added = False
+
+            def add(current: AllowList) -> AllowList:
+                nonlocal added
+                if sender in current.allow:
+                    return current
+                added = True
+                return current.with_added(sender)
+
+            self.node.update_allowlist(add)
+            return added
+
+        try:
+            acceptance = accept_held_dm_request(
+                dm_requests_path=config.dm_requests_path,
+                allowlist_path=config.allowlist_path,
+                blocklist_path=config.blocklist_path,
+                inbox=inbox,
+                mailbox=mailbox,
+                sender_name=sender_name,
+                ref=ref,
+                allow_sender=allow_sender,
+            )
+        except DmRequestsError as exc:
+            raise ValueError(str(exc)) from exc
+        result = acceptance.to_dict()
+        # A copy already in the feed (an import, or a console accept
+        # that crashed after the mirror) must not be mirrored again:
+        # the feed would show the same wire id twice.
+        with self._lock:
+            in_feed = acceptance.record is not None and any(
+                message.get("wire_id") == acceptance.record.get("id")
+                for message in self._messages
+            )
+        if (
+            acceptance.delivered
+            and acceptance.record is not None
+            and not in_feed
+        ):
+            # The message landed in the inbox directly, bypassing the
+            # node, so mirror it into the console feed like an import
+            # — otherwise the user accepts and sees nothing change.  A
+            # retraction that landed after the helper's check must not
+            # be mirrored back: the removal guard is checked under the
+            # append lock, like the live inbound path.
+            self._mirror_imported_messages(
+                [acceptance.record], reject_removed_wire_id=True
+            )
+            unread = self.unread()
+            self.bus.publish({"type": "unread", "unread": unread})
+            result["unread"] = unread
+        return result
+
+    def decline_dm_request(self, ref: str) -> Dict[str, Any]:
+        """Drop one held DM request without allow-listing its sender.
+
+        The same drop ``tau messages decline-request`` performs.
+        Raises ``ValueError`` for an unknown request.
+        """
+        config = self.node.config
+        try:
+            request = remove_dm_request(config.dm_requests_path, ref)
+        except DmRequestsError as exc:
+            raise ValueError(str(exc)) from exc
+        return {"declined": request.to_dict()}
 
     def tan_export(self, *, all_authors: bool = False) -> Dict[str, Any]:
         """Return the portable backup document the CLI writes.
@@ -6724,6 +6872,21 @@ class _WebHandler(BaseHTTPRequestHandler):
                     items = [item for item in items if item.get("pinned")]
                 self._send_json({"messages": items}, head_only)
                 return
+            if path == "/api/messages/requests":
+                try:
+                    requests = self.bridge.dm_requests()
+                except DmRequestsError as exc:
+                    # An unreadable store is an expected state, not a
+                    # server fault: answer with its message instead of
+                    # a 500 traceback on every console poll.
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                self._send_json(
+                    {"requests": requests, "count": len(requests)}, head_only
+                )
+                return
             if path == "/api/messages/export":
                 # The full inbox backup goes only to the local machine,
                 # even when the bridge is bound to a remote interface.
@@ -7170,6 +7333,12 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages/unpin":
                 self._handle_pin_message(body, head_only, pinned=False)
+                return
+            if path == "/api/messages/requests/accept":
+                self._handle_accept_dm_request(body, head_only)
+                return
+            if path == "/api/messages/requests/decline":
+                self._handle_decline_dm_request(body, head_only)
                 return
             if path == "/api/messages/read":
                 peer = body.get("peer")
@@ -8231,6 +8400,56 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 503)
             return
         self._send_json({"ok": True, "import": result}, head_only)
+
+    def _handle_accept_dm_request(self, body: Dict[str, Any], head_only: bool) -> None:
+        ref = body.get("id")
+        if not isinstance(ref, str) or not ref:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a DM request id"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.accept_dm_request(ref)
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except WebBridgeError as exc:
+            # A missing inbox or mailbox is a missing capability, not
+            # a rate limit: answer 503, like the other handlers do for
+            # a store write that failed.
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_decline_dm_request(self, body: Dict[str, Any], head_only: bool) -> None:
+        ref = body.get("id")
+        if not isinstance(ref, str) or not ref:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a DM request id"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.decline_dm_request(ref)
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except WebBridgeError as exc:
+            # A missing inbox or mailbox is a missing capability, not
+            # a rate limit: answer 503, like the other handlers do for
+            # a store write that failed.
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json(result, head_only)
 
     def _handle_delete_message(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("id")
