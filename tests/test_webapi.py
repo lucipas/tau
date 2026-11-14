@@ -10827,6 +10827,27 @@ def test_forward_message_endpoint_rejects_both_or_neither_target(bridge, node):
     assert "unknown group" in payload["error"]["message"]
 
 
+def test_forward_message_endpoint_reports_failed_group_leg(bridge, node):
+    from tau.blocklist import BlockList
+
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList())
+    node.group_refusals = {BOB_HASH}
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "group": "crew"},
+    )
+    assert status == 200
+    # The fan-out is partial: the top-level ok says so, like the
+    # group-send endpoint, instead of claiming success.
+    assert payload["ok"] is False
+    assert [m["status"] for m in payload["messages"]] == ["delivered", "failed"]
+    assert payload["messages"][1]["peer_name"] == "bob"
+    assert payload["response"]["results"][1]["error"] == "not_allowed"
+
+
 def test_forward_message_endpoint_attributes_own_message_as_you(bridge, node):
     _sent_console_entry(bridge, node)
     status, _, payload = _json(
