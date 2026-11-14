@@ -545,7 +545,11 @@ export function useTan() {
   // switches stay exclusive.
   const setTagFilter = useCallback(
     async (tag: string | null) => {
-      const normalized = tag !== null && tag.trim() !== "" ? tag.trim() : null;
+      // Tags are stored casefolded without the leading '#', matching
+      // the server and the sidebar, so comparisons with them hold.
+      const cleaned =
+        tag === null ? "" : tag.trim().replace(/^#/, "").toLowerCase();
+      const normalized = cleaned !== "" ? cleaned : null;
       if (normalized === tagFilterRef.current) {
         // Re-picking the current tag: setting the same state would
         // bail out without reloading, so refresh directly.
@@ -1129,10 +1133,11 @@ export function useTan() {
           }
           return [result.post, ...previous];
         });
-        await load();
         // A new post can introduce a tag; refresh the list, keeping
-        // the old one on failure.
+        // the old one on failure. Started before the feed refresh so a
+        // failed feed refresh cannot skip it.
         void loadTags().catch(() => undefined);
+        await load();
         return result.post;
       } finally {
         setPosting(false);
@@ -1295,15 +1300,16 @@ export function useTan() {
     async (target: string) => {
       invalidateVerify();
       await apiPost("/api/tan/delete", { target });
+      // A delete can retire a tag; refresh the list, keeping the old
+      // one on failure. Started before the refreshes below so a failed
+      // feed refresh cannot skip it.
+      void loadTags().catch(() => undefined);
       await Promise.all([
         load(),
         refreshSavedIfLoaded(),
         refreshPinnedIfLoaded(),
         refreshHiddenIfLoaded(),
       ]);
-      // A delete can retire a tag; refresh the list, keeping the old
-      // one on failure.
-      void loadTags().catch(() => undefined);
     },
     [
       load,
@@ -1345,11 +1351,14 @@ export function useTan() {
       // alongside the feed.
       await Promise.all([load(), refreshAuthors()]);
       void loadSuggestions().catch(() => undefined);
+      // A sync can bring in posts with new tags; refresh the list,
+      // keeping the old one on failure.
+      void loadTags().catch(() => undefined);
       return result.sync;
     } finally {
       setSyncing(false);
     }
-  }, [load, invalidateVerify, refreshAuthors, loadSuggestions]);
+  }, [load, invalidateVerify, refreshAuthors, loadSuggestions, loadTags]);
 
   // A read-only audit: verifying never writes to the store and never
   // reloads the feed, so it stays independent of the poll cadence.
@@ -1503,6 +1512,17 @@ export function useTan() {
     unmuteKeyword,
     like,
     unlike,
+    repost,
+    fetchLikers,
+    deletePost,
+    editPost,
+    sync,
+    verify,
+    exportTan,
+    importTan,
+  };
+}
+unlike,
     repost,
     fetchLikers,
     deletePost,

@@ -269,6 +269,8 @@ export function SocialConsole() {
     setShowHidden(false);
     setShowScheduled(false);
     tan.setShowMentions(false);
+    // An open thread would otherwise keep rendering over the tagged timeline.
+    tan.closeThread();
     tan.setView("timeline");
     void tan.setTagFilter(tan.tagFilter === tag ? null : tag);
   }
@@ -467,6 +469,8 @@ export function SocialConsole() {
     setError(null);
     try {
       await tan.muteAuthor(post.author);
+    } catch (caught) {
+      setError(caught instanceof Error ? c  await tan.muteAuthor(post.author);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not mute");
     } finally {
@@ -973,7 +977,13 @@ export function SocialConsole() {
                     </button>
                     ) : (
                     <>
-                    {tan.tagFilter !== null ? (
+                    {tan.tagFilter !== null &&
+                    tan.view === "timeline" &&
+                    !tan.showMentions &&
+                    !showSaved &&
+                    !showPinned &&
+                    !showHidden &&
+                    !showScheduled ? (
                     <button
                       type="button"
                       onClick={() => void tan.setTagFilter(null)}
@@ -1045,6 +1055,7 @@ export function SocialConsole() {
                           setShowScheduled(false);
                           tan.setShowMentions(false);
                           tan.setView("top");
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.view === "top" &&
@@ -1068,6 +1079,7 @@ export function SocialConsole() {
                           setShowScheduled(false);
                           tan.setShowMentions(true);
                           tan.setView("timeline");
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.showMentions ? "bg-signal/15 text-signal" : "text-mist"
@@ -1084,6 +1096,7 @@ export function SocialConsole() {
                           setShowPinned(false);
                           setShowHidden(false);
                           setShowScheduled(false);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           showSaved ? "bg-signal/15 text-signal" : "text-mist"
@@ -1100,6 +1113,7 @@ export function SocialConsole() {
                           setShowPinned(true);
                           setShowHidden(false);
                           setShowScheduled(false);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           showPinned ? "bg-signal/15 text-signal" : "text-mist"
@@ -1116,6 +1130,7 @@ export function SocialConsole() {
                           setShowPinned(false);
                           setShowHidden(true);
                           setShowScheduled(false);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           showHidden ? "bg-signal/15 text-signal" : "text-mist"
@@ -1132,6 +1147,7 @@ export function SocialConsole() {
                           setShowPinned(false);
                           setShowHidden(false);
                           setShowScheduled(true);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           showScheduled ? "bg-signal/15 text-signal" : "text-mist"
@@ -1991,7 +2007,12 @@ function PostText({
   for (const match of text.matchAll(TAG_PATTERN)) {
     const index = match.index ?? 0;
     if (index > lastIndex) parts.push(text.slice(lastIndex, index));
-    const tag = match[1].replace(/-+$/, "");
+    // Filters use the casefolded tag, as the store and sidebar do.
+    const raw = match[1].replace(/-+$/, "");
+    const tag = raw.toLowerCase();
+    // A candidate whose casefolded form is not a valid tag (e.g.
+    // `#İstanbul`) stays plain text; the server would reject it.
+    if (!/^\p{L}[\p{L}\p{N}_-]*$/u.test(tag)) continue;
     parts.push(
       <button
         key={`${index}-${tag}`}
@@ -2004,8 +2025,8 @@ function PostText({
       </button>,
     );
     // Trailing hyphens are not part of the tag; keep them as text.
-    if (match[1].length > tag.length) {
-      parts.push(match[1].slice(tag.length));
+    if (match[1].length > raw.length) {
+      parts.push(match[1].slice(raw.length));
     }
     lastIndex = index + match[0].length;
   }
