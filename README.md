@@ -144,7 +144,7 @@ The same bridge is the local integration point for scripts:
 | `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |
-| `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` — or to a group with `{"group": "<id, id prefix or name>", "text": "hi"}` (one outbound entry per member; replies and expiry are peer-DM-only) |
+| `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` — or to a group with `{"group": "<id, id prefix or name>", "text": "hi"}` (one outbound entry per member; replies, expiry and scheduling work for DM and group sends) |
 | `/api/messages/export` | GET | stored DMs as the CLI's JSON export document (localhost only) |
 | `/api/messages/import` | POST | import a DM export document (localhost only) |
 | `/api/files/<sender>/<name>` | GET | download a file received from `<sender>` |
