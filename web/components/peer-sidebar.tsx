@@ -1187,7 +1187,7 @@ export function PeerSidebar({
                         type="text"
                         value={renameText}
                         onChange={(event) => setRenameText(event.target.value)}
-                        maxLength={64}
+                        maxLength={48}
                         className="w-full rounded-lg border border-line/80 bg-void/60 px-2.5 py-1.5 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
                       />
                       <button
@@ -1223,6 +1223,7 @@ export function PeerSidebar({
                         <button
                           type="button"
                           disabled={
+                            savingRename ||
                             savingTopic ||
                             topicText.trim() === (group.topic ?? "")
                           }
@@ -1234,7 +1235,7 @@ export function PeerSidebar({
                         {group.topic ? (
                           <button
                             type="button"
-                            disabled={savingTopic}
+                            disabled={savingRename || savingTopic}
                             onClick={() => void submitTopic(group.id, true)}
                             className="rounded-md border border-line/80 px-2.5 py-1 font-mono text-[11px] text-mist transition hover:text-rose-300 disabled:opacity-50"
                           >
