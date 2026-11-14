@@ -25,13 +25,25 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable, Optional, Union
+from typing import Any, Dict, FrozenSet, Iterable, Iterator, Optional, Union
 
 from .util import atomic_write_json
 
 log = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows only; the lock uses msvcrt there, as identity.py does.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 DESTINATION_HEX_LENGTH = 32
 ALLOWLIST_FILE_MODE = 0o600
@@ -137,6 +149,48 @@ def save_allowlist(path: Union[str, Path], allowlist: AllowList) -> Path:
     """Persist *allowlist* to *path* as JSON (mode 0600) and return the path."""
     target = Path(path).expanduser()
     return atomic_write_json(target, allowlist.to_dict(), mode=ALLOWLIST_FILE_MODE)
+
+
+@contextmanager
+def allowlist_lock(path: Optional[Union[str, Path]]) -> Iterator[None]:
+    """Serialize read-modify-write updates of the allow-list.
+
+    Same shape as the ignored-groups lock in ``tau.ignored_groups``:
+    a flock on a ``.allowlist.json.lock`` sidecar.  An atomic file
+    replacement alone does not protect the whole update — without the
+    lock, two commands racing load the same file and the last save
+    discards the other's change.  Callers must reload inside the
+    lock.  Windows locks the first byte of the sidecar with
+    ``msvcrt.locking``, as ``tau.identity`` does.  A ``None`` path has
+    no file to lock, so the lock is a no-op there.
+    """
+    if path is None:
+        yield
+        return
+    if fcntl is None and msvcrt is None:  # pragma: no cover - neither platform
+        yield
+        return
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.with_name(f".{target.name}.lock")
+    with open(lock_path, "a+") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        else:  # pragma: no cover - exercised on Windows
+            lock.seek(0, os.SEEK_END)
+            if lock.tell() == 0:
+                lock.write(" ")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            else:  # pragma: no cover - exercised on Windows
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def load_allowlist_or_deny_all(

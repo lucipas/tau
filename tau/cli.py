@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from . import __version__
 from .allowlist import (
     AllowListError,
+    allowlist_lock,
     clean_destination,
     load_allowlist,
     load_allowlist_or_deny_all,
@@ -10040,37 +10041,45 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_allowlist(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
-    try:
-        allowlist = load_allowlist(config.allowlist_path)
-    except AllowListError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
-
     command = getattr(args, "allowlist_command", None)
     registry = PeerRegistry(config.peers_path)
     changed = False
 
-    if command == "add":
-        destination = _resolve_allowlist_peer(registry, args.peer)
-        if destination not in allowlist.allow:
-            allowlist = allowlist.with_added(destination)
-            changed = True
-    elif command == "remove":
-        destination = _resolve_allowlist_peer(registry, args.peer)
-        if destination in allowlist.allow:
-            allowlist = allowlist.with_removed(destination)
-            changed = True
-    elif command == "on":
-        if not allowlist.enabled:
-            allowlist = allowlist.with_enabled(True)
-            changed = True
-    elif command == "off":
-        if allowlist.enabled:
-            allowlist = allowlist.with_enabled(False)
-            changed = True
-
-    if changed:
-        save_allowlist(config.allowlist_path, allowlist)
+    if command in ("add", "remove", "on", "off"):
+        # Reload inside the lock: two allow-list commands racing
+        # must not discard each other's change to a different sender.
+        with allowlist_lock(config.allowlist_path):
+            try:
+                allowlist = load_allowlist(config.allowlist_path)
+            except AllowListError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return _EXIT_ERROR
+            if command == "add":
+                destination = _resolve_allowlist_peer(registry, args.peer)
+                if destination not in allowlist.allow:
+                    allowlist = allowlist.with_added(destination)
+                    changed = True
+            elif command == "remove":
+                destination = _resolve_allowlist_peer(registry, args.peer)
+                if destination in allowlist.allow:
+                    allowlist = allowlist.with_removed(destination)
+                    changed = True
+            elif command == "on":
+                if not allowlist.enabled:
+                    allowlist = allowlist.with_enabled(True)
+                    changed = True
+            elif command == "off":
+                if allowlist.enabled:
+                    allowlist = allowlist.with_enabled(False)
+                    changed = True
+            if changed:
+                save_allowlist(config.allowlist_path, allowlist)
+    else:
+        try:
+            allowlist = load_allowlist(config.allowlist_path)
+        except AllowListError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
 
     def describe(destination: str) -> Dict[str, Any]:
         peer = registry.get(destination)

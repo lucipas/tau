@@ -23,6 +23,7 @@ import RNS
 from . import __version__
 from .allowlist import (
     AllowList,
+    allowlist_lock,
     load_allowlist,
     load_allowlist_or_deny_all,
     save_allowlist,
@@ -613,13 +614,16 @@ class TauNode:
         The web console uses this so an owner changing the list from
         the console sees it enforced immediately: unlike the CLI,
         whose saved changes only apply when the node restarts, the
-        console *is* the running node.
+        console *is* the running node.  The save holds the
+        allow-list file lock, so a CLI command writing the same file
+        cannot interleave with it.
         """
         with self._allowlist_lock:
             # Persist first: if the write fails, the running node keeps
             # the policy that is actually on disk.
-            save_allowlist(self.config.allowlist_path, allowlist)
-            self._allowlist = allowlist
+            with allowlist_lock(self.config.allowlist_path):
+                save_allowlist(self.config.allowlist_path, allowlist)
+                self._allowlist = allowlist
 
     def update_allowlist(
         self, transform: Callable[[AllowList], AllowList]
@@ -632,15 +636,21 @@ class TauNode:
         the CLI refuses the same edit — instead of replacing the file
         with the node's fail-closed fallback. The whole
         read-modify-write is serialised, so overlapping console
-        mutations cannot lose each other's changes.
+        mutations cannot lose each other's changes — and the file lock
+        serialises it against the CLI's writers too, which the
+        in-process lock alone cannot.  The save is inlined here rather
+        than going through :meth:`set_allowlist` so the file lock is
+        taken once, not nested.
         """
         with self._allowlist_lock:
-            current = load_allowlist(
-                getattr(self.config, "allowlist_path", None)
-            )
-            updated = transform(current)
-            self.set_allowlist(updated)
-            return updated
+            with allowlist_lock(getattr(self.config, "allowlist_path", None)):
+                current = load_allowlist(
+                    getattr(self.config, "allowlist_path", None)
+                )
+                updated = transform(current)
+                save_allowlist(self.config.allowlist_path, updated)
+                self._allowlist = updated
+                return updated
 
     @property
     def read_receipts_enabled(self) -> bool:
