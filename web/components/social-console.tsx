@@ -261,20 +261,17 @@ export function SocialConsole() {
   }
 
   // Clicking a hashtag filters the timeline to that tag: leave any
-  // shelf, mentions view or open thread and show the tagged timeline
-  // instead. Clicking the active tag again clears the filter. The tag
-  // counts cover the whole store, so applying one also widens the
-  // scope to everything — otherwise the count could promise posts
-  // the following-only feed hides.
+  // shelf or mentions view and show the tagged timeline instead.
+  // Clicking the active tag again clears the filter.
   function submitTagFilter(tag: string) {
     setShowSaved(false);
     setShowPinned(false);
     setShowHidden(false);
     setShowScheduled(false);
     tan.setShowMentions(false);
-    tan.setView("timeline");
+    // An open thread would otherwise keep rendering over the tagged timeline.
     tan.closeThread();
-    if (tan.tagFilter !== tag) tan.setAll(true);
+    tan.setView("timeline");
     void tan.setTagFilter(tan.tagFilter === tag ? null : tag);
   }
 
@@ -1991,14 +1988,9 @@ function canRepost(post: TanPost): boolean {
 // digits, underscores or hyphens, with trailing hyphens stripped —
 // so `#mesh-` reads as `mesh`, the way the store counts it. The
 // stripped hyphens are kept as plain text, so the rendered text is
-// exactly the post's text. The filter value is normalised the way the
-// server normalises it, so `#Mesh` filters as `mesh` and matches the
-// sidebar; a candidate the server would reject (its casefolded form
-// no longer reads as one tag, such as `#İstanbul`) stays plain text
-// instead of a button that would only fetch a 400. Without an `onTag`
-// the text renders unchanged, as before.
+// exactly the post's text. Without an `onTag` the text renders
+// unchanged, as before.
 const TAG_PATTERN = /(?<![\p{L}\p{N}_])#([\p{L}][\p{L}\p{N}_-]*)/gu;
-const WHOLE_TAG_PATTERN = /^[\p{L}][\p{L}\p{N}_-]*$/u;
 
 function PostText({
   text,
@@ -2013,27 +2005,26 @@ function PostText({
   for (const match of text.matchAll(TAG_PATTERN)) {
     const index = match.index ?? 0;
     if (index > lastIndex) parts.push(text.slice(lastIndex, index));
-    const tag = match[1].replace(/-+$/, "");
-    const normalized = tag.toLowerCase();
-    if (WHOLE_TAG_PATTERN.test(normalized)) {
-      parts.push(
-        <button
-          key={`${index}-${tag}`}
-          type="button"
-          onClick={() => onTag(normalized)}
-          title={`show #${normalized} posts`}
-          className="text-signal transition hover:underline"
-        >
-          #{tag}
-        </button>,
-      );
-      // Trailing hyphens are not part of the tag; keep them as text.
-      if (match[1].length > tag.length) {
-        parts.push(match[1].slice(tag.length));
-      }
-    } else {
-      // Not a tag once normalised: keep the original text as-is.
-      parts.push(match[0]);
+    // Filters use the casefolded tag, as the store and sidebar do.
+    const raw = match[1].replace(/-+$/, "");
+    const tag = raw.toLowerCase();
+    // A candidate whose casefolded form is not a valid tag (e.g.
+    // `#İstanbul`) stays plain text; the server would reject it.
+    if (!/^\p{L}[\p{L}\p{N}_-]*$/u.test(tag)) continue;
+    parts.push(
+      <button
+        key={`${index}-${tag}`}
+        type="button"
+        onClick={() => onTag(tag)}
+        title={`show #${tag} posts`}
+        className="text-signal transition hover:underline"
+      >
+        #{tag}
+      </button>,
+    );
+    // Trailing hyphens are not part of the tag; keep them as text.
+    if (match[1].length > raw.length) {
+      parts.push(match[1].slice(raw.length));
     }
     lastIndex = index + match[0].length;
   }

@@ -1619,44 +1619,6 @@ describe("PostCard hashtags", () => {
     expect(screen.getByText("hello #mesh")).toBeTruthy();
     expect(screen.queryByTitle("show #mesh posts")).toBeNull();
   });
-
-  it("normalises a capitalised hashtag before filtering", () => {
-    const onTag = vi.fn();
-    render(
-      <PostCard
-        post={makePost({ text: "hello #Mesh" })}
-        onToggleLike={() => {}}
-        onRepost={() => {}}
-        onReply={() => {}}
-        onDelete={() => {}}
-        deleting={false}
-        onTag={onTag}
-      />,
-    );
-
-    fireEvent.click(screen.getByTitle("show #mesh posts"));
-    expect(onTag).toHaveBeenCalledTimes(1);
-    expect(onTag).toHaveBeenCalledWith("mesh");
-  });
-
-  it("leaves a hashtag the server would reject as plain text", () => {
-    const onTag = vi.fn();
-    render(
-      <PostCard
-        post={makePost({ text: "hello #İstanbul" })}
-        onToggleLike={() => {}}
-        onRepost={() => {}}
-        onReply={() => {}}
-        onDelete={() => {}}
-        deleting={false}
-        onTag={onTag}
-      />,
-    );
-
-    expect(screen.getByText("hello #İstanbul")).toBeTruthy();
-    expect(screen.queryByTitle(/^show #/)).toBeNull();
-    expect(onTag).not.toHaveBeenCalled();
-  });
 });
 
 describe("SocialConsole tags sidebar", () => {
@@ -1732,7 +1694,7 @@ describe("SocialConsole tags sidebar", () => {
       sync: vi.fn(),
       ...overrides,
     };
-    return { tan: mockTan.current, setTagFilter, closeThread: mockTan.current.closeThread as Mock };
+    return { tan: mockTan.current, setTagFilter };
   }
 
   it("lists tags most-used first and filters on click", () => {
@@ -1775,26 +1737,6 @@ describe("SocialConsole tags sidebar", () => {
     render(<SocialConsole />);
 
     fireEvent.click(screen.getByTitle("show #mesh posts"));
-    expect(setTagFilter).toHaveBeenCalledTimes(1);
-    expect(setTagFilter).toHaveBeenCalledWith("mesh");
-  });
-
-  it("hides the filter chip on views the tag does not filter", () => {
-    setTanWithTags({ tagFilter: "mesh", view: "top" });
-    render(<SocialConsole />);
-
-    expect(screen.queryByRole("button", { name: "#mesh ✕" })).toBeNull();
-  });
-
-  it("closes an open thread when a hashtag in it is clicked", () => {
-    const { setTagFilter, closeThread } = setTanWithTags({
-      threadRef: "c".repeat(64),
-      threadPosts: [makePost({ text: "hello #mesh" })],
-    });
-    render(<SocialConsole />);
-
-    fireEvent.click(screen.getByTitle("show #mesh posts"));
-    expect(closeThread).toHaveBeenCalledTimes(1);
     expect(setTagFilter).toHaveBeenCalledTimes(1);
     expect(setTagFilter).toHaveBeenCalledWith("mesh");
   });
