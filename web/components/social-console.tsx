@@ -1072,6 +1072,17 @@ export function SocialConsole() {
                       <button
                         type="button"
                         onClick={() => {
+                          // Tapping Top while it is already selected must
+                          // refresh the feed: setView is a no-op then, and
+                          // Top does not poll.
+                          const alreadyTop =
+                            tan.view === "top" &&
+                            !showSaved &&
+                            !showPinned &&
+                            !showHidden &&
+                            !showScheduled &&
+                            !tan.showMentions &&
+                            tan.tagFilter === null;
                           setShowSaved(false);
                           setShowPinned(false);
                           setShowHidden(false);
@@ -1079,6 +1090,15 @@ export function SocialConsole() {
                           tan.setShowMentions(false);
                           tan.setView("top");
                           void tan.setTagFilter(null);
+                          if (alreadyTop) {
+                            tan.refresh().catch((caught) => {
+                              setError(
+                                caught instanceof Error
+                                  ? caught.message
+                                  : "could not load the feed",
+                              );
+                            });
+                          }
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.view === "top" &&
