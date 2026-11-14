@@ -7690,13 +7690,13 @@ class _WebHandler(BaseHTTPRequestHandler):
                     if (
                         not isinstance(expires_in, (int, float))
                         or isinstance(expires_in, bool)
-                        or not _valid_expires_in(expires_in)
+                        or not _valid_tan_expires_in(expires_in)
                     ):
                         self._send_json(
                             {
                                 "error": {
                                     "message": "field 'expires_in' must be a number of "
-                                    "seconds between 0 and 30 days"
+                                    "seconds (0 < expires_in <= 604800)"
                                 }
                             },
                             head_only,
@@ -9137,6 +9137,29 @@ class _WebHandler(BaseHTTPRequestHandler):
 
 
 def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
+    values = query.get(name) or []
+    if not values:
+        return False
+    return values[0].strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_param(
+    query: Dict[str, List[str]],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    values = query.get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+t[str, List[str]], name: str) -> bool:
     values = query.get(name) or []
     if not values:
         return False

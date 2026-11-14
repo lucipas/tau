@@ -7184,6 +7184,7 @@ def test_tan_post_via_api_accepts_expires_in(tmp_path):
             ({"text": "x", "expires_in": -10}, "expires_in"),
             ({"text": "x", "expires_in": "soon"}, "expires_in"),
             ({"text": "x", "expires_in": True}, "expires_in"),
+            ({"text": "x", "expires_in": 604801}, "expires_in"),
             ({"text": "x", "expires_in": 2592001}, "expires_in"),
         ]:
             status, _, payload = _json(
