@@ -1854,4 +1854,17 @@ describe("SocialConsole tags sidebar", () => {
     expect(setAll).toHaveBeenLastCalledWith(false);
     expect(setTagFilter).toHaveBeenCalledWith(null);
   });
+
+  it("refreshes the top ranking when Top is tapped while already selected", () => {
+    setTanWithTags({ view: "top", tagFilter: null });
+    const refresh = mockTan.current.refresh as Mock;
+    refresh.mockResolvedValue(undefined);
+    render(<SocialConsole />);
+
+    // The top view never joins the timeline poll, and clearing an
+    // already-clear filter no longer loads, so a repeat tap is Top's
+    // manual refresh.
+    fireEvent.click(screen.getByRole("button", { name: "top" }));
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
 });
