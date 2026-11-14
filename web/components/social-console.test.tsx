@@ -1854,4 +1854,31 @@ describe("SocialConsole tags sidebar", () => {
     expect(setAll).toHaveBeenLastCalledWith(false);
     expect(setTagFilter).toHaveBeenCalledWith(null);
   });
+
+  it("refreshes the top ranking when Top is tapped while already selected", () => {
+    setTanWithTags({ view: "top", tagFilter: null });
+    const refresh = mockTan.current.refresh as Mock;
+    render(<SocialConsole />);
+
+    // The top view never joins the timeline poll, and clearing an
+    // already-clear filter no longer loads, so a repeat tap is Top's
+    // manual refresh.
+    fireEvent.click(screen.getByRole("button", { name: "top" }));
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the top ranking when leaving a shelf view from Top", () => {
+    setTanWithTags({ view: "top", tagFilter: null });
+    const refresh = mockTan.current.refresh as Mock;
+    const loadSaved = mockTan.current.loadSaved as Mock;
+    loadSaved.mockResolvedValue(undefined);
+    render(<SocialConsole />);
+
+    // Opening a shelf does not change the hook view, so returning to
+    // Top changes nothing the feed effect watches — the tap itself
+    // must refresh.
+    fireEvent.click(screen.getByRole("button", { name: "saved" }));
+    fireEvent.click(screen.getByRole("button", { name: "top" }));
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
 });
