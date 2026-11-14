@@ -125,6 +125,9 @@ describe("Composer group mode", () => {
     expect(screen.getByText(/replying to/)).toBeTruthy();
     expect(screen.getByLabelText("Message expiry")).toBeTruthy();
     expect(screen.getByLabelText("Send later")).toBeTruthy();
+    expect(
+      screen.getByText("expiry and schedule apply to every member's copy"),
+    ).toBeTruthy();
     expect(screen.queryByText("peer DMs only")).toBeNull();
 
     fireEvent.change(screen.getByLabelText("Message expiry"), {

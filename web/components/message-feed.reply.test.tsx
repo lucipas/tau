@@ -152,6 +152,56 @@ describe("resolveQuote", () => {
     expect(resolveQuote([otherPeer, reply], reply)).toBe("unavailable");
   });
 
+  it("resolves a group quote across legs of the same group", () => {
+    const groupId = "e".repeat(32);
+    // The quoted message arrived from alice; the reply is an outbound
+    // leg to bob, so the two entries name different peers — only the
+    // group scopes the quote.
+    const original = makeMessage({
+      id: 1,
+      group: groupId,
+      group_name: "crew",
+      text: "original thought",
+      wire_id: "a".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      direction: "out",
+      peer: "cd".repeat(16),
+      peer_name: "bob",
+      group: groupId,
+      group_name: "crew",
+      text: "seconded",
+      wire_id: "b".repeat(32),
+      in_reply_to: { id: "a".repeat(32), excerpt: "0123456789abcdef" },
+    });
+    expect(resolveQuote([original, reply], reply)).toEqual({
+      name: "alice",
+      text: "original thought",
+    });
+  });
+
+  it("does not resolve a group quote from another group", () => {
+    const original = makeMessage({
+      id: 1,
+      group: "e".repeat(32),
+      group_name: "crew",
+      text: "original thought",
+      wire_id: "a".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      group: "f".repeat(32),
+      group_name: "other",
+      text: "cross quote",
+      wire_id: "b".repeat(32),
+      in_reply_to: { id: "a".repeat(32), excerpt: "0123456789abcdef" },
+    });
+    expect(resolveQuote([original, reply], reply)).toBe("unavailable");
+  });
+
   it("returns null for a standalone message", () => {
     const message = makeMessage();
     expect(resolveQuote([message], message)).toBeNull();

@@ -364,8 +364,7 @@ export function Composer({
         </span>
         {groupMode ? (
           <span className="font-mono text-[10px] text-mist/70">
-            disappearing and scheduled group messages expire on each
-            member&apos;s copy
+            expiry and schedule apply to every member&apos;s copy
           </span>
         ) : null}
         <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">

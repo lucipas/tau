@@ -327,9 +327,10 @@ export function resolveQuote(
   message: TauMessage,
 ): ResolvedQuote | null {
   // A quote resolves only inside the same conversation: the same peer
-  // for a DM, the same group for a group message (members differ per
-  // entry, so the peer cannot scope a group reply). The quoted text is
-  // pulled from this console's own history, never
+  // for a DM, the same group for a group message — a group send is one
+  // logical message with a leg per member, so the peer differs per
+  // entry and cannot scope a group reply. The quoted text is pulled
+  // from this console's own history, never
   // from the wire, so a reference to a message that never arrived —
   // or to another peer's message — renders as unavailable instead of
   // trusting the sender's claim about what was said. When the reply
@@ -341,8 +342,10 @@ export function resolveQuote(
   // cannot be checked; they still render.
   const ref = message.in_reply_to;
   if (!ref || !ref.id) return null;
-  const candidates = messages.filter(
-    (entry) => entry.peer === message.peer && entry.wire_id === ref.id,
+  const candidates = messages.filter((entry) =>
+    message.group
+      ? entry.group === message.group && entry.wire_id === ref.id
+      : entry.peer === message.peer && entry.wire_id === ref.id,
   );
   if (candidates.length === 0) return "unavailable";
   let quoted = candidates[0];
