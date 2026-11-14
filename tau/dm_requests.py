@@ -43,7 +43,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 from .allowlist import (
     AllowListError,
@@ -369,9 +369,10 @@ def accept_dm_request(
     blocklist_path: Optional[Union[str, Path]],
     inbox: Any,
     mailbox: Any,
-    sender_name: str,
+    sender_name: Union[str, Callable[[str], str]],
     ref: str,
     now: Optional[float] = None,
+    allow_sender: Optional[Callable[[str], bool]] = None,
 ) -> DmRequestAcceptance:
     """Allow-list a request's sender and deliver the held message.
 
@@ -412,28 +413,46 @@ def accept_dm_request(
     persisted — in every failure case the request stays held for a
     retry.
     """
-    moment = time.time() if now is None else now
     blocked = load_blocked_set(blocklist_path)
     if blocked is None:
         raise DmRequestsError(
             "block-list is unusable; refusing to accept a request"
         )
     with dm_requests_lock(dm_requests_path):
+        # Read the clock under the lock so a hold that expires while
+        # acceptance waits for it is seen as expired.  An explicit
+        # ``now`` is kept for deterministic callers.
+        moment = time.time() if now is None else now
         requests = list_dm_requests(dm_requests_path, now=moment)
         request = resolve_dm_request(requests, ref)
         if request.sender in blocked:
             raise DmRequestsError(
                 "sender is blocked; decline the request or unblock them first"
             )
-        try:
-            allowlist = load_allowlist(allowlist_path)
-        except AllowListError as exc:
-            raise DmRequestsError(str(exc)) from exc
+        # Resolved from the request found under the lock, so the label
+        # always names the sender that is actually accepted.
+        sender_label = (
+            sender_name(request.sender)
+            if callable(sender_name)
+            else sender_name
+        )
         allowlisted = False
-        if request.sender not in allowlist.allow:
-            allowlist = allowlist.with_added(request.sender)
-            save_allowlist(allowlist_path, allowlist)
-            allowlisted = True
+        if allow_sender is not None:
+            # The caller owns the allow-list (the web console's running
+            # node), so the change goes through its synchronised path.
+            try:
+                allowlisted = bool(allow_sender(request.sender))
+            except AllowListError as exc:
+                raise DmRequestsError(str(exc)) from exc
+        else:
+            try:
+                allowlist = load_allowlist(allowlist_path)
+            except AllowListError as exc:
+                raise DmRequestsError(str(exc)) from exc
+            if request.sender not in allowlist.allow:
+                allowlist = allowlist.with_added(request.sender)
+                save_allowlist(allowlist_path, allowlist)
+                allowlisted = True
         delivered = False
         skipped = None
         record: Optional[Dict[str, Any]] = None
@@ -446,7 +465,7 @@ def accept_dm_request(
                 skipped = "it was already delivered"
             else:
                 record = {
-                    "from": sender_name,
+                    "from": sender_label,
                     "destination": request.sender,
                     "text": request.text,
                     "kind": request.kind,

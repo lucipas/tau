@@ -63,7 +63,6 @@ from .dm_requests import (
     accept_dm_request,
     list_dm_requests,
     remove_dm_request,
-    resolve_dm_request,
 )
 from .doctor import all_ok, run_checks
 from .identity import (
@@ -7769,19 +7768,15 @@ def cmd_messages_accept_request(args: argparse.Namespace) -> int:
     config = _make_config(args)
     registry = PeerRegistry(config.peers_path)
     try:
-        requests = list_dm_requests(config.dm_requests_path)
-        request = resolve_dm_request(requests, args.target)
-    except DmRequestsError as exc:
-        raise NodeError(str(exc)) from exc
-    sender_name = _request_sender_label(registry, request.sender)
-    try:
         acceptance = accept_dm_request(
             dm_requests_path=config.dm_requests_path,
             allowlist_path=config.allowlist_path,
             blocklist_path=config.blocklist_path,
             inbox=Inbox(config.inbox_path),
             mailbox=Mailbox(config.mailbox_path),
-            sender_name=sender_name,
+            # Resolved under the request-store lock, from the request
+            # actually accepted, so the label cannot name another one.
+            sender_name=lambda sender: _request_sender_label(registry, sender),
             ref=args.target,
         )
     except DmRequestsError as exc:
@@ -7790,7 +7785,7 @@ def cmd_messages_accept_request(args: argparse.Namespace) -> int:
     delivered = acceptance.delivered
     allowlisted = acceptance.allowlisted
     skipped = acceptance.skipped
-    name = sender_name
+    name = _request_sender_label(registry, request.sender)
     if _json_mode(args):
         _emit(acceptance.to_dict(), True)
         return _EXIT_OK

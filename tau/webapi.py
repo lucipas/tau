@@ -155,13 +155,12 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
-from .allowlist import AllowListError, clean_destination
+from .allowlist import AllowList, AllowListError, clean_destination
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
     list_dm_requests,
     remove_dm_request,
-    resolve_dm_request,
 )
 from .backup import BackupError, create_backup
 from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
@@ -3205,21 +3204,35 @@ class WebBridge:
         """
         config = self.node.config
         registry = getattr(self.node, "registry", None)
-        try:
-            requests = list_dm_requests(config.dm_requests_path)
-            request = resolve_dm_request(requests, ref)
-        except DmRequestsError as exc:
-            raise ValueError(str(exc)) from exc
-        peer = registry.get(request.sender) if registry is not None else None
-        sender_name = (
-            peer.display_name if peer is not None else short_hash(request.sender)
-        )
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
             raise WebBridgeError("this node has no message inbox")
         mailbox = getattr(self.node, "mailbox", None)
         if mailbox is None:
             raise WebBridgeError("this node has no mailbox")
+
+        def sender_name(sender: str) -> str:
+            # Resolved under the request-store lock, from the request
+            # actually accepted.
+            peer = registry.get(sender) if registry is not None else None
+            return peer.display_name if peer is not None else short_hash(sender)
+
+        def allow_sender(sender: str) -> bool:
+            # Changes the running node's allow-list, so the sender is
+            # admitted at once and the console's view and the saved
+            # file stay in step.  Returns whether the sender was added.
+            added = False
+
+            def add(current: AllowList) -> AllowList:
+                nonlocal added
+                if sender in current.allow:
+                    return current
+                added = True
+                return current.with_added(sender)
+
+            self.node.update_allowlist(add)
+            return added
+
         try:
             acceptance = accept_held_dm_request(
                 dm_requests_path=config.dm_requests_path,
@@ -3229,11 +3242,24 @@ class WebBridge:
                 mailbox=mailbox,
                 sender_name=sender_name,
                 ref=ref,
+                allow_sender=allow_sender,
             )
         except DmRequestsError as exc:
             raise ValueError(str(exc)) from exc
         result = acceptance.to_dict()
-        if acceptance.delivered and acceptance.record is not None:
+        # A copy already in the feed (an import, or a console accept
+        # that crashed after the mirror) must not be mirrored again:
+        # the feed would show the same wire id twice.
+        with self._lock:
+            in_feed = acceptance.record is not None and any(
+                message.get("wire_id") == acceptance.record.get("id")
+                for message in self._messages
+            )
+        if (
+            acceptance.delivered
+            and acceptance.record is not None
+            and not in_feed
+        ):
             # The message landed in the inbox directly, bypassing the
             # node, so mirror it into the console feed like an import
             # — otherwise the user accepts and sees nothing change.
@@ -6824,7 +6850,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"messages": items}, head_only)
                 return
             if path == "/api/messages/requests":
-                requests = self.bridge.dm_requests()
+                try:
+                    requests = self.bridge.dm_requests()
+                except DmRequestsError as exc:
+                    # An unreadable store is an expected state, not a
+                    # server fault: answer with its message instead of
+                    # a 500 traceback on every console poll.
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
                 self._send_json(
                     {"requests": requests, "count": len(requests)}, head_only
                 )
