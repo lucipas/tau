@@ -2740,15 +2740,32 @@ class WebBridge:
         shows for the same store. One extra row is fetched to learn
         whether another page follows, the way the saved view does.
         """
-        from .tangents.tan import annotate_pinned, annotate_saved, hidden_posts
+        from .identity import destination_hash, load_identity
+        from .tangents.tan import annotate_pinned, annotate_saved, annotated_hidden_posts
 
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
-            rows = hidden_posts(conn, limit=limit + 1, offset=offset)
-            posts = rows[:limit]
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            posts, next_offset = annotated_hidden_posts(
+                conn,
+                limit=limit,
+                offset=offset,
+                viewer=viewer,
+                exclude_authors=blocked,
+                exclude_all=exclude_all,
+            )
             annotate_saved(conn, posts)
             annotate_pinned(conn, posts)
-            next_offset = offset + limit if len(rows) > limit else None
             return {"posts": posts, "next_offset": next_offset}
         finally:
             conn.close()

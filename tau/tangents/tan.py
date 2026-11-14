@@ -4166,6 +4166,69 @@ def annotated_saved_posts(
     return kept, raw_offset if raw_offset < int(total) else None
 
 
+def annotated_hidden_posts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+    offset: int = 0,
+    viewer: Optional[str] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Hidden posts with the timeline's reaction, reply and repost annotations.
+
+    The hidden list itself is not filtered by hides: every entry stays
+    listed, in :func:`hidden_posts` order.  Blocked authors' entries are
+    dropped from the view, and everything is dropped when the block-list
+    could not be read (*exclude_all*), the same as the timeline.  Parents,
+    quoted and repost originals keep the usual redaction.
+
+    Returns ``(posts, next_offset)`` where *next_offset* is computed from
+    the raw rows, so a caller pages with it even when some rows were
+    dropped.
+    """
+    start = max(0, int(offset))
+    if exclude_all:
+        return [], None
+    rows = hidden_posts(conn, limit=limit + 1, offset=start)
+    next_offset = start + limit if len(rows) > limit else None
+    blocked = set(_clean_excluded(exclude_authors))
+    posts = [post for post in rows[:limit] if post["author"] not in blocked]
+    silenced = muted_author_set(conn)
+    keywords = _muted_keyword_list(conn)
+    hidden_hashes = hidden_post_set(conn)
+    annotate_reactions(conn, posts, viewer=viewer)
+    annotate_repost_counts(conn, posts, viewer=viewer)
+    annotate_quote_counts(
+        conn,
+        annotate_replies(
+            conn,
+            posts,
+            muted_keywords=keywords,
+            exclude_authors=silenced,
+            blocked_authors=blocked,
+            hidden_posts=hidden_hashes,
+        ),
+    )
+    annotate_quotes(
+        conn,
+        posts,
+        muted_keywords=keywords,
+        exclude_authors=silenced,
+        blocked_authors=blocked,
+        hidden_posts=hidden_hashes,
+    )
+    annotate_reposts(
+        conn,
+        posts,
+        muted_keywords=keywords,
+        exclude_authors=silenced,
+        blocked_authors=blocked,
+        hidden_posts=hidden_hashes,
+    )
+    return posts, next_offset
+
+
 def pin_post(
     conn: sqlite3.Connection,
     ref: str,
