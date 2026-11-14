@@ -42,12 +42,16 @@ function renderSidebar({
       blocks={{}}
       verifications={verifications}
       unread={{}}
+      archived={[]}
+      archivedError={null}
       selected=""
       onPing={() => {}}
       onInfo={() => {}}
       onForgetPeer={async () => {}}
       onBlock={() => {}}
       onUnblock={() => {}}
+      onArchivePeer={async () => {}}
+      onUnarchivePeer={async () => {}}
       onVerify={onVerify}
       onShowSafetyNumber={onShowSafetyNumber}
       onDismissVerification={onDismissVerification}

@@ -36,6 +36,34 @@ export function Console() {
       setMode("custom");
       return;
     }
+    // An archive from another tab or the CLI hides the selected
+    // conversation: never keep submitting to a hidden thread. Fall back
+    // to a remaining peer, then to a group.
+    if (
+      mode === "peer" &&
+      target &&
+      tau.archivedConversations.some(
+        (entry) => entry.destination === target,
+      )
+    ) {
+      const next = tau.peers.find(
+        (peer) =>
+          !tau.archivedConversations.some(
+            (entry) => entry.destination === peer.destination,
+          ),
+      );
+      if (next) {
+        setTarget(next.destination);
+      } else if (tau.groups.length > 0) {
+        setMode("group");
+        setTarget(tau.groups[0].id);
+      } else {
+        setMode("custom");
+        setTarget("");
+      }
+      setReplyTo(null);
+      return;
+    }
     // A refresh can remove the selected group: never keep submitting its
     // stale id. Fall back to a remaining group, then to a peer.
     if (mode === "group" && !tau.groups.some((group) => group.id === target)) {
@@ -59,15 +87,23 @@ export function Console() {
       return;
     }
     if (!target && !customPicked.current) {
-      if (tau.peers.length > 0) {
+      // Auto-select skips archived conversations: their threads are
+      // hidden until restored.
+      const firstActive = tau.peers.find(
+        (peer) =>
+          !tau.archivedConversations.some(
+            (entry) => entry.destination === peer.destination,
+          ),
+      );
+      if (firstActive) {
         setMode("peer");
-        setTarget(tau.peers[0].destination);
+        setTarget(firstActive.destination);
       } else if (tau.groups.length > 0) {
         setMode("group");
         setTarget(tau.groups[0].id);
       }
     }
-  }, [tau.peers, tau.groups, tau.groupSwap, target, mode]);
+  }, [tau.peers, tau.groups, tau.groupSwap, tau.archivedConversations, target, mode]);
 
   function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
@@ -173,6 +209,8 @@ export function Console() {
             verifications={tau.verifications}
             blocks={tau.blocks}
             unread={tau.unread.per_peer}
+            archived={tau.archivedConversations}
+            archivedError={tau.archivedError}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
@@ -209,6 +247,21 @@ export function Console() {
             }}
             onUnblock={(destination) => {
               void tau.unblockPeer(destination).catch(() => undefined);
+            }}
+            onArchivePeer={async (destination) => {
+              await tau.archiveConversation(destination);
+              // The archived conversation is gone from the feed: clear
+              // the selection and let the auto-select pick the next peer.
+              // Only if it is still selected; the user may have picked
+              // another peer while the archive was pending.
+              if (targetRef.current === destination) {
+                targetRef.current = "";
+                setTarget("");
+                setReplyTo(null);
+              }
+            }}
+            onUnarchivePeer={async (destination) => {
+              await tau.unarchiveConversation(destination);
             }}
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
