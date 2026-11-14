@@ -475,6 +475,84 @@ describe("useTau group management", () => {
 
     expect(result.current.groups).toEqual([successor]);
   });
+
+  it("swaps in the successor group when it is renamed", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({ id: "bb".repeat(16), name: "weekdays" });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+    expect(result.current.groups).toEqual([created]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockResolvedValueOnce({ ok: true, groups: [successor] });
+    let returned:
+      | { ok: boolean; group: TauGroup; previous_id: string }
+      | undefined;
+    await act(async () => {
+      returned = await result.current.renameGroup(created.id, "weekdays");
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/rename", {
+      group: created.id,
+      name: "weekdays",
+    });
+    expect(returned).toEqual({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    expect(result.current.groups).toEqual([successor]);
+    expect(result.current.groupSwap).toEqual({
+      from: created.id,
+      to: successor.id,
+    });
+  });
+
+  it("updates a group's topic in place and clears it with null", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+
+    const updated = makeGroup({ topic: "hiking plans" });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: updated });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.setGroupTopic(created.id, "hiking plans");
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/topic", {
+      group: created.id,
+      topic: "hiking plans",
+    });
+    expect(result.current.groups).toEqual([updated]);
+
+    const cleared = makeGroup({ topic: "" });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: cleared });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.setGroupTopic(created.id, null);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/topic", {
+      group: created.id,
+      clear: true,
+    });
+    expect(result.current.groups).toEqual([cleared]);
+  });
 });
 
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {

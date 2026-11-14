@@ -74,6 +74,10 @@ export interface TauGroup {
   // Absent on snapshots from an older bridge; only groups this node
   // created offer member changes in the console.
   created_by_me?: boolean;
+  // The group's topic, as set with `tau group topic` or from the
+  // console; empty when none is set. Absent on snapshots from an older
+  // bridge.
+  topic?: string;
 }
 
 export interface GroupsResponse {
@@ -95,6 +99,17 @@ export interface ChangeGroupMembersResponse {
   ok: boolean;
   group: TauGroup;
   previous_id: string;
+}
+
+export interface RenameGroupResponse {
+  ok: boolean;
+  group: TauGroup;
+  previous_id: string;
+}
+
+export interface SetGroupTopicResponse {
+  ok: boolean;
+  group: TauGroup;
 }
 
 export interface Peer {

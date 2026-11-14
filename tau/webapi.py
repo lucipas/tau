@@ -19,6 +19,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/delete delete ``{"group": "<id | prefix | name>"}``
     POST /api/groups/add-member add ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
+    POST /api/groups/rename rename ``{"group": "<id | prefix | name>", "name": "<new name>"}``
+    POST /api/groups/topic set or clear the topic ``{"group": "...", "topic": "..."}`` / ``{"group": "...", "clear": true}``
     GET  /api/messages     recent inbound/outbound messages
                            (``?pinned=1`` lists pinned messages only,
                            across the whole console log)
@@ -6203,6 +6205,54 @@ class WebBridge:
             "previous_id": group["id"],
         }
 
+    def rename_group(self, query: str, name: str) -> Dict[str, Any]:
+        """Rename a group from the console, mirroring ``tau group rename``.
+
+        Only the group's creator can rename it: the id derives from
+        the name, so the rename is a successor group (same roster, new
+        name, new id) and the old id is reported as ``previous_id`` so
+        the console can follow the swap.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'name' is required")
+        group = self.node.groups.find(query.strip())
+        own_hash = self.node.destination_hexhash
+        if not group["local"] or group["creator"] != own_hash:
+            raise ValueError("only the creator can rename a group")
+        new_group = self.node.groups.rename(
+            group["id"], name.strip(), created_by=own_hash
+        )
+        return {
+            "group": self._describe_group(new_group),
+            "previous_id": group["id"],
+        }
+
+    def set_group_topic(
+        self, query: str, *, topic: Optional[str] = None, clear: bool = False
+    ) -> Dict[str, Any]:
+        """Set or clear a group's topic from the console.
+
+        Mirrors ``tau group topic``: only the group's creator can
+        change it, and the topic is local state until the next group
+        message carries it to the members.  The id does not change.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        if clear and topic is not None:
+            raise ValueError("pass a topic or clear, not both")
+        if not clear and topic is None:
+            raise ValueError("field 'topic' is required")
+        group = self.node.groups.find(query.strip())
+        own_hash = self.node.destination_hexhash
+        if not group["local"] or group["creator"] != own_hash:
+            raise ValueError("only the creator can change a group's topic")
+        updated = self.node.groups.set_topic(
+            group["id"], "" if clear else topic, created_by=own_hash
+        )
+        return {"group": self._describe_group(updated)}
+
     def messages(
         self, limit: int = 200, *, strict_pins: bool = False
     ) -> List[Dict[str, Any]]:
@@ -7515,6 +7565,83 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **changed}, head_only)
+                return
+            if path == "/api/groups/rename":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    renamed = self.bridge.rename_group(
+                        target.strip(), name.strip()
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **renamed}, head_only)
+                return
+            if path == "/api/groups/topic":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                topic = body.get("topic")
+                clear = body.get("clear") is True
+                if topic is not None and not isinstance(topic, str):
+                    self._send_json(
+                        {"error": {"message": "field 'topic' must be text"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if clear and topic is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "pass a topic or clear, not both"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                if not clear and topic is None:
+                    self._send_json(
+                        {"error": {"message": "field 'topic' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    updated = self.bridge.set_group_topic(
+                        target.strip(), topic=topic, clear=clear
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **updated}, head_only)
                 return
             if path == "/api/outbox/retry":
                 self._handle_outbox_retry(body, head_only)

@@ -1685,6 +1685,197 @@ def test_api_groups_delete_removes_group(bridge, node, tmp_path):
     assert listed["count"] == 0
 
 
+def test_api_groups_rename_returns_successor_group(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/rename",
+        method="POST",
+        body={"group": "weekend", "name": "weekdays"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # The name derives the id, so the rename is a successor group.
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert payload["group"]["name"] == "weekdays"
+    assert payload["group"]["created_at"] == created["created_at"]
+    assert sorted(
+        member["hash"] for member in payload["group"]["members"]
+    ) == sorted([PEER_HASH, node.destination_hexhash])
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+    assert listed["groups"][0]["id"] == payload["group"]["id"]
+
+
+def test_api_groups_rename_to_same_name_is_a_noop(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/rename",
+        method="POST",
+        body={"group": "weekend", "name": "weekend"},
+    )
+    assert status == 200
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] == created["id"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+
+
+def test_api_groups_rename_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    cases = [
+        ({}, "field 'group' is required"),
+        ({"group": "weekend"}, "field 'name' is required"),
+        ({"group": "weekend", "name": "  "}, "field 'name' is required"),
+        ({"group": "missing", "name": "other"}, "unknown group"),
+    ]
+    for body, message in cases:
+        status, _, payload = _json(
+            bridge, "/api/groups/rename", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+
+
+def test_api_groups_rename_refuses_non_creator(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    node.groups.create(
+        "weekend", [PEER_HASH, OTHER_HASH], created_by=PEER_HASH
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/rename",
+        method="POST",
+        body={"group": "weekend", "name": "weekdays"},
+    )
+    assert status == 400
+    assert "only the creator can rename a group" in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["name"] == "weekend"
+
+
+def test_api_groups_topic_set_and_clear(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/topic",
+        method="POST",
+        body={"group": "weekend", "topic": "  hiking plans  "},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # A topic change keeps the id.
+    assert payload["group"]["id"] == created["id"]
+    assert payload["group"]["topic"] == "hiking plans"
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["topic"] == "hiking plans"
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/topic",
+        method="POST",
+        body={"group": "weekend", "clear": True},
+    )
+    assert status == 200
+    assert payload["group"]["id"] == created["id"]
+    assert payload["group"]["topic"] == ""
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["topic"] == ""
+
+
+def test_api_groups_topic_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    cases = [
+        ({}, "field 'group' is required"),
+        ({"group": "weekend"}, "field 'topic' is required"),
+        ({"group": "weekend", "topic": 12}, "field 'topic' must be text"),
+        (
+            {"group": "weekend", "topic": "plans", "clear": True},
+            "pass a topic or clear, not both",
+        ),
+        (
+            {"group": "weekend", "topic": "x" * 141},
+            "topic is longer than 140 characters",
+        ),
+        ({"group": "missing", "topic": "plans"}, "unknown group"),
+    ]
+    for body, message in cases:
+        status, _, payload = _json(
+            bridge, "/api/groups/topic", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["topic"] == ""
+
+
+def test_api_groups_topic_refuses_non_creator(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    node.groups.create(
+        "weekend", [PEER_HASH, OTHER_HASH], created_by=PEER_HASH
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/topic",
+        method="POST",
+        body={"group": "weekend", "topic": "plans"},
+    )
+    assert status == 400
+    assert (
+        "only the creator can change a group's topic"
+        in payload["error"]["message"]
+    )
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["topic"] == ""
+
+
 def _add_carol_to_registry(node):
     node.registry._peers.append(
         Peer(
