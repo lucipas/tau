@@ -84,3 +84,11 @@ export function formatSendsIn(sendAfter: number | null | undefined): string | nu
 export function peerLabel(name: string, hash: string): string {
   return `${name || "unknown"} · ${shortHash(hash, 8)}`;
 }
+
+/** Lowercase a Tan tag the way the server does: Python `str.casefold` maps
+ * ß to ss and final sigma ς to σ, which JavaScript `toLowerCase` leaves
+ * alone. A tag clicked in post text must match the sidebar's canonical
+ * form — #Straße becomes "strasse" on both sides. */
+export function casefoldTag(tag: string): string {
+  return tag.toLowerCase().replace(/ß/g, "ss").replace(/ς/g, "σ");
+}

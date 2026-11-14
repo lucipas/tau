@@ -1746,4 +1746,198 @@ describe("useTan tag fixes", () => {
       ]),
     );
   });
+
+  it("does not start a feed load when clearing an already-clear filter", async () => {
+    const mine = makePost();
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/tags")) {
+        return Promise.resolve({ tags: [{ tag: "mesh", count: 1 }], count: 1 });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [mine], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    const timelineCallsBefore = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/timeline?"),
+    ).length;
+
+    await act(async () => {
+      await result.current.setTagFilter(null);
+    });
+
+    // No second load: the view switch that cleared the filter loads
+    // on its own, and a failed load must not reject to a voided caller.
+    const timelineCallsAfter = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/timeline?"),
+    ).length;
+    expect(timelineCallsAfter).toBe(timelineCallsBefore);
+    expect(result.current.tagFilter).toBeNull();
+  });
+
+  it("reports a feed error instead of rejecting when a re-picked tag reload fails", async () => {
+    const tagged = makePost({ text: "hello #mesh", hash: "e".repeat(64) });
+    let failTimeline = false;
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/tags")) {
+        return Promise.resolve({ tags: [{ tag: "mesh", count: 1 }], count: 1 });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return failTimeline
+          ? Promise.reject(new Error("feed unavailable"))
+          : Promise.resolve({ posts: [tagged], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([tagged]));
+    await act(async () => {
+      await result.current.setTagFilter("mesh");
+    });
+    expect(result.current.tagFilter).toBe("mesh");
+
+    failTimeline = true;
+    await act(async () => {
+      await result.current.setTagFilter("mesh");
+    });
+    expect(result.current.tagFilter).toBe("mesh");
+    expect(result.current.error).toBe("feed unavailable");
+  });
+
+  it("casefolds a tag with an expanding lowercase", async () => {
+    const tagged = makePost({ text: "hello #strasse", hash: "e".repeat(64) });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/tags")) {
+        return Promise.resolve({
+          tags: [{ tag: "strasse", count: 1 }],
+          count: 1,
+        });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [tagged], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([tagged]));
+
+    await act(async () => {
+      await result.current.setTagFilter("Straße");
+    });
+    // Python casefold maps ß to ss, so the stored filter matches the
+    // sidebar's canonical "strasse" — toLowerCase alone would store
+    // "straße" and the toggle would never compare equal.
+    expect(result.current.tagFilter).toBe("strasse");
+    expect(
+      mockedGet.mock.calls.some((call) =>
+        String(call[0]).includes("tag=strasse"),
+      ),
+    ).toBe(true);
+  });
+
+  it("refreshes the tag list when an import brings in new posts", async () => {
+    const doc = {
+      format: "tau-tan-export",
+      version: 1,
+      exported_at: 1000,
+      authors: ["a".repeat(64)],
+      entries: [{ hash: "c".repeat(64), text: "hello #radio" }],
+    };
+    let tagsVersion = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/tags")) {
+        tagsVersion += 1;
+        return Promise.resolve({
+          tags:
+            tagsVersion > 1
+              ? [
+                  { tag: "mesh", count: 1 },
+                  { tag: "radio", count: 1 },
+                ]
+              : [{ tag: "mesh", count: 1 }],
+          count: tagsVersion > 1 ? 2 : 1,
+        });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [], count: 0 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      import: { imported: 1, present: 0, skipped: 0, errors: [] },
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() =>
+      expect(result.current.tags).toEqual([{ tag: "mesh", count: 1 }]),
+    );
+
+    await act(async () => {
+      await result.current.importTan(doc);
+    });
+    await waitFor(() =>
+      expect(result.current.tags).toEqual([
+        { tag: "mesh", count: 1 },
+        { tag: "radio", count: 1 },
+      ]),
+    );
+  });
+
+  it("refreshes the tag list when a post is hidden or unhidden", async () => {
+    const mine = makePost();
+    let tagsVersion = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/tags")) {
+        tagsVersion += 1;
+        return Promise.resolve({
+          tags:
+            tagsVersion > 1
+              ? [
+                  { tag: "mesh", count: 1 },
+                  { tag: "radio", count: 1 },
+                ]
+              : [{ tag: "mesh", count: 1 }],
+          count: tagsVersion > 1 ? 2 : 1,
+        });
+      }
+      if (path.startsWith("/api/tan/hidden")) {
+        return Promise.resolve({ posts: [], count: 0, next_offset: null });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [mine], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() =>
+      expect(result.current.tags).toEqual([{ tag: "mesh", count: 1 }]),
+    );
+
+    // Hiding the only post carrying a tag changes the counts, so the
+    // sidebar must refresh — and unhiding it must refresh again.
+    await act(async () => {
+      await result.current.hide(mine.hash);
+    });
+    await waitFor(() =>
+      expect(result.current.tags).toEqual([
+        { tag: "mesh", count: 1 },
+        { tag: "radio", count: 1 },
+      ]),
+    );
+
+    await act(async () => {
+      await result.current.unhide(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/unhide", {
+      target: mine.hash,
+    });
+  });
 });
