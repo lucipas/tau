@@ -770,19 +770,20 @@ export function useTan() {
   // Re-read every page currently shown, paging with the server's
   // offsets. A hide or unhide shifts the offsets behind the shown
   // pages, so refreshing only the first page would leave the rest
-  // stale.
+  // stale. One extra row is read so a new hide, which lands at the
+  // top, does not push the last shown post out of the list.
   const reloadHidden = useCallback(async () => {
-    const shown = hiddenRef.current.length;
-    if (shown === 0) return;
+    if (!hiddenLoadedRef.current) return;
+    const want = hiddenRef.current.length + 1;
     const generation = ++hiddenGenerationRef.current;
     setHiddenLoading(true);
     try {
       const all: TanPost[] = [];
       let offset: number | null = 0;
-      while (all.length < shown && offset !== null) {
+      while (all.length < want && offset !== null) {
         const result = await fetchHiddenPage(
           offset,
-          Math.min(HIDDEN_PAGE_SIZE, shown - all.length),
+          Math.min(HIDDEN_PAGE_SIZE, want - all.length),
         );
         if (hiddenGenerationRef.current !== generation) return;
         all.push(...result.posts);
