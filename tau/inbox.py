@@ -1324,6 +1324,37 @@ class Inbox:
         matches.sort(key=lambda entry: entry.get("received_at") or 0)
         return dict(matches[-1])
 
+    def find_sent_group_message(
+        self, group: str, sent_at: float
+    ) -> Optional[Dict[str, Any]]:
+        """This node's own record of one group send, by shared send time.
+
+        A group send is recorded once, not per leg, with no member
+        destination: its shared time is stored as ``leg_sent_at``
+        rather than ``sent_at``.  The author of such a send is this
+        node, which the caller must check before using this lookup.
+        Returns ``None`` when no record matches.
+        """
+        try:
+            wanted_at = float(sent_at)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        with self._transaction():
+            matches = [
+                entry
+                for entry in self._messages
+                if entry.get("kind") == "group"
+                and entry.get("direction") == "out"
+                and entry.get("group") == group
+                and isinstance(entry.get("leg_sent_at"), (int, float))
+                and not isinstance(entry.get("leg_sent_at"), bool)
+                and float(entry["leg_sent_at"]) == wanted_at
+            ]
+        if not matches:
+            return None
+        matches.sort(key=lambda entry: entry.get("received_at") or 0)
+        return dict(matches[-1])
+
     def reconcile_group_reactions(
         self,
         group: str,

@@ -5429,6 +5429,79 @@ class TauNode:
                 ),
             }
 
+    def _group_reply_reference(
+        self, group_id: str, reply_to: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Attach the logical reference to a group reply, when known.
+
+        The wire id in ``reply_to`` names the leg this node holds, but
+        every other member holds a different leg id for the same send,
+        so the reply also carries the (group, author, shared
+        ``sent_at``) triple every leg shares — the same triple
+        reactions and retracts already use to name the logical
+        message — and each recipient resolves the quote against its
+        own copy.  The quoted message is looked up in the local
+        inbox (a received message, or one of this node's own sent
+        group messages, whose record carries every leg id); a
+        still-queued leg of this node's own send is not in the inbox
+        yet, so the outbox entry's shared send time covers it, with
+        this node as the author.  A reference the local stores
+        cannot resolve — or one that already carries the triple —
+        is returned unchanged: the send never fails for want of a
+        reference its own history cannot supply, and the wire id
+        still renders for the sender.
+        """
+        if (
+            reply_to.get("group") is not None
+            and reply_to.get("author") is not None
+            and reply_to.get("sent_at") is not None
+        ):
+            return reply_to
+        try:
+            # A copy imported by another process (``tau import`` while
+            # ``tau serve`` runs) must be visible here, or the reply
+            # leaves without the triple it could have carried — the
+            # same reason _handle_reaction reloads before resolving.
+            # A failed reload fails soft here, not closed: the
+            # reference is best effort, and the send must not fail
+            # because the inbox could not be re-read.
+            self.inbox.reload()
+        except (InboxError, OSError):
+            pass
+        quoted = None
+        try:
+            quoted = self.inbox.resolve(str(reply_to["id"]))
+        except ValueError:
+            quoted = None
+        if (
+            quoted is not None
+            and quoted.get("kind") == "group"
+            and quoted.get("group") == group_id
+        ):
+            sent_at = quoted.get("leg_sent_at")
+            if sent_at is None:
+                sent_at = quoted.get("sent_at")
+            author = quoted.get("destination") or self.destination_hexhash
+            if isinstance(sent_at, (int, float)) and not isinstance(
+                sent_at, bool
+            ):
+                return {
+                    **reply_to,
+                    "group": group_id,
+                    "author": author,
+                    "sent_at": sent_at,
+                }
+            return reply_to
+        entry = self.mailbox.get_outbox(str(reply_to["id"]))
+        if entry is not None and entry.group_id == group_id:
+            return {
+                **reply_to,
+                "group": group_id,
+                "author": self.destination_hexhash,
+                "sent_at": entry.wire_sent_at,
+            }
+        return reply_to
+
     def send_group_message(
         self,
         group: Union[str, Dict[str, Any]],
@@ -5458,7 +5531,14 @@ class TauNode:
         ``{\"id\": <wire id>, \"excerpt\": <short hash>}``.  The
         reference travels on every leg, through queued legs and
         sealed relay copies, exactly like a direct-message reply.
-        Each send is recorded once in the local inbox (direction out,
+        Before the fan-out it is enriched with the quoted message's
+        logical identity — the group, its author's destination hash,
+        and the shared ``sent_at`` every leg of the send carries
+        (see ``_group_reply_reference``) — because the wire id names
+        only the leg this node holds: every other member holds a
+        different leg id for the same send, so a bare wire id would
+        render as unavailable on their consoles.  Each send is
+        recorded once in the local inbox (direction out,
         like a sent DM), with every leg id in ``leg_ids`` — so the
         sender's own group message can itself be quoted and a peer's
         reply to it renders — without one record per leg evicting
@@ -5512,6 +5592,8 @@ class TauNode:
                 "send_after requires queue=True"
             )
         reply_to = clean_in_reply_to(in_reply_to)
+        if reply_to is not None:
+            reply_to = self._group_reply_reference(group["id"], reply_to)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         context = {

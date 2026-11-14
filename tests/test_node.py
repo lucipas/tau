@@ -445,6 +445,174 @@ def test_send_group_message_uses_one_send_time_for_all_legs(
     assert len(sent_ats) == 1
 
 
+def test_send_group_message_reply_attaches_logical_reference(
+    tmp_path, monkeypatch
+):
+    # A reply to a received group message carries the logical
+    # reference (group, author, shared sent_at) on every leg, so a
+    # member who holds a different leg id for the quoted send can
+    # still resolve the quote against its own copy.
+    from tau.protocol import excerpt_hash, parse_group_message
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.inbox.append_group_message(
+        {
+            "from": "alice",
+            "destination": alice.hexhash,
+            "text": "original thought",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "a1" * 16,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+        },
+        group=group["id"],
+        author=alice.hexhash,
+        sent_at=1000.0,
+        members={alice.hexhash, bob.hexhash, node.destination.hexhash},
+    )
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_message(
+        "crew",
+        "seconded",
+        in_reply_to={
+            "id": "a1" * 16,
+            "excerpt": excerpt_hash("original thought"),
+        },
+    )
+
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        ref = parse_group_message(payload)["in_reply_to"]
+        assert ref["id"] == "a1" * 16
+        assert ref["excerpt"] == excerpt_hash("original thought")
+        assert ref["group"] == group["id"]
+        assert ref["author"] == alice.hexhash
+        assert ref["sent_at"] == 1000.0
+
+
+def test_send_group_message_reply_to_own_send_names_self_as_author(
+    tmp_path, monkeypatch
+):
+    # Quoting one of this node's own sent group messages names this
+    # node as the author and the legs' shared send time, so the
+    # recipients resolve it against the copy they hold.
+    from tau.protocol import excerpt_hash, parse_group_message
+
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    first = node.send_group_message("crew", "my earlier point")
+    assert first["ok"] is True
+    leg_id = first["results"][0]["id"]
+    payloads.clear()
+
+    response = node.send_group_message(
+        "crew",
+        "as I said",
+        in_reply_to={
+            "id": leg_id,
+            "excerpt": excerpt_hash("my earlier point"),
+        },
+    )
+
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        ref = parse_group_message(payload)["in_reply_to"]
+        assert ref["id"] == leg_id
+        assert ref["group"] == group["id"]
+        assert ref["author"] == node.destination.hexhash
+        assert ref["sent_at"] == first["sent_at"]
+
+
+def test_send_group_message_reply_to_unknown_id_keeps_wire_reference(
+    tmp_path, monkeypatch
+):
+    # A quoted id the local inbox cannot resolve — the sender is
+    # quoting from another device's history — keeps its wire-id
+    # reference: the send never fails for want of a reference its
+    # own history cannot supply.
+    from tau.protocol import excerpt_hash, parse_group_message
+
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_message(
+        "crew",
+        "seconded",
+        in_reply_to={
+            "id": "d" * 32,
+            "excerpt": excerpt_hash("someone else's thought"),
+        },
+    )
+
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert parse_group_message(payload)["in_reply_to"] == {
+            "id": "d" * 32,
+            "excerpt": excerpt_hash("someone else's thought"),
+        }
+
+
+def test_send_message_reply_keeps_wire_reference_only(
+    tmp_path, monkeypatch
+):
+    # Direct messages keep the wire-id behavior: no logical
+    # reference is attached, because a DM has one copy per side and
+    # the wire id already names it.
+    from tau.protocol import parse_message
+
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    monkeypatch.setattr(node, "resolve_peer", lambda *args, **kwargs: peer)
+    calls = []
+
+    def fake_request(*args, **kwargs):
+        calls.append(args)
+        return {"ok": True, "echo": "seconded"}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_message(
+        peer,
+        "seconded",
+        in_reply_to={"id": "a" * 32, "excerpt": "0123456789abcdef"},
+    )
+
+    assert response["ok"] is True
+    assert len(calls) == 1
+    assert parse_message(calls[0][2])["in_reply_to"] == {
+        "id": "a" * 32,
+        "excerpt": "0123456789abcdef",
+    }
+
+
 def test_send_group_message_with_send_after_queues_without_delivery(
     tmp_path, monkeypatch
 ):
