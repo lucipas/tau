@@ -510,6 +510,7 @@ export interface AcceptDmRequestResponse {
 
 export interface DeclineDmRequestResponse {
   declined: DmRequestEntry;
+  blocked: boolean;
 }
 
 export interface AllowlistEntry {

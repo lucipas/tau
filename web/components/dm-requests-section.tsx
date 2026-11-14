@@ -21,11 +21,17 @@ export function DmRequestsSection({
 }: {
   requests: DmRequestEntry[];
   onAccept: (id: string) => Promise<AcceptDmRequestResponse>;
-  onDecline: (id: string) => Promise<DeclineDmRequestResponse>;
+  onDecline: (
+    id: string,
+    options?: { block?: boolean },
+  ) => Promise<DeclineDmRequestResponse>;
 }) {
   const nowMs = useNow(30000);
   const now = (nowMs ?? Date.now()) / 1000;
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const [confirmingBlockId, setConfirmingBlockId] = useState<string | null>(
+    null,
+  );
   const [acceptingId, setAcceptingId] = useState<string | null>(null);
   const [decliningId, setDecliningId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,8 +52,21 @@ export function DmRequestsSection({
     setError(null);
     setNotice(null);
     setConfirmingId(id);
+    setConfirmingBlockId(null);
     if (confirmTimer.current) clearTimeout(confirmTimer.current);
     confirmTimer.current = setTimeout(() => setConfirmingId(null), 5000);
+  }
+
+  function armBlockConfirm(id: string) {
+    setError(null);
+    setNotice(null);
+    setConfirmingBlockId(id);
+    setConfirmingId(null);
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    confirmTimer.current = setTimeout(
+      () => setConfirmingBlockId(null),
+      5000,
+    );
   }
 
   async function confirmAccept(id: string) {
@@ -72,17 +91,23 @@ export function DmRequestsSection({
     }
   }
 
-  async function confirmDecline(id: string) {
-    // Declining drops the held message for good.
+  async function confirmDecline(id: string, block: boolean) {
+    // Declining drops the held message for good; blocking as well
+    // keeps the sender from re-requesting straight away.
     if (acceptingId !== null || decliningId !== null) return;
     if (confirmTimer.current) clearTimeout(confirmTimer.current);
     setConfirmingId(null);
+    setConfirmingBlockId(null);
     setDecliningId(id);
     setError(null);
     setNotice(null);
     try {
-      await onDecline(id);
-      setNotice("declined — the held message was dropped.");
+      await onDecline(id, { block });
+      setNotice(
+        block
+          ? "declined — sender blocked, the held message was dropped."
+          : "declined — the held message was dropped.",
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "decline failed");
     } finally {
@@ -101,7 +126,8 @@ export function DmRequestsSection({
 
       <p className="mt-2 font-mono text-[11px] leading-relaxed text-mist/80">
         messages from peers outside the allow-list — accept to allow-list
-        the sender and deliver the message, decline to drop it.
+        the sender and deliver the message, decline to drop it, decline
+        &amp; block to drop it and keep the sender from re-requesting.
       </p>
 
       {notice ? (
@@ -141,7 +167,7 @@ export function DmRequestsSection({
                   disabled={acceptingId !== null || decliningId !== null}
                   onClick={() => {
                     if (confirmingId === request.id) {
-                      void confirmDecline(request.id);
+                      void confirmDecline(request.id, false);
                     } else {
                       armConfirm(request.id);
                     }
@@ -157,6 +183,28 @@ export function DmRequestsSection({
                     : confirmingId === request.id
                       ? "confirm decline"
                       : "decline"}
+                </button>
+                <button
+                  type="button"
+                  disabled={acceptingId !== null || decliningId !== null}
+                  onClick={() => {
+                    if (confirmingBlockId === request.id) {
+                      void confirmDecline(request.id, true);
+                    } else {
+                      armBlockConfirm(request.id);
+                    }
+                  }}
+                  className={`rounded-md border px-2 py-1 font-mono text-[11px] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50 ${
+                    confirmingBlockId === request.id
+                      ? "border-amber/60 bg-amber/10 text-amber"
+                      : "border-line/80 bg-panel/60 text-mist hover:border-rose-400/50 hover:text-rose-300"
+                  }`}
+                >
+                  {decliningId === request.id
+                    ? "declining…"
+                    : confirmingBlockId === request.id
+                      ? "confirm decline & block"
+                      : "decline & block"}
                 </button>
               </div>
             </div>

@@ -9,7 +9,9 @@ to add the peer first, which needs out-of-band coordination.
 This module holds those denied messages instead of discarding them:
 each one is kept in ``dm-requests.json`` in the data directory until
 the owner accepts it (which allow-lists the sender and delivers the
-message into the inbox) or declines it (which drops it).  Block-list
+message into the inbox) or declines it (which drops it, and can
+block the sender in the same step so their next message is dropped
+outright instead of held again).  Block-list
 denials are never recorded — blocking means the message is never
 stored, never marked seen, and never passed on, and a request would
 break that promise.
@@ -51,7 +53,7 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
-from .blocklist import load_blocked_set
+from .blocklist import BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .inbox import InboxError
 from .protocol import ProtocolError, clean_in_reply_to
 from .util import atomic_write_json
@@ -338,6 +340,87 @@ def remove_dm_request(
             path, [entry for entry in stored if entry.id != request.id]
         )
     return request
+
+
+@dataclass
+class DmRequestDecline:
+    """The outcome of declining one held DM request."""
+
+    request: DmRequest
+    blocked: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "declined": self.request.to_dict(),
+            "blocked": self.blocked,
+        }
+
+
+@contextmanager
+def blocklist_edit_lock(path: Optional[Union[str, Path]]) -> Iterator[None]:
+    """Serialize load-modify-save updates of the block-list file.
+
+    Uses the same sidecar lock as the requests store, on the block-list
+    path, so a CLI decline and a console block edit in another process
+    cannot save snapshots derived from the same old list.  A ``None``
+    path has no file to guard and takes no lock.
+    """
+    if path is None:
+        yield
+        return
+    with dm_requests_lock(path):
+        yield
+
+
+def decline_dm_request(
+    *,
+    dm_requests_path: Union[str, Path],
+    blocklist_path: Optional[Union[str, Path]],
+    ref: str,
+    now: Optional[float] = None,
+    block: bool = False,
+    block_sender: Optional[Callable[[str], bool]] = None,
+) -> DmRequestDecline:
+    """Drop the request *ref* names, optionally blocking its sender.
+
+    Shared by the CLI (``tau messages decline-request``) and the web
+    console, so the two cannot drift apart on the block step.
+
+    The request is dropped first: an unknown ref errors before
+    anything is blocked, and a request that expired while waiting
+    reports as unknown rather than resurrecting.  With *block*, the
+    sender is then added to the block-list, so their next message is
+    dropped outright instead of held again — a sender already on the
+    list stays there and reports ``blocked`` as False, like the
+    accept path's ``allowlisted``.
+
+    The caller may pass *block_sender* (the web console's running
+    node owns the block-list), which is called with the sender and
+    returns whether it was newly added; it is then responsible for
+    its own errors.  Without it, the block-list file is updated under
+    its lock.  A block-list that cannot be read raises
+    :class:`DmRequestsError` after the drop, so the caller reports
+    the decline succeeded but the block did not; a failed block-list
+    write raises :class:`OSError` unwrapped, like the accept path's
+    allow-list save.
+    """
+    request = remove_dm_request(dm_requests_path, ref, now=now)
+    blocked = False
+    if block and block_sender is not None:
+        blocked = bool(block_sender(request.sender))
+    elif block:
+        with blocklist_edit_lock(blocklist_path):
+            try:
+                blocklist = load_blocklist(blocklist_path)
+            except BlockListError as exc:
+                raise DmRequestsError(
+                    "declined the request but could not read the block-list: "
+                    f"{exc}"
+                ) from exc
+            if request.sender not in blocklist.blocked:
+                save_blocklist(blocklist_path, blocklist.with_added(request.sender))
+                blocked = True
+    return DmRequestDecline(request=request, blocked=blocked)
 
 
 @dataclass

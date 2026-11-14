@@ -20,7 +20,7 @@ import RNS
 from tau import cli
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
 from tau.backup import MANIFEST_NAME, restore_backup
-from tau.blocklist import BlockList, save_blocklist
+from tau.blocklist import BlockList, load_blocklist, save_blocklist
 from tau.config import TauConfig
 from tau.groups import GroupStore
 from tau.identity import destination_hash, load_identity
@@ -8977,6 +8977,41 @@ def test_decline_dm_request_endpoint_drops_request(bridge, node):
     )
     assert status == 400
     assert "no DM request" in payload["error"]["message"]
+
+
+def test_decline_dm_request_endpoint_with_block_blocks_sender(bridge, node):
+    save_allowlist(
+        node.config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset()),
+    )
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/decline",
+        method="POST",
+        body={"id": "req-1", "block": True},
+    )
+    assert status == 200
+    assert payload["declined"]["id"] == "req-1"
+    assert payload["blocked"] is True
+    _, _, listed = _json(bridge, "/api/messages/requests")
+    assert listed == {"requests": [], "count": 0}
+    assert PEER_HASH in load_blocklist(node.config.blocklist_path).blocked
+
+
+def test_decline_dm_request_endpoint_non_bool_block_is_400(bridge, node):
+    _record_dm_request(bridge, request_id="req-1", sender=PEER_HASH)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/requests/decline",
+        method="POST",
+        body={"id": "req-1", "block": "yes"},
+    )
+    assert status == 400
+    assert "block" in payload["error"]["message"]
+    # The request is still held: a bad flag declines nothing.
+    _, _, listed = _json(bridge, "/api/messages/requests")
+    assert listed["count"] == 1
 
 
 def test_dm_requests_endpoint_hides_blocked_senders(bridge, node):

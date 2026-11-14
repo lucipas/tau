@@ -40,10 +40,16 @@ function renderSection(
   requests: DmRequestEntry[],
   {
     onAccept = vi.fn(async () => makeAcceptResult()),
-    onDecline = vi.fn(async () => ({ declined: makeRequest() })),
+    onDecline = vi.fn(async () => ({
+      declined: makeRequest(),
+      blocked: false,
+    })),
   }: {
     onAccept?: (id: string) => Promise<AcceptDmRequestResponse>;
-    onDecline?: (id: string) => Promise<DeclineDmRequestResponse>;
+    onDecline?: (
+      id: string,
+      options?: { block?: boolean },
+    ) => Promise<DeclineDmRequestResponse>;
   } = {},
 ) {
   return {
@@ -73,6 +79,9 @@ describe("DmRequestsSection", () => {
     expect(screen.getByText("hello, let me in")).toBeTruthy();
     expect(screen.getByRole("button", { name: "accept" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "decline" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "decline & block" }),
+    ).toBeTruthy();
   });
 
   it("accepts with one click and reports the delivery", async () => {
@@ -91,10 +100,22 @@ describe("DmRequestsSection", () => {
     fireEvent.click(screen.getByRole("button", { name: "decline" }));
     expect(onDecline).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "confirm decline" }));
-    expect(onDecline).toHaveBeenCalledWith("req-1");
+    expect(onDecline).toHaveBeenCalledWith("req-1", { block: false });
     expect(
       await screen.findByText(/the held message was dropped/),
     ).toBeTruthy();
+  });
+
+  it("decline & block asks for confirmation and blocks the sender", async () => {
+    const { onDecline } = renderSection([makeRequest()]);
+
+    fireEvent.click(screen.getByRole("button", { name: "decline & block" }));
+    expect(onDecline).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "confirm decline & block" }),
+    );
+    expect(onDecline).toHaveBeenCalledWith("req-1", { block: true });
+    expect(await screen.findByText(/sender blocked/)).toBeTruthy();
   });
 
   it("shows an accept failure instead of the notice", async () => {

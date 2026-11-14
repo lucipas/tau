@@ -61,7 +61,9 @@ script) can read what arrives from the mesh and send messages back:
                            allow-list the sender and deliver the held
                            message into the inbox
     POST /api/messages/requests/decline decline ``{"id": "<request id>"}``:
-                           drop the held request without allow-listing
+                           drop the held request without allow-listing;
+                           ``"block": true`` also adds the sender to
+                           the block-list
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
     GET  /api/backup       download a backup archive of the data directory
@@ -159,8 +161,9 @@ from .allowlist import AllowList, AllowListError, clean_destination
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
+    blocklist_edit_lock,
+    decline_dm_request as decline_held_dm_request,
     list_dm_requests,
-    remove_dm_request,
 )
 from .backup import BackupError, create_backup
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
@@ -3292,18 +3295,70 @@ class WebBridge:
             result["unread"] = unread
         return result
 
-    def decline_dm_request(self, ref: str) -> Dict[str, Any]:
+    def decline_dm_request(self, ref: str, *, block: bool = False) -> Dict[str, Any]:
         """Drop one held DM request without allow-listing its sender.
 
-        The same drop ``tau messages decline-request`` performs.
+        The same drop ``tau messages decline-request`` performs; with
+        *block* the sender is added to the block-list too.
         Raises ``ValueError`` for an unknown request.
         """
         config = self.node.config
+        path = config.blocklist_path
+        setter = getattr(self.node, "set_blocklist", None)
+
+        def block_sender(sender: str) -> bool:
+            # Same synchronised path as the console's block toggle: the
+            # file is re-read under the lock, the running node's cache is
+            # refreshed even when the sender is already listed, and a peer
+            # event tells every console.  The request is already dropped,
+            # so failures are reported as a partial success.
+            added = False
+            with self._blocklist_lock, blocklist_edit_lock(path):
+                try:
+                    current = load_blocklist(path)
+                except BlockListError as exc:
+                    if callable(setter):
+                        # Fail closed until the owner repairs the file.
+                        setter(BlockList(block_all=True))
+                    raise WebBridgeError(
+                        "declined the request but the block-list on disk is "
+                        f"unusable, so the sender was not blocked; fix or "
+                        f"remove it ({exc})"
+                    ) from exc
+                updated = current.with_added(sender)
+                added = updated.blocked != current.blocked
+                if added:
+                    if path is None:
+                        raise WebBridgeError(
+                            "declined the request but this node has no "
+                            "block-list path, so the sender was not blocked"
+                        )
+                    try:
+                        save_blocklist(path, updated)
+                    except OSError as exc:
+                        raise WebBridgeError(
+                            "declined the request but could not save the "
+                            f"block-list, so the sender was not blocked ({exc})"
+                        ) from exc
+                if callable(setter):
+                    setter(updated)
+                if added:
+                    peer = self.node.registry.get(sender)
+                    if peer is not None:
+                        self.record_peer(peer)
+            return added
+
         try:
-            request = remove_dm_request(config.dm_requests_path, ref)
+            decline = decline_held_dm_request(
+                dm_requests_path=config.dm_requests_path,
+                blocklist_path=path,
+                ref=ref,
+                block=block,
+                block_sender=block_sender,
+            )
         except DmRequestsError as exc:
             raise ValueError(str(exc)) from exc
-        return {"declined": request.to_dict()}
+        return decline.to_dict()
 
     def tan_export(self, *, all_authors: bool = False) -> Dict[str, Any]:
         """Return the portable backup document the CLI writes.
@@ -5921,7 +5976,7 @@ class WebBridge:
         setter = getattr(self.node, "set_blocklist", None)
         # Hold the lock across load, modify, save, cache update and publish
         # so a concurrent edit cannot derive its change from the same stale list.
-        with self._blocklist_lock:
+        with self._blocklist_lock, blocklist_edit_lock(path):
             try:
                 # Always re-read the file: the cached list may predate CLI
                 # edits or a corruption that appeared since it was loaded.
@@ -8435,8 +8490,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
+        block = body.get("block", False)
+        if not isinstance(block, bool):
+            self._send_json(
+                {"error": {"message": "field 'block' must be a boolean"}},
+                head_only,
+                400,
+            )
+            return
         try:
-            result = self.bridge.decline_dm_request(ref)
+            result = self.bridge.decline_dm_request(ref, block=block)
         except ValueError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
