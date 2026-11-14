@@ -356,6 +356,22 @@ class DmRequestDecline:
         }
 
 
+@contextmanager
+def blocklist_edit_lock(path: Optional[Union[str, Path]]) -> Iterator[None]:
+    """Serialize load-modify-save updates of the block-list file.
+
+    Uses the same sidecar lock as the requests store, on the block-list
+    path, so a CLI decline and a console block edit in another process
+    cannot save snapshots derived from the same old list.  A ``None``
+    path has no file to guard and takes no lock.
+    """
+    if path is None:
+        yield
+        return
+    with dm_requests_lock(path):
+        yield
+
+
 def decline_dm_request(
     *,
     dm_requests_path: Union[str, Path],
@@ -363,6 +379,7 @@ def decline_dm_request(
     ref: str,
     now: Optional[float] = None,
     block: bool = False,
+    block_sender: Optional[Callable[[str], bool]] = None,
 ) -> DmRequestDecline:
     """Drop the request *ref* names, optionally blocking its sender.
 
@@ -375,25 +392,34 @@ def decline_dm_request(
     sender is then added to the block-list, so their next message is
     dropped outright instead of held again — a sender already on the
     list stays there and reports ``blocked`` as False, like the
-    accept path's ``allowlisted``.  A block-list that cannot be read
-    raises :class:`DmRequestsError` after the drop, so the caller
-    reports the decline succeeded but the block did not; a failed
-    block-list write raises :class:`OSError` unwrapped, like the
-    accept path's allow-list save.
+    accept path's ``allowlisted``.
+
+    The caller may pass *block_sender* (the web console's running
+    node owns the block-list), which is called with the sender and
+    returns whether it was newly added; it is then responsible for
+    its own errors.  Without it, the block-list file is updated under
+    its lock.  A block-list that cannot be read raises
+    :class:`DmRequestsError` after the drop, so the caller reports
+    the decline succeeded but the block did not; a failed block-list
+    write raises :class:`OSError` unwrapped, like the accept path's
+    allow-list save.
     """
     request = remove_dm_request(dm_requests_path, ref, now=now)
     blocked = False
-    if block:
-        try:
-            blocklist = load_blocklist(blocklist_path)
-        except BlockListError as exc:
-            raise DmRequestsError(
-                "declined the request but could not read the block-list: "
-                f"{exc}"
-            ) from exc
-        if request.sender not in blocklist.blocked:
-            save_blocklist(blocklist_path, blocklist.with_added(request.sender))
-            blocked = True
+    if block and block_sender is not None:
+        blocked = bool(block_sender(request.sender))
+    elif block:
+        with blocklist_edit_lock(blocklist_path):
+            try:
+                blocklist = load_blocklist(blocklist_path)
+            except BlockListError as exc:
+                raise DmRequestsError(
+                    "declined the request but could not read the block-list: "
+                    f"{exc}"
+                ) from exc
+            if request.sender not in blocklist.blocked:
+                save_blocklist(blocklist_path, blocklist.with_added(request.sender))
+                blocked = True
     return DmRequestDecline(request=request, blocked=blocked)
 
 

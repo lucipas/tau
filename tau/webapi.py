@@ -161,6 +161,7 @@ from .allowlist import AllowList, AllowListError, clean_destination
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
+    blocklist_edit_lock,
     decline_dm_request as decline_held_dm_request,
     list_dm_requests,
 )
@@ -3302,12 +3303,58 @@ class WebBridge:
         Raises ``ValueError`` for an unknown request.
         """
         config = self.node.config
+        path = config.blocklist_path
+        setter = getattr(self.node, "set_blocklist", None)
+
+        def block_sender(sender: str) -> bool:
+            # Same synchronised path as the console's block toggle: the
+            # file is re-read under the lock, the running node's cache is
+            # refreshed even when the sender is already listed, and a peer
+            # event tells every console.  The request is already dropped,
+            # so failures are reported as a partial success.
+            added = False
+            with self._blocklist_lock, blocklist_edit_lock(path):
+                try:
+                    current = load_blocklist(path)
+                except BlockListError as exc:
+                    if callable(setter):
+                        # Fail closed until the owner repairs the file.
+                        setter(BlockList(block_all=True))
+                    raise WebBridgeError(
+                        "declined the request but the block-list on disk is "
+                        f"unusable, so the sender was not blocked; fix or "
+                        f"remove it ({exc})"
+                    ) from exc
+                updated = current.with_added(sender)
+                added = updated.blocked != current.blocked
+                if added:
+                    if path is None:
+                        raise WebBridgeError(
+                            "declined the request but this node has no "
+                            "block-list path, so the sender was not blocked"
+                        )
+                    try:
+                        save_blocklist(path, updated)
+                    except OSError as exc:
+                        raise WebBridgeError(
+                            "declined the request but could not save the "
+                            f"block-list, so the sender was not blocked ({exc})"
+                        ) from exc
+                if callable(setter):
+                    setter(updated)
+                if added:
+                    peer = self.node.registry.get(sender)
+                    if peer is not None:
+                        self.record_peer(peer)
+            return added
+
         try:
             decline = decline_held_dm_request(
                 dm_requests_path=config.dm_requests_path,
-                blocklist_path=config.blocklist_path,
+                blocklist_path=path,
                 ref=ref,
                 block=block,
+                block_sender=block_sender,
             )
         except DmRequestsError as exc:
             raise ValueError(str(exc)) from exc
@@ -5929,7 +5976,7 @@ class WebBridge:
         setter = getattr(self.node, "set_blocklist", None)
         # Hold the lock across load, modify, save, cache update and publish
         # so a concurrent edit cannot derive its change from the same stale list.
-        with self._blocklist_lock:
+        with self._blocklist_lock, blocklist_edit_lock(path):
             try:
                 # Always re-read the file: the cached list may predate CLI
                 # edits or a corruption that appeared since it was loaded.
