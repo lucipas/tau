@@ -355,6 +355,36 @@ def test_block_cli_unknown_peer(tmp_path, capsys):
     assert "unknown peer" in capsys.readouterr().err
 
 
+def test_block_cli_holds_blocklist_lock_while_saving(tmp_path, monkeypatch):
+    # A concurrent decline-and-block must not save from the same stale
+    # snapshot: the whole load-modify-save in `tau block` runs under
+    # blocklist_edit_lock, so a second exclusive flock on the sidecar
+    # must fail while the save runs.
+    fcntl = pytest.importorskip("fcntl")
+    data_dir, sender_hash = _seed_peer(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    lock_path = config.blocklist_path.with_name(
+        f".{config.blocklist_path.name}.lock"
+    )
+    real_save = cli.save_blocklist
+
+    def guarded_save(path, blocklist):
+        with open(lock_path, "a+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass  # expected: the command holds the lock
+            else:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                raise AssertionError("block-list save ran without the lock")
+        return real_save(path, blocklist)
+
+    monkeypatch.setattr(cli, "save_blocklist", guarded_save)
+    code = cli.main(["block", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert sender_hash.hex() in load_blocklist(config.blocklist_path).blocked
+
+
 def test_messages_hides_blocked_senders(tmp_path, capsys):
     data_dir, sender_hash = _seed_peer(tmp_path)
     config = TauConfig.resolve(data_dir=data_dir, name="bob")

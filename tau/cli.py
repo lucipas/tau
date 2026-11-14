@@ -61,6 +61,7 @@ from .config import (
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request,
+    blocklist_edit_lock,
     decline_dm_request,
     list_dm_requests,
 )
@@ -10051,11 +10052,6 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
 def cmd_block(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
-    try:
-        blocklist = load_blocklist(config.blocklist_path)
-    except BlockListError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
 
     # Forms: `tau block <peer>` blocks, `tau unblock <peer>` unblocks,
     # `tau block list` lists, and `tau block add/remove <peer>` keep
@@ -10067,37 +10063,47 @@ def cmd_block(args: argparse.Namespace) -> int:
     registry = PeerRegistry(config.peers_path)
     changed = False
 
-    if command == "remove":
-        destination = _resolve_allowlist_peer(registry, peer_arg)
-        if destination in blocklist.blocked:
-            blocklist = blocklist.with_removed(destination)
-            changed = True
-    elif target in (None, "list") and peer_arg is None:
-        pass  # list
-    elif target == "add":
-        if peer_arg is None:
-            raise NodeError("`tau block add` needs a peer")
-        destination = _resolve_allowlist_peer(registry, peer_arg)
-        if destination not in blocklist.blocked:
-            blocklist = blocklist.with_added(destination)
-            changed = True
-    elif target == "remove":
-        if peer_arg is None:
-            raise NodeError("`tau block remove` needs a peer")
-        destination = _resolve_allowlist_peer(registry, peer_arg)
-        if destination in blocklist.blocked:
-            blocklist = blocklist.with_removed(destination)
-            changed = True
-    elif peer_arg is not None:
-        raise NodeError(f"unexpected argument: {peer_arg!r}")
-    else:
-        destination = _resolve_allowlist_peer(registry, target)
-        if destination not in blocklist.blocked:
-            blocklist = blocklist.with_added(destination)
-            changed = True
+    # The whole load-modify-save runs under the block-list lock, so a
+    # concurrent decline-and-block cannot save from the same stale
+    # snapshot and silently drop this change (or vice versa).
+    with blocklist_edit_lock(config.blocklist_path):
+        try:
+            blocklist = load_blocklist(config.blocklist_path)
+        except BlockListError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
 
-    if changed:
-        save_blocklist(config.blocklist_path, blocklist)
+        if command == "remove":
+            destination = _resolve_allowlist_peer(registry, peer_arg)
+            if destination in blocklist.blocked:
+                blocklist = blocklist.with_removed(destination)
+                changed = True
+        elif target in (None, "list") and peer_arg is None:
+            pass  # list
+        elif target == "add":
+            if peer_arg is None:
+                raise NodeError("`tau block add` needs a peer")
+            destination = _resolve_allowlist_peer(registry, peer_arg)
+            if destination not in blocklist.blocked:
+                blocklist = blocklist.with_added(destination)
+                changed = True
+        elif target == "remove":
+            if peer_arg is None:
+                raise NodeError("`tau block remove` needs a peer")
+            destination = _resolve_allowlist_peer(registry, peer_arg)
+            if destination in blocklist.blocked:
+                blocklist = blocklist.with_removed(destination)
+                changed = True
+        elif peer_arg is not None:
+            raise NodeError(f"unexpected argument: {peer_arg!r}")
+        else:
+            destination = _resolve_allowlist_peer(registry, target)
+            if destination not in blocklist.blocked:
+                blocklist = blocklist.with_added(destination)
+                changed = True
+
+        if changed:
+            save_blocklist(config.blocklist_path, blocklist)
 
     def describe(destination: str) -> Dict[str, Any]:
         peer = registry.get(destination)
