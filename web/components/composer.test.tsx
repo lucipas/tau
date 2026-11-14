@@ -218,6 +218,53 @@ describe("Composer file attach", () => {
       ),
     );
   });
+
+  it("sends an attached file to the group in group mode", async () => {
+    const onSendFile = vi.fn();
+    const onSendGroupFile = vi
+      .fn()
+      .mockResolvedValue([makeMessage(), makeMessage({ id: 2 })]);
+    render(
+      <Composer
+        peers={peers}
+        groups={groups}
+        target={GROUP_ID}
+        mode="group"
+        onTargetChange={vi.fn()}
+        onModeChange={vi.fn()}
+        onSend={vi.fn()}
+        onSendGroup={vi.fn()}
+        onSendFile={onSendFile}
+        onSendGroupFile={onSendGroupFile}
+      />,
+    );
+    const file = new File(["hello"], "notes.txt", { type: "text/plain" });
+    attachFile(file);
+
+    fireEvent.click(screen.getByRole("button", { name: /send file/i }));
+    await waitFor(() =>
+      expect(onSendGroupFile).toHaveBeenCalledWith(GROUP_ID, file),
+    );
+    expect(onSendFile).not.toHaveBeenCalled();
+  });
+
+  it("hides the attach button in group mode without a group file handler", () => {
+    render(
+      <Composer
+        peers={peers}
+        groups={groups}
+        target={GROUP_ID}
+        mode="group"
+        onTargetChange={vi.fn()}
+        onModeChange={vi.fn()}
+        onSend={vi.fn()}
+        onSendGroup={vi.fn()}
+        onSendFile={vi.fn().mockResolvedValue(makeMessage())}
+      />,
+    );
+
+    expect(screen.queryByLabelText("Attach a file")).toBeNull();
+  });
 });
 
 describe("Composer send later", () => {

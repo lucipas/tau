@@ -371,6 +371,12 @@ export interface SendFileResponse {
   response: Record<string, unknown>;
 }
 
+export interface SendGroupFileResponse {
+  ok: boolean;
+  messages: TauMessage[];
+  response: Record<string, unknown>;
+}
+
 export interface OutboxEntry {
   id: string;
   to: string;

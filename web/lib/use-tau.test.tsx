@@ -1238,6 +1238,90 @@ describe("useTau sendGroup", () => {
   });
 });
 
+describe("useTau sendGroupFile", () => {
+  it("posts the group and file and appends one entry per leg", async () => {
+    const legs = [
+      makeMessage({ id: 1, peer: PEER_HASH, peer_name: "alice" }),
+      makeMessage({ id: 2, peer: BOB_HASH, peer_name: "bob" }),
+    ];
+    mockedPost.mockResolvedValue({
+      ok: true,
+      messages: legs,
+      response: { ok: true, group: GROUP_ID, name: "crew", results: [] },
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot(),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+
+    let sent: TauMessage[];
+    await act(async () => {
+      sent = await result.current.sendGroupFile(
+        GROUP_ID,
+        new File(["hello mesh"], "notes.txt", { type: "text/plain" }),
+      );
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/send-file", {
+      group: GROUP_ID,
+      name: "notes.txt",
+      data: "aGVsbG8gbWVzaA==",
+    });
+    expect(sent!).toEqual(legs);
+    expect(result.current.messages).toEqual(legs);
+  });
+
+  it("throws naming the failed member but keeps the legs in the feed", async () => {
+    const legs = [
+      makeMessage({ id: 1, peer: PEER_HASH, peer_name: "alice" }),
+      makeMessage({
+        id: 2,
+        peer: BOB_HASH,
+        peer_name: "bob",
+        status: "failed",
+      }),
+    ];
+    mockedPost.mockResolvedValue({
+      ok: false,
+      messages: legs,
+      response: {
+        ok: false,
+        group: GROUP_ID,
+        name: "crew",
+        results: [
+          { to: PEER_HASH, to_name: "alice", delivered: true },
+          { to: BOB_HASH, to_name: "bob", ok: false, error: "not_allowed" },
+        ],
+      },
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot(),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+
+    await act(async () => {
+      await expect(
+        result.current.sendGroupFile(
+          GROUP_ID,
+          new File(["hello mesh"], "notes.txt", { type: "text/plain" }),
+        ),
+      ).rejects.toThrow(
+        /could not send to bob — alice already received this/,
+      );
+    });
+
+    expect(result.current.messages).toEqual(legs);
+  });
+});
+
 describe("useTau forwardMessageToGroup", () => {
   it("posts the group target and appends one entry per leg", async () => {
     const legs = [

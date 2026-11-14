@@ -197,6 +197,7 @@ class FakeNode:
             "crew", [PEER_HASH, BOB_HASH], created_by=PEER_HASH
         )
         self.sent_files = []
+        self.group_sent_files = []
         self.announced = 0
         self.flush_calls = []
         self.flush_lock_busy = False
@@ -581,6 +582,47 @@ class FakeNode:
             "size": len(data),
             "sha256": hashlib.sha256(data).hexdigest(),
             "to": peer.hexhash,
+        }
+
+    def send_group_file(self, group, path, *, timeout=300.0, discover_timeout=None):
+        import hashlib
+        from pathlib import Path
+
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        data = Path(path).read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        self.group_sent_files.append((group["name"], Path(path).name, data))
+        names = {PEER_HASH: "alice", BOB_HASH: "bob"}
+        results = []
+        for member in group["members"]:
+            if member in self.group_refusals:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "ok": False,
+                        "error": "not_allowed",
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "delivered": True,
+                        "id": f"file-{member[:8]}",
+                        "name": Path(path).name,
+                        "size": len(data),
+                        "sha256": digest,
+                    }
+                )
+        return {
+            "ok": all(r.get("delivered") for r in results),
+            "v": 1,
+            "group": group["id"],
+            "name": group["name"],
+            "results": results,
         }
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
@@ -13731,6 +13773,68 @@ def test_send_file_survives_bridge_restart(node, tmp_path):
         bridge2.stop()
 
 
+def test_send_group_file_records_one_entry_per_leg(bridge, node):
+    import hashlib
+
+    group_id = node.groups.list_groups()[0]["id"]
+    data = b"hello mesh"
+    messages, response = bridge.send_group_file("crew", "notes.txt", data)
+    assert response["ok"] is True
+    assert node.group_sent_files == [("crew", "notes.txt", data)]
+    assert len(messages) == 2
+    assert all(m["direction"] == "out" for m in messages)
+    assert all(m["group"] == group_id for m in messages)
+    assert all(m["group_name"] == "crew" for m in messages)
+    assert all(m["status"] == "delivered" for m in messages)
+    assert all(m["text"] == "Sent file: notes.txt (10 bytes)" for m in messages)
+    assert all(
+        m["file"]
+        == {
+            "name": "notes.txt",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        for m in messages
+    )
+    assert messages[0]["wire_id"] == "file-" + PEER_HASH[:8]
+    # The feed carries both legs, and the bus tells live consoles.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert len(feed["messages"]) == 2
+    published = [e for e in bridge.bus.replay(0) if e.get("type") == "message"]
+    assert [e["message"]["id"] for e in published[-2:]] == [
+        m["id"] for m in messages
+    ]
+
+
+def test_send_group_file_failed_leg_is_recorded(bridge, node):
+    node.group_refusals = {BOB_HASH}
+    data = b"hello mesh"
+    messages, response = bridge.send_group_file("crew", "notes.txt", data)
+    assert response["ok"] is False
+    assert len(messages) == 2
+    by_peer = {m["peer"]: m for m in messages}
+    assert by_peer[PEER_HASH]["status"] == "delivered"
+    assert by_peer[PEER_HASH]["wire_id"] == "file-" + PEER_HASH[:8]
+    assert by_peer[BOB_HASH]["status"] == "failed"
+    assert "wire_id" not in by_peer[BOB_HASH]
+    assert by_peer[BOB_HASH]["file"]["name"] == "notes.txt"
+
+
+def test_send_group_file_validation(bridge):
+    from tau.protocol import MAX_FILE_BYTES
+
+    with pytest.raises(ValueError, match="target group is required"):
+        bridge.send_group_file("", "a.txt", b"x")
+    with pytest.raises(ValueError, match="unknown group"):
+        bridge.send_group_file("nobody", "a.txt", b"x")
+    with pytest.raises(ValueError, match="not usable"):
+        bridge.send_group_file("crew", "..", b"x")
+    with pytest.raises(ValueError, match="outside the"):
+        bridge.send_group_file("crew", "a.txt", b"")
+    with pytest.raises(ValueError, match="outside the"):
+        bridge.send_group_file("crew", "a.txt", b"x" * (MAX_FILE_BYTES + 1))
+
+
 def test_messages_import_rejects_wrong_format(bridge):
     status, _, payload = _json(
         bridge, "/api/messages/import", method="POST", body={"format": "nope"}
@@ -13923,6 +14027,39 @@ def test_send_file_endpoint_accepts_bodies_over_the_json_cap(bridge, node):
     assert status == 200
     assert payload["message"]["file"]["size"] == 40 * 1024
     assert node.sent_files[0][1] == "big.bin"
+
+
+def test_send_group_file_endpoint(bridge, node):
+    import base64
+
+    data = base64.b64encode(b"hello mesh").decode("ascii")
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/send-file",
+        method="POST",
+        body={"group": "crew", "name": "notes.txt", "data": data},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert len(payload["messages"]) == 2
+    assert all(m["file"]["name"] == "notes.txt" for m in payload["messages"])
+    assert payload["response"]["results"][0]["size"] == 10
+    assert node.group_sent_files == [("crew", "notes.txt", b"hello mesh")]
+
+
+def test_send_group_file_endpoint_rejects_bad_requests(bridge):
+    for body, fragment, status_code in (
+        ({"name": "a.txt", "data": "eA=="}, "group", 400),
+        ({"group": "crew", "data": "eA=="}, "name", 400),
+        ({"group": "crew", "name": "a.txt"}, "data", 400),
+        ({"group": "crew", "name": "a.txt", "data": "not base64!!"}, "data", 400),
+        ({"group": "nobody", "name": "a.txt", "data": "eA=="}, "unknown group", 404),
+    ):
+        status, _, payload = _json(
+            bridge, "/api/groups/send-file", method="POST", body=body
+        )
+        assert status == status_code
+        assert fragment in payload["error"]["message"]
 
 
 def test_other_endpoints_keep_the_json_body_cap(bridge):

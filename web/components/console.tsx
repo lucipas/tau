@@ -398,6 +398,7 @@ export function Console() {
               onSend={tau.send}
               onSendGroup={tau.sendGroup}
               onSendFile={tau.sendFile}
+              onSendGroupFile={tau.sendGroupFile}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
             />
