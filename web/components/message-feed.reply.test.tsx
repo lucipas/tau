@@ -190,6 +190,67 @@ describe("resolveQuote", () => {
     });
   });
 
+  it("does not resolve a group reference carried by a DM", () => {
+    const GROUP = "cd".repeat(16);
+    const original = makeMessage({
+      id: 1,
+      peer: "aa".repeat(16),
+      peer_name: "alice",
+      text: "original thought",
+      group: GROUP,
+      sent_at: 1000,
+      wire_id: "c".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    // No group on the reply: it is a DM, so a group reference it
+    // carries — a remote peer can send one — must not render that
+    // group's text under it.
+    const reply = makeMessage({
+      id: 2,
+      text: "seconded",
+      wire_id: "d".repeat(32),
+      in_reply_to: {
+        id: "a".repeat(32),
+        excerpt: "0123456789abcdef",
+        group: GROUP,
+        author: "aa".repeat(16),
+        sent_at: 1000,
+      },
+    });
+    expect(resolveQuote([original, reply], reply)).toBe("unavailable");
+  });
+
+  it("does not resolve a group reference from another group", () => {
+    const GROUP = "cd".repeat(16);
+    const original = makeMessage({
+      id: 1,
+      peer: "aa".repeat(16),
+      peer_name: "alice",
+      text: "original thought",
+      group: GROUP,
+      sent_at: 1000,
+      wire_id: "c".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      peer: "bb".repeat(16),
+      peer_name: "bob",
+      text: "seconded",
+      group: "ef".repeat(16),
+      sent_at: 1002,
+      wire_id: "d".repeat(32),
+      in_reply_to: {
+        id: "a".repeat(32),
+        excerpt: "0123456789abcdef",
+        group: GROUP,
+        author: "aa".repeat(16),
+        sent_at: 1000,
+      },
+    });
+    expect(resolveQuote([original, reply], reply)).toBe("unavailable");
+  });
+
   it("does not resolve a group quote whose logical reference names another author", () => {
     const GROUP = "cd".repeat(16);
     const original = makeMessage({

@@ -346,9 +346,12 @@ export function resolveQuote(
   // shared sent_at) resolves against any leg of the quoted send: the
   // wire id differs per recipient, so it only ever matches the
   // sender's own copy. The author is the peer for an inbound entry
-  // and this node for an outbound one; when the triple matches
-  // nothing, the wire-id match below still runs, which covers
-  // replies from senders that predate the reference.
+  // and this node for an outbound one; the reply must be in the same
+  // group as the reference — a DM or a reply in another group
+  // carrying a group reference must not render that group's text.
+  // When the triple matches nothing, the wire-id match below still
+  // runs, which covers replies from senders that predate the
+  // reference.
   const ref = message.in_reply_to;
   if (!ref || !ref.id) return null;
   if (

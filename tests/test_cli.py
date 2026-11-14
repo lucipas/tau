@@ -2062,7 +2062,10 @@ def test_quote_line_prefers_logical_reference_over_foreign_leg_id(tmp_path):
             "sent_at": 1000.0,
         },
     }
-    assert cli._quote_line(inbox, registry, reply) == "↩ alice: same words"
+    assert (
+        cli._quote_line(inbox, registry, reply, blocked=frozenset(), own_hash=None)
+        == "↩ alice: same words"
+    )
     # Without the logical reference the same reply cannot resolve:
     # the wire id names a leg this node never held, and the excerpt
     # matches two authors' messages, so no author can be named.
@@ -2071,7 +2074,10 @@ def test_quote_line_prefers_logical_reference_over_foreign_leg_id(tmp_path):
         "id": "f" * 32,
         "excerpt": excerpt_hash("same words"),
     }
-    assert cli._quote_line(inbox, registry, bare) == "↩ original not available"
+    assert (
+        cli._quote_line(inbox, registry, bare, blocked=frozenset(), own_hash=None)
+        == "↩ original not available"
+    )
 
 
 def test_messages_hides_non_member_group_reaction(tmp_path, capsys):
