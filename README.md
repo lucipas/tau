@@ -287,6 +287,11 @@ tau tan unmute-keyword crypto
 tau tan mute alice
 tau tan muted
 
+# Hide one post without muting its author: it leaves your timeline,
+# search, top posts and threads, but keeps syncing — unhide to see it again
+tau tan hide <hash>
+tau tan hidden
+
 # Back up your posts (or every cached author's) and restore them later —
 # every entry's signature and hash are re-verified on import
 tau tan export --output tan-backup.json

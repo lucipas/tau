@@ -134,6 +134,7 @@ MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
+MAX_HIDDEN_POSTS = 512
 MAX_PINNED_POSTS = 10
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
@@ -576,6 +577,11 @@ CREATE TABLE IF NOT EXISTS saved_posts (
 CREATE TABLE IF NOT EXISTS pinned_posts (
     hash TEXT PRIMARY KEY,
     pinned_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hidden_posts (
+    hash TEXT PRIMARY KEY,
+    hidden_at REAL NOT NULL
 );
 """
 
@@ -1641,6 +1647,7 @@ def annotate_replies(
     muted_keywords: Optional[Sequence[str]] = None,
     exclude_authors: Optional[Set[str]] = None,
     blocked_authors: Optional[Set[str]] = None,
+    hidden_posts: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``reply_to`` parent summary to reply entries, in place.
 
@@ -1653,7 +1660,9 @@ def annotate_replies(
     ``expired`` set.  A parent matching a muted keyword (see
     :func:`muted_keywords`) is reported the same way, with its text
     blanked and ``muted`` set, so the muted content does not leak
-    through the preview.  A parent whose
+    through the preview.  A parent in *hidden_posts* is reported the
+    same way, with its text blanked and ``hidden`` set, so hiding a
+    post never leaks its words through a reply snippet.  A parent whose
     author is in *exclude_authors* (muted) is reported as ``None`` so
     its name and text never surface.  A parent whose author is in
     *blocked_authors* is reported with its text blanked, its author
@@ -1724,13 +1733,14 @@ def annotate_replies(
         is_muted = _text_matches_muted_keywords(
             str(parent.get("text") or ""), muted_pattern
         )
+        is_hidden = hidden_posts is not None and parent["hash"] in hidden_posts
         preview = {
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
             "text": (
                 ""
-                if is_deleted or is_muted or is_expired_parent
+                if is_deleted or is_muted or is_expired_parent or is_hidden
                 else parent["text"]
             ),
             "deleted": is_deleted,
@@ -1740,6 +1750,10 @@ def annotate_replies(
             # Only present when muted, so unmuted previews keep their
             # established shape.
             preview["muted"] = True
+        if is_hidden:
+            # Only present when hidden, so visible previews keep their
+            # established shape.
+            preview["hidden"] = True
         if is_expired_parent:
             # Only present when expired, so live previews keep their
             # established shape.
@@ -1800,6 +1814,7 @@ def annotate_quotes(
     muted_keywords: Optional[Sequence[str]] = None,
     exclude_authors: Optional[Set[str]] = None,
     blocked_authors: Optional[Set[str]] = None,
+    hidden_posts: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``quoted`` original summary to quote entries, in place.
 
@@ -1811,6 +1826,9 @@ def annotate_quotes(
     An original matching a muted keyword (see :func:`muted_keywords`)
     is reported the same way, with its text blanked and ``muted`` set,
     so the muted content does not leak through the preview.  An
+    original in *hidden_posts* is reported the same way, with its text
+    blanked and ``hidden`` set, so hiding a post never leaks its words
+    through a quote preview.  An
     original whose author is in *exclude_authors* (muted) is reported
     as ``None`` so its name and text never surface.  An original whose
     author is in *blocked_authors* is reported with its text blanked,
@@ -1878,6 +1896,7 @@ def annotate_quotes(
         is_muted = _text_matches_muted_keywords(
             str(parent.get("text") or ""), muted_pattern
         )
+        is_hidden = hidden_posts is not None and parent["hash"] in hidden_posts
         is_expired_parent = is_expired(parent)
         summary = {
             "hash": parent["hash"],
@@ -1885,7 +1904,7 @@ def annotate_quotes(
             "name": parent["name"],
             "text": (
                 ""
-                if is_deleted or is_muted or is_expired_parent
+                if is_deleted or is_muted or is_expired_parent or is_hidden
                 else parent["text"]
             ),
             "deleted": is_deleted,
@@ -1894,6 +1913,10 @@ def annotate_quotes(
             # Only present when muted, so unmuted previews keep their
             # established shape.
             summary["muted"] = True
+        if is_hidden:
+            # Only present when hidden, so visible previews keep their
+            # established shape.
+            summary["hidden"] = True
         if is_expired_parent:
             # Only present when expired, so live previews keep their shape.
             summary["expired"] = True
@@ -1908,6 +1931,7 @@ def annotate_reposts(
     muted_keywords: Optional[Sequence[str]] = None,
     exclude_authors: Optional[Set[str]] = None,
     blocked_authors: Optional[Set[str]] = None,
+    hidden_posts: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``repost_of`` original-post summary to repost entries, in place.
 
@@ -1932,7 +1956,8 @@ def annotate_reposts(
     by an author in *blocked_authors* or *exclude_authors* (muted), or
     whose original text matches a muted keyword, is dropped from the
     returned list instead of being kept with a redacted preview the
-    way a reply is.  Without the filter arguments nothing is dropped,
+    way a reply is.  A repost whose original is in *hidden_posts* is
+    dropped the same way.  Without the filter arguments nothing is dropped,
     so an explicit lookup still shows the repost.  The summary shows
     the original's current text: its author's latest edit is applied
     first, the same way :func:`annotate_replies` edits its parents.
@@ -1980,6 +2005,8 @@ def annotate_reposts(
         if blocked_authors and original["author"] in blocked_authors:
             continue
         if exclude_authors and original["author"] in exclude_authors:
+            continue
+        if hidden_posts and original["hash"] in hidden_posts:
             continue
         if _text_matches_muted_keywords(
             str(original.get("text") or ""), muted_pattern
@@ -2646,7 +2673,10 @@ def timeline(
     and a reply to one keeps its ``reply_to`` preview text blanked —
     muting is display-only, so entries stay stored and unmuting
     restores them.  Posts by muted authors never appear either, for the
-    same reason.  A repost of a post by a muted or blocked author, or
+    same reason.  Hidden posts never appear either, and a reply to
+    one keeps its ``reply_to`` preview text blanked — hiding is
+    display-only, so unhiding restores them.  A repost of a post by
+    a muted or blocked author, or
     of a post matching a muted keyword, never appears either — a
     repost carries no text of its own, so hiding the original hides
     the repost.  Pages are read until ``limit`` unmuted posts are
@@ -2674,6 +2704,11 @@ def timeline(
         exclude_authors=silenced,
         blocked_authors=blocked,
     )
+    hidden_hashes = hidden_post_set(conn)
+
+    def _drop_hidden(page: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        visible = keep_tag(page) if keep_tag is not None else page
+        return without_hidden_posts(visible, hidden_hashes)
     if include_all:
         posts = _fill_unmuted(
             conn,
@@ -2688,7 +2723,7 @@ def timeline(
             ),
             before,
             lambda post: float(post["created_at"]),
-            filter_page=keep_tag,
+            filter_page=_drop_hidden,
         )
         return annotate_reposts(
             conn,
@@ -2706,17 +2741,20 @@ def timeline(
                             muted_keywords=keywords,
                             exclude_authors=silenced,
                             blocked_authors=blocked,
+                            hidden_posts=hidden_hashes,
                         ),
                     ),
                     muted_keywords=keywords,
                     exclude_authors=silenced,
                     blocked_authors=blocked,
+                    hidden_posts=hidden_hashes,
                 ),
                 viewer=viewer,
             ),
             muted_keywords=keywords,
             exclude_authors=silenced,
             blocked_authors=blocked,
+            hidden_posts=hidden_hashes,
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -2751,7 +2789,7 @@ def timeline(
         page,
         before,
         lambda post: float(post["created_at"]),
-        filter_page=keep_tag,
+        filter_page=_drop_hidden,
     )
     return annotate_reposts(
         conn,
@@ -2769,17 +2807,20 @@ def timeline(
                         muted_keywords=keywords,
                         exclude_authors=silenced,
                         blocked_authors=blocked,
+                        hidden_posts=hidden_hashes,
                     ),
                 ),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
                 blocked_authors=blocked,
+                hidden_posts=hidden_hashes,
             ),
             viewer=viewer,
         ),
         muted_keywords=keywords,
         exclude_authors=silenced,
         blocked_authors=blocked,
+        hidden_posts=hidden_hashes,
     )
 
 
@@ -2793,7 +2834,7 @@ def author_timeline(
     exclude_all: bool = False,
     tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Return one author's posts newest first, with muted posts skipped.
+    """Return one author's posts newest first, with muted and hidden posts skipped.
 
     Pages through the author's chain until *limit* unmuted posts are
     collected, so muted posts never shrink the result.  Reply previews
@@ -2818,6 +2859,11 @@ def author_timeline(
     keep_tag = _tag_page_filter(
         conn, wanted_tag, keywords=keywords, blocked_authors=blocked
     )
+    hidden_hashes = hidden_post_set(conn)
+
+    def _drop_hidden(page: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        visible = keep_tag(page) if keep_tag is not None else page
+        return without_hidden_posts(visible, hidden_hashes)
 
     def page(cursor: int) -> List[Dict[str, Any]]:
         rows = conn.execute(
@@ -2837,7 +2883,7 @@ def author_timeline(
         page,
         0,
         lambda post: int(post["seq"]),
-        filter_page=keep_tag,
+        filter_page=_drop_hidden,
     )
     return annotate_reposts(
         conn,
@@ -2858,16 +2904,19 @@ def author_timeline(
                         muted_keywords=keywords,
                         exclude_authors=silenced,
                         blocked_authors=blocked,
+                        hidden_posts=hidden_hashes,
                     ),
                 ),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
                 blocked_authors=blocked,
+                hidden_posts=hidden_hashes,
             ),
             viewer=viewer,
         ),
         muted_keywords=keywords,
         blocked_authors=blocked,
+        hidden_posts=hidden_hashes,
     )
 
 
@@ -2907,7 +2956,9 @@ def top_posts(
     timeline.  Posts by muted authors never rank either, and a reply
     to one keeps no parent preview at all, as in the timeline —
     muting is display-only, so entries stay stored and unmuting
-    restores them.  An explicit *author* is an explicit lookup, like
+    restores them.  Hidden posts never rank either, and a reply to
+    one keeps its parent preview text blanked with a ``hidden``
+    flag.  An explicit *author* is an explicit lookup, like
     ``timeline --author``: their posts rank even when they are muted,
     but a reply of theirs to a muted author's post still keeps no
     parent preview, so the mute never leaks through a preview.
@@ -2922,6 +2973,7 @@ def top_posts(
     count = max(1, min(int(limit), MAX_TOP_POSTS))
     keywords = _muted_keyword_list(conn)
     silenced = muted_author_set(conn)
+    hidden_hashes = hidden_post_set(conn)
     blocked = set(_clean_excluded(exclude_authors))
     params: List[Any] = []
     where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
@@ -2947,6 +2999,7 @@ def top_posts(
     # is actually displayed.
     candidates = annotate_edits(conn, _without_expired(_public_posts(rows)))
     candidates = without_muted_keywords(conn, candidates, keywords)
+    candidates = without_hidden_posts(candidates, hidden_hashes)
     if ruleset is not None:
         candidates = [
             post
@@ -2977,6 +3030,7 @@ def top_posts(
         muted_keywords=keywords,
         exclude_authors=silenced,
         blocked_authors=blocked,
+        hidden_posts=hidden_hashes,
     )
     return annotate_repost_counts(
         conn,
@@ -3056,7 +3110,8 @@ def thread(
     its parent's subtree rather than re-parented.  Replies by muted
     authors are hidden the same way, subtree included — except the
     entry the caller named, which always anchors the thread even when
-    its author is muted, and a muted ancestor above it, which simply
+    its author is muted or the entry itself is hidden, and a muted or
+    hidden ancestor above it, which simply
     ends the climb instead of being promoted to the root.  An unknown,
     ambiguous or deleted reference raises :class:`TanError`, exactly as
     :func:`resolve_post` does; so does a reference to an unlinked entry
@@ -3079,14 +3134,19 @@ def thread(
         raise TanError(f"post is from a blocked author: {ref!r}")
     silenced = muted_author_set(conn)
     keywords = _muted_keyword_list(conn)
+    hidden_hashes = hidden_post_set(conn)
     muted_pattern = _muted_keyword_pattern(keywords)
     root = start
     ancestors = {root["hash"]}
     # Once a muted entry is met (the named entry itself, or an ancestor),
     # the visible root stops moving, but the climb continues so that
     # deleted ancestors above it are still rejected.
-    anchored = start["author"] in silenced or _text_matches_muted_keywords(
-        str(start.get("text") or ""), muted_pattern
+    anchored = (
+        start["author"] in silenced
+        or str(start["hash"]) in hidden_hashes
+        or _text_matches_muted_keywords(
+            str(start.get("text") or ""), muted_pattern
+        )
     )
     cursor = start
     while cursor.get("kind") in (KIND_REPLY, KIND_REPOST) and cursor.get("target"):
@@ -3114,6 +3174,7 @@ def thread(
         cursor = parent
         if not anchored and (
             parent["author"] in silenced
+            or str(parent["hash"]) in hidden_hashes
             or _text_matches_muted_keywords(
                 str(parent.get("text") or ""), muted_pattern
             )
@@ -3158,6 +3219,7 @@ def thread(
             child
             for child in generation
             if child["hash"] not in seen
+            and child["hash"] not in hidden_hashes
             and child["author"] not in silenced
             and child["author"] not in excluded
             and not _text_matches_muted_keywords(
@@ -3196,6 +3258,7 @@ def thread(
                 muted_keywords=keywords,
                 exclude_authors=silenced,
                 blocked_authors=excluded,
+                hidden_posts=hidden_hashes,
             ),
             viewer=viewer,
         )
@@ -3238,6 +3301,9 @@ def search_posts(
     entirely: searching for a word you muted still finds it.  Posts by
     muted authors never match an open search either; searching with an
     explicit *author* is a direct lookup and still shows their posts.
+    Posts in the local hidden list never match, open search or
+    explicit-author search alike — hiding is about the post, not
+    the author.
     """
     if not isinstance(query, str) or not query.strip():
         raise TanError("search text must not be empty")
@@ -3275,6 +3341,10 @@ def search_posts(
             if str(post["author"]) not in silenced
             and str(post["author"]) not in excluded
         ]
+    hidden_hashes = hidden_post_set(conn)
+    matches = [
+        post for post in matches if str(post["hash"]) not in hidden_hashes
+    ]
     return annotate_repost_counts(
         conn,
         annotate_quotes(
@@ -3286,6 +3356,7 @@ def search_posts(
                 ),
             ),
             blocked_authors=excluded,
+            hidden_posts=hidden_hashes,
         ),
         viewer=viewer,
     )
@@ -3311,7 +3382,7 @@ def tags(
     tag, on its current text: an edited post contributes the tags of
     its edited text, not the original.  Posts their author deleted
     never count, and posts by muted or blocked authors never count
-    either.  Muted keywords are ignored — this is an explicit lookup,
+    either.  Hidden posts never count either.  Muted keywords are ignored — this is an explicit lookup,
     the way search is.  Results are sorted by count, most-used first,
     then by tag, and carry ``{"tag": ..., "count": ...}``.
     """
@@ -3319,6 +3390,7 @@ def tags(
         return []
     excluded = set(_clean_excluded(exclude_authors))
     hidden = excluded | muted_author_set(conn)
+    hidden_hashes = hidden_post_set(conn)
     count = max(1, min(int(limit), MAX_TAGS))
     where = (
         "linked = 1 AND kind IN ('post', 'reply', 'quote') "
@@ -3333,6 +3405,8 @@ def tags(
     counts: Dict[str, int] = {}
     for post in posts:
         if str(post["author"]) in hidden:
+            continue
+        if str(post["hash"]) in hidden_hashes:
             continue
         text = states.get(post["hash"], {}).get("text", post["text"])
         for tag in extract_tags(text):
@@ -3387,7 +3461,8 @@ def mentions(
     Unlinked replies never appear either.  The console's hiding rules
     apply as in :func:`timeline`: replies by muted or blocked authors
     (``exclude_authors``) and replies matching a muted keyword never
-    appear, and ``exclude_all`` hides every mention — the display side
+    appear, and neither do replies you hid, and ``exclude_all``
+    hides every mention — the display side
     of a block-list that failed closed.  Pages are read until *limit*
     visible mentions are collected or the store is exhausted.  Results
     carry the same like annotations and ``reply_to`` parent summary as
@@ -3400,6 +3475,7 @@ def mentions(
     count = max(1, min(int(limit), MAX_MENTIONS_POSTS))
     silenced = muted_author_set(conn)
     blocked = set(_clean_excluded(exclude_authors))
+    hidden_hashes = hidden_post_set(conn)
     hidden = sorted(silenced | blocked)
     keywords = _muted_keyword_list(conn)
     author_clause = ""
@@ -3439,8 +3515,11 @@ def mentions(
         # paging continues past them.
         visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
         kept.extend(
-            without_muted_keywords(
-                conn, _without_expired(_public_posts(visible)), keywords
+            without_hidden_posts(
+                without_muted_keywords(
+                    conn, _without_expired(_public_posts(visible)), keywords
+                ),
+                hidden_hashes,
             )
         )
         if len(rows) < MAX_FEED_POSTS:
@@ -3456,6 +3535,7 @@ def mentions(
         muted_keywords=keywords,
         exclude_authors=silenced,
         blocked_authors=blocked,
+        hidden_posts=hidden_hashes,
     )
 
 
@@ -3844,6 +3924,31 @@ def without_muted_keywords(
     ]
 
 
+def without_hidden_posts(
+    posts: List[Dict[str, Any]],
+    hidden: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Drop posts the viewer hid, keeping the rest.
+
+    Hiding is display-only: entries stay stored and keep syncing, so
+    unhiding restores them.  A repost of a hidden post is dropped too
+    — a repost carries no text of its own, so hiding the original
+    hides the repost, the way muting an author hides reposts of their
+    posts.  An empty *hidden* set keeps every post.
+    """
+    if not hidden:
+        return list(posts)
+    return [
+        post
+        for post in posts
+        if str(post.get("hash") or "") not in hidden
+        and not (
+            post.get("kind") == KIND_REPOST
+            and str(post.get("target") or "") in hidden
+        )
+    ]
+
+
 def muted_author_set(conn: sqlite3.Connection) -> Set[str]:
     """Authors currently muted, as a set of destination hashes."""
     rows = conn.execute("SELECT author FROM muted_authors").fetchall()
@@ -4002,7 +4107,8 @@ def annotated_saved_posts(
     parent matching a muted keyword has its text blanked.  Posts by
     muted authors or matching a muted keyword are dropped from the
     view — muting is display-only, so the saves stay stored and
-    unmuting restores them.  Each returned post carries ``saved`` and
+    unmuting restores them.  Hidden posts are dropped the same way,
+    and a hidden parent keeps its preview text blanked.  Each returned post carries ``saved`` and
     ``saved_at``.
 
     Returns ``(posts, next_offset)``: up to *limit* visible posts
@@ -4015,6 +4121,7 @@ def annotated_saved_posts(
     """
     silenced = muted_author_set(conn)
     keywords = _muted_keyword_list(conn)
+    hidden_hashes = hidden_post_set(conn)
     kept: List[Dict[str, Any]] = []
     raw_offset = max(0, int(offset))
     while len(kept) < limit:
@@ -4033,10 +4140,12 @@ def annotated_saved_posts(
                     ),
                     muted_keywords=keywords,
                     exclude_authors=silenced,
+                    hidden_posts=hidden_hashes,
                 ),
             ),
             muted_keywords=keywords,
             exclude_authors=silenced,
+            hidden_posts=hidden_hashes,
         )
         annotate_repost_counts(conn, batch, viewer=viewer)
         for post in batch:
@@ -4046,6 +4155,7 @@ def annotated_saved_posts(
                 post["edited"] = False
             post["saved"] = True
         batch = [post for post in batch if post["author"] not in silenced]
+        batch = [post for post in batch if str(post["hash"]) not in hidden_hashes]
         batch = without_muted_keywords(conn, batch, keywords)
         if ruleset is not None:
             batch = apply_display_rules(batch, ruleset)
@@ -4162,6 +4272,116 @@ def pinned_posts(
     for row in rows:
         post = _row_to_post(row)
         post["pinned_at"] = float(row["pinned_at"])
+        if str(post["hash"]) in deleted:
+            post["deleted"] = True
+            post["text"] = ""
+        records.append(post)
+    return records
+
+
+def hidden_post_set(conn: sqlite3.Connection) -> Set[str]:
+    """Posts currently hidden, as a set of entry hashes."""
+    rows = conn.execute("SELECT hash FROM hidden_posts").fetchall()
+    return {str(row["hash"]) for row in rows}
+
+
+def hide_post(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Hide one cached post from this node's local views.
+
+    Hiding is private to this node — no signed entry, nothing gossiped.
+    The target must be a cached, linked post, reply, quote or repost
+    that has not been deleted; hiding the same post twice is a no-op
+    that reports the original hide time.  Hidden posts stay stored and
+    keep syncing, so unhiding restores them everywhere.
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        raise TanError("post has not linked yet; sync its chain before hiding")
+    digest = str(post["hash"])
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking for an existing hide and the
+    # capacity, so a competing hide cannot slip in between check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT hidden_at FROM hidden_posts WHERE hash = ?", (digest,)
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            return {
+                "hash": digest,
+                "author": str(post["author"]),
+                "name": str(post.get("name") or ""),
+                "hidden_at": float(existing["hidden_at"]),
+                "already_hidden": True,
+            }
+        count = conn.execute("SELECT COUNT(*) AS n FROM hidden_posts").fetchone()["n"]
+        if int(count) >= MAX_HIDDEN_POSTS:
+            raise TanError(f"hidden posts are limited to {MAX_HIDDEN_POSTS} entries")
+        conn.execute(
+            "INSERT INTO hidden_posts(hash, hidden_at) VALUES(?, ?)",
+            (digest, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {
+        "hash": digest,
+        "author": str(post["author"]),
+        "name": str(post.get("name") or ""),
+        "hidden_at": timestamp,
+        "already_hidden": False,
+    }
+
+
+def unhide_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
+    """Remove a post from the local hidden list.
+
+    Returns the resolved post hash with whether a hide was removed, so
+    callers — including ``--json`` output — can identify the post even
+    when *ref* was a short prefix.
+    """
+    digest = _resolve_saved_ref(conn, ref)
+    with conn:
+        cursor = conn.execute("DELETE FROM hidden_posts WHERE hash = ?", (digest,))
+    return {"hash": digest, "unhidden": cursor.rowcount > 0}
+
+
+def hidden_posts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Hidden posts, newest hide first.
+
+    A post deleted after being hidden stays in the list with its text
+    blanked and ``deleted`` set, so the hide is not silently lost.
+    *offset* pages through the list in hide order, so a caller can
+    reach hides older than one page.
+    """
+    count = max(1, min(int(limit), MAX_HIDDEN_POSTS))
+    start = max(0, int(offset))
+    # Expired posts are filtered in SQL, before LIMIT/OFFSET, so the raw
+    # offset a caller advances by counts exactly the rows it was given.
+    rows = conn.execute(
+        "SELECT p.*, s.hidden_at FROM hidden_posts s "
+        "JOIN posts p ON p.hash = s.hash "
+        "WHERE p.expires_at IS NULL OR p.expires_at > ? "
+        "ORDER BY s.hidden_at DESC, s.hash DESC LIMIT ? OFFSET ?",
+        (time.time(), count, start),
+    ).fetchall()
+    deleted = deleted_targets(conn)
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        post = _row_to_post(row)
+        post["hidden_at"] = float(row["hidden_at"])
         if str(post["hash"]) in deleted:
             post["deleted"] = True
             post["text"] = ""
