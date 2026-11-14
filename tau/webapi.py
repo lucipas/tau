@@ -4985,6 +4985,10 @@ class WebBridge:
             messages, response = self.send_group_message(
                 group.strip(), forwarded, timeout=timeout
             )
+            # The aggregate ok mirrors the group-send endpoint: a
+            # refused or unqueueable leg reports False so the console
+            # can name the members who missed the message instead of
+            # closing the picker on a success flag.
             return {
                 "ok": bool(response.get("ok", True)),
                 "messages": messages,

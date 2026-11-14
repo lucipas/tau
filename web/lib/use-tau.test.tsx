@@ -1277,6 +1277,88 @@ describe("useTau forwardMessageToGroup", () => {
     // A queued leg lands in the outbox; the forward refreshes it at once.
     expect(mockedGet).toHaveBeenCalledWith("/api/outbox");
   });
+
+  it("keeps an inbound message recorded between two legs", async () => {
+    const legs = [
+      makeMessage({ id: 2, peer: PEER_HASH, peer_name: "alice" }),
+      makeMessage({ id: 4, peer: BOB_HASH, peer_name: "bob" }),
+    ];
+    mockedPost.mockResolvedValue({
+      ok: true,
+      messages: legs,
+      response: { ok: true, group: GROUP_ID, name: "crew", results: [] },
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot(),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+
+    await act(async () => {
+      await result.current.forwardMessageToGroup(1, GROUP_ID);
+    });
+
+    // The legs are not a complete view up to their highest id: an
+    // inbound message recorded between them must still arrive from
+    // its SSE event instead of being dropped as already seen.
+    await act(async () => {
+      FakeEventSource.instances[0].emit("message", {
+        message: makeMessage({
+          id: 3,
+          peer: PEER_HASH,
+          peer_name: "alice",
+          text: "between legs",
+        }),
+      });
+    });
+    expect(result.current.messages.map((m) => m.id)).toEqual([2, 3, 4]);
+  });
+
+  it("throws naming the failed member but keeps the legs in the feed", async () => {
+    const legs = [
+      makeMessage({ id: 2, peer: PEER_HASH, peer_name: "alice" }),
+      makeMessage({
+        id: 3,
+        peer: BOB_HASH,
+        peer_name: "bob",
+        status: "failed",
+      }),
+    ];
+    mockedPost.mockResolvedValue({
+      ok: false,
+      messages: legs,
+      response: {
+        ok: false,
+        group: GROUP_ID,
+        name: "crew",
+        results: [
+          { to: PEER_HASH, to_name: "alice", delivered: true },
+          { to: BOB_HASH, to_name: "bob", ok: false, error: "not_allowed" },
+        ],
+      },
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot(),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+
+    await act(async () => {
+      await expect(
+        result.current.forwardMessageToGroup(1, GROUP_ID),
+      ).rejects.toThrow(
+        /could not forward to bob — alice already received this/,
+      );
+    });
+
+    expect(result.current.messages).toEqual(legs);
+  });
 });
 
 describe("useTau retractMessage", () => {

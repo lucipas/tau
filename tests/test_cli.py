@@ -4993,6 +4993,10 @@ class _FakeGroupSendNode:
     """Stub TauNode for `tau group send`: records the reply reference."""
 
     instances: list = []
+    # Tests opt into queued legs (a `--wait` forward's offline member)
+    # and decide whether the wait finds them delivered.
+    queue_legs = False
+    deliver_on_wait = False
 
     def __init__(self, config, **kwargs):
         from tau.groups import GroupStore
@@ -5002,6 +5006,7 @@ class _FakeGroupSendNode:
         self.mailbox = _FakeGroupMailbox()
         self.sent: list = []
         self.send_kwargs: list = []
+        self.wait_calls: list = []
         _FakeGroupSendNode.instances.append(self)
 
     def start(self):
@@ -5010,10 +5015,14 @@ class _FakeGroupSendNode:
     def stop(self):
         pass
 
+    def wait_for_delivery(self, message_id, timeout=0.0):
+        self.wait_calls.append((message_id, timeout))
+        return _FakeGroupSendNode.deliver_on_wait
+
     def send_group_message(self, group, text, **kwargs):
         self.sent.append((group, text, kwargs.get("in_reply_to")))
         self.send_kwargs.append(kwargs)
-        if kwargs.get("send_after") is not None:
+        if kwargs.get("send_after") is not None or _FakeGroupSendNode.queue_legs:
             return {
                 "ok": True,
                 "group": group["id"],
@@ -5024,14 +5033,22 @@ class _FakeGroupSendNode:
                         "to_name": "alice",
                         "queued": True,
                         "id": "f" * 32,
-                        "send_after": kwargs["send_after"],
+                        **(
+                            {"send_after": kwargs["send_after"]}
+                            if kwargs.get("send_after") is not None
+                            else {}
+                        ),
                     },
                     {
                         "to": "ab" * 16,
                         "to_name": "bob",
                         "queued": True,
                         "id": "e" * 32,
-                        "send_after": kwargs["send_after"],
+                        **(
+                            {"send_after": kwargs["send_after"]}
+                            if kwargs.get("send_after") is not None
+                            else {}
+                        ),
                     },
                 ],
             }
@@ -5469,6 +5486,69 @@ def test_forward_to_group_unknown_group_is_an_error(
     )
     assert code == 1
     assert "unknown group" in capsys.readouterr().err
+
+
+def test_forward_to_group_waits_for_queued_legs(
+    tmp_path, capsys, monkeypatch
+):
+    # A group forward honours --wait: the queued legs are waited on
+    # instead of the one-shot flush, and a delivery inside the budget
+    # reports delivered.
+    from tau.groups import GroupStore
+
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    store = GroupStore(config.groups_path)
+    store.create("weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    monkeypatch.setattr(_FakeGroupSendNode, "queue_legs", True)
+    monkeypatch.setattr(_FakeGroupSendNode, "deliver_on_wait", True)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--group",
+            "weekend",
+            "--wait",
+            "5",
+            "aaaa",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert node.wait_calls == [("f" * 32, 5.0), ("e" * 32, 5.0)]
+    assert "delivered to alice" in capsys.readouterr().out
+
+
+def test_forward_to_group_wait_conflicts_with_no_queue(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.groups import GroupStore
+
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    store = GroupStore(config.groups_path)
+    store.create("weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--group",
+            "weekend",
+            "--wait",
+            "5",
+            "--no-queue",
+            "aaaa",
+        ]
+    )
+    assert code == 2
+    assert "--wait cannot be combined with --no-queue" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
 
 
 def test_forward_prefers_registry_alias_for_sender_label(
