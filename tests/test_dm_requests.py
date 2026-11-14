@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import stat
@@ -28,11 +29,11 @@ from tau.dm_requests import (
     save_dm_requests,
 )
 from tau.identity import destination_hash
-from tau.inbox import Inbox
+from tau.inbox import Inbox, InboxError
 from tau.mailbox import Mailbox
 from tau.node import TauNode
 from tau.peers import PeerRegistry
-from tau.protocol import decode, encode, encode_message
+from tau.protocol import decode, encode, encode_message, retract_dict
 
 
 ALICE = "aa" * 16
@@ -399,3 +400,204 @@ def test_cli_accept_unknown_errors(tmp_path, capsys):
     data_dir = tmp_path / "node"
     assert run_cli("messages", "accept-request", "nope", "--data-dir", str(data_dir)) == 1
     assert "no DM request" in capsys.readouterr().err
+
+
+def _signed_retract(sender, target, message_id):
+    """A retract payload signed by *sender*, as send_retraction builds it."""
+    payload = retract_dict(target, message_id=message_id)
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+# -- bot-review follow-ups ---------------------------------------------------
+
+def test_denied_quoted_dm_records_and_accepts(tmp_path, capsys):
+    # A quoted DM carries in_reply_to as a dict; the store must hold
+    # that shape and the accept must deliver it back intact.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    _enable_allowlist(node)
+    sender = RNS.Identity()
+    result = call_handler(
+        node._handle_message,
+        encode_message(
+            "quoting you",
+            message_id="req-q",
+            in_reply_to={"id": "orig-1", "excerpt": "abcd"},
+        ),
+        sender,
+    )
+    assert result["ok"] is False
+    assert result["error"]["code"] == "not_allowed"
+    requests = load_dm_requests(node.config.dm_requests_path)
+    assert len(requests) == 1
+    assert requests[0].in_reply_to == {"id": "orig-1", "excerpt": "abcd"}
+    assert run_cli("messages", "accept-request", "req-q", "--data-dir", str(tmp_path)) == 0
+    entries = Inbox(node.config.inbox_path).list_messages(limit=None)
+    assert len(entries) == 1
+    assert entries[0]["in_reply_to"] == {"id": "orig-1", "excerpt": "abcd"}
+
+
+def test_denied_dm_with_bad_sent_at_records_as_unknown(tmp_path):
+    # The protocol accepts any number for sent_at, including a
+    # boolean, NaN and infinity; the store cannot reload those, so
+    # the node normalizes them to an unknown send time instead.
+    # NaN and infinity cannot come through the strict wire encoder,
+    # so those two arrive as hand-built JSON, the way a modified
+    # client would send them.
+    node = make_node(tmp_path)
+    _enable_allowlist(node)
+    sender = RNS.Identity()
+    for index, bad in enumerate((True, float("nan"), float("inf"))):
+        data = json.dumps(
+            {
+                "type": "message",
+                "text": "hi",
+                "kind": "message",
+                "sent_at": bad,
+                "id": f"req-bad-{index}",
+            }
+        ).encode("utf-8")
+        result = call_handler(node._handle_message, data, sender)
+        assert result["ok"] is False
+        assert result["error"]["code"] == "not_allowed"
+    requests = load_dm_requests(node.config.dm_requests_path)
+    assert len(requests) == 3
+    assert all(entry.sent_at == 0.0 for entry in requests)
+
+
+def test_from_dict_rejects_unrepresentable_sent_at():
+    # A huge integer survives JSON but not float(): the loader must
+    # raise DmRequestsError, never OverflowError.
+    with pytest.raises(DmRequestsError):
+        DmRequest.from_dict(make_request().to_dict() | {"sent_at": 10**400})
+
+
+def test_cli_accept_refuses_blocked_sender(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    save_allowlist(
+        config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset({ALICE})),
+    )
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", sender=BOB, received_at=now - 60),
+        now=now,
+    )
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({BOB})))
+    assert run_cli("messages", "accept-request", "req-1", "--data-dir", str(data_dir)) == 1
+    assert "blocked" in capsys.readouterr().err
+    # Nothing was allow-listed, delivered or removed.
+    assert BOB not in load_allowlist(config.allowlist_path).allow
+    assert Inbox(config.inbox_path).list_messages(limit=None) == []
+    assert len(load_dm_requests(config.dm_requests_path)) == 1
+
+
+def test_cli_accept_refuses_unreadable_blocklist(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    save_allowlist(
+        config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset({ALICE})),
+    )
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", sender=BOB, received_at=now - 60),
+        now=now,
+    )
+    (config.blocklist_path).write_text("{not json", encoding="utf-8")
+    assert run_cli("messages", "accept-request", "req-1", "--data-dir", str(data_dir)) == 1
+    assert "block-list is unusable" in capsys.readouterr().err
+    assert len(load_dm_requests(config.dm_requests_path)) == 1
+
+
+def test_cli_accept_failed_append_keeps_request_for_retry(tmp_path, capsys, monkeypatch):
+    # Appending to the inbox fails on the first accept: no seen
+    # marker may be left behind, so the retry delivers the held copy.
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="tester")
+    save_allowlist(
+        config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset({ALICE})),
+    )
+    now = time.time()
+    record_dm_request(
+        config.dm_requests_path,
+        make_request("req-1", sender=BOB, received_at=now - 60),
+        now=now,
+    )
+    calls = []
+    original_append = cli.Inbox.append
+
+    def flaky(self, record):
+        if not calls:
+            calls.append(1)
+            raise InboxError("disk full")
+        return original_append(self, record)
+
+    monkeypatch.setattr(cli.Inbox, "append", flaky)
+    assert run_cli("messages", "accept-request", "req-1", "--data-dir", str(data_dir)) == 1
+    assert "could not deliver" in capsys.readouterr().err
+    assert len(load_dm_requests(config.dm_requests_path)) == 1
+    assert Mailbox(config.mailbox_path).is_seen("req-1") is False
+    assert Inbox(config.inbox_path).list_messages(limit=None) == []
+    assert run_cli("messages", "accept-request", "req-1", "--data-dir", str(data_dir)) == 0
+    entries = Inbox(config.inbox_path).list_messages(limit=None)
+    assert len(entries) == 1
+    assert entries[0]["id"] == "req-1"
+    assert Mailbox(config.mailbox_path).is_seen("req-1") is True
+    assert load_dm_requests(config.dm_requests_path) == []
+
+
+def test_retract_of_held_request_blocks_accept(tmp_path, capsys):
+    # A sender whose DM is held may still retract it: the signed
+    # retract records a marker even though the sender is outside
+    # the allow-list, and accepting the request then refuses to
+    # deliver the withdrawn text.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    _enable_allowlist(node)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    result = call_handler(
+        node._handle_message,
+        encode_message("take this back later", message_id="req-1"),
+        sender,
+    )
+    assert result["ok"] is False
+    assert len(load_dm_requests(node.config.dm_requests_path)) == 1
+    response = call_handler(
+        node._handle_retract,
+        _signed_retract(sender, "req-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert node.mailbox.is_retracted(sender_hash, "req-1") is True
+    assert run_cli("messages", "accept-request", "req-1", "--data-dir", str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "not delivered" in out
+    assert "retracted" in out
+    assert sender_hash in load_allowlist(node.config.allowlist_path).allow
+    assert Inbox(node.config.inbox_path).list_messages(limit=None) == []
+    assert load_dm_requests(node.config.dm_requests_path) == []
+
+
+def test_retract_of_unknown_id_from_unlisted_sender_still_denied(tmp_path):
+    # The held-request exception is exact: a retract for an id with
+    # no held request from this sender is denied as before, so an
+    # unlisted peer cannot write markers for arbitrary ids.
+    node = make_node(tmp_path)
+    _enable_allowlist(node)
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_retract,
+        _signed_retract(sender, "no-such-id", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+    assert node.mailbox.is_retracted(destination_hash(sender).hex(), "no-such-id") is False

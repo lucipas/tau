@@ -35,7 +35,12 @@ from .config import (
     tcp_listen_endpoints,
     write_rns_config,
 )
-from .dm_requests import DM_REQUEST_TTL, DmRequest, record_dm_request
+from .dm_requests import (
+    DM_REQUEST_TTL,
+    DmRequest,
+    list_dm_requests,
+    record_dm_request,
+)
 from .groups import GroupStore, pinned_group
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -1549,6 +1554,23 @@ class TauNode:
         message_id = message.get("id")
         if not caller_hash or not message_id:
             return
+        # sent_at is sender-supplied and the protocol accepts any
+        # number for it, including a boolean, NaN, infinity, or an
+        # integer too large to convert: the store rejects those on
+        # load, so normalize here the way the inbox does (unknown
+        # send time) instead of persisting a request that can never
+        # be read back.  expires_at is already validated finite by
+        # the parser, and in_reply_to by clean_in_reply_to.
+        sent_at = message.get("sent_at")
+        if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+            sent_at = 0.0
+        else:
+            try:
+                sent_at = float(sent_at)
+            except (OverflowError, ValueError):
+                sent_at = 0.0
+            if sent_at != sent_at or sent_at in (float("inf"), float("-inf")):
+                sent_at = 0.0
         try:
             record_dm_request(
                 self.config.dm_requests_path,
@@ -1557,7 +1579,7 @@ class TauNode:
                     sender=caller_hash,
                     text=message["text"],
                     kind=message["kind"],
-                    sent_at=message.get("sent_at") or 0.0,
+                    sent_at=sent_at,
                     received_at=received_at,
                     request_expires_at=received_at + DM_REQUEST_TTL,
                     expires_at=message.get("expires_at"),
@@ -1567,6 +1589,25 @@ class TauNode:
             )
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record DM request", exc_info=True)
+
+    def _has_held_dm_request(self, sender_hash: str, message_id: str) -> bool:
+        """True when *sender_hash* has a live held request for *message_id*.
+
+        Used by the retract handler: a sender whose DM is still held
+        may retract it even though they are outside the allow-list —
+        the retract is signed, so the check is exact, and it records
+        a marker without admitting anything else from that sender.
+        A store failure reads as no held request, so the retract is
+        denied exactly as before.
+        """
+        try:
+            requests = list_dm_requests(self.config.dm_requests_path)
+        except Exception:  # pragma: no cover - defensive
+            return False
+        return any(
+            entry.id == message_id and entry.sender == sender_hash
+            for entry in requests
+        )
 
     def _record_retraction(
         self, sender_hash: str, message_id: str, *, confirmed: bool = False
@@ -2732,13 +2773,19 @@ class TauNode:
                 "invalid_retraction", "retraction signature does not verify"
             )
         if not self.allowlist.is_allowed(caller_hash):
-            log.info(
-                "Retraction from %s denied by the DM allow-list",
-                caller_hash or "anonymous",
-            )
-            return response_error(
-                "not_allowed", "sender is not on this node's allow-list"
-            )
+            if not self._has_held_dm_request(caller_hash, retract["target"]):
+                log.info(
+                    "Retraction from %s denied by the DM allow-list",
+                    caller_hash or "anonymous",
+                )
+                return response_error(
+                    "not_allowed", "sender is not on this node's allow-list"
+                )
+            # The retract targets the sender's own held DM request:
+            # fall through so the verified retract records its marker
+            # below.  The message itself stays held, never delivered,
+            # and accepting the request later finds the marker and
+            # refuses to deliver it.
 
         # Only the message's original sender may retract it: the stored
         # copy's sender hash must match the caller.  An unknown id is

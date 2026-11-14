@@ -60,9 +60,11 @@ from .config import (
 )
 from .dm_requests import (
     DmRequestsError,
+    dm_requests_lock,
     list_dm_requests,
     remove_dm_request,
     resolve_dm_request,
+    save_dm_requests,
 )
 from .doctor import all_ok, run_checks
 from .identity import (
@@ -7760,50 +7762,75 @@ def cmd_messages_requests(args: argparse.Namespace) -> int:
 def cmd_messages_accept_request(args: argparse.Namespace) -> int:
     """Allow-list a request's sender and deliver the held message.
 
-    The sender is allow-listed first, so a retry of the same message
-    after acceptance is admitted and deduped instead of denied again.
-    Delivery marks the id seen before appending, under the mailbox
-    transaction, so a concurrent retry cannot land a second copy
-    between the check and the insert — the same order the live
-    delivery path uses.  A message the sender retracted while it was
-    held, or whose own expiry passed while it was held, is not
-    delivered; the sender is still allow-listed and the request is
-    still dropped.  The request is removed only after the delivery
-    step, so a failure there leaves it in place for a retry.
+    The whole acceptance runs under the requests-store lock: the
+    request is resolved, delivered and removed while holding it, so
+    a concurrent decline (or eviction) cannot take the request away
+    mid-acceptance and leave this command delivering a copy it then
+    silently fails to remove.  The sender is allow-listed first, so
+    a retry of the same message after acceptance is admitted and
+    deduped instead of denied again — but a sender who has since
+    been blocked is refused outright, matching the node's
+    block-before-allow rule for live DMs (and a block-list that
+    cannot be read refuses too, failing closed like the node).
+
+    Delivery appends to the inbox before marking the id seen, under
+    the mailbox transaction, so a failed append leaves no durable
+    seen marker behind and the request stays for a retry; a copy
+    already in the inbox (a previous accept that appended and then
+    crashed before marking seen) is not appended twice.  Holding
+    the mailbox transaction across both steps is what keeps a
+    concurrent live retry from landing a second copy between them —
+    the live delivery path takes the same transaction before it
+    checks the seen set.  The message's own expiry is re-checked
+    against the current time inside that transaction, so a message
+    that expires while acceptance waits is never delivered late.  A
+    message the sender retracted while it was held, or whose own
+    expiry passed while it was held, is not delivered; the sender
+    is still allow-listed and the request is still dropped.
     """
     config = _make_config(args)
     registry = PeerRegistry(config.peers_path)
-    now = time.time()
-    try:
-        requests = list_dm_requests(config.dm_requests_path)
-        request = resolve_dm_request(requests, args.target)
-    except DmRequestsError as exc:
-        raise NodeError(str(exc)) from exc
-    try:
-        allowlist = load_allowlist(config.allowlist_path)
-    except AllowListError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        print(
+            "error: block-list is unusable; refusing to accept a request",
+            file=sys.stderr,
+        )
         return _EXIT_ERROR
-    if request.sender not in allowlist.allow:
-        allowlist = allowlist.with_added(request.sender)
-        save_allowlist(config.allowlist_path, allowlist)
-        allowlisted = True
-    else:
-        allowlisted = False
-    inbox = Inbox(config.inbox_path)
-    mailbox = Mailbox(config.mailbox_path)
-    delivered = False
-    skipped = None
-    if request.message_expired(now):
-        skipped = "its own expiry had passed while it was held"
-    else:
+    with dm_requests_lock(config.dm_requests_path):
+        now = time.time()
+        try:
+            requests = list_dm_requests(config.dm_requests_path, now=now)
+            request = resolve_dm_request(requests, args.target)
+        except DmRequestsError as exc:
+            raise NodeError(str(exc)) from exc
+        if request.sender in blocked:
+            raise NodeError(
+                "sender is blocked; decline the request or unblock them first"
+            )
+        try:
+            allowlist = load_allowlist(config.allowlist_path)
+        except AllowListError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        if request.sender not in allowlist.allow:
+            allowlist = allowlist.with_added(request.sender)
+            save_allowlist(config.allowlist_path, allowlist)
+            allowlisted = True
+        else:
+            allowlisted = False
+        inbox = Inbox(config.inbox_path)
+        mailbox = Mailbox(config.mailbox_path)
+        delivered = False
+        skipped = None
         with mailbox.transaction():
-            if mailbox.is_retracted(request.sender, request.id):
+            if request.message_expired(time.time()):
+                skipped = "its own expiry had passed while it was held"
+            elif mailbox.is_retracted(request.sender, request.id):
                 skipped = "the sender retracted it while it was held"
             elif mailbox.is_seen(request.id):
                 skipped = "it was already delivered"
             else:
-                mailbox.mark_seen(request.id, now=now)
                 peer = registry.get(request.sender)
                 sender_name = (
                     peer.display_name
@@ -7823,20 +7850,50 @@ def cmd_messages_accept_request(args: argparse.Namespace) -> int:
                 }
                 if request.in_reply_to is not None:
                     record["in_reply_to"] = request.in_reply_to
-                try:
-                    inbox.append(record)
-                except (InboxError, ValueError) as exc:
-                    raise NodeError(
-                        f"could not deliver the held message: {exc}"
-                    ) from exc
-                delivered = True
-    try:
-        remove_dm_request(config.dm_requests_path, request.id)
-    except DmRequestsError:
-        # It expired between the resolve and the removal; it is gone
-        # either way, and the delivery above already happened.
-        pass
+                already_stored = inbox.find(request.id, peer=request.sender)
+                if already_stored is not None:
+                    # A previous accept appended the copy but crashed
+                    # before marking it seen: mark it now instead of
+                    # appending a second copy.
+                    mailbox.mark_seen(request.id, now=time.time())
+                    delivered = True
+                else:
+                    try:
+                        inbox.append(record)
+                    except (InboxError, ValueError) as exc:
+                        raise NodeError(
+                            f"could not deliver the held message: {exc}"
+                        ) from exc
+                    mailbox.mark_seen(request.id, now=time.time())
+                    delivered = True
+        save_dm_requests(
+            config.dm_requests_path,
+            [entry for entry in requests if entry.id != request.id],
+        )
     name = _request_sender_label(registry, request.sender)
+    if _json_mode(args):
+        _emit(
+            {
+                "accepted": request.to_dict(),
+                "delivered": delivered,
+                "allowlisted": allowlisted,
+                "skipped": skipped,
+            },
+            True,
+        )
+        return _EXIT_OK
+    short = _safe_id_prefix(request.id)
+    when = _format_message_time(request.received_at)
+    if delivered:
+        state = "delivered to the inbox"
+    else:
+        state = f"not delivered ({skipped})"
+    if allowlisted:
+        print(f"accepted [{short}] from {name} ({when}) — sender allow-listed, message {state}")
+        print("  (a running serve applies the allow-list change when it restarts)")
+    else:
+        print(f"accepted [{short}] from {name} ({when}) — sender already allow-listed, message {state}")
+    return _EXIT_OK
     if _json_mode(args):
         _emit(
             {

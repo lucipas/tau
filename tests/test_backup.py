@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat
 import tarfile
+import time
 from pathlib import Path
 import tempfile
 import threading
@@ -15,6 +16,7 @@ import pytest
 from tau import cli
 from tau.backup import BACKUP_FILES, MANIFEST_NAME, create_backup, restore_backup
 from tau.config import TauConfig
+from tau.dm_requests import DM_REQUEST_TTL, DmRequest, record_dm_request
 from tau.identity import destination_hash, load_identity
 from tau.node import InstanceLock
 from tau.tangents.tan import init_db
@@ -561,6 +563,70 @@ def test_restore_force_removes_stale_groups_blocklist_files(tmp_path, capsys):
     assert not (node_b / "blocklist.json").exists()
     assert not stale.exists()
     assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+
+
+def test_restore_force_removes_stale_dm_requests(tmp_path, capsys):
+    # A --force restore replaces the whole node state: a dm-requests
+    # file the archive does not hold must not survive it.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = _init_node(tmp_path, "b", "bob")
+    (node_b / "dm-requests.json").write_text(
+        '{"requests": []}\n', encoding="utf-8"
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(["restore", str(archive), "--data-dir", str(node_b), "--force"])
+        == 0
+    )
+    capsys.readouterr()
+    assert not (node_b / "dm-requests.json").exists()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+
+
+def test_backup_restore_round_trip_keeps_dm_requests(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    now = time.time()
+    assert record_dm_request(
+        node_a / "dm-requests.json",
+        DmRequest(
+            id="req-1",
+            sender="bb" * 16,
+            text="hello, let me in",
+            kind="chat",
+            sent_at=now - 60,
+            received_at=now - 60,
+            request_expires_at=now - 60 + DM_REQUEST_TTL,
+        ),
+        now=now,
+    )
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "restore",
+                str(archive),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert "dm-requests.json" in payload["files"]
+    assert (node_b / "dm-requests.json").read_bytes() == (
+        node_a / "dm-requests.json"
+    ).read_bytes()
 
 
 def test_restore_rejects_misplaced_files_member(tmp_path):

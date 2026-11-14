@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 from .allowlist import clean_destination
+from .protocol import ProtocolError, clean_in_reply_to
 from .util import atomic_write_json
 
 log = logging.getLogger(__name__)
@@ -78,9 +79,13 @@ def _clean_text(value: Any) -> str:
 def _clean_timestamp(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise DmRequestsError(f"request {field} must be a number")
-    if value != value or value in (float("inf"), float("-inf")):
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise DmRequestsError(f"request {field} must be finite") from exc
+    if number != number or number in (float("inf"), float("-inf")):
         raise DmRequestsError(f"request {field} must be finite")
-    return float(value)
+    return number
 
 
 def _clean_optional_timestamp(value: Any, field: str) -> Optional[float]:
@@ -101,7 +106,7 @@ class DmRequest:
     received_at: float
     request_expires_at: float
     expires_at: Optional[float] = None
-    in_reply_to: Optional[str] = None
+    in_reply_to: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -133,9 +138,12 @@ class DmRequest:
         kind = data.get("kind")
         if not isinstance(kind, str) or not kind:
             raise DmRequestsError("request kind must be a non-empty string")
-        in_reply_to = data.get("in_reply_to")
-        if in_reply_to is not None and not isinstance(in_reply_to, str):
-            raise DmRequestsError("request in_reply_to must be a string")
+        try:
+            in_reply_to = clean_in_reply_to(data.get("in_reply_to"))
+        except ProtocolError as exc:
+            raise DmRequestsError(
+                f"request in_reply_to is not a valid reply reference: {exc}"
+            ) from exc
         return cls(
             id=request_id,
             sender=sender,
