@@ -741,8 +741,16 @@ class Inbox:
         finally:
             self._lock.release()
 
-    def append(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Record one message, dropping the oldest past its direction's cap."""
+    def append(self, record: Dict[str, Any], *, strict: bool = False) -> Dict[str, Any]:
+        """Record one message, dropping the oldest past its direction's cap.
+
+        ``strict`` passes through to :meth:`_save`: a failed persist
+        then raises :class:`OSError` instead of being logged and
+        ignored, so a caller that must not acknowledge unstored state
+        (accepting a held DM request) never reports a delivery that
+        never landed on disk.  The live delivery path keeps the
+        default, so a failed persist there never breaks delivery.
+        """
         entry = _valid_record(record)
         if entry is None:
             raise ValueError("inbox record needs text")
@@ -750,7 +758,7 @@ class Inbox:
             entry["seq"] = self._next_seq()
             self._messages.append(entry)
             self._messages = _retain(self._messages)
-            self._save()
+            self._save(strict=strict)
         return entry
 
     def add_note(self, text: str, *, sender_name: str, destination: str) -> Dict[str, Any]:
