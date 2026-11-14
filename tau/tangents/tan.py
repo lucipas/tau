@@ -4155,7 +4155,7 @@ def annotated_saved_posts(
                 post["edited"] = False
             post["saved"] = True
         batch = [post for post in batch if post["author"] not in silenced]
-        batch = [post for post in batch if str(post["hash"]) not in hidden_hashes]
+        batch = without_hidden_posts(batch, hidden_hashes)
         batch = without_muted_keywords(conn, batch, keywords)
         if ruleset is not None:
             batch = apply_display_rules(batch, ruleset)
@@ -4426,6 +4426,7 @@ def annotated_pinned_posts(
     silenced = muted_author_set(conn)
     blocked = set(_clean_excluded(exclude_authors))
     keywords = _muted_keyword_list(conn)
+    hidden_hashes = hidden_post_set(conn)
     kept: List[Dict[str, Any]] = []
     raw_offset = max(0, int(offset))
     while len(kept) < limit:
@@ -5583,6 +5584,18 @@ class TanApp:
                     )
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Tan gossip failed", exc_info=True)
+            finally:
+                self._gossip_slots.release()
+
+        threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
+                  )
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Tan gossip failed", exc_info=True)
+            finally:
+                self._gossip_slots.release()
+
+        threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
+c_info=True)
             finally:
                 self._gossip_slots.release()
 
