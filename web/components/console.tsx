@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { useTau } from "@/lib/use-tau";
-import type { TauMessage } from "@/lib/types";
+import type { Peer, TauMessage } from "@/lib/types";
 
 import { BundleSection } from "./bundle-section";
 import { Composer } from "./composer";
@@ -16,6 +16,18 @@ import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
 import { SettingsSection } from "./settings-section";
+
+// Peers whose conversation is not archived: the only peers the console
+// offers as send targets. An archived thread stays hidden until restored.
+function activePeersOf(
+  peers: Peer[],
+  archived: { destination: string }[],
+): Peer[] {
+  return peers.filter(
+    (peer) =>
+      !archived.some((entry) => entry.destination === peer.destination),
+  );
+}
 
 export function Console() {
   const tau = useTau();
@@ -77,9 +89,9 @@ export function Console() {
       }
       if (tau.groups.length > 0) {
         setTarget(tau.groups[0].id);
-      } else if (tau.peers.length > 0) {
+      } else if (activePeersOf(tau.peers, tau.archivedConversations).length > 0) {
         setMode("peer");
-        setTarget(tau.peers[0].destination);
+        setTarget(activePeersOf(tau.peers, tau.archivedConversations)[0].destination);
       } else {
         setMode("custom");
         setTarget("");
@@ -89,18 +101,19 @@ export function Console() {
     if (!target && !customPicked.current) {
       // Auto-select skips archived conversations: their threads are
       // hidden until restored.
-      const firstActive = tau.peers.find(
-        (peer) =>
-          !tau.archivedConversations.some(
-            (entry) => entry.destination === peer.destination,
-          ),
-      );
+      const firstActive = activePeersOf(tau.peers, tau.archivedConversations)[0];
       if (firstActive) {
         setMode("peer");
         setTarget(firstActive.destination);
       } else if (tau.groups.length > 0) {
         setMode("group");
         setTarget(tau.groups[0].id);
+      } else {
+        // Every peer is archived and there are no groups: nothing to
+        // send to, so offer the custom-address mode instead of an
+        // empty peer selection.
+        setMode("custom");
+        setTarget("");
       }
     }
   }, [tau.peers, tau.groups, tau.groupSwap, tau.archivedConversations, target, mode]);
@@ -371,7 +384,7 @@ export function Console() {
               <DoctorSection onRun={tau.runDoctor} />
             </div>
             <Composer
-              peers={tau.peers}
+              peers={activePeersOf(tau.peers, tau.archivedConversations)}
               groups={tau.groups}
               target={target}
               mode={mode}
