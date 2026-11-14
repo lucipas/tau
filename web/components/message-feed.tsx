@@ -326,8 +326,10 @@ export function resolveQuote(
   messages: TauMessage[],
   message: TauMessage,
 ): ResolvedQuote | null {
-  // A quote resolves only inside the same conversation (same peer):
-  // the quoted text is pulled from this console's own history, never
+  // A quote resolves only inside the same conversation: the same peer
+  // for a DM, the same group for a group message (members differ per
+  // entry, so the peer cannot scope a group reply). The quoted text is
+  // pulled from this console's own history, never
   // from the wire, so a reference to a message that never arrived —
   // or to another peer's message — renders as unavailable instead of
   // trusting the sender's claim about what was said. When the reply
