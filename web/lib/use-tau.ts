@@ -43,6 +43,7 @@ import type {
   PingResult,
   PinMessageResponse,
   ReactResponse,
+  RenameGroupResponse,
   RenameResponse,
   RetractMessageResponse,
   RetryOutboxResponse,
@@ -50,6 +51,7 @@ import type {
   SendFileResponse,
   SendGroupResponse,
   SendResponse,
+  SetGroupTopicResponse,
   Snapshot,
   SocialInfo,
   TauGroup,
@@ -212,6 +214,32 @@ export function useTau() {
     if (requestId !== groupsSeq.current) return;
     setGroups(result.groups);
   }, []);
+
+  // A roster change or a rename is a successor group: swap the old id
+  // for the new one at once, so the console can move a selected old id
+  // to its successor before the missing-target fallback runs.
+  const applyGroupSuccessor = useCallback(
+    (previousId: string, updated: TauGroup) => {
+      groupEdits.current += 1;
+      setGroups((previous) => {
+        // A snapshot may already list the successor: keep one entry per
+        // id, placed where the old group was.
+        const rest = previous.filter(
+          (entry) => entry.id !== previousId && entry.id !== updated.id,
+        );
+        const index = previous.findIndex((entry) => entry.id === previousId);
+        if (index === -1) return [...rest, updated];
+        const before = previous
+          .slice(0, index)
+          .filter(
+            (entry) => entry.id !== previousId && entry.id !== updated.id,
+          ).length;
+        return [...rest.slice(0, before), updated, ...rest.slice(before)];
+      });
+      setGroupSwap({ from: previousId, to: updated.id });
+    },
+    [],
+  );
 
   // Verification time the console last applied per peer. Peer events
   // queued before a successful verify carry the older trust state and
@@ -1253,26 +1281,7 @@ export function useTau() {
       // new one at once, then refresh best-effort so a failed GET
       // cannot leave the stale roster on screen.
       const updated = result.group;
-      const previousId = result.previous_id;
-      groupEdits.current += 1;
-      setGroups((previous) => {
-        // A snapshot may already list the successor: keep one entry per
-        // id, placed where the old group was.
-        const rest = previous.filter(
-          (entry) => entry.id !== previousId && entry.id !== updated.id,
-        );
-        const index = previous.findIndex((entry) => entry.id === previousId);
-        if (index === -1) return [...rest, updated];
-        const before = previous
-          .slice(0, index)
-          .filter(
-            (entry) => entry.id !== previousId && entry.id !== updated.id,
-          ).length;
-        return [...rest.slice(0, before), updated, ...rest.slice(before)];
-      });
-      // Same batch as the swap, so the console can move a selected old
-      // id to its successor before the missing-target fallback runs.
-      setGroupSwap({ from: previousId, to: updated.id });
+      applyGroupSuccessor(result.previous_id, updated);
       try {
         await refreshGroups();
       } catch {
@@ -1280,7 +1289,7 @@ export function useTau() {
       }
       return result;
     },
-    [refreshGroups],
+    [applyGroupSuccessor, refreshGroups],
   );
 
   const addGroupMembers = useCallback(
@@ -1293,6 +1302,50 @@ export function useTau() {
     (group: string, members: string[]) =>
       changeGroupMembers(group, members, false),
     [changeGroupMembers],
+  );
+
+  const renameGroup = useCallback(
+    async (group: string, name: string) => {
+      const result = await apiPost<RenameGroupResponse>(
+        "/api/groups/rename",
+        { group, name },
+      );
+      // A rename is a successor group, exactly like a roster change:
+      // swap the old id for the new one at once, then refresh
+      // best-effort so a failed GET cannot leave the stale name.
+      applyGroupSuccessor(result.previous_id, result.group);
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [applyGroupSuccessor, refreshGroups],
+  );
+
+  const setGroupTopic = useCallback(
+    async (group: string, topic: string | null) => {
+      const result = await apiPost<SetGroupTopicResponse>(
+        "/api/groups/topic",
+        topic === null ? { group, clear: true } : { group, topic },
+      );
+      // A topic change keeps the id: update the group in place at
+      // once, then refresh best-effort so a failed GET cannot leave
+      // the stale topic on screen.
+      const updated = result.group;
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.map((entry) => (entry.id === updated.id ? updated : entry)),
+      );
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups],
   );
 
   const editBlock = useCallback(
@@ -1855,6 +1908,8 @@ export function useTau() {
     deleteGroup,
     addGroupMembers,
     removeGroupMembers,
+    renameGroup,
+    setGroupTopic,
     refreshOutbox,
     refreshGroups,
     groupSwap,

@@ -6,6 +6,8 @@ import type {
   ChangeGroupMembersResponse,
   NodeInfo,
   Peer,
+  RenameGroupResponse,
+  SetGroupTopicResponse,
   SocialInfo,
   TauGroup,
 } from "@/lib/types";
@@ -69,6 +71,14 @@ type SidebarOptions = {
     group: string,
     members: string[],
   ) => Promise<ChangeGroupMembersResponse>;
+  onRenameGroup?: (
+    group: string,
+    name: string,
+  ) => Promise<RenameGroupResponse>;
+  onSetGroupTopic?: (
+    group: string,
+    topic: string | null,
+  ) => Promise<SetGroupTopicResponse>;
   node?: NodeInfo | null;
   social?: SocialInfo | null;
   blocks?: Record<string, { pending?: boolean; error?: string }>;
@@ -142,6 +152,8 @@ function renderSidebar(
       onDeleteGroup={options.onDeleteGroup}
       onAddGroupMembers={options.onAddGroupMembers}
       onRemoveGroupMembers={options.onRemoveGroupMembers}
+      onRenameGroup={options.onRenameGroup}
+      onSetGroupTopic={options.onSetGroupTopic}
     />,
   );
 }
@@ -643,6 +655,153 @@ describe("PeerSidebar group management", () => {
         }) as HTMLInputElement
       ).checked,
     ).toBe(true);
+  });
+
+  it("shows a group's topic on its row", () => {
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ topic: "hiking plans" })],
+    });
+
+    expect(screen.getByText("hiking plans")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "edit" })).toBeNull();
+  });
+
+  it("offers rename and topic edits only on groups this node created", () => {
+    const onRenameGroup = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    const onSetGroupTopic = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({ created_by_me: true }),
+        makeGroup({ id: "22".repeat(16), name: "theirs" }),
+      ],
+      onRenameGroup,
+      onSetGroupTopic,
+    });
+
+    expect(screen.getAllByRole("button", { name: "edit" })).toHaveLength(1);
+  });
+
+  it("renames a group and closes the panel", async () => {
+    const successor = makeGroup({ id: "22".repeat(16), name: "weekdays" });
+    const onRenameGroup = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    const onSetGroupTopic = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: true })],
+      onRenameGroup,
+      onSetGroupTopic,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "edit" }));
+    fireEvent.change(screen.getByLabelText("name"), {
+      target: { value: "weekdays" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "save name" }));
+
+    expect(onRenameGroup).toHaveBeenCalledWith("11".repeat(16), "weekdays");
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "save name" }),
+      ).toBeNull(),
+    );
+  });
+
+  it("sets a group's topic and closes the panel", async () => {
+    const updated = makeGroup({ topic: "hiking plans" });
+    const onRenameGroup = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    const onSetGroupTopic = vi.fn(async () => ({
+      ok: true,
+      group: updated,
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: true })],
+      onRenameGroup,
+      onSetGroupTopic,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "edit" }));
+    fireEvent.change(screen.getByLabelText("topic"), {
+      target: { value: "hiking plans" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "save topic" }));
+
+    expect(onSetGroupTopic).toHaveBeenCalledWith(
+      "11".repeat(16),
+      "hiking plans",
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "save topic" }),
+      ).toBeNull(),
+    );
+  });
+
+  it("clears a group's topic", async () => {
+    const onRenameGroup = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    const onSetGroupTopic = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup({ topic: "" }),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: true, topic: "hiking plans" })],
+      onRenameGroup,
+      onSetGroupTopic,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "clear topic" }));
+
+    expect(onSetGroupTopic).toHaveBeenCalledWith("11".repeat(16), null);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "clear topic" }),
+      ).toBeNull(),
+    );
+  });
+
+  it("shows a rename error instead of closing the panel", async () => {
+    const onRenameGroup = vi.fn(async () => {
+      throw new Error("only the creator can rename a group");
+    });
+    const onSetGroupTopic = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: true })],
+      onRenameGroup,
+      onSetGroupTopic,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "edit" }));
+    fireEvent.change(screen.getByLabelText("name"), {
+      target: { value: "weekdays" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "save name" }));
+
+    await screen.findByText("only the creator can rename a group");
+    expect(screen.getByRole("button", { name: "save name" })).toBeTruthy();
   });
 });
 

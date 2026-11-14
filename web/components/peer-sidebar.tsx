@@ -8,6 +8,8 @@ import type {
   ChangeGroupMembersResponse,
   NodeInfo,
   Peer,
+  RenameGroupResponse,
+  SetGroupTopicResponse,
   SocialInfo,
   TauGroup,
   VerifyState,
@@ -48,6 +50,8 @@ export function PeerSidebar({
   onDeleteGroup,
   onAddGroupMembers,
   onRemoveGroupMembers,
+  onRenameGroup,
+  onSetGroupTopic,
 }: {
   node: NodeInfo | null;
   peers: Peer[];
@@ -80,6 +84,14 @@ export function PeerSidebar({
     group: string,
     members: string[],
   ) => Promise<ChangeGroupMembersResponse>;
+  onRenameGroup?: (
+    group: string,
+    name: string,
+  ) => Promise<RenameGroupResponse>;
+  onSetGroupTopic?: (
+    group: string,
+    topic: string | null,
+  ) => Promise<SetGroupTopicResponse>;
 }) {
   const now = useNow();
   const [confirmingForget, setConfirmingForget] = useState<string | null>(
@@ -285,6 +297,72 @@ export function PeerSidebar({
       setGroupError(caught instanceof Error ? caught.message : "create failed");
     } finally {
       setCreating(false);
+    }
+  }
+
+  const [detailsId, setDetailsId] = useState<string | null>(null);
+  const [renameText, setRenameText] = useState("");
+  const [topicText, setTopicText] = useState("");
+  const [savingRename, setSavingRename] = useState(false);
+  const [savingTopic, setSavingTopic] = useState(false);
+  // Bumped whenever the name/topic editor switches, so a change that
+  // finishes later only touches the editor it was started from.
+  const detailsSession = useRef(0);
+
+  function toggleDetails(group: TauGroup) {
+    detailsSession.current += 1;
+    setGroupError(null);
+    setRenameText(group.name);
+    setTopicText(group.topic ?? "");
+    setDetailsId((previous) => (previous === group.id ? null : group.id));
+  }
+
+  async function submitRename(groupId: string) {
+    if (!onRenameGroup) return;
+    const name = renameText.trim();
+    if (!name) return;
+    const session = detailsSession.current;
+    setSavingRename(true);
+    setGroupError(null);
+    try {
+      await onRenameGroup(groupId, name);
+      // A rename is a successor group with a new id, so the panel
+      // belongs to the old id: close it on success, unless the user
+      // has already moved on to another group's panel.
+      if (detailsSession.current === session) {
+        setDetailsId(null);
+      }
+    } catch (caught) {
+      if (detailsSession.current === session) {
+        setGroupError(
+          caught instanceof Error ? caught.message : "rename failed",
+        );
+      }
+    } finally {
+      setSavingRename(false);
+    }
+  }
+
+  async function submitTopic(groupId: string, clear: boolean) {
+    if (!onSetGroupTopic) return;
+    const topic = clear ? null : topicText.trim();
+    if (!clear && topic === "") return;
+    const session = detailsSession.current;
+    setSavingTopic(true);
+    setGroupError(null);
+    try {
+      await onSetGroupTopic(groupId, topic);
+      if (detailsSession.current === session) {
+        setDetailsId(null);
+      }
+    } catch (caught) {
+      if (detailsSession.current === session) {
+        setGroupError(
+          caught instanceof Error ? caught.message : "topic failed",
+        );
+      }
+    } finally {
+      setSavingTopic(false);
     }
   }
   // Blocking is the one peer action that silences someone, so it takes
@@ -1009,6 +1087,13 @@ export function PeerSidebar({
                 group.created_by_me === true &&
                 onAddGroupMembers !== undefined &&
                 onRemoveGroupMembers !== undefined;
+              // A rename or a topic change is creator-only, like a
+              // roster change; a learned group shows its topic but
+              // offers no edit.
+              const canEditDetails =
+                group.created_by_me === true &&
+                onRenameGroup !== undefined &&
+                onSetGroupTopic !== undefined;
               const addCandidates = canEditMembers
                 ? peers.filter(
                     (peer) =>
@@ -1035,8 +1120,23 @@ export function PeerSidebar({
                     <p className="mt-0.5 truncate font-mono text-[10px] text-mist">
                       {group.members.map((member) => member.name).join(", ")}
                     </p>
+                    {group.topic ? (
+                      <p className="mt-0.5 truncate text-[11px] leading-relaxed text-mist">
+                        {group.topic}
+                      </p>
+                    ) : null}
                   </div>
                   <div className="flex shrink-0 gap-1.5">
+                    {canEditDetails ? (
+                      <button
+                        type="button"
+                        disabled={savingRename || savingTopic}
+                        onClick={() => toggleDetails(group)}
+                        className="rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                      >
+                        {detailsId === group.id ? "close" : "edit"}
+                      </button>
+                    ) : null}
                     {canEditMembers ? (
                       <button
                         type="button"
@@ -1073,6 +1173,82 @@ export function PeerSidebar({
                     ) : null}
                   </div>
                 </div>
+                {canEditDetails && detailsId === group.id ? (
+                  <div className="mt-2 space-y-2 border-t border-line/50 pt-2">
+                    <div>
+                      <label
+                        htmlFor={`rename-${group.id}`}
+                        className="mb-1 block font-mono text-[10px] uppercase tracking-wide text-mist"
+                      >
+                        name
+                      </label>
+                      <input
+                        id={`rename-${group.id}`}
+                        type="text"
+                        value={renameText}
+                        onChange={(event) => setRenameText(event.target.value)}
+                        maxLength={64}
+                        className="w-full rounded-lg border border-line/80 bg-void/60 px-2.5 py-1.5 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        disabled={
+                          savingRename ||
+                          !renameText.trim() ||
+                          renameText.trim() === group.name
+                        }
+                        onClick={() => void submitRename(group.id)}
+                        className="mt-1.5 rounded-md border border-signal/50 bg-signal/10 px-2.5 py-1 font-mono text-[11px] text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                      >
+                        {savingRename ? "renaming…" : "save name"}
+                      </button>
+                    </div>
+                    <div>
+                      <label
+                        htmlFor={`topic-${group.id}`}
+                        className="mb-1 block font-mono text-[10px] uppercase tracking-wide text-mist"
+                      >
+                        topic
+                      </label>
+                      <input
+                        id={`topic-${group.id}`}
+                        type="text"
+                        value={topicText}
+                        onChange={(event) => setTopicText(event.target.value)}
+                        placeholder="no topic set"
+                        maxLength={140}
+                        className="w-full rounded-lg border border-line/80 bg-void/60 px-2.5 py-1.5 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
+                      />
+                      <div className="mt-1.5 flex gap-2">
+                        <button
+                          type="button"
+                          disabled={
+                            savingTopic ||
+                            topicText.trim() === (group.topic ?? "")
+                          }
+                          onClick={() => void submitTopic(group.id, false)}
+                          className="rounded-md border border-signal/50 bg-signal/10 px-2.5 py-1 font-mono text-[11px] text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                        >
+                          {savingTopic ? "saving…" : "save topic"}
+                        </button>
+                        {group.topic ? (
+                          <button
+                            type="button"
+                            disabled={savingTopic}
+                            onClick={() => void submitTopic(group.id, true)}
+                            className="rounded-md border border-line/80 px-2.5 py-1 font-mono text-[11px] text-mist transition hover:text-rose-300 disabled:opacity-50"
+                          >
+                            clear topic
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-mist">
+                      Members learn a new name or topic from the next
+                      message sent to the group.
+                    </p>
+                  </div>
+                ) : null}
                 {canEditMembers && editingId === group.id ? (
                   <div className="mt-2 space-y-2 border-t border-line/50 pt-2">
                     {addCandidates.length === 0 ? (

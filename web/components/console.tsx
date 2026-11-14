@@ -219,6 +219,10 @@ export function Console() {
             onRemoveGroupMembers={(group, members) =>
               tau.removeGroupMembers(group, members)
             }
+            onRenameGroup={(group, name) => tau.renameGroup(group, name)}
+            onSetGroupTopic={(group, topic) =>
+              tau.setGroupTopic(group, topic)
+            }
           />
             <AllowlistSection
               allowlist={tau.allowlist}
