@@ -1536,7 +1536,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="disappearing post: hide it from timelines and searches "
         "after this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — the "
         "expiry is signed with the post and starts when it is "
-        "published, not when it is queued",
+        "published, not when it is queued; followers on tau releases "
+        "older than this one reject expiring posts and so stop seeing "
+        "the author's later posts",
     )
     tan_post.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
@@ -2821,7 +2823,6 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         finally:
             conn.close()
 
-    expires_at = None
     expire_seconds = 0.0
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
@@ -2834,7 +2835,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        expires_at = time.time() + expire_seconds
+    # The absolute deadline is taken when the post is created, not here, so
+    # node start-up and the publish request do not eat into the lifetime.
 
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
@@ -2884,6 +2886,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
+        expires_at = time.time() + expire_seconds if expire_text is not None else None
         post = app.create_post(text, reply_to=reply_to, expires_at=expires_at)
         published = None
     else:
@@ -10009,6 +10012,10 @@ def _cmd_messages_sent(
         else:
             state = entry["state"]
         print(f"[{when}] to {name} — {state}")
+        for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+— {state}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
