@@ -53,6 +53,7 @@ import type {
   RetryOutboxResponse,
   SafetyNumberResponse,
   SendFileResponse,
+  SendGroupFileResponse,
   SendGroupResponse,
   SendResponse,
   SetGroupTopicResponse,
@@ -1270,6 +1271,58 @@ export function useTau() {
     return sent;
   }, []);
 
+  const sendGroupFile = useCallback(async (group: string, file: File) => {
+    const data = await fileToBase64(file);
+    const result = await apiPost<SendGroupFileResponse>(
+      "/api/groups/send-file",
+      {
+        group,
+        name: file.name,
+        data,
+      },
+    );
+    setMessages((previous) => {
+      const fresh = result.messages.filter(
+        (entry) => !previous.some((known) => known.id === entry.id),
+      );
+      if (fresh.length === 0) return previous;
+      return [...previous, ...fresh].sort((a, b) => a.id - b.id);
+    });
+    // Do not advance snapshotMax here: the legs are not a complete
+    // view up to their highest id, and an inbound message recorded
+    // between two legs must still be accepted from its SSE event.
+    // Duplicate leg events are dropped by the dedupe in onMessage.
+    if (!result.ok) {
+      // The legs are already in the feed with their own statuses, so
+      // this only surfaces the summary: the message stays sendable.
+      // Name the members who already received it so a retry is a
+      // deliberate duplicate fan-out, not a silent one. Files never
+      // queue, so there is no queued leg to warn about.
+      const legs = (result.response.results as Array<
+        Record<string, unknown>
+      >) ?? [];
+      const failed = legs.filter((leg) => !leg.delivered);
+      const deliveredNames = legs
+        .filter((leg) => leg.delivered)
+        .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+      const names = failed.map((leg) =>
+        String(leg.to_name || leg.to || "a member").slice(0, 8),
+      );
+      const already =
+        deliveredNames.length > 0
+          ? `${deliveredNames.join(", ")} already received this`
+          : "";
+      throw new Error(
+        names.length > 0
+          ? already.length > 0
+            ? `could not send to ${names.join(", ")} — ${already}; sending again resends it to the whole group`
+            : `could not send to ${names.join(", ")}`
+          : "some group members did not receive the file",
+      );
+    }
+    return result.messages;
+  }, []);
+
   const ping = useCallback(async (destination: string) => {
     setPings((previous) => ({
       ...previous,
@@ -2128,6 +2181,7 @@ export function useTau() {
     forwardMessageToGroup,
     sendGroup,
     sendFile,
+    sendGroupFile,
     ping,
     fetchInfo,
     showSafetyNumber,

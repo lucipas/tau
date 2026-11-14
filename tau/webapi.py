@@ -41,6 +41,9 @@ script) can read what arrives from the mesh and send messages back:
                            (sender destination hash, sanitised file name)
     POST /api/send-file    send a file ``{"to": "...", "name": "...", "data": "<base64>"}``
                            (optional ``"timeout"`` seconds, default 300)
+    POST /api/groups/send-file send a file to a group ``{"group": "<id | prefix | name>",
+                           "name": "...", "data": "<base64>"}`` (optional ``"timeout"``
+                           seconds, default 300; one outbound entry per member)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     POST /api/messages/delete delete ``{"id": <console message id>}`` from
@@ -3536,6 +3539,7 @@ class WebBridge:
                 message
                 for message in self._messages
                 if message.get("group") == group_id
+                and not message.get("file")
                 and isinstance(message.get("wire_id"), str)
                 and str(message["wire_id"]).lower().startswith(ref)
             ]
@@ -3960,6 +3964,107 @@ class WebBridge:
         self.bus.publish({"type": "message", "message": message})
         return message, response
 
+    def send_group_file(
+        self,
+        group: str,
+        name: str,
+        data: bytes,
+        *,
+        timeout: float = 300.0,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Send a file to every member of a group from the console.
+
+        Mirrors :meth:`send_file` on the peer path and
+        :meth:`send_group_message` on the group path: the bytes are
+        staged in a temporary directory under the sanitised file name
+        — ``TauNode.send_group_file`` takes a path — and the staging
+        directory is removed once the fan-out finishes or fails.  One
+        outbound feed entry is recorded per leg, each carrying the
+        group id/name badge, its own delivery status, and the file
+        metadata (name, size, SHA-256) — the same shape as a peer
+        file send, so the feed renders both alike.  A leg the member
+        explicitly refused, or that could not be reached, is recorded
+        as ``failed`` rather than silently dropped, so the sender sees
+        which members did not get the file.  A leg retracted while its
+        console record was still in flight is omitted instead: the
+        leg went out on the wire, so the response still reports it,
+        but there is no record to show.
+
+        The group is resolved by id, id prefix, or exact name through
+        ``GroupStore.find`` (unknown or ambiguous queries raise
+        ``ValueError``).  Files are direct links only in v1, so a
+        refused or unreachable member fails fast instead of queueing,
+        and there is no outbox id on any leg.
+        """
+        if not isinstance(group, str) or not group.strip():
+            raise ValueError("target group is required")
+        clean_name = sanitize_file_name(name)
+        if not clean_name:
+            raise ValueError(f"file name {name!r} is not usable")
+        if len(clean_name.encode("utf-8")) > 255:
+            raise ValueError("file name is too long (more than 255 bytes)")
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError("file data must be bytes")
+        data = bytes(data)
+        if len(data) < 1 or len(data) > MAX_FILE_BYTES:
+            raise ValueError(
+                f"file of {len(data)} bytes is outside the "
+                f"1..{MAX_FILE_BYTES} byte limit"
+            )
+        # Reload the persisted store first: a group created or deleted by
+        # another process (``tau group``) must be seen by this send.
+        self.node.groups.list_groups()
+        group_record = self.node.groups.find(group.strip())
+        digest = hashlib.sha256(data).hexdigest()
+        sent_at = time.time()
+        with tempfile.TemporaryDirectory(prefix="tau-send-file-") as staging:
+            staged = Path(staging) / clean_name
+            staged.write_bytes(data)
+            response = self.node.send_group_file(
+                group_record, staged, timeout=timeout
+            )
+        messages: List[Dict[str, Any]] = []
+        for result in response.get("results") or []:
+            member = str(result.get("to") or "")
+            peer_name = result.get("to_name") or (
+                short_hash(member) if member else "unknown"
+            )
+            delivered = bool(result.get("delivered"))
+            status = "delivered" if delivered else "failed"
+            # A failed leg carries no wire id: the recipient never saw
+            # that file, so no reply may be quoted against it.
+            wire_id = (
+                result.get("id")
+                if delivered and isinstance(result.get("id"), str)
+                else None
+            )
+            with self._send_lock:
+                message = self._append_message(
+                    direction="out",
+                    peer=member or None,
+                    peer_name=peer_name,
+                    text=f"Sent file: {clean_name} ({len(data)} bytes)",
+                    sent_at=sent_at,
+                    received_at=time.time(),
+                    status=status,
+                    group=group_record["id"],
+                    group_name=group_record.get("name") or "",
+                    wire_id=wire_id,
+                    file={
+                        "name": clean_name,
+                        "size": len(data),
+                        "sha256": digest,
+                    },
+                )
+                if message is None:
+                    # This leg was retracted while its console record
+                    # was still in flight: the leg went out on the
+                    # wire, so the response still reports it, but
+                    # there is no record to show.
+                    continue
+            self.bus.publish({"type": "message", "message": message})
+            messages.append(message)
+        return messages, response
 
     def react(
         self,
@@ -3998,6 +4103,13 @@ class WebBridge:
         with self._lock:
             for message in self._messages:
                 if message.get("wire_id") == target:
+                    if isinstance(message.get("group"), str) and message.get(
+                        "file"
+                    ):
+                        raise ValueError(
+                            "group file transfers cannot be reacted to or"
+                            " replied to"
+                        )
                     peer = message.get("peer")
                     group = message.get("group")
                     if isinstance(group, str):
@@ -4192,6 +4304,11 @@ class WebBridge:
                 raise ValueError(f"unknown message: {target!r}")
             if entry.get("direction") != "out":
                 raise ValueError("only your own sent messages can be edited")
+            if entry.get("file"):
+                # Before the group dispatch below: a group file leg
+                # carries both fields, and the group path would refuse
+                # it with a misleading leg-timing error instead.
+                raise ValueError("file transfers cannot be edited")
         if entry.get("group"):
             # The group path takes the lock itself to gather the legs,
             # so this stays outside the block above: re-entering it
@@ -4202,8 +4319,6 @@ class WebBridge:
                 target, entry, cleaned, timeout=timeout
             )
         with self._lock:
-            if entry.get("file"):
-                raise ValueError("file transfers cannot be edited")
             if entry.get("status") == "queued":
                 # An edit answered "not found" would let the queued
                 # copy arrive later with the old text, so cancellation
@@ -4576,6 +4691,11 @@ class WebBridge:
                 raise ValueError(
                     "only your own sent messages can be retracted"
                 )
+            if removed.get("file"):
+                # Before the group dispatch below: a group file leg
+                # carries both fields, and the group path would refuse
+                # it with a misleading leg-timing error instead.
+                raise ValueError("file transfers cannot be retracted")
         if removed.get("group"):
             # The group path takes the lock itself to gather the legs,
             # so this stays outside the block above: re-entering it
@@ -4584,8 +4704,6 @@ class WebBridge:
                 target, removed, timeout=timeout
             )
         with self._lock:
-            if removed.get("file"):
-                raise ValueError("file transfers cannot be retracted")
             if removed.get("status") == "queued":
                 # A retract answered "not found" would let the queued
                 # copy arrive later, so cancellation has to go through
@@ -7733,6 +7851,8 @@ class _WebHandler(BaseHTTPRequestHandler):
             # body cap than a chat message or a single action.
             if path == "/api/send-file":
                 limit = MAX_FILE_BODY_BYTES
+            elif path == "/api/groups/send-file":
+                limit = MAX_FILE_BODY_BYTES
             elif path in ("/api/messages/import", "/api/tan/import"):
                 limit = MAX_IMPORT_BYTES
             else:
@@ -7743,6 +7863,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/send-file":
                 self._handle_send_file(body, head_only)
+                return
+            if path == "/api/groups/send-file":
+                self._handle_send_group_file(body, head_only)
                 return
             if path == "/api/react":
                 self._handle_react(body, head_only)
@@ -8929,6 +9052,71 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         self._send_json(
             {"ok": True, "message": message, "response": response}, head_only
+        )
+
+    def _handle_send_group_file(self, body: Dict[str, Any], head_only: bool) -> None:
+        group = body.get("group")
+        name = body.get("name")
+        data = body.get("data")
+        timeout = body.get("timeout", 300.0)
+        if not isinstance(group, str) or not group.strip():
+            self._send_json(
+                {"error": {"message": "field 'group' is required"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(name, str) or not name.strip():
+            self._send_json(
+                {"error": {"message": "field 'name' is required"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(data, str):
+            self._send_json(
+                {"error": {"message": "field 'data' must be base64"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            timeout = 300.0
+        # Clamp before float(): huge ints would overflow float() otherwise.
+        timeout = float(max(1, min(timeout, 300)))
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (ValueError, base64.binascii.Error):
+            self._send_json(
+                {"error": {"message": "field 'data' must be valid base64"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            messages, response = self.bridge.send_group_file(
+                group.strip(),
+                name,
+                raw,
+                timeout=timeout,
+            )
+        except ValueError as exc:
+            # GroupStore.find raises ValueError for both an unknown
+            # group and an ambiguous query; only the unknown case is
+            # a 404, the ambiguous one stays a 400.
+            status = 404 if str(exc).startswith("unknown group:") else 400
+            self._send_json({"error": {"message": str(exc)}}, head_only, status)
+            return
+        except (ProtocolError, NodeError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(
+            {
+                "ok": bool(response.get("ok", True)),
+                "messages": messages,
+                "response": response,
+            },
+            head_only,
         )
 
     def _handle_react(self, body: Dict[str, Any], head_only: bool) -> None:

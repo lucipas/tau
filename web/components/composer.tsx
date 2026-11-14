@@ -18,6 +18,7 @@ export function Composer({
   onSend,
   onSendGroup,
   onSendFile,
+  onSendGroupFile,
   replyTo,
   onCancelReply,
 }: {
@@ -42,6 +43,10 @@ export function Composer({
     sendIn?: number,
   ) => Promise<TauMessage[]>;
   onSendFile?: (to: string, file: File) => Promise<TauMessage | null>;
+  onSendGroupFile?: (
+    group: string,
+    file: File,
+  ) => Promise<TauMessage[]>;
   replyTo?: TauMessage | null;
   onCancelReply?: () => void;
 }) {
@@ -56,6 +61,10 @@ export function Composer({
 
   const custom = mode === "custom" || (peers.length === 0 && mode !== "group");
   const groupMode = mode === "group";
+  // The attach button only shows when the handler for the current
+  // mode exists: a group target needs the group fan-out, a peer
+  // target the single-peer send.
+  const canAttach = groupMode ? !!onSendGroupFile : !!onSendFile;
   const selectValue = custom ? "__custom" : groupMode ? "__group" : target;
 
   useEffect(() => {
@@ -73,7 +82,12 @@ export function Composer({
       return;
     }
     if (file) {
-      if (!onSendFile) return;
+      // A group target fans the file out to every member; a peer
+      // target sends it to one peer. The attach button only shows
+      // when the handler for the current mode exists, so reaching
+      // here without one means the mode changed mid-submit.
+      const sendFileToTarget = groupMode ? onSendGroupFile : onSendFile;
+      if (!sendFileToTarget) return;
       if (file.size > MAX_FILE_BYTES) {
         setError("File is larger than 10 MiB.");
         return;
@@ -81,7 +95,7 @@ export function Composer({
       setSending(true);
       setError(null);
       try {
-        await onSendFile(trimmedTarget, file);
+        await sendFileToTarget(trimmedTarget, file);
         setFile(null);
         if (fileInputRef.current) fileInputRef.current.value = "";
         onCancelReply?.();
@@ -298,7 +312,7 @@ export function Composer({
           }
           className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
-        {onSendFile ? (
+        {canAttach ? (
           <>
             <input
               ref={fileInputRef}
