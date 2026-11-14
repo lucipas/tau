@@ -3539,6 +3539,7 @@ class WebBridge:
                 message
                 for message in self._messages
                 if message.get("group") == group_id
+                and not message.get("file")
                 and isinstance(message.get("wire_id"), str)
                 and str(message["wire_id"]).lower().startswith(ref)
             ]
@@ -4102,6 +4103,13 @@ class WebBridge:
         with self._lock:
             for message in self._messages:
                 if message.get("wire_id") == target:
+                    if isinstance(message.get("group"), str) and message.get(
+                        "file"
+                    ):
+                        raise ValueError(
+                            "group file transfers cannot be reacted to or"
+                            " replied to"
+                        )
                     peer = message.get("peer")
                     group = message.get("group")
                     if isinstance(group, str):

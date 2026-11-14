@@ -817,7 +817,7 @@ function MessageBubble({
             <span>· rtt {formatRtt(message.rtt_ms)}</span>
           ) : null}
           {expiry !== null ? <span>· {expiry}</span> : null}
-          {onReply && message.wire_id ? (
+          {onReply && message.wire_id && !(message.group && message.file) ? (
             <button
               type="button"
               title="Reply to this message"
