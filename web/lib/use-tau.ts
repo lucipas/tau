@@ -1007,10 +1007,11 @@ export function useTau() {
           if (fresh.length === 0) return previous;
           return [...previous, ...fresh].sort((a, b) => a.id - b.id);
         });
-        // Do not advance snapshotMax here: the legs are not a complete
-        // view up to their highest id, and an inbound message recorded
-        // between two legs must still be accepted from its SSE event.
       }
+      // Do not advance snapshotMax here: the legs are not a complete
+      // view up to their highest id, and an inbound message recorded
+      // between two legs must still be accepted from its SSE event.
+      // Duplicate leg events are dropped by the dedupe in onMessage.
       // A queued leg lands in the outbox; refresh so it shows at once
       // instead of waiting for the next poll. Best-effort: a failed
       // refresh must not report a successful send as failed.
@@ -1020,9 +1021,11 @@ export function useTau() {
         // The next poll picks the entry up.
       }
       if (!result.ok) {
-        // Same summary as `sendGroup`: the legs are already in the feed
-        // with their own statuses, so name the members who missed it
-        // and those who already have it (or a queued copy).
+        // The legs are already in the feed with their own statuses, so
+        // this only surfaces the summary: the message stays sendable.
+        // Name the members who already received it — or have a copy
+        // queued and will still receive it — so a retry is a
+        // deliberate duplicate fan-out, not a silent one.
         const legs = (result.response.results as Array<
           Record<string, unknown>
         >) ?? [];
@@ -1047,9 +1050,9 @@ export function useTau() {
         throw new Error(
           names.length > 0
             ? already.length > 0
-              ? `could not forward to ${names.join(", ")} — ${already}`
+              ? `could not forward to ${names.join(", ")} — ${already}; forwarding again resends it to the whole group`
               : `could not forward to ${names.join(", ")}`
-            : "could not forward to the group",
+            : "some group members did not receive the forwarded message",
         );
       }
       return sent;
