@@ -325,6 +325,7 @@ export type ResolvedQuote =
 export function resolveQuote(
   messages: TauMessage[],
   message: TauMessage,
+  ownHash?: string | null,
 ): ResolvedQuote | null {
   // A quote resolves only inside the same conversation (same peer):
   // the quoted text is pulled from this console's own history, never
@@ -337,15 +338,42 @@ export function resolveQuote(
   // means the local copy changed, so the original is unavailable.
   // Entries written before excerpt hashes existed carry no hash and
   // cannot be checked; they still render.
+  //
+  // A group reply that carries the logical reference (group, author,
+  // shared sent_at) resolves against any leg of the quoted send: the
+  // wire id differs per recipient, so it only ever matches the
+  // sender's own copy. The author is the peer for an inbound entry
+  // and this node for an outbound one; when the triple matches
+  // nothing, the wire-id match below still runs, which covers
+  // replies from senders that predate the reference.
   const ref = message.in_reply_to;
   if (!ref || !ref.id) return null;
+  if (ref.group && ref.author && typeof ref.sent_at === "number") {
+    const logical = messages.filter(
+      (entry) =>
+        entry.group === ref.group &&
+        entry.sent_at === ref.sent_at &&
+        (entry.direction === "in"
+          ? entry.peer === ref.author
+          : ref.author === ownHash),
+    );
+    if (logical.length > 0) {
+      return pickQuoted(logical, ref.excerpt);
+    }
+  }
   const candidates = messages.filter(
     (entry) => entry.peer === message.peer && entry.wire_id === ref.id,
   );
   if (candidates.length === 0) return "unavailable";
+  return pickQuoted(candidates, ref.excerpt);
+}
+
+function pickQuoted(
+  candidates: TauMessage[],
+  excerpt: string | null | undefined,
+): ResolvedQuote {
   let quoted = candidates[0];
-  if (ref.excerpt) {
-    const excerpt = ref.excerpt;
+  if (excerpt) {
     const verified = candidates.find(
       (entry) =>
         entry.excerpt_hash === excerpt ||
@@ -401,7 +429,7 @@ function MessageBubble({
     return () => clearInterval(timer);
   }, [message.send_after]);
   const scheduled = formatSendsIn(message.send_after);
-  const quote = resolveQuote(messages, message);
+  const quote = resolveQuote(messages, message, node?.destination ?? null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);

@@ -152,6 +152,141 @@ describe("resolveQuote", () => {
     expect(resolveQuote([otherPeer, reply], reply)).toBe("unavailable");
   });
 
+  it("resolves a group quote by its logical reference, not the leg id", () => {
+    const GROUP = "cd".repeat(16);
+    const AUTHOR = "aa".repeat(16);
+    // This console holds its own leg of the quoted send (wire id
+    // "c…"); the reply names the sender's leg ("a…"), which this
+    // console never held — the wire id alone cannot resolve it.
+    const original = makeMessage({
+      id: 1,
+      peer: AUTHOR,
+      peer_name: "alice",
+      text: "original thought",
+      group: GROUP,
+      sent_at: 1000,
+      wire_id: "c".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      peer: "bb".repeat(16),
+      peer_name: "bob",
+      text: "seconded",
+      group: GROUP,
+      sent_at: 1002,
+      wire_id: "d".repeat(32),
+      in_reply_to: {
+        id: "a".repeat(32),
+        excerpt: "0123456789abcdef",
+        group: GROUP,
+        author: AUTHOR,
+        sent_at: 1000,
+      },
+    });
+    expect(resolveQuote([original, reply], reply)).toEqual({
+      name: "alice",
+      text: "original thought",
+    });
+  });
+
+  it("does not resolve a group quote whose logical reference names another author", () => {
+    const GROUP = "cd".repeat(16);
+    const original = makeMessage({
+      id: 1,
+      peer: "aa".repeat(16),
+      peer_name: "alice",
+      text: "original thought",
+      group: GROUP,
+      sent_at: 1000,
+      wire_id: "c".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      peer: "bb".repeat(16),
+      peer_name: "bob",
+      text: "seconded",
+      group: GROUP,
+      sent_at: 1002,
+      wire_id: "d".repeat(32),
+      in_reply_to: {
+        id: "a".repeat(32),
+        excerpt: "0123456789abcdef",
+        group: GROUP,
+        author: "ee".repeat(16),
+        sent_at: 1000,
+      },
+    });
+    expect(resolveQuote([original, reply], reply)).toBe("unavailable");
+  });
+
+  it("resolves a group quote of this node's own sent message", () => {
+    const GROUP = "cd".repeat(16);
+    const OWN = "ff".repeat(16);
+    // The quoted send is an outbound leg: its peer is the member it
+    // went to, so only the node's own hash names its author.
+    const original = makeMessage({
+      id: 1,
+      direction: "out",
+      peer: "bb".repeat(16),
+      peer_name: "bob",
+      text: "my earlier point",
+      group: GROUP,
+      sent_at: 1000,
+      wire_id: "c".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      peer: "bb".repeat(16),
+      peer_name: "bob",
+      text: "as you said",
+      group: GROUP,
+      sent_at: 1002,
+      wire_id: "d".repeat(32),
+      in_reply_to: {
+        id: "a".repeat(32),
+        excerpt: "0123456789abcdef",
+        group: GROUP,
+        author: OWN,
+        sent_at: 1000,
+      },
+    });
+    expect(resolveQuote([original, reply], reply, OWN)).toEqual({
+      name: "you",
+      text: "my earlier point",
+    });
+  });
+
+  it("falls back to the wire id when the logical reference matches nothing", () => {
+    // A reply from a sender that predates the reference, quoting
+    // its own message: the triple names a send time this console
+    // never held, but the wire id still names the sender's copy.
+    const original = makeMessage({
+      id: 1,
+      text: "original thought",
+      wire_id: "a".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      text: "seconded",
+      wire_id: "b".repeat(32),
+      in_reply_to: {
+        id: "a".repeat(32),
+        excerpt: "0123456789abcdef",
+        group: "cd".repeat(16),
+        author: "aa".repeat(16),
+        sent_at: 9999,
+      },
+    });
+    expect(resolveQuote([original, reply], reply)).toEqual({
+      name: "alice",
+      text: "original thought",
+    });
+  });
+
   it("returns null for a standalone message", () => {
     const message = makeMessage();
     expect(resolveQuote([message], message)).toBeNull();

@@ -53,8 +53,19 @@ export interface TauMessage {
   excerpt_hashes?: string[];
   // Quoted message reference: wire id + short excerpt hash of the text
   // the sender quoted. The quote is rendered from local history only;
-  // see resolveQuote in message-feed.tsx.
-  in_reply_to?: { id: string; excerpt: string | null } | null;
+  // see resolveQuote in message-feed.tsx. A group reply may also carry
+  // the quoted message's logical reference — the group, its author's
+  // destination hash, and the send time every leg shares — so a member
+  // who holds a different leg id can still resolve it.
+  in_reply_to?:
+    | {
+        id: string;
+        excerpt: string | null;
+        group?: string;
+        author?: string;
+        sent_at?: number;
+      }
+    | null;
   // File metadata, present on file entries: the name, size and
   // SHA-256 of the file this message carried. Received files can be
   // downloaded from GET /api/files/<sender>/<name>.

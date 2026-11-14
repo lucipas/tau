@@ -1090,6 +1090,16 @@ def clean_in_reply_to(value: Any) -> Optional[Dict[str, Any]]:
     error — the sender is either buggy or trying to smuggle junk past
     the size budget — while a missing one simply means a standalone
     message.
+
+    A group reply may also carry the quoted message's logical
+    reference — the ``group`` it was sent to, its ``author``'s
+    destination hash, and the ``sent_at`` every leg of the send
+    shares — so a member who holds a different leg id for the same
+    send can still resolve the quote (see
+    ``TauNode.send_group_message``).  The three travel together or
+    not at all: a partial logical reference names nothing
+    resolvable.  A reference without them keeps the wire-id behavior
+    DMs and older group messages use.
     """
     if value is None:
         return None
@@ -1108,7 +1118,30 @@ def clean_in_reply_to(value: Any) -> Optional[Dict[str, Any]]:
         ):
             raise ProtocolError("in_reply_to excerpt must be a short hex hash")
         excerpt = excerpt.lower()
-    return {"id": message_id, "excerpt": excerpt}
+    group = value.get("group")
+    author = value.get("author")
+    sent_at = value.get("sent_at")
+    if group is None and author is None and sent_at is None:
+        return {"id": message_id, "excerpt": excerpt}
+    if not isinstance(group, str) or not group or len(group) > 64:
+        raise ProtocolError(
+            "in_reply_to group must be a string of 1-64 characters"
+        )
+    if not isinstance(author, str) or not author or len(author) > 64:
+        raise ProtocolError(
+            "in_reply_to author must be a string of 1-64 characters"
+        )
+    if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+        raise ProtocolError("in_reply_to sent_at must be a number")
+    if not math.isfinite(float(sent_at)):
+        raise ProtocolError("in_reply_to sent_at must be a finite number")
+    return {
+        "id": message_id,
+        "excerpt": excerpt,
+        "group": group,
+        "author": author,
+        "sent_at": sent_at,
+    }
 def encode_message(
     text: str,
     *,

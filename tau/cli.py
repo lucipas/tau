@@ -7079,7 +7079,24 @@ def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> 
     group_id = entry.get("group")
     excerpt = reply_to.get("excerpt")
     if isinstance(group_id, str) and group_id:
-        quoted = inbox.find(ref_id, group=group_id)
+        quoted = None
+        # A reply that carries the logical reference names the quoted
+        # send exactly, even when this node holds a different leg id
+        # for it — or the same text under another author, which the
+        # excerpt fallback below cannot attribute.  The reference is
+        # only trusted inside its own group: a group that does not
+        # match this message's is a sender error, not a quote.
+        if (
+            reply_to.get("group") == group_id
+            and isinstance(reply_to.get("author"), str)
+            and isinstance(reply_to.get("sent_at"), (int, float))
+            and not isinstance(reply_to.get("sent_at"), bool)
+        ):
+            quoted = inbox.find_group_message(
+                group_id, reply_to["author"], reply_to["sent_at"]
+            )
+        if quoted is None:
+            quoted = inbox.find(ref_id, group=group_id)
         if quoted is None and isinstance(excerpt, str) and excerpt:
             quoted = inbox.find_by_excerpt(excerpt, group=group_id)
     else:

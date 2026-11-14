@@ -182,6 +182,72 @@ def test_group_message_roundtrip_with_reply():
     assert parsed["in_reply_to"] == reply_to
 
 
+def test_group_message_roundtrip_with_logical_reply_reference():
+    # A group reply may carry the quoted message's logical reference —
+    # the group, its author, and the send time every leg shares — so a
+    # member who holds a different leg id can still resolve the quote.
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    group_id = derive_group_id(members[0], "weekend", members)
+    reply_to = {
+        "id": "a" * 32,
+        "excerpt": excerpt_hash("original thought"),
+        "group": group_id,
+        "author": members[0],
+        "sent_at": 1234.5,
+    }
+    data = encode_group_message(
+        "seconded",
+        message_id="b" * 32,
+        group_id=group_id,
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+        in_reply_to=reply_to,
+    )
+    parsed = parse_group_message(data)
+    assert parsed["in_reply_to"] == reply_to
+
+
+def test_group_message_rejects_partial_logical_reference():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    group_id = derive_group_id(members[0], "weekend", members)
+    base = {
+        "group_id": group_id,
+        "group_name": "weekend",
+        "creator": members[0],
+        "members": members,
+    }
+    # The three travel together or not at all: a partial logical
+    # reference names nothing resolvable.
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            **base,
+            in_reply_to={"id": "a" * 32, "group": group_id},
+        )
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            **base,
+            in_reply_to={
+                "id": "a" * 32,
+                "group": group_id,
+                "author": members[0],
+            },
+        )
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            **base,
+            in_reply_to={
+                "id": "a" * 32,
+                "group": group_id,
+                "author": members[0],
+                "sent_at": "yesterday",
+            },
+        )
+
+
 def test_group_message_without_reply_has_no_reference():
     members = ["ab" * 16, "cd" * 16, "ef" * 16]
     data = encode_group_message(

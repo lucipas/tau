@@ -2014,6 +2014,66 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "alice" in out
 
 
+def test_quote_line_prefers_logical_reference_over_foreign_leg_id(tmp_path):
+    """A group reply that carries the logical reference resolves
+    against this node's own copy even when the reply names another
+    member's leg id — and even when the same text appears under
+    another author, where the excerpt fallback cannot attribute the
+    quote.
+    """
+    from tau.protocol import excerpt_hash
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    registry = PeerRegistry(tmp_path / "peers.json")
+    group_id = "cd" * 16
+    alice_hash = "aa" * 16
+    bob_hash = "bb" * 16
+    for author, author_hash, leg_id in (
+        ("alice", alice_hash, "a1" * 16),
+        ("bob", bob_hash, "b1" * 16),
+    ):
+        inbox.append(
+            {
+                "from": author,
+                "destination": author_hash,
+                "text": "same words",
+                "sent_at": 1000.0,
+                "received_at": 1001.0,
+                "id": leg_id,
+                "kind": "group",
+                "group": group_id,
+                "group_name": "crew",
+            }
+        )
+    reply = {
+        "destination": bob_hash,
+        "from": "bob",
+        "text": "seconded",
+        "sent_at": 1002.0,
+        "received_at": 1003.0,
+        "id": "r1" * 16,
+        "kind": "group",
+        "group": group_id,
+        "in_reply_to": {
+            "id": "f" * 32,
+            "excerpt": excerpt_hash("same words"),
+            "group": group_id,
+            "author": alice_hash,
+            "sent_at": 1000.0,
+        },
+    }
+    assert cli._quote_line(inbox, registry, reply) == "↩ alice: same words"
+    # Without the logical reference the same reply cannot resolve:
+    # the wire id names a leg this node never held, and the excerpt
+    # matches two authors' messages, so no author can be named.
+    bare = dict(reply)
+    bare["in_reply_to"] = {
+        "id": "f" * 32,
+        "excerpt": excerpt_hash("same words"),
+    }
+    assert cli._quote_line(inbox, registry, bare) == "↩ original not available"
+
+
 def test_messages_hides_non_member_group_reaction(tmp_path, capsys):
     """A stored reaction from a non-member never prints on a group
     message, even when the authorization recheck or its cleanup failed
