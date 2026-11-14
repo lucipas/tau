@@ -565,9 +565,10 @@ describe("useTan deletePost", () => {
       const firstMuted = deferred();
       const firstMutedKeywords = deferred();
       const firstSuggestions = deferred();
+      const firstTags = deferred();
       // A feed load fires the timeline, following, muted and muted-
-      // keyword requests, and the authors directory and suggestions
-      // load beside it.
+      // keyword requests, and the authors directory, suggestions and
+      // tag list load beside it.
       const queue = [
         first,
         firstFollowing,
@@ -575,6 +576,7 @@ describe("useTan deletePost", () => {
         firstMutedKeywords,
         firstAuthors,
         firstSuggestions,
+        firstTags,
       ];
       let next = 0;
       mockedGet.mockImplementation((path: string) =>
@@ -585,12 +587,12 @@ describe("useTan deletePost", () => {
 
       const { result } = renderHook(() => useTan());
       // The initial load is in flight; a poll tick must not invalidate it.
-      // Six feed calls plus the one rules load.
-      expect(mockedGet.mock.calls.length).toBe(7);
+      // Seven feed calls plus the one rules load.
+      expect(mockedGet.mock.calls.length).toBe(8);
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBe(7);
+      expect(mockedGet.mock.calls.length).toBe(8);
 
       await act(async () => {
         first.resolve({ posts: [mine], count: 1 });
@@ -599,6 +601,7 @@ describe("useTan deletePost", () => {
         firstMutedKeywords.resolve({ muted_keywords: [], count: 0 });
         firstAuthors.resolve(emptyAuthors);
         firstSuggestions.resolve(emptySuggestions);
+        firstTags.resolve({ tags: [], count: 0 });
       });
       expect(result.current.posts).toEqual([mine]);
 
@@ -609,7 +612,7 @@ describe("useTan deletePost", () => {
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBeGreaterThan(7);
+      expect(mockedGet.mock.calls.length).toBeGreaterThan(8);
     } finally {
       vi.useRealTimers();
     }
@@ -619,9 +622,10 @@ describe("useTan deletePost", () => {
     const first = makePost({ hash: "a".repeat(64), text: "first" });
     const second = makePost({ hash: "b".repeat(64), text: "second" });
     // Two feed loads in flight: the initial load takes the first
-    // six deferreds (timeline, following, muted, muted keywords,
-    // authors, suggestions), the refresh the next four.
+    // seven deferreds (timeline, following, muted, muted keywords,
+    // authors, suggestions, tags), the refresh the next four.
     const queue = [
+      deferred(),
       deferred(),
       deferred(),
       deferred(),
@@ -648,10 +652,10 @@ describe("useTan deletePost", () => {
     });
     // Resolve the newer load first, then the older one.
     await act(async () => {
-      queue[6].resolve({ posts: [second], count: 1 });
-      queue[7].resolve(emptyFollowing);
-      queue[8].resolve({ muted: [], count: 0 });
-      queue[9].resolve({ muted_keywords: [], count: 0 });
+      queue[7].resolve({ posts: [second], count: 1 });
+      queue[8].resolve(emptyFollowing);
+      queue[9].resolve({ muted: [], count: 0 });
+      queue[10].resolve({ muted_keywords: [], count: 0 });
     });
     await act(async () => {
       queue[0].resolve({ posts: [first], count: 1 });
@@ -660,6 +664,7 @@ describe("useTan deletePost", () => {
       queue[3].resolve({ muted_keywords: [], count: 0 });
       queue[4].resolve(emptyAuthors);
       queue[5].resolve(emptySuggestions);
+      queue[6].resolve({ tags: [], count: 0 });
     });
     await act(async () => {
       await refreshPromise;
@@ -1366,10 +1371,11 @@ describe("useTan top view", () => {
     try {
       const top = makePost({ text: "most liked", likes: 5 });
       // Six queued calls for the initial load (feed, following, muted,
-      // muted keywords, authors, suggestions) plus the rules load, then
-      // five more for the top load (feed, following, muted, muted
-      // keywords, authors).
+      // muted keywords, authors, suggestions) plus the tag list and
+      // the rules load, then five more for the top load (feed,
+      // following, muted, muted keywords, authors).
       const queue = [
+        deferred(),
         deferred(),
         deferred(),
         deferred(),
@@ -1392,25 +1398,25 @@ describe("useTan top view", () => {
       const { result } = renderHook(() => useTan());
       // The initial timeline load is in flight; switch to top, which
       // supersedes it with a top load.
-      expect(mockedGet.mock.calls.length).toBe(7);
+      expect(mockedGet.mock.calls.length).toBe(8);
       act(() => {
         result.current.setView("top");
       });
-      expect(mockedGet.mock.calls.length).toBe(12);
+      expect(mockedGet.mock.calls.length).toBe(13);
 
       await act(async () => {
-        queue[6].resolve({ posts: [top], count: 1 });
-        queue[7].resolve(emptyFollowing);
-        queue[8].resolve({ muted: [], count: 0 });
-        queue[9].resolve({ muted_keywords: [], count: 0 });
-        queue[10].resolve(emptyAuthors);
+        queue[7].resolve({ posts: [top], count: 1 });
+        queue[8].resolve(emptyFollowing);
+        queue[9].resolve({ muted: [], count: 0 });
+        queue[10].resolve({ muted_keywords: [], count: 0 });
+        queue[11].resolve(emptyAuthors);
       });
       expect(result.current.posts).toEqual([top]);
 
       await act(async () => {
         vi.advanceTimersByTime(15000);
       });
-      expect(mockedGet.mock.calls.length).toBe(12);
+      expect(mockedGet.mock.calls.length).toBe(13);
     } finally {
       vi.useRealTimers();
     }
@@ -1535,5 +1541,118 @@ describe("useTan top view", () => {
       String(call[0]).startsWith("/api/tan/top"),
     ).length;
     expect(topLoadsAfter).toBeGreaterThan(topLoadsBefore);
+  });
+});
+
+describe("useTan tag filter", () => {
+  it("loads the tag list and filters the timeline by tag", async () => {
+    const tagged = makePost({ text: "hello #mesh", hash: "e".repeat(64) });
+    const plain = makePost({ text: "plain", hash: "f".repeat(64) });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/tags")) {
+        return Promise.resolve({ tags: [{ tag: "mesh", count: 1 }], count: 1 });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return path.includes("tag=mesh")
+          ? Promise.resolve({ posts: [tagged], count: 1 })
+          : Promise.resolve({ posts: [plain, tagged], count: 2 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([plain, tagged]));
+    await waitFor(() =>
+      expect(result.current.tags).toEqual([{ tag: "mesh", count: 1 }]),
+    );
+    expect(result.current.tagFilter).toBeNull();
+
+    await act(async () => {
+      await result.current.setTagFilter("mesh");
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([tagged]));
+    expect(result.current.tagFilter).toBe("mesh");
+    const timelineCalls = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/timeline?"),
+    );
+    expect(
+      timelineCalls.some((call) => String(call[0]).includes("tag=mesh")),
+    ).toBe(true);
+
+    // Clearing the filter returns to the unfiltered timeline.
+    await act(async () => {
+      await result.current.setTagFilter(null);
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([plain, tagged]));
+    expect(result.current.tagFilter).toBeNull();
+  });
+
+  it("searching clears the tag filter", async () => {
+    const tagged = makePost({ text: "hello #mesh", hash: "e".repeat(64) });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/tags")) {
+        return Promise.resolve({ tags: [{ tag: "mesh", count: 1 }], count: 1 });
+      }
+      if (path.startsWith("/api/tan/search")) {
+        return Promise.resolve({ posts: [tagged], count: 1 });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return path.includes("tag=mesh")
+          ? Promise.resolve({ posts: [tagged], count: 1 })
+          : Promise.resolve({ posts: [tagged], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([tagged]));
+
+    await act(async () => {
+      await result.current.setTagFilter("mesh");
+    });
+    expect(result.current.tagFilter).toBe("mesh");
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    await waitFor(() =>
+      expect(result.current.searchResults).toEqual([tagged]),
+    );
+    expect(result.current.tagFilter).toBeNull();
+    expect(
+      mockedGet.mock.calls.some((call) =>
+        String(call[0]).startsWith("/api/tan/search?q=mesh"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps the previous tag list when the tags request fails", async () => {
+    const mine = makePost();
+    let failTags = false;
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/tags")) {
+        return failTags
+          ? Promise.reject(new Error("tags unavailable"))
+          : Promise.resolve({ tags: [{ tag: "mesh", count: 1 }], count: 1 });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() =>
+      expect(result.current.tags).toEqual([{ tag: "mesh", count: 1 }]),
+    );
+
+    // A failed refresh keeps the last good list instead of clearing it.
+    failTags = true;
+    mockedPost.mockResolvedValue({
+      post: makePost({ text: "another #mesh post", hash: "g".repeat(64) }),
+    });
+    await act(async () => {
+      await result.current.publish("another #mesh post");
+    });
+    expect(result.current.tags).toEqual([{ tag: "mesh", count: 1 }]);
   });
 });

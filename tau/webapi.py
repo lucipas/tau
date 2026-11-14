@@ -89,6 +89,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/id/rename    rename this node (live name + re-announce)
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/tags     tags in stored posts, most-used first
     GET  /api/tan/top      most-liked stored posts (``?limit=10``, ``?author=<name or hash>``)
     GET  /api/tan/search   search stored posts by keyword
     GET  /api/tan/mentions replies to your own posts
@@ -1791,6 +1792,7 @@ class WebBridge:
         limit: int = 30,
         include_all: bool = False,
         author: Optional[str] = None,
+        tag: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
@@ -1834,6 +1836,7 @@ class WebBridge:
                     viewer=viewer,
                     exclude_authors=blocked,
                     exclude_all=exclude_all,
+                    tag=tag,
                 )
             elif include_all:
                 posts = timeline(
@@ -1843,6 +1846,7 @@ class WebBridge:
                     viewer=viewer,
                     exclude_authors=blocked,
                     exclude_all=exclude_all,
+                    tag=tag,
                 )
             else:
                 authors = [record["author"] for record in following(conn)]
@@ -1855,6 +1859,7 @@ class WebBridge:
                     viewer=viewer,
                     exclude_authors=blocked,
                     exclude_all=exclude_all,
+                    tag=tag,
                 )
             annotate_saved(conn, posts)
             annotate_pinned(conn, posts)
@@ -2098,6 +2103,32 @@ class WebBridge:
             )
             annotate_pinned(conn, posts)
             return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
+    def tan_tags(self, *, limit: int = 30) -> List[Dict[str, Any]]:
+        """Tags in stored posts, most-used first, with post counts.
+
+        Mirrors :func:`tau.cli.cmd_tan_tags`: the same counts and
+        visibility rules, so the console shows exactly what the CLI
+        shows for the same store. The node's block-list is applied as
+        in :meth:`tan_timeline`, and muted authors and hidden posts
+        never count. Muted keywords are ignored, as in search — this
+        is an explicit lookup.
+        """
+        from .tangents.tan import tags
+
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            return tags(
+                conn,
+                limit=limit,
+                exclude_authors=blocked,
+                exclude_all=exclude_all,
+            )
         finally:
             conn.close()
 
@@ -7122,14 +7153,22 @@ class _WebHandler(BaseHTTPRequestHandler):
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
                 include_all = _query_flag(query, "all")
                 author = (query.get("author") or [None])[0]
+                tag = (query.get("tag") or [None])[0]
                 try:
                     posts = self.bridge.tan_timeline(
-                        limit=limit, include_all=include_all, author=author
+                        limit=limit, include_all=include_all, author=author, tag=tag
                     )
                 except Exception as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/tags":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=100)
+                entries = self.bridge.tan_tags(limit=limit)
+                self._send_json(
+                    {"tags": entries, "count": len(entries)}, head_only
+                )
                 return
             if path == "/api/tan/top":
                 limit = _int_param(query, "limit", default=10, minimum=1, maximum=100)
