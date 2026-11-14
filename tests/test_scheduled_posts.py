@@ -179,8 +179,13 @@ class _FakeTanApp:
         self.published = []
         self.fail_publish = fail_publish
 
-    def create_post(self, text, *, reply_to=None):
-        post = {"hash": "c" * 64, "text": text, "reply_to": reply_to}
+    def create_post(self, text, *, reply_to=None, expires_at=None):
+        post = {
+            "hash": "c" * 64,
+            "text": text,
+            "reply_to": reply_to,
+            "expires_at": expires_at,
+        }
         self.created.append(post)
         return post
 
@@ -895,3 +900,71 @@ def test_cancel_tolerates_already_deleted_post(tmp_path):
     save_scheduled_posts(path, ScheduledPosts(posts=(entry,)))
     assert _run_cli(data_dir, ["tan", "cancel-scheduled", entry.id]) == 0
     assert len(load_scheduled_posts(path)) == 0
+
+
+# -- disappearing scheduled posts ---------------------------------------------
+
+
+def test_schedule_post_with_expiry_round_trips(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="later, briefly", publish_at=2000.0, now=1000.0, expires_in=3600.0
+    )
+    assert post.expires_in == 3600.0
+    reloaded = load_scheduled_posts(path).posts[0]
+    assert reloaded.expires_in == 3600.0
+    assert reloaded.to_dict()["expires_in"] == 3600.0
+
+
+def test_schedule_post_rejects_expiry_over_cap(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="at most 7d"):
+        schedule_post(
+            path, text="too long", publish_at=2000.0, now=1000.0,
+            expires_in=8 * 24 * 3600.0,
+        )
+    with pytest.raises(ScheduledPostsError):
+        schedule_post(
+            path, text="negative", publish_at=2000.0, now=1000.0, expires_in=-1.0
+        )
+    assert len(load_scheduled_posts(path)) == 0
+
+
+def test_publish_due_applies_expiry_at_publish_time(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(
+        path, text="brief", publish_at=1000.0, now=900.0, expires_in=3600.0
+    )
+    app = _FakeTanApp()
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 1
+    # The clock starts when the post is published, not when it was queued.
+    assert app.created[0]["expires_at"] == 2000.0 + 3600.0
+    assert app.published[-1][0]["expires_at"] == 2000.0 + 3600.0
+
+
+def test_publish_due_retry_keeps_the_same_expiry(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(
+        path, text="brief", publish_at=1000.0, now=900.0, expires_in=3600.0
+    )
+    app = _FakeTanApp(fail_publish=True)
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+
+    app.fail_publish = False
+    result = publish_due_scheduled_posts(path, app, now=2100.0)
+    assert result == {"published": 1, "kept": 0}
+    # The retry re-sends the post signed on the first attempt, so the
+    # expiry does not slide forward with the retry.
+    assert app.published[-1][0]["expires_at"] == 2000.0 + 3600.0
+
+
+def test_publish_due_without_expiry_passes_none(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="forever", publish_at=1000.0, now=900.0)
+    app = _FakeTanApp()
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert app.created[0]["expires_at"] is None

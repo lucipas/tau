@@ -139,6 +139,13 @@ MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
 MAX_SYNC_PAGES = 32
 
+# Longest a disappearing Tan post may live after it is published: a
+# post that outlives this is a permanent post, so refuse it at the
+# flag instead of storing an expiry nobody will honour.  The same 7d
+# cap as a scheduled post's delay — a post cannot be scheduled
+# further out than it is allowed to live.
+MAX_TAN_POST_EXPIRY = 7 * 24 * 60 * 60
+
 # Fields covered by the post hash.  ``prev`` is deliberately not in this tuple:
 # it is prefixed to the canonical body, exactly as the original scaffold
 # described ("cat the previous hash to the new message and hash it").
@@ -198,6 +205,7 @@ _POST_COLUMNS = (
     "text",
     "created_at",
     "received_at",
+    "expires_at",
     "sig",
     "seq",
     "linked",
@@ -240,10 +248,20 @@ def _require_timestamp(value: Any, field: str) -> float:
 
 
 def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
-    """Fields covered by the hash for *mesg*, based on its entry kind."""
+    """Fields covered by the hash for *mesg*, based on its entry kind.
+
+    An expiry is signed when the post carries one, so a relay cannot
+    strip or extend it without breaking the hash — but a post without
+    one hashes exactly as before, so entries written before expiry
+    existed still verify.
+    """
     if mesg.get("kind") in TARGETED_KINDS:
-        return TARGETED_HASH_FIELDS
-    return HASH_FIELDS
+        fields = TARGETED_HASH_FIELDS
+    else:
+        fields = HASH_FIELDS
+    if mesg.get("expires_at") is not None:
+        fields = fields + ("expires_at",)
+    return fields
 
 
 def _canonical_body(post: Dict[str, Any]) -> bytes:
@@ -271,6 +289,7 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         "sig": post["sig"],
         "kind": post.get("kind") or KIND_POST,
         "target": post.get("target") or "",
+        "expires_at": post.get("expires_at"),
     }
 
 
@@ -352,6 +371,13 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
     if now is not None and created_at > float(now) + 86400.0:
         raise PostError("post timestamp is too far in the future")
 
+    raw_expires = mesg.get("expires_at")
+    expires_at: Optional[float] = None
+    if raw_expires is not None:
+        expires_at = _require_timestamp(raw_expires, "expires_at")
+        if expires_at <= created_at:
+            raise PostError("expires_at must be after created_at")
+
     raw_target = mesg.get("target", "")
     if raw_target is None:
         raw_target = ""
@@ -372,6 +398,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "prev": prev,
         "kind": kind,
         "target": target,
+        "expires_at": expires_at,
     }
     _check_wire_size(post)
     return post
@@ -494,6 +521,7 @@ CREATE TABLE IF NOT EXISTS posts (
     text TEXT NOT NULL,
     created_at REAL NOT NULL,
     received_at REAL NOT NULL,
+    expires_at REAL,
     sig TEXT NOT NULL,
     seq INTEGER NOT NULL DEFAULT 0,
     linked INTEGER NOT NULL DEFAULT 0,
@@ -579,6 +607,8 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE posts ADD COLUMN target TEXT NOT NULL DEFAULT ''"
         )
+    if columns and "expires_at" not in columns:  # migrate a pre-expiry database
+        conn.execute("ALTER TABLE posts ADD COLUMN expires_at REAL")
     # Created after the migration above: the index references columns a
     # pre-reactions database does not have yet when _SCHEMA first runs.
     conn.execute("CREATE INDEX IF NOT EXISTS posts_target ON posts(target)")
@@ -615,7 +645,16 @@ def open_readonly_db(path: Union[str, Path]) -> sqlite3.Connection:
     except sqlite3.Error as exc:
         conn.close()
         raise TanError(f"could not read the Tan store: {exc}") from exc
-    required = {"author", "name", "created_at", "seq", "kind", "target", "linked"}
+    required = {
+        "author",
+        "name",
+        "created_at",
+        "seq",
+        "kind",
+        "target",
+        "linked",
+        "expires_at",
+    }
     if not required <= columns or "follows" not in tables:
         conn.close()
         raise TanError(
@@ -789,8 +828,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, sig, seq, linked, kind, target) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, expires_at, sig, seq, linked, kind, target) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -801,6 +840,7 @@ def store_post(
                     post["text"],
                     post["created_at"],
                     timestamp,
+                    post.get("expires_at"),
                     post["sig"],
                     seq,
                     1 if linked else 0,
@@ -844,12 +884,23 @@ def create_post(
     name: str = "anonymous",
     now: Optional[float] = None,
     previous: Optional[str] = None,
+    expires_at: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Create, sign and store a post owned by *identity*."""
+    """Create, sign and store a post owned by *identity*.
+
+    When *expires_at* is given the post disappears from display
+    surfaces once that time passes; the expiry is signed with the
+    post, so it cannot be stripped or extended without breaking the
+    hash.  It must be after the post's creation time.
+    """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
     clean_name = sanitize_name(name)
     clean_text = normalize_message(text)
+    if expires_at is not None:
+        expires_at = _require_timestamp(expires_at, "expires_at")
+        if expires_at <= timestamp:
+            raise PostError("expires_at must be after created_at")
     # The head read and the append must be one atomic step: see
     # _chain_write — two writers racing this window would fork the chain.
     with _chain_write(conn):
@@ -869,6 +920,8 @@ def create_post(
             "created_at": timestamp,
             "prev": prev,
         }
+        if expires_at is not None:
+            body["expires_at"] = expires_at
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -936,6 +989,7 @@ def create_reply(
     name: str = "anonymous",
     now: Optional[float] = None,
     previous: Optional[str] = None,
+    expires_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a reply to the post *target*.
 
@@ -949,7 +1003,9 @@ def create_reply(
     author has seen in full.  Replies received from peers for parents
     that have not arrived yet are still stored through the sync path
     (:func:`store_post`) and shown without a parent snippet until the
-    parent arrives.
+    parent arrives.  A reply may carry its own *expires_at*, like a
+    post; replying to a post whose expiry has already passed raises,
+    the same as replying to a deleted post.
     """
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
@@ -965,6 +1021,12 @@ def create_reply(
         )
     if _is_deleted(conn, existing):
         raise TanError("post has been deleted")
+    if is_expired(existing, now=timestamp):
+        raise TanError("post has expired")
+    if expires_at is not None:
+        expires_at = _require_timestamp(expires_at, "expires_at")
+        if expires_at <= timestamp:
+            raise PostError("expires_at must be after created_at")
     clean_text = normalize_message(text)
     # The head read and the append must be one atomic step: see
     # _chain_write — two writers racing this window would fork the chain.
@@ -987,6 +1049,8 @@ def create_reply(
             "kind": KIND_REPLY,
             "target": target,
         }
+        if expires_at is not None:
+            body["expires_at"] = expires_at
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -1574,10 +1638,12 @@ def annotate_replies(
     the parent is cached locally, and is ``None`` when the parent has
     not arrived yet — a reply is still shown on its own.  A deleted
     parent is reported as deleted with its text blanked, so the thread
-    stays readable without resurfacing removed content.  A parent
-    matching a muted keyword (see :func:`muted_keywords`) is reported
-    the same way, with its text blanked and ``muted`` set, so the
-    muted content does not leak through the preview.  A parent whose
+    stays readable without resurfacing removed content.  An expired
+    parent is reported the same way, with its text blanked and
+    ``expired`` set.  A parent matching a muted keyword (see
+    :func:`muted_keywords`) is reported the same way, with its text
+    blanked and ``muted`` set, so the muted content does not leak
+    through the preview.  A parent whose
     author is in *exclude_authors* (muted) is reported as ``None`` so
     its name and text never surface.  A parent whose author is in
     *blocked_authors* is reported with its text blanked, its author
@@ -1629,6 +1695,7 @@ def annotate_replies(
             post["reply_to"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
+        is_expired_parent = is_expired(parent)
         if blocked_authors and parent["author"] in blocked_authors:
             # Redact identity too: a blocked author's name and hash must
             # not leak through a reply's parent summary.
@@ -1651,7 +1718,11 @@ def annotate_replies(
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
-            "text": "" if is_deleted or is_muted else parent["text"],
+            "text": (
+                ""
+                if is_deleted or is_muted or is_expired_parent
+                else parent["text"]
+            ),
             "deleted": is_deleted,
             "edited": bool(parent.get("edited")),
         }
@@ -1659,6 +1730,10 @@ def annotate_replies(
             # Only present when muted, so unmuted previews keep their
             # established shape.
             preview["muted"] = True
+        if is_expired_parent:
+            # Only present when expired, so live previews keep their
+            # established shape.
+            preview["expired"] = True
         post["reply_to"] = preview
     return posts
 
@@ -2050,6 +2125,32 @@ def _is_deleted(conn: sqlite3.Connection, post: Dict[str, Any]) -> bool:
     return row is not None
 
 
+def is_expired(post: Dict[str, Any], *, now: Optional[float] = None) -> bool:
+    """Whether *post*'s expiry has passed.
+
+    A post without an expiry never expires.  Like a deleted post, an
+    expired one stays in the store — the chain must stay verifiable
+    and sync must keep carrying it — it is only hidden from display
+    surfaces.
+    """
+    expires_at = post.get("expires_at")
+    if expires_at is None:
+        return False
+    try:
+        deadline = float(expires_at)
+    except (TypeError, ValueError):
+        return False
+    at = float(now if now is not None else time.time())
+    return deadline <= at
+
+
+def _without_expired(
+    posts: List[Dict[str, Any]], *, now: Optional[float] = None
+) -> List[Dict[str, Any]]:
+    """Drop expired posts from a display list, keeping the rest in order."""
+    return [post for post in posts if not is_expired(post, now=now)]
+
+
 def apply_display_rules(
     posts: List[Dict[str, Any]], ruleset: Ruleset
 ) -> List[Dict[str, Any]]:
@@ -2094,6 +2195,8 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
         if post is not None and post.get("kind", KIND_POST) in TIMELINE_KINDS:
             if _is_deleted(conn, post):
                 raise TanError(f"post has been deleted: {ref!r}")
+            if is_expired(post):
+                raise TanError(f"post has expired: {ref!r}")
             return post
         raise TanError(f"unknown post: {ref!r}")
     if len(value) >= 8:
@@ -2112,6 +2215,8 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
             if post is not None:
                 if _is_deleted(conn, post):
                     raise TanError(f"post has been deleted: {ref!r}")
+                if is_expired(post):
+                    raise TanError(f"post has expired: {ref!r}")
                 return post
         if len(rows) > 1:
             raise TanError(f"{len(rows)} posts match prefix {value!r}")
@@ -2195,6 +2300,10 @@ def feed(
             (author, max(0, int(after_seq)), count),
         ).fetchall()
         posts = _public_posts(rows)
+        if posts_only:
+            # Display only: sync callers keep expired entries so chains
+            # stay complete — the entries are hidden, not deleted.
+            posts = _without_expired(posts)
         return annotate_edits(conn, posts) if posts_only else posts
 
     params: List[Any] = []
@@ -2218,6 +2327,10 @@ def feed(
         params,
     ).fetchall()
     posts = _public_posts(rows)
+    if posts_only:
+        # Display only: sync callers keep expired entries so chains
+        # stay complete — the entries are hidden, not deleted.
+        posts = _without_expired(posts)
     return annotate_edits(conn, posts) if posts_only else posts
 
 
@@ -2601,7 +2714,7 @@ def timeline(
             "ORDER BY created_at DESC, hash DESC LIMIT ?",
             params,
         ).fetchall()
-        return _public_posts(rows)
+        return _without_expired(_public_posts(rows))
 
     posts = _fill_unmuted(
         conn,
@@ -2686,7 +2799,7 @@ def author_timeline(
             "ORDER BY seq ASC LIMIT ?",
             (author, max(0, int(cursor)), MAX_FEED_POSTS),
         ).fetchall()
-        return [_row_to_post_with_meta(row) for row in rows]
+        return _without_expired([_row_to_post_with_meta(row) for row in rows])
 
     posts = _fill_unmuted(
         conn,
@@ -2803,7 +2916,7 @@ def top_posts(
     ).fetchall()
     # Edits first, so keyword muting and the ruleset see the text that
     # is actually displayed.
-    candidates = annotate_edits(conn, _public_posts(rows))
+    candidates = annotate_edits(conn, _without_expired(_public_posts(rows)))
     candidates = without_muted_keywords(conn, candidates, keywords)
     if ruleset is not None:
         candidates = [
@@ -2960,6 +3073,10 @@ def thread(
             # deleted parent whose chain never linked up hides its
             # subtree just the same.
             raise TanError(f"post has been deleted: {ref!r}")
+        if is_expired(parent):
+            # An expired parent hides its subtree the same way: the
+            # thread cannot be read past a post that is gone.
+            raise TanError(f"post has expired: {ref!r}")
         if parent["author"] in excluded:
             raise TanError(f"post is from a blocked author: {ref!r}")
         if not parent.get("linked"):
@@ -3002,7 +3119,8 @@ def thread(
             )
         # Batches are merged here, so re-sort the whole generation.
         generation = sorted(
-            _public_posts(rows), key=lambda post: (post["created_at"], post["hash"])
+            _without_expired(_public_posts(rows)),
+            key=lambda post: (post["created_at"], post["hash"]),
         )
         # A muted reply hides its whole subtree: it never enters the
         # frontier, so its own replies are never collected.  Replies by
@@ -3112,7 +3230,7 @@ def search_posts(
         "ORDER BY created_at DESC, hash DESC",
         params,
     ).fetchall()
-    candidates = _public_posts(rows)
+    candidates = _without_expired(_public_posts(rows))
     states = edit_states(conn, [post["hash"] for post in candidates])
     matches = [
         post
@@ -3181,7 +3299,7 @@ def tags(
         f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
         "ORDER BY created_at DESC, hash DESC",
     ).fetchall()
-    posts = _public_posts(rows)
+    posts = _without_expired(_public_posts(rows))
     states = edit_states(conn, [post["hash"] for post in posts])
     counts: Dict[str, int] = {}
     for post in posts:
@@ -3291,7 +3409,11 @@ def mentions(
         # the thread view hides it.  Hidden rows still advance the cursor so
         # paging continues past them.
         visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
-        kept.extend(without_muted_keywords(conn, _public_posts(visible), keywords))
+        kept.extend(
+            without_muted_keywords(
+                conn, _without_expired(_public_posts(visible)), keywords
+            )
+        )
         if len(rows) < MAX_FEED_POSTS:
             break
         last = rows[-1]
@@ -3824,6 +3946,8 @@ def saved_posts(
     records: List[Dict[str, Any]] = []
     for row in rows:
         post = _row_to_post(row)
+        if is_expired(post):
+            continue
         post["saved_at"] = float(row["saved_at"])
         if str(post["hash"]) in deleted:
             post["deleted"] = True
@@ -4004,6 +4128,8 @@ def pinned_posts(
     records: List[Dict[str, Any]] = []
     for row in rows:
         post = _row_to_post(row)
+        if is_expired(post):
+            continue
         post["pinned_at"] = float(row["pinned_at"])
         if str(post["hash"]) in deleted:
             post["deleted"] = True
@@ -4665,16 +4791,28 @@ class TanApp:
         publish: bool = False,
         targets: Optional[Sequence[Any]] = None,
         ttl: int = MAX_GOSSIP_TTL,
+        expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Create a post, or a reply when *reply_to* names a parent post."""
+        """Create a post, or a reply when *reply_to* names a parent post.
+
+        When *expires_at* is given the post disappears from display
+        surfaces once that time passes; see :func:`create_post`.
+        """
         conn = self.connect()
         try:
             if reply_to is not None:
                 post = create_reply(
-                    conn, self.identity, reply_to, text, name=self.name
+                    conn,
+                    self.identity,
+                    reply_to,
+                    text,
+                    name=self.name,
+                    expires_at=expires_at,
                 )
             else:
-                post = create_post(conn, self.identity, text, name=self.name)
+                post = create_post(
+                    conn, self.identity, text, name=self.name, expires_at=expires_at
+                )
         finally:
             conn.close()
         if publish and self.node is not None:
