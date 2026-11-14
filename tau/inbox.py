@@ -1709,13 +1709,19 @@ class Inbox:
             annotated.append(copy)
         return annotated
 
-    def _unread_counts_locked(self) -> Dict[str, Any]:
+    def _unread_counts_locked(
+        self, *, exclude_dm_from: Optional[Collection[str]] = None
+    ) -> Dict[str, Any]:
         """Per-conversation unread counts from the in-memory state.
 
         Only received messages count: a reply this node sent is never
         unread for its owner, so sent records past the cursor must not
         inflate the counts (see :meth:`mark_unread`, which reports the
-        same received-only totals).
+        same received-only totals).  ``exclude_dm_from`` hides the
+        direct messages of the named senders — an archived
+        conversation never lights the badge — but their group posts
+        still count: a group post belongs to the group, not to the
+        hidden conversation, and the group thread stays visible.
         """
         per_peer: Dict[str, int] = {}
         for entry in self._messages:
@@ -1725,10 +1731,18 @@ class Inbox:
                 entry, self._read_cursors.get(entry.get("destination") or "")
             ):
                 destination = entry.get("destination") or ""
+                if (
+                    exclude_dm_from
+                    and destination in exclude_dm_from
+                    and not entry.get("group")
+                ):
+                    continue
                 per_peer[destination] = per_peer.get(destination, 0) + 1
         return {"per_peer": per_peer, "total": sum(per_peer.values())}
 
-    def unread_counts(self) -> Dict[str, Any]:
+    def unread_counts(
+        self, *, exclude_dm_from: Optional[Collection[str]] = None
+    ) -> Dict[str, Any]:
         """Per-conversation unread counts, reloaded from disk first.
 
         The reload under the cross-process lock is what lets a serving
@@ -1736,7 +1750,7 @@ class Inbox:
         advanced (and vice versa).
         """
         with self._transaction():
-            return self._unread_counts_locked()
+            return self._unread_counts_locked(exclude_dm_from=exclude_dm_from)
 
     def mark_read(
         self,
@@ -1744,6 +1758,7 @@ class Inbox:
         *,
         up_to_seq: Optional[int] = None,
         at: Optional[float] = None,
+        exclude_dm_from: Optional[Collection[str]] = None,
     ) -> Any:
         """Advance the read cursor for one conversation, or all of them.
 
@@ -1786,7 +1801,7 @@ class Inbox:
                     "last_read_id": newest.get("id"),
                 }
             self._save()
-            return self._unread_counts_locked()
+            return self._unread_counts_locked(exclude_dm_from=exclude_dm_from)
 
     def mark_unread(
         self, peer: str, *, all: bool = False

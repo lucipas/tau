@@ -1978,6 +1978,8 @@ describe("useTau archived conversations", () => {
 
     // A new arrival for the archived peer stays hidden; one for
     // another peer lands in the feed. Group posts are never archived.
+    // The snapshot DM from the archived peer is hidden too, once the
+    // archived list lands and reconciles the open views.
     await act(async () => {
       source.emit("message", {
         message: makeMessage({
@@ -2004,7 +2006,7 @@ describe("useTau archived conversations", () => {
         }),
       });
     });
-    expect(result.current.messages.map((m) => m.id)).toEqual([1, 3, 4]);
+    expect(result.current.messages.map((m) => m.id)).toEqual([3, 4]);
     unmount();
   });
 });

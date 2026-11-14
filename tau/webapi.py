@@ -6741,39 +6741,26 @@ class WebBridge:
         self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
         return dict(counts, revision=self._unread_revision)
 
-    def _drop_archived_unread(self, counts: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove archived conversations from unread counts.
-
-        An archived conversation never lights the badge: its counts are
-        dropped and the total recomputed, like the messages() filter hides
-        its history. Every unread result passes through here so no path
-        can publish a count for an archived peer.
-        """
-        archived = self._archived_set()
-        if archived and counts.get("per_peer"):
-            kept = {
-                destination: unread
-                for destination, unread in counts["per_peer"].items()
-                if destination not in archived
-            }
-            return {"per_peer": kept, "total": sum(kept.values())}
-        return counts
-
     def unread(self) -> Dict[str, Any]:
         """Per-conversation unread counts from the node inbox.
 
         A node without an inbox (tests, embeds) simply has nothing
-        unread; read state is local to this node either way.
+        unread; read state is local to this node either way.  An
+        archived conversation never lights the badge, so its direct
+        messages are excluded at the source — but the sender's group
+        posts still count, since the group thread stays visible.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
                 try:
-                    counts = inbox.unread_counts()
+                    counts = inbox.unread_counts(
+                        exclude_dm_from=self._archived_set()
+                    )
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)
-            return self._stamp_unread(self._drop_archived_unread(counts))
+            return self._stamp_unread(counts)
 
     def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
         """Advance the inbox read cursor for one conversation, or all.
@@ -6786,8 +6773,10 @@ class WebBridge:
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
-                counts = inbox.mark_read(peer=peer)
-            stamped = self._stamp_unread(self._drop_archived_unread(counts))
+                counts = inbox.mark_read(
+                    peer=peer, exclude_dm_from=self._archived_set()
+                )
+            stamped = self._stamp_unread(counts)
         if inbox is not None:
             self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
@@ -9523,33 +9512,4 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
-)imum, min(value, maximum))
-            self.wfile.write(body)
 
-    def _send_error(self, status: int, message: str, head_only: bool = False) -> None:
-        self._send_json({"error": {"message": message}}, head_only, status)
-
-
-def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
-    values = query.get(name) or []
-    if not values:
-        return False
-    return values[0].strip().lower() in ("1", "true", "yes", "on")
-
-
-def _int_param(
-    query: Dict[str, List[str]],
-    name: str,
-    *,
-    default: int,
-    minimum: int,
-    maximum: int,
-) -> int:
-    values = query.get(name)
-    if not values:
-        return default
-    try:
-        value = int(values[0])
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(value, maximum))

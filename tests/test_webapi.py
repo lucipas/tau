@@ -3548,6 +3548,14 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
             destination=OTHER_HASH,
             **{"from": "carol", "id": "m-2", "received_at": 102.0},
         )
+        # A group post from alice: same destination as her DM, but it
+        # belongs to the group thread, which archiving must not hide.
+        _inbound_record(
+            node,
+            kind="group",
+            group="11" * 16,
+            **{"from": "alice", "id": "m-3", "received_at": 103.0},
+        )
 
         assert [m["text"] for m in bridge.messages()] == [
             "from alice",
@@ -3556,8 +3564,8 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
             "crew hello",
         ]
         assert _counts(bridge.unread()) == {
-            "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
-            "total": 2,
+            "per_peer": {PEER_HASH: 2, OTHER_HASH: 1},
+            "total": 3,
         }
 
         result = bridge.archive_conversation("alice")
@@ -3579,10 +3587,11 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
         listed = bridge.archived_conversations()
         assert listed["count"] == 1
         assert listed["archived"][0]["messages"] == 2
-        # The archived thread stops lighting the badge.
+        # The archived thread stops lighting the badge — but alice's
+        # group post still counts, since the group thread stays visible.
         assert _counts(bridge.unread()) == {
-            "per_peer": {OTHER_HASH: 1},
-            "total": 1,
+            "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
+            "total": 2,
         }
 
         bridge.unarchive_conversation(PEER_HASH)
@@ -3593,8 +3602,8 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
             "crew hello",
         ]
         assert _counts(bridge.unread()) == {
-            "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
-            "total": 2,
+            "per_peer": {PEER_HASH: 2, OTHER_HASH: 1},
+            "total": 3,
         }
     finally:
         bridge.stop()
