@@ -7839,6 +7839,101 @@ def test_tan_top_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_tags_via_api(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "first #mesh post", name="alice", now=1000)
+        create_post(conn, alice, "second #mesh #radio post", name="alice", now=1001)
+        create_post(conn, bob, "bob #radio post", name="bob", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/tags")
+        assert status == 200
+        assert payload["tags"] == [
+            {"tag": "mesh", "count": 2},
+            {"tag": "radio", "count": 2},
+        ]
+        assert payload["count"] == 2
+
+        status, _, payload = _json(bridge, "/api/tan/tags?limit=1")
+        assert status == 200
+        assert payload["tags"] == [{"tag": "mesh", "count": 2}]
+
+        # A blocked author's posts never count, and a failed-closed
+        # list hides every tag.
+        node.blocklist = BlockList(blocked=frozenset({destination_hash(bob).hex()}))
+        status, _, payload = _json(bridge, "/api/tan/tags")
+        assert status == 200
+        assert payload["tags"] == [
+            {"tag": "mesh", "count": 2},
+            {"tag": "radio", "count": 1},
+        ]
+
+        node.blocklist = BlockList(block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/tags")
+        assert status == 200
+        assert payload["tags"] == []
+    finally:
+        bridge.stop()
+
+
+def test_tan_timeline_tag_filter_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "tagged #mesh post", name="alice", now=1000)
+        create_post(conn, bob, "plain post", name="bob", now=1001)
+        create_post(conn, bob, "another #mesh post", name="bob", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1&tag=mesh")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "another #mesh post",
+            "tagged #mesh post",
+        ]
+
+        # A leading hash and case do not matter: the tag is normalised.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1&tag=%23MESH")
+        assert status == 200
+        assert payload["count"] == 2
+
+        # An unused tag matches nothing, and a malformed tag is a 400.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1&tag=radio")
+        assert status == 200
+        assert payload["posts"] == []
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1&tag=1bad")
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
 def test_tan_top_matches_timeline_annotations(tmp_path):
     import RNS
 

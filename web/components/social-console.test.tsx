@@ -672,6 +672,9 @@ describe("SocialConsole muted sidebar", () => {
       authorsTotal: 0,
       loadMoreAuthors: vi.fn(),
       suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
       saved: [],
@@ -807,6 +810,9 @@ describe("SocialConsole search", () => {
       authorsTotal: 0,
       loadMoreAuthors: vi.fn(),
       suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
       all: false,
@@ -920,6 +926,9 @@ describe("SocialConsole mentions view", () => {
       authorsTotal: 0,
       loadMoreAuthors: vi.fn(),
       suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
       all: false,
@@ -1034,6 +1043,9 @@ describe("SocialConsole pinned view", () => {
       authorsTotal: 0,
       loadMoreAuthors: vi.fn(),
       suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
       saved: [],
@@ -1178,6 +1190,9 @@ describe("SocialConsole authors directory", () => {
       authorsTotal: 0,
       loadMoreAuthors: vi.fn(),
       suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
       all: false,
@@ -1320,6 +1335,9 @@ describe("SocialConsole hidden view", () => {
       authorsTotal: 0,
       loadMoreAuthors: vi.fn(),
       suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
       saved: [],
@@ -1543,5 +1561,241 @@ describe("PostCard pin control", () => {
 
     expect(screen.queryByTitle("Pin this post to the top of your pinned list")).toBeNull();
     expect(screen.queryByTitle("Remove from pinned posts")).toBeNull();
+  });
+});
+
+describe("PostCard hashtags", () => {
+  it("renders hashtags as buttons that filter the timeline", () => {
+    const onTag = vi.fn();
+    render(
+      <PostCard
+        post={makePost({ text: "hello #mesh and #radio-2" })}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+        onTag={onTag}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("show #mesh posts"));
+    expect(onTag).toHaveBeenCalledTimes(1);
+    expect(onTag).toHaveBeenCalledWith("mesh");
+    fireEvent.click(screen.getByTitle("show #radio-2 posts"));
+    expect(onTag).toHaveBeenCalledWith("radio-2");
+  });
+
+  it("does not linkify a hash inside a word", () => {
+    const onTag = vi.fn();
+    render(
+      <PostCard
+        post={makePost({ text: "C# code and a#b are not tags" })}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+        onTag={onTag}
+      />,
+    );
+
+    expect(screen.getByText("C# code and a#b are not tags")).toBeTruthy();
+    expect(onTag).not.toHaveBeenCalled();
+  });
+
+  it("renders plain text when no tag handler is given", () => {
+    render(
+      <PostCard
+        post={makePost({ text: "hello #mesh" })}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+      />,
+    );
+
+    expect(screen.getByText("hello #mesh")).toBeTruthy();
+    expect(screen.queryByTitle("show #mesh posts")).toBeNull();
+  });
+
+  it("normalises a capitalised hashtag before filtering", () => {
+    const onTag = vi.fn();
+    render(
+      <PostCard
+        post={makePost({ text: "hello #Mesh" })}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+        onTag={onTag}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("show #mesh posts"));
+    expect(onTag).toHaveBeenCalledTimes(1);
+    expect(onTag).toHaveBeenCalledWith("mesh");
+  });
+
+  it("leaves a hashtag the server would reject as plain text", () => {
+    const onTag = vi.fn();
+    render(
+      <PostCard
+        post={makePost({ text: "hello #İstanbul" })}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+        onTag={onTag}
+      />,
+    );
+
+    expect(screen.getByText("hello #İstanbul")).toBeTruthy();
+    expect(screen.queryByTitle(/^show #/)).toBeNull();
+    expect(onTag).not.toHaveBeenCalled();
+  });
+});
+
+describe("SocialConsole tags sidebar", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  // The search describe's makeTan covers the whole hook shape; the
+  // tags tests reuse it with the tag fields set.
+  function setTanWithTags(overrides: Record<string, unknown>) {
+    const setTagFilter = vi.fn();
+    mockTan.current = {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
+      tags: [
+        { tag: "mesh", count: 3 },
+        { tag: "radio", count: 1 },
+      ],
+      tagFilter: null,
+      setTagFilter,
+      mutedAuthors: [],
+      mutedKeywords: [],
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
+      all: false,
+      setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      ...overrides,
+    };
+    return { tan: mockTan.current, setTagFilter, closeThread: mockTan.current.closeThread as Mock };
+  }
+
+  it("lists tags most-used first and filters on click", () => {
+    const { setTagFilter } = setTanWithTags({});
+    render(<SocialConsole />);
+
+    const mesh = screen.getByRole("button", { name: "#mesh · 3" });
+    const radio = screen.getByRole("button", { name: "#radio · 1" });
+    expect(mesh.compareDocumentPosition(radio)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+
+    fireEvent.click(mesh);
+    expect(setTagFilter).toHaveBeenCalledTimes(1);
+    expect(setTagFilter).toHaveBeenCalledWith("mesh");
+  });
+
+  it("shows the empty state when there are no tags", () => {
+    setTanWithTags({ tags: [] });
+    render(<SocialConsole />);
+
+    expect(
+      screen.getByText("No hashtags in stored posts yet. Post with a #tag, or sync to pull tagged posts from your peers."),
+    ).toBeTruthy();
+  });
+
+  it("shows the active filter chip and clears it on click", () => {
+    const { setTagFilter } = setTanWithTags({ tagFilter: "mesh" });
+    render(<SocialConsole />);
+
+    fireEvent.click(screen.getByRole("button", { name: "#mesh ✕" }));
+    expect(setTagFilter).toHaveBeenCalledTimes(1);
+    expect(setTagFilter).toHaveBeenCalledWith(null);
+  });
+
+  it("clicking a hashtag in a post filters the timeline", () => {
+    const { setTagFilter } = setTanWithTags({
+      posts: [makePost({ text: "hello #mesh" })],
+    });
+    render(<SocialConsole />);
+
+    fireEvent.click(screen.getByTitle("show #mesh posts"));
+    expect(setTagFilter).toHaveBeenCalledTimes(1);
+    expect(setTagFilter).toHaveBeenCalledWith("mesh");
+  });
+
+  it("hides the filter chip on views the tag does not filter", () => {
+    setTanWithTags({ tagFilter: "mesh", view: "top" });
+    render(<SocialConsole />);
+
+    expect(screen.queryByRole("button", { name: "#mesh ✕" })).toBeNull();
+  });
+
+  it("closes an open thread when a hashtag in it is clicked", () => {
+    const { setTagFilter, closeThread } = setTanWithTags({
+      threadRef: "c".repeat(64),
+      threadPosts: [makePost({ text: "hello #mesh" })],
+    });
+    render(<SocialConsole />);
+
+    fireEvent.click(screen.getByTitle("show #mesh posts"));
+    expect(closeThread).toHaveBeenCalledTimes(1);
+    expect(setTagFilter).toHaveBeenCalledTimes(1);
+    expect(setTagFilter).toHaveBeenCalledWith("mesh");
   });
 });

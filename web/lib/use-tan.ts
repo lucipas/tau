@@ -31,6 +31,8 @@ import type {
   TanSuggestResponse,
   TanSuggestion,
   TanSyncResponse,
+  TanTagsResponse,
+  TanTag,
   TanTimelineResponse,
   TanVerifyReport,
 } from "./types";
@@ -79,6 +81,14 @@ export function useTan() {
   }, [authors]);
   const authorsGenerationRef = useRef(0);
   const [suggestions, setSuggestions] = useState<TanSuggestion[]>([]);
+  // Tags in stored posts, most-used first. The list is a whole-store
+  // scan, so it refreshes on the suggestions cadence rather than on
+  // the feed poll, and after an action that can change the tag set.
+  const [tags, setTags] = useState<TanTag[]>([]);
+  // The tag the timeline is filtered to, or null for the unfiltered
+  // timeline. A view switch like the search: setting it fetches the
+  // timeline endpoint with `?tag=` instead of the plain timeline.
+  const [tagFilter, setTagFilterState] = useState<string | null>(null);
   const [mutedAuthors, setMutedAuthors] = useState<TanMutedAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<TanMutedKeyword[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
@@ -160,6 +170,13 @@ export function useTan() {
     showMentionsRef.current = showMentions;
   }, [showMentions]);
 
+  // The tag filter the timeline is showing, kept beside `tagFilter`
+  // so a feed load can read it without waiting for the state update.
+  const tagFilterRef = useRef(tagFilter);
+  useEffect(() => {
+    tagFilterRef.current = tagFilter;
+  }, [tagFilter]);
+
   // The open thread's reference, kept alongside `threadRef` so a feed
   // load can reload the thread without waiting for the state update.
   // Set directly in `openThread`/`closeThread` for the same reason.
@@ -194,7 +211,13 @@ export function useTan() {
     try {
       const isTop = viewRef.current === "top";
       const activeSearch = searchQueryRef.current;
-      const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
+      const activeTag = tagFilterRef.current;
+      // The tag filter applies to the timeline only: a search, the
+      // top ranking and mentions each fetch their own endpoint.
+      const timelineParams = new URLSearchParams({ limit: "100" });
+      if (allRef.current) timelineParams.set("all", "1");
+      if (activeTag !== null) timelineParams.set("tag", activeTag);
+      const timelineUrl = `/api/tan/timeline?${timelineParams.toString()}`;
       // A search stays a search even from the top view: the search form
       // is always visible, so a search submitted there must fetch the
       // search endpoint, not the top ranking.
@@ -209,7 +232,7 @@ export function useTan() {
             ? apiGet<TanTimelineResponse>("/api/tan/top?limit=10")
             : showMentionsRef.current
               ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
-              : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
+              : apiGet<TanTimelineResponse>(timelineUrl),
         apiGet<TanFollowingResponse>("/api/tan/following"),
         apiGet<TanMutedResponse>("/api/tan/muted").catch(() => null),
         apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords").catch(
@@ -364,7 +387,7 @@ export function useTan() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, view, searchQuery, showMentions, load, refreshAuthors]);
+  }, [all, view, searchQuery, showMentions, tagFilter, load, refreshAuthors]);
 
   // Suggestions have their own generation so a slow ranking response cannot
   // overwrite a newer one, and they never block the feed load.
@@ -393,6 +416,35 @@ export function useTan() {
       clearInterval(timer);
     };
   }, [loadSuggestions]);
+
+  // Tags have their own generation so a slow response cannot overwrite
+  // a newer one, and they never block the feed load. A failure keeps
+  // the last good list, the way suggestions do.
+  const tagsGenerationRef = useRef(0);
+  const loadTags = useCallback(async () => {
+    const generation = ++tagsGenerationRef.current;
+    const result = await apiGet<TanTagsResponse>("/api/tan/tags");
+    if (tagsGenerationRef.current !== generation) return;
+    setTags(result.tags ?? []);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    async function tickTags() {
+      try {
+        await loadTags();
+      } catch {
+        // Tags are optional; keep the last good list on failure.
+      }
+      if (disposed) return;
+    }
+    void tickTags();
+    const timer = setInterval(() => void tickTags(), SUGGEST_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [loadTags]);
 
   const refresh = useCallback(async () => {
     await load();
@@ -479,6 +531,38 @@ export function useTan() {
       // for the new one while its request is in flight.
       setSearchResults([]);
       setSearchQuery(trimmed);
+      // A search leaves the tag filter: the two switches are
+      // exclusive, so a search result is never shown as a tag hit.
+      setTagFilterState(null);
+    },
+    [load],
+  );
+
+  // A tag filter is a view switch, like a search: setting it re-runs
+  // the load effect, which fetches the timeline with `?tag=` instead
+  // of the plain timeline. Clearing it returns to the timeline the
+  // same way. Picking a tag leaves any search results, and the two
+  // switches stay exclusive. The stored value is normalised the way
+  // the server normalises it — a leading `#` stripped, casefolded —
+  // so a tag clicked as `#Mesh` matches the sidebar's `#mesh` and
+  // the active-tag toggle compares equal values.
+  const setTagFilter = useCallback(
+    async (tag: string | null) => {
+      const normalized =
+        tag !== null && tag.trim() !== ""
+          ? tag.trim().replace(/^#/, "").toLowerCase()
+          : null;
+      if (normalized === tagFilterRef.current) {
+        // Re-picking the current tag: setting the same state would
+        // bail out without reloading, so refresh directly.
+        await load();
+        return;
+      }
+      if (normalized !== null) {
+        setSearchResults([]);
+        setSearchQuery(null);
+      }
+      setTagFilterState(normalized);
     },
     [load],
   );
@@ -1045,6 +1129,11 @@ export function useTan() {
           ...(replyTo ? { reply_to: replyTo } : {}),
           ...(expiresIn ? { expires_in: expiresIn } : {}),
         });
+        // The post is stored once the POST succeeds: refresh the tag
+        // list at once, independently of the feed reload below, so a
+        // failed feed refresh cannot leave a new tag out of the list.
+        // A failed refresh keeps the old list.
+        void loadTags().catch(() => undefined);
         setPosts((previous) => {
           if (previous.some((post) => post.hash === result.post.hash)) {
             return previous;
@@ -1057,7 +1146,7 @@ export function useTan() {
         setPosting(false);
       }
     },
-    [load, invalidateVerify],
+    [load, invalidateVerify, loadTags],
   );
 
   const quote = useCallback(
@@ -1068,6 +1157,9 @@ export function useTan() {
           target,
           text,
         });
+        // The quote is stored once the POST succeeds: refresh the tag
+        // list at once, independently of the feed reload below.
+        void loadTags().catch(() => undefined);
         setPosts((previous) => {
           if (previous.some((post) => post.hash === result.post.hash)) {
             return previous;
@@ -1085,7 +1177,7 @@ export function useTan() {
         setPosting(false);
       }
     },
-    [load],
+    [load, loadTags],
   );
 
   const follow = useCallback(
@@ -1211,6 +1303,10 @@ export function useTan() {
     async (target: string) => {
       invalidateVerify();
       await apiPost("/api/tan/delete", { target });
+      // The delete is committed once the POST succeeds: refresh the
+      // tag list at once, independently of the shelf refreshes below,
+      // so a failed refresh cannot leave a retired tag listed.
+      void loadTags().catch(() => undefined);
       await Promise.all([
         load(),
         refreshSavedIfLoaded(),
@@ -1224,12 +1320,16 @@ export function useTan() {
       refreshHiddenIfLoaded,
       refreshSavedIfLoaded,
       refreshPinnedIfLoaded,
+      loadTags,
     ],
   );
 
   const editPost = useCallback(
     async (target: string, text: string) => {
       await apiPost("/api/tan/edit", { target, text });
+      // The edit is committed once the POST succeeds: refresh the tag
+      // list at once, independently of the feed reload below.
+      void loadTags().catch(() => undefined);
       // The edit is already committed. A refresh failure must not make the
       // caller treat the edit as failed, so report it as a feed error instead.
       try {
@@ -1240,7 +1340,7 @@ export function useTan() {
         );
       }
     },
-    [load],
+    [load, loadTags],
   );
 
   const sync = useCallback(async () => {
@@ -1254,11 +1354,14 @@ export function useTan() {
       // alongside the feed.
       await Promise.all([load(), refreshAuthors()]);
       void loadSuggestions().catch(() => undefined);
+      // A sync can bring in new tags too; refresh the list, keeping
+      // the old one on failure.
+      void loadTags().catch(() => undefined);
       return result.sync;
     } finally {
       setSyncing(false);
     }
-  }, [load, invalidateVerify, refreshAuthors, loadSuggestions]);
+  }, [load, invalidateVerify, refreshAuthors, loadSuggestions, loadTags]);
 
   // A read-only audit: verifying never writes to the store and never
   // reloads the feed, so it stays independent of the poll cadence.
@@ -1342,6 +1445,9 @@ export function useTan() {
     authorsTotal,
     loadMoreAuthors,
     suggestions,
+    tags,
+    tagFilter,
+    setTagFilter,
     mutedAuthors,
     mutedKeywords,
     saved,

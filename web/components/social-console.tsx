@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
 import type {
@@ -257,6 +258,24 @@ export function SocialConsole() {
   function clearSearch() {
     setSearchText("");
     tan.clearSearch();
+  }
+
+  // Clicking a hashtag filters the timeline to that tag: leave any
+  // shelf, mentions view or open thread and show the tagged timeline
+  // instead. Clicking the active tag again clears the filter. The tag
+  // counts cover the whole store, so applying one also widens the
+  // scope to everything — otherwise the count could promise posts
+  // the following-only feed hides.
+  function submitTagFilter(tag: string) {
+    setShowSaved(false);
+    setShowPinned(false);
+    setShowHidden(false);
+    setShowScheduled(false);
+    tan.setShowMentions(false);
+    tan.setView("timeline");
+    tan.closeThread();
+    if (tan.tagFilter !== tag) tan.setAll(true);
+    void tan.setTagFilter(tan.tagFilter === tag ? null : tag);
   }
 
   async function toggleLike(post: TanPost) {
@@ -698,6 +717,45 @@ export function SocialConsole() {
 
             <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
               <div className="flex items-center justify-between">
+                <SectionLabel>tags</SectionLabel>
+                <span className="font-mono text-[10px] text-mist">
+                  {tan.tags.length}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Hashtags in stored posts, most-used first. Pick one to
+                filter the timeline to it.
+              </p>
+              {tan.tags.length === 0 ? (
+                <p className="mt-3 rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
+                  No hashtags in stored posts yet. Post with a #tag, or
+                  sync to pull tagged posts from your peers.
+                </p>
+              ) : (
+                <ul className="mt-3 flex flex-wrap gap-1.5">
+                  {tan.tags.map((record) => (
+                    <li key={record.tag}>
+                      <button
+                        type="button"
+                        onClick={() => submitTagFilter(record.tag)}
+                        aria-pressed={tan.tagFilter === record.tag}
+                        title={`${record.count} post${record.count === 1 ? "" : "s"}`}
+                        className={`rounded-lg border px-2 py-1 font-mono text-[11px] transition ${
+                          tan.tagFilter === record.tag
+                            ? "border-signal/60 bg-signal/15 text-signal"
+                            : "border-line/60 bg-void/40 text-mist hover:border-signal/50 hover:text-signal"
+                        }`}
+                      >
+                        #{record.tag} · {record.count}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <div className="flex items-center justify-between">
                 <SectionLabel>muted</SectionLabel>
                 <span className="font-mono text-[10px] text-mist">
                   {tan.mutedAuthors.length + tan.mutedKeywords.length}
@@ -919,6 +977,23 @@ export function SocialConsole() {
                       clear search
                     </button>
                     ) : (
+                    <>
+                    {tan.tagFilter !== null &&
+                    tan.view === "timeline" &&
+                    !tan.showMentions &&
+                    !showSaved &&
+                    !showPinned &&
+                    !showHidden &&
+                    !showScheduled ? (
+                    <button
+                      type="button"
+                      onClick={() => void tan.setTagFilter(null)}
+                      title="clear the tag filter"
+                      className="rounded-lg border border-signal/50 bg-signal/10 px-2 py-1 font-mono text-[11px] text-signal transition hover:border-signal/70"
+                    >
+                      #{tan.tagFilter} ✕
+                    </button>
+                    ) : null}
                     <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
                       <button
                         type="button"
@@ -930,6 +1005,7 @@ export function SocialConsole() {
                           tan.setShowMentions(false);
                           tan.setView("timeline");
                           tan.setAll(false);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.view === "timeline" &&
@@ -955,6 +1031,7 @@ export function SocialConsole() {
                           tan.setShowMentions(false);
                           tan.setView("timeline");
                           tan.setAll(true);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.view === "timeline" &&
@@ -979,6 +1056,7 @@ export function SocialConsole() {
                           setShowScheduled(false);
                           tan.setShowMentions(false);
                           tan.setView("top");
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.view === "top" &&
@@ -1002,6 +1080,7 @@ export function SocialConsole() {
                           setShowScheduled(false);
                           tan.setShowMentions(true);
                           tan.setView("timeline");
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.showMentions ? "bg-signal/15 text-signal" : "text-mist"
@@ -1018,6 +1097,7 @@ export function SocialConsole() {
                           setShowPinned(false);
                           setShowHidden(false);
                           setShowScheduled(false);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           showSaved ? "bg-signal/15 text-signal" : "text-mist"
@@ -1034,6 +1114,7 @@ export function SocialConsole() {
                           setShowPinned(true);
                           setShowHidden(false);
                           setShowScheduled(false);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           showPinned ? "bg-signal/15 text-signal" : "text-mist"
@@ -1050,6 +1131,7 @@ export function SocialConsole() {
                           setShowPinned(false);
                           setShowHidden(true);
                           setShowScheduled(false);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           showHidden ? "bg-signal/15 text-signal" : "text-mist"
@@ -1066,6 +1148,7 @@ export function SocialConsole() {
                           setShowPinned(false);
                           setShowHidden(false);
                           setShowScheduled(true);
+                          void tan.setTagFilter(null);
                         }}
                         className={`rounded px-2 py-1 ${
                           showScheduled ? "bg-signal/15 text-signal" : "text-mist"
@@ -1074,6 +1157,7 @@ export function SocialConsole() {
                         scheduled
                       </button>
                     </div>
+                    </>
                     )}
                   </>
                 )}
@@ -1115,6 +1199,7 @@ export function SocialConsole() {
                     onDelete={submitDelete}
                     onHide={submitHide}
                     onOpenThread={(target) => void tan.openThread(target.hash)}
+                    onTag={submitTagFilter}
                     deleting={deleting}
                   />
                 ) : showPinned && !showingSearch ? (
@@ -1144,6 +1229,7 @@ export function SocialConsole() {
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
                           deleting={deleting.has(post.hash)}
+                          onTag={submitTagFilter}
                           onOpenThread={(target) => void tan.openThread(target.hash)}
                         />
                       ))}
@@ -1205,6 +1291,7 @@ export function SocialConsole() {
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
                           deleting={deleting.has(post.hash)}
+                          onTag={submitTagFilter}
                         />
                       ))}
                       {tan.savedHasMore ? (
@@ -1244,6 +1331,7 @@ export function SocialConsole() {
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
                           deleting={deleting.has(post.hash)}
+                          onTag={submitTagFilter}
                         />
                       ))}
                       {tan.hiddenHasMore ? (
@@ -1280,6 +1368,7 @@ export function SocialConsole() {
                         onReply={(target) => setReplyTarget(target)}
                         onDelete={submitDelete}
                         deleting={deleting.has(post.hash)}
+                        onTag={submitTagFilter}
                         onOpenThread={(target) => void tan.openThread(target.hash)}
                       />
                     ))
@@ -1322,6 +1411,7 @@ export function SocialConsole() {
                       onDelete={submitDelete}
                       onEdit={submitEdit}
                       deleting={deleting.has(post.hash)}
+                      onTag={submitTagFilter}
                       onMute={submitMute}
                       muting={muting.has(post.author)}
                       onOpenThread={(target) => void tan.openThread(target.hash)}
@@ -1678,6 +1768,7 @@ function ThreadView({
   onDelete,
   onHide,
   onOpenThread,
+  onTag,
   deleting,
 }: {
   posts: TanPost[] | null;
@@ -1689,6 +1780,7 @@ function ThreadView({
   onDelete: (post: TanPost) => void;
   onHide: (post: TanPost) => void;
   onOpenThread: (post: TanPost) => void;
+  onTag?: (tag: string) => void;
   deleting: ReadonlySet<string>;
 }) {
   // Entries are already in depth-first order with their depth, so the
@@ -1714,6 +1806,7 @@ function ThreadView({
             onHide={onHide}
             deleting={deleting.has(post.hash)}
             onOpenThread={onOpenThread}
+            onTag={onTag}
           />
         ))}
       </>
@@ -1892,6 +1985,62 @@ function canRepost(post: TanPost): boolean {
   );
 }
 
+// Hashtags in post text, rendered as buttons that filter the timeline
+// to the tag. The pattern mirrors the store's tag extraction: a `#`
+// not preceded by a word character, a letter first, then letters,
+// digits, underscores or hyphens, with trailing hyphens stripped —
+// so `#mesh-` reads as `mesh`, the way the store counts it. The
+// stripped hyphens are kept as plain text, so the rendered text is
+// exactly the post's text. The filter value is normalised the way the
+// server normalises it, so `#Mesh` filters as `mesh` and matches the
+// sidebar; a candidate the server would reject (its casefolded form
+// no longer reads as one tag, such as `#İstanbul`) stays plain text
+// instead of a button that would only fetch a 400. Without an `onTag`
+// the text renders unchanged, as before.
+const TAG_PATTERN = /(?<![\p{L}\p{N}_])#([\p{L}][\p{L}\p{N}_-]*)/gu;
+const WHOLE_TAG_PATTERN = /^[\p{L}][\p{L}\p{N}_-]*$/u;
+
+function PostText({
+  text,
+  onTag,
+}: {
+  text: string;
+  onTag?: (tag: string) => void;
+}) {
+  if (!onTag) return <>{text}</>;
+  const parts: ReactNode[] = [];
+  let lastIndex = 0;
+  for (const match of text.matchAll(TAG_PATTERN)) {
+    const index = match.index ?? 0;
+    if (index > lastIndex) parts.push(text.slice(lastIndex, index));
+    const tag = match[1].replace(/-+$/, "");
+    const normalized = tag.toLowerCase();
+    if (WHOLE_TAG_PATTERN.test(normalized)) {
+      parts.push(
+        <button
+          key={`${index}-${tag}`}
+          type="button"
+          onClick={() => onTag(normalized)}
+          title={`show #${normalized} posts`}
+          className="text-signal transition hover:underline"
+        >
+          #{tag}
+        </button>,
+      );
+      // Trailing hyphens are not part of the tag; keep them as text.
+      if (match[1].length > tag.length) {
+        parts.push(match[1].slice(tag.length));
+      }
+    } else {
+      // Not a tag once normalised: keep the original text as-is.
+      parts.push(match[0]);
+    }
+    lastIndex = index + match[0].length;
+  }
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  return <>{parts}</>;
+}
+
 export function VerifyResult({ report }: { report: TanVerifyReport }) {
   if (report.ok) {
     return (
@@ -1951,6 +2100,7 @@ export function PostCard({
   onMute,
   muting,
   onOpenThread,
+  onTag,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
@@ -1981,6 +2131,9 @@ export function PostCard({
   onMute?: (post: TanPost) => void;
   muting?: boolean;
   onOpenThread?: (post: TanPost) => void;
+  // Optional like onQuote/onMute: views that do not wire tag filtering
+  // render the card with plain post text, as before.
+  onTag?: (tag: string) => void;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
@@ -2129,7 +2282,7 @@ export function PostCard({
             </p>
           ) : bodyText ? (
             <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
-              {bodyText}
+              <PostText text={bodyText} onTag={onTag} />
             </p>
           ) : null}
           {post.kind === "quote" ? (

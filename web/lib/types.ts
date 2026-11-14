@@ -659,6 +659,16 @@ export interface MessagesSearchResponse {
   count: number;
 }
 
+export interface TanTag {
+  tag: string;
+  count: number;
+}
+
+export interface TanTagsResponse {
+  tags: TanTag[];
+  count: number;
+}
+
 export interface TanTimelineResponse {
   posts: TanPost[];
   count: number;
