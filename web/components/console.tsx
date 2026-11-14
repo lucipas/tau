@@ -284,9 +284,6 @@ export function Console() {
                 }
               }}
             />
-            {/* Stays mounted when the queue empties so a retry's result
-                line survives the last entry leaving; it renders nothing
-                itself when there is nothing to show. */}
             <div className="mt-4">
               <DmRequestsSection
                 requests={tau.dmRequests}
@@ -294,6 +291,9 @@ export function Console() {
                 onDecline={tau.declineDmRequest}
               />
             </div>
+            {/* Stays mounted when the queue empties so a retry's result
+                line survives the last entry leaving; it renders nothing
+                itself when there is nothing to show. */}
             <div className="mt-4">
               <OutboxSection
                 entries={tau.outbox}
