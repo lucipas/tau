@@ -1074,13 +1074,11 @@ export function SocialConsole() {
                         onClick={() => {
                           // Tapping Top while it is already selected must
                           // refresh the feed: setView is a no-op then, and
-                          // Top does not poll.
+                          // Top does not poll. Shelf views are component
+                          // state the feed effect does not watch, so
+                          // leaving one from Top needs the same refresh.
                           const alreadyTop =
                             tan.view === "top" &&
-                            !showSaved &&
-                            !showPinned &&
-                            !showHidden &&
-                            !showScheduled &&
                             !tan.showMentions &&
                             tan.tagFilter === null;
                           setShowSaved(false);
