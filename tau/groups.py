@@ -255,6 +255,11 @@ class GroupStore:
         self._retired: List[str] = []
         self._retired_groups: Dict[str, Dict[str, Any]] = {}
         self._left: List[Dict[str, Any]] = []
+        # Retired group id -> its creator, for verifying rename
+        # lineage after the retired record itself is evicted (see
+        # :meth:`lineage`).  One small entry per retirement; it is
+        # never capped, unlike the full retired records.
+        self._lineage_creators: Dict[str, str] = {}
         self._load()
 
     def _load(self) -> None:
@@ -321,6 +326,23 @@ class GroupStore:
                 if entry_id not in seen:
                     seen.add(entry_id)
                     self._left.append({"id": entry_id, "left_at": float(left_at)})
+        creators = raw.get("lineage_creators")
+        self._lineage_creators = {}
+        if isinstance(creators, dict):
+            for group_id, creator in creators.items():
+                if (
+                    not isinstance(group_id, str)
+                    or len(group_id) != 32
+                    or not isinstance(creator, str)
+                    or len(creator) != 32
+                ):
+                    continue
+                try:
+                    bytes.fromhex(group_id)
+                    bytes.fromhex(creator)
+                except ValueError:
+                    continue
+                self._lineage_creators[group_id.lower()] = creator.lower()
 
     def _save(self) -> None:
         """Persist the store; raises :class:`OSError` when the write fails."""
@@ -333,13 +355,14 @@ class GroupStore:
                 "retired": self._retired,
                 "retired_groups": list(self._retired_groups.values()),
                 "left": self._left,
+                "lineage_creators": self._lineage_creators,
             },
             mode=0o600,
         )
 
     def _snapshot(
         self,
-    ) -> "tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Dict[str, Any]], List[Dict[str, Any]]]":
+    ) -> "tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Dict[str, Any]], List[Dict[str, Any]], Dict[str, str]]":
         """In-memory state before a mutation, for rollback on a failed save.
 
         A shallow copy is enough: mutations replace whole records, they
@@ -350,11 +373,12 @@ class GroupStore:
             list(self._retired),
             dict(self._retired_groups),
             list(self._left),
+            dict(self._lineage_creators),
         )
 
     def _restore(
         self,
-        snapshot: "tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Dict[str, Any]], List[Dict[str, Any]]]",
+        snapshot: "tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Dict[str, Any]], List[Dict[str, Any]], Dict[str, str]]",
     ) -> None:
         """Restore the state captured by :meth:`_snapshot`.
 
@@ -363,11 +387,12 @@ class GroupStore:
         state in place, so a group whose first write failed would stay
         visible until restart.
         """
-        groups, retired, retired_groups, left = snapshot
+        groups, retired, retired_groups, left, lineage_creators = snapshot
         self._groups = dict(groups)
         self._retired = list(retired)
         self._retired_groups = dict(retired_groups)
         self._left = list(left)
+        self._lineage_creators = dict(lineage_creators)
 
     def _retire(self, group: Dict[str, Any]) -> None:
         """Remember a replaced group's roster for retracts of its messages.
@@ -389,6 +414,11 @@ class GroupStore:
                 for old_id in dropped:
                     self._retired_groups.pop(old_id, None)
         self._retired_groups[group_id] = dict(group)
+        # Keep the creator evidence even after the record itself is
+        # evicted: lineage verification (see :meth:`lineage`) needs
+        # it long after the roster is forgotten.
+        if group.get("creator"):
+            self._lineage_creators[group_id] = group["creator"]
 
     def _unretire(self, group_id: str) -> None:
         """Lift a retirement: the id is live again, so its retained record goes too.
@@ -1220,17 +1250,22 @@ class GroupStore:
     def lineage(self, group_id: str) -> List[str]:
         """This group's id plus its verified rename predecessors.
 
-        A predecessor counts only when this store holds a live or
-        retired record for it whose creator matches this group's
-        creator.  A claimed id with no record, or one created by
-        someone else, is dropped: a creator cannot borrow another
-        group's history by naming its id in a message's lineage, and
-        a read, pin, or badge scoped to the lineage must never touch
-        that other group's mail.  Reloads from disk first, so a
-        rename in another process is seen.  An unknown id has no
-        lineage: it stands alone.  A group with no creator on record
-        keeps no predecessors either — there is nothing to verify
-        them against.
+        A predecessor counts only when its creator can be verified
+        against this group's creator: from its live record, its
+        retained retired record, or the creator evidence kept when
+        it was retired (see :meth:`_retire`), which survives the
+        retirement cap evicting the record itself.  A claimed id
+        with no surviving evidence is dropped — including a
+        predecessor from a store written before that evidence was
+        kept, whose posts stay visible in unfiltered listings and
+        search but no longer join the successor's scoped views.
+        A creator cannot borrow another group's history by naming
+        its id in a message's lineage, and a read, pin, or badge
+        scoped to the lineage never touches that other group's mail.
+        Reloads from disk first, so a rename in another process is
+        seen.  An unknown id has no lineage: it stands alone.  A
+        group with no creator on record keeps no predecessors
+        either — there is nothing to verify them against.
         """
         with self._transaction():
             found = self._groups.get(str(group_id).lower())
@@ -1244,9 +1279,12 @@ class GroupStore:
                 pred = self._groups.get(str(pred_id).lower())
                 if pred is None:
                     pred = self._retired_groups.get(str(pred_id).lower())
-                if pred is None or (pred.get("creator") or "") != creator:
+                if pred is not None:
+                    if (pred.get("creator") or "") != creator:
+                        continue
+                elif self._lineage_creators.get(str(pred_id).lower()) != creator:
                     continue
-                ids.append(pred["id"])
+                ids.append(pred["id"] if pred is not None else str(pred_id).lower())
             return ids
 
     def find(self, query: str) -> Optional[Dict[str, Any]]:
