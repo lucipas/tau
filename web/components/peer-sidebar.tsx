@@ -842,7 +842,12 @@ export function PeerSidebar({
                 ? Math.max(0, now / 1000 - peer.last_seen)
                 : peer.age;
               const isSelected = peer.destination === selected;
-              const unreadCount = unread[peer.destination] ?? 0;
+              // A muted peer's row never shows a badge: its per-peer count
+              // can hold posts from unmuted groups, which belong to the
+              // group and still count in the total.
+              const unreadCount = muted.peers.includes(peer.destination)
+                ? 0
+                : (unread[peer.destination] ?? 0);
               const displayName = peer.alias || peer.name || "unknown";
               const isEditingAlias = editingAlias === peer.destination;
               const armingBlock = confirmBlock === peer.destination;
