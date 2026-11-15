@@ -6516,6 +6516,11 @@ class WebBridge:
             # counts, even when it names this node.
             "created_by_me": bool(group.get("local"))
             and group.get("creator") == self.node.destination_hexhash,
+            # Only a member can leave: a group this node created —
+            # under this identity or an earlier one — uses delete
+            # instead, so the sidebar never offers a leave the bridge
+            # would refuse.
+            "can_leave": not bool(group.get("local")),
             # Ignored groups stay listed but muted: the flag rides on
             # the description so the sidebar can show it without a
             # second round-trip.
@@ -6875,7 +6880,11 @@ class WebBridge:
         return {"group": self._describe_group(updated, ignored)}
 
     def messages(
-        self, limit: int = 200, *, strict_pins: bool = False
+        self,
+        limit: int = 200,
+        *,
+        strict_pins: bool = False,
+        include_ignored: bool = False,
     ) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
         # Drop disappearing messages whose deadline has passed while the
@@ -6927,6 +6936,22 @@ class WebBridge:
                 or (item.get("peer") or item.get("destination") or "")
                 not in archived
             ]
+        # Ignored groups stay stored but are hidden from the default
+        # listing, like the CLI's `tau messages`: the console feed is
+        # the default listing, so an ignored group's posts — inbound
+        # and outbound legs alike — stay out of it until unignored.
+        # A search is an explicit lookup and still finds them, so it
+        # calls with include_ignored=True.
+        if not include_ignored:
+            ignored = load_ignored_group_ids(
+                getattr(self.node.config, "ignored_groups_path", None)
+            )
+            if ignored:
+                items = [
+                    item
+                    for item in items
+                    if str(item.get("group") or "") not in ignored
+                ]
         # Hidden entries must not use up the window: slice only after
         # the blocklist and archive filters have run.
         if limit >= 0:
@@ -7052,7 +7077,10 @@ class WebBridge:
         if not isinstance(query, str) or not query.strip():
             raise RequestError("search text must not be empty")
         needle = query.strip().casefold()
-        items = self.messages(limit=-1)
+        # A search is an explicit lookup, so it still finds ignored
+        # groups' posts — the same stored history the traffic view
+        # shows, minus the default listing's ignore filter.
+        items = self.messages(limit=-1, include_ignored=True)
         if peer is not None and peer.strip():
             target = peer.strip().casefold()
             items = [
@@ -7229,7 +7257,9 @@ class WebBridge:
         unread; read state is local to this node either way.  An
         archived conversation never lights the badge, so its direct
         messages are excluded at the source — but the sender's group
-        posts still count, since the group thread stays visible.
+        posts still count, since the group thread stays visible.  An
+        ignored group's posts never light a badge either, so they are
+        excluded too; the members' direct messages still count.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
@@ -7237,7 +7267,14 @@ class WebBridge:
             if inbox is not None:
                 try:
                     counts = inbox.unread_counts(
-                        exclude_dm_from=self._archived_set()
+                        exclude_dm_from=self._archived_set(),
+                        exclude_group=load_ignored_group_ids(
+                            getattr(
+                                self.node.config,
+                                "ignored_groups_path",
+                                None,
+                            )
+                        ),
                     )
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)
@@ -7255,7 +7292,13 @@ class WebBridge:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
                 counts = inbox.mark_read(
-                    peer=peer, exclude_dm_from=self._archived_set()
+                    peer=peer,
+                    exclude_dm_from=self._archived_set(),
+                    exclude_group=load_ignored_group_ids(
+                        getattr(
+                            self.node.config, "ignored_groups_path", None
+                        )
+                    ),
                 )
             stamped = self._stamp_unread(counts)
         if inbox is not None:
@@ -8311,6 +8354,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     unignored = self.bridge.unignore_group(target.strip())
+                except IgnoredGroupsError as exc:
+                    # Stored ignore data is damaged: the request was
+                    # valid, so this is a server failure, not a 400.
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 500)
+                    return
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return

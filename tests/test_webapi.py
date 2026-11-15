@@ -2588,6 +2588,140 @@ def test_ignored_id_for_query_matches_full_id_and_unique_prefix():
         _ignored_id_for_query(ignored, "abcd")
 
 
+def test_api_groups_leave_and_ignore_flag_in_group_list(
+    bridge, node, tmp_path
+):
+    _learned_group(node, tmp_path)
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["ignored"] is False
+    # A learned group can be left; a group this node created cannot.
+    assert listed["groups"][0]["can_leave"] is True
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "mine", "members": [PEER_HASH]},
+    )
+    _, _, listed = _json(bridge, "/api/groups")
+    mine = [g for g in listed["groups"] if g["name"] == "mine"][0]
+    assert mine["created_by_me"] is True
+    assert mine["can_leave"] is False
+
+
+def test_api_messages_hide_ignored_group_posts(bridge, node, tmp_path):
+    group_id = _learned_group(node, tmp_path)
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "crew chat",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "kind": "group",
+            "group": group_id,
+            "group_name": "weekend",
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "plain dm",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == [
+        "crew chat",
+        "plain dm",
+    ]
+
+    _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["plain dm"]
+    # A search is an explicit lookup: it still finds the ignored
+    # group's posts, like the CLI's `tau messages --search`.
+    _, _, found = _json(bridge, "/api/messages/search?q=crew")
+    assert [m["text"] for m in found["messages"]] == ["crew chat"]
+
+    _json(
+        bridge,
+        "/api/groups/unignore",
+        method="POST",
+        body={"group": "weekend"},
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == [
+        "crew chat",
+        "plain dm",
+    ]
+
+
+def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
+    group_id = _learned_group(node, tmp_path)
+    _inbound_record(
+        node,
+        id="dm-1",
+        destination=PEER_HASH,
+        text="plain dm",
+        sent_at=100.0,
+        received_at=101.0,
+    )
+    _inbound_record(
+        node,
+        id="group-1",
+        destination=PEER_HASH,
+        text="crew chat",
+        sent_at=102.0,
+        received_at=103.0,
+        kind="group",
+        group=group_id,
+        group_name="weekend",
+    )
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {PEER_HASH: 2},
+        "total": 2,
+    }
+
+    _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "total": 1,
+    }
+
+    _json(
+        bridge,
+        "/api/groups/unignore",
+        method="POST",
+        body={"group": "weekend"},
+    )
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {PEER_HASH: 2},
+        "total": 2,
+    }
+
+
+def test_api_groups_ignore_with_corrupt_list_is_500(bridge, node, tmp_path):
+    _learned_group(node, tmp_path)
+    (tmp_path / "ignored-groups.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    for path in ("/api/groups/ignore", "/api/groups/unignore"):
+        status, _, payload = _json(
+            bridge, path, method="POST", body={"group": "weekend"}
+        )
+        assert status == 500
+        assert "ignored-groups" in payload["error"]["message"]
+
+
 def _inbound_record(node, **overrides):
     """A received DM, appended to the node inbox first — the order the
     node itself uses before it hands the record to the bridge."""

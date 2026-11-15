@@ -1371,6 +1371,39 @@ def test_unread_counts_exclude_dm_from_keeps_group_posts(tmp_path):
     ) == {"per_peer": {"aa" * 16: 1}, "total": 1}
 
 
+def test_unread_counts_exclude_group_hides_its_posts_only(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="dm-1", destination="aa" * 16, received_at=1.0))
+    inbox.append(
+        _record(
+            id="group-1",
+            destination="aa" * 16,
+            received_at=2.0,
+            kind="group",
+            group="11" * 16,
+            group_name="crew",
+        )
+    )
+    inbox.append(_record(id="dm-2", destination="bb" * 16, received_at=3.0))
+
+    # Without the exclusion, the sender's DM and group post count
+    # together under the same destination.
+    assert inbox.unread_counts() == {
+        "per_peer": {"aa" * 16: 2, "bb" * 16: 1},
+        "total": 3,
+    }
+    # Excluding the group hides only its post: the sender's DM still
+    # counts, and the other sender is untouched.
+    assert inbox.unread_counts(exclude_group={"11" * 16}) == {
+        "per_peer": {"aa" * 16: 1, "bb" * 16: 1},
+        "total": 2,
+    }
+    # mark_read reports the same filtered counts after the mark.
+    assert inbox.mark_read(
+        peer="bb" * 16, exclude_group={"11" * 16}
+    ) == {"per_peer": {"aa" * 16: 1}, "total": 1}
+
+
 def test_mark_read_advances_only_to_up_to(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", received_at=1.0))
