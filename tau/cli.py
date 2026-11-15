@@ -66,6 +66,16 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .muted import (
+    MutedError,
+    expand_muted_groups,
+    group_lineage,
+    load_muted,
+    muted_groups_for,
+    muted_lock,
+    muted_peers_for,
+    save_muted,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request,
@@ -91,7 +101,7 @@ from .ignored_groups import (
     load_ignored_groups,
     save_ignored_groups,
 )
-from .inbox import Inbox, InboxError
+from .inbox import Inbox, InboxError, _conversation_key
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
 from .node import (
@@ -1135,6 +1145,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     disappearing.set_defaults(func=cmd_disappearing)
 
+    mute = subparsers.add_parser(
+        "mute",
+        parents=[common],
+        help="mute or unmute a conversation so it never lights the unread badge",
+    )
+    mute_target = mute.add_mutually_exclusive_group(required=False)
+    mute_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    mute_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    mute.add_argument(
+        "--off",
+        action="store_true",
+        help="unmute this conversation instead",
+    )
+    mute.set_defaults(func=cmd_mute)
+
     archived = subparsers.add_parser(
         "archived",
         parents=[common],
@@ -1225,7 +1258,15 @@ def build_parser() -> argparse.ArgumentParser:
     messages_unread.add_argument(
         "peer",
         metavar="PEER",
+        nargs="?",
+        default=None,
         help="peer name, destination hash or hash prefix",
+    )
+    messages_unread.add_argument(
+        "--group",
+        default=None,
+        metavar="ID|NAME",
+        help="mark a group's posts unread instead of a peer's",
     )
     messages_unread.add_argument(
         "--all",
@@ -7473,38 +7514,93 @@ def cmd_messages(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
+    # A corrupt mutes file fails open here: the conversations count
+    # as unmuted (with a warning), never breaking the listing.
+    muted_peers = muted_peers_for(config.muted_path)
+    muted_groups = expand_muted_groups(
+        muted_groups_for(config.muted_path),
+        GroupStore(config.groups_path).list_groups(),
+    )
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
     group_id = None
     group_ids = None
     if getattr(args, "group", None):
-        group = GroupStore(config.groups_path).find(args.group)
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
         group_id = group["id"]
         # History spans renames: messages stored under a predecessor
-        # id still belong to this group.
-        group_ids = [group["id"], *(group.get("renamed_from") or [])]
+        # id still belong to this group.  The store only keeps
+        # predecessors whose record shares this group's creator.
+        group_ids = store.lineage(group["id"])
     if getattr(args, "count", False):
         # A count is for scripting: it never advances the read cursor.
-        counts = inbox.unread_counts()
+        # Muted conversations never count, so the badge and the
+        # scripting count agree.
+        counts = inbox.unread_counts(
+            exclude_dm_from=muted_peers,
+            exclude_group=muted_groups,
+        )
         per_peer = counts["per_peer"]
-        if peer_hash is not None:
+        per_group = counts["per_group"]
+        if peer_hash is not None and group_ids is not None:
+            # Both filters list the group posts this sender made in the
+            # group, so count that intersection as the listing shows
+            # it: blocked senders' posts are hidden from the listing,
+            # so they never count.  An unreadable block-list hides
+            # everything, exactly as the listing does.
+            blocked = load_blocked_set(config.blocklist_path)
+            if blocked is None:
+                here = 0
+            else:
+                here = sum(
+                    1
+                    for entry in inbox.list_messages(peer=peer_hash, group=group_ids)
+                    if entry.get("unread")
+                    and entry.get("destination") not in blocked
+                )
+            per_peer = {}
+            per_group = {group_id: here} if here else {}
+        elif peer_hash is not None:
+            # A peer filter is a DM filter: group posts are not that
+            # conversation's mail.
             per_peer = {
                 destination: count
                 for destination, count in per_peer.items()
                 if destination == peer_hash
             }
-        total = sum(per_peer.values())
+            per_group = {}
+        elif group_ids is not None:
+            # A renamed group's history spans its lineage: fold the
+            # predecessors' counts into the current id's line.
+            here = sum(per_group.get(gid, 0) for gid in group_ids)
+            per_group = {group_id: here} if here else {}
+            per_peer = {}
+        total = sum(per_peer.values()) + sum(per_group.values())
         if _json_mode(args):
-            _emit({"unread": per_peer, "total": total}, True)
+            _emit(
+                {"unread": per_peer, "unread_groups": per_group, "total": total},
+                True,
+            )
             return _EXIT_OK
-        if not per_peer:
+        if not per_peer and not per_group:
             print("No unread messages.")
             return _EXIT_OK
         for destination, count in sorted(per_peer.items()):
             peer = registry.get(destination)
             name = peer.display_name if peer is not None else "unknown"
             print(f"{name} ({short_hash(destination)}): {count} unread")
+        groups = GroupStore(config.groups_path)
+        for group, count in sorted(per_group.items()):
+            # A group can be gone while its posts stay stored: fall
+            # back to a bare label instead of failing the count.
+            try:
+                found = groups.find(group)
+            except ValueError:
+                found = None
+            name = found["name"] if found else "group"
+            print(f"{name} ({short_hash(group)}): {count} unread")
         print(f"Total: {total} unread")
         return _EXIT_OK
     limit = getattr(args, "limit", 30)
@@ -7539,7 +7635,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
         # listing; say so instead of showing an empty list.
         peer = registry.get(peer_hash)
         name = peer.display_name if peer is not None else "unknown"
-        unread = inbox.unread_counts()["per_peer"].get(peer_hash, 0)
+        unread = inbox.unread_counts(
+            exclude_dm_from=muted_peers,
+            exclude_group=muted_groups,
+        )["per_peer"].get(peer_hash, 0)
         if _json_mode(args):
             _emit(
                 {
@@ -7566,7 +7665,13 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # that cannot be read hides everything, matching the node, which
     # blocks all senders on the same condition.
     entries = inbox.list_messages(
-        limit=None, peer=peer_hash, group=group_ids, query=query, kind=kind
+        limit=None,
+        peer=peer_hash,
+        group=group_ids,
+        query=query,
+        kind=kind,
+        exclude_dm_from=muted_peers,
+        exclude_group=muted_groups,
     )
     # A stored reaction from a non-member must never be displayed on
     # a group message, even when the authorization recheck or its
@@ -7710,48 +7815,50 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # out — otherwise an older unread message that did not match would
     # silently lose its unread state.
     if query is None:
+        # Read cursors are per-conversation, so a DM and a group post
+        # from the same sender advance independently — but a listing
+        # that only shows part of one conversation must still not
+        # advance past mail it did not show.  Track the newest shown
+        # sequence per conversation, skipping a conversation entirely
+        # when the limit cut off one of its unread messages.
         partially_listed = {
-            str(entry.get("destination") or "")
-            for entry in omitted
-            if entry.get("unread")
+            _conversation_key(entry) for entry in omitted if entry.get("unread")
         }
         newest_shown: Dict[str, int] = {}
         for entry in shown:
-            destination = str(entry.get("destination") or "")
-            if destination in partially_listed:
+            key = _conversation_key(entry)
+            if key in partially_listed:
                 continue
-            newest_shown[destination] = max(
-                newest_shown.get(destination, 0), int(entry["seq"])
-            )
-        # A read cursor is per-sender, shared by DMs and group posts,
-        # A read cursor is per-sender, shared by DMs and group posts,
-        # so showing a DM would otherwise mark an older hidden group
-        # post read, and showing a group post would otherwise mark an
-        # older hidden DM read, without the owner ever seeing it.  Cap
-        # each destination's advance just before its oldest unread
-        # message that this listing did not show — ignored-group mail,
-        # archived mail, or mail a filtered view (group, --ignored,
-        # --archived) left out.  The capped
-        # message stays unread until the owner displays it; the next
-        # listing that does advances past it.
+            newest_shown[key] = max(newest_shown.get(key, 0), int(entry["seq"]))
+        # Cap each conversation's advance just before its oldest
+        # unread message that this listing did not show — ignored-group
+        # mail, archived mail, or mail a filtered view (group,
+        # --ignored, --archived) left out.  The capped message stays
+        # unread until the owner displays it; the next listing that
+        # does advances past it.
         shown_seqs = {int(entry["seq"]) for entry in shown}
         hidden_floor: Dict[str, int] = {}
         for entry in inbox.list_messages(limit=None):
-            destination = str(entry.get("destination") or "")
-            if destination not in newest_shown:
+            key = _conversation_key(entry)
+            if key not in newest_shown:
                 continue
             if not entry.get("unread"):
                 continue
             if int(entry["seq"]) in shown_seqs:
                 continue
             seq = int(entry["seq"])
-            if destination not in hidden_floor or seq < hidden_floor[destination]:
-                hidden_floor[destination] = seq
-        for destination, up_to_seq in newest_shown.items():
-            floor = hidden_floor.get(destination)
+            if key not in hidden_floor or seq < hidden_floor[key]:
+                hidden_floor[key] = seq
+        for key, up_to_seq in newest_shown.items():
+            floor = hidden_floor.get(key)
             if floor is not None:
                 up_to_seq = min(up_to_seq, floor - 1)
-            inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
+            if key.startswith("group:"):
+                inbox.mark_read(group=key[len("group:"):], up_to_seq=up_to_seq)
+            else:
+                inbox.mark_read(
+                    peer=key[len("dm:"):], up_to_seq=up_to_seq
+                )
         # Listing a DM is reading it: send the sender a receipt, unless
         # this node opted out.  Best-effort — failures stay silent.
         outcome = _send_displayed_receipts(config, inbox, shown)
@@ -7795,6 +7902,29 @@ def cmd_messages_unread(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
+    if getattr(args, "group", None):
+        if getattr(args, "peer", None):
+            raise NodeError("pass a peer or --group, not both")
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
+        # History spans renames: the mark covers the current id and
+        # every predecessor, like the --group listing does.
+        group_ids = _group_ids_spanning_renames(store, group)
+        counts = inbox.mark_unread(group=group_ids, all=getattr(args, "all", False))
+        if counts is None:
+            raise NodeError(f"no stored messages in group {args.group!r}")
+        unread = sum(counts["per_group"].get(gid, 0) for gid in group_ids)
+        noun = "message" if unread == 1 else "messages"
+        if _json_mode(args):
+            _emit(
+                {"group": group["id"], "unread": unread, "total": counts["total"]},
+                True,
+            )
+        else:
+            print(f"marked {unread} {noun} in group {group['name']} unread")
+        return _EXIT_OK
+    if not getattr(args, "peer", None):
+        raise NodeError("pass a peer or --group")
     peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
     counts = inbox.mark_unread(peer_hash, all=getattr(args, "all", False))
     if counts is None:
@@ -8320,6 +8450,106 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_mute(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    if getattr(args, "off", False) and args.peer is None and args.group is None:
+        print("error: --off needs a --peer or --group to unmute", file=sys.stderr)
+        return _EXIT_ERROR
+    if args.peer is None and args.group is None:
+        # No target lists what is muted, mirroring `tau archived`.
+        muted = load_muted(config.muted_path)
+        if _json_mode(args):
+            _emit(
+                {
+                    "peers": sorted(muted.peers),
+                    "groups": sorted(muted.groups),
+                },
+                True,
+            )
+            return _EXIT_OK
+        registry = PeerRegistry(config.peers_path)
+        store = GroupStore(config.groups_path)
+        if not muted.peers and not muted.groups:
+            print("No muted conversations.")
+            return _EXIT_OK
+        for destination in sorted(muted.peers):
+            peer = registry.get(destination)
+            name = peer.display_name if peer is not None else "unknown"
+            print(f"{name} ({short_hash(destination)})")
+        for group_id in sorted(muted.groups):
+            try:
+                group = store.find(group_id)
+                label = f"group {group['name']} ({short_hash(group_id)})"
+            except (ValueError, KeyError):
+                label = f"group {short_hash(group_id)}"
+            print(label)
+        return _EXIT_OK
+    if args.group is not None:
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
+        key = group["id"]
+        # The whole rename lineage moves together, like the bridge.
+        lineage = group_lineage(group)
+        label = f"group {group['name']} ({short_hash(key)})"
+        is_group = True
+    else:
+        inbox = Inbox(config.inbox_path)
+        registry = PeerRegistry(config.peers_path)
+        key = _resolve_inbox_peer(inbox, registry, args.peer)
+        peer = registry.get(key)
+        name = peer.display_name if peer is not None else "unknown"
+        label = f"conversation with {name} ({short_hash(key)})"
+        is_group = False
+    # Reload inside the lock: two mute commands racing must not
+    # discard each other's change to a different conversation.
+    with muted_lock(config.muted_path):
+        try:
+            muted = load_muted(config.muted_path)
+        except MutedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        if is_group:
+            previous = muted.is_muted_group_lineage(lineage)
+            if getattr(args, "off", False):
+                muted = muted.without_group_lineage(lineage)
+            else:
+                muted = muted.with_group_lineage(lineage)
+        else:
+            previous = muted.is_muted_peer(key)
+            if getattr(args, "off", False):
+                muted = muted.without_peer(key)
+            else:
+                muted = muted.with_peer(key)
+        changed = previous != (not getattr(args, "off", False))
+        if changed:
+            save_muted(config.muted_path, muted)
+    current = not getattr(args, "off", False)
+    if _json_mode(args):
+        _emit(
+            {
+                "target": key,
+                "group": is_group,
+                "muted": current,
+                "changed": changed,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if getattr(args, "off", False):
+        if previous:
+            print(f"Unmuted {label}: its messages count as unread again.")
+        else:
+            print(f"{label} was not muted.")
+    elif previous:
+        print(f"{label} is already muted.")
+    else:
+        print(
+            f"Muted {label}: its messages still arrive, but never light "
+            "the unread badge."
+        )
+    return _EXIT_OK
+
+
 def cmd_archived(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -8723,15 +8953,27 @@ def cmd_group_ignored(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _group_ids_spanning_renames(group: Dict[str, Any]) -> List[str]:
-    """This group's id plus its rename predecessors, for history lookups."""
-    return [group["id"], *(group.get("renamed_from") or [])]
+def _group_ids_spanning_renames(
+    store: "GroupStore", group: Dict[str, Any]
+) -> List[str]:
+    """This group's id plus its verified rename predecessors, for history lookups.
+
+    The store only keeps a predecessor whose live or retired record
+    shares this group's creator, so a claimed id from another creator
+    never widens the lookup.  A store read that fails leaves the group
+    standing alone rather than trusting the raw claim.
+    """
+    try:
+        return store.lineage(group["id"])
+    except Exception:  # pragma: no cover - defensive
+        return [group["id"]]
 
 
 def cmd_group_pin(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    group = GroupStore(config.groups_path).find(args.group)
-    group_ids = _group_ids_spanning_renames(group)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    group_ids = _group_ids_spanning_renames(store, group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     entry = _resolve_group_pin_target(inbox, group_ids, args.message)
@@ -8762,8 +9004,9 @@ def cmd_group_pin(args: argparse.Namespace) -> int:
 
 def cmd_group_unpin(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    group = GroupStore(config.groups_path).find(args.group)
-    group_ids = _group_ids_spanning_renames(group)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    group_ids = _group_ids_spanning_renames(store, group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     entry = _resolve_group_pin_target(inbox, group_ids, args.message)
@@ -8799,8 +9042,9 @@ def cmd_group_pinned(args: argparse.Namespace) -> int:
     and the listing never advances the read cursor.
     """
     config = _make_config(args)
-    group = GroupStore(config.groups_path).find(args.group)
-    group_ids = _group_ids_spanning_renames(group)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    group_ids = _group_ids_spanning_renames(store, group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     limit = getattr(args, "limit", 30)

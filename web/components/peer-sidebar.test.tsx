@@ -9,6 +9,7 @@ import type {
   IgnoreGroupResponse,
   LeaveGroupResponse,
   LeftGroup,
+  MutedConversations,
   NodeInfo,
   Peer,
   RejoinGroupResponse,
@@ -103,6 +104,12 @@ type SidebarOptions = {
   onMarkUnread?: (destination: string) => Promise<void>;
   archived?: ArchivedConversation[];
   archivedError?: string | null;
+  muted?: MutedConversations;
+  mutedError?: string | null;
+  onSetMuted?: (
+    target: { peer?: string; group?: string },
+    muted: boolean,
+  ) => Promise<void>;
   infos?: Record<string, PeerInfoState>;
   onInfo?: (destination: string) => void;
 };
@@ -159,6 +166,8 @@ function renderSidebar(
       unread={unread}
       archived={options.archived ?? []}
       archivedError={options.archivedError ?? null}
+      muted={options.muted ?? { peers: [], groups: [] }}
+      mutedError={options.mutedError ?? null}
       selected=""
       onPing={() => {}}
       onInfo={options.onInfo ?? onInfo}
@@ -167,6 +176,7 @@ function renderSidebar(
       onUnblock={options.onUnblock ?? (() => {})}
       onArchivePeer={options.onArchivePeer ?? (async () => {})}
       onUnarchivePeer={options.onUnarchivePeer ?? (async () => {})}
+      onSetMuted={options.onSetMuted}
       onMarkUnread={options.onMarkUnread}
       onVerify={() => {}}
       onShowSafetyNumber={() => {}}
@@ -215,6 +225,63 @@ describe("PeerSidebar unread badges", () => {
     renderSidebar({ ["ab".repeat(16)]: 150 });
 
     expect(screen.getByTitle("150 unread messages").textContent).toBe("99+");
+  });
+});
+
+describe("PeerSidebar mute", () => {
+  const aliceHash = "ab".repeat(16);
+  const groupId = "11".repeat(16);
+
+  it("shows a muted tag for a muted peer, and no mute button without a handler", () => {
+    renderSidebar({}, vi.fn(), {
+      muted: { peers: [aliceHash], groups: [] },
+    });
+
+    expect(
+      screen.getByTitle(/Muted: messages still arrive/),
+    ).toBeTruthy();
+    expect(
+      screen.queryByLabelText("Mute conversation with alice"),
+    ).toBeNull();
+  });
+
+  it("mutes a peer when the mute button is clicked", async () => {
+    const onSetMuted = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), { onSetMuted });
+
+    fireEvent.click(screen.getByLabelText("Mute conversation with alice"));
+    await waitFor(() =>
+      expect(onSetMuted).toHaveBeenCalledWith({ peer: aliceHash }, true),
+    );
+  });
+
+  it("unmutes a muted peer and a muted group", async () => {
+    const onSetMuted = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), {
+      muted: { peers: [aliceHash], groups: [groupId] },
+      groups: [makeGroup()],
+      onSetMuted,
+    });
+
+    fireEvent.click(screen.getByLabelText("Unmute conversation with alice"));
+    await waitFor(() =>
+      expect(onSetMuted).toHaveBeenCalledWith({ peer: aliceHash }, false),
+    );
+    fireEvent.click(screen.getByLabelText("Unmute group weekend"));
+    await waitFor(() =>
+      expect(onSetMuted).toHaveBeenCalledWith({ group: groupId }, false),
+    );
+  });
+
+  it("shows a muted tag for a muted group", () => {
+    renderSidebar({}, vi.fn(), {
+      muted: { peers: [], groups: [groupId] },
+      groups: [makeGroup()],
+    });
+
+    expect(
+      screen.getByTitle(/Muted: messages still arrive/),
+    ).toBeTruthy();
   });
 });
 

@@ -340,9 +340,8 @@ def test_ignored_group_post_is_not_marked_read(tmp_path, capsys):
 
 
 def test_dm_view_does_not_clear_hidden_group_post_unread(tmp_path, capsys):
-    # The read cursor is per-sender, shared by DMs and group posts:
-    # showing alice's newer DM must not mark her older hidden group
-    # post read.  The cursor stops just before it.
+    # Read cursors are per-conversation: showing alice's newer DM
+    # marks it read without touching her older hidden group post.
     data_dir, _, _ = _seed_group_and_dm(tmp_path)
     cli.main(["group", "ignore", "weekend", "--data-dir", str(data_dir)])
     capsys.readouterr()
@@ -359,8 +358,8 @@ def test_dm_view_does_not_clear_hidden_group_post_unread(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ignored_unread"] == 1
 
-    # Once the group post is read via --ignored, the next default
-    # listing advances past the DM too.
+    # Reading the group post via --ignored leaves the DM as it was:
+    # it was already read by the peer listing above.
     code = cli.main(["messages", "--data-dir", str(data_dir), "--ignored"])
     assert code == 0
     assert "group hello" in capsys.readouterr().out
@@ -370,11 +369,9 @@ def test_dm_view_does_not_clear_hidden_group_post_unread(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ignored_unread"] == 0
     assert payload["count"] == 2
-    # The listing annotates read state before its own mark-read, so
-    # the DM still shows unread here; the next listing sees it read.
     # (Newest first, so the DM is the second entry.)
     dm = next(entry for entry in payload["messages"] if entry["id"] == "m-alice")
-    assert dm["unread"] is True
+    assert dm["unread"] is False
 
     code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
     assert code == 0

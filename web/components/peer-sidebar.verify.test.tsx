@@ -46,6 +46,8 @@ function renderSidebar({
       unread={{}}
       archived={[]}
       archivedError={null}
+      muted={{ peers: [], groups: [] }}
+      mutedError={null}
       selected=""
       onPing={() => {}}
       onInfo={() => {}}

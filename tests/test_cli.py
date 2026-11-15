@@ -2509,7 +2509,7 @@ def test_messages_search_does_not_mark_unmatched_unread_read(tmp_path, capsys):
     code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {"unread": {sender_hash.hex(): 2}, "total": 2}
+    assert payload == {"unread": {sender_hash.hex(): 2}, "unread_groups": {}, "total": 2}
 
 
 def test_messages_empty_and_unknown_peer(tmp_path, capsys):
@@ -3279,6 +3279,122 @@ def test_messages_unread_all_marks_whole_conversation_unread(tmp_path, capsys):
     assert payload == {"peer": sender_hash.hex(), "unread": 2, "total": 2}
 
 
+def test_messages_unread_group_scopes_to_the_group(tmp_path, capsys):
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    carol = RNS.Identity()
+    carol_hash = destination_hash(carol)
+    members = [sender_hash.hex(), carol_hash.hex()]
+    group_id = derive_group_id(sender_hash.hex(), "crew", members)
+    GroupStore(config.groups_path).record(
+        group_id, "crew", members, creator=sender_hash.hex()
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+        }
+    )
+
+    # Listing marks everything read.
+    assert cli.main(["messages", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "messages",
+            "unread",
+            "--group",
+            "crew",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert "marked 1 message in group crew unread" in capsys.readouterr().out
+
+    # Only the group post is unread again; the DMs stay read.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["text"] == "group hello"
+
+
+def test_messages_unread_group_covers_rename_lineage(tmp_path, capsys):
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    carol = RNS.Identity()
+    carol_hash = destination_hash(carol)
+    dave = RNS.Identity()
+    dave_hash = destination_hash(dave)
+    members = [sender_hash.hex(), carol_hash.hex()]
+    old_id = derive_group_id(sender_hash.hex(), "crew", members)
+    groups = GroupStore(config.groups_path)
+    groups.record(old_id, "crew", members, creator=sender_hash.hex())
+    # A successor under the same name, carried by the creator so it
+    # supersedes the predecessor, with the old id in its lineage.
+    new_members = members + [dave_hash.hex()]
+    new_id = derive_group_id(sender_hash.hex(), "crew", new_members)
+    groups.record(
+        new_id,
+        "crew",
+        new_members,
+        creator=sender_hash.hex(),
+        sender=sender_hash.hex(),
+        renamed_from=[old_id],
+    )
+    inbox = Inbox(config.inbox_path)
+    for message_id, group_id in (("g-old", old_id), ("g-new", new_id)):
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": sender_hash.hex(),
+                "text": f"hello {message_id}",
+                "sent_at": 12.0,
+                "received_at": 22.0,
+                "id": message_id,
+                "kind": "group",
+                "group": group_id,
+                "group_name": "crew",
+            }
+        )
+
+    # Listing marks everything read.
+    assert cli.main(["messages", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "messages",
+            "unread",
+            "--group",
+            "crew",
+            "--all",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"group": new_id, "unread": 2, "total": 2}
+
+
 def test_messages_unread_unknown_peer(tmp_path, capsys):
     data_dir, _ = _seed_messages(tmp_path)
 
@@ -3303,7 +3419,7 @@ def test_messages_count_does_not_advance_the_cursor(tmp_path, capsys):
     )
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {"unread": {sender_hash.hex(): 2}, "total": 2}
+    assert payload == {"unread": {sender_hash.hex(): 2}, "unread_groups": {}, "total": 2}
 
     code = cli.main(
         ["messages", "--data-dir", str(data_dir), "--count", "--peer", "alice"]
@@ -3340,7 +3456,54 @@ def test_messages_count_ignores_sent_records(tmp_path, capsys):
     code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {"unread": {}, "total": 0}
+    assert payload == {"unread": {}, "unread_groups": {}, "total": 0}
+
+
+def test_messages_count_combined_filter_excludes_blocked_senders(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    store = GroupStore(config.groups_path)
+    group = store.create(
+        "crew", [sender_hash.hex(), "cd" * 16], created_by=sender_hash.hex()
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew chat",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-group",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+        }
+    )
+    # The listing hides alice's posts once she is blocked; the
+    # combined peer-and-group count must hide them too.
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({sender_hash.hex()}))
+    )
+
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--count",
+            "--peer",
+            "alice",
+            "--group",
+            "crew",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {}, "unread_groups": {}, "total": 0}
 
 
 def test_messages_unread_filter_applies_before_limit(tmp_path, capsys):
@@ -3417,7 +3580,7 @@ def test_messages_limit_truncation_reports_unshown_unread(tmp_path, capsys):
     code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {"unread": {sender_hash.hex(): 3}, "total": 3}
+    assert payload == {"unread": {sender_hash.hex(): 3}, "unread_groups": {}, "total": 3}
 
     # The text listing prints the same hint, and the plain listing
     # truncates the same way.
@@ -3431,6 +3594,77 @@ def test_messages_limit_truncation_reports_unshown_unread(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["total"] == 3
 
 
+def test_messages_dm_listing_does_not_consume_hidden_group_post(tmp_path, capsys):
+    """A hidden group post must not pin the DM cursor (issue #409)."""
+    from tau.ignored_groups import IgnoredGroups, save_ignored_groups
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    group_id = "11" * 16
+    inbox = Inbox(config.inbox_path)
+    # The group post arrives first: under the old per-sender cursor
+    # it would cap the DM advance at seq 0, so the shown DM would
+    # reappear as unread forever.
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "group hello",
+            "sent_at": 9.0,
+            "received_at": 19.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "first hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "second hello",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "m-2",
+        }
+    )
+    save_ignored_groups(
+        config.ignored_groups_path, IgnoredGroups(frozenset({group_id}))
+    )
+
+    # The default listing hides the ignored group's post and shows
+    # the DMs; showing the DM must mark it read without consuming
+    # the group post the owner never saw.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-2", "m-1"]
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "unread": {},
+        "unread_groups": {group_id: 1},
+        "total": 1,
+    }
+
+
 def test_messages_count_empty(tmp_path, capsys):
     code = cli.main(["messages", "--data-dir", str(tmp_path / "node"), "--count"])
     assert code == 0
@@ -3440,7 +3674,7 @@ def test_messages_count_empty(tmp_path, capsys):
         ["messages", "--data-dir", str(tmp_path / "node"), "--count", "--json"]
     )
     assert code == 0
-    assert json.loads(capsys.readouterr().out) == {"unread": {}, "total": 0}
+    assert json.loads(capsys.readouterr().out) == {"unread": {}, "unread_groups": {}, "total": 0}
 # -- outbox held / drop-held ---------------------------------------------------
 
 

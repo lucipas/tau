@@ -69,6 +69,10 @@ script) can read what arrives from the mesh and send messages back:
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
+    GET  /api/messages/muted muted DM conversations and groups
+    POST /api/messages/mute mute ``{"peer": "<name or hash>"}`` or
+                           ``{"group": "<id | prefix | name>"}``
+                           (``"muted": false`` unmutes)
     GET  /api/messages/requests list DMs held for review from peers
                            outside the allow-list
     POST /api/messages/requests/accept accept ``{"id": "<request id>"}``:
@@ -186,6 +190,16 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .muted import (
+    MutedError,
+    expand_muted_groups,
+    group_lineage,
+    load_muted,
+    muted_groups_for,
+    muted_lock,
+    muted_peers_for,
+    save_muted,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
@@ -200,6 +214,7 @@ from .config import (
     ARCHIVED_FILE_NAME,
     DISAPPEARING_FILE_NAME,
     MESSAGES_FILE_NAME,
+    MUTED_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
     set_node_setting,
@@ -921,6 +936,8 @@ class WebBridge:
         # same way, so concurrent console requests cannot overwrite each
         # other's conversation.
         self._disappearing_lock = threading.Lock()
+        # Serializes mute/unmute read-modify-write cycles the same way.
+        self._muted_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -6565,6 +6582,151 @@ class WebBridge:
             "changed": changed,
         }
 
+    def _muted_path(self) -> Optional[Path]:
+        """This node's muted-conversations path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "muted_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / MUTED_FILE_NAME
+
+    def _muted_sets(self) -> "tuple[FrozenSet[str], FrozenSet[str]]":
+        """Muted (peers, groups), failing open on a corrupt file.
+
+        Count paths use this: a corrupt mutes file must never break
+        an unread read — the conversations count as unmuted, and the
+        warning is what surfaces the corruption.
+        """
+        path = self._muted_path()
+        return (
+            muted_peers_for(path),
+            expand_muted_groups(muted_groups_for(path), self._group_records()),
+        )
+
+    def _group_records(self) -> List[Dict[str, Any]]:
+        """Known group records, so mutes follow a group across renames."""
+        groups = getattr(self.node, "groups", None)
+        if groups is None:
+            return []
+        try:
+            return groups.list_groups()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store", exc_info=True)
+            return []
+
+    def muted_conversations(self, *, visible_only: bool = False) -> Dict[str, Any]:
+        """All muted conversations, for the console load.
+
+        Mirrors the stored file: peer destination hashes and group
+        ids, each sorted, with a group's muted rename successors
+        included.  With ``visible_only`` (remote consoles) only the
+        peers and groups the console already lists are returned, so
+        no conversation outside that view is named.  A corrupt file is
+        a 503 — the owner repairs or removes it before the console
+        shows mutes, the same as the disappearing defaults.
+        """
+        path = self._muted_path()
+        if path is None:
+            return {"peers": [], "groups": []}
+        try:
+            muted = load_muted(path)
+        except MutedError as exc:
+            raise WebBridgeError(
+                "muted conversations on disk are unusable; fix or remove them "
+                f"before editing ({exc})"
+            ) from exc
+        records = self._group_records()
+        peers = set(muted.peers)
+        groups = set(expand_muted_groups(muted.groups, records))
+        if visible_only:
+            peers &= {str(item.get("destination") or "") for item in self.peers()}
+            visible_groups: set = set()
+            for record in records:
+                visible_groups |= group_lineage(record)
+            groups &= visible_groups
+        return {"peers": sorted(peers), "groups": sorted(groups)}
+
+    def set_muted(
+        self,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+        muted: bool = True,
+    ) -> Dict[str, Any]:
+        """Mute or unmute one conversation.
+
+        Exactly one of *peer* (registry name, hash or prefix) or *group*
+        (id, prefix or name) names the conversation; *muted* is the new
+        state.  Mirrors ``tau mute``: the list is reloaded inside the
+        lock so two writes racing cannot discard each other's
+        conversation, and a corrupt file is a 503.  The unread counts
+        change with the mute, so the new counts are published for other
+        tabs at once.  The read cursor is untouched: unmuting restores
+        counting, including messages that arrived while muted.
+        """
+        if (peer is None) == (group is None):
+            raise ValueError("exactly one of 'peer' or 'group' is required")
+        if group is not None:
+            if not isinstance(group, str) or not group.strip():
+                raise ValueError("field 'group' is required")
+            record = self.node.groups.find(group.strip())
+            key = record["id"]
+            lineage = group_lineage(record)
+            is_group = True
+        else:
+            if not isinstance(peer, str) or not peer.strip():
+                raise ValueError("field 'peer' is required")
+            key = self._resolve_block_target(peer.strip())
+            is_group = False
+        path = self._muted_path()
+        if path is None:
+            raise WebBridgeError("this node has no muted-conversations path")
+        with self._muted_lock, muted_lock(path):
+            try:
+                current = load_muted(path)
+            except MutedError as exc:
+                raise WebBridgeError(
+                    "muted conversations on disk are unusable; fix or remove them "
+                    f"before editing ({exc})"
+                ) from exc
+            if is_group:
+                # The whole rename lineage moves together, so a mute
+                # made before or after a rename covers both ids.
+                previous = current.is_muted_group_lineage(lineage)
+                updated = (
+                    current.with_group_lineage(lineage)
+                    if muted
+                    else current.without_group_lineage(lineage)
+                )
+            else:
+                previous = current.is_muted_peer(key)
+                updated = (
+                    current.with_peer(key)
+                    if muted
+                    else current.without_peer(key)
+                )
+            changed = previous != muted
+            if changed:
+                save_muted(path, updated)
+        counts: Optional[Dict[str, Any]] = None
+        if changed:
+            # unread() takes the unread lock itself; the publish rides
+            # the same SSE event a mark-read sends.
+            counts = self.unread()
+            self.bus.publish({"type": "unread", "unread": counts})
+        return {
+            "target": key,
+            "group": is_group,
+            "muted": muted,
+            "changed": changed,
+            # The counts after the change, so the console can hold the
+            # restored unread count of an unmuted open conversation.
+            "unread": counts,
+        }
+
     def archived_conversations(self) -> Dict[str, Any]:
         """Archived DM conversations, with the console log's message counts.
 
@@ -7384,6 +7546,70 @@ class WebBridge:
         self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
         return dict(counts, revision=self._unread_revision)
 
+    def _group_lineage(self, group_id: str) -> List[str]:
+        """A group id plus its verified rename predecessors, current id first.
+
+        Group posts keep the id they arrived under, so a renamed
+        group's history spans its current id and every predecessor.
+        The lineage comes from the store, which only keeps a
+        predecessor whose live or retired record shares this group's
+        creator — a claimed id from another creator is not history.
+        An unknown id has no lineage: it stands alone.  Reading the
+        store never breaks an unread call — a failure falls back to
+        the id alone, exactly as the unknown case.
+        """
+        try:
+            groups = getattr(self.node, "groups", None)
+            if groups is None:
+                return [group_id]
+            return groups.lineage(group_id)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store for lineage", exc_info=True)
+            return [group_id]
+
+    def _fold_group_counts(self, counts: Dict[str, Any]) -> Dict[str, Any]:
+        """Fold predecessor unread counts into their successor's entry.
+
+        ``per_group`` is keyed by the id each post arrived under, but
+        the console only ever shows a group's current id — so a
+        renamed group's older posts would inflate ``total`` with no
+        badge to clear them from.  Fold each predecessor's count into
+        its successor, so the badge on the current group covers the
+        whole lineage.  ``total`` is unchanged: it is the sum of the
+        same posts, just bucketed under the current id.
+        """
+        per_group = counts.get("per_group") or {}
+        if not per_group:
+            return counts
+        try:
+            groups = getattr(self.node, "groups", None)
+            known = groups.list_groups() if groups is not None else []
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store for folding", exc_info=True)
+            known = []
+        successor: Dict[str, str] = {}
+        for group in known:
+            if not isinstance(group, dict):
+                continue
+            # Only verified predecessors fold: the store drops a
+            # claimed id whose record belongs to another creator.  A
+            # store read that fails for one group leaves its counts
+            # under the predecessor's own id, still visible.
+            try:
+                lineage = groups.lineage(group["id"])
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Could not read group lineage for folding", exc_info=True)
+                continue
+            for predecessor in lineage[1:]:
+                successor[predecessor] = group["id"]
+        folded: Dict[str, int] = {}
+        for group_id, count in per_group.items():
+            target = successor.get(group_id, group_id)
+            folded[target] = folded.get(target, 0) + count
+        if folded == per_group:
+            return counts
+        return dict(counts, per_group=folded)
+
     def unread(self) -> Dict[str, Any]:
         """Per-conversation unread counts from the node inbox.
 
@@ -7393,76 +7619,140 @@ class WebBridge:
         messages are excluded at the source — but the sender's group
         posts still count, since the group thread stays visible.  An
         ignored group's posts never light a badge either, so they are
-        excluded too; the members' direct messages still count.
+        excluded too; the members' direct messages still count.  A
+        muted conversation never lights a badge either, by the same
+        per-side rule as archived and ignored.  A renamed group's
+        posts count under its current id, so the badge on the group
+        covers its whole history.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
-            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            counts: Dict[str, Any] = {"per_peer": {}, "per_group": {}, "total": 0}
             if inbox is not None:
                 try:
+                    muted_peers, muted_groups = self._muted_sets()
                     counts = inbox.unread_counts(
-                        exclude_dm_from=self._archived_set(),
+                        exclude_dm_from=self._archived_set() | muted_peers,
                         exclude_group=load_ignored_group_ids(
                             getattr(
                                 self.node.config,
                                 "ignored_groups_path",
                                 None,
                             )
-                        ),
+                        )
+                        | muted_groups,
                     )
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)
+                else:
+                    counts = self._fold_group_counts(counts)
             return self._stamp_unread(counts)
 
-    def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
+    def _readable_group_lineage(
+        self, group_id: str, ignored: FrozenSet[str]
+    ) -> List[str]:
+        """A group's lineage minus its ignored predecessors.
+
+        Ignored groups keep their own read state: opening the current
+        group must never advance a hidden predecessor's cursor, or
+        unignoring it later shows no unread history from before the
+        rename — and marking unread must never move one either.  The
+        current id always stays: its own read behavior does not change.
+        """
+        lineage = self._group_lineage(group_id)
+        if not lineage:
+            return lineage
+        return [
+            gid for gid in lineage if gid == lineage[0] or gid not in ignored
+        ]
+
+    def mark_read(
+        self, peer: Optional[str] = None, *, group: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Advance the inbox read cursor for one conversation, or all.
 
         The console calls this when a conversation is opened, so its
         unread badge clears; other tabs learn from the ``unread`` SSE
-        event.  Read state never leaves this node.
+        event.  ``peer`` names a DM conversation and ``group`` a group
+        conversation; each advances only its own cursor, so opening a
+        DM never consumes a group post from the same sender.  A group
+        mark advances the whole rename lineage, so opening a renamed
+        group clears its older posts too — except an ignored
+        predecessor, whose read state stays frozen until it is
+        unignored.  Read state never leaves this node.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
-            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            counts: Dict[str, Any] = {"per_peer": {}, "per_group": {}, "total": 0}
             if inbox is not None:
+                muted_peers, muted_groups = self._muted_sets()
+                ignored = load_ignored_group_ids(
+                    getattr(self.node.config, "ignored_groups_path", None)
+                )
                 counts = inbox.mark_read(
                     peer=peer,
-                    exclude_dm_from=self._archived_set(),
-                    exclude_group=load_ignored_group_ids(
-                        getattr(
-                            self.node.config, "ignored_groups_path", None
-                        )
+                    group=(
+                        self._readable_group_lineage(group, ignored)
+                        if group is not None
+                        else None
                     ),
+                    exclude_dm_from=self._archived_set() | muted_peers,
+                    exclude_group=ignored | muted_groups,
                 )
+                counts = self._fold_group_counts(counts)
             stamped = self._stamp_unread(counts)
         if inbox is not None:
             self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 
-    def mark_unread(self, peer: str, *, all: bool = False) -> Dict[str, Any]:
+    def mark_unread(
+        self,
+        peer: Optional[str] = None,
+        *,
+        group: Optional[str] = None,
+        all: bool = False,
+    ) -> Dict[str, Any]:
         """Move one conversation's read cursor back so it shows unread again.
 
         The console marks a conversation read when it is opened, so this
         is the way back — the mirror of :meth:`mark_read`, backed by
         :meth:`Inbox.mark_unread`.  By default the newest received message
-        becomes unread again; ``all=True`` clears the cursor so the whole
-        conversation shows unread.  Other tabs learn from the ``unread``
-        SSE event, exactly as they do for a mark-read.  Read receipts are
-        untouched: a receipt already sent for a message stays sent, and
-        only the local display cursor moves.  Raises :class:`ValueError`
-        when the peer has no stored messages to mark, or when the node
+        in the conversation becomes unread again; ``all=True`` clears the
+        cursor so the whole conversation shows unread.  ``peer`` names a
+        DM conversation and ``group`` a group conversation; a group mark
+        covers the whole rename lineage, so a renamed group's older
+        posts mark unread together — except an ignored predecessor,
+        whose read state stays frozen until it is unignored.  Other
+        tabs learn from the ``unread`` SSE event, exactly as they do
+        for a mark-read.  Read receipts are untouched: a receipt
+        already sent for a message stays sent, and only the local
+        display cursor moves.  Raises :class:`ValueError` when the
+        conversation has no stored messages to mark, or when the node
         has no inbox to mark them in.
         """
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
             raise ValueError("this node has no inbox to mark unread")
         with self._unread_lock:
+            muted_peers, muted_groups = self._muted_sets()
+            ignored = load_ignored_group_ids(
+                getattr(self.node.config, "ignored_groups_path", None)
+            )
             moved = inbox.mark_unread(
-                peer, all=all, exclude_dm_from=self._archived_set()
+                peer,
+                group=(
+                    self._readable_group_lineage(group, ignored)
+                    if group is not None
+                    else None
+                ),
+                all=all,
+                exclude_dm_from=self._archived_set() | muted_peers,
+                exclude_group=ignored | muted_groups,
             )
             if moved is None:
-                raise ValueError(f"no stored messages from {peer!r}")
-            stamped = self._stamp_unread(moved)
+                target = group if group is not None else peer
+                raise ValueError(f"no stored messages in {target!r}")
+            stamped = self._stamp_unread(self._fold_group_counts(moved))
         self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 
@@ -7917,6 +8207,22 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     result = self.bridge.disappearing_defaults()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
+            if path == "/api/messages/muted":
+                # The full mute list names every muted conversation,
+                # including peers absent from the registry, so a remote
+                # client gets only the conversations its console lists.
+                # Mutes stay settable from any client, so the console
+                # can always show and undo them.
+                visible_only = not _is_loopback_client(self.client_address[0])
+                try:
+                    result = self.bridge.muted_conversations(
+                        visible_only=visible_only
+                    )
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
@@ -8399,16 +8705,61 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                group = body.get("group")
+                if group is not None and (
+                    not isinstance(group, str) or not group.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'group' must be a group id"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if peer is not None and group is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "pass 'peer' or 'group', not both"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 counts = self.bridge.mark_read(
-                    peer.strip() if isinstance(peer, str) else None
+                    peer.strip() if isinstance(peer, str) else None,
+                    group=group.strip() if isinstance(group, str) else None,
                 )
                 self._send_json({"ok": True, "unread": counts}, head_only)
                 return
             if path == "/api/messages/unread":
                 peer = body.get("peer")
-                if not isinstance(peer, str) or not peer.strip():
+                if peer is not None and (
+                    not isinstance(peer, str) or not peer.strip()
+                ):
                     self._send_json(
-                        {"error": {"message": "field 'peer' is required"}},
+                        {"error": {"message": "field 'peer' must be a peer hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                group = body.get("group")
+                if group is not None and (
+                    not isinstance(group, str) or not group.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'group' must be a group id"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if (peer is None) == (group is None):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "pass exactly one of 'peer' and 'group'"
+                            }
+                        },
                         head_only,
                         400,
                     )
@@ -8427,7 +8778,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     counts = self.bridge.mark_unread(
-                        peer.strip(), all=mark_all
+                        peer.strip() if isinstance(peer, str) else None,
+                        group=group.strip() if isinstance(group, str) else None,
+                        all=mark_all,
                     )
                 except ValueError as exc:
                     self._send_json(
@@ -8502,6 +8855,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "disappearing": result}, head_only)
+                return
+            if path == "/api/messages/mute":
+                # ``muted`` defaults to true: posting a target mutes
+                # it; posting ``"muted": false`` unmutes it.
+                muted = body.get("muted", True)
+                if not isinstance(muted, bool):
+                    self._send_json(
+                        {"error": {"message": "field 'muted' must be a boolean"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.set_muted(
+                        peer=body.get("peer"),
+                        group=body.get("group"),
+                        muted=muted,
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "mute": result}, head_only)
                 return
             if path == "/api/messages/import":
                 try:
