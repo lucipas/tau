@@ -555,6 +555,158 @@ describe("useTau group management", () => {
   });
 });
 
+describe("useTau group leave / ignore", () => {
+  it("drops a left group and records it left even when the refresh fails", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+    expect(result.current.groups).toEqual([created]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      id: created.id,
+      name: "crew",
+    });
+    mockedGet.mockRejectedValue(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.leaveGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/leave", {
+      group: created.id,
+    });
+    expect(result.current.groups).toEqual([]);
+    expect(result.current.leftGroups).toHaveLength(1);
+    expect(result.current.leftGroups[0].id).toBe(created.id);
+  });
+
+  it("clears the left entry when a group is rejoined", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      id: created.id,
+      name: "crew",
+    });
+    mockedGet.mockRejectedValue(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.leaveGroup(created.id);
+    });
+    expect(result.current.leftGroups).toHaveLength(1);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      rejoined: created.id,
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({ left: [], ignored: [] })
+        : Promise.resolve({ groups: [], count: 0 }),
+    );
+    await act(async () => {
+      await result.current.rejoinGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/rejoin", {
+      group: created.id,
+    });
+    expect(result.current.leftGroups).toEqual([]);
+  });
+
+  it("flips the ignored flag when a group is ignored and unignored", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: created.id,
+      name: "crew",
+      ignored: true,
+      changed: true,
+    });
+    mockedGet.mockRejectedValue(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.ignoreGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/ignore", {
+      group: created.id,
+    });
+    expect(result.current.groups).toEqual([
+      { ...created, ignored: true },
+    ]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: created.id,
+      name: "crew",
+      ignored: false,
+      changed: true,
+    });
+    await act(async () => {
+      await result.current.unignoreGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/unignore", {
+      group: created.id,
+    });
+    expect(result.current.groups).toEqual([
+      { ...created, ignored: false },
+    ]);
+  });
+
+  it("drops an orphaned ignored entry when it is unignored", async () => {
+    const orphanId = "dd".repeat(16);
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({
+            left: [],
+            ignored: [{ id: orphanId, name: "" }],
+          })
+        : Promise.resolve({ groups: [], count: 0 }),
+    );
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.refreshLeftGroups();
+    });
+    expect(result.current.ignoredGroups).toEqual([
+      { id: orphanId, name: "" },
+    ]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: orphanId,
+      name: "",
+      ignored: false,
+      changed: true,
+    });
+    mockedGet.mockRejectedValue(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.unignoreGroup(orphanId);
+    });
+
+    expect(result.current.ignoredGroups).toEqual([]);
+  });
+});
+
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {
   const { result } = renderHook(() => useTau());
   const source = FakeEventSource.instances[0];

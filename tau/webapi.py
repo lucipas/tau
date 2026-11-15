@@ -24,6 +24,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/rename rename ``{"group": "<id | prefix | name>", "name": "<new name>"}``
     POST /api/groups/topic set or clear the topic ``{"group": "...", "topic": "..."}`` / ``{"group": "...", "clear": true}``
+    POST /api/groups/leave leave ``{"group": "..."}`` — members only;
+                           a group this node created uses delete instead
+    POST /api/groups/rejoin rejoin a left group ``{"group": "<32-char id>"}``
+    POST /api/groups/ignore ignore ``{"group": "..."}``
+    POST /api/groups/unignore unignore ``{"group": "..."}``
+    GET  /api/groups/left   groups this node has left, plus ignored groups
     GET  /api/messages     recent inbound/outbound messages
                            (``?pinned=1`` lists pinned messages only,
                            across the whole console log)
@@ -192,7 +198,13 @@ from .config import (
     set_node_setting,
     write_node_metadata,
 )
-from .groups import pinned_rosters, visible_reactions
+from .groups import GroupStore, pinned_rosters, visible_reactions
+from .ignored_groups import (
+    ignored_groups_lock,
+    load_ignored_group_ids,
+    load_ignored_groups,
+    save_ignored_groups,
+)
 from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
@@ -739,6 +751,53 @@ def _apply_edit(message: Dict[str, Any], text: str, edited_at: float) -> bool:
     message["edited_at"] = edited_at
     message["excerpt_hash"] = excerpt_hash(text)
     return True
+
+
+def _stored_group_matches(groups: GroupStore, query: str) -> bool:
+    """True when any stored group matches *query* by id, id prefix, or name.
+
+    Mirrors :meth:`tau.groups.GroupStore.find`: a full id matches by
+    lookup, a shorter query by exact (case-insensitive) name or by an
+    id prefix of at least four characters.  Used to tell an ambiguous
+    lookup apart from one that found nothing at all.  Mirrors
+    :func:`tau.cli._stored_group_matches`.
+    """
+    needle = query.strip()
+    if len(needle) == 32:
+        return groups.get(needle) is not None
+    lowered = needle.lower()
+    for group in groups.list_groups():
+        if group["name"].casefold() == needle.casefold():
+            return True
+        if len(needle) >= 4 and group["id"].startswith(lowered):
+            return True
+    return False
+
+
+def _ignored_id_for_query(
+    ignored_ids: FrozenSet[str], query: str
+) -> Optional[str]:
+    """The ignored id *query* names when no stored group record does.
+
+    Accepts a full 32-character id or a unique id prefix of at least
+    four characters, as :meth:`tau.groups.GroupStore.find` does.
+    Returns ``None`` when nothing matches; raises :class:`ValueError`
+    when a prefix matches several ignored ids.  Mirrors
+    :func:`tau.cli._ignored_id_for_query`.
+    """
+    needle = query.strip().lower()
+    if len(needle) == 32:
+        return needle if needle in ignored_ids else None
+    if len(needle) < 4:
+        return None
+    matches = sorted(
+        group_id for group_id in ignored_ids if group_id.startswith(needle)
+    )
+    if len(matches) > 1:
+        raise ValueError(
+            f"{len(matches)} ignored groups match the id prefix {query!r}"
+        )
+    return matches[0] if matches else None
 
 
 class WebBridge:
@@ -6415,15 +6474,22 @@ class WebBridge:
 
     def groups(self) -> List[Dict[str, Any]]:
         try:
+            ignored = load_ignored_group_ids(
+                getattr(self.node.config, "ignored_groups_path", None)
+            )
             return [
-                self._describe_group(group)
+                self._describe_group(group, ignored)
                 for group in self.node.groups.list_groups()
             ]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read group store", exc_info=True)
             return []
 
-    def _describe_group(self, group: Dict[str, Any]) -> Dict[str, Any]:
+    def _describe_group(
+        self,
+        group: Dict[str, Any],
+        ignored_ids: FrozenSet[str] = frozenset(),
+    ) -> Dict[str, Any]:
         members = []
         for member_hash in group["members"]:
             peer = self.node.registry.get(member_hash)
@@ -6449,6 +6515,10 @@ class WebBridge:
             # counts, even when it names this node.
             "created_by_me": bool(group.get("local"))
             and group.get("creator") == self.node.destination_hexhash,
+            # Ignored groups stay listed but muted: the flag rides on
+            # the description so the sidebar can show it without a
+            # second round-trip.
+            "ignored": group["id"] in ignored_ids,
         }
 
     def create_group(self, name: str, members: List[str]) -> Dict[str, Any]:
@@ -6494,6 +6564,170 @@ class WebBridge:
         if not self.node.groups.delete(group["id"]):
             raise ValueError(f"unknown group: {query.strip()!r}")
         return {"id": group["id"], "name": group["name"]}
+
+    def leave_group(self, query: str) -> Dict[str, Any]:
+        """Leave a known group from the console, mirroring ``tau group leave``.
+
+        Only a member can leave: a group this node created is removed
+        with delete instead, because a later message from a member
+        cannot re-pin a created group the way it can a learned one.
+        Leaving is local only — the creator is not told and keeps this
+        node on the roster, so the messages keep coming and are
+        rejected here.  Returns the left id and name, plus any
+        successor roster for the same creator and name left with it.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        group = self.node.groups.find(query.strip())
+        if group["local"]:
+            raise ValueError(
+                "only members can leave a group they did not create —"
+                " delete your own group with `tau group delete`"
+            )
+        left_ids = self.node.groups.leave(group["id"])
+        if not left_ids:
+            raise ValueError(f"unknown group: {query.strip()!r}")
+        siblings = [gid for gid in left_ids if gid != group["id"]]
+        result: Dict[str, Any] = {"id": group["id"], "name": group["name"]}
+        if siblings:
+            result["also_left"] = siblings
+        return result
+
+    def rejoin_group(self, group_id: str) -> Dict[str, Any]:
+        """Undo a leave from the console, mirroring ``tau group rejoin``.
+
+        The next group message pins the group again.  Takes the full
+        32-character id: a left group has no record left to resolve a
+        name or prefix against.
+        """
+        if not isinstance(group_id, str) or not group_id.strip():
+            raise ValueError("field 'group' is required")
+        cleaned = group_id.strip().lower()
+        valid = len(cleaned) == 32
+        if valid:
+            try:
+                bytes.fromhex(cleaned)
+            except ValueError:
+                valid = False
+        if not valid:
+            raise ValueError(f"invalid group id: {group_id.strip()!r}")
+        if not self.node.groups.rejoin(cleaned):
+            raise ValueError(f"group {cleaned} was never left")
+        return {"rejoined": cleaned}
+
+    def ignore_group(self, query: str) -> Dict[str, Any]:
+        """Ignore a known group from the console, mirroring ``tau group ignore``.
+
+        Ignoring never deletes anything and never stops delivery: it
+        is a local display preference, so the group's messages keep
+        arriving and stay stored, and unignoring restores the full
+        history.  ``changed`` is false when the group was already
+        ignored.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        group = self.node.groups.find(query.strip())
+        group_id = group["id"]
+        path = getattr(self.node.config, "ignored_groups_path", None)
+        if path is None:
+            raise ValueError("ignored-groups is not configured for this node")
+        # Reload inside the lock: two ignore commands racing must not
+        # discard each other's change to a different group.
+        with ignored_groups_lock(path):
+            ignored = load_ignored_groups(path)
+            already = ignored.is_ignored(group_id)
+            if not already:
+                ignored = ignored.with_added(group_id)
+                save_ignored_groups(path, ignored)
+        return {
+            "group": group_id,
+            "name": group["name"],
+            "ignored": True,
+            "changed": not already,
+        }
+
+    def unignore_group(self, query: str) -> Dict[str, Any]:
+        """Unignore a group from the console, mirroring ``tau group unignore``.
+
+        The group record can be gone (deleted, or a backup restored
+        the ignore list without groups.json): a full id or unique id
+        prefix still resolves against the ignored list itself, so an
+        ignored group is never stuck hidden with no way out.
+        ``changed`` is false when the group was not ignored.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        path = getattr(self.node.config, "ignored_groups_path", None)
+        if path is None:
+            raise ValueError("ignored-groups is not configured for this node")
+        find_error: Optional[ValueError] = None
+        group: Optional[Dict[str, Any]] = None
+        try:
+            group = self.node.groups.find(query.strip())
+        except ValueError as exc:
+            find_error = exc
+        with ignored_groups_lock(path):
+            ignored = load_ignored_groups(path)
+            if group is not None:
+                group_id = group["id"]
+                name = group["name"]
+            else:
+                # The orphan fallback is only for a lookup that found
+                # no stored group at all: an ambiguous name or id
+                # prefix must still be rejected, not silently resolved
+                # against an orphaned ignored id that happens to share
+                # the prefix.
+                if _stored_group_matches(self.node.groups, query.strip()):
+                    raise find_error
+                resolved = _ignored_id_for_query(
+                    ignored.ignored, query.strip()
+                )
+                if resolved is None:
+                    raise find_error
+                group_id = resolved
+                name = ""
+            was_ignored = ignored.is_ignored(group_id)
+            if was_ignored:
+                ignored = ignored.with_removed(group_id)
+                save_ignored_groups(path, ignored)
+        return {
+            "group": group_id,
+            "name": name,
+            "ignored": False,
+            "changed": was_ignored,
+        }
+
+    def left_groups(self) -> Dict[str, Any]:
+        """Groups this node has left, plus the ignored groups, for the console.
+
+        Left groups carry only their id and the time they were left —
+        the record is gone, so there is no name to show.  Ignored
+        groups carry the name when a record still exists, so the
+        console can offer unignore for an ignored group whose record
+        was deleted (or a backup restored the ignore list without
+        groups.json) instead of leaving it hidden with no way out.
+        """
+        left = self.node.groups.left_groups()
+        ignored_ids = load_ignored_group_ids(
+            getattr(self.node.config, "ignored_groups_path", None)
+        )
+        ignored = []
+        for group_id in ignored_ids:
+            stored = self.node.groups.get(group_id)
+            ignored.append(
+                {
+                    "id": group_id,
+                    "name": stored["name"] if stored is not None else "",
+                }
+            )
+        # Named groups first, alphabetically; orphaned ids last, by id.
+        ignored.sort(
+            key=lambda entry: (
+                not entry["name"],
+                entry["name"] or entry["id"],
+            )
+        )
+        return {"left": left, "ignored": ignored}
 
     def change_group_members(
         self, query: str, members: List[str], *, adding: bool
@@ -7390,6 +7624,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 groups = self.bridge.groups()
                 self._send_json({"groups": groups, "count": len(groups)}, head_only)
                 return
+            if path == "/api/groups/left":
+                self._send_json(self.bridge.left_groups(), head_only)
+                return
             if path == "/api/messages":
                 pinned_only = query.get("pinned") == ["1"]
                 # A pinned view spans the whole console log, not just
@@ -7987,6 +8224,82 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "deleted": deleted}, head_only)
+                return
+            if path == "/api/groups/leave":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    left = self.bridge.leave_group(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **left}, head_only)
+                return
+            if path == "/api/groups/rejoin":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    rejoined = self.bridge.rejoin_group(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **rejoined}, head_only)
+                return
+            if path == "/api/groups/ignore":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    ignored = self.bridge.ignore_group(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **ignored}, head_only)
+                return
+            if path == "/api/groups/unignore":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    unignored = self.bridge.unignore_group(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **unignored}, head_only)
                 return
             if path in (
                 "/api/groups/add-member",

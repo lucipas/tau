@@ -30,6 +30,11 @@ import type {
   GroupsResponse,
   HeldMailEntry,
   HeldMailResponse,
+  IgnoreGroupResponse,
+  IgnoredGroupEntry,
+  LeaveGroupResponse,
+  LeftGroup,
+  LeftGroupsResponse,
   MarkReadResponse,
   MessagesExportDocument,
   MessagesImportResponse,
@@ -47,6 +52,7 @@ import type {
   PingResult,
   PinMessageResponse,
   ReactResponse,
+  RejoinGroupResponse,
   RenameGroupResponse,
   RenameResponse,
   RetractMessageResponse,
@@ -61,6 +67,7 @@ import type {
   SocialInfo,
   TauGroup,
   TauMessage,
+  UnignoreGroupResponse,
   UnpinMessageResponse,
   UnreadCounts,
   UpdateSettingsResponse,
@@ -154,6 +161,13 @@ export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [groups, setGroups] = useState<TauGroup[]>([]);
+  // Groups this node has left, plus the ignored groups: the left
+  // list is the way back in, and the ignored list covers groups
+  // whose record is gone but whose ignored id survives.
+  const [leftGroups, setLeftGroups] = useState<LeftGroup[]>([]);
+  const [ignoredGroups, setIgnoredGroups] = useState<IgnoredGroupEntry[]>(
+    [],
+  );
   // The latest roster swap: the console uses it to keep a selected old
   // group id pointing at its successor.
   const [groupSwap, setGroupSwap] = useState<{
@@ -231,6 +245,18 @@ export function useTau() {
     const result = await apiGet<GroupsResponse>("/api/groups");
     if (requestId !== groupsSeq.current) return;
     setGroups(result.groups);
+  }, []);
+
+  const leftGroupsSeq = useRef(0);
+
+  const refreshLeftGroups = useCallback(async () => {
+    // Same polling shape as the groups: a leave or ignore from
+    // another tab or the CLI shows up here without a reload.
+    const requestId = ++leftGroupsSeq.current;
+    const result = await apiGet<LeftGroupsResponse>("/api/groups/left");
+    if (requestId !== leftGroupsSeq.current) return;
+    setLeftGroups(result.left);
+    setIgnoredGroups(result.ignored);
   }, []);
 
   // A roster change or a rename is a successor group: swap the old id
@@ -790,6 +816,7 @@ export function useTau() {
         refreshDmRequests(),
         refreshArchived(),
         refreshGroups(),
+        refreshLeftGroups(),
         refreshSettings(),
         refreshAllowlist(),
       ]);
@@ -799,7 +826,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshGroups, refreshSettings, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshGroups, refreshLeftGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     (target: string) =>
@@ -1579,6 +1606,109 @@ export function useTau() {
     [refreshGroups],
   );
 
+  const leaveGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<LeaveGroupResponse>(
+        "/api/groups/leave",
+        { group },
+      );
+      // Drop the group locally at once; a left group has no record
+      // to reappear from, so the refresh below must not be the only
+      // thing that removes it. The left entry carries a local time
+      // until the refresh replaces it with the stored one.
+      const leftIds = [result.id, ...(result.also_left ?? [])];
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.filter((entry) => !leftIds.includes(entry.id)),
+      );
+      setLeftGroups((previous) => [
+        ...previous.filter((entry) => !leftIds.includes(entry.id)),
+        { id: result.id, left_at: Date.now() / 1000 },
+      ]);
+      try {
+        await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups, refreshLeftGroups],
+  );
+
+  const rejoinGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<RejoinGroupResponse>(
+        "/api/groups/rejoin",
+        { group },
+      );
+      // Rejoining clears the left list; the record itself only
+      // returns when the next message pins the group again, so there
+      // is nothing to add back to the roster here.
+      groupEdits.current += 1;
+      setLeftGroups((previous) =>
+        previous.filter((entry) => entry.id !== result.rejoined),
+      );
+      try {
+        await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups, refreshLeftGroups],
+  );
+
+  const ignoreGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<IgnoreGroupResponse>(
+        "/api/groups/ignore",
+        { group },
+      );
+      // Flip the flag in place at once, then refresh best-effort so
+      // a failed GET cannot leave the stale flag on screen.
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.map((entry) =>
+          entry.id === result.group ? { ...entry, ignored: true } : entry,
+        ),
+      );
+      try {
+        await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups, refreshLeftGroups],
+  );
+
+  const unignoreGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<UnignoreGroupResponse>(
+        "/api/groups/unignore",
+        { group },
+      );
+      // Flip the flag in place, and drop an orphaned ignored entry
+      // (no stored group to flip) at once.
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.map((entry) =>
+          entry.id === result.group ? { ...entry, ignored: false } : entry,
+        ),
+      );
+      setIgnoredGroups((previous) =>
+        previous.filter((entry) => entry.id !== result.group),
+      );
+      try {
+        await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups, refreshLeftGroups],
+  );
+
   const editBlock = useCallback(
     async (destination: string, block: boolean) => {
       setBlocks((previous) => ({
@@ -2133,6 +2263,8 @@ export function useTau() {
     node,
     peers,
     groups,
+    leftGroups,
+    ignoredGroups,
     messages,
     searchResults,
     searchQuery,
@@ -2199,12 +2331,17 @@ export function useTau() {
     clearReaction,
     createGroup,
     deleteGroup,
+    leaveGroup,
+    rejoinGroup,
+    ignoreGroup,
+    unignoreGroup,
     addGroupMembers,
     removeGroupMembers,
     renameGroup,
     setGroupTopic,
     refreshOutbox,
     refreshGroups,
+    refreshLeftGroups,
     groupSwap,
     refreshSettings,
     updateSetting,

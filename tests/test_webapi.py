@@ -160,6 +160,7 @@ class FakeNode:
             dm_requests_path=data_dir / "dm-requests.json",
             allowlist_path=data_dir / "allowlist.json",
             blocklist_path=data_dir / "blocklist.json",
+            ignored_groups_path=data_dir / "ignored-groups.json",
         )
         self._allowlist = AllowList()
         self._allowlist_lock = threading.RLock()
@@ -2369,6 +2370,222 @@ def test_api_groups_delete_unknown_group_is_400(bridge, node, tmp_path):
     )
     assert status == 400
     assert payload["error"]["message"] == "field 'group' is required"
+
+
+def _learned_group(node, tmp_path, name="weekend"):
+    """A group learned from the mesh, so the console may leave it."""
+    from tau.groups import GroupStore, derive_group_id
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    group_id = derive_group_id(
+        PEER_HASH, name, [PEER_HASH, node.destination_hexhash]
+    )
+    assert node.groups.record(
+        group_id,
+        name,
+        [PEER_HASH, node.destination_hexhash],
+        creator=PEER_HASH,
+        sender=PEER_HASH,
+    )
+    return group_id
+
+
+def test_api_groups_leave_removes_learned_group_and_rejoin_clears_it(
+    bridge, node, tmp_path
+):
+    group_id = _learned_group(node, tmp_path)
+    status, _, payload = _json(
+        bridge, "/api/groups/leave", method="POST", body={"group": "weekend"}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["id"] == group_id
+    assert payload["name"] == "weekend"
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 0
+    _, _, left = _json(bridge, "/api/groups/left")
+    assert [entry["id"] for entry in left["left"]] == [group_id]
+    assert "left_at" in left["left"][0]
+    assert left["ignored"] == []
+    # Rejoining clears the left list, but the record is gone: the
+    # group only returns when the next message pins it again.
+    status, _, payload = _json(
+        bridge, "/api/groups/rejoin", method="POST", body={"group": group_id}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["rejoined"] == group_id
+    _, _, left = _json(bridge, "/api/groups/left")
+    assert left["left"] == []
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 0
+
+
+def test_api_groups_leave_refuses_created_group(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge, "/api/groups/leave", method="POST", body={"group": "weekend"}
+    )
+    assert status == 400
+    assert "only members can leave" in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+
+
+def test_api_groups_leave_unknown_group_is_400(bridge, node, tmp_path):
+    _learned_group(node, tmp_path)
+    status, _, payload = _json(
+        bridge, "/api/groups/leave", method="POST", body={"group": "nope"}
+    )
+    assert status == 400
+    assert "nope" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge, "/api/groups/leave", method="POST", body={}
+    )
+    assert status == 400
+    assert payload["error"]["message"] == "field 'group' is required"
+
+
+def test_api_groups_rejoin_rejects_bad_input(bridge, node, tmp_path):
+    _learned_group(node, tmp_path)
+    status, _, payload = _json(
+        bridge, "/api/groups/rejoin", method="POST", body={"group": "nope"}
+    )
+    assert status == 400
+    assert "invalid group id" in payload["error"]["message"]
+    never_left = "ab" * 16
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/rejoin",
+        method="POST",
+        body={"group": never_left},
+    )
+    assert status == 400
+    assert "was never left" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge, "/api/groups/rejoin", method="POST", body={}
+    )
+    assert status == 400
+    assert payload["error"]["message"] == "field 'group' is required"
+
+
+def test_api_groups_ignore_and_unignore_round_trip(bridge, node, tmp_path):
+    group_id = _learned_group(node, tmp_path)
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["ignored"] is False
+    status, _, payload = _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["group"] == group_id
+    assert payload["name"] == "weekend"
+    assert payload["ignored"] is True
+    assert payload["changed"] is True
+    # Ignoring twice is not an error: the second call reports no change.
+    _, _, payload = _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    assert payload["ignored"] is True
+    assert payload["changed"] is False
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["ignored"] is True
+    _, _, left = _json(bridge, "/api/groups/left")
+    assert left["left"] == []
+    assert left["ignored"] == [{"id": group_id, "name": "weekend"}]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/unignore",
+        method="POST",
+        body={"group": "weekend"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["ignored"] is False
+    assert payload["changed"] is True
+    _, _, payload = _json(
+        bridge,
+        "/api/groups/unignore",
+        method="POST",
+        body={"group": "weekend"},
+    )
+    assert payload["ignored"] is False
+    assert payload["changed"] is False
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["ignored"] is False
+    _, _, left = _json(bridge, "/api/groups/left")
+    assert left["ignored"] == []
+
+
+def test_api_groups_ignore_unknown_group_is_400(bridge, node, tmp_path):
+    _learned_group(node, tmp_path)
+    status, _, payload = _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "nope"}
+    )
+    assert status == 400
+    assert "nope" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge, "/api/groups/ignore", method="POST", body={}
+    )
+    assert status == 400
+    assert payload["error"]["message"] == "field 'group' is required"
+
+
+def test_api_groups_unignore_resolves_orphaned_ignored_id(
+    bridge, node, tmp_path
+):
+    group_id = _learned_group(node, tmp_path)
+    _json(
+        bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"}
+    )
+    # The record is gone but the ignore list survived: the console
+    # must still offer unignore, by full id or unique prefix.
+    assert node.groups.delete(group_id)
+    _, _, left = _json(bridge, "/api/groups/left")
+    assert left["ignored"] == [{"id": group_id, "name": ""}]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/unignore",
+        method="POST",
+        body={"group": group_id[:8]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["group"] == group_id
+    assert payload["name"] == ""
+    assert payload["changed"] is True
+    # Once removed from the ignore list, the orphaned id no longer
+    # resolves at all.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/unignore",
+        method="POST",
+        body={"group": group_id},
+    )
+    assert status == 400
+    assert "unknown group" in payload["error"]["message"]
+
+
+def test_ignored_id_for_query_matches_full_id_and_unique_prefix():
+    from tau.webapi import _ignored_id_for_query
+
+    first = "abcd" + "ab" * 14
+    second = "abcd" + "ef" * 14
+    ignored = frozenset([first, second])
+    assert _ignored_id_for_query(ignored, first) == first
+    assert _ignored_id_for_query(ignored, first[:8]) == first
+    assert _ignored_id_for_query(ignored, "cd" * 16) is None
+    assert _ignored_id_for_query(ignored, "ab") is None
+    with pytest.raises(ValueError, match="2 ignored groups match"):
+        _ignored_id_for_query(ignored, "abcd")
 
 
 def _inbound_record(node, **overrides):

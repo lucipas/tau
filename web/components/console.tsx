@@ -275,6 +275,12 @@ export function Console() {
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
             onDeleteGroup={(group) => tau.deleteGroup(group)}
+            onLeaveGroup={(group) => tau.leaveGroup(group)}
+            onRejoinGroup={(group) => tau.rejoinGroup(group)}
+            onIgnoreGroup={(group) => tau.ignoreGroup(group)}
+            onUnignoreGroup={(group) => tau.unignoreGroup(group)}
+            leftGroups={tau.leftGroups}
+            ignoredGroups={tau.ignoredGroups}
             onAddGroupMembers={(group, members) =>
               tau.addGroupMembers(group, members)
             }
