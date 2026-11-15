@@ -4451,12 +4451,15 @@ def test_muted_conversations_endpoints(node, tmp_path):
             body={"peer": "alice"},
         )
         assert status == 200
-        assert payload["mute"] == {
-            "target": PEER_HASH,
-            "group": False,
-            "muted": True,
-            "changed": True,
-        }
+        assert payload["mute"]["target"] == PEER_HASH
+        assert payload["mute"]["group"] is False
+        assert payload["mute"]["muted"] is True
+        assert payload["mute"]["changed"] is True
+        # set_muted returns the unread counts after a change, so the
+        # console can hold the restored count when unmuting.
+        assert payload["mute"]["unread"]["per_peer"] == {}
+        assert payload["mute"]["unread"]["total"] == 0
+        assert isinstance(payload["mute"]["unread"]["revision"], int)
         status, _, payload = _json(bridge, "/api/messages/muted")
         assert payload == {"peers": [PEER_HASH], "groups": []}
 
