@@ -5428,6 +5428,112 @@ def test_tan_mute_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_follow_tag_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "hello from tan", name="tester", now=1000)
+        create_post(
+            conn, other, "bob's #gardening update", name="bob", now=1001
+        )
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/followed-tags")
+        assert status == 200
+        assert payload == {"followed_tags": [], "count": 0}
+
+        # A stranger's tagged post stays out of the plain timeline.
+        status, _, payload = _json(bridge, "/api/tan/timeline")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/follow-tag",
+            method="POST",
+            body={"tag": "#gardening"},
+        )
+        assert status == 200
+        assert payload["follow"]["tag"] == "gardening"
+        first_followed_at = payload["follow"]["added_at"]
+
+        # The followed tag pulls the post into the timeline at once.
+        status, _, payload = _json(bridge, "/api/tan/timeline")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "bob's #gardening update",
+            "hello from tan",
+        ]
+
+        status, _, payload = _json(bridge, "/api/tan/followed-tags")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["followed_tags"][0]["display"] == "#gardening"
+
+        # Re-following is a no-op: the original follow time is kept.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/follow-tag",
+            method="POST",
+            body={"tag": "GARDENING"},
+        )
+        assert status == 200
+        assert payload["follow"]["added_at"] == first_followed_at
+        status, _, relisted = _json(bridge, "/api/tan/followed-tags")
+        assert relisted["followed_tags"][0]["added_at"] == first_followed_at
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unfollow-tag",
+            method="POST",
+            body={"tag": "gardening"},
+        )
+        assert status == 200
+        assert payload["follow"]["unfollowed"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline")
+        assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
+
+        # Unfollowing again reports that nothing was followed.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unfollow-tag",
+            method="POST",
+            body={"tag": "gardening"},
+        )
+        assert payload["follow"]["unfollowed"] is False
+
+        # Missing fields and invalid tags are rejected.
+        status, _, payload = _json(
+            bridge, "/api/tan/follow-tag", method="POST", body={}
+        )
+        assert status == 400
+        assert "field 'tag' is required" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/follow-tag",
+            method="POST",
+            body={"tag": "not a tag!!"},
+        )
+        assert status == 400
+        assert "not a tag" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_hidden_annotates_own_posts_and_respects_blocklist(tmp_path):
     import RNS
 

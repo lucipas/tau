@@ -933,6 +933,17 @@ export interface TanMutedKeywordsResponse {
   count: number;
 }
 
+export interface TanFollowedTag {
+  tag: string;
+  display: string;
+  added_at: number;
+}
+
+export interface TanFollowedTagsResponse {
+  followed_tags: TanFollowedTag[];
+  count: number;
+}
+
 export interface TanPostResponse {
   ok: boolean;
   post: TanPost;
