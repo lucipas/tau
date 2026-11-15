@@ -171,8 +171,10 @@ from .tangents.tan import (
     mentions,
     mute,
     mute_keyword,
+    mute_tag,
     muted,
     muted_keywords,
+    muted_tags,
     open_db_readonly,
     open_readonly_db,
     pin_post,
@@ -193,6 +195,7 @@ from .tangents.tan import (
     unhide_post,
     unmute,
     unmute_keyword,
+    unmute_tag,
     unpin_post,
     unsave_post,
     verify_store,
@@ -2117,6 +2120,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="list followed hashtags",
     )
     tan_followed_tags.set_defaults(func=cmd_tan_followed_tags)
+
+    tan_mute_tag = tan_sub.add_parser(
+        "mute-tag",
+        parents=[common],
+        help="mute a hashtag so its posts stay out of your timeline",
+    )
+    tan_mute_tag.add_argument("tag", metavar="#TAG", help="hashtag to mute")
+    tan_mute_tag.set_defaults(func=cmd_tan_mute_tag)
+
+    tan_unmute_tag = tan_sub.add_parser(
+        "unmute-tag",
+        parents=[common],
+        help="stop muting a hashtag",
+    )
+    tan_unmute_tag.add_argument("tag", metavar="#TAG", help="hashtag to unmute")
+    tan_unmute_tag.set_defaults(func=cmd_tan_unmute_tag)
+
+    tan_muted_tags = tan_sub.add_parser(
+        "muted-tags",
+        parents=[common],
+        help="list muted hashtags",
+    )
+    tan_muted_tags.set_defaults(func=cmd_tan_muted_tags)
 
     tan_save = tan_sub.add_parser(
         "save", parents=[common], help="save a post to read later"
@@ -4203,6 +4229,65 @@ def cmd_tan_followed_tags(args: argparse.Namespace) -> int:
                 "%Y-%m-%d %H:%M"
             )
             print(f"{record['display']} (followed {when})")
+    return _EXIT_OK
+
+
+def cmd_tan_mute_tag(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    config.prepare()
+    conn = init_db(config.social_db_path)
+    try:
+        record = mute_tag(conn, args.tag)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        print(f"muted tag {record['display']!r}")
+    return _EXIT_OK
+
+
+def cmd_tan_unmute_tag(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        removed = unmute_tag(conn, args.tag)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(
+            {
+                "tag": clean_tag(args.tag),
+                "unmuted": removed,
+            },
+            True,
+        )
+    else:
+        if removed:
+            print(f"unmuted tag {args.tag.strip()!r}")
+        else:
+            print(f"tag {args.tag.strip()!r} was not muted")
+    return _EXIT_OK
+
+
+def cmd_tan_muted_tags(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        records = muted_tags(conn)
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"muted_tags": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print("No muted tags. Try `tau tan mute-tag #TAG`.")
+        for record in records:
+            when = datetime.fromtimestamp(float(record["added_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(f"{record['display']} (muted {when})")
     return _EXIT_OK
 
 

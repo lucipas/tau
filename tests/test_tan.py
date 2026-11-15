@@ -64,7 +64,9 @@ from tau.tangents.tan import (
     likers,
     list_authors,
     mute_keyword,
+    mute_tag,
     muted_keywords,
+    muted_tags,
     post_likers,
     quote_counts,
     reaction_states,
@@ -85,6 +87,7 @@ from tau.tangents.tan import (
     search_posts,
     store,
     store_post,
+    MAX_MUTED_TAGS,
     SUGGEST_FOLLOWED_WEIGHT,
     suggest_authors,
     tags,
@@ -96,11 +99,13 @@ from tau.tangents.tan import (
     unhide_post,
     unmute,
     unmute_keyword,
+    unmute_tag,
     unpin_post,
     unsave_post,
     verify_post,
     verify_store,
     without_muted_keywords,
+    without_muted_tags,
 )
 
 
@@ -4871,6 +4876,76 @@ def test_cli_mute_keyword(tmp_path, capsys):
     ]
 
 
+def test_cli_mute_tag(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    for text in ("crypto #spam to the moon", "mesh notes"):
+        assert (
+            main(
+                [
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "--json",
+                    text,
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "tan",
+                "mute-tag",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "#spam",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["tag"] == "spam"
+
+    assert main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == ["mesh notes"]
+
+    assert main(["tan", "muted-tags", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["muted_tags"][0]["tag"] == "spam"
+
+    assert (
+        main(
+            [
+                "tan",
+                "unmute-tag",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "spam",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unmuted"] is True
+
+    assert main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == [
+        "mesh notes",
+        "crypto #spam to the moon",
+    ]
+
+
 def test_save_post_round_trip(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -6492,6 +6567,162 @@ def test_follow_tag_round_trip(tmp_path):
         follow_tag(conn, "two words")
     with pytest.raises(TanError, match="not a tag"):
         unfollow_tag(conn, "")
+
+
+def test_mute_tag_round_trip(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    record = mute_tag(conn, "#MeshNet", now=1000)
+    assert record == {"tag": "meshnet", "display": "#MeshNet", "added_at": 1000.0}
+    mute_tag(conn, "ato", now=1001)
+
+    # Newest first; the display form the user typed is kept.
+    assert muted_tags(conn) == [
+        {"tag": "ato", "display": "ato", "added_at": 1001.0},
+        {"tag": "meshnet", "display": "#MeshNet", "added_at": 1000.0},
+    ]
+
+    # Re-muting is a no-op: same tag, original time and display.
+    assert mute_tag(conn, "MESHNET", now=1002) == {
+        "tag": "meshnet",
+        "display": "#MeshNet",
+        "added_at": 1000.0,
+    }
+    assert len(muted_tags(conn)) == 2
+
+    assert unmute_tag(conn, "#meshnet") is True
+    assert unmute_tag(conn, "meshnet") is False
+    assert [record["tag"] for record in muted_tags(conn)] == ["ato"]
+
+    with pytest.raises(TanError, match="not a tag"):
+        mute_tag(conn, "two words")
+    with pytest.raises(TanError, match="not a tag"):
+        unmute_tag(conn, "")
+
+    # The list is capped: one slot is already taken by "ato".
+    for index in range(MAX_MUTED_TAGS - 1):
+        conn.execute(
+            "INSERT INTO muted_tags(tag, display, added_at) VALUES(?, ?, ?)",
+            (f"tag{index}", f"tag{index}", 2000 + index),
+        )
+    conn.commit()
+    with pytest.raises(TanError, match="limited to 256"):
+        mute_tag(conn, "one-too-many")
+
+
+def test_timeline_mutes_tagged_posts(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    dave = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    tagged = create_post(conn, bob, "#meshnet from bob", name="bob", now=1000)
+    plain = create_post(conn, bob, "plain from bob", name="bob", now=1001)
+    own_tagged = create_post(conn, alice, "mine #meshnet", name="alice", now=1002)
+    stranger = create_post(conn, carol, "#meshnet from carol", name="carol", now=1003)
+    repost = create_repost(conn, dave, tagged["hash"], name="dave", now=1004)
+    authors = [author_of(alice), author_of(bob)]
+
+    follow_tag(conn, "meshnet")
+    # Baseline: the tag pulls the stranger's post and the repost in.
+    assert [post["hash"] for post in timeline(conn, authors)] == [
+        repost["hash"],
+        stranger["hash"],
+        own_tagged["hash"],
+        plain["hash"],
+        tagged["hash"],
+    ]
+
+    mute_tag(conn, "#meshnet")
+    # The muted tag wins over the followed tag and over the followed
+    # author: only the untagged post survives. A repost of a muted-tag
+    # post goes with it.
+    assert [post["hash"] for post in timeline(conn, authors)] == [plain["hash"]]
+    # Browsing the muted tag itself finds nothing either.
+    assert timeline(conn, authors, tag="meshnet") == []
+
+    # Unmuting restores everything.
+    unmute_tag(conn, "meshnet")
+    assert [post["hash"] for post in timeline(conn, authors)] == [
+        repost["hash"],
+        stranger["hash"],
+        own_tagged["hash"],
+        plain["hash"],
+        tagged["hash"],
+    ]
+
+
+def test_timeline_blanks_muted_tag_quote_preview(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    original = create_post(conn, bob, "#spam secret plans", name="bob", now=1000)
+    quote = create_quote(
+        conn, carol, original["hash"], "look at this", name="carol", now=1001
+    )
+    follow(conn, author_of(carol), name="carol")
+    authors = [author_of(alice), author_of(carol)]
+
+    # Baseline: the quote shows the original's text in its preview.
+    found = timeline(conn, authors)
+    assert [post["hash"] for post in found] == [quote["hash"]]
+    assert found[0]["quoted"]["text"] == "#spam secret plans"
+
+    mute_tag(conn, "spam")
+    # The quote itself stays — its own comment is clean — but the
+    # preview of the muted-tag original is blanked and marked muted,
+    # the same protection a muted keyword gets.
+    found = timeline(conn, authors)
+    assert [post["hash"] for post in found] == [quote["hash"]]
+    assert found[0]["quoted"]["text"] == ""
+    assert found[0]["quoted"]["muted"] is True
+    # The author view blanks it the same way.
+    found = author_timeline(conn, author_of(carol))
+    assert [post["hash"] for post in found] == [quote["hash"]]
+    assert found[0]["quoted"]["text"] == ""
+    assert found[0]["quoted"]["muted"] is True
+
+
+def test_without_muted_tags_keeps_unmuted_posts(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    noisy = create_post(conn, alice, "crypto #spam", name="alice", now=1000)
+    kept = create_post(conn, alice, "mesh notes", name="alice", now=1001)
+    repost = create_repost(conn, bob, noisy["hash"], name="bob", now=1002)
+
+    posts = [noisy, kept, repost]
+    assert without_muted_tags(conn, posts) == posts
+    mute_tag(conn, "spam")
+    # The repost goes with the post it reposts: it carries no text of
+    # its own, so it matches on the original's tags.
+    assert without_muted_tags(conn, posts) == [kept]
+
+
+def test_search_finds_muted_tag_posts(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "crypto #spam roundup", name="alice", now=1000)
+    mute_tag(conn, "spam")
+
+    # Search is an explicit lookup: it still finds the muted tag.
+    assert [item["hash"] for item in search_posts(conn, "spam")] == [post["hash"]]
+
+
+def test_author_timeline_mutes_tagged_posts(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    tagged = create_post(conn, bob, "#meshnet from bob", name="bob", now=1000)
+    plain = create_post(conn, bob, "plain from bob", name="bob", now=1001)
+
+    mute_tag(conn, "meshnet")
+    assert [post["hash"] for post in author_timeline(conn, author_of(bob))] == [
+        plain["hash"]
+    ]
+    # Browsing the author's muted tag finds nothing either.
+    assert author_timeline(conn, author_of(bob), tag="meshnet") == []
+    unmute_tag(conn, "meshnet")
+    assert [post["hash"] for post in author_timeline(conn, author_of(bob))] == [
+        plain["hash"],
+        tagged["hash"],
+    ]
 
 
 def test_timeline_includes_followed_tag_posts(identities, tmp_path):
