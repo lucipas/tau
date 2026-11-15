@@ -6598,6 +6598,45 @@ def test_timeline_followed_tag_with_no_followed_authors(identities, tmp_path):
     assert found[0].get("via_tag") == "meshnet"
 
 
+def test_timeline_followed_tag_silenced_repost_does_not_consume_limit(
+    identities, tmp_path
+):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    original = create_post(conn, bob, "#meshnet from bob", name="bob", now=1000)
+    create_repost(conn, alice, original["hash"], name="alice", now=1001)
+    tagged = create_post(conn, carol, "#meshnet from carol", name="carol", now=999)
+    authors = [author_of(alice)]
+
+    mute(conn, author_of(bob), name="bob")
+    follow_tag(conn, "meshnet")
+    # The repost is the newest post, but the timeline drops reposts of
+    # muted authors — so it must not consume the one slot the limit
+    # allows; the tagged post behind it still comes back.
+    found = timeline(conn, authors, limit=1)
+    assert [post["hash"] for post in found] == [tagged["hash"]]
+    assert found[0].get("via_tag") == "meshnet"
+
+
+def test_timeline_followed_tag_pages_past_shared_timestamps(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    posts = [
+        create_post(conn, bob, f"#meshnet post {index}", name="bob", now=1000)
+        for index in range(21)
+    ]
+    authors = [author_of(alice)]
+
+    follow_tag(conn, "meshnet")
+    # Every post shares one timestamp, so a created_at-only page cursor
+    # would strand the last page: all 21 still come back.
+    found = timeline(conn, authors, limit=21)
+    assert len(found) == 21
+    assert {post["hash"] for post in found} == {post["hash"] for post in posts}
+    assert all(post.get("via_tag") == "meshnet" for post in found)
+
+
 def test_cli_tan_follow_tag(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
