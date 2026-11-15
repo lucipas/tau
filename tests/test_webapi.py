@@ -4509,6 +4509,10 @@ def test_muted_conversations_endpoints(node, tmp_path):
         assert status == 200
         assert payload["mute"]["muted"] is False
         assert payload["mute"]["changed"] is True
+        # The unmute answer carries the restored count: the message
+        # that arrived while muted counts again.
+        assert payload["mute"]["unread"]["per_peer"] == {PEER_HASH: 1}
+        assert payload["mute"]["unread"]["total"] == 1
         counts = bridge.unread()
         assert counts["per_peer"] == {PEER_HASH: 1}
         assert counts["total"] == 1
