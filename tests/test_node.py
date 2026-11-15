@@ -2616,10 +2616,9 @@ def test_wait_for_delivery_keeps_retries_at_poll_interval(tmp_path, monkeypatch)
     # CPU-throttled machine a late wake-up could push a gap over the
     # bound (or drop the retry count below it) and fail the test
     # intermittently.  ``wait_for_delivery`` reads ``time.monotonic``
-    # and ``time.sleep`` through the ``time`` module, as does the
-    # mailbox lock it waits on, so patching both here makes the whole
-    # wait deterministic: every sleep advances the clock by exactly
-    # ``poll_interval``.
+    # and ``time.sleep`` through the ``time`` module, so patching both
+    # here makes the wait deterministic: every sleep advances the
+    # clock by exactly ``poll_interval``.
     node = make_node(tmp_path)
     entry = _seed_wait_entry(node)
     stamps = []
