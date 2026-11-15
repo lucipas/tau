@@ -7465,7 +7465,13 @@ class WebBridge:
             raise ValueError("this node has no inbox to mark unread")
         with self._unread_lock:
             moved = inbox.mark_unread(
-                peer, group=group, all=all, exclude_dm_from=self._archived_set()
+                peer,
+                group=group,
+                all=all,
+                exclude_dm_from=self._archived_set(),
+                exclude_group=load_ignored_group_ids(
+                    getattr(self.node.config, "ignored_groups_path", None)
+                ),
             )
             if moved is None:
                 target = group if group is not None else peer

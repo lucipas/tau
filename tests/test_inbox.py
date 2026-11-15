@@ -1826,6 +1826,36 @@ def test_old_per_sender_cursor_fans_out_to_each_conversation(tmp_path):
     }
 
 
+def test_old_cursors_of_two_senders_in_one_group_keep_unread_posts(tmp_path):
+    """Per-sender pre-#409 cursors must not mark another member's post read."""
+    group = "11" * 16
+    alice, bruno = "aa" * 16, "bb" * 16
+    messages = [
+        _record(id="g-alice-1", destination=alice, received_at=1.0,
+                kind="group", group=group, group_name="crew"),
+        _record(id="g-bruno-1", destination=bruno, received_at=2.0,
+                kind="group", group=group, group_name="crew"),
+        _record(id="g-alice-2", destination=alice, received_at=3.0,
+                kind="group", group=group, group_name="crew"),
+    ]
+    # Alice read everything she posted; Bruno has no cursor at all.
+    cursors = {
+        alice: {"last_read_seq": 3, "last_read_id": "g-alice-2"},
+    }
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps({"messages": messages, "read_cursors": cursors}),
+        encoding="utf-8",
+    )
+    inbox = Inbox(path)
+    # Bruno's post is unread, and so is Alice's later post that sits
+    # after it: the single group cursor cannot skip over Bruno's.
+    assert inbox.unread_counts()["per_group"] == {group: 2}
+    listed = {entry["id"]: entry["unread"] for entry in inbox.list_messages()}
+    assert listed["g-bruno-1"] is True
+    assert listed["g-alice-1"] is False
+
+
 def test_same_timestamp_messages_are_all_read_after_marking(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="first", received_at=1.0))

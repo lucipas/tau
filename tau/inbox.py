@@ -279,27 +279,32 @@ def _conversation_key(entry: Dict[str, Any]) -> str:
     return f"dm:{entry.get('destination') or ''}"
 
 
-def _cursor_conversations(key: str, messages: List[Dict[str, Any]]) -> List[str]:
-    """The conversation keys one stored cursor key covers.
+def _parse_mark(value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """One stored cursor value as ``{"seq", "at", "id"}``, or ``None`` if malformed.
 
-    A ``dm:`` or ``group:`` key covers exactly its own conversation.
-    A bare destination is the pre-#409 format — one cursor shared by
-    the sender's DM and every group they posted in — so it fans out
-    to each of those conversations, and the migration neither reads
-    nor unreads mail the owner already saw.
+    ``seq`` is set for a sequence-based cursor; ``at`` (a time) is set
+    only for a cursor saved before sequence numbers existed.
     """
-    if key.startswith("dm:") or key.startswith("group:"):
-        return [key]
-    conversations = {f"dm:{key}"}
-    for entry in messages:
-        if (
-            (entry.get("destination") or "") == key
-            and entry.get("kind") == "group"
-            and isinstance(entry.get("group"), str)
-            and entry.get("group")
-        ):
-            conversations.add(f"group:{entry['group']}")
-    return sorted(conversations)
+    last_read_id = value.get("last_read_id")
+    if last_read_id is not None and not isinstance(last_read_id, str):
+        return None
+    seq = value.get("last_read_seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+        try:
+            last_read_at = float(value.get("last_read_at"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(last_read_at):
+            return None
+        return {"seq": None, "at": last_read_at, "id": last_read_id}
+    return {"seq": seq, "at": None, "id": last_read_id}
+
+
+def _mark_covers(mark: Dict[str, Any], entry: Dict[str, Any]) -> bool:
+    """Whether a legacy cursor *mark* already covers *entry*."""
+    if mark["seq"] is not None:
+        return entry["seq"] <= mark["seq"]
+    return entry["received_at"] <= mark["at"]
 
 
 def _valid_cursors(
@@ -311,46 +316,76 @@ def _valid_cursors(
     per conversation (see :func:`_conversation_key`).  A cursor saved
     before sequence numbers carries only ``last_read_at``; it is
     resolved to the newest stored message it covered in that
-    conversation.  A cursor saved before per-conversation cursors
-    is keyed by bare sender destination and fans out to every
-    conversation that sender participates in (see
-    :func:`_cursor_conversations`).  Malformed entries are skipped;
-    a missing or non-object ``read_cursors`` section means the file
-    was written before read state existed, and the caller migrates
-    instead.
+    conversation.  Malformed entries are skipped; a missing or
+    non-object ``read_cursors`` section means the file was written
+    before read state existed, and the caller migrates instead.
+
+    A cursor saved before per-conversation cursors is keyed by bare
+    sender destination.  Its read state applies to that sender's own
+    posts only.  A group conversation then gets one cursor placed just
+    below its earliest post that was unread under those per-sender
+    cursors, so no unread post is marked read.  Posts from a sender
+    with no legacy cursor count as unread.  An explicit ``dm:`` or
+    ``group:`` cursor always wins over the migrated value.  The result
+    does not depend on the order of the stored keys.
     """
     if raw is None or not isinstance(raw, dict):
         return None
     cursors: Dict[str, Dict[str, Any]] = {}
+    legacy: Dict[str, Dict[str, Any]] = {}
     for key, value in raw.items():
         if not isinstance(key, str) or not isinstance(value, dict):
             continue
-        last_read_id = value.get("last_read_id")
-        if last_read_id is not None and not isinstance(last_read_id, str):
+        mark = _parse_mark(value)
+        if mark is None:
             continue
-        targets = _cursor_conversations(key, messages)
-        seq = value.get("last_read_seq")
-        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
-            try:
-                last_read_at = float(value.get("last_read_at"))
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(last_read_at):
-                continue
-            for target in targets:
-                covered = [
-                    entry["seq"]
-                    for entry in messages
-                    if _conversation_key(entry) == target
-                    and entry["received_at"] <= last_read_at
-                ]
-                cursors[target] = {
-                    "last_read_seq": max(covered, default=0),
-                    "last_read_id": last_read_id,
-                }
+        if not (key.startswith("dm:") or key.startswith("group:")):
+            legacy[key] = mark
             continue
-        for target in targets:
-            cursors[target] = {"last_read_seq": seq, "last_read_id": last_read_id}
+        if mark["seq"] is None:
+            covered = [
+                entry["seq"]
+                for entry in messages
+                if _conversation_key(entry) == key
+                and entry["received_at"] <= mark["at"]
+            ]
+            seq = max(covered, default=0)
+        else:
+            seq = mark["seq"]
+        cursors[key] = {"last_read_seq": seq, "last_read_id": mark["id"]}
+    conversations: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in messages:
+        conversations.setdefault(_conversation_key(entry), []).append(entry)
+    for conversation, entries in conversations.items():
+        if conversation in cursors:
+            continue
+        inbound = [entry for entry in entries if entry.get("direction") != "out"]
+        if not inbound:
+            continue
+        unread = [
+            entry["seq"]
+            for entry in inbound
+            if not (
+                (entry.get("destination") or "") in legacy
+                and _mark_covers(legacy[entry.get("destination") or ""], entry)
+            )
+        ]
+        if len(unread) == len(inbound):
+            # Nothing in this conversation was read: no cursor, so all of it
+            # stays unread.
+            continue
+        boundary = min(unread, default=None)
+        below = [
+            entry for entry in entries if boundary is None or entry["seq"] < boundary
+        ]
+        if not below:
+            # The earliest post is unread, so nothing precedes it to mark read.
+            continue
+        newest = max(below, key=lambda entry: entry["seq"])
+        cursors[conversation] = {
+            "last_read_seq": newest["seq"],
+            "last_read_id": newest.get("id"),
+        }
     return cursors
 
 
@@ -1955,6 +1990,7 @@ class Inbox:
         all: bool = False,
         group: Optional[str] = None,
         exclude_dm_from: Optional[Collection[str]] = None,
+        exclude_group: Optional[Collection[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Move a conversation's read cursor back so mail shows unread again.
 
@@ -2026,7 +2062,10 @@ class Inbox:
                 except OSError:
                     self._read_cursors = snapshot
                     raise
-            return self._unread_counts_locked(exclude_dm_from=exclude_dm_from)
+            return self._unread_counts_locked(
+                exclude_dm_from=exclude_dm_from,
+                exclude_group=exclude_group,
+            )
 
 
     def find(
