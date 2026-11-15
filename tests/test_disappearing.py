@@ -183,6 +183,28 @@ def test_send_message_applies_peer_default(tmp_path, monkeypatch):
     assert before + 3600 <= expires_at <= time.time() + 3600
 
 
+def test_send_message_default_expiry_persisted_in_sent_record(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit Major on #403: the wire payload carried the default
+    # expiry but the sender's own inbox copy did not, so Inbox._load
+    # kept the copy after the deadline. The sent record must carry it.
+    node = _make_node(tmp_path)
+    peer = _make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    _set_peer_default(node, peer, 3600)
+    monkeypatch.setattr(node, "_request", lambda *args, **kwargs: {"ok": True})
+    before = time.time()
+    node.send_message("alice", "this disappears")
+    sent = node.inbox.list_messages(limit=None, direction="out")
+    assert len(sent) == 1
+    expires_at = sent[0].get("expires_at")
+    assert expires_at is not None
+    assert before + 3600 <= expires_at <= time.time() + 3600
+
+
 def test_send_message_explicit_expire_wins_over_default(tmp_path, monkeypatch):
     node = _make_node(tmp_path)
     peer = _make_peer()
@@ -283,6 +305,30 @@ def test_send_group_message_applies_group_default(tmp_path, monkeypatch):
         expires_at = parse_group_message(payload)["expires_at"]
         assert expires_at is not None
         assert before + 300 <= expires_at <= time.time() + 300
+
+
+def test_send_group_message_default_expiry_persisted_in_sent_record(
+    tmp_path, monkeypatch
+):
+    # Same CodeRabbit Major as the DM case, for the group path: the
+    # one inbox record per group send must carry the default expiry.
+    node, group, alice, bob = _group_node(tmp_path)
+    save_disappearing_defaults(
+        node.config.disappearing_path,
+        DisappearingDefaults(groups={group["id"]: 300}),
+    )
+    monkeypatch.setattr(
+        node, "_request", lambda *a, **k: {"ok": True, "_rtt": 0.004}
+    )
+    before = time.time()
+    response = node.send_group_message("crew", "this disappears for all")
+    assert response["ok"] is True
+    sent = node.inbox.list_messages(limit=None, direction="out")
+    assert len(sent) == 1
+    assert sent[0].get("kind") == "group"
+    expires_at = sent[0].get("expires_at")
+    assert expires_at is not None
+    assert before + 300 <= expires_at <= time.time() + 300
 
 
 def test_send_group_message_explicit_expire_wins(tmp_path, monkeypatch):
@@ -387,6 +433,35 @@ def test_resolve_inbox_peer_ambiguous_alias_raises(tmp_path):
     registry = types.SimpleNamespace(all=lambda: [first, second])
     with pytest.raises(cli.NodeError, match="share the alias"):
         cli._resolve_inbox_peer(inbox, registry, "work")
+
+
+def test_disappearing_peer_prefers_alias_over_name_end_to_end(
+    tmp_path, capsys
+):
+    # Same alias-precedence Major, end to end through the command: one
+    # peer named "work", another aliased "work" — the disappearing
+    # command must store the default for the aliased peer.
+    from tau.identity import destination_hash
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    named = RNS.Identity()
+    named_hash = destination_hash(named)
+    registry.upsert(named_hash, named.get_public_key(), name="work", now=100.0)
+    aliased = RNS.Identity()
+    aliased_hash = destination_hash(aliased)
+    registry.upsert(aliased_hash, aliased.get_public_key(), name="bob", now=100.0)
+    registry.set_alias(aliased_hash, "work")
+    registry.save()
+
+    code = cli.main(
+        ["disappearing", "--data-dir", str(data_dir), "--peer", "work", "1h"]
+    )
+    assert code == 0
+    defaults = load_disappearing_defaults(data_dir / "disappearing.json")
+    assert defaults.peer_default(aliased_hash.hex()) == 3600.0
+    assert defaults.peer_default(named_hash.hex()) is None
 
 
 def test_disappearing_peer_roundtrip(tmp_path, capsys):
