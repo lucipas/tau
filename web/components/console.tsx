@@ -17,6 +17,21 @@ import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
 import { SettingsSection } from "./settings-section";
 
+// Defaults are stored under canonical destination hashes, but a custom
+// target can be a name, a hash with stray whitespace, or mixed case.
+// Map it to the stored key so the picker shows the saved default.
+function canonicalPeerTarget(target: string, peers: Peer[]): string {
+  const trimmed = target.trim();
+  const lowered = trimmed.toLowerCase();
+  const match = peers.find(
+    (peer) =>
+      peer.destination.toLowerCase() === lowered ||
+      peer.name === trimmed ||
+      peer.alias === trimmed,
+  );
+  return match ? match.destination.toLowerCase() : lowered;
+}
+
 // Peers whose conversation is not archived: the only peers the console
 // offers as send targets. An archived thread stays hidden until restored.
 function activePeersOf(
@@ -451,6 +466,33 @@ export function Console() {
               onSendGroupFile={tau.sendGroupFile}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
+              disappearingDefault={
+                target.trim() === ""
+                  ? null
+                  : mode === "group"
+                    ? (tau.disappearingDefaults.groups[target.trim()] ?? null)
+                    : (tau.disappearingDefaults.peers[
+                        canonicalPeerTarget(target, tau.peers)
+                      ] ?? null)
+              }
+              disappearingError={tau.disappearingError}
+              onSetDisappearingDefault={
+                target.trim() === ""
+                  ? undefined
+                  : async (seconds) => {
+                      if (mode === "group") {
+                        await tau.setDisappearingDefault(
+                          { group: target },
+                          seconds,
+                        );
+                      } else {
+                        await tau.setDisappearingDefault(
+                          { peer: target },
+                          seconds,
+                        );
+                      }
+                    }
+              }
             />
             <div className="mt-4">
               <SettingsSection

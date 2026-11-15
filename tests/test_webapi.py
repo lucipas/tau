@@ -4319,6 +4319,124 @@ def test_archive_without_data_dir(bridge):
     assert payload == {"archived": [], "count": 0}
 
 
+def test_disappearing_defaults_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert status == 200
+        assert payload == {"peers": {}, "groups": {}}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"peer": "alice", "seconds": 3600},
+        )
+        assert status == 200
+        assert payload["disappearing"] == {
+            "target": PEER_HASH,
+            "group": False,
+            "disappearing_seconds": 3600,
+            "changed": True,
+        }
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert payload == {"peers": {PEER_HASH: 3600.0}, "groups": {}}
+
+        # A group default is keyed by group id, resolved by name.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"group": "crew", "seconds": 300},
+        )
+        assert status == 200
+        assert payload["disappearing"]["group"] is True
+        assert payload["disappearing"]["disappearing_seconds"] == 300
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert payload["groups"] != {}
+        assert list(payload["groups"].values()) == [300.0]
+
+        # Clearing removes the entry; clearing again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"peer": "alice", "seconds": None},
+        )
+        assert status == 200
+        assert payload["disappearing"]["disappearing_seconds"] is None
+        assert payload["disappearing"]["changed"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"peer": "alice", "seconds": None},
+        )
+        assert payload["disappearing"]["changed"] is False
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert payload["peers"] == {}
+    finally:
+        bridge.stop()
+
+
+def test_disappearing_defaults_endpoint_rejects_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"peer": "alice", "group": "crew", "seconds": 60},
+            {"peer": "alice", "seconds": 0},
+            {"peer": "alice", "seconds": -5},
+            {"peer": "alice", "seconds": 31 * 24 * 3600},
+            {"peer": "alice", "seconds": "1h"},
+            {"peer": "alice", "seconds": True},
+            {"peer": "nobody", "seconds": 60},
+            {"peer": "  ", "seconds": 60},
+            {"group": "nobody", "seconds": 60},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/messages/disappearing", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_disappearing_defaults_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "disappearing.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"peer": "alice", "seconds": 60},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert status == 503
+    finally:
+        bridge.stop()
+
+
+def test_disappearing_defaults_without_data_dir(bridge):
+    # A dataless node has no disappearing-defaults path: edits are
+    # refused, but the list still answers empty instead of failing the
+    # console poll.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/disappearing",
+        method="POST",
+        body={"peer": "alice", "seconds": 60},
+    )
+    assert status == 503
+    status, _, payload = _json(bridge, "/api/messages/disappearing")
+    assert status == 200
+    assert payload == {"peers": {}, "groups": {}}
+
+
 def test_tan_mute_via_api(tmp_path):
     import RNS
 
@@ -7387,7 +7505,7 @@ def _queue_send(node, mail_id="mail-1"):
             "queued": True,
             "id": mail_id,
             "to": peer.hexhash,
-            "expires_at": 9999.0,
+            "expires_at": time.time() + 3600,
         }
 
     node.send_message = _send
@@ -7599,7 +7717,7 @@ def test_delivery_before_record_is_not_lost(bridge, node):
             "queued": True,
             "id": "mail-1",
             "to": peer.hexhash,
-            "expires_at": 9999.0,
+            "expires_at": time.time() + 3600,
         }
 
     node.send_message = _send

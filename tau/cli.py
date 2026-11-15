@@ -59,6 +59,13 @@ from .config import (
     write_node_metadata,
     write_rns_config,
 )
+from .disappearing import (
+    MAX_DISAPPEARING_SECONDS,
+    DisappearingError,
+    disappearing_lock,
+    load_disappearing_defaults,
+    save_disappearing_defaults,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request,
@@ -1074,6 +1081,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unarchive.add_argument("peer", help="peer name, destination hash or hash prefix")
     unarchive.set_defaults(func=cmd_unarchive)
+
+    disappearing = subparsers.add_parser(
+        "disappearing",
+        parents=[common],
+        help="set, show or clear a per-conversation disappearing-message default",
+    )
+    disappearing_target = disappearing.add_mutually_exclusive_group(required=True)
+    disappearing_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    disappearing_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    disappearing.add_argument(
+        "duration",
+        nargs="?",
+        metavar="DURATION",
+        help="default lifetime from 1s to 7d, like 30s, 5m, 2h or 7d (omit to show the current setting)",
+    )
+    disappearing.add_argument(
+        "--off",
+        action="store_true",
+        help="clear the default for this conversation",
+    )
+    disappearing.set_defaults(func=cmd_disappearing)
 
     archived = subparsers.add_parser(
         "archived",
@@ -5710,6 +5746,9 @@ def _reconcile_queued_sends(
         ):
             to_hex = result["to"]
             target = result["target"]
+            # The node reports the effective expiry (explicit or the
+            # per-conversation default); prefer it over the caller's.
+            effective_expires = result.get("expires_at", expires_at)
             # Keep the private "_" fields (e.g. the resolved reply id).
             private = {k: v for k, v in result.items() if k.startswith("_")}
             result.clear()
@@ -5721,8 +5760,8 @@ def _reconcile_queued_sends(
                     "id": message_id,
                     "to": to_hex,
                     **(
-                        {"expires_at": expires_at}
-                        if expires_at is not None
+                        {"expires_at": effective_expires}
+                        if effective_expires is not None
                         else {}
                     ),
                     **private,
@@ -6832,7 +6871,10 @@ def _resolve_inbox_peer(
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
     A full destination hash filters directly, and an exact name match
-    wins over any prefix.  For a hash prefix, registered peers and
+    wins over any prefix.  Aliases resolve before names, matching
+    ``PeerRegistry.resolve`` and the message-send path: when one peer's
+    name equals another peer's alias, ``--peer`` must pick the same
+    peer a send would.  For a hash prefix, registered peers and
     senders stored in the inbox are combined before selecting: a
     prefix shared by two distinct senders is ambiguous, even when one
     of them is registered and the other is not (pruned, or never
@@ -6844,6 +6886,18 @@ def _resolve_inbox_peer(
     if _is_hex32(target):
         return target.lower()
     peers = registry.all()
+    by_alias = [
+        peer
+        for peer in peers
+        if peer.alias and peer.alias.casefold() == target.casefold()
+    ]
+    if len(by_alias) == 1:
+        return by_alias[0].hexhash
+    if len(by_alias) > 1:
+        raise NodeError(
+            f"{len(by_alias)} peers share the alias {target!r}; "
+            "use a destination hash"
+        )
     by_name = [peer for peer in peers if peer.name.casefold() == target.casefold()]
     if len(by_name) == 1:
         return by_name[0].hexhash
@@ -8010,6 +8064,98 @@ def cmd_unarchive(args: argparse.Namespace) -> int:
         print(
             f"Conversation with {name} ({short_hash(destination)}) "
             "was not archived."
+        )
+    return _EXIT_OK
+
+
+def cmd_disappearing(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    if getattr(args, "off", False) and args.duration is not None:
+        print("error: --off and a duration cannot be combined", file=sys.stderr)
+        return _EXIT_ERROR
+    if args.group is not None:
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
+        key = group["id"]
+        label = f"group {group['name']} ({short_hash(key)})"
+        is_group = True
+    else:
+        inbox = Inbox(config.inbox_path)
+        registry = PeerRegistry(config.peers_path)
+        key = _resolve_inbox_peer(inbox, registry, args.peer)
+        peer = registry.get(key)
+        name = peer.display_name if peer is not None else "unknown"
+        label = f"conversation with {name} ({short_hash(key)})"
+        is_group = False
+    seconds = None
+    if args.duration is not None:
+        try:
+            seconds = _parse_duration(
+                args.duration,
+                label="duration",
+                max_seconds=MAX_DISAPPEARING_SECONDS,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+    # Reload inside the lock: two disappearing commands racing must not
+    # discard each other's change to a different conversation.
+    with disappearing_lock(config.disappearing_path):
+        try:
+            defaults = load_disappearing_defaults(config.disappearing_path)
+        except DisappearingError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        if is_group:
+            previous = defaults.group_default(key)
+            if getattr(args, "off", False):
+                defaults = defaults.without_group(key)
+            elif seconds is not None:
+                defaults = defaults.with_group(key, seconds)
+        else:
+            previous = defaults.peer_default(key)
+            if getattr(args, "off", False):
+                defaults = defaults.without_peer(key)
+            elif seconds is not None:
+                defaults = defaults.with_peer(key, seconds)
+        changed = (previous != seconds) if seconds is not None or getattr(
+            args, "off", False
+        ) else False
+        if seconds is not None or getattr(args, "off", False):
+            save_disappearing_defaults(config.disappearing_path, defaults)
+    current = seconds if seconds is not None else (
+        None if getattr(args, "off", False) else previous
+    )
+    if _json_mode(args):
+        _emit(
+            {
+                "target": key,
+                "group": is_group,
+                "disappearing_seconds": current,
+                "changed": changed,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if seconds is not None:
+        print(
+            f"Messages to {label} now disappear after "
+            f"{_describe_duration(seconds)} unless a send passes its own --expire."
+        )
+    elif getattr(args, "off", False):
+        if previous is None:
+            print(f"Messages to {label} already had no disappearing default.")
+        else:
+            print(f"Cleared the disappearing default for {label}.")
+    elif previous is None:
+        print(
+            f"Messages to {label} have no disappearing default; "
+            "pass a duration like 1h to set one."
+        )
+    else:
+        print(
+            f"Messages to {label} disappear after "
+            f"{_describe_duration(previous)} unless a send passes its own --expire."
         )
     return _EXIT_OK
 

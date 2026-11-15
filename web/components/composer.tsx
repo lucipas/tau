@@ -8,6 +8,25 @@ import { formatFileSize } from "@/lib/format";
 
 import { SendIcon } from "./ui";
 
+// Shortest whole-unit rendering of a duration in seconds, for the
+// disappearing-default picker: 90s stays "90s", 3600 becomes "1h".
+function describeDuration(seconds: number): string {
+  for (const [suffix, size] of [
+    ["d", 86400],
+    ["h", 3600],
+    ["m", 60],
+    ["s", 1],
+  ] as const) {
+    if (seconds >= size && seconds % size === 0) {
+      return `${seconds / size}${suffix}`;
+    }
+  }
+  return `${seconds}s`;
+}
+
+// Durations the disappearing-default picker offers as presets.
+const DISAPPEARING_PRESETS: number[] = [30, 300, 3600, 86400, 604800];
+
 export function Composer({
   peers,
   groups,
@@ -21,6 +40,9 @@ export function Composer({
   onSendGroupFile,
   replyTo,
   onCancelReply,
+  disappearingDefault,
+  onSetDisappearingDefault,
+  disappearingError,
 }: {
   peers: Peer[];
   groups: TauGroup[];
@@ -49,12 +71,16 @@ export function Composer({
   ) => Promise<TauMessage[]>;
   replyTo?: TauMessage | null;
   onCancelReply?: () => void;
+  disappearingDefault?: number | null;
+  onSetDisappearingDefault?: (seconds: number | null) => Promise<void>;
+  disappearingError?: string | null;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expireSeconds, setExpireSeconds] = useState<number | null>(null);
   const [sendSeconds, setSendSeconds] = useState<number | null>(null);
+  const [savingDefault, setSavingDefault] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -70,6 +96,33 @@ export function Composer({
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
+
+  async function changeDisappearingDefault(value: string) {
+    if (!onSetDisappearingDefault) return;
+    const seconds = value === "" ? null : Number(value);
+    setSavingDefault(true);
+    setError(null);
+    try {
+      await onSetDisappearingDefault(seconds);
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "could not save disappearing default",
+      );
+    } finally {
+      setSavingDefault(false);
+    }
+  }
+
+  // With no per-message expiry picked, the conversation default is
+  // what the send carries; a scheduled send ignores it.
+  const defaultHint =
+    disappearingDefault != null && expireSeconds === null
+      ? sendSeconds !== null
+        ? `default ${describeDuration(disappearingDefault)} — scheduled sends ignore it`
+        : `messages disappear after ${describeDuration(disappearingDefault)} by default`
+      : null;
 
   async function submit() {
     const trimmedTarget = target.trim();
@@ -410,13 +463,55 @@ export function Composer({
             }}
             className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
           >
-            <option value="">never</option>
+            <option value="">
+              {disappearingDefault != null
+                ? `default (${describeDuration(disappearingDefault)})`
+                : "never"}
+            </option>
             <option value="300">in 5 minutes</option>
             <option value="3600">in 1 hour</option>
             <option value="86400">in 1 day</option>
             <option value="604800">in 7 days</option>
           </select>
         </label>
+        {onSetDisappearingDefault ? (
+          <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+            default expiry
+            <select
+              aria-label="Disappearing default"
+              disabled={savingDefault}
+              value={
+                disappearingDefault == null
+                  ? ""
+                  : String(disappearingDefault)
+              }
+              onChange={(event) => {
+                void changeDisappearingDefault(event.target.value);
+              }}
+              className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60 disabled:opacity-50"
+            >
+              <option value="">off</option>
+              {disappearingDefault != null &&
+              !DISAPPEARING_PRESETS.includes(disappearingDefault) ? (
+                // A default set from the CLI to another value (e.g. 2h)
+                // must still show as selected, not fall back to "off".
+                <option value={String(disappearingDefault)}>
+                  {describeDuration(disappearingDefault)}
+                </option>
+              ) : null}
+              <option value="30">30s</option>
+              <option value="300">5m</option>
+              <option value="3600">1h</option>
+              <option value="86400">1d</option>
+              <option value="604800">7d</option>
+            </select>
+          </label>
+        ) : null}
+        {defaultHint ? (
+          <span className="font-mono text-[10px] text-mist/70">
+            {defaultHint}
+          </span>
+        ) : null}
       </div>
     </section>
   );

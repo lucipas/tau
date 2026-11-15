@@ -35,6 +35,7 @@ FILES_DIR_NAME = "files"
 BLOCKLIST_FILE_NAME = "blocklist.json"
 IGNORED_GROUPS_FILE_NAME = "ignored-groups.json"
 ARCHIVED_FILE_NAME = "archived.json"
+DISAPPEARING_FILE_NAME = "disappearing.json"
 DM_REQUESTS_FILE_NAME = "dm-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
 NODE_LOCK_FILE_NAME = "node.lock"
@@ -70,6 +71,7 @@ class TauConfig:
     blocklist_path: Path
     ignored_groups_path: Path
     archived_path: Path
+    disappearing_path: Path
     dm_requests_path: Path
     scheduled_posts_path: Path
     name: str
@@ -111,6 +113,7 @@ class TauConfig:
             blocklist_path=base / BLOCKLIST_FILE_NAME,
             ignored_groups_path=base / IGNORED_GROUPS_FILE_NAME,
             archived_path=base / ARCHIVED_FILE_NAME,
+            disappearing_path=base / DISAPPEARING_FILE_NAME,
             dm_requests_path=base / DM_REQUESTS_FILE_NAME,
             scheduled_posts_path=base / SCHEDULED_POSTS_FILE_NAME,
             name=node_name,

@@ -180,6 +180,12 @@ from .archive import (
     load_archived_set,
     save_archive,
 )
+from .disappearing import (
+    DisappearingError,
+    disappearing_lock,
+    load_disappearing_defaults,
+    save_disappearing_defaults,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
@@ -192,6 +198,7 @@ from .blocklist import BlockList, BlockListError, load_blocked_set, load_blockli
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
     ARCHIVED_FILE_NAME,
+    DISAPPEARING_FILE_NAME,
     MESSAGES_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
@@ -910,6 +917,10 @@ class WebBridge:
         # console requests cannot overwrite each other's changes.
         self._blocklist_lock = threading.Lock()
         self._archive_lock = threading.Lock()
+        # Serializes disappearing-default read-modify-write cycles the
+        # same way, so concurrent console requests cannot overwrite each
+        # other's conversation.
+        self._disappearing_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -3696,6 +3707,9 @@ class WebBridge:
             send_after=send_after,
         )
         queued = bool(response.get("queued"))
+        # Record the effective expiry (explicit or per-conversation
+        # default), so the console purges this outgoing copy on time.
+        effective_expires = _effective_expires_at(response, expires_at)
         # The outbox id links this record to a later delivery; only
         # present while the message is queued.
         mail_id = response.get("id") if queued else None
@@ -3713,7 +3727,7 @@ class WebBridge:
                 status="queued" if queued else "delivered",
                 rtt=_as_float(response.get("_rtt")),
                 mail_id=mail_id,
-                expires_at=expires_at,
+                expires_at=effective_expires,
                 send_after=send_after,
                 wire_id=wire_id,
                 # A live send went out over the direct link by
@@ -3870,6 +3884,7 @@ class WebBridge:
         # message returns it): record that on each outbound entry, not
         # a post-delivery timestamp, so reacting to a leg from the
         # console names the logical message every member holds.
+        effective_expires = _effective_expires_at(response, expires_at)
         wire_sent_at = response.get("sent_at")
         if not isinstance(wire_sent_at, (int, float)) or isinstance(
             wire_sent_at, bool
@@ -3911,7 +3926,7 @@ class WebBridge:
                     mail_id=mail_id,
                     group=group_record["id"],
                     group_name=group_record.get("name") or "",
-                    expires_at=expires_at,
+                    expires_at=effective_expires,
                     send_after=send_after,
                     in_reply_to=in_reply_to,
                     wire_id=wire_id,
@@ -6441,6 +6456,108 @@ class WebBridge:
         """Restore an archived conversation, mirroring ``tau unarchive``."""
         return self._edit_archive(target, archive=False)
 
+    def _disappearing_path(self) -> Optional[Path]:
+        """This node's disappearing-defaults path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "disappearing_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / DISAPPEARING_FILE_NAME
+
+    def disappearing_defaults(self) -> Dict[str, Any]:
+        """All per-conversation disappearing defaults, for the console load.
+
+        Mirrors the stored file: peer destination hashes and group ids,
+        each mapped to its default lifetime in seconds.  A corrupt file
+        is a 503 — the owner repairs or removes it before the console
+        shows defaults, the same as the archive list.
+        """
+        path = self._disappearing_path()
+        if path is None:
+            return {"peers": {}, "groups": {}}
+        try:
+            defaults = load_disappearing_defaults(path)
+        except DisappearingError as exc:
+            raise WebBridgeError(
+                "disappearing defaults on disk are unusable; fix or remove them "
+                f"before editing ({exc})"
+            ) from exc
+        return {"peers": dict(defaults.peers), "groups": dict(defaults.groups)}
+
+    def set_disappearing_default(
+        self,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+        seconds: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Set or clear one conversation's disappearing default.
+
+        Exactly one of *peer* (registry name, hash or prefix) or *group*
+        (id, prefix or name) names the conversation; *seconds* is the
+        default lifetime, or ``None`` to clear it.  Mirrors
+        ``tau disappearing``: the list is reloaded inside the lock so
+        two writes racing cannot discard each other's conversation, a
+        bad duration is a :class:`ValueError`, and a corrupt file is a
+        503.  The node picks the default up on the next send — every
+        read reloads the file, so there is no cached copy to refresh.
+        """
+        if (peer is None) == (group is None):
+            raise ValueError("exactly one of 'peer' or 'group' is required")
+        if group is not None:
+            if not isinstance(group, str) or not group.strip():
+                raise ValueError("field 'group' is required")
+            record = self.node.groups.find(group.strip())
+            key = record["id"]
+            is_group = True
+        else:
+            if not isinstance(peer, str) or not peer.strip():
+                raise ValueError("field 'peer' is required")
+            key = self._resolve_block_target(peer.strip())
+            is_group = False
+        path = self._disappearing_path()
+        if path is None:
+            raise WebBridgeError("this node has no disappearing-defaults path")
+        with self._disappearing_lock, disappearing_lock(path):
+            try:
+                current = load_disappearing_defaults(path)
+            except DisappearingError as exc:
+                raise WebBridgeError(
+                    "disappearing defaults on disk are unusable; fix or remove them "
+                    f"before editing ({exc})"
+                ) from exc
+            try:
+                if is_group:
+                    previous = current.group_default(key)
+                    updated = (
+                        current.without_group(key)
+                        if seconds is None
+                        else current.with_group(key, seconds)
+                    )
+                else:
+                    previous = current.peer_default(key)
+                    updated = (
+                        current.without_peer(key)
+                        if seconds is None
+                        else current.with_peer(key, seconds)
+                    )
+            except DisappearingError as exc:
+                raise ValueError(str(exc)) from exc
+            changed = (previous != seconds) if seconds is not None else (
+                previous is not None
+            )
+            if changed:
+                save_disappearing_defaults(path, updated)
+        return {
+            "target": key,
+            "group": is_group,
+            "disappearing_seconds": seconds,
+            "changed": changed,
+        }
+
     def archived_conversations(self) -> Dict[str, Any]:
         """Archived DM conversations, with the console log's message counts.
 
@@ -7533,6 +7650,24 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
+def _effective_expires_at(response: Any, fallback: Optional[float]) -> Optional[float]:
+    """The node's effective expiry for a send, or *fallback* when absent.
+
+    A send with no explicit expiry may still expire by the
+    per-conversation default; the node reports that value so the
+    console record can carry it and be purged on time.
+    """
+    if not isinstance(response, dict):
+        return fallback
+    value = response.get("expires_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return fallback
+    value = float(value)
+    if not math.isfinite(value):
+        return fallback
+    return value
+
+
 def file_arrival_text(record: Dict[str, Any]) -> str:
     """Feed line for a received file: name, size and short SHA-256.
 
@@ -7753,6 +7888,28 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/conversations/archived":
                 try:
                     result = self.bridge.archived_conversations()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
+            if path == "/api/messages/disappearing":
+                # The full map names every locally configured conversation,
+                # including peers absent from the registry, so it goes
+                # only to the local machine, like the messages export.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "disappearing defaults are only available from localhost"
+                            }
+                        },
+                        head_only,
+                        403,
+                    )
+                    return
+                try:
+                    result = self.bridge.disappearing_defaults()
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
@@ -8321,6 +8478,23 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "archive": result}, head_only)
+                return
+            if path == "/api/messages/disappearing":
+                try:
+                    result = self.bridge.set_disappearing_default(
+                        peer=body.get("peer"),
+                        group=body.get("group"),
+                        seconds=body.get("seconds"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "disappearing": result}, head_only)
                 return
             if path == "/api/messages/import":
                 try:
@@ -10339,4 +10513,3 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
-

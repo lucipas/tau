@@ -231,6 +231,30 @@ export interface ArchiveConversationResponse {
   archive: ArchiveConversationResult;
 }
 
+// Per-conversation disappearing-message defaults: peer destination
+// hashes and group ids, each mapped to its default lifetime in seconds.
+export interface DisappearingDefaults {
+  peers: Record<string, number>;
+  groups: Record<string, number>;
+}
+
+export interface DisappearingDefaultsResponse {
+  peers: Record<string, number>;
+  groups: Record<string, number>;
+}
+
+export interface DisappearingResult {
+  target: string;
+  group: boolean;
+  disappearing_seconds: number | null;
+  changed: boolean;
+}
+
+export interface DisappearingResponse {
+  ok: boolean;
+  disappearing: DisappearingResult;
+}
+
 export interface InterfaceInfo {
   name: string;
   online: boolean;
