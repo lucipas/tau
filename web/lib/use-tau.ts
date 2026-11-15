@@ -211,8 +211,9 @@ export function useTau() {
   // The latest restored-mail signal from an unread event: mail an
   // unmute or unignore in another console restored, not new
   // arrivals. The console holds the restored count for its open
-  // conversation instead of auto-reading it; null means the last
-  // unread update restored nothing.
+  // conversation instead of auto-reading it. The signal stays until a
+  // newer restored event or a snapshot replaces it, so a batched
+  // ordinary update cannot erase it first; null means none is pending.
   const [restoredUnread, setRestoredUnread] =
     useState<RestoredUnread[] | null>(null);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
@@ -390,13 +391,7 @@ export function useTau() {
   // count at least as new as the last one applied may replace state.
   // `restored` rides the same event, so a stale count drops its
   // restored signal with it instead of holding mail the counts no
-  // longer show.  A plain update carries no restored signal and must
-  // not erase a pending one: an ordinary message event or read
-  // response that lands before the console's effect runs would
-  // otherwise lose the restore and auto-read the restored mail.  The
-  // signal is replaced only by a newer restore; the console's hold
-  // effect acts on each new signal and ignores a stale one, since a
-  // conversation opened later marks itself read on open.
+  // longer show.
   const applyUnread = useCallback(
     (
       counts: UnreadCounts,
@@ -407,7 +402,11 @@ export function useTau() {
       if (!reset && revision < unreadRevision.current) return;
       unreadRevision.current = revision;
       setUnread(counts);
-      if (restored !== null) setRestoredUnread(restored);
+      // An ordinary update must not erase a pending restored signal: a
+      // batch can carry one alongside a plain count, and the console
+      // has not consumed it yet. Only a snapshot (reset) or a newer
+      // restored event replaces it.
+      if (reset || restored !== null) setRestoredUnread(restored);
     },
     [],
   );
