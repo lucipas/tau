@@ -153,12 +153,21 @@ export function Console() {
   // level releases it, so a conversation that gets new mail while open
   // still reads as read. Reopening the conversation clears it too.
   const manualUnread = useRef(new Map<string, number>());
+  // How many times each conversation has been (re)opened: a mark-unread
+  // response that arrives after a reopen must not reinstall its hold.
+  const unreadGen = useRef(new Map<string, number>());
 
   // The open conversation reads as read: the auto-selected one on load,
   // and one that gets new mail while it stays open. A failed call leaves
   // the badge in place until the count next changes.
   useEffect(() => {
-    if (!target || openUnread === 0) return;
+    if (!target) return;
+    if (openUnread === 0) {
+      // Read elsewhere (another tab, the CLI): the reminder is gone,
+      // so the hold goes with it — new mail must auto-read again.
+      manualUnread.current.delete(target);
+      return;
+    }
     const held = manualUnread.current.get(target);
     if (held !== undefined && openUnread <= held) return;
     if (held !== undefined) manualUnread.current.delete(target);
@@ -173,6 +182,10 @@ export function Console() {
     // Reopening clears any mark-unread hold: opening the conversation
     // marks it read, as before.
     manualUnread.current.delete(destination);
+    unreadGen.current.set(
+      destination,
+      (unreadGen.current.get(destination) ?? 0) + 1,
+    );
     // Opening the conversation advances its read cursor on the node,
     // so the badge clears. A failed call leaves the badge in place.
     void tau.markRead(destination).catch(() => undefined);
@@ -286,7 +299,13 @@ export function Console() {
               await tau.unarchiveConversation(destination);
             }}
             onMarkUnread={async (destination, all = false) => {
+              const gen = unreadGen.current.get(destination) ?? 0;
               const counts = await tau.markUnread(destination, all);
+              // A reopen since the click invalidates this hold, and so
+              // does leaving the conversation: install it only if this
+              // selection is still current and still open.
+              if ((unreadGen.current.get(destination) ?? 0) !== gen) return;
+              if (targetRef.current !== destination) return;
               manualUnread.current.set(
                 destination,
                 counts.per_peer[destination] ?? 0,

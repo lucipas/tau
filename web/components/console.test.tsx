@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { Peer, TauGroup } from "@/lib/types";
@@ -276,6 +276,26 @@ describe("Console mark unread", () => {
     );
     expect(markRead).not.toHaveBeenCalled();
 
+    // Read elsewhere clears the hold: the count drops to zero, and the
+    // next message auto-reads again instead of sticking at the held level.
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      markRead,
+      markUnread,
+      unread: { per_peer: {}, total: 0 },
+    });
+    rerender(<Console />);
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      markRead,
+      markUnread,
+      unread: { per_peer: { [alice.destination]: 1 }, total: 1 },
+    });
+    rerender(<Console />);
+    await waitFor(() =>
+      expect(markRead).toHaveBeenCalledWith(alice.destination),
+    );
+
     // New mail above the held level releases the hold: the open
     // conversation reads as read again.
     mockedUseTau.mockReturnValue({
@@ -288,5 +308,64 @@ describe("Console mark unread", () => {
     await waitFor(() =>
       expect(markRead).toHaveBeenCalledWith(alice.destination),
     );
+  });
+
+  it("does not reinstall a hold after the conversation was reopened", async () => {
+    const alice = makePeer("ab".repeat(16), "alice");
+    const bob = makePeer("cd".repeat(16), "bob");
+    const markRead = vi.fn().mockResolvedValue({ per_peer: {}, total: 0 });
+    let resolveMark!: (value: {
+      per_peer: Record<string, number>;
+      total: number;
+    }) => void;
+    const markUnread = vi.fn(
+      () =>
+        new Promise<{
+          per_peer: Record<string, number>;
+          total: number;
+        }>((resolve) => {
+          resolveMark = resolve;
+        }),
+    );
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      markRead,
+      markUnread,
+    });
+
+    const { rerender } = render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("alice · abababab")).toBeTruthy(),
+    );
+
+    // Start a mark-unread, then reopen the conversation before it lands.
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Mark conversation with alice unread",
+      }),
+    );
+    await waitFor(() =>
+      expect(markUnread).toHaveBeenCalledWith(alice.destination, false),
+    );
+    fireEvent.click(
+      screen.getByTitle(`Message alice (${alice.destination})`),
+    );
+    await waitFor(() =>
+      expect(markRead).toHaveBeenCalledWith(alice.destination),
+    );
+
+    // The late response must not reinstall the hold: the count it
+    // produced auto-reads like any new mail.
+    await act(async () => {
+      resolveMark({ per_peer: { [alice.destination]: 1 }, total: 1 });
+    });
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      markRead,
+      markUnread,
+      unread: { per_peer: { [alice.destination]: 1 }, total: 1 },
+    });
+    rerender(<Console />);
+    await waitFor(() => expect(markRead).toHaveBeenCalledTimes(2));
   });
 });

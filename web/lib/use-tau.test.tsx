@@ -10,6 +10,7 @@ import type {
   Snapshot,
   TauGroup,
   TauMessage,
+  UnreadCounts,
 } from "./types";
 import { useTau } from "./use-tau";
 
@@ -2244,6 +2245,51 @@ describe("useTau archived conversations", () => {
     expect(result.current.unread).toEqual({
       per_peer: { [PEER_HASH]: 2 },
       total: 2,
+      revision: undefined,
+    });
+    unmount();
+  });
+
+  it("sends a mark-unread only after an earlier mark-read finishes", async () => {
+    const { result, unmount } = renderHook(() => useTau());
+    const first = deferred<{ ok: boolean; unread: UnreadCounts }>();
+    const second = deferred<{ ok: boolean; unread: UnreadCounts }>();
+    mockedPost
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+
+    // Both writes start at once; only the first may hit the server.
+    let readDone: Promise<UnreadCounts> | undefined;
+    let unreadDone: Promise<UnreadCounts> | undefined;
+    await act(async () => {
+      readDone = result.current.markRead(PEER_HASH);
+      unreadDone = result.current.markUnread(PEER_HASH);
+    });
+    await waitFor(() => expect(mockedPost).toHaveBeenCalledTimes(1));
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/read", {
+      peer: PEER_HASH,
+    });
+
+    // The read's response releases the unread write, in issue order.
+    await act(async () => {
+      first.resolve({ ok: true, unread: { per_peer: {}, total: 0 } });
+      await readDone;
+    });
+    await waitFor(() => expect(mockedPost).toHaveBeenCalledTimes(2));
+    expect(mockedPost).toHaveBeenNthCalledWith(2, "/api/messages/unread", {
+      peer: PEER_HASH,
+      all: false,
+    });
+    await act(async () => {
+      second.resolve({
+        ok: true,
+        unread: { per_peer: { [PEER_HASH]: 1 }, total: 1 },
+      });
+      await unreadDone;
+    });
+    expect(result.current.unread).toEqual({
+      per_peer: { [PEER_HASH]: 1 },
+      total: 1,
       revision: undefined,
     });
     unmount();

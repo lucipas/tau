@@ -116,8 +116,11 @@ export function PeerSidebar({
   const [archiveErrors, setArchiveErrors] = useState<Record<string, string>>(
     {},
   );
-  const [markingUnreadId, setMarkingUnreadId] = useState<string | null>(
-    null,
+  // Pending mark-unread destinations, one entry each: a single shared
+  // id would let one row's finish re-enable another row's button while
+  // its own request is still running.
+  const [markingUnread, setMarkingUnread] = useState<ReadonlySet<string>>(
+    new Set(),
   );
   const [markUnreadErrors, setMarkUnreadErrors] = useState<
     Record<string, string>
@@ -204,7 +207,7 @@ export function PeerSidebar({
   // confirm step, but a failed write still surfaces under the row.
   async function runMarkUnread(destination: string, all = false) {
     if (!onMarkUnread) return;
-    setMarkingUnreadId(destination);
+    setMarkingUnread((previous) => new Set(previous).add(destination));
     setMarkUnreadErrors((previous) => {
       const next = { ...previous };
       delete next[destination];
@@ -221,7 +224,11 @@ export function PeerSidebar({
             : "could not mark conversation unread",
       }));
     } finally {
-      setMarkingUnreadId(null);
+      setMarkingUnread((previous) => {
+        const next = new Set(previous);
+        next.delete(destination);
+        return next;
+      });
     }
   }
 
@@ -841,7 +848,7 @@ export function PeerSidebar({
                       {onMarkUnread ? (
                         <button
                           type="button"
-                          disabled={markingUnreadId === peer.destination}
+                          disabled={markingUnread.has(peer.destination)}
                           onClick={() =>
                             void runMarkUnread(peer.destination)
                           }
@@ -849,7 +856,7 @@ export function PeerSidebar({
                           title="Mark unread — the newest message from this peer shows unread again, as a reminder to answer it; read receipts already sent stay sent"
                           className="shrink-0 rounded-md border border-line/70 px-1.5 py-1 font-mono text-[10px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
                         >
-                          {markingUnreadId === peer.destination
+                          {markingUnread.has(peer.destination)
                             ? "marking…"
                             : "mark unread"}
                         </button>
@@ -857,7 +864,7 @@ export function PeerSidebar({
                       {onMarkUnread ? (
                         <button
                           type="button"
-                          disabled={markingUnreadId === peer.destination}
+                          disabled={markingUnread.has(peer.destination)}
                           onClick={() =>
                             void runMarkUnread(peer.destination, true)
                           }
@@ -865,7 +872,9 @@ export function PeerSidebar({
                           title="Mark all unread — the whole conversation shows unread again; read receipts already sent stay sent"
                           className="shrink-0 rounded-md border border-line/70 px-1.5 py-1 font-mono text-[10px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
                         >
-                          mark all unread
+                          {markingUnread.has(peer.destination)
+                            ? "marking…"
+                            : "mark all unread"}
                         </button>
                       ) : null}
                       <button

@@ -969,6 +969,56 @@ describe("PeerSidebar archived conversations", () => {
     );
   });
 
+  it("keeps both rows pending when marks overlap", async () => {
+    let resolveAlice!: () => void;
+    let resolveBob!: () => void;
+    const onMarkUnread = vi.fn(
+      (destination: string) =>
+        destination === aliceHash
+          ? new Promise<void>((resolve) => {
+              resolveAlice = resolve;
+            })
+          : new Promise<void>((resolve) => {
+              resolveBob = resolve;
+            }),
+    );
+    renderSidebar({}, vi.fn(), { onMarkUnread });
+
+    const aliceButton = screen.getByRole("button", {
+      name: "Mark conversation with alice unread",
+    });
+    const bobButton = screen.getByRole("button", {
+      name: "Mark conversation with bob unread",
+    });
+    fireEvent.click(aliceButton);
+    fireEvent.click(bobButton);
+    await waitFor(() => expect(onMarkUnread).toHaveBeenCalledTimes(2));
+
+    // Both stay disabled while their own request runs.
+    expect(
+      (aliceButton as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect((bobButton as HTMLButtonElement).disabled).toBe(true);
+
+    // Finishing alice's re-enables only alice's row.
+    await act(async () => {
+      resolveAlice();
+    });
+    await waitFor(() =>
+      expect(
+        (aliceButton as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    expect((bobButton as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => {
+      resolveBob();
+    });
+    await waitFor(() =>
+      expect((bobButton as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
   it("shows a failed mark-unread under the peer row", async () => {
     const onMarkUnread = vi
       .fn()

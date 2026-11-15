@@ -1734,17 +1734,39 @@ export function useTau() {
       return next;
     });
   }, []);
+  // Read-state writes land on the server in the order they were issued:
+  // a mark-read sent just before a mark-unread must not overtake it on
+  // the wire and erase the reminder. Chain them through one promise so
+  // each waits for the previous write's response before sending; a
+  // failed write still lets the next one go.
+  const readChain = useRef(Promise.resolve());
+  const chainReadWrite = useCallback(
+    (task: () => Promise<UnreadCounts>) => {
+      const run = readChain.current
+        .catch(() => undefined)
+        .then(task);
+      readChain.current = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    },
+    [],
+  );
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
     // next snapshot reconciles.
-    const result = await apiPost<MarkReadResponse>(
-      "/api/messages/read",
-      peer ? { peer } : {},
-    );
-    applyUnread(result.unread);
-    return result.unread;
-  }, [applyUnread]);
+    return chainReadWrite(async () => {
+      const result = await apiPost<MarkReadResponse>(
+        "/api/messages/read",
+        peer ? { peer } : {},
+      );
+      applyUnread(result.unread);
+      return result.unread;
+    });
+  }, [applyUnread, chainReadWrite]);
 
   const markUnread = useCallback(async (peer: string, all = false) => {
     // The way back from a mark-read: the newest received message shows
@@ -1752,13 +1774,15 @@ export function useTau() {
     // read DM the owner has not answered yet stays visible as a
     // reminder. A failed call leaves the badge alone; the next
     // snapshot reconciles.
-    const result = await apiPost<MarkUnreadResponse>(
-      "/api/messages/unread",
-      { peer, all },
-    );
-    applyUnread(result.unread);
-    return result.unread;
-  }, [applyUnread]);
+    return chainReadWrite(async () => {
+      const result = await apiPost<MarkUnreadResponse>(
+        "/api/messages/unread",
+        { peer, all },
+      );
+      applyUnread(result.unread);
+      return result.unread;
+    });
+  }, [applyUnread, chainReadWrite]);
 
   const exportBundle = useCallback(async (includeTan: boolean) => {
     return apiPost<BundleExportResponse>("/api/bundle/export", {

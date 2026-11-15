@@ -7026,21 +7026,20 @@ class WebBridge:
         SSE event, exactly as they do for a mark-read.  Read receipts are
         untouched: a receipt already sent for a message stays sent, and
         only the local display cursor moves.  Raises :class:`ValueError`
-        when the peer has no stored messages to mark.
+        when the peer has no stored messages to mark, or when the node
+        has no inbox to mark them in.
         """
         inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise ValueError("this node has no inbox to mark unread")
         with self._unread_lock:
-            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
-            if inbox is not None:
-                moved = inbox.mark_unread(
-                    peer, all=all, exclude_dm_from=self._archived_set()
-                )
-                if moved is None:
-                    raise ValueError(f"no stored messages from {peer!r}")
-                counts = moved
-            stamped = self._stamp_unread(counts)
-        if inbox is not None:
-            self.bus.publish({"type": "unread", "unread": stamped})
+            moved = inbox.mark_unread(
+                peer, all=all, exclude_dm_from=self._archived_set()
+            )
+            if moved is None:
+                raise ValueError(f"no stored messages from {peer!r}")
+            stamped = self._stamp_unread(moved)
+        self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 
     def snapshot(self) -> Dict[str, Any]:
@@ -7966,6 +7965,27 @@ class _WebHandler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self._send_json(
                         {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                except OSError:
+                    # The cursor moved in memory but could not be saved,
+                    # so the mark did not land: say so instead of the
+                    # generic 500, and leave the badge alone.
+                    log.warning(
+                        "Could not save the read state for mark-unread",
+                        exc_info=True,
+                    )
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": (
+                                    "could not save the read state; "
+                                    "the conversation was not marked unread"
+                                )
+                            }
+                        },
+                        head_only,
+                        503,
                     )
                     return
                 self._send_json({"ok": True, "unread": counts}, head_only)

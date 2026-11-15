@@ -2570,6 +2570,34 @@ def test_mark_unread_counts_exclude_archived_conversations(node, tmp_path):
         bridge.stop()
 
 
+def test_mark_unread_endpoint_reports_unsaved_cursor(
+    bridge, node, monkeypatch
+):
+    _inbound_record(node)
+    _json(bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH})
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(node.inbox, "_save", failing_save)
+    status, _, payload = _json(
+        bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 503
+    assert "could not save the read state" in payload["error"]["message"]
+
+
+def test_mark_unread_endpoint_without_inbox_is_an_error(
+    bridge, node, monkeypatch
+):
+    monkeypatch.setattr(node, "inbox", None)
+    status, _, payload = _json(
+        bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 400
+    assert "no inbox" in payload["error"]["message"]
+
+
 def test_send_validation(bridge):
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"to": "alice", "text": " "}
