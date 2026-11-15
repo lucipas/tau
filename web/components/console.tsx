@@ -17,6 +17,21 @@ import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
 import { SettingsSection } from "./settings-section";
 
+// Defaults are stored under canonical destination hashes, but a custom
+// target can be a name, a hash with stray whitespace, or mixed case.
+// Map it to the stored key so the picker shows the saved default.
+function canonicalPeerTarget(target: string, peers: Peer[]): string {
+  const trimmed = target.trim();
+  const lowered = trimmed.toLowerCase();
+  const match = peers.find(
+    (peer) =>
+      peer.destination.toLowerCase() === lowered ||
+      peer.name === trimmed ||
+      peer.alias === trimmed,
+  );
+  return match ? match.destination.toLowerCase() : lowered;
+}
+
 // Peers whose conversation is not archived: the only peers the console
 // offers as send targets. An archived thread stays hidden until restored.
 function activePeersOf(
@@ -455,9 +470,12 @@ export function Console() {
                 target.trim() === ""
                   ? null
                   : mode === "group"
-                    ? (tau.disappearingDefaults.groups[target] ?? null)
-                    : (tau.disappearingDefaults.peers[target] ?? null)
+                    ? (tau.disappearingDefaults.groups[target.trim()] ?? null)
+                    : (tau.disappearingDefaults.peers[
+                        canonicalPeerTarget(target, tau.peers)
+                      ] ?? null)
               }
+              disappearingError={tau.disappearingError}
               onSetDisappearingDefault={
                 target.trim() === ""
                   ? undefined
@@ -492,6 +510,19 @@ export function Console() {
             onImport={tau.importMessages}
           />
         </main>
+
+        <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
+          <span>
+            tau {tau.node?.version ?? "—"} · Reticulum{" "}
+            {tau.node?.rns_version ?? "—"}
+          </span>
+          <span>no servers · no accounts · encrypted links</span>
+        </footer>
+      </div>
+    </div>
+  );
+}
+       </main>
 
         <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
           <span>

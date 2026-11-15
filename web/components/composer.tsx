@@ -24,6 +24,9 @@ function describeDuration(seconds: number): string {
   return `${seconds}s`;
 }
 
+// Durations the disappearing-default picker offers as presets.
+const DISAPPEARING_PRESETS: number[] = [30, 300, 3600, 86400, 604800];
+
 export function Composer({
   peers,
   groups,
@@ -39,6 +42,7 @@ export function Composer({
   onCancelReply,
   disappearingDefault,
   onSetDisappearingDefault,
+  disappearingError,
 }: {
   peers: Peer[];
   groups: TauGroup[];
@@ -69,6 +73,7 @@ export function Composer({
   onCancelReply?: () => void;
   disappearingDefault?: number | null;
   onSetDisappearingDefault?: (seconds: number | null) => Promise<void>;
+  disappearingError?: string | null;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -486,6 +491,14 @@ export function Composer({
               className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60 disabled:opacity-50"
             >
               <option value="">off</option>
+              {disappearingDefault != null &&
+              !DISAPPEARING_PRESETS.includes(disappearingDefault) ? (
+                // A default set from the CLI to another value (e.g. 2h)
+                // must still show as selected, not fall back to "off".
+                <option value={String(disappearingDefault)}>
+                  {describeDuration(disappearingDefault)}
+                </option>
+              ) : null}
               <option value="30">30s</option>
               <option value="300">5m</option>
               <option value="3600">1h</option>
@@ -493,6 +506,27 @@ export function Composer({
               <option value="604800">7d</option>
             </select>
           </label>
+        ) : null}
+        {defaultHint ? (
+          <span className="font-mono text-[10px] text-mist/70">
+            {defaultHint}
+          </span>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+e="300">5m</option>
+              <option value="3600">1h</option>
+              <option value="86400">1d</option>
+              <option value="604800">7d</option>
+            </select>
+          </label>
+        ) : null}
+        {disappearingError ? (
+          <span className="font-mono text-[10px] text-amber-300">
+            {disappearingError}
+          </span>
         ) : null}
         {defaultHint ? (
           <span className="font-mono text-[10px] text-mist/70">
