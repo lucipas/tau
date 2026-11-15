@@ -85,6 +85,11 @@ export interface TauGroup {
   // Absent on snapshots from an older bridge; only groups this node
   // created offer member changes in the console.
   created_by_me?: boolean;
+  // False when the bridge will refuse a leave — a group this node
+  // created, under this identity or an earlier one — so the sidebar
+  // never offers a leave that always fails. Absent on snapshots from
+  // an older bridge, which the sidebar treats as leavable.
+  can_leave?: boolean;
   // The group's topic, as set with `tau group topic` or from the
   // console; empty when none is set. Absent on snapshots from an older
   // bridge.

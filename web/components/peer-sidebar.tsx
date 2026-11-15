@@ -1442,7 +1442,9 @@ export function PeerSidebar({
                             : "delete"}
                       </button>
                     ) : null}
-                    {group.created_by_me === false && onLeaveGroup ? (
+                    {group.created_by_me === false &&
+                    group.can_leave !== false &&
+                    onLeaveGroup ? (
                       <button
                         type="button"
                         disabled={leavingId === group.id}

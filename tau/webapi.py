@@ -6653,6 +6653,11 @@ class WebBridge:
             if not already:
                 ignored = ignored.with_added(group_id)
                 save_ignored_groups(path, ignored)
+        if not already:
+            # The group's posts stop lighting the badge at once: push
+            # the recomputed counts so every open console reconciles
+            # without waiting for the next message.
+            self.bus.publish({"type": "unread", "unread": self.unread()})
         return {
             "group": group_id,
             "name": group["name"],
@@ -6704,6 +6709,11 @@ class WebBridge:
             if was_ignored:
                 ignored = ignored.with_removed(group_id)
                 save_ignored_groups(path, ignored)
+        if was_ignored:
+            # Stored history returns on unignore, including its unread
+            # posts: push the recomputed counts so every open console
+            # reconciles without waiting for the next message.
+            self.bus.publish({"type": "unread", "unread": self.unread()})
         return {
             "group": group_id,
             "name": name,

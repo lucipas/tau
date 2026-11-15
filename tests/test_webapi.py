@@ -2695,6 +2695,15 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
         "per_peer": {PEER_HASH: 1},
         "total": 1,
     }
+    # The ignore pushed fresh counts to every open console, so the
+    # badge drops without waiting for the next message.
+    unread_events = [
+        event for event in bridge.bus.replay(0) if event["type"] == "unread"
+    ]
+    assert _counts(unread_events[-1]["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "total": 1,
+    }
 
     _json(
         bridge,

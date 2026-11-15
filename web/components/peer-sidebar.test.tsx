@@ -866,6 +866,23 @@ describe("PeerSidebar group leave / ignore", () => {
     expect(screen.queryByRole("button", { name: "leave" })).toBeNull();
   });
 
+  it("hides the leave button when the server says it cannot be left", () => {
+    // A group this node created under an earlier identity reports
+    // created_by_me false but can_leave false: the button must not
+    // offer a leave the bridge will refuse.
+    const onLeaveGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      id: group,
+      name: "weekend",
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: false, can_leave: false })],
+      onLeaveGroup,
+    });
+
+    expect(screen.queryByRole("button", { name: "leave" })).toBeNull();
+  });
+
   it("offers ignore on a group", async () => {
     const onIgnoreGroup = vi.fn(async (group: string) => ({
       ok: true,

@@ -705,6 +705,134 @@ describe("useTau group leave / ignore", () => {
 
     expect(result.current.ignoredGroups).toEqual([]);
   });
+
+  it("hides an ignored group's posts at once and drops live arrivals", async () => {
+    const created = makeGroup();
+    const thread = [
+      makeMessage({ id: 1, peer: PEER_HASH, group: undefined, text: "hi" }),
+      makeMessage({ id: 2, peer: PEER_HASH, text: "crew hello" }),
+      makeMessage({
+        id: 3,
+        peer: "cd".repeat(16),
+        peer_name: "carol",
+        group: undefined,
+        text: "hey",
+      }),
+    ];
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({ left: [], ignored: [] })
+        : path === "/api/groups"
+          ? Promise.resolve({ groups: [created], count: 1 })
+          : Promise.resolve({ groups: [], count: 0 }),
+    );
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], thread) });
+    });
+    await waitFor(() =>
+      expect(result.current.messages.map((m) => m.id)).toEqual([1, 2, 3]),
+    );
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: created.id,
+      name: "crew",
+      ignored: true,
+      changed: true,
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({
+            left: [],
+            ignored: [{ id: created.id, name: "crew" }],
+          })
+        : path === "/api/groups"
+          ? Promise.resolve({ groups: [created], count: 1 })
+          : Promise.resolve({ groups: [], count: 0 }),
+    );
+    await act(async () => {
+      await result.current.ignoreGroup(created.id);
+    });
+
+    // The group post leaves the feed at once; the DMs stay.
+    expect(result.current.messages.map((m) => m.id)).toEqual([1, 3]);
+    expect(result.current.ignoredGroups).toEqual([
+      { id: created.id, name: "crew" },
+    ]);
+
+    // A new arrival for the ignored group stays hidden; one for
+    // another peer lands in the feed.
+    await act(async () => {
+      source.emit("message", {
+        message: makeMessage({ id: 4, peer: PEER_HASH, text: "still hidden" }),
+      });
+      source.emit("message", {
+        message: makeMessage({
+          id: 5,
+          peer: "cd".repeat(16),
+          peer_name: "carol",
+          group: undefined,
+          text: "visible",
+        }),
+      });
+    });
+    expect(result.current.messages.map((m) => m.id)).toEqual([1, 3, 5]);
+  });
+
+  it("restores an ignored group's posts when it is unignored", async () => {
+    const created = makeGroup();
+    const thread = [
+      makeMessage({ id: 1, peer: PEER_HASH, group: undefined, text: "hi" }),
+      makeMessage({ id: 2, peer: PEER_HASH, text: "crew hello" }),
+    ];
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({
+            left: [],
+            ignored: [{ id: created.id, name: "crew" }],
+          })
+        : path === "/api/groups"
+          ? Promise.resolve({ groups: [created], count: 1 })
+          : Promise.resolve({ groups: [], count: 0 }),
+    );
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], thread) });
+    });
+    // The left-groups poll lands after the snapshot and hides the
+    // ignored group's post, like another tab ignoring it would.
+    await waitFor(() =>
+      expect(result.current.messages.map((m) => m.id)).toEqual([1]),
+    );
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: created.id,
+      name: "crew",
+      ignored: false,
+      changed: true,
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/messages?limit=200"
+        ? Promise.resolve({ messages: thread })
+        : path === "/api/groups/left"
+          ? Promise.resolve({ left: [], ignored: [] })
+          : path === "/api/groups"
+            ? Promise.resolve({ groups: [created], count: 1 })
+            : Promise.resolve({ groups: [], count: 0 }),
+    );
+    await act(async () => {
+      await result.current.unignoreGroup(created.id);
+    });
+
+    expect(result.current.messages.map((m) => m.id)).toEqual([1, 2]);
+    expect(result.current.ignoredGroups).toEqual([]);
+  });
 });
 
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {
