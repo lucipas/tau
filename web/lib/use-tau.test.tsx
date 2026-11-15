@@ -2203,6 +2203,52 @@ describe("useTau archived conversations", () => {
     unmount();
   });
 
+  it("marks a conversation unread again and applies the new counts", async () => {
+    mockArchivedGet();
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() => expect(result.current.peers).toHaveLength(1));
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      unread: { per_peer: { [PEER_HASH]: 1 }, total: 1 },
+    });
+    await act(async () => {
+      await result.current.markUnread(PEER_HASH);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/unread", {
+      peer: PEER_HASH,
+      all: false,
+    });
+    expect(result.current.unread).toEqual({
+      per_peer: { [PEER_HASH]: 1 },
+      total: 1,
+      revision: undefined,
+    });
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      unread: { per_peer: { [PEER_HASH]: 2 }, total: 2 },
+    });
+    await act(async () => {
+      await result.current.markUnread(PEER_HASH, true);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/unread", {
+      peer: PEER_HASH,
+      all: true,
+    });
+    expect(result.current.unread).toEqual({
+      per_peer: { [PEER_HASH]: 2 },
+      total: 2,
+      revision: undefined,
+    });
+    unmount();
+  });
+
   it("drops live messages for an archived peer, keeps the rest", async () => {
     mockArchivedGet();
     const { result, unmount } = renderHook(() => useTau());

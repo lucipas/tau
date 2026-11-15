@@ -88,6 +88,7 @@ type SidebarOptions = {
   onForgetPeer?: (destination: string, force: boolean) => Promise<void>;
   onArchivePeer?: (destination: string) => Promise<void>;
   onUnarchivePeer?: (destination: string) => Promise<void>;
+  onMarkUnread?: (destination: string) => Promise<void>;
   archived?: ArchivedConversation[];
   archivedError?: string | null;
   infos?: Record<string, PeerInfoState>;
@@ -152,6 +153,7 @@ function renderSidebar(
       onUnblock={options.onUnblock ?? (() => {})}
       onArchivePeer={options.onArchivePeer ?? (async () => {})}
       onUnarchivePeer={options.onUnarchivePeer ?? (async () => {})}
+      onMarkUnread={options.onMarkUnread}
       onVerify={() => {}}
       onShowSafetyNumber={() => {}}
       onDismissVerification={() => {}}
@@ -936,6 +938,38 @@ describe("PeerSidebar archived conversations", () => {
     );
     await waitFor(() =>
       expect(onArchivePeer).toHaveBeenCalledWith(aliceHash),
+    );
+  });
+
+  it("marks a conversation unread from the peer row without a confirm step", async () => {
+    const onMarkUnread = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), { onMarkUnread });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Mark conversation with alice unread",
+      }),
+    );
+    await waitFor(() =>
+      expect(onMarkUnread).toHaveBeenCalledWith(aliceHash),
+    );
+  });
+
+  it("shows a failed mark-unread under the peer row", async () => {
+    const onMarkUnread = vi
+      .fn()
+      .mockRejectedValue(new Error("no stored messages from 'alice'"));
+    renderSidebar({}, vi.fn(), { onMarkUnread });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Mark conversation with alice unread",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText("no stored messages from 'alice'"),
+      ).toBeTruthy(),
     );
   });
 

@@ -46,6 +46,7 @@ export function PeerSidebar({
   onUnblock,
   onArchivePeer,
   onUnarchivePeer,
+  onMarkUnread,
   onVerify,
   onShowSafetyNumber,
   onDismissVerification,
@@ -78,6 +79,7 @@ export function PeerSidebar({
   onUnblock: (destination: string) => void;
   onArchivePeer: (destination: string) => Promise<void>;
   onUnarchivePeer: (destination: string) => Promise<void>;
+  onMarkUnread?: (destination: string) => Promise<void>;
   onVerify: (destination: string) => void;
   onShowSafetyNumber: (destination: string) => void;
   onDismissVerification: (destination: string) => void;
@@ -114,6 +116,12 @@ export function PeerSidebar({
   const [archiveErrors, setArchiveErrors] = useState<Record<string, string>>(
     {},
   );
+  const [markingUnreadId, setMarkingUnreadId] = useState<string | null>(
+    null,
+  );
+  const [markUnreadErrors, setMarkUnreadErrors] = useState<
+    Record<string, string>
+  >({});
   const forgetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -188,6 +196,32 @@ export function PeerSidebar({
       }));
     } finally {
       setArchivingId(null);
+    }
+  }
+
+  // Marking unread only moves the local display cursor back — nothing
+  // is deleted and no receipt changes — so like archiving it needs no
+  // confirm step, but a failed write still surfaces under the row.
+  async function runMarkUnread(destination: string) {
+    if (!onMarkUnread) return;
+    setMarkingUnreadId(destination);
+    setMarkUnreadErrors((previous) => {
+      const next = { ...previous };
+      delete next[destination];
+      return next;
+    });
+    try {
+      await onMarkUnread(destination);
+    } catch (caught) {
+      setMarkUnreadErrors((previous) => ({
+        ...previous,
+        [destination]:
+          caught instanceof Error
+            ? caught.message
+            : "could not mark conversation unread",
+      }));
+    } finally {
+      setMarkingUnreadId(null);
     }
   }
 
@@ -804,6 +838,22 @@ export function PeerSidebar({
                           ? "archiving…"
                           : "archive"}
                       </button>
+                      {onMarkUnread ? (
+                        <button
+                          type="button"
+                          disabled={markingUnreadId === peer.destination}
+                          onClick={() =>
+                            void runMarkUnread(peer.destination)
+                          }
+                          aria-label={`Mark conversation with ${peer.name} unread`}
+                          title="Mark unread — the newest message from this peer shows unread again, as a reminder to answer it; read receipts already sent stay sent"
+                          className="shrink-0 rounded-md border border-line/70 px-1.5 py-1 font-mono text-[10px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                        >
+                          {markingUnreadId === peer.destination
+                            ? "marking…"
+                            : "mark unread"}
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         disabled={forgettingId === peer.destination}
@@ -1039,6 +1089,11 @@ export function PeerSidebar({
                     {archiveErrors[peer.destination] ? (
                       <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
                         {archiveErrors[peer.destination]}
+                      </p>
+                    ) : null}
+                    {markUnreadErrors[peer.destination] ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        {markUnreadErrors[peer.destination]}
                       </p>
                     ) : null}
                   </div>

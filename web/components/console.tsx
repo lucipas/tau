@@ -272,6 +272,9 @@ export function Console() {
             onUnarchivePeer={async (destination) => {
               await tau.unarchiveConversation(destination);
             }}
+            onMarkUnread={async (destination) => {
+              await tau.markUnread(destination);
+            }}
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
             onDeleteGroup={(group) => tau.deleteGroup(group)}

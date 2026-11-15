@@ -242,6 +242,11 @@ export interface MarkReadResponse {
   unread: UnreadCounts;
 }
 
+export interface MarkUnreadResponse {
+  ok: boolean;
+  unread: UnreadCounts;
+}
+
 export interface BridgeInfo {
   version: string;
   web: boolean;

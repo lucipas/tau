@@ -31,6 +31,7 @@ import type {
   HeldMailEntry,
   HeldMailResponse,
   MarkReadResponse,
+  MarkUnreadResponse,
   MessagesExportDocument,
   MessagesImportResponse,
   MessagesImportResult,
@@ -1745,6 +1746,20 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  const markUnread = useCallback(async (peer: string, all = false) => {
+    // The way back from a mark-read: the newest received message shows
+    // unread again (or the whole conversation, with all=true), so a
+    // read DM the owner has not answered yet stays visible as a
+    // reminder. A failed call leaves the badge alone; the next
+    // snapshot reconciles.
+    const result = await apiPost<MarkUnreadResponse>(
+      "/api/messages/unread",
+      { peer, all },
+    );
+    applyUnread(result.unread);
+    return result.unread;
+  }, [applyUnread]);
+
   const exportBundle = useCallback(async (includeTan: boolean) => {
     return apiPost<BundleExportResponse>("/api/bundle/export", {
       include_tan: includeTan,
@@ -2194,6 +2209,7 @@ export function useTau() {
     backup,
     runDoctor,
     markRead,
+    markUnread,
     setPeerAlias,
     reactToMessage,
     clearReaction,
