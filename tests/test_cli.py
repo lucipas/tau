@@ -5157,6 +5157,9 @@ def test_group_pinned_blocked_filter_applies_to_received_only(tmp_path, capsys):
     out = _pinned_text()
     assert "original thought" not in out
     assert "sent pinned note" in out
+    # A group send is labelled by its group, never as an unknown peer.
+    assert "you → weekend" in out
+    assert "unknown" not in out
 
 
 def test_group_messages_renders_quote_from_local_history(tmp_path, capsys):

@@ -7182,15 +7182,21 @@ def _resolve_group_reply_target(
 
 
 def _resolve_group_pin_target(
-    inbox: Inbox, group_ids: Sequence[str], ref: str
+    inbox: Inbox,
+    group_ids: Sequence[str],
+    ref: str,
+    mailbox: Optional[Mailbox] = None,
 ) -> Dict[str, Any]:
     """Resolve ``tau group pin`` / ``unpin`` to one stored group message.
 
     Same scoping as :func:`_resolve_group_reply_target` but inbox-only:
     a pin attaches to a stored record, so a still-queued leg has nothing
     to pin and is never a candidate.  ``group_ids`` spans renames, so a
-    message stored under a predecessor id still resolves.  A prefix
-    matching more than one record, or nothing at all, is refused.
+    message stored under a predecessor id still resolves.  An exact id
+    wins over a longer id that merely starts with it, as in
+    :meth:`Inbox.pin`.  A send whose every leg is still in the outbox is
+    refused when ``mailbox`` is given.  A prefix matching more than one
+    record, or nothing at all, is refused.
     """
     ref = ref.strip()
     if not ref:
@@ -7198,6 +7204,35 @@ def _resolve_group_pin_target(
     matches: List[Dict[str, Any]] = []
     for group_id in group_ids:
         matches.extend(inbox.find_prefix(ref, group=group_id))
+    exact = [m for m in matches if str(m["id"]) == ref]
+    if not exact:
+        folded = ref.lower()
+        exact = [m for m in matches if str(m["id"]).lower() == folded]
+    if exact:
+        matches = exact
+    if mailbox is not None and matches:
+        queued_ids = {
+            entry.id
+            for entry in mailbox.outbox_list()
+            if entry.group_id in group_ids
+        }
+
+        def _all_legs_queued(item: Dict[str, Any]) -> bool:
+            # An outbound group send is one record with every leg id; it
+            # is queued-only while each of its legs is still in the outbox.
+            if item.get("direction") != "out":
+                return False
+            legs = [
+                leg for leg in item.get("leg_ids") or [] if isinstance(leg, str)
+            ] or [str(item["id"])]
+            return all(leg in queued_ids for leg in legs)
+
+        if all(_all_legs_queued(m) for m in matches):
+            raise NodeError(
+                f"message {ref!r} is still queued for every member;"
+                " pin it once delivered"
+            )
+        matches = [m for m in matches if not _all_legs_queued(m)]
     if len(matches) > 1:
         raise NodeError(
             f"{len(matches)} messages in this group match {ref!r};"
@@ -7331,7 +7366,10 @@ def _print_message_entry(
     destination = str(entry.get("destination") or "")
     peer = registry.get(destination)
     sender = short_hash(destination)
-    if entry.get("direction") == "out":
+    if entry.get("direction") == "out" and entry.get("kind") == "group":
+        # A group send has no single destination: name the group instead.
+        who = f"you → {entry.get('group_name') or 'group'}"
+    elif entry.get("direction") == "out":
         name = peer.display_name if peer is not None else "unknown"
         who = f"you → {name} ({sender})"
     else:
@@ -8651,9 +8689,10 @@ def cmd_group_pin(args: argparse.Namespace) -> int:
     group_ids = _group_ids_spanning_renames(group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    entry = _resolve_group_pin_target(inbox, group_ids, args.message)
+    mailbox = Mailbox(config.mailbox_path)
+    entry = _resolve_group_pin_target(inbox, group_ids, args.message, mailbox)
     try:
-        pinned, changed = inbox.pin(str(entry["id"]))
+        pinned, changed = inbox.pin(str(entry["id"]), groups=group_ids)
     except InboxError as exc:
         raise NodeError(str(exc)) from exc
     if _json_mode(args):
@@ -8683,9 +8722,10 @@ def cmd_group_unpin(args: argparse.Namespace) -> int:
     group_ids = _group_ids_spanning_renames(group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    entry = _resolve_group_pin_target(inbox, group_ids, args.message)
+    mailbox = Mailbox(config.mailbox_path)
+    entry = _resolve_group_pin_target(inbox, group_ids, args.message, mailbox)
     try:
-        unpinned, changed = inbox.unpin(str(entry["id"]))
+        unpinned, changed = inbox.unpin(str(entry["id"]), groups=group_ids)
     except InboxError as exc:
         raise NodeError(str(exc)) from exc
     if _json_mode(args):

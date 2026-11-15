@@ -943,7 +943,9 @@ class Inbox:
             return {"pruned": len(doomed), "per_peer": per_peer, "dry_run": False}
 
 
-    def pin(self, ref: str) -> Tuple[Dict[str, Any], bool]:
+    def pin(
+        self, ref: str, *, groups: Optional[Collection[str]] = None
+    ) -> Tuple[Dict[str, Any], bool]:
         """Pin one stored message by full id or unique prefix.
 
         Pins are local-only: nothing is sent to the peer, and the flag
@@ -953,9 +955,10 @@ class Inbox:
         pinning an already-pinned message is a no-op, not an error.
         The change runs inside the cross-process transaction, like
         :meth:`delete`, so a concurrent ``tau serve`` cannot lose it.
+        ``groups`` limits the match to records in those group ids.
         """
         with self._transaction():
-            entry = _match_ref(list(self._messages), ref)
+            entry = _match_ref(self._scoped_messages(groups), ref)
             if entry.get("pinned"):
                 return dict(entry), False
             entry["pinned"] = True
@@ -2213,6 +2216,17 @@ class Inbox:
                 # would mirror nothing.
                 kept = {id(item) for item in self._messages}
                 inserted.extend(item for item in added if id(item) in kept)
+        return {
+            "imported": imported,
+            "present": present,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._messages)
+end(item for item in added if id(item) in kept)
         return {
             "imported": imported,
             "present": present,
