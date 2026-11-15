@@ -1901,6 +1901,7 @@ class Inbox:
         *,
         all: bool = False,
         exclude_dm_from: Optional[Collection[str]] = None,
+        exclude_group: Optional[Collection[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Move a conversation's read cursor back so mail shows unread again.
 
@@ -1955,7 +1956,10 @@ class Inbox:
                 except OSError:
                     self._read_cursors = snapshot
                     raise
-            return self._unread_counts_locked(exclude_dm_from=exclude_dm_from)
+            return self._unread_counts_locked(
+                exclude_dm_from=exclude_dm_from,
+                exclude_group=exclude_group,
+            )
 
 
     def find(

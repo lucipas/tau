@@ -25,7 +25,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterator, Optional, Union
+from typing import Any, Dict, FrozenSet, Iterable, Iterator, Optional, Union
 
 from .allowlist import AllowListError, clean_destination
 from .util import atomic_write_json
@@ -116,6 +116,18 @@ class MutedConversations:
         peers.discard(_clean_destination(destination))
         return MutedConversations(peers=frozenset(peers), groups=self.groups)
 
+    def is_muted_group_lineage(self, lineage: Iterable[str]) -> bool:
+        """Whether any id of a group's rename lineage is muted."""
+        return any(group_id in self.groups for group_id in lineage)
+
+    def with_group_lineage(self, lineage: Iterable[str]) -> "MutedConversations":
+        groups = set(self.groups) | set(lineage)
+        return MutedConversations(peers=self.peers, groups=frozenset(groups))
+
+    def without_group_lineage(self, lineage: Iterable[str]) -> "MutedConversations":
+        groups = set(self.groups) - set(lineage)
+        return MutedConversations(peers=self.peers, groups=frozenset(groups))
+
     def with_group(self, group_id: str) -> "MutedConversations":
         groups = set(self.groups)
         groups.add(_clean_group_id(group_id))
@@ -145,6 +157,45 @@ class MutedConversations:
             peers=_clean_muted(data.get("peers"), kind="peer"),
             groups=_clean_muted(data.get("groups"), kind="group"),
         )
+
+
+def group_lineage(record: Any) -> FrozenSet[str]:
+    """A group's id plus its rename predecessors, as valid group ids.
+
+    A rename makes a successor group with a new id, and messages sent
+    before it still carry the predecessor ids in ``renamed_from``.  A
+    group mute covers the whole lineage, so the conversation stays
+    muted across a rename.  Malformed entries are skipped.
+    """
+    if not isinstance(record, dict):
+        return frozenset()
+    ids = [record.get("id"), *(record.get("renamed_from") or [])]
+    cleaned = set()
+    for value in ids:
+        try:
+            cleaned.add(_clean_group_id(value))
+        except MutedError:
+            continue
+    return frozenset(cleaned)
+
+
+def expand_muted_groups(
+    groups: FrozenSet[str], records: Iterable[Any]
+) -> FrozenSet[str]:
+    """Add the lineage of every group that shares a muted id.
+
+    A group muted before a rename stores only its old id; the successor
+    is the group whose lineage names that id, so its new posts must
+    stay muted too.  Lineages are matched in both directions this way.
+    """
+    if not groups:
+        return groups
+    expanded = set(groups)
+    for record in records:
+        lineage = group_lineage(record)
+        if lineage & groups:
+            expanded |= lineage
+    return frozenset(expanded)
 
 
 def load_muted(path: Optional[Union[str, Path]]) -> MutedConversations:

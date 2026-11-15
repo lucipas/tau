@@ -192,6 +192,8 @@ from .disappearing import (
 )
 from .muted import (
     MutedError,
+    expand_muted_groups,
+    group_lineage,
     load_muted,
     muted_groups_for,
     muted_lock,
@@ -6594,16 +6596,30 @@ class WebBridge:
         path = self._muted_path()
         return (
             muted_peers_for(path),
-            muted_groups_for(path),
+            expand_muted_groups(muted_groups_for(path), self._group_records()),
         )
 
-    def muted_conversations(self) -> Dict[str, Any]:
+    def _group_records(self) -> List[Dict[str, Any]]:
+        """Known group records, so mutes follow a group across renames."""
+        groups = getattr(self.node, "groups", None)
+        if groups is None:
+            return []
+        try:
+            return groups.list_groups()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store", exc_info=True)
+            return []
+
+    def muted_conversations(self, *, visible_only: bool = False) -> Dict[str, Any]:
         """All muted conversations, for the console load.
 
         Mirrors the stored file: peer destination hashes and group
-        ids, each sorted.  A corrupt file is a 503 — the owner
-        repairs or removes it before the console shows mutes, the
-        same as the disappearing defaults.
+        ids, each sorted, with a group's muted rename successors
+        included.  With ``visible_only`` (remote consoles) only the
+        peers and groups the console already lists are returned, so
+        no conversation outside that view is named.  A corrupt file is
+        a 503 — the owner repairs or removes it before the console
+        shows mutes, the same as the disappearing defaults.
         """
         path = self._muted_path()
         if path is None:
@@ -6615,7 +6631,16 @@ class WebBridge:
                 "muted conversations on disk are unusable; fix or remove them "
                 f"before editing ({exc})"
             ) from exc
-        return {"peers": sorted(muted.peers), "groups": sorted(muted.groups)}
+        records = self._group_records()
+        peers = set(muted.peers)
+        groups = set(expand_muted_groups(muted.groups, records))
+        if visible_only:
+            peers &= {str(item.get("destination") or "") for item in self.peers()}
+            visible_groups: set = set()
+            for record in records:
+                visible_groups |= group_lineage(record)
+            groups &= visible_groups
+        return {"peers": sorted(peers), "groups": sorted(groups)}
 
     def set_muted(
         self,
@@ -6642,6 +6667,7 @@ class WebBridge:
                 raise ValueError("field 'group' is required")
             record = self.node.groups.find(group.strip())
             key = record["id"]
+            lineage = group_lineage(record)
             is_group = True
         else:
             if not isinstance(peer, str) or not peer.strip():
@@ -6660,11 +6686,13 @@ class WebBridge:
                     f"before editing ({exc})"
                 ) from exc
             if is_group:
-                previous = current.is_muted_group(key)
+                # The whole rename lineage moves together, so a mute
+                # made before or after a rename covers both ids.
+                previous = current.is_muted_group_lineage(lineage)
                 updated = (
-                    current.with_group(key)
+                    current.with_group_lineage(lineage)
                     if muted
-                    else current.without_group(key)
+                    else current.without_group_lineage(lineage)
                 )
             else:
                 previous = current.is_muted_peer(key)
@@ -6676,6 +6704,7 @@ class WebBridge:
             changed = previous != muted
             if changed:
                 save_muted(path, updated)
+        counts: Optional[Dict[str, Any]] = None
         if changed:
             # unread() takes the unread lock itself; the publish rides
             # the same SSE event a mark-read sends.
@@ -6686,6 +6715,9 @@ class WebBridge:
             "group": is_group,
             "muted": muted,
             "changed": changed,
+            # The counts after the change, so the console can hold the
+            # restored unread count of an unmuted open conversation.
+            "unread": counts,
         }
 
     def archived_conversations(self) -> Dict[str, Any]:
@@ -7586,11 +7618,15 @@ class WebBridge:
         if inbox is None:
             raise ValueError("this node has no inbox to mark unread")
         with self._unread_lock:
+            muted_peers, muted_groups = self._muted_sets()
             moved = inbox.mark_unread(
                 peer,
                 all=all,
-                exclude_dm_from=self._archived_set()
-                | self._muted_sets()[0],
+                exclude_dm_from=self._archived_set() | muted_peers,
+                exclude_group=load_ignored_group_ids(
+                    getattr(self.node.config, "ignored_groups_path", None)
+                )
+                | muted_groups,
             )
             if moved is None:
                 raise ValueError(f"no stored messages from {peer!r}")
@@ -8056,22 +8092,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages/muted":
                 # The full mute list names every muted conversation,
-                # including peers absent from the registry, so it goes
-                # only to the local machine, like the disappearing
-                # defaults.
-                if not _is_loopback_client(self.client_address[0]):
-                    self._send_json(
-                        {
-                            "error": {
-                                "message": "muted conversations are only available from localhost"
-                            }
-                        },
-                        head_only,
-                        403,
-                    )
-                    return
+                # including peers absent from the registry, so a remote
+                # client gets only the conversations its console lists.
+                # Mutes stay settable from any client, so the console
+                # can always show and undo them.
+                visible_only = not _is_loopback_client(self.client_address[0])
                 try:
-                    result = self.bridge.muted_conversations()
+                    result = self.bridge.muted_conversations(
+                        visible_only=visible_only
+                    )
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
@@ -10701,4 +10730,43 @@ def _int_param(
         value = int(values[0])
     except (TypeError, ValueError):
         return default
+    return max(minimum, min(value, maximum))
+header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        if status >= 400:
+            self.send_header("Connection", "close")
+        self._cors_headers()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _send_error(self, status: int, message: str, head_only: bool = False) -> None:
+        self._send_json({"error": {"message": message}}, head_only, status)
+
+
+def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
+    values = query.get(name) or []
+    if not values:
+        return False
+    return values[0].strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_param(
+    query: Dict[str, List[str]],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    values = query.get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+lt
     return max(minimum, min(value, maximum))

@@ -851,8 +851,8 @@ export function useTau() {
   const refreshMuted = useCallback(async () => {
     // Same stale-response guard as the disappearing refresh: a slow
     // poll must not restore mutes a set or clear already moved. A
-    // failed poll leaves the last known mutes in place instead of
-    // flashing an error.
+    // failed poll keeps the last known mutes in place and reports the
+    // error in mutedError.
     const requestId = ++refreshMutedSeq.current;
     try {
       const result = await apiGet<MutedConversationsResponse>(

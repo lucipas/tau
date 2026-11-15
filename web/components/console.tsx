@@ -320,8 +320,41 @@ export function Console() {
             onUnarchivePeer={async (destination) => {
               await tau.unarchiveConversation(destination);
             }}
-            onSetMuted={async (target, muted) => {
-              await tau.setMuted(target, muted);
+            onSetMuted={async (muteTarget, muted) => {
+              // Unmuting the open conversation restores the unread mail
+              // that arrived while it was muted. That mail is not new, so
+              // hold the count until the unmute answers: the auto-read
+              // below must not mark it read. The hold starts unbounded
+              // (an event may land before the response) and settles on
+              // the restored count.
+              const heldPeer =
+                !muted &&
+                muteTarget.peer !== undefined &&
+                mode === "peer" &&
+                targetRef.current === muteTarget.peer
+                  ? muteTarget.peer
+                  : undefined;
+              if (heldPeer !== undefined) {
+                manualUnread.current.set(heldPeer, Number.POSITIVE_INFINITY);
+              }
+              try {
+                const change = await tau.setMuted(muteTarget, muted);
+                if (heldPeer !== undefined) {
+                  if (targetRef.current === heldPeer) {
+                    manualUnread.current.set(
+                      heldPeer,
+                      change.unread?.per_peer[heldPeer] ?? 0,
+                    );
+                  } else {
+                    manualUnread.current.delete(heldPeer);
+                  }
+                }
+              } catch (error) {
+                if (heldPeer !== undefined) {
+                  manualUnread.current.delete(heldPeer);
+                }
+                throw error;
+              }
             }}
             onMarkUnread={async (destination, all = false) => {
               const gen = unreadGen.current.get(destination) ?? 0;

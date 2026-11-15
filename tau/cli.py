@@ -68,6 +68,8 @@ from .disappearing import (
 )
 from .muted import (
     MutedError,
+    expand_muted_groups,
+    group_lineage,
     load_muted,
     muted_groups_for,
     muted_lock,
@@ -7440,7 +7442,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # A corrupt mutes file fails open here: the conversations count
     # as unmuted (with a warning), never breaking the listing.
     muted_peers = muted_peers_for(config.muted_path)
-    muted_groups = muted_groups_for(config.muted_path)
+    muted_groups = expand_muted_groups(
+        muted_groups_for(config.muted_path),
+        GroupStore(config.groups_path).list_groups(),
+    )
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
@@ -8340,6 +8345,8 @@ def cmd_mute(args: argparse.Namespace) -> int:
         store = GroupStore(config.groups_path)
         group = store.find(args.group)
         key = group["id"]
+        # The whole rename lineage moves together, like the bridge.
+        lineage = group_lineage(group)
         label = f"group {group['name']} ({short_hash(key)})"
         is_group = True
     else:
@@ -8359,11 +8366,11 @@ def cmd_mute(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return _EXIT_ERROR
         if is_group:
-            previous = muted.is_muted_group(key)
+            previous = muted.is_muted_group_lineage(lineage)
             if getattr(args, "off", False):
-                muted = muted.without_group(key)
+                muted = muted.without_group_lineage(lineage)
             else:
-                muted = muted.with_group(key)
+                muted = muted.with_group_lineage(lineage)
         else:
             previous = muted.is_muted_peer(key)
             if getattr(args, "off", False):

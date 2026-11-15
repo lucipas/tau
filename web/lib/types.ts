@@ -273,6 +273,8 @@ export interface MuteResult {
   group: boolean;
   muted: boolean;
   changed: boolean;
+  // The unread counts after the change, when it changed anything.
+  unread?: UnreadCounts | null;
 }
 
 export interface MuteResponse {
