@@ -25,6 +25,7 @@ DESTINATION_HASH_BYTES = 16
 PUBLIC_KEY_BYTES = 64
 REGISTRY_VERSION = 1
 MAX_PEERS = 256
+MAX_NOTE_LENGTH = 500
 DEFAULT_MAX_AGE = 7 * 24 * 60 * 60
 
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -47,6 +48,21 @@ def _clean_stored_alias(value: Any) -> Optional[str]:
     if alias is not None and _HEX_LIKE.match(alias):
         return None
     return alias
+
+
+def _clean_stored_note(value: Any) -> Optional[str]:
+    """Normalise a stored peer note, dropping values that are unusable.
+
+    Non-strings and blank strings become ``None``; a note longer than
+    :data:`MAX_NOTE_LENGTH` is truncated, so a note saved by an older
+    version or edited by hand cannot grow the registry without bound.
+    """
+    if not isinstance(value, str):
+        return None
+    note = value.strip()
+    if not note:
+        return None
+    return note[:MAX_NOTE_LENGTH]
 
 
 def _dedupe_aliases(peers: Iterable[Peer]) -> None:
@@ -118,6 +134,11 @@ class Peer:
     # Local-only label for this peer, set with `tau peers alias`.  Never
     # sent in peer exchange or announces, and never overwritten by them.
     alias: Optional[str] = None
+    # Private note about this peer, set with `tau peers note`.  Like the
+    # alias, it is owner-only context ("met at ATO, runs the roof node")
+    # that never leaves this node: it stays out of peer exchange and
+    # announces, and re-announces never overwrite it.
+    note: Optional[str] = None
     # When the owner compared safety numbers with this peer out of band
     # and confirmed the key is theirs (``tau peers verify``).  The
     # fingerprint is the pairwise safety number recorded at that moment.
@@ -178,6 +199,7 @@ class Peer:
             "caps": list(self.caps),
             "via_exchange": self.via_exchange,
             "alias": self.alias,
+            "note": self.note,
             "lxmf": self.lxmf_hash,
             "delivered_count": self.delivered_count,
             "last_delivered_at": self.last_delivered_at,
@@ -252,6 +274,7 @@ class Peer:
             caps=tuple(cap for cap in caps if isinstance(cap, str))[:16],
             via_exchange=raw.get("via_exchange") is True,
             alias=_clean_stored_alias(raw.get("alias")),
+            note=_clean_stored_note(raw.get("note")),
             verified_at=cls._optional_timestamp(raw, "verified_at"),
             verified_fingerprint=verified_fingerprint,
             key_change_at=cls._optional_timestamp(raw, "key_change_at"),
@@ -286,6 +309,11 @@ class Peer:
         """
         payload = self.public_dict(now)
         payload["alias"] = self.alias
+        # No "note": the console payload is served to the web console,
+        # which can be exposed remotely (--http-allow-remote) without
+        # owner authentication, so private notes stay out of it until a
+        # console UI for notes exists.  The CLI reads notes from
+        # to_dict() instead.
         payload["verified"] = self.is_verified
         payload["verified_at"] = self.verified_at
         payload["key_change_at"] = self.key_change_at
@@ -461,18 +489,61 @@ class PeerRegistry:
         self.save()
         return peer
 
+    def set_note(self, target: Union[bytes, str], note: str) -> Peer:
+        """Save a private note on a known peer, stored only in this registry.
+
+        The note is trimmed and capped at :data:`MAX_NOTE_LENGTH`; an
+        empty or overlong note raises :class:`PeerError` (use
+        :meth:`clear_note` to remove one).  Raises :class:`PeerError`
+        for an unknown peer.  The note survives re-announces:
+        :meth:`upsert` never touches it.
+        """
+        if not isinstance(note, str):
+            raise PeerError("note must be a string")
+        clean = note.strip()
+        if not clean:
+            raise PeerError("note must not be empty")
+        if len(clean) > MAX_NOTE_LENGTH:
+            raise PeerError(
+                f"note must be at most {MAX_NOTE_LENGTH} characters "
+                f"({len(clean)} given)"
+            )
+        with self._lock:
+            peer = self.resolve(target)
+            if peer is None:
+                raise PeerError(f"unknown peer {target!r}")
+            peer.note = clean
+        self.save()
+        return peer
+
+    def clear_note(self, target: Union[bytes, str]) -> Peer:
+        """Remove a peer's private note.
+
+        Raises :class:`PeerError` when the peer is unknown or has no
+        note set.
+        """
+        with self._lock:
+            peer = self.resolve(target)
+            if peer is None:
+                raise PeerError(f"unknown peer {target!r}")
+            if not peer.note:
+                raise PeerError(f"peer {peer.display_name} has no note")
+            peer.note = None
+        self.save()
+        return peer
+
     def refresh_aliases(self) -> int:
-        """Pick up alias changes another process made to the registry file.
+        """Pick up alias and note changes another process made to the registry file.
 
         A running node holds its registry in memory and rewrites the
-        whole file on every save, so an alias set by a one-shot command
-        (``tau peers alias``) while the node serves would be lost at the
-        next save.  Only aliases are refreshed — peer records themselves
+        whole file on every save, so an alias or note set by a one-shot command
+        (``tau peers alias``, ``tau peers note``) while the node serves would be lost at the
+        next save.  Only aliases and notes are refreshed — peer records themselves
         are this process's observations — and a peer absent from the file
-        keeps its alias.  A disk alias that another in-memory peer
+        keeps its alias and note.  A disk alias that another in-memory peer
         already holds is not applied: applying it would leave two peers
         sharing one alias and make resolution ambiguous.  Returns the
-        number of peers whose alias changed.
+        number of peers whose alias or note changed.
         """
         if self.path is None:
             return 0
@@ -489,7 +560,9 @@ class PeerRegistry:
                         peer.alias.casefold(), peer.destination_hash
                     )
             for entry in entries:
-                if not isinstance(entry, dict) or "alias" not in entry:
+                if not isinstance(entry, dict):
+                    continue
+                if "alias" not in entry and "note" not in entry:
                     continue
                 destination = entry.get("destination", "")
                 if not isinstance(destination, str) or not _HEX32.match(
@@ -499,20 +572,30 @@ class PeerRegistry:
                 peer = self._peers.get(bytes.fromhex(destination))
                 if peer is None:
                     continue
-                alias = _clean_stored_alias(entry.get("alias"))
-                if alias is not None:
-                    owner = claimed.get(alias.casefold())
-                    if owner is not None and owner != peer.destination_hash:
-                        # Another peer already holds this alias (for
-                        # example one missing from this file kept it);
-                        # applying it here would make the alias ambiguous.
-                        continue
-                if peer.alias != alias:
-                    if peer.alias is not None:
-                        claimed.pop(peer.alias.casefold(), None)
-                    peer.alias = alias
+                peer_changed = False
+                if "alias" in entry:
+                    alias = _clean_stored_alias(entry.get("alias"))
                     if alias is not None:
-                        claimed[alias.casefold()] = peer.destination_hash
+                        owner = claimed.get(alias.casefold())
+                        if owner is not None and owner != peer.destination_hash:
+                            # Another peer already holds this alias (for
+                            # example one missing from this file kept it);
+                            # applying it here would make the alias ambiguous.
+                            # The note below can still be applied.
+                            alias = peer.alias
+                    if peer.alias != alias:
+                        if peer.alias is not None:
+                            claimed.pop(peer.alias.casefold(), None)
+                        peer.alias = alias
+                        if alias is not None:
+                            claimed[alias.casefold()] = peer.destination_hash
+                        peer_changed = True
+                if "note" in entry:
+                    note = _clean_stored_note(entry.get("note"))
+                    if peer.note != note:
+                        peer.note = note
+                        peer_changed = True
+                if peer_changed:
                     changed += 1
         return changed
 

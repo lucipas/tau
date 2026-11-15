@@ -6249,6 +6249,9 @@ class WebBridge:
         # tests) simply edits.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
         with lock:
+            # Pick up notes a one-shot command saved since the last
+            # periodic refresh, so this save does not write back stale ones.
+            self.node.registry.refresh_aliases()
             if alias is not None and alias.strip():
                 peer = self.node.registry.set_alias(destination, alias)
             else:
@@ -6309,6 +6312,10 @@ class WebBridge:
         # without the lock (e.g. in tests) simply marks and saves.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
         with lock:
+            # Pick up notes a one-shot command saved since the last
+            # periodic refresh, so this save does not write back stale
+            # ones — the same reason set_peer_alias refreshes first.
+            self.node.registry.refresh_aliases()
             self.node.registry.mark_verified(peer.destination_hash, number)
             self.node.registry.save()
         return {
@@ -8345,6 +8352,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                 return
             if path == "/api/backup":
+                # The archive holds the node identity and peers.json —
+                # which now stores private peer notes — so it goes only
+                # to the local machine, like the messages export.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_error(
+                        HTTPStatus.FORBIDDEN,
+                        "backup downloads are only available from localhost",
+                        head_only,
+                    )
+                    return
                 try:
                     result = self.bridge.backup()
                 except WebBridgeError as exc:
