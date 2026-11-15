@@ -7420,11 +7420,13 @@ def cmd_messages(args: argparse.Namespace) -> int:
     group_id = None
     group_ids = None
     if getattr(args, "group", None):
-        group = GroupStore(config.groups_path).find(args.group)
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
         group_id = group["id"]
         # History spans renames: messages stored under a predecessor
-        # id still belong to this group.
-        group_ids = [group["id"], *(group.get("renamed_from") or [])]
+        # id still belong to this group.  The store only keeps
+        # predecessors whose record shares this group's creator.
+        group_ids = store.lineage(group["id"])
     if getattr(args, "count", False):
         # A count is for scripting: it never advances the read cursor.
         counts = inbox.unread_counts()
@@ -7432,12 +7434,20 @@ def cmd_messages(args: argparse.Namespace) -> int:
         per_group = counts["per_group"]
         if peer_hash is not None and group_ids is not None:
             # Both filters list the group posts this sender made in the
-            # group, so count that intersection as the listing shows it.
-            here = sum(
-                1
-                for entry in inbox.list_messages(peer=peer_hash, group=group_ids)
-                if entry.get("unread")
-            )
+            # group, so count that intersection as the listing shows
+            # it: blocked senders' posts are hidden from the listing,
+            # so they never count.  An unreadable block-list hides
+            # everything, exactly as the listing does.
+            blocked = load_blocked_set(config.blocklist_path)
+            if blocked is None:
+                here = 0
+            else:
+                here = sum(
+                    1
+                    for entry in inbox.list_messages(peer=peer_hash, group=group_ids)
+                    if entry.get("unread")
+                    and entry.get("destination") not in blocked
+                )
             per_peer = {}
             per_group = {group_id: here} if here else {}
         elif peer_hash is not None:
@@ -7774,10 +7784,11 @@ def cmd_messages_unread(args: argparse.Namespace) -> int:
     if getattr(args, "group", None):
         if getattr(args, "peer", None):
             raise NodeError("pass a peer or --group, not both")
-        group = GroupStore(config.groups_path).find(args.group)
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
         # History spans renames: the mark covers the current id and
         # every predecessor, like the --group listing does.
-        group_ids = _group_ids_spanning_renames(group)
+        group_ids = _group_ids_spanning_renames(store, group)
         counts = inbox.mark_unread(group=group_ids, all=getattr(args, "all", False))
         if counts is None:
             raise NodeError(f"no stored messages in group {args.group!r}")
@@ -8721,15 +8732,27 @@ def cmd_group_ignored(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _group_ids_spanning_renames(group: Dict[str, Any]) -> List[str]:
-    """This group's id plus its rename predecessors, for history lookups."""
-    return [group["id"], *(group.get("renamed_from") or [])]
+def _group_ids_spanning_renames(
+    store: "GroupStore", group: Dict[str, Any]
+) -> List[str]:
+    """This group's id plus its verified rename predecessors, for history lookups.
+
+    The store only keeps a predecessor whose live or retired record
+    shares this group's creator, so a claimed id from another creator
+    never widens the lookup.  A store read that fails leaves the group
+    standing alone rather than trusting the raw claim.
+    """
+    try:
+        return store.lineage(group["id"])
+    except Exception:  # pragma: no cover - defensive
+        return [group["id"]]
 
 
 def cmd_group_pin(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    group = GroupStore(config.groups_path).find(args.group)
-    group_ids = _group_ids_spanning_renames(group)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    group_ids = _group_ids_spanning_renames(store, group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     entry = _resolve_group_pin_target(inbox, group_ids, args.message)
@@ -8760,8 +8783,9 @@ def cmd_group_pin(args: argparse.Namespace) -> int:
 
 def cmd_group_unpin(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    group = GroupStore(config.groups_path).find(args.group)
-    group_ids = _group_ids_spanning_renames(group)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    group_ids = _group_ids_spanning_renames(store, group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     entry = _resolve_group_pin_target(inbox, group_ids, args.message)
@@ -8797,8 +8821,9 @@ def cmd_group_pinned(args: argparse.Namespace) -> int:
     and the listing never advances the read cursor.
     """
     config = _make_config(args)
-    group = GroupStore(config.groups_path).find(args.group)
-    group_ids = _group_ids_spanning_renames(group)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    group_ids = _group_ids_spanning_renames(store, group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     limit = getattr(args, "limit", 30)

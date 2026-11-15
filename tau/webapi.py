@@ -7378,24 +7378,25 @@ class WebBridge:
         return dict(counts, revision=self._unread_revision)
 
     def _group_lineage(self, group_id: str) -> List[str]:
-        """A group id plus its rename predecessors, current id first.
+        """A group id plus its verified rename predecessors, current id first.
 
         Group posts keep the id they arrived under, so a renamed
-        group's history spans its current id and every predecessor
-        (see :func:`tau.groups.GroupStore.record`).  An unknown id
-        has no lineage: it stands alone.  Reading the store never
-        breaks an unread call — a failure falls back to the id
-        alone, exactly as the unknown case.
+        group's history spans its current id and every predecessor.
+        The lineage comes from the store, which only keeps a
+        predecessor whose live or retired record shares this group's
+        creator — a claimed id from another creator is not history.
+        An unknown id has no lineage: it stands alone.  Reading the
+        store never breaks an unread call — a failure falls back to
+        the id alone, exactly as the unknown case.
         """
         try:
             groups = getattr(self.node, "groups", None)
-            found = groups.get(group_id) if groups is not None else None
+            if groups is None:
+                return [group_id]
+            return groups.lineage(group_id)
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read group store for lineage", exc_info=True)
-            found = None
-        if not isinstance(found, dict):
             return [group_id]
-        return [found["id"], *(found.get("renamed_from") or [])]
 
     def _fold_group_counts(self, counts: Dict[str, Any]) -> Dict[str, Any]:
         """Fold predecessor unread counts into their successor's entry.
@@ -7421,7 +7422,16 @@ class WebBridge:
         for group in known:
             if not isinstance(group, dict):
                 continue
-            for predecessor in group.get("renamed_from") or []:
+            # Only verified predecessors fold: the store drops a
+            # claimed id whose record belongs to another creator.  A
+            # store read that fails for one group leaves its counts
+            # under the predecessor's own id, still visible.
+            try:
+                lineage = groups.lineage(group["id"])
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Could not read group lineage for folding", exc_info=True)
+                continue
+            for predecessor in lineage[1:]:
                 successor[predecessor] = group["id"]
         folded: Dict[str, int] = {}
         for group_id, count in per_group.items():

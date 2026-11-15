@@ -1217,6 +1217,38 @@ class GroupStore:
             group = self._retired_groups.get(group_id.lower())
         return dict(group) if group is not None else None
 
+    def lineage(self, group_id: str) -> List[str]:
+        """This group's id plus its verified rename predecessors.
+
+        A predecessor counts only when this store holds a live or
+        retired record for it whose creator matches this group's
+        creator.  A claimed id with no record, or one created by
+        someone else, is dropped: a creator cannot borrow another
+        group's history by naming its id in a message's lineage, and
+        a read, pin, or badge scoped to the lineage must never touch
+        that other group's mail.  Reloads from disk first, so a
+        rename in another process is seen.  An unknown id has no
+        lineage: it stands alone.  A group with no creator on record
+        keeps no predecessors either — there is nothing to verify
+        them against.
+        """
+        with self._transaction():
+            found = self._groups.get(str(group_id).lower())
+            if found is None:
+                return [group_id]
+            creator = found.get("creator") or ""
+            if not creator:
+                return [found["id"]]
+            ids = [found["id"]]
+            for pred_id in dict.fromkeys(found.get("renamed_from") or []):
+                pred = self._groups.get(str(pred_id).lower())
+                if pred is None:
+                    pred = self._retired_groups.get(str(pred_id).lower())
+                if pred is None or (pred.get("creator") or "") != creator:
+                    continue
+                ids.append(pred["id"])
+            return ids
+
     def find(self, query: str) -> Optional[Dict[str, Any]]:
         """Resolve a group by id, id prefix, or exact name.
 

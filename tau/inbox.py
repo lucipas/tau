@@ -323,10 +323,14 @@ def _valid_cursors(
     sender destination.  Its read state applies to that sender's own
     posts only.  A group conversation then gets one cursor placed just
     below its earliest post that was unread under those per-sender
-    cursors, so no unread post is marked read.  Posts from a sender
-    with no legacy cursor count as unread.  An explicit ``dm:`` or
-    ``group:`` cursor always wins over the migrated value.  The result
-    does not depend on the order of the stored keys.
+    cursors, so no unread post is marked read.  One cursor cannot
+    express per-member read state, so posts a sender had already
+    read after that boundary resurface as unread once, until the
+    group is marked read again — that is the accepted trade-off.
+    Posts from a sender with no legacy cursor count as unread.  An
+    explicit ``dm:`` or ``group:`` cursor always wins over the
+    migrated value.  The result does not depend on the order of the
+    stored keys.
     """
     if raw is None or not isinstance(raw, dict):
         return None

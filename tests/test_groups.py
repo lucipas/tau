@@ -2179,6 +2179,38 @@ def test_group_store_rename(tmp_path):
     assert blank["renamed_from"] == [renamed["id"], group["id"]]
 
 
+def test_group_store_lineage_validates_predecessors(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    mine = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    theirs = store.create("side", [OTHER_HASH, OWN_HASH], created_by=OTHER_HASH)
+    # A creator-authorized message claims an unrelated group's id as
+    # lineage: the store keeps the claim, but the lineage refuses it.
+    assert store.record(
+        mine["id"],
+        "weekend",
+        [OWN_HASH, OTHER_HASH],
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        renamed_from=[theirs["id"]],
+    )
+    assert store.get(mine["id"])["renamed_from"] == [theirs["id"]]
+    assert store.lineage(mine["id"]) == [mine["id"]]
+    # A real rename keeps its predecessor: the retired record shares
+    # the successor's creator.
+    renamed = store.rename(mine["id"], "road trip", created_by=OWN_HASH)
+    assert store.lineage(renamed["id"]) == [renamed["id"], mine["id"]]
+    # An unknown id stands alone.
+    assert store.lineage("ff" * 16) == ["ff" * 16]
+    # A rename in another process is seen: the lineage reloads.
+    other = GroupStore(tmp_path / "groups.json")
+    renamed_again = other.rename(renamed["id"], "detour", created_by=OWN_HASH)
+    assert store.lineage(renamed_again["id"]) == [
+        renamed_again["id"],
+        renamed["id"],
+        mine["id"],
+    ]
+
+
 def test_group_store_rename_refusals(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)

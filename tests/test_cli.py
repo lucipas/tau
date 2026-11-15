@@ -3459,6 +3459,53 @@ def test_messages_count_ignores_sent_records(tmp_path, capsys):
     assert payload == {"unread": {}, "unread_groups": {}, "total": 0}
 
 
+def test_messages_count_combined_filter_excludes_blocked_senders(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    store = GroupStore(config.groups_path)
+    group = store.create(
+        "crew", [sender_hash.hex(), "cd" * 16], created_by=sender_hash.hex()
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew chat",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-group",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+        }
+    )
+    # The listing hides alice's posts once she is blocked; the
+    # combined peer-and-group count must hide them too.
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({sender_hash.hex()}))
+    )
+
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--count",
+            "--peer",
+            "alice",
+            "--group",
+            "crew",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {}, "unread_groups": {}, "total": 0}
+
+
 def test_messages_unread_filter_applies_before_limit(tmp_path, capsys):
     """An older unread message is not crowded out by newer read ones."""
     data_dir = tmp_path / "node"

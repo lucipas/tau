@@ -2927,6 +2927,60 @@ def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path
     }
 
 
+def test_mark_read_group_ignores_poisoned_lineage(bridge, node, tmp_path):
+    """A claimed predecessor from another creator never clears its mail."""
+    from tau.groups import derive_group_id
+
+    mine_id = _learned_group(node, tmp_path)
+    other_id = derive_group_id(
+        OTHER_HASH, "side", [OTHER_HASH, node.destination_hexhash]
+    )
+    assert node.groups.record(
+        other_id,
+        "side",
+        [OTHER_HASH, node.destination_hexhash],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+    )
+    # The weekend group's creator claims the side group as lineage.
+    assert node.groups.record(
+        mine_id,
+        "weekend",
+        [PEER_HASH, node.destination_hexhash],
+        creator=PEER_HASH,
+        sender=PEER_HASH,
+        renamed_from=[other_id],
+    )
+    _inbound_record(
+        node,
+        id="g-mine",
+        received_at=101.0,
+        kind="group",
+        group=mine_id,
+        group_name="weekend",
+    )
+    _inbound_record(
+        node,
+        id="g-other",
+        received_at=102.0,
+        kind="group",
+        group=other_id,
+        group_name="side",
+    )
+
+    # Opening the weekend group clears only its own post: the side
+    # group's unread count stays, and is never folded into weekend's.
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"group": mine_id}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {
+        "per_peer": {},
+        "per_group": {other_id: 1},
+        "total": 1,
+    }
+
+
 def test_mark_read_endpoint_rejects_peer_and_group_together(bridge):
     status, _, payload = _json(
         bridge,
