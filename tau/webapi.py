@@ -1285,6 +1285,9 @@ class WebBridge:
         # it must carry the same trust fields — a public_dict payload would
         # silently drop the verified badge and any key-change warning.
         payload = peer.local_dict()
+        # Private notes never reach the web console: it can be exposed
+        # remotely (--http-allow-remote) without owner authentication.
+        payload.pop("note", None)
         # Annotate like the snapshot does, so a live update or alias
         # response does not erase the frontend's blocked badge.
         blocklist = getattr(self.node, "blocklist", None)
@@ -6232,6 +6235,9 @@ class WebBridge:
         # tests) simply edits.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
         with lock:
+            # Pick up notes a one-shot command saved since the last
+            # periodic refresh, so this save does not write back stale ones.
+            self.node.registry.refresh_aliases()
             if alias is not None and alias.strip():
                 peer = self.node.registry.set_alias(destination, alias)
             else:
