@@ -677,6 +677,7 @@ describe("SocialConsole muted sidebar", () => {
       setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
+      followedTags: [],
       saved: [],
       savedLoading: false,
       savedHasMore: false,
@@ -717,6 +718,8 @@ describe("SocialConsole muted sidebar", () => {
       unmuteAuthor: vi.fn(),
       muteKeyword: vi.fn(),
       unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       deletePost: vi.fn(),
@@ -767,6 +770,40 @@ describe("SocialConsole muted sidebar", () => {
     expect(tan.muteKeyword).toHaveBeenCalledWith("bitcoin");
   });
 
+  it("shows the empty state when no tags are followed", () => {
+    setTan({});
+    render(<SocialConsole />);
+
+    expect(screen.getByText(/No followed tags\./)).toBeTruthy();
+  });
+
+  it("lists followed tags and unfollows each by its display", () => {
+    const tan = setTan({
+      followedTags: [
+        { tag: "gardening", display: "#gardening", added_at: 1 },
+      ],
+    });
+    render(<SocialConsole />);
+
+    expect(screen.queryByText(/No followed tags\./)).toBeNull();
+    expect(screen.getByText("#gardening")).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("unfollow this tag"));
+    expect(tan.unfollowTag).toHaveBeenCalledWith("#gardening");
+  });
+
+  it("submits a typed tag through followTag", () => {
+    const tan = setTan({});
+    render(<SocialConsole />);
+
+    const input = screen.getByPlaceholderText("follow a #tag");
+    fireEvent.change(input, {
+      target: { value: "#gardening" },
+    });
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+    expect(tan.followTag).toHaveBeenCalledWith("#gardening");
+  });
+
   it("keeps text typed while a keyword mute is in flight", async () => {
     let resolveMute!: (value: unknown) => void;
     const pending = new Promise((resolve) => {
@@ -815,6 +852,7 @@ describe("SocialConsole search", () => {
       setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
+      followedTags: [],
       all: false,
       setAll: vi.fn(),
       view: "timeline",
@@ -835,6 +873,8 @@ describe("SocialConsole search", () => {
       unmuteAuthor: vi.fn(),
       muteKeyword: vi.fn(),
       unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       repost: vi.fn(),
@@ -931,6 +971,7 @@ describe("SocialConsole mentions view", () => {
       setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
+      followedTags: [],
       all: false,
       setAll: vi.fn(),
       view: "timeline",
@@ -951,6 +992,8 @@ describe("SocialConsole mentions view", () => {
       unmuteAuthor: vi.fn(),
       muteKeyword: vi.fn(),
       unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       repost: vi.fn(),
@@ -1048,6 +1091,7 @@ describe("SocialConsole pinned view", () => {
       setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
+      followedTags: [],
       saved: [],
       savedLoading: false,
       savedHasMore: false,
@@ -1089,6 +1133,8 @@ describe("SocialConsole pinned view", () => {
       unmuteAuthor: vi.fn(),
       muteKeyword: vi.fn(),
       unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       repost: vi.fn(),
@@ -1195,6 +1241,7 @@ describe("SocialConsole authors directory", () => {
       setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
+      followedTags: [],
       all: false,
       setAll: vi.fn(),
       view: "timeline",
@@ -1215,6 +1262,8 @@ describe("SocialConsole authors directory", () => {
       unmuteAuthor: vi.fn(),
       muteKeyword: vi.fn(),
       unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       deletePost: vi.fn(),
@@ -1340,6 +1389,7 @@ describe("SocialConsole hidden view", () => {
       setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
+      followedTags: [],
       saved: [],
       savedLoading: false,
       savedHasMore: false,
@@ -1381,6 +1431,8 @@ describe("SocialConsole hidden view", () => {
       unmuteAuthor: vi.fn(),
       muteKeyword: vi.fn(),
       unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       repost: vi.fn(),
@@ -1708,6 +1760,7 @@ describe("SocialConsole tags sidebar", () => {
       setTagFilter,
       mutedAuthors: [],
       mutedKeywords: [],
+      followedTags: [],
       saved: [],
       savedLoading: false,
       savedHasMore: false,
@@ -1748,6 +1801,8 @@ describe("SocialConsole tags sidebar", () => {
       unmuteAuthor: vi.fn(),
       muteKeyword: vi.fn(),
       unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       deletePost: vi.fn(),
@@ -1886,6 +1941,7 @@ describe("SocialConsole embedded", () => {
       setTagFilter: vi.fn(),
       mutedAuthors: [],
       mutedKeywords: [],
+      followedTags: [],
       all: false,
       setAll: vi.fn(),
       view: "timeline",
@@ -1906,6 +1962,8 @@ describe("SocialConsole embedded", () => {
       unmuteAuthor: vi.fn(),
       muteKeyword: vi.fn(),
       unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       repost: vi.fn(),

@@ -28,6 +28,7 @@ export function SocialConsole({
   const [text, setText] = useState("");
   const [target, setTarget] = useState("");
   const [keyword, setKeyword] = useState("");
+  const [tag, setTag] = useState("");
   const [searchText, setSearchText] = useState("");
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [quoteTarget, setQuoteTarget] = useState<TanPost | null>(null);
@@ -539,6 +540,33 @@ export function SocialConsole({
       );
     }
   }
+
+  async function submitFollowTag() {
+    if (!tag.trim()) return;
+    // Capture the submitted text: typing during the request must not be
+    // wiped by the clear below, only the text that was actually followed.
+    const submitted = tag;
+    setError(null);
+    try {
+      await tan.followTag(submitted.trim());
+      setTag((current) => (current === submitted ? "" : current));
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "could not follow tag",
+      );
+    }
+  }
+
+  async function submitUnfollowTag(tagValue: string) {
+    setError(null);
+    try {
+      await tan.unfollowTag(tagValue);
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "could not unfollow tag",
+      );
+    }
+  }
   // While a search is active the feed shows its results instead of the
   // timeline; the following/everything toggle is a timeline filter, so it
   // hides until the search is cleared.
@@ -774,6 +802,69 @@ export function SocialConsole({
                         }`}
                       >
                         #{record.tag} · {record.count}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <div className="flex items-center justify-between">
+                <SectionLabel>followed tags</SectionLabel>
+                <span className="font-mono text-[10px] text-mist">
+                  {tan.followedTags.length}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Posts carrying a followed tag join the timeline even when
+                their author is not followed.
+              </p>
+              <form
+                className="mt-3 flex gap-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submitFollowTag();
+                }}
+              >
+                <input
+                  value={tag}
+                  onChange={(event) => setTag(event.target.value)}
+                  placeholder="follow a #tag"
+                  spellCheck={false}
+                  className="h-9 min-w-0 flex-1 rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+                />
+                <button
+                  type="submit"
+                  disabled={!tag.trim()}
+                  className="rounded-lg border border-line bg-void/70 px-2.5 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                >
+                  follow
+                </button>
+              </form>
+
+              {tan.followedTags.length === 0 ? (
+                <p className="mt-3 rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
+                  No followed tags. Follow one above, or pick a tag from the
+                  list to filter the timeline to it.
+                </p>
+              ) : (
+                <ul className="mt-3 space-y-1.5">
+                  {tan.followedTags.map((record) => (
+                    <li
+                      key={record.tag}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+                    >
+                      <p className="min-w-0 truncate font-mono text-xs text-zinc-200">
+                        #{record.tag}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void submitUnfollowTag(record.display)}
+                        className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
+                        title="unfollow this tag"
+                      >
+                        unfollow
                       </button>
                     </li>
                   ))}

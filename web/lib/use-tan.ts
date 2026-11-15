@@ -10,6 +10,8 @@ import type {
   TanCancelScheduledResponse,
   TanExportDocument,
   TanFollow,
+  TanFollowedTag,
+  TanFollowedTagsResponse,
   TanFollowingResponse,
   TanHiddenResponse,
   TanImportResponse,
@@ -92,6 +94,7 @@ export function useTan() {
   const [tagFilter, setTagFilterState] = useState<string | null>(null);
   const [mutedAuthors, setMutedAuthors] = useState<TanMutedAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<TanMutedKeyword[]>([]);
+  const [followedTags, setFollowedTags] = useState<TanFollowedTag[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
@@ -224,22 +227,26 @@ export function useTan() {
       // search endpoint, not the top ranking.
       // A failed mute list keeps its previous contents rather than blocking
       // the timeline and following refresh.
-      const [feed, follows, muted, mutedKeywords] = await Promise.all([
-        activeSearch !== null
-          ? apiGet<TanTimelineResponse>(
-              `/api/tan/search?q=${encodeURIComponent(activeSearch)}&limit=100`,
-            )
-          : isTop
-            ? apiGet<TanTimelineResponse>("/api/tan/top?limit=10")
-            : showMentionsRef.current
-              ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
-              : apiGet<TanTimelineResponse>(timelineUrl),
-        apiGet<TanFollowingResponse>("/api/tan/following"),
-        apiGet<TanMutedResponse>("/api/tan/muted").catch(() => null),
-        apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords").catch(
-          () => null,
-        ),
-      ]);
+      const [feed, follows, muted, mutedKeywords, followedTags] =
+        await Promise.all([
+          activeSearch !== null
+            ? apiGet<TanTimelineResponse>(
+                `/api/tan/search?q=${encodeURIComponent(activeSearch)}&limit=100`,
+              )
+            : isTop
+              ? apiGet<TanTimelineResponse>("/api/tan/top?limit=10")
+              : showMentionsRef.current
+                ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
+                : apiGet<TanTimelineResponse>(timelineUrl),
+          apiGet<TanFollowingResponse>("/api/tan/following"),
+          apiGet<TanMutedResponse>("/api/tan/muted").catch(() => null),
+          apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords").catch(
+            () => null,
+          ),
+          apiGet<TanFollowedTagsResponse>("/api/tan/followed-tags").catch(
+            () => null,
+          ),
+        ]);
       if (generationRef.current !== generation) return false;
       if (activeSearch !== null) {
         setSearchResults(feed.posts);
@@ -256,6 +263,9 @@ export function useTan() {
       if (muted !== null) setMutedAuthors(muted.muted ?? []);
       if (mutedKeywords !== null) {
         setMutedKeywords(mutedKeywords.muted_keywords ?? []);
+      }
+      if (followedTags !== null) {
+        setFollowedTags(followedTags.followed_tags ?? []);
       }
       setError(null);
       // An open thread reloads with the feed, so a new reply (or a
@@ -1253,6 +1263,24 @@ export function useTan() {
     [load],
   );
 
+  // The tag edit has committed before the refresh runs, so a refresh
+  // failure is reported as a warning rather than as the edit failing.
+  const followTag = useCallback(
+    async (tag: string) => {
+      await apiPost("/api/tan/follow-tag", { tag });
+      await runRefreshes([load()]);
+    },
+    [load, runRefreshes],
+  );
+
+  const unfollowTag = useCallback(
+    async (tag: string) => {
+      await apiPost("/api/tan/unfollow-tag", { tag });
+      await runRefreshes([load()]);
+    },
+    [load, runRefreshes],
+  );
+
   const like = useCallback(
     async (target: string) => {
       // Likes are chain entries in the store, so they invalidate an
@@ -1476,6 +1504,7 @@ export function useTan() {
     setTagFilter,
     mutedAuthors,
     mutedKeywords,
+    followedTags,
     saved,
     savedLoading,
     savedHasMore,
@@ -1539,6 +1568,8 @@ export function useTan() {
     unmuteAuthor,
     muteKeyword,
     unmuteKeyword,
+    followTag,
+    unfollowTag,
     like,
     unlike,
     repost,
