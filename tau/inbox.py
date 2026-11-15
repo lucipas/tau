@@ -943,7 +943,25 @@ class Inbox:
             return {"pruned": len(doomed), "per_peer": per_peer, "dry_run": False}
 
 
-    def pin(self, ref: str) -> Tuple[Dict[str, Any], bool]:
+    def _scoped_messages(
+        self, groups: Optional[Collection[str]]
+    ) -> List[Dict[str, Any]]:
+        """Stored records, limited to *groups* when given.
+
+        ``None`` means every record; an empty collection matches
+        nothing, so a pin scoped to a group can never land on another
+        conversation's message.  Records without a group (DMs) never
+        match a group scope.
+        """
+        entries = list(self._messages)
+        if groups is None:
+            return entries
+        wanted = set(groups)
+        return [item for item in entries if str(item.get("group") or "") in wanted]
+
+    def pin(
+        self, ref: str, *, groups: Optional[Collection[str]] = None
+    ) -> Tuple[Dict[str, Any], bool]:
         """Pin one stored message by full id or unique prefix.
 
         Pins are local-only: nothing is sent to the peer, and the flag
@@ -953,9 +971,10 @@ class Inbox:
         pinning an already-pinned message is a no-op, not an error.
         The change runs inside the cross-process transaction, like
         :meth:`delete`, so a concurrent ``tau serve`` cannot lose it.
+        ``groups`` limits the match to records in those group ids.
         """
         with self._transaction():
-            entry = _match_ref(list(self._messages), ref)
+            entry = _match_ref(self._scoped_messages(groups), ref)
             if entry.get("pinned"):
                 return dict(entry), False
             entry["pinned"] = True
@@ -969,15 +988,18 @@ class Inbox:
                 ) from exc
         return dict(entry), True
 
-    def unpin(self, ref: str) -> Tuple[Dict[str, Any], bool]:
+    def unpin(
+        self, ref: str, *, groups: Optional[Collection[str]] = None
+    ) -> Tuple[Dict[str, Any], bool]:
         """Remove the pin from one stored message.
 
-        Same addressing as :meth:`pin`.  Returns the record and
-        whether a pin was actually removed — unpinning a message that
-        was never pinned is a no-op, not an error.
+        Same addressing as :meth:`pin`, including the ``groups`` scope.
+        Returns the record and whether a pin was actually removed —
+        unpinning a message that was never pinned is a no-op, not an
+        error.
         """
         with self._transaction():
-            entry = _match_ref(list(self._messages), ref)
+            entry = _match_ref(self._scoped_messages(groups), ref)
             if not entry.get("pinned"):
                 return dict(entry), False
             del entry["pinned"]

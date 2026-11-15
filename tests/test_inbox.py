@@ -533,6 +533,49 @@ def test_unpin_never_pinned_is_noop(tmp_path):
     assert "pinned" not in entry
 
 
+def test_pin_unpin_groups_scope_limits_match_to_those_groups(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    group_a = "aa" * 16
+    group_b = "bb" * 16
+    inbox.append(
+        _record(id="in-a", text="group a", kind="group", group=group_a)
+    )
+    inbox.append(
+        _record(id="in-b", text="group b", kind="group", group=group_b)
+    )
+    inbox.append(_record(id="dm", text="a dm"))
+
+    # Pinning inside the scope works, and the pin is visible globally.
+    entry, changed = inbox.pin("in-a", groups=[group_a])
+    assert changed is True
+    assert entry["pinned"] is True
+    assert inbox.list_messages(pinned_only=True)[0]["id"] == "in-a"
+
+    # The same id is unknown from another group's scope, for pin and
+    # unpin alike — a group command can never touch another
+    # conversation's message through the mutation.
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.pin("in-a", groups=[group_b])
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.unpin("in-a", groups=[group_b])
+    # A DM has no group, so no group scope ever matches it.
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.pin("dm", groups=[group_a])
+
+    # Unpinning inside the scope clears the pin.
+    entry, changed = inbox.unpin("in-a", groups=[group_a])
+    assert changed is True
+    assert inbox.list_messages(pinned_only=True) == []
+
+    # Without a scope, pin and unpin keep their old behavior.
+    entry, changed = inbox.pin("dm")
+    assert changed is True
+    entry, changed = inbox.unpin("dm")
+    assert changed is True
+
+
 def test_pin_write_failure_rolls_back(tmp_path, monkeypatch):
     import tau.inbox
     from tau.inbox import InboxError

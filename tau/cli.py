@@ -1577,6 +1577,53 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_send_file.set_defaults(func=cmd_group_send_file)
 
+    group_pin = group_sub.add_parser(
+        "pin",
+        parents=[common],
+        help="pin a message in this group so it stays easy to find",
+    )
+    group_pin.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_pin.add_argument(
+        "message",
+        metavar="MESSAGE",
+        help="message id or unique prefix within the group",
+    )
+    group_pin.set_defaults(func=cmd_group_pin)
+
+    group_unpin = group_sub.add_parser(
+        "unpin",
+        parents=[common],
+        help="remove the pin from a message in this group",
+    )
+    group_unpin.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_unpin.add_argument(
+        "message",
+        metavar="MESSAGE",
+        help="message id or unique prefix within the group",
+    )
+    group_unpin.set_defaults(func=cmd_group_unpin)
+
+    group_pinned = group_sub.add_parser(
+        "pinned",
+        parents=[common],
+        help="list pinned messages in this group",
+    )
+    group_pinned.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_pinned.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="show the newest N pinned messages (default 30)",
+    )
+    group_pinned.set_defaults(func=cmd_group_pinned)
+
     tan = subparsers.add_parser(
         "tan",
         parents=[common],
@@ -7134,6 +7181,49 @@ def _resolve_group_reply_target(
     return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
 
 
+def _resolve_group_pin_target(
+    inbox: Inbox, group_ids: Sequence[str], ref: str
+) -> Dict[str, Any]:
+    """Resolve ``tau group pin`` / ``unpin`` to one stored group message.
+
+    Same scoping as :func:`_resolve_group_reply_target` but inbox-only:
+    a pin attaches to a stored record, so a still-queued leg has nothing
+    to pin and is never a candidate.  ``group_ids`` spans renames, so a
+    message stored under a predecessor id still resolves.  An exact id
+    wins over a longer id that merely starts with it, as in
+    :meth:`Inbox.pin` (via :func:`_match_ref`).  A prefix matching more
+    than one record, or nothing at all, is refused.
+
+    A sent group message pins like any sent record — ``tau pin`` pins
+    sent DMs regardless of delivery — so there is deliberately no
+    refusal for sends whose legs are still queued: the stored record
+    is what the pin attaches to, not the delivery state.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("message must not be empty")
+    matches: List[Dict[str, Any]] = []
+    for group_id in group_ids:
+        matches.extend(inbox.find_prefix(ref, group=group_id))
+    exact = [m for m in matches if str(m["id"]) == ref]
+    if not exact:
+        folded = ref.lower()
+        exact = [m for m in matches if str(m["id"]).lower() == folded]
+    if exact:
+        matches = exact
+    if len(matches) > 1:
+        raise NodeError(
+            f"{len(matches)} messages in this group match {ref!r};"
+            " use a longer prefix"
+        )
+    if not matches:
+        raise NodeError(
+            f"no message {ref!r} in this group to pin;"
+            " pins attach to a stored message from this group's history"
+        )
+    return matches[0]
+
+
 def _own_destination_hash(config: TauConfig) -> Optional[str]:
     """This node's destination hash, or ``None`` without an identity."""
     identity = load_identity(config.identity_path)
@@ -7254,7 +7344,10 @@ def _print_message_entry(
     destination = str(entry.get("destination") or "")
     peer = registry.get(destination)
     sender = short_hash(destination)
-    if entry.get("direction") == "out":
+    if entry.get("direction") == "out" and entry.get("kind") == "group":
+        # A group send has no single destination: name the group instead.
+        who = f"you → {entry.get('group_name') or 'group'}"
+    elif entry.get("direction") == "out":
         name = peer.display_name if peer is not None else "unknown"
         who = f"you → {name} ({sender})"
     else:
@@ -8560,6 +8653,116 @@ def cmd_group_ignored(args: argparse.Namespace) -> int:
             f"{name} ({entry['id'][:8]}): "
             f"{entry['messages']} message(s)"
         )
+    return _EXIT_OK
+
+
+def _group_ids_spanning_renames(group: Dict[str, Any]) -> List[str]:
+    """This group's id plus its rename predecessors, for history lookups."""
+    return [group["id"], *(group.get("renamed_from") or [])]
+
+
+def cmd_group_pin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    group = GroupStore(config.groups_path).find(args.group)
+    group_ids = _group_ids_spanning_renames(group)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    entry = _resolve_group_pin_target(inbox, group_ids, args.message)
+    try:
+        pinned, changed = inbox.pin(str(entry["id"]), groups=group_ids)
+    except InboxError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit(
+            {"pinned": pinned, "already_pinned": not changed, "group": group["id"]},
+            True,
+        )
+        return _EXIT_OK
+    short = _safe_id_prefix(str(pinned.get("id") or ""))
+    when = _format_message_time(float(pinned.get("received_at", 0)))
+    state = "pinned" if changed else "already pinned"
+    print(
+        f"{state} [{short}] {_message_peer_label(registry, pinned)}"
+        f" ({when}) in group \"{group['name']}\""
+    )
+    if changed:
+        print(
+            "note: pins are local-only; the members' copies are unaffected"
+            " and the pin is never sent."
+        )
+    return _EXIT_OK
+
+
+def cmd_group_unpin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    group = GroupStore(config.groups_path).find(args.group)
+    group_ids = _group_ids_spanning_renames(group)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    entry = _resolve_group_pin_target(inbox, group_ids, args.message)
+    try:
+        unpinned, changed = inbox.unpin(str(entry["id"]), groups=group_ids)
+    except InboxError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit(
+            {
+                "unpinned": unpinned,
+                "was_pinned": changed,
+                "group": group["id"],
+            },
+            True,
+        )
+        return _EXIT_OK
+    short = _safe_id_prefix(str(unpinned.get("id") or ""))
+    when = _format_message_time(float(unpinned.get("received_at", 0)))
+    state = "unpinned" if changed else "was not pinned"
+    print(
+        f"{state} [{short}] {_message_peer_label(registry, unpinned)}"
+        f" ({when}) in group \"{group['name']}\""
+    )
+    return _EXIT_OK
+
+
+def cmd_group_pinned(args: argparse.Namespace) -> int:
+    """List pinned messages in one group, received and sent.
+
+    Same listing as ``tau pinned`` scoped to the group: history spans
+    renames, blocked senders' received pins stay hidden like there,
+    and the listing never advances the read cursor.
+    """
+    config = _make_config(args)
+    group = GroupStore(config.groups_path).find(args.group)
+    group_ids = _group_ids_spanning_renames(group)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    limit = getattr(args, "limit", 30)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    entries = inbox.list_messages(
+        limit=None, group=group_ids, pinned_only=True, direction=None
+    )
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        entries = [entry for entry in entries if entry.get("direction") == "out"]
+    elif blocked:
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("direction") == "out"
+            or entry.get("destination") not in blocked
+        ]
+    shown = entries if limit is None else entries[:limit]
+    if _json_mode(args):
+        _emit({"messages": shown, "count": len(shown), "group": group["id"]}, True)
+    elif not shown:
+        print(f"No pinned messages in group \"{group['name']}\".")
+    else:
+        own_hash = _own_destination_hash(config)
+        for entry in shown:
+            _print_message_entry(
+                inbox, registry, entry, blocked=blocked, own_hash=own_hash
+            )
     return _EXIT_OK
 
 

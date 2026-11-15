@@ -4933,6 +4933,235 @@ def test_resolve_group_reply_target_rejects_prefix_shared_across_stores(
         cli._resolve_group_reply_target(inbox, mailbox, "aaaa", group["id"])
 
 
+def test_parser_group_pin_unpin_pinned_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["group", "pin", "weekend", "aaaa"])
+    assert args.group == "weekend"
+    assert args.message == "aaaa"
+    assert args.func is cli.cmd_group_pin
+
+    args = parser.parse_args(["group", "unpin", "weekend", "aaaa"])
+    assert args.group == "weekend"
+    assert args.message == "aaaa"
+    assert args.func is cli.cmd_group_unpin
+
+    args = parser.parse_args(["group", "pinned", "weekend", "--limit", "5"])
+    assert args.group == "weekend"
+    assert args.limit == 5
+    assert args.func is cli.cmd_group_pinned
+
+    defaults = parser.parse_args(["group", "pinned", "weekend"])
+    assert defaults.limit == 30
+
+
+def test_resolve_group_pin_target_scopes_to_the_group(tmp_path):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    group_ids = [group["id"]]
+
+    entry = cli._resolve_group_pin_target(inbox, group_ids, "aaaa")
+    assert entry["id"] == "a" * 32
+    # The other group's message shares the "aaaa" prefix but must not
+    # leak into this group's resolution: its full id is unknown here.
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_group_pin_target(inbox, group_ids, "a" * 31 + "f")
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_group_pin_target(inbox, group_ids, "zzzz")
+    with pytest.raises(cli.NodeError, match="must not be empty"):
+        cli._resolve_group_pin_target(inbox, group_ids, "  ")
+
+    # Two messages in the same group sharing a prefix are refused.
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "near miss",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "a" * 31 + "c",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+        }
+    )
+    with pytest.raises(cli.NodeError, match="2 messages"):
+        cli._resolve_group_pin_target(inbox, group_ids, "aaaa")
+
+
+def test_group_pin_unpin_round_trip(tmp_path, capsys):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+
+    code = cli.main(
+        ["group", "pin", "weekend", "aaaa", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "pinned [aaaaaaaa] from alice" in out
+    assert 'in group "weekend"' in out
+    assert "pins are local-only" in out
+
+    # The pin survives a fresh process and shows in the group listing.
+    code = cli.main(["group", "pinned", "weekend", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "original thought" in out
+    assert "seconded" not in out
+
+    # ... and in the global listing, like any pin.
+    code = cli.main(["pinned", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "original thought" in capsys.readouterr().out
+
+    code = cli.main(
+        ["group", "unpin", "weekend", "aaaa", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "unpinned [aaaaaaaa] from alice" in capsys.readouterr().out
+
+    code = cli.main(["group", "pinned", "weekend", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert 'No pinned messages in group "weekend".' in capsys.readouterr().out
+
+
+def test_group_pin_json_and_errors(tmp_path, capsys):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "near miss",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "a" * 31 + "c",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+        }
+    )
+
+    # Ambiguous prefix within the group.
+    code = cli.main(
+        ["group", "pin", "weekend", "aaaa", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "2 messages in this group match" in capsys.readouterr().err
+
+    # A message from the other group is refused, not pinned.
+    code = cli.main(
+        ["group", "pin", "weekend", "a" * 31 + "f", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "no message" in capsys.readouterr().err
+
+    # Unknown group.
+    code = cli.main(
+        ["group", "pin", "nope", "aaaa", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "unknown group" in capsys.readouterr().err
+
+    # Unknown message.
+    code = cli.main(
+        ["group", "pin", "weekend", "zzzz", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "no message" in capsys.readouterr().err
+
+    # Negative limit is refused.
+    code = cli.main(
+        ["group", "pinned", "weekend", "--limit", "-1", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "--limit must not be negative" in capsys.readouterr().err
+
+    code = cli.main(
+        ["group", "pin", "weekend", "b" * 32, "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pinned"]["id"] == "b" * 32
+    assert payload["already_pinned"] is False
+    assert payload["group"] == group["id"]
+
+    # Pinning twice reports the pin was already there.
+    code = cli.main(
+        ["group", "pin", "weekend", "b" * 32, "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["already_pinned"] is True
+
+    # The group listing reports the pin in JSON.
+    code = cli.main(
+        ["group", "pinned", "weekend", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["id"] == "b" * 32
+    assert payload["group"] == group["id"]
+
+    code = cli.main(
+        ["group", "unpin", "weekend", "b" * 32, "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unpinned"]["id"] == "b" * 32
+    assert payload["was_pinned"] is True
+
+    # Unpinning an unpinned message is a no-op, not an error.
+    code = cli.main(
+        ["group", "unpin", "weekend", "b" * 32, "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["was_pinned"] is False
+
+
+def test_group_pinned_blocked_filter_applies_to_received_only(tmp_path, capsys):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "cd" * 16,
+            "text": "sent pinned note",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "s-1",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "out",
+        }
+    )
+    cli.main(["group", "pin", "weekend", "aaaa", "--data-dir", str(data_dir)])
+    cli.main(["group", "pin", "weekend", "s-1", "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    def _pinned_text():
+        code = cli.main(["group", "pinned", "weekend", "--data-dir", str(data_dir)])
+        assert code == 0
+        return capsys.readouterr().out
+
+    # Blocking the sender hides the received pin, not the sent one.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": ["cd" * 16]}), encoding="utf-8"
+    )
+    out = _pinned_text()
+    assert "original thought" not in out
+    assert "sent pinned note" in out
+    # A group send is labelled by its group, never as an unknown peer.
+    assert "you → weekend" in out
+    assert "unknown" not in out
+
+
 def test_group_messages_renders_quote_from_local_history(tmp_path, capsys):
     data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
     code = cli.main(
