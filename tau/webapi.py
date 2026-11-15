@@ -6610,6 +6610,50 @@ class WebBridge:
             log.debug("Could not read group store", exc_info=True)
             return []
 
+    def _restored_entry(
+        self,
+        counts: Dict[str, Any],
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """The restored-mail entry for one conversation, or ``None``.
+
+        *counts* are the fresh unread counts; the entry names the
+        conversation by the bare peer hash or group id the console
+        holds its badges under, with the restored unread count.  A
+        conversation with no unread mail gets no entry, so a change
+        that restores nothing sends an ordinary unread event.
+        """
+        if (peer is None) == (group is None):
+            raise ValueError("exactly one of 'peer' or 'group' is required")
+        bucket = counts.get("per_group") if group is not None else counts.get("per_peer")
+        key = group if group is not None else peer
+        unread_after = int((bucket or {}).get(key, 0))
+        if unread_after <= 0:
+            return None
+        return {"target": key, "unread": unread_after}
+
+    def _publish_unread(
+        self,
+        counts: Dict[str, Any],
+        *,
+        restored: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Publish fresh unread counts to every open console.
+
+        *restored* names conversations whose unread mail this change
+        restored — mail that arrived while muted or ignored, not new
+        arrivals.  A console that has one of those conversations open
+        holds the restored count instead of auto-reading it as new
+        mail.  The key is omitted when nothing was restored, so
+        ordinary unread events keep their existing shape.
+        """
+        event: Dict[str, Any] = {"type": "unread", "unread": counts}
+        if restored:
+            event["restored"] = restored
+        self.bus.publish(event)
+
     def muted_conversations(self, *, visible_only: bool = False) -> Dict[str, Any]:
         """All muted conversations, for the console load.
 
@@ -6705,11 +6749,24 @@ class WebBridge:
             if changed:
                 save_muted(path, updated)
         counts: Optional[Dict[str, Any]] = None
+        restored: List[Dict[str, Any]] = []
         if changed:
             # unread() takes the unread lock itself; the publish rides
             # the same SSE event a mark-read sends.
             counts = self.unread()
-            self.bus.publish({"type": "unread", "unread": counts})
+            if not muted:
+                # Unmuting restores counting for mail that arrived
+                # while muted; name it in the event, so every open
+                # console — not just the one that unmuted — holds the
+                # restored mail instead of auto-reading it as new.
+                entry = self._restored_entry(
+                    counts,
+                    group=key if is_group else None,
+                    peer=None if is_group else key,
+                )
+                if entry is not None:
+                    restored.append(entry)
+            self._publish_unread(counts, restored=restored or None)
         return {
             "target": key,
             "group": is_group,
@@ -6991,8 +7048,15 @@ class WebBridge:
         if was_ignored:
             # Stored history returns on unignore, including its unread
             # posts: push the recomputed counts so every open console
-            # reconciles without waiting for the next message.
-            self.bus.publish({"type": "unread", "unread": self.unread()})
+            # reconciles without waiting for the next message.  Name
+            # the restored posts in the event, like an unmute does, so
+            # a console with the group open holds them instead of
+            # auto-reading them as new mail.
+            counts = self.unread()
+            entry = self._restored_entry(counts, group=group_id)
+            self._publish_unread(
+                counts, restored=[entry] if entry is not None else None
+            )
         return {
             "group": group_id,
             "name": name,

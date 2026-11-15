@@ -4823,6 +4823,87 @@ def test_muted_conversations_endpoints(node, tmp_path):
         bridge.stop()
 
 
+def test_unmute_names_restored_mail_in_the_unread_event(node, tmp_path):
+    # Issue #411 repro 3: an unmute restores mail that arrived while
+    # muted, and every open console must hold it instead of
+    # auto-reading it as new mail. The published unread event names
+    # the restored conversation, so the other consoles can tell
+    # restored counts from new arrivals.
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        group_id = node.groups.list_groups()[0]["id"]
+
+        def unread_events():
+            return [
+                event
+                for event in bridge.bus.replay(0)
+                if event["type"] == "unread"
+            ]
+
+        # Muting publishes an ordinary unread event: nothing restored.
+        _json(bridge, "/api/messages/mute", method="POST", body={"peer": "alice"})
+        assert unread_events()[-1].get("restored") is None
+        _json(bridge, "/api/messages/mute", method="POST", body={"group": "crew"})
+        assert unread_events()[-1].get("restored") is None
+
+        # Mail arrives while muted, for the DM and for the group.
+        _inbound_record(
+            node,
+            id="dm-muted",
+            text="hello while muted",
+            sent_at=1000.0,
+            received_at=1001.0,
+        )
+        _inbound_record(
+            node,
+            id="group-muted",
+            text="crew chat while muted",
+            sent_at=1002.0,
+            received_at=1003.0,
+            kind="group",
+            group=group_id,
+            group_name="crew",
+        )
+        assert bridge.unread()["total"] == 0
+
+        # Unmuting the DM names only its restored mail.
+        _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"peer": "alice", "muted": False},
+        )
+        assert unread_events()[-1]["restored"] == [
+            {"target": PEER_HASH, "unread": 1}
+        ]
+
+        # Unmuting the group names its restored posts, under the
+        # current group id the console holds the badge under.
+        _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"group": "crew", "muted": False},
+        )
+        assert unread_events()[-1]["restored"] == [
+            {"target": group_id, "unread": 1}
+        ]
+
+        # Unignoring a group restores its posts the same way.
+        _json(
+            bridge, "/api/groups/ignore", method="POST", body={"group": "crew"}
+        )
+        assert unread_events()[-1].get("restored") is None
+        _json(
+            bridge, "/api/groups/unignore", method="POST", body={"group": "crew"}
+        )
+        assert unread_events()[-1]["restored"] == [
+            {"target": group_id, "unread": 1}
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_muted_conversations_endpoint_rejects_bad_input(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:
