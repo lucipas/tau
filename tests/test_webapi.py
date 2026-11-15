@@ -5534,6 +5534,114 @@ def test_tan_follow_tag_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_mute_tag_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "hello from tan", name="tester", now=1000)
+        create_post(
+            conn, identity, "my #gardening update", name="tester", now=1001
+        )
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/muted-tags")
+        assert status == 200
+        assert payload == {"muted_tags": [], "count": 0}
+
+        # Both posts are in the plain timeline before the mute.
+        status, _, payload = _json(bridge, "/api/tan/timeline")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "my #gardening update",
+            "hello from tan",
+        ]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute-tag",
+            method="POST",
+            body={"tag": "#gardening"},
+        )
+        assert status == 200
+        assert payload["mute"]["tag"] == "gardening"
+        first_muted_at = payload["mute"]["added_at"]
+
+        # The muted tag drops the post from the timeline at once.
+        status, _, payload = _json(bridge, "/api/tan/timeline")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
+
+        status, _, payload = _json(bridge, "/api/tan/muted-tags")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["muted_tags"][0]["display"] == "#gardening"
+
+        # Re-muting is a no-op: the original mute time is kept.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute-tag",
+            method="POST",
+            body={"tag": "GARDENING"},
+        )
+        assert status == 200
+        assert payload["mute"]["added_at"] == first_muted_at
+        status, _, relisted = _json(bridge, "/api/tan/muted-tags")
+        assert relisted["muted_tags"][0]["added_at"] == first_muted_at
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unmute-tag",
+            method="POST",
+            body={"tag": "gardening"},
+        )
+        assert status == 200
+        assert payload["mute"]["unmuted"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline")
+        assert [item["text"] for item in payload["posts"]] == [
+            "my #gardening update",
+            "hello from tan",
+        ]
+
+        # Unmuting again reports that nothing was muted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unmute-tag",
+            method="POST",
+            body={"tag": "gardening"},
+        )
+        assert payload["mute"]["unmuted"] is False
+
+        # Missing fields and invalid tags are rejected.
+        status, _, payload = _json(
+            bridge, "/api/tan/mute-tag", method="POST", body={}
+        )
+        assert status == 400
+        assert "field 'tag' is required" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute-tag",
+            method="POST",
+            body={"tag": "not a tag!!"},
+        )
+        assert status == 400
+        assert "not a tag" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_hidden_annotates_own_posts_and_respects_blocklist(tmp_path):
     import RNS
 

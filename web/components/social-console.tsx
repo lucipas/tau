@@ -29,6 +29,7 @@ export function SocialConsole({
   const [target, setTarget] = useState("");
   const [keyword, setKeyword] = useState("");
   const [tag, setTag] = useState("");
+  const [mutedTag, setMutedTag] = useState("");
   const [searchText, setSearchText] = useState("");
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [quoteTarget, setQuoteTarget] = useState<TanPost | null>(null);
@@ -567,6 +568,33 @@ export function SocialConsole({
       );
     }
   }
+
+  async function submitMuteTag() {
+    if (!mutedTag.trim()) return;
+    // Capture the submitted text: typing during the request must not be
+    // wiped by the clear below, only the text that was actually muted.
+    const submitted = mutedTag;
+    setError(null);
+    try {
+      await tan.muteTag(submitted.trim());
+      setMutedTag((current) => (current === submitted ? "" : current));
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "could not mute tag",
+      );
+    }
+  }
+
+  async function submitUnmuteTag(tagValue: string) {
+    setError(null);
+    try {
+      await tan.unmuteTag(tagValue);
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "could not unmute tag",
+      );
+    }
+  }
   // While a search is active the feed shows its results instead of the
   // timeline; the following/everything toggle is a timeline filter, so it
   // hides until the search is cleared.
@@ -876,12 +904,14 @@ export function SocialConsole({
               <div className="flex items-center justify-between">
                 <SectionLabel>muted</SectionLabel>
                 <span className="font-mono text-[10px] text-mist">
-                  {tan.mutedAuthors.length + tan.mutedKeywords.length}
+                  {tan.mutedAuthors.length +
+                    tan.mutedKeywords.length +
+                    tan.mutedTags.length}
                 </span>
               </div>
               <p className="mt-2 text-[11px] leading-relaxed text-mist">
-                Muted authors and keywords stay stored but never appear in
-                the timeline. Unmuting restores the full history.
+                Muted authors, keywords, and tags stay stored but never
+                appear in the timeline. Unmuting restores the full history.
               </p>
               <form
                 className="mt-3 flex gap-2"
@@ -906,11 +936,35 @@ export function SocialConsole({
                 </button>
               </form>
 
+              <form
+                className="mt-3 flex gap-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submitMuteTag();
+                }}
+              >
+                <input
+                  value={mutedTag}
+                  onChange={(event) => setMutedTag(event.target.value)}
+                  placeholder="mute a #tag"
+                  spellCheck={false}
+                  className="h-9 min-w-0 flex-1 rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+                />
+                <button
+                  type="submit"
+                  disabled={!mutedTag.trim()}
+                  className="rounded-lg border border-line bg-void/70 px-2.5 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                >
+                  mute tag
+                </button>
+              </form>
+
               {tan.mutedAuthors.length === 0 &&
-              tan.mutedKeywords.length === 0 ? (
+              tan.mutedKeywords.length === 0 &&
+              tan.mutedTags.length === 0 ? (
                 <p className="mt-3 rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
-                  Nothing muted. Mute an author from their post, or a keyword
-                  above.
+                  Nothing muted. Mute an author from their post, or a
+                  keyword or tag above.
                 </p>
               ) : null}
               {tan.mutedAuthors.length > 0 ? (
@@ -956,6 +1010,28 @@ export function SocialConsole({
                         onClick={() => void submitUnmuteKeyword(record.display)}
                         className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
                         title="unmute this keyword"
+                      >
+                        unmute
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {tan.mutedTags.length > 0 ? (
+                <ul className="mt-3 space-y-1.5">
+                  {tan.mutedTags.map((record) => (
+                    <li
+                      key={record.tag}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+                    >
+                      <p className="min-w-0 truncate font-mono text-xs text-zinc-200">
+                        #{record.tag}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void submitUnmuteTag(record.display)}
+                        className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
+                        title="unmute this tag"
                       >
                         unmute
                       </button>

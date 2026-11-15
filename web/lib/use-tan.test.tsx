@@ -565,17 +565,19 @@ describe("useTan deletePost", () => {
       const firstMuted = deferred();
       const firstMutedKeywords = deferred();
       const firstFollowedTags = deferred();
+      const firstMutedTags = deferred();
       const firstSuggestions = deferred();
       const firstTags = deferred();
-      // A feed load fires the timeline, following, muted, muted-keyword
-      // and followed-tag requests, and the authors directory, suggestions
-      // and tag list load beside it.
+      // A feed load fires the timeline, following, muted, muted-keyword,
+      // followed-tag and muted-tag requests, and the authors directory,
+      // suggestions and tag list load beside it.
       const queue = [
         first,
         firstFollowing,
         firstMuted,
         firstMutedKeywords,
         firstFollowedTags,
+        firstMutedTags,
         firstAuthors,
         firstSuggestions,
         firstTags,
@@ -589,12 +591,12 @@ describe("useTan deletePost", () => {
 
       const { result } = renderHook(() => useTan());
       // The initial load is in flight; a poll tick must not invalidate it.
-      // Eight feed calls plus the one rules load.
-      expect(mockedGet.mock.calls.length).toBe(9);
+      // Nine feed calls plus the one rules load.
+      expect(mockedGet.mock.calls.length).toBe(10);
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBe(9);
+      expect(mockedGet.mock.calls.length).toBe(10);
 
       await act(async () => {
         first.resolve({ posts: [mine], count: 1 });
@@ -602,6 +604,7 @@ describe("useTan deletePost", () => {
         firstMuted.resolve({ muted: [], count: 0 });
         firstMutedKeywords.resolve({ muted_keywords: [], count: 0 });
         firstFollowedTags.resolve({ followed_tags: [], count: 0 });
+        firstMutedTags.resolve({ muted_tags: [], count: 0 });
         firstAuthors.resolve(emptyAuthors);
         firstSuggestions.resolve(emptySuggestions);
         firstTags.resolve({ tags: [], count: 0 });
@@ -615,7 +618,7 @@ describe("useTan deletePost", () => {
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBeGreaterThan(9);
+      expect(mockedGet.mock.calls.length).toBeGreaterThan(10);
     } finally {
       vi.useRealTimers();
     }
@@ -625,9 +628,11 @@ describe("useTan deletePost", () => {
     const first = makePost({ hash: "a".repeat(64), text: "first" });
     const second = makePost({ hash: "b".repeat(64), text: "second" });
     // Two feed loads in flight: the initial load takes the first
-    // eight deferreds (timeline, following, muted, muted keywords,
-    // followed tags, authors, suggestions, tags), the refresh the next five.
+    // nine deferreds (timeline, following, muted, muted keywords,
+    // followed tags, muted tags, authors, suggestions, tags), the refresh
+    // the next six.
     const queue = [
+      deferred(),
       deferred(),
       deferred(),
       deferred(),
@@ -660,11 +665,12 @@ describe("useTan deletePost", () => {
     });
     // Resolve the newer load first, then the older one.
     await act(async () => {
-      queue[8].resolve({ posts: [second], count: 1 });
-      queue[9].resolve(emptyFollowing);
-      queue[10].resolve({ muted: [], count: 0 });
-      queue[11].resolve({ muted_keywords: [], count: 0 });
-      queue[12].resolve({ followed_tags: [], count: 0 });
+      queue[9].resolve({ posts: [second], count: 1 });
+      queue[10].resolve(emptyFollowing);
+      queue[11].resolve({ muted: [], count: 0 });
+      queue[12].resolve({ muted_keywords: [], count: 0 });
+      queue[13].resolve({ followed_tags: [], count: 0 });
+      queue[14].resolve({ muted_tags: [], count: 0 });
     });
     await act(async () => {
       queue[0].resolve({ posts: [first], count: 1 });
@@ -672,9 +678,10 @@ describe("useTan deletePost", () => {
       queue[2].resolve({ muted: [], count: 0 });
       queue[3].resolve({ muted_keywords: [], count: 0 });
       queue[4].resolve({ followed_tags: [], count: 0 });
-      queue[5].resolve(emptyAuthors);
-      queue[6].resolve(emptySuggestions);
-      queue[7].resolve({ tags: [], count: 0 });
+      queue[5].resolve({ muted_tags: [], count: 0 });
+      queue[6].resolve(emptyAuthors);
+      queue[7].resolve(emptySuggestions);
+      queue[8].resolve({ tags: [], count: 0 });
     });
     await act(async () => {
       await refreshPromise;
@@ -909,6 +916,9 @@ describe("useTan mute actions", () => {
   const followedTags = [
     { tag: "gardening", display: "#gardening", added_at: 1002 },
   ];
+  const mutedTags = [
+    { tag: "spoilers", display: "#spoilers", added_at: 1003 },
+  ];
 
   function mockFeed() {
     mockedGet.mockImplementation((path: string) => {
@@ -923,6 +933,9 @@ describe("useTan mute actions", () => {
       }
       if (path === "/api/tan/followed-tags") {
         return Promise.resolve({ followed_tags: followedTags, count: 1 });
+      }
+      if (path === "/api/tan/muted-tags") {
+        return Promise.resolve({ muted_tags: mutedTags, count: 1 });
       }
       return Promise.resolve(emptyFollowing);
     });
@@ -994,6 +1007,38 @@ describe("useTan mute actions", () => {
     });
     expect(mockedPost).toHaveBeenCalledWith("/api/tan/unfollow-tag", {
       tag: "gardening",
+    });
+  });
+
+  it("loads muted tags with the feed", async () => {
+    mockFeed();
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() =>
+      expect(result.current.mutedTags).toEqual(mutedTags),
+    );
+  });
+
+  it("mutes and unmutes a tag and reloads the feed", async () => {
+    mockFeed();
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() =>
+      expect(result.current.mutedTags).toEqual(mutedTags),
+    );
+
+    await act(async () => {
+      await result.current.muteTag("#spoilers");
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/mute-tag", {
+      tag: "#spoilers",
+    });
+
+    await act(async () => {
+      await result.current.unmuteTag("spoilers");
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/unmute-tag", {
+      tag: "spoilers",
     });
   });
 
@@ -1418,11 +1463,14 @@ describe("useTan top view", () => {
     vi.useFakeTimers();
     try {
       const top = makePost({ text: "most liked", likes: 5 });
-      // Eight queued calls for the initial load (feed, following, muted,
-      // muted keywords, followed tags, authors, suggestions) plus the tag
-      // list and the rules load, then six more for the top load (feed,
-      // following, muted, muted keywords, followed tags, authors).
+      // Nine queued calls for the initial load (feed, following, muted,
+      // muted keywords, followed tags, muted tags, authors, suggestions)
+      // plus the tag list and the rules load, then seven more for the top
+      // load (feed, following, muted, muted keywords, followed tags,
+      // muted tags, authors).
       const queue = [
+        deferred(),
+        deferred(),
         deferred(),
         deferred(),
         deferred(),
@@ -1448,26 +1496,27 @@ describe("useTan top view", () => {
       const { result } = renderHook(() => useTan());
       // The initial timeline load is in flight; switch to top, which
       // supersedes it with a top load.
-      expect(mockedGet.mock.calls.length).toBe(9);
+      expect(mockedGet.mock.calls.length).toBe(10);
       act(() => {
         result.current.setView("top");
       });
-      expect(mockedGet.mock.calls.length).toBe(15);
+      expect(mockedGet.mock.calls.length).toBe(17);
 
       await act(async () => {
-        queue[8].resolve({ posts: [top], count: 1 });
-        queue[9].resolve(emptyFollowing);
-        queue[10].resolve({ muted: [], count: 0 });
-        queue[11].resolve({ muted_keywords: [], count: 0 });
-        queue[12].resolve({ followed_tags: [], count: 0 });
-        queue[13].resolve(emptyAuthors);
+        queue[9].resolve({ posts: [top], count: 1 });
+        queue[10].resolve(emptyFollowing);
+        queue[11].resolve({ muted: [], count: 0 });
+        queue[12].resolve({ muted_keywords: [], count: 0 });
+        queue[13].resolve({ followed_tags: [], count: 0 });
+        queue[14].resolve({ muted_tags: [], count: 0 });
+        queue[15].resolve(emptyAuthors);
       });
       expect(result.current.posts).toEqual([top]);
 
       await act(async () => {
         vi.advanceTimersByTime(15000);
       });
-      expect(mockedGet.mock.calls.length).toBe(15);
+      expect(mockedGet.mock.calls.length).toBe(17);
     } finally {
       vi.useRealTimers();
     }

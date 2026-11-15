@@ -944,6 +944,17 @@ export interface TanFollowedTagsResponse {
   count: number;
 }
 
+export interface TanMutedTag {
+  tag: string;
+  display: string;
+  added_at: number;
+}
+
+export interface TanMutedTagsResponse {
+  muted_tags: TanMutedTag[];
+  count: number;
+}
+
 export interface TanPostResponse {
   ok: boolean;
   post: TanPost;

@@ -21,6 +21,8 @@ import type {
   TanMutedKeyword,
   TanMutedKeywordsResponse,
   TanMutedResponse,
+  TanMutedTag,
+  TanMutedTagsResponse,
   TanPost,
   TanPostResponse,
   TanRules,
@@ -95,6 +97,7 @@ export function useTan() {
   const [mutedAuthors, setMutedAuthors] = useState<TanMutedAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<TanMutedKeyword[]>([]);
   const [followedTags, setFollowedTags] = useState<TanFollowedTag[]>([]);
+  const [mutedTags, setMutedTags] = useState<TanMutedTag[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
@@ -227,7 +230,7 @@ export function useTan() {
       // search endpoint, not the top ranking.
       // A failed mute list keeps its previous contents rather than blocking
       // the timeline and following refresh.
-      const [feed, follows, muted, mutedKeywords, followedTags] =
+      const [feed, follows, muted, mutedKeywords, followedTags, mutedTags] =
         await Promise.all([
           activeSearch !== null
             ? apiGet<TanTimelineResponse>(
@@ -244,6 +247,9 @@ export function useTan() {
             () => null,
           ),
           apiGet<TanFollowedTagsResponse>("/api/tan/followed-tags").catch(
+            () => null,
+          ),
+          apiGet<TanMutedTagsResponse>("/api/tan/muted-tags").catch(
             () => null,
           ),
         ]);
@@ -266,6 +272,9 @@ export function useTan() {
       }
       if (followedTags !== null) {
         setFollowedTags(followedTags.followed_tags ?? []);
+      }
+      if (mutedTags !== null) {
+        setMutedTags(mutedTags.muted_tags ?? []);
       }
       setError(null);
       // An open thread reloads with the feed, so a new reply (or a
@@ -1281,6 +1290,24 @@ export function useTan() {
     [load, runRefreshes],
   );
 
+  // The tag edit has committed before the refresh runs, so a refresh
+  // failure is reported as a warning rather than as the edit failing.
+  const muteTag = useCallback(
+    async (tag: string) => {
+      await apiPost("/api/tan/mute-tag", { tag });
+      await runRefreshes([load()]);
+    },
+    [load, runRefreshes],
+  );
+
+  const unmuteTag = useCallback(
+    async (tag: string) => {
+      await apiPost("/api/tan/unmute-tag", { tag });
+      await runRefreshes([load()]);
+    },
+    [load, runRefreshes],
+  );
+
   const like = useCallback(
     async (target: string) => {
       // Likes are chain entries in the store, so they invalidate an
@@ -1505,6 +1532,7 @@ export function useTan() {
     mutedAuthors,
     mutedKeywords,
     followedTags,
+    mutedTags,
     saved,
     savedLoading,
     savedHasMore,
@@ -1570,6 +1598,8 @@ export function useTan() {
     unmuteKeyword,
     followTag,
     unfollowTag,
+    muteTag,
+    unmuteTag,
     like,
     unlike,
     repost,
