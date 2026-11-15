@@ -18,9 +18,8 @@ fail loudly so a bad file is never silently overwritten.  The peer
 sees only the normal per-message ``expires_at``; the default itself
 is never sent.
 
-Durations are seconds, 1s..30d (``MAX_MAIL_TTL``, the same cap as
-``--expire``): a disappearing message cannot outlive the
-store-and-forward envelope that might carry it.
+Durations are seconds, 1s..7d (``MAX_DISAPPEARING_SECONDS``): a
+standing default is kept within the range the console picker offers.
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Mapping, Optional, Union
 
 from .allowlist import AllowListError, clean_destination
-from .protocol import MAX_MAIL_TTL
 from .util import atomic_write_json
 
 log = logging.getLogger(__name__)
@@ -46,7 +44,7 @@ except ImportError:  # pragma: no cover - non-POSIX
 
 DISAPPEARING_FILE_MODE = 0o600
 
-MAX_DISAPPEARING_SECONDS = MAX_MAIL_TTL
+MAX_DISAPPEARING_SECONDS = 7 * 24 * 60 * 60
 
 
 class DisappearingError(ValueError):
@@ -57,15 +55,18 @@ def _clean_seconds(value: Any) -> float:
     # A present ``null`` or a non-number is malformed, not "no default":
     # treating it as empty would switch the default off instead of
     # failing loudly.  Zero or negative durations and anything past
-    # the mail TTL are rejected the same way ``--expire`` rejects them.
+    # the 7d cap are rejected.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise DisappearingError("disappearing default must be a number of seconds")
-    seconds = float(value)
+    try:
+        seconds = float(value)
+    except OverflowError as exc:
+        raise DisappearingError("disappearing default is too large") from exc
     if not math.isfinite(seconds) or seconds <= 0:
         raise DisappearingError("disappearing default must be longer than 0s")
     if seconds > MAX_DISAPPEARING_SECONDS:
         raise DisappearingError(
-            "disappearing default must be at most 30d (the mail TTL)"
+            "disappearing default must be at most 7d"
         )
     return seconds
 

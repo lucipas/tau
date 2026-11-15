@@ -60,6 +60,7 @@ from .config import (
     write_rns_config,
 )
 from .disappearing import (
+    MAX_DISAPPEARING_SECONDS,
     DisappearingError,
     disappearing_lock,
     load_disappearing_defaults,
@@ -1101,7 +1102,7 @@ def build_parser() -> argparse.ArgumentParser:
         "duration",
         nargs="?",
         metavar="DURATION",
-        help="default lifetime like 30s, 5m, 2h or 7d (omit to show the current setting)",
+        help="default lifetime from 1s to 7d, like 30s, 5m, 2h or 7d (omit to show the current setting)",
     )
     disappearing.add_argument(
         "--off",
@@ -5745,6 +5746,9 @@ def _reconcile_queued_sends(
         ):
             to_hex = result["to"]
             target = result["target"]
+            # The node reports the effective expiry (explicit or the
+            # per-conversation default); prefer it over the caller's.
+            effective_expires = result.get("expires_at", expires_at)
             # Keep the private "_" fields (e.g. the resolved reply id).
             private = {k: v for k, v in result.items() if k.startswith("_")}
             result.clear()
@@ -5756,8 +5760,8 @@ def _reconcile_queued_sends(
                     "id": message_id,
                     "to": to_hex,
                     **(
-                        {"expires_at": expires_at}
-                        if expires_at is not None
+                        {"expires_at": effective_expires}
+                        if effective_expires is not None
                         else {}
                     ),
                     **private,
@@ -8071,7 +8075,11 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
     seconds = None
     if args.duration is not None:
         try:
-            seconds = _parse_duration(args.duration, label="duration")
+            seconds = _parse_duration(
+                args.duration,
+                label="duration",
+                max_seconds=MAX_DISAPPEARING_SECONDS,
+            )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return _EXIT_ERROR
@@ -10557,3 +10565,4 @@ def _cmd_messages_sent(
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
+eturn _EXIT_OK

@@ -5310,6 +5310,7 @@ class TauNode:
                     )
                 self._record_sent(
                     {
+                        **({"expires_at": expires_at} if expires_at is not None else {}),
                         "from": self.name,
                         "destination": peer.hexhash,
                         "text": normalized,
@@ -5360,8 +5361,14 @@ class TauNode:
                 response.pop("expires_at", None)
                 response.pop("to", None)
                 response["queued"] = False
+                if expires_at is not None:
+                    # The effective expiry (explicit or per-conversation
+                    # default) so callers can record the outgoing copy's
+                    # deadline; the peer's own value was dropped above.
+                    response["expires_at"] = expires_at
             self._record_sent(
                 {
+                    **({"expires_at": expires_at} if expires_at is not None else {}),
                     "from": self.name,
                     "destination": peer.hexhash,
                     "text": normalized,
@@ -5419,6 +5426,7 @@ class TauNode:
             )
             self._record_sent(
                 {
+                    **({"expires_at": expires_at} if expires_at is not None else {}),
                     "from": self.name,
                     "destination": dest_hash.hex(),
                     "text": normalized,
@@ -6028,6 +6036,7 @@ class TauNode:
         if sent_leg_ids:
             self._record_sent(
                 {
+                    **({"expires_at": expires_at} if expires_at is not None else {}),
                     "from": self.name,
                     "destination": "",
                     "text": normalized,
@@ -6064,6 +6073,7 @@ class TauNode:
             # WebBridge.react) instead of a post-delivery timestamp no
             # member's copy carries.
             "sent_at": sent_at,
+            **({"expires_at": expires_at} if expires_at is not None else {}),
             "results": results,
         }
 

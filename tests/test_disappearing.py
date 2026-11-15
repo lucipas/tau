@@ -124,12 +124,15 @@ def test_seconds_must_be_positive_and_within_mail_ttl():
     with pytest.raises(DisappearingError):
         DisappearingDefaults().with_peer(ALICE, 0)
     with pytest.raises(DisappearingError):
-        DisappearingDefaults().with_group(GROUP_ID, 31 * 24 * 3600)
-    # The cap is the mail TTL: 30 days is allowed, like --expire.
+        DisappearingDefaults().with_group(GROUP_ID, 8 * 24 * 3600)
+    # The cap is 7 days, the range the console picker offers.
     assert (
-        DisappearingDefaults().with_peer(ALICE, 30 * 24 * 3600).peer_default(ALICE)
-        == 30 * 24 * 3600.0
+        DisappearingDefaults().with_peer(ALICE, 7 * 24 * 3600).peer_default(ALICE)
+        == 7 * 24 * 3600.0
     )
+    # An integer too large for a float is malformed, not a crash.
+    with pytest.raises(DisappearingError):
+        DisappearingDefaults().with_peer(ALICE, 10**400)
 
 
 # -- node send paths ------------------------------------------------------

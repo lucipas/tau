@@ -3707,6 +3707,9 @@ class WebBridge:
             send_after=send_after,
         )
         queued = bool(response.get("queued"))
+        # Record the effective expiry (explicit or per-conversation
+        # default), so the console purges this outgoing copy on time.
+        effective_expires = _effective_expires_at(response, expires_at)
         # The outbox id links this record to a later delivery; only
         # present while the message is queued.
         mail_id = response.get("id") if queued else None
@@ -3724,7 +3727,7 @@ class WebBridge:
                 status="queued" if queued else "delivered",
                 rtt=_as_float(response.get("_rtt")),
                 mail_id=mail_id,
-                expires_at=expires_at,
+                expires_at=effective_expires,
                 send_after=send_after,
                 wire_id=wire_id,
                 # A live send went out over the direct link by
@@ -3881,6 +3884,7 @@ class WebBridge:
         # message returns it): record that on each outbound entry, not
         # a post-delivery timestamp, so reacting to a leg from the
         # console names the logical message every member holds.
+        effective_expires = _effective_expires_at(response, expires_at)
         wire_sent_at = response.get("sent_at")
         if not isinstance(wire_sent_at, (int, float)) or isinstance(
             wire_sent_at, bool
@@ -3922,7 +3926,7 @@ class WebBridge:
                     mail_id=mail_id,
                     group=group_record["id"],
                     group_name=group_record.get("name") or "",
-                    expires_at=expires_at,
+                    expires_at=effective_expires,
                     send_after=send_after,
                     in_reply_to=in_reply_to,
                     wire_id=wire_id,
@@ -7646,6 +7650,24 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
+def _effective_expires_at(response: Any, fallback: Optional[float]) -> Optional[float]:
+    """The node's effective expiry for a send, or *fallback* when absent.
+
+    A send with no explicit expiry may still expire by the
+    per-conversation default; the node reports that value so the
+    console record can carry it and be purged on time.
+    """
+    if not isinstance(response, dict):
+        return fallback
+    value = response.get("expires_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return fallback
+    value = float(value)
+    if not math.isfinite(value):
+        return fallback
+    return value
+
+
 def file_arrival_text(record: Dict[str, Any]) -> str:
     """Feed line for a received file: name, size and short SHA-256.
 
@@ -7872,6 +7894,20 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json(result, head_only)
                 return
             if path == "/api/messages/disappearing":
+                # The full map names every locally configured conversation,
+                # including peers absent from the registry, so it goes
+                # only to the local machine, like the messages export.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "disappearing defaults are only available from localhost"
+                            }
+                        },
+                        head_only,
+                        403,
+                    )
+                    return
                 try:
                     result = self.bridge.disappearing_defaults()
                 except WebBridgeError as exc:
@@ -10473,6 +10509,36 @@ def _int_param(
     if not values:
         return default
     try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+
+> bool:
+    values = query.get(name) or []
+    if not values:
+        return False
+    return values[0].strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_param(
+    query: Dict[str, List[str]],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    values = query.get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+
+:
         value = int(values[0])
     except (TypeError, ValueError):
         return default
