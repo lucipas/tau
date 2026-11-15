@@ -6585,6 +6585,28 @@ def test_timeline_followed_tag_repost_and_edit(identities, tmp_path):
     ]
 
 
+def test_timeline_followed_tag_skips_expired_original_repost(
+    identities, tmp_path
+):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    original = create_post(conn, bob, "tagged #meshnet", name="bob", now=1000)
+    repost = create_repost(conn, carol, original["hash"], name="carol", now=1001)
+    # Let the original expire after the repost: the repost itself is
+    # still live, but the tag it carried has disappeared with the
+    # original, so following the tag must not surface it.
+    conn.execute(
+        "UPDATE posts SET expires_at = ? WHERE hash = ?",
+        (1002, original["hash"]),
+    )
+    conn.commit()
+
+    follow_tag(conn, "meshnet")
+    found = timeline(conn, [author_of(alice)])
+    assert [post["hash"] for post in found] == []
+
+
 def test_timeline_followed_tag_with_no_followed_authors(identities, tmp_path):
     _, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")

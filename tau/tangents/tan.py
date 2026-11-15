@@ -2600,8 +2600,10 @@ def _post_tag_sets(
     The match runs on each post's current text — an edited post matches
     its edited text, not the original — and a repost matches on the
     text of the post it reposts, since a repost carries no text of its
-    own.  A repost whose original has not arrived (or is deleted)
-    carries no visible text and never matches.  Originals are fetched
+    own.  A repost whose original has not arrived (or is deleted, or
+    has expired) carries no visible text and never matches: the
+    display blanks an expired original's text, so matching on it would
+    route disappeared content into tag timelines.  Originals are fetched
     in one query, the same way :func:`annotate_reposts` fetches them.
     """
     if not posts:
@@ -2626,6 +2628,8 @@ def _post_tag_sets(
             conn, [post["hash"] for post in original_posts]
         )
         for original in original_posts:
+            if is_expired(original):
+                continue
             text = original_states.get(original["hash"], {}).get(
                 "text", original["text"]
             )
