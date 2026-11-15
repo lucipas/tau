@@ -1687,6 +1687,8 @@ class Inbox:
         kind: Optional[str] = None,
         direction: Optional[str] = "in",
         pinned_only: bool = False,
+        exclude_dm_from: Optional[Collection[str]] = None,
+        exclude_group: Optional[Collection[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
@@ -1701,7 +1703,13 @@ class Inbox:
         of the default listing, which is the received-message view
         ``tau messages`` has always shown; pass ``direction="out"`` or
         ``direction=None`` to see them.  ``pinned_only`` keeps only
-        messages flagged by :meth:`pin`.
+        messages flagged by :meth:`pin`.  ``exclude_dm_from`` and
+        ``exclude_group`` name muted (or otherwise quiet) conversations:
+        their entries still list, but the ``unread`` marker is cleared
+        for them, the same way :meth:`_unread_counts_locked` clears
+        their counts — a muted conversation never shows an unread
+        marker, while a muted sender's group posts still carry theirs
+        when only the sender is excluded, and vice versa.
         Each entry carries ``unread``: whether it arrived after its
         sender's read cursor, and a ``reactions`` list when the message
         has any — derived from the reaction store, never stored counters.
@@ -1754,6 +1762,19 @@ class Inbox:
             unread = item.get("direction") != "out" and _is_unread(
                 item, cursors.get(item.get("destination") or "")
             )
+            # A muted conversation's entries still list, but carry no
+            # unread marker — the same exclusion the counts apply, so
+            # the marker and the badge can never disagree.
+            if unread:
+                if (
+                    exclude_dm_from
+                    and not item.get("group")
+                    and (item.get("destination") or "") in exclude_dm_from
+                ) or (
+                    exclude_group
+                    and str(item.get("group") or "") in exclude_group
+                ):
+                    unread = False
             copy = dict(item, unread=unread)
             reactions = by_target.get(str(item.get("id") or ""))
             if reactions:

@@ -4437,6 +4437,136 @@ def test_disappearing_defaults_without_data_dir(bridge):
     assert payload == {"peers": {}, "groups": {}}
 
 
+def test_muted_conversations_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/messages/muted")
+        assert status == 200
+        assert payload == {"peers": [], "groups": []}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 200
+        assert payload["mute"] == {
+            "target": PEER_HASH,
+            "group": False,
+            "muted": True,
+            "changed": True,
+        }
+        status, _, payload = _json(bridge, "/api/messages/muted")
+        assert payload == {"peers": [PEER_HASH], "groups": []}
+
+        # Muting again is a no-op; the unread count for the muted
+        # peer is already 0.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert payload["mute"]["changed"] is False
+
+        # A group mute is keyed by group id, resolved by name.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"group": "crew"},
+        )
+        assert status == 200
+        assert payload["mute"]["group"] is True
+        assert payload["mute"]["muted"] is True
+        status, _, payload = _json(bridge, "/api/messages/muted")
+        assert payload["peers"] == [PEER_HASH]
+        assert len(payload["groups"]) == 1
+
+        # Unmuting restores counting, including messages that arrived
+        # while muted.
+        node.inbox.append(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello while muted",
+                "sent_at": 1000.0,
+                "received_at": 1001.0,
+                "id": "msg-muted",
+            }
+        )
+        assert bridge.unread()["total"] == 0
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"peer": "alice", "muted": False},
+        )
+        assert status == 200
+        assert payload["mute"]["muted"] is False
+        assert payload["mute"]["changed"] is True
+        counts = bridge.unread()
+        assert counts["per_peer"] == {PEER_HASH: 1}
+        assert counts["total"] == 1
+        status, _, payload = _json(bridge, "/api/messages/muted")
+        assert payload["peers"] == []
+    finally:
+        bridge.stop()
+
+
+def test_muted_conversations_endpoint_rejects_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"peer": "alice", "group": "crew"},
+            {"peer": "alice", "muted": "yes"},
+            {"peer": "nobody"},
+            {"peer": "  "},
+            {"group": "nobody"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/messages/mute", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_muted_conversations_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        node.inbox.append(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 1000.0,
+                "received_at": 1001.0,
+                "id": "msg-1",
+            }
+        )
+        assert bridge.unread()["total"] == 1
+        (tmp_path / "muted.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/messages/muted")
+        assert status == 503
+        # The counts fail open: a corrupt file never hides the badge,
+        # it just counts the conversation as unmuted.
+        assert bridge.unread()["total"] == 1
+    finally:
+        bridge.stop()
+
+
 def test_tan_mute_via_api(tmp_path):
     import RNS
 

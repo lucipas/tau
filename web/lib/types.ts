@@ -255,6 +255,31 @@ export interface DisappearingResponse {
   disappearing: DisappearingResult;
 }
 
+// Muted conversations: peer destination hashes and group ids, each
+// listed once. A muted conversation still lists its messages, but
+// never counts as unread.
+export interface MutedConversations {
+  peers: string[];
+  groups: string[];
+}
+
+export interface MutedConversationsResponse {
+  peers: string[];
+  groups: string[];
+}
+
+export interface MuteResult {
+  target: string;
+  group: boolean;
+  muted: boolean;
+  changed: boolean;
+}
+
+export interface MuteResponse {
+  ok: boolean;
+  mute: MuteResult;
+}
+
 export interface InterfaceInfo {
   name: string;
   online: boolean;

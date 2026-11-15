@@ -66,6 +66,14 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .muted import (
+    MutedError,
+    load_muted,
+    muted_groups_for,
+    muted_lock,
+    muted_peers_for,
+    save_muted,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request,
@@ -1110,6 +1118,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="clear the default for this conversation",
     )
     disappearing.set_defaults(func=cmd_disappearing)
+
+    mute = subparsers.add_parser(
+        "mute",
+        parents=[common],
+        help="mute or unmute a conversation so it never lights the unread badge",
+    )
+    mute_target = mute.add_mutually_exclusive_group(required=False)
+    mute_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    mute_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    mute.add_argument(
+        "--off",
+        action="store_true",
+        help="unmute this conversation instead",
+    )
+    mute.set_defaults(func=cmd_mute)
 
     archived = subparsers.add_parser(
         "archived",
@@ -7406,6 +7437,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
+    # A corrupt mutes file fails open here: the conversations count
+    # as unmuted (with a warning), never breaking the listing.
+    muted_peers = muted_peers_for(config.muted_path)
+    muted_groups = muted_groups_for(config.muted_path)
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
@@ -7419,7 +7454,12 @@ def cmd_messages(args: argparse.Namespace) -> int:
         group_ids = [group["id"], *(group.get("renamed_from") or [])]
     if getattr(args, "count", False):
         # A count is for scripting: it never advances the read cursor.
-        counts = inbox.unread_counts()
+        # Muted conversations never count, so the badge and the
+        # scripting count agree.
+        counts = inbox.unread_counts(
+            exclude_dm_from=muted_peers,
+            exclude_group=muted_groups,
+        )
         per_peer = counts["per_peer"]
         if peer_hash is not None:
             per_peer = {
@@ -7472,7 +7512,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
         # listing; say so instead of showing an empty list.
         peer = registry.get(peer_hash)
         name = peer.display_name if peer is not None else "unknown"
-        unread = inbox.unread_counts()["per_peer"].get(peer_hash, 0)
+        unread = inbox.unread_counts(
+            exclude_dm_from=muted_peers,
+            exclude_group=muted_groups,
+        )["per_peer"].get(peer_hash, 0)
         if _json_mode(args):
             _emit(
                 {
@@ -7499,7 +7542,13 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # that cannot be read hides everything, matching the node, which
     # blocks all senders on the same condition.
     entries = inbox.list_messages(
-        limit=None, peer=peer_hash, group=group_ids, query=query, kind=kind
+        limit=None,
+        peer=peer_hash,
+        group=group_ids,
+        query=query,
+        kind=kind,
+        exclude_dm_from=muted_peers,
+        exclude_group=muted_groups,
     )
     # A stored reaction from a non-member must never be displayed on
     # a group message, even when the authorization recheck or its
@@ -8249,6 +8298,104 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
         print(
             f"Messages to {label} disappear after "
             f"{_describe_duration(previous)} unless a send passes its own --expire."
+        )
+    return _EXIT_OK
+
+
+def cmd_mute(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    if getattr(args, "off", False) and args.peer is None and args.group is None:
+        print("error: --off needs a --peer or --group to unmute", file=sys.stderr)
+        return _EXIT_ERROR
+    if args.peer is None and args.group is None:
+        # No target lists what is muted, mirroring `tau archived`.
+        muted = load_muted(config.muted_path)
+        if _json_mode(args):
+            _emit(
+                {
+                    "peers": sorted(muted.peers),
+                    "groups": sorted(muted.groups),
+                },
+                True,
+            )
+            return _EXIT_OK
+        registry = PeerRegistry(config.peers_path)
+        store = GroupStore(config.groups_path)
+        if not muted.peers and not muted.groups:
+            print("No muted conversations.")
+            return _EXIT_OK
+        for destination in sorted(muted.peers):
+            peer = registry.get(destination)
+            name = peer.display_name if peer is not None else "unknown"
+            print(f"{name} ({short_hash(destination)})")
+        for group_id in sorted(muted.groups):
+            try:
+                group = store.find(group_id)
+                label = f"group {group['name']} ({short_hash(group_id)})"
+            except (ValueError, KeyError):
+                label = f"group {short_hash(group_id)}"
+            print(label)
+        return _EXIT_OK
+    if args.group is not None:
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
+        key = group["id"]
+        label = f"group {group['name']} ({short_hash(key)})"
+        is_group = True
+    else:
+        inbox = Inbox(config.inbox_path)
+        registry = PeerRegistry(config.peers_path)
+        key = _resolve_inbox_peer(inbox, registry, args.peer)
+        peer = registry.get(key)
+        name = peer.display_name if peer is not None else "unknown"
+        label = f"conversation with {name} ({short_hash(key)})"
+        is_group = False
+    # Reload inside the lock: two mute commands racing must not
+    # discard each other's change to a different conversation.
+    with muted_lock(config.muted_path):
+        try:
+            muted = load_muted(config.muted_path)
+        except MutedError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        if is_group:
+            previous = muted.is_muted_group(key)
+            if getattr(args, "off", False):
+                muted = muted.without_group(key)
+            else:
+                muted = muted.with_group(key)
+        else:
+            previous = muted.is_muted_peer(key)
+            if getattr(args, "off", False):
+                muted = muted.without_peer(key)
+            else:
+                muted = muted.with_peer(key)
+        changed = previous != (not getattr(args, "off", False))
+        if changed:
+            save_muted(config.muted_path, muted)
+    current = not getattr(args, "off", False)
+    if _json_mode(args):
+        _emit(
+            {
+                "target": key,
+                "group": is_group,
+                "muted": current,
+                "changed": changed,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if getattr(args, "off", False):
+        if previous:
+            print(f"Unmuted {label}: its messages count as unread again.")
+        else:
+            print(f"{label} was not muted.")
+    elif previous:
+        print(f"{label} is already muted.")
+    else:
+        print(
+            f"Muted {label}: its messages still arrive, but never light "
+            "the unread badge."
         )
     return _EXIT_OK
 

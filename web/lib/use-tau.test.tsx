@@ -2761,3 +2761,117 @@ describe("useTau disappearing defaults", () => {
     unmount();
   });
 });
+
+describe("useTau muted conversations", () => {
+  function mockMutedGet(
+    muted: { peers: string[]; groups: string[] } = {
+      peers: [],
+      groups: [],
+    },
+  ) {
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/messages/muted"
+        ? Promise.resolve(muted)
+        : path === "/api/peers"
+          ? Promise.resolve({ peers: [], count: 0 })
+          : path === "/api/outbox"
+            ? Promise.resolve({ outbox: [], count: 0, held_for_others: 0 })
+            : Promise.resolve({ groups: [], count: 0 }),
+    );
+  }
+
+  it("loads the mutes and applies a mute at once", async () => {
+    mockMutedGet({ peers: [PEER_HASH], groups: [] });
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() =>
+      expect(result.current.mutedConversations).toEqual({
+        peers: [PEER_HASH],
+        groups: [],
+      }),
+    );
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      mute: {
+        target: GROUP_ID,
+        group: true,
+        muted: true,
+        changed: true,
+      },
+    });
+    // The re-read after the mute returns the new list.
+    mockMutedGet({ peers: [PEER_HASH], groups: [GROUP_ID] });
+    await act(async () => {
+      await result.current.setMuted({ group: GROUP_ID }, true);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/mute", {
+      group: GROUP_ID,
+      muted: true,
+    });
+    // The mute applies to local state at once, before the re-read.
+    expect(result.current.mutedConversations).toEqual({
+      peers: [PEER_HASH],
+      groups: [GROUP_ID],
+    });
+    unmount();
+  });
+
+  it("clears a peer mute and drops it from state", async () => {
+    mockMutedGet({ peers: [PEER_HASH], groups: [] });
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() =>
+      expect(result.current.mutedConversations.peers).toEqual([PEER_HASH]),
+    );
+
+    // The re-read after the unmute returns an empty list.
+    mockMutedGet({ peers: [], groups: [] });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      mute: {
+        target: PEER_HASH,
+        group: false,
+        muted: false,
+        changed: true,
+      },
+    });
+    await act(async () => {
+      await result.current.setMuted({ peer: PEER_HASH }, false);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/mute", {
+      peer: PEER_HASH,
+      muted: false,
+    });
+    expect(result.current.mutedConversations.peers).toEqual([]);
+    unmount();
+  });
+
+  it("keeps the last known mutes when the poll fails", async () => {
+    mockMutedGet({ peers: [PEER_HASH], groups: [] });
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() =>
+      expect(result.current.mutedConversations.peers).toEqual([PEER_HASH]),
+    );
+
+    mockedGet.mockRejectedValue(new Error("bridge down"));
+    await act(async () => {
+      await result.current.refreshMuted();
+    });
+    expect(result.current.mutedConversations.peers).toEqual([PEER_HASH]);
+    expect(result.current.mutedError).toBe("bridge down");
+    unmount();
+  });
+});

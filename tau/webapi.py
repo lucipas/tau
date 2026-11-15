@@ -69,6 +69,10 @@ script) can read what arrives from the mesh and send messages back:
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
+    GET  /api/messages/muted muted DM conversations and groups
+    POST /api/messages/mute mute ``{"peer": "<name or hash>"}`` or
+                           ``{"group": "<id | prefix | name>"}``
+                           (``"muted": false`` unmutes)
     GET  /api/messages/requests list DMs held for review from peers
                            outside the allow-list
     POST /api/messages/requests/accept accept ``{"id": "<request id>"}``:
@@ -186,6 +190,14 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .muted import (
+    MutedError,
+    load_muted,
+    muted_groups_for,
+    muted_lock,
+    muted_peers_for,
+    save_muted,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
@@ -200,6 +212,7 @@ from .config import (
     ARCHIVED_FILE_NAME,
     DISAPPEARING_FILE_NAME,
     MESSAGES_FILE_NAME,
+    MUTED_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
     set_node_setting,
@@ -921,6 +934,8 @@ class WebBridge:
         # same way, so concurrent console requests cannot overwrite each
         # other's conversation.
         self._disappearing_lock = threading.Lock()
+        # Serializes mute/unmute read-modify-write cycles the same way.
+        self._muted_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -6558,6 +6573,121 @@ class WebBridge:
             "changed": changed,
         }
 
+    def _muted_path(self) -> Optional[Path]:
+        """This node's muted-conversations path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "muted_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / MUTED_FILE_NAME
+
+    def _muted_sets(self) -> "tuple[FrozenSet[str], FrozenSet[str]]":
+        """Muted (peers, groups), failing open on a corrupt file.
+
+        Count paths use this: a corrupt mutes file must never break
+        an unread read — the conversations count as unmuted, and the
+        warning is what surfaces the corruption.
+        """
+        path = self._muted_path()
+        return (
+            muted_peers_for(path),
+            muted_groups_for(path),
+        )
+
+    def muted_conversations(self) -> Dict[str, Any]:
+        """All muted conversations, for the console load.
+
+        Mirrors the stored file: peer destination hashes and group
+        ids, each sorted.  A corrupt file is a 503 — the owner
+        repairs or removes it before the console shows mutes, the
+        same as the disappearing defaults.
+        """
+        path = self._muted_path()
+        if path is None:
+            return {"peers": [], "groups": []}
+        try:
+            muted = load_muted(path)
+        except MutedError as exc:
+            raise WebBridgeError(
+                "muted conversations on disk are unusable; fix or remove them "
+                f"before editing ({exc})"
+            ) from exc
+        return {"peers": sorted(muted.peers), "groups": sorted(muted.groups)}
+
+    def set_muted(
+        self,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+        muted: bool = True,
+    ) -> Dict[str, Any]:
+        """Mute or unmute one conversation.
+
+        Exactly one of *peer* (registry name, hash or prefix) or *group*
+        (id, prefix or name) names the conversation; *muted* is the new
+        state.  Mirrors ``tau mute``: the list is reloaded inside the
+        lock so two writes racing cannot discard each other's
+        conversation, and a corrupt file is a 503.  The unread counts
+        change with the mute, so the new counts are published for other
+        tabs at once.  The read cursor is untouched: unmuting restores
+        counting, including messages that arrived while muted.
+        """
+        if (peer is None) == (group is None):
+            raise ValueError("exactly one of 'peer' or 'group' is required")
+        if group is not None:
+            if not isinstance(group, str) or not group.strip():
+                raise ValueError("field 'group' is required")
+            record = self.node.groups.find(group.strip())
+            key = record["id"]
+            is_group = True
+        else:
+            if not isinstance(peer, str) or not peer.strip():
+                raise ValueError("field 'peer' is required")
+            key = self._resolve_block_target(peer.strip())
+            is_group = False
+        path = self._muted_path()
+        if path is None:
+            raise WebBridgeError("this node has no muted-conversations path")
+        with self._muted_lock, muted_lock(path):
+            try:
+                current = load_muted(path)
+            except MutedError as exc:
+                raise WebBridgeError(
+                    "muted conversations on disk are unusable; fix or remove them "
+                    f"before editing ({exc})"
+                ) from exc
+            if is_group:
+                previous = current.is_muted_group(key)
+                updated = (
+                    current.with_group(key)
+                    if muted
+                    else current.without_group(key)
+                )
+            else:
+                previous = current.is_muted_peer(key)
+                updated = (
+                    current.with_peer(key)
+                    if muted
+                    else current.without_peer(key)
+                )
+            changed = previous != muted
+            if changed:
+                save_muted(path, updated)
+        if changed:
+            # unread() takes the unread lock itself; the publish rides
+            # the same SSE event a mark-read sends.
+            counts = self.unread()
+            self.bus.publish({"type": "unread", "unread": counts})
+        return {
+            "target": key,
+            "group": is_group,
+            "muted": muted,
+            "changed": changed,
+        }
+
     def archived_conversations(self) -> Dict[str, Any]:
         """Archived DM conversations, with the console log's message counts.
 
@@ -7386,22 +7516,26 @@ class WebBridge:
         messages are excluded at the source — but the sender's group
         posts still count, since the group thread stays visible.  An
         ignored group's posts never light a badge either, so they are
-        excluded too; the members' direct messages still count.
+        excluded too; the members' direct messages still count.  A
+        muted conversation never lights a badge either, by the same
+        per-side rule as archived and ignored.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
                 try:
+                    muted_peers, muted_groups = self._muted_sets()
                     counts = inbox.unread_counts(
-                        exclude_dm_from=self._archived_set(),
+                        exclude_dm_from=self._archived_set() | muted_peers,
                         exclude_group=load_ignored_group_ids(
                             getattr(
                                 self.node.config,
                                 "ignored_groups_path",
                                 None,
                             )
-                        ),
+                        )
+                        | muted_groups,
                     )
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)
@@ -7418,14 +7552,16 @@ class WebBridge:
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
+                muted_peers, muted_groups = self._muted_sets()
                 counts = inbox.mark_read(
                     peer=peer,
-                    exclude_dm_from=self._archived_set(),
+                    exclude_dm_from=self._archived_set() | muted_peers,
                     exclude_group=load_ignored_group_ids(
                         getattr(
                             self.node.config, "ignored_groups_path", None
                         )
-                    ),
+                    )
+                    | muted_groups,
                 )
             stamped = self._stamp_unread(counts)
         if inbox is not None:
@@ -7451,7 +7587,10 @@ class WebBridge:
             raise ValueError("this node has no inbox to mark unread")
         with self._unread_lock:
             moved = inbox.mark_unread(
-                peer, all=all, exclude_dm_from=self._archived_set()
+                peer,
+                all=all,
+                exclude_dm_from=self._archived_set()
+                | self._muted_sets()[0],
             )
             if moved is None:
                 raise ValueError(f"no stored messages from {peer!r}")
@@ -7910,6 +8049,29 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     result = self.bridge.disappearing_defaults()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
+            if path == "/api/messages/muted":
+                # The full mute list names every muted conversation,
+                # including peers absent from the registry, so it goes
+                # only to the local machine, like the disappearing
+                # defaults.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "muted conversations are only available from localhost"
+                            }
+                        },
+                        head_only,
+                        403,
+                    )
+                    return
+                try:
+                    result = self.bridge.muted_conversations()
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
@@ -8495,6 +8657,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "disappearing": result}, head_only)
+                return
+            if path == "/api/messages/mute":
+                # ``muted`` defaults to true: posting a target mutes
+                # it; posting ``"muted": false`` unmutes it.
+                muted = body.get("muted", True)
+                if not isinstance(muted, bool):
+                    self._send_json(
+                        {"error": {"message": "field 'muted' must be a boolean"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.set_muted(
+                        peer=body.get("peer"),
+                        group=body.get("group"),
+                        muted=muted,
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "mute": result}, head_only)
                 return
             if path == "/api/messages/import":
                 try:

@@ -1447,6 +1447,55 @@ def test_unread_counts_exclude_group_hides_its_posts_only(tmp_path):
     ) == {"per_peer": {"aa" * 16: 1}, "total": 1}
 
 
+def test_list_messages_clears_unread_marker_for_excluded_conversations(
+    tmp_path,
+):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="dm-1", destination="aa" * 16, received_at=1.0))
+    inbox.append(
+        _record(
+            id="group-1",
+            destination="aa" * 16,
+            received_at=2.0,
+            kind="group",
+            group="11" * 16,
+            group_name="crew",
+        )
+    )
+    inbox.append(_record(id="dm-2", destination="bb" * 16, received_at=3.0))
+
+    # Without the exclusion, everything past the cursor is unread.
+    assert [entry["unread"] for entry in inbox.list_messages()] == [
+        True,
+        True,
+        True,
+    ]
+    # Excluding the sender clears only the DM marker: the group post
+    # belongs to the group thread, which stays visible.
+    listed = inbox.list_messages(exclude_dm_from={"aa" * 16})
+    assert {entry["id"]: entry["unread"] for entry in listed} == {
+        "dm-1": False,
+        "group-1": True,
+        "dm-2": True,
+    }
+    # Excluding the group clears only its post's marker.
+    listed = inbox.list_messages(exclude_group={"11" * 16})
+    assert {entry["id"]: entry["unread"] for entry in listed} == {
+        "dm-1": True,
+        "group-1": False,
+        "dm-2": True,
+    }
+    # Both exclusions together clear both, and agree with the counts.
+    # Newest first: the other sender's DM stays unread.
+    listed = inbox.list_messages(
+        exclude_dm_from={"aa" * 16}, exclude_group={"11" * 16}
+    )
+    assert [entry["unread"] for entry in listed] == [True, False, False]
+    assert inbox.unread_counts(
+        exclude_dm_from={"aa" * 16}, exclude_group={"11" * 16}
+    ) == {"per_peer": {"bb" * 16: 1}, "total": 1}
+
+
 def test_mark_read_advances_only_to_up_to(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", received_at=1.0))

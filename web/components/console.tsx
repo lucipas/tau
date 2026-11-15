@@ -266,6 +266,8 @@ export function Console() {
             unread={tau.unread.per_peer}
             archived={tau.archivedConversations}
             archivedError={tau.archivedError}
+            muted={tau.mutedConversations}
+            mutedError={tau.mutedError}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
@@ -317,6 +319,9 @@ export function Console() {
             }}
             onUnarchivePeer={async (destination) => {
               await tau.unarchiveConversation(destination);
+            }}
+            onSetMuted={async (target, muted) => {
+              await tau.setMuted(target, muted);
             }}
             onMarkUnread={async (destination, all = false) => {
               const gen = unreadGen.current.get(destination) ?? 0;
