@@ -717,9 +717,28 @@ export function useTau() {
     let backoffMs = 1000;
     let everOpened = false;
 
+    const scheduleWebSocketReconnect = () => {
+      setConnection("reconnecting");
+      const delay = backoffMs;
+      backoffMs = Math.min(backoffMs * 2, 30000);
+      reconnectTimer = setTimeout(connectWebSocket, delay);
+    };
+
     const connectWebSocket = () => {
       if (disposed) return;
-      const socket = new WebSocket(websocketUrl());
+      let socket: WebSocket;
+      try {
+        socket = new WebSocket(websocketUrl());
+      } catch {
+        // The constructor throws synchronously for a URL it cannot
+        // parse; treat it like a socket that never opened.
+        if (!everOpened) {
+          cleanupTransport = connectEventSource();
+        } else {
+          scheduleWebSocketReconnect();
+        }
+        return;
+      }
       let opened = false;
       const onSocketOpen = () => {
         opened = true;
@@ -750,10 +769,7 @@ export function useTau() {
           cleanupTransport = connectEventSource();
           return;
         }
-        setConnection("reconnecting");
-        const delay = backoffMs;
-        backoffMs = Math.min(backoffMs * 2, 30000);
-        reconnectTimer = setTimeout(connectWebSocket, delay);
+        scheduleWebSocketReconnect();
       };
       socket.addEventListener("open", onSocketOpen);
       socket.addEventListener("message", onSocketMessage);

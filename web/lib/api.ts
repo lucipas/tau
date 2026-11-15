@@ -116,9 +116,15 @@ export function eventsUrl(since = 0): string {
 
 export function websocketUrl(): string {
   if (API_BASE) {
-    // http(s)://host:port -> ws(s)://host:port, e.g. the :8787 bridge
-    // under `next dev`.
-    return `${API_BASE.replace(/^http/, "ws")}/ws`;
+    if (/^https?:/i.test(API_BASE) || typeof window === "undefined") {
+      // http(s)://host:port -> ws(s)://host:port, e.g. the :8787 bridge
+      // under `next dev`.
+      return `${API_BASE.replace(/^http/, "ws")}/ws`;
+    }
+    // A relative base such as "/tau" needs the page's origin to resolve.
+    const url = new URL(`${API_BASE}/ws`, window.location.href);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
   }
   if (typeof window === "undefined") {
     return "";
