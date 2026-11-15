@@ -1840,6 +1840,9 @@ def annotate_quotes(
     An original matching a muted keyword (see :func:`muted_keywords`)
     is reported the same way, with its text blanked and ``muted`` set,
     so the muted content does not leak through the preview.  An
+    original whose current text carries a tag in *muted_tags* is
+    reported the same way, so muted-tag posts do not leak through a
+    quote preview either.  An
     original in *hidden_posts* is reported the same way, with its text
     blanked and ``hidden`` set, so hiding a post never leaks its words
     through a quote preview.  An
@@ -1885,6 +1888,10 @@ def annotate_quotes(
         ).fetchall()
         deleted = {(str(row["target"]), str(row["author"])) for row in rows}
     muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
+    muted_tag_set = set(muted_tags or [])
+    parent_tag_sets = (
+        _post_tag_sets(conn, list(parents.values())) if muted_tag_set else {}
+    )
     for post in posts:
         if post.get("kind") != KIND_QUOTE:
             continue
@@ -1909,6 +1916,8 @@ def annotate_quotes(
             continue
         is_muted = _text_matches_muted_keywords(
             str(parent.get("text") or ""), muted_pattern
+        ) or bool(
+            muted_tag_set & parent_tag_sets.get(str(parent["hash"]), set())
         )
         is_hidden = hidden_posts is not None and parent["hash"] in hidden_posts
         is_expired_parent = is_expired(parent)
@@ -2796,6 +2805,7 @@ def timeline(
                     exclude_authors=silenced,
                     blocked_authors=blocked,
                     hidden_posts=hidden_hashes,
+                    muted_tags=muted,
                 ),
                 viewer=viewer,
             ),
@@ -2803,6 +2813,7 @@ def timeline(
             exclude_authors=silenced,
             blocked_authors=blocked,
             hidden_posts=hidden_hashes,
+            muted_tags=muted,
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -2923,6 +2934,7 @@ def timeline(
                 exclude_authors=silenced,
                 blocked_authors=blocked,
                 hidden_posts=hidden_hashes,
+                muted_tags=muted,
             ),
             viewer=viewer,
         ),
@@ -2930,6 +2942,7 @@ def timeline(
         exclude_authors=silenced,
         blocked_authors=blocked,
         hidden_posts=hidden_hashes,
+        muted_tags=muted,
     )
 
 
@@ -3023,12 +3036,14 @@ def author_timeline(
                 exclude_authors=silenced,
                 blocked_authors=blocked,
                 hidden_posts=hidden_hashes,
+                muted_tags=muted,
             ),
             viewer=viewer,
         ),
         muted_keywords=keywords,
         blocked_authors=blocked,
         hidden_posts=hidden_hashes,
+        muted_tags=muted,
     )
 
 
@@ -6017,3 +6032,4 @@ class TanApp:
                 self._gossip_slots.release()
 
         threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
+start()
