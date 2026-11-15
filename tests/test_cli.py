@@ -3333,6 +3333,68 @@ def test_messages_unread_group_scopes_to_the_group(tmp_path, capsys):
     assert payload["messages"][0]["text"] == "group hello"
 
 
+def test_messages_unread_group_covers_rename_lineage(tmp_path, capsys):
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    carol = RNS.Identity()
+    carol_hash = destination_hash(carol)
+    dave = RNS.Identity()
+    dave_hash = destination_hash(dave)
+    members = [sender_hash.hex(), carol_hash.hex()]
+    old_id = derive_group_id(sender_hash.hex(), "crew", members)
+    groups = GroupStore(config.groups_path)
+    groups.record(old_id, "crew", members, creator=sender_hash.hex())
+    # A successor under the same name, carried by the creator so it
+    # supersedes the predecessor, with the old id in its lineage.
+    new_members = members + [dave_hash.hex()]
+    new_id = derive_group_id(sender_hash.hex(), "crew", new_members)
+    groups.record(
+        new_id,
+        "crew",
+        new_members,
+        creator=sender_hash.hex(),
+        sender=sender_hash.hex(),
+        renamed_from=[old_id],
+    )
+    inbox = Inbox(config.inbox_path)
+    for message_id, group_id in (("g-old", old_id), ("g-new", new_id)):
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": sender_hash.hex(),
+                "text": f"hello {message_id}",
+                "sent_at": 12.0,
+                "received_at": 22.0,
+                "id": message_id,
+                "kind": "group",
+                "group": group_id,
+                "group_name": "crew",
+            }
+        )
+
+    # Listing marks everything read.
+    assert cli.main(["messages", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "messages",
+            "unread",
+            "--group",
+            "crew",
+            "--all",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"group": new_id, "unread": 2, "total": 2}
+
+
 def test_messages_unread_unknown_peer(tmp_path, capsys):
     data_dir, _ = _seed_messages(tmp_path)
 

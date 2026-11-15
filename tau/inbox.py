@@ -16,12 +16,11 @@ conversation, so reading a DM never consumes a group post from the
 same sender, and vice versa.  Arrival order comes from the append
 sequence, not the wall clock, so a clock change cannot hide new
 mail.  Read state is strictly local — it never leaves the node — and
-files written before per-conversation cursors existed migrate with
-each old per-sender cursor fanned out to the conversations that
-sender participates in, so an upgrade does not surface a wall of
-"unread" for mail the owner already saw; files written before
-cursors existed at all migrate with every stored message marked
-read.
+files written before per-conversation cursors existed migrate from
+each sender's old cursor: a post counts as read only when its own
+sender's cursor covered it, so the migration never marks another
+member's unread group post read; files written before cursors
+existed at all migrate with every stored message marked read.
 """
 
 from __future__ import annotations
@@ -1924,7 +1923,7 @@ class Inbox:
         self,
         peer: Union[None, str, List[str]] = None,
         *,
-        group: Optional[str] = None,
+        group: Union[None, str, Collection[str]] = None,
         up_to_seq: Optional[int] = None,
         at: Optional[float] = None,
         exclude_dm_from: Optional[Collection[str]] = None,
@@ -1943,6 +1942,8 @@ class Inbox:
         ``peer`` names a DM conversation: only that sender's direct
         messages move — their group posts keep their own cursor.
         ``group`` names a group instead: only that group's posts move.
+        It takes a collection too, so a renamed group's whole lineage
+        (current id plus its predecessors) advances together.
         With neither, every conversation's cursor advances to its own
         newest message.  Called with a list of message ids instead of
         a peer, it stamps those messages' ``read_at`` for the
@@ -1953,7 +1954,8 @@ class Inbox:
             return self._stamp_read_ids(list(peer), at=at)
         with self._transaction():
             if group is not None:
-                scopes = [f"group:{group}"]
+                groups = [group] if isinstance(group, str) else list(group)
+                scopes = [f"group:{item}" for item in groups]
             elif peer is not None:
                 scopes = [f"dm:{peer}"]
             else:
@@ -1988,7 +1990,7 @@ class Inbox:
         peer: Optional[str] = None,
         *,
         all: bool = False,
-        group: Optional[str] = None,
+        group: Union[None, str, Collection[str]] = None,
         exclude_dm_from: Optional[Collection[str]] = None,
         exclude_group: Optional[Collection[str]] = None,
     ) -> Optional[Dict[str, Any]]:
@@ -2003,27 +2005,33 @@ class Inbox:
         message stays sent, and a delayed ``mark_read`` still cannot
         move a cursor backward on its own.  ``peer`` names a DM
         conversation; ``group`` names a group instead, and the peer's
-        group posts are untouched by a DM mark.  A conversation with
-        no stored messages is left alone and the return is ``None``;
-        otherwise the unread counts after the mark, with
-        ``exclude_dm_from`` left out exactly as :meth:`unread_counts`
-        leaves them out.  Raises ``OSError`` when the moved cursor
-        cannot be persisted, leaving the in-memory cursor untouched.
+        group posts are untouched by a DM mark.  ``group`` takes a
+        collection too, so a renamed group's whole lineage (current id
+        plus its predecessors) marks unread together: the default step
+        moves the cursor of the conversation holding the newest post
+        across the lineage.  A conversation with no stored messages
+        is left alone and the return is ``None``; otherwise the unread
+        counts after the mark, with ``exclude_dm_from`` left out
+        exactly as :meth:`unread_counts` leaves them out.  Raises
+        ``OSError`` when the moved cursor cannot be persisted, leaving
+        the in-memory cursor untouched.
         """
         with self._transaction():
             # Only received messages count: a reply we sent must neither
             # stand in for the unread reminder nor satisfy the presence check.
             if group is not None:
-                key = f"group:{group}"
+                groups = [group] if isinstance(group, str) else list(group)
+                wanted = set(groups)
+                keys = [f"group:{item}" for item in groups]
                 entries = [
                     entry
                     for entry in self._messages
                     if entry.get("kind") == "group"
-                    and entry.get("group") == group
+                    and entry.get("group") in wanted
                     and entry.get("direction") == "in"
                 ]
             elif peer is not None:
-                key = f"dm:{peer}"
+                keys = [f"dm:{peer}"]
                 entries = [
                     entry
                     for entry in self._messages
@@ -2037,14 +2045,21 @@ class Inbox:
                 return None
             snapshot = dict(self._read_cursors)
             if all:
-                self._read_cursors.pop(key, None)
+                for key in keys:
+                    self._read_cursors.pop(key, None)
             else:
                 newest = max(entries, key=lambda entry: entry["seq"])
+                key = _conversation_key(newest)
+                scoped = [
+                    entry
+                    for entry in entries
+                    if _conversation_key(entry) == key
+                ]
                 cursor = self._read_cursors.get(key)
                 # Already unread: the newest received message is past the cursor.
                 if not _is_unread(newest, cursor):
                     earlier = [
-                        entry for entry in entries if entry["seq"] < newest["seq"]
+                        entry for entry in scoped if entry["seq"] < newest["seq"]
                     ]
                     if not earlier:
                         self._read_cursors.pop(key, None)

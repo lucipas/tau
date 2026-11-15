@@ -1706,6 +1706,52 @@ def test_mark_read_group_leaves_same_senders_dm_unread(tmp_path):
     assert [entry["unread"] for entry in listed] == [False, True]
 
 
+def test_mark_read_group_lineage_advances_predecessors(tmp_path):
+    """A renamed group's lineage marks read — and unread — together."""
+    old_id, new_id = "11" * 16, "22" * 16
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(
+            id="old-1",
+            destination="aa" * 16,
+            received_at=1.0,
+            kind="group",
+            group=old_id,
+            group_name="crew",
+        )
+    )
+    inbox.append(
+        _record(
+            id="new-1",
+            destination="aa" * 16,
+            received_at=2.0,
+            kind="group",
+            group=new_id,
+            group_name="crew",
+        )
+    )
+
+    inbox.mark_read(group=[new_id, old_id])
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
+
+    # The default step marks the newest post across the lineage
+    # unread — the one under the current id.
+    counts = inbox.mark_unread(group=[new_id, old_id])
+    assert counts == {
+        "per_peer": {},
+        "per_group": {new_id: 1},
+        "total": 1,
+    }
+
+    # ...and --all clears both cursors.
+    counts = inbox.mark_unread(group=[new_id, old_id], all=True)
+    assert counts == {
+        "per_peer": {},
+        "per_group": {old_id: 1, new_id: 1},
+        "total": 2,
+    }
+
+
 def test_mark_read_all_advances_each_conversation(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="dm-1", destination="aa" * 16, received_at=1.0))

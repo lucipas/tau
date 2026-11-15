@@ -7377,6 +7377,60 @@ class WebBridge:
         self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
         return dict(counts, revision=self._unread_revision)
 
+    def _group_lineage(self, group_id: str) -> List[str]:
+        """A group id plus its rename predecessors, current id first.
+
+        Group posts keep the id they arrived under, so a renamed
+        group's history spans its current id and every predecessor
+        (see :func:`tau.groups.GroupStore.record`).  An unknown id
+        has no lineage: it stands alone.  Reading the store never
+        breaks an unread call — a failure falls back to the id
+        alone, exactly as the unknown case.
+        """
+        try:
+            groups = getattr(self.node, "groups", None)
+            found = groups.get(group_id) if groups is not None else None
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store for lineage", exc_info=True)
+            found = None
+        if not isinstance(found, dict):
+            return [group_id]
+        return [found["id"], *(found.get("renamed_from") or [])]
+
+    def _fold_group_counts(self, counts: Dict[str, Any]) -> Dict[str, Any]:
+        """Fold predecessor unread counts into their successor's entry.
+
+        ``per_group`` is keyed by the id each post arrived under, but
+        the console only ever shows a group's current id — so a
+        renamed group's older posts would inflate ``total`` with no
+        badge to clear them from.  Fold each predecessor's count into
+        its successor, so the badge on the current group covers the
+        whole lineage.  ``total`` is unchanged: it is the sum of the
+        same posts, just bucketed under the current id.
+        """
+        per_group = counts.get("per_group") or {}
+        if not per_group:
+            return counts
+        try:
+            groups = getattr(self.node, "groups", None)
+            known = groups.list_groups() if groups is not None else []
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store for folding", exc_info=True)
+            known = []
+        successor: Dict[str, str] = {}
+        for group in known:
+            if not isinstance(group, dict):
+                continue
+            for predecessor in group.get("renamed_from") or []:
+                successor[predecessor] = group["id"]
+        folded: Dict[str, int] = {}
+        for group_id, count in per_group.items():
+            target = successor.get(group_id, group_id)
+            folded[target] = folded.get(target, 0) + count
+        if folded == per_group:
+            return counts
+        return dict(counts, per_group=folded)
+
     def unread(self) -> Dict[str, Any]:
         """Per-conversation unread counts from the node inbox.
 
@@ -7387,6 +7441,8 @@ class WebBridge:
         posts still count, since the group thread stays visible.  An
         ignored group's posts never light a badge either, so they are
         excluded too; the members' direct messages still count.
+        A renamed group's posts count under its current id, so the
+        badge on the group covers its whole history.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
@@ -7405,6 +7461,8 @@ class WebBridge:
                     )
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)
+                else:
+                    counts = self._fold_group_counts(counts)
             return self._stamp_unread(counts)
 
     def mark_read(
@@ -7416,8 +7474,10 @@ class WebBridge:
         unread badge clears; other tabs learn from the ``unread`` SSE
         event.  ``peer`` names a DM conversation and ``group`` a group
         conversation; each advances only its own cursor, so opening a
-        DM never consumes a group post from the same sender.  Read
-        state never leaves this node.
+        DM never consumes a group post from the same sender.  A group
+        mark advances the whole rename lineage, so opening a renamed
+        group clears its older posts too.  Read state never leaves
+        this node.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
@@ -7425,7 +7485,11 @@ class WebBridge:
             if inbox is not None:
                 counts = inbox.mark_read(
                     peer=peer,
-                    group=group,
+                    group=(
+                        self._group_lineage(group)
+                        if group is not None
+                        else None
+                    ),
                     exclude_dm_from=self._archived_set(),
                     exclude_group=load_ignored_group_ids(
                         getattr(
@@ -7433,6 +7497,7 @@ class WebBridge:
                         )
                     ),
                 )
+                counts = self._fold_group_counts(counts)
             stamped = self._stamp_unread(counts)
         if inbox is not None:
             self.bus.publish({"type": "unread", "unread": stamped})
@@ -7452,13 +7517,14 @@ class WebBridge:
         :meth:`Inbox.mark_unread`.  By default the newest received message
         in the conversation becomes unread again; ``all=True`` clears the
         cursor so the whole conversation shows unread.  ``peer`` names a
-        DM conversation and ``group`` a group conversation.  Other tabs
-        learn from the ``unread`` SSE event, exactly as they do for a
-        mark-read.  Read receipts are untouched: a receipt already sent
-        for a message stays sent, and only the local display cursor
-        moves.  Raises :class:`ValueError` when the conversation has no
-        stored messages to mark, or when the node has no inbox to mark
-        them in.
+        DM conversation and ``group`` a group conversation; a group mark
+        covers the whole rename lineage, so a renamed group's older
+        posts mark unread together.  Other tabs learn from the
+        ``unread`` SSE event, exactly as they do for a mark-read.  Read
+        receipts are untouched: a receipt already sent for a message
+        stays sent, and only the local display cursor moves.  Raises
+        :class:`ValueError` when the conversation has no stored messages
+        to mark, or when the node has no inbox to mark them in.
         """
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
@@ -7466,7 +7532,9 @@ class WebBridge:
         with self._unread_lock:
             moved = inbox.mark_unread(
                 peer,
-                group=group,
+                group=(
+                    self._group_lineage(group) if group is not None else None
+                ),
                 all=all,
                 exclude_dm_from=self._archived_set(),
                 exclude_group=load_ignored_group_ids(
@@ -7476,7 +7544,7 @@ class WebBridge:
             if moved is None:
                 target = group if group is not None else peer
                 raise ValueError(f"no stored messages in {target!r}")
-            stamped = self._stamp_unread(moved)
+            stamped = self._stamp_unread(self._fold_group_counts(moved))
         self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 

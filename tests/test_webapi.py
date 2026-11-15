@@ -2863,6 +2863,70 @@ def test_mark_read_endpoint_group_leaves_dm_unread(bridge, node):
     assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
 
 
+def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path):
+    """A renamed group's older posts count under its current id."""
+    from tau.groups import derive_group_id
+
+    old_id = _learned_group(node, tmp_path)
+    new_id = derive_group_id(
+        PEER_HASH,
+        "weekend",
+        [PEER_HASH, node.destination_hexhash, OTHER_HASH],
+    )
+    assert node.groups.record(
+        new_id,
+        "weekend",
+        [PEER_HASH, node.destination_hexhash, OTHER_HASH],
+        creator=PEER_HASH,
+        sender=PEER_HASH,
+        renamed_from=[old_id],
+    )
+    _inbound_record(
+        node,
+        id="g-old",
+        received_at=101.0,
+        kind="group",
+        group=old_id,
+        group_name="weekend",
+    )
+    _inbound_record(
+        node,
+        id="g-new",
+        received_at=102.0,
+        kind="group",
+        group=new_id,
+        group_name="weekend",
+    )
+
+    # Both posts count under the current id — the console has no
+    # badge or read action for the retired one.
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {},
+        "per_group": {new_id: 2},
+        "total": 2,
+    }
+
+    # Opening the group clears the whole lineage, old id included.
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"group": new_id}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+
+    # And marking it unread again restores the newest post across
+    # the lineage, still under the current id.
+    status, _, payload = _json(
+        bridge, "/api/messages/unread", method="POST", body={"group": new_id}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {
+        "per_peer": {},
+        "per_group": {new_id: 1},
+        "total": 1,
+    }
+
+
 def test_mark_read_endpoint_rejects_peer_and_group_together(bridge):
     status, _, payload = _json(
         bridge,

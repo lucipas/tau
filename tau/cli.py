@@ -7450,11 +7450,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
             }
             per_group = {}
         elif group_ids is not None:
-            per_group = {
-                group: count
-                for group, count in per_group.items()
-                if group in group_ids
-            }
+            # A renamed group's history spans its lineage: fold the
+            # predecessors' counts into the current id's line.
+            here = sum(per_group.get(gid, 0) for gid in group_ids)
+            per_group = {group_id: here} if here else {}
             per_peer = {}
         total = sum(per_peer.values()) + sum(per_group.values())
         if _json_mode(args):
@@ -7776,15 +7775,17 @@ def cmd_messages_unread(args: argparse.Namespace) -> int:
         if getattr(args, "peer", None):
             raise NodeError("pass a peer or --group, not both")
         group = GroupStore(config.groups_path).find(args.group)
-        group_id = group["id"]
-        counts = inbox.mark_unread(group=group_id, all=getattr(args, "all", False))
+        # History spans renames: the mark covers the current id and
+        # every predecessor, like the --group listing does.
+        group_ids = _group_ids_spanning_renames(group)
+        counts = inbox.mark_unread(group=group_ids, all=getattr(args, "all", False))
         if counts is None:
             raise NodeError(f"no stored messages in group {args.group!r}")
-        unread = counts["per_group"].get(group_id, 0)
+        unread = sum(counts["per_group"].get(gid, 0) for gid in group_ids)
         noun = "message" if unread == 1 else "messages"
         if _json_mode(args):
             _emit(
-                {"group": group_id, "unread": unread, "total": counts["total"]},
+                {"group": group["id"], "unread": unread, "total": counts["total"]},
                 True,
             )
         else:
