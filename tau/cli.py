@@ -156,8 +156,11 @@ from .tangents.tan import (
     apply_display_rules,
     author_stats,
     author_timeline,
+    clean_tag,
     export_entries,
     follow,
+    follow_tag,
+    followed_tags,
     following,
     hidden_posts,
     hide_post,
@@ -186,6 +189,7 @@ from .tangents.tan import (
     timeline,
     top_posts,
     unfollow,
+    unfollow_tag,
     unhide_post,
     unmute,
     unmute_keyword,
@@ -2067,6 +2071,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_muted_keywords.set_defaults(func=cmd_tan_muted_keywords)
 
+    tan_follow_tag = tan_sub.add_parser(
+        "follow-tag",
+        parents=[common],
+        help="follow a hashtag so its posts join your timeline",
+    )
+    tan_follow_tag.add_argument("tag", metavar="#TAG", help="hashtag to follow")
+    tan_follow_tag.set_defaults(func=cmd_tan_follow_tag)
+
+    tan_unfollow_tag = tan_sub.add_parser(
+        "unfollow-tag",
+        parents=[common],
+        help="stop following a hashtag",
+    )
+    tan_unfollow_tag.add_argument("tag", metavar="#TAG", help="hashtag to unfollow")
+    tan_unfollow_tag.set_defaults(func=cmd_tan_unfollow_tag)
+
+    tan_followed_tags = tan_sub.add_parser(
+        "followed-tags",
+        parents=[common],
+        help="list followed hashtags",
+    )
+    tan_followed_tags.set_defaults(func=cmd_tan_followed_tags)
+
     tan_save = tan_sub.add_parser(
         "save", parents=[common], help="save a post to read later"
     )
@@ -2739,7 +2766,8 @@ def _print_tan_posts(
         when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
             "%Y-%m-%d %H:%M"
         )
-        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}{' (edited)' if post.get('edited') else ''}{' 📌' if post.get('pinned') else ''}")
+        via = f" via #{post['via_tag']}" if post.get("via_tag") else ""
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}{' (edited)' if post.get('edited') else ''}{' 📌' if post.get('pinned') else ''}{via}")
         if post.get("kind") == "reply":
             parent = post.get("reply_to")
             if isinstance(parent, dict):
@@ -4092,6 +4120,65 @@ def cmd_tan_muted_keywords(args: argparse.Namespace) -> int:
                 "%Y-%m-%d %H:%M"
             )
             print(f"{record['display']} (muted {when})")
+    return _EXIT_OK
+
+
+def cmd_tan_follow_tag(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    config.prepare()
+    conn = init_db(config.social_db_path)
+    try:
+        record = follow_tag(conn, args.tag)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        print(f"following tag {record['display']!r}")
+    return _EXIT_OK
+
+
+def cmd_tan_unfollow_tag(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        removed = unfollow_tag(conn, args.tag)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(
+            {
+                "tag": clean_tag(args.tag),
+                "unfollowed": removed,
+            },
+            True,
+        )
+    else:
+        if removed:
+            print(f"unfollowed tag {args.tag.strip()!r}")
+        else:
+            print(f"tag {args.tag.strip()!r} was not followed")
+    return _EXIT_OK
+
+
+def cmd_tan_followed_tags(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        records = followed_tags(conn)
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"followed_tags": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print("No followed tags. Try `tau tan follow-tag #TAG`.")
+        for record in records:
+            when = datetime.fromtimestamp(float(record["added_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(f"{record['display']} (followed {when})")
     return _EXIT_OK
 
 
