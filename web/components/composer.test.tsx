@@ -299,3 +299,70 @@ describe("Composer send later", () => {
     expect(screen.getByLabelText("Send later")).toBeTruthy();
   });
 });
+
+describe("Composer disappearing default", () => {
+  function renderWithDefault({
+    disappearingDefault = null as number | null,
+    onSetDisappearingDefault = vi.fn().mockResolvedValue(undefined),
+  } = {}) {
+    render(
+      <Composer
+        peers={peers}
+        groups={groups}
+        target={PEER_HASH}
+        mode="peer"
+        onTargetChange={() => {}}
+        onModeChange={() => {}}
+        onSend={vi.fn()}
+        onSendGroup={vi.fn()}
+        disappearingDefault={disappearingDefault}
+        onSetDisappearingDefault={onSetDisappearingDefault}
+      />,
+    );
+    return { onSetDisappearingDefault };
+  }
+
+  it("offers the default picker and saves the choice", async () => {
+    const { onSetDisappearingDefault } = renderWithDefault();
+    const select = screen.getByLabelText(
+      "Disappearing default",
+    ) as HTMLSelectElement;
+    expect(select.value).toBe("");
+    fireEvent.change(select, { target: { value: "3600" } });
+    await waitFor(() =>
+      expect(onSetDisappearingDefault).toHaveBeenCalledWith(3600),
+    );
+  });
+
+  it("shows the active default in the per-message expiry and as a hint", () => {
+    renderWithDefault({ disappearingDefault: 3600 });
+    expect(
+      (screen.getByLabelText("Message expiry") as HTMLSelectElement).value,
+    ).toBe("");
+    expect(screen.getByText("default (1h)")).toBeTruthy();
+    expect(
+      screen.getByText("messages disappear after 1h by default"),
+    ).toBeTruthy();
+    expect(
+      (screen.getByLabelText("Disappearing default") as HTMLSelectElement)
+        .value,
+    ).toBe("3600");
+  });
+
+  it("hides the picker when no setter is provided", () => {
+    render(
+      <Composer
+        peers={peers}
+        groups={groups}
+        target={PEER_HASH}
+        mode="peer"
+        onTargetChange={() => {}}
+        onModeChange={() => {}}
+        onSend={vi.fn()}
+        onSendGroup={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText("Disappearing default")).toBeNull();
+    expect(screen.getByText("never")).toBeTruthy();
+  });
+});

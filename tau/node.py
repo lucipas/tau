@@ -42,6 +42,7 @@ from .dm_requests import (
     list_dm_requests,
     record_dm_request,
 )
+from .disappearing import group_default_for, peer_default_for
 from .groups import GroupStore, pinned_group
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -5189,7 +5190,9 @@ class TauNode:
         envelopes, the receiver purges the message once it passes, and
         a queued copy expires at the same deadline.  Expiry is
         cooperative — a modified client can keep copies — so this is
-        hygiene, not a guarantee.
+        hygiene, not a guarantee.  When ``expires_at`` is None and the
+        send is not scheduled, a per-conversation disappearing default
+        (``tau disappearing``) fills it in instead.
 
         ``in_reply_to`` quotes an earlier message in the same
         conversation: ``{"id": <wire id>, "excerpt": <short hash>}``.
@@ -5231,6 +5234,25 @@ class TauNode:
                 "cannot schedule a message without queueing: "
                 "send_after requires queue=True"
             )
+        if expires_at is None and send_after is None:
+            # A per-conversation disappearing default fills in the
+            # expiry the send did not pass: the payload, the queued
+            # copy and the sent record all carry it, exactly like an
+            # explicit --expire.  The target hash is best-effort here
+            # (a name nobody has resolved yet has no hash to look up),
+            # and a corrupt defaults file fails open with a warning
+            # inside peer_default_for — a send must never break over it.
+            dest_hash = self._target_hash(target)
+            default = (
+                peer_default_for(
+                    getattr(self.config, "disappearing_path", None),
+                    dest_hash.hex(),
+                )
+                if dest_hash is not None
+                else None
+            )
+            if default is not None:
+                expires_at = time.time() + default
         message_id = generate_message_id()
         payload = encode_message(
             normalized,
@@ -5557,7 +5579,9 @@ class TauNode:
         ``expires_at`` is an optional sender-set expiry (epoch seconds),
         exactly like a direct message: it travels in every leg's
         payload, a queued leg expires at the same deadline, and the
-        receiver purges the message once it passes.
+        receiver purges the message once it passes.  When ``expires_at``
+        is None and the send is not scheduled, a per-conversation
+        disappearing default (``tau disappearing``) fills it in instead.
 
         ``send_after`` schedules the message (epoch seconds), exactly
         like a direct message: instead of attempting delivery now,
@@ -5601,6 +5625,15 @@ class TauNode:
                 "cannot schedule a message without queueing: "
                 "send_after requires queue=True"
             )
+        if expires_at is None and send_after is None:
+            # Same disappearing default as send_message, keyed by the
+            # group id: every leg carries the same expiry.
+            default = group_default_for(
+                getattr(self.config, "disappearing_path", None),
+                group["id"],
+            )
+            if default is not None:
+                expires_at = time.time() + default
         reply_to = clean_in_reply_to(in_reply_to)
         if reply_to is not None:
             reply_to = self._group_reply_reference(group["id"], reply_to)

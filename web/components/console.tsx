@@ -451,6 +451,30 @@ export function Console() {
               onSendGroupFile={tau.sendGroupFile}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
+              disappearingDefault={
+                target.trim() === ""
+                  ? null
+                  : mode === "group"
+                    ? (tau.disappearingDefaults.groups[target] ?? null)
+                    : (tau.disappearingDefaults.peers[target] ?? null)
+              }
+              onSetDisappearingDefault={
+                target.trim() === ""
+                  ? undefined
+                  : async (seconds) => {
+                      if (mode === "group") {
+                        await tau.setDisappearingDefault(
+                          { group: target },
+                          seconds,
+                        );
+                      } else {
+                        await tau.setDisappearingDefault(
+                          { peer: target },
+                          seconds,
+                        );
+                      }
+                    }
+              }
             />
             <div className="mt-4">
               <SettingsSection

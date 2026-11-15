@@ -2626,3 +2626,138 @@ describe("useTau archived conversations", () => {
     unmount();
   });
 });
+
+describe("useTau disappearing defaults", () => {
+  function mockDisappearingGet(
+    defaults: { peers: Record<string, number>; groups: Record<string, number> } = {
+      peers: {},
+      groups: {},
+    },
+  ) {
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/messages/disappearing"
+        ? Promise.resolve(defaults)
+        : path === "/api/peers"
+          ? Promise.resolve({ peers: [], count: 0 })
+          : path === "/api/outbox"
+            ? Promise.resolve({ outbox: [], count: 0, held_for_others: 0 })
+            : Promise.resolve({ groups: [], count: 0 }),
+    );
+  }
+
+  it("loads the defaults and applies a set at once", async () => {
+    mockDisappearingGet({
+      peers: { [PEER_HASH]: 3600 },
+      groups: {},
+    });
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() =>
+      expect(result.current.disappearingDefaults).toEqual({
+        peers: { [PEER_HASH]: 3600 },
+        groups: {},
+      }),
+    );
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      disappearing: {
+        target: GROUP_ID,
+        group: true,
+        disappearing_seconds: 300,
+        changed: true,
+      },
+    });
+    // The re-read after the set returns the new defaults.
+    mockDisappearingGet({
+      peers: { [PEER_HASH]: 3600 },
+      groups: { [GROUP_ID]: 300 },
+    });
+    await act(async () => {
+      await result.current.setDisappearingDefault(
+        { group: GROUP_ID },
+        300,
+      );
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/disappearing", {
+      group: GROUP_ID,
+      seconds: 300,
+    });
+    // The set applies to local state at once, before the re-read.
+    expect(result.current.disappearingDefaults).toEqual({
+      peers: { [PEER_HASH]: 3600 },
+      groups: { [GROUP_ID]: 300 },
+    });
+    unmount();
+  });
+
+  it("clears a peer default and drops it from state", async () => {
+    mockDisappearingGet({
+      peers: { [PEER_HASH]: 3600 },
+      groups: {},
+    });
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() =>
+      expect(result.current.disappearingDefaults.peers).toEqual({
+        [PEER_HASH]: 3600,
+      }),
+    );
+
+    // The re-read after the clear returns empty defaults.
+    mockDisappearingGet({ peers: {}, groups: {} });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      disappearing: {
+        target: PEER_HASH,
+        group: false,
+        disappearing_seconds: null,
+        changed: true,
+      },
+    });
+    await act(async () => {
+      await result.current.setDisappearingDefault({ peer: PEER_HASH }, null);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/disappearing", {
+      peer: PEER_HASH,
+      seconds: null,
+    });
+    expect(result.current.disappearingDefaults.peers).toEqual({});
+    unmount();
+  });
+
+  it("keeps the last known defaults when the poll fails", async () => {
+    mockDisappearingGet({
+      peers: { [PEER_HASH]: 60 },
+      groups: {},
+    });
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() =>
+      expect(result.current.disappearingDefaults.peers).toEqual({
+        [PEER_HASH]: 60,
+      }),
+    );
+
+    mockedGet.mockRejectedValue(new Error("bridge down"));
+    await act(async () => {
+      await result.current.refreshDisappearing();
+    });
+    expect(result.current.disappearingDefaults.peers).toEqual({
+      [PEER_HASH]: 60,
+    });
+    expect(result.current.disappearingError).toBe("bridge down");
+    unmount();
+  });
+});

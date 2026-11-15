@@ -19,6 +19,9 @@ import type {
   DeclineDmRequestResponse,
   DeleteGroupResponse,
   DeleteMessageResponse,
+  DisappearingDefaults,
+  DisappearingDefaultsResponse,
+  DisappearingResponse,
   DmRequestEntry,
   DmRequestsResponse,
   DoctorResponse,
@@ -211,6 +214,11 @@ export function useTau() {
     ArchivedConversation[]
   >([]);
   const [archivedError, setArchivedError] = useState<string | null>(null);
+  const [disappearingDefaults, setDisappearingDefaults] =
+    useState<DisappearingDefaults>({ peers: {}, groups: {} });
+  const [disappearingError, setDisappearingError] = useState<string | null>(
+    null,
+  );
   // Destinations with an archived conversation, for the live feed: a
   // message that arrives for one (archived from another tab or the CLI)
   // is dropped on arrival, the same way a blocked sender's is.
@@ -807,6 +815,31 @@ export function useTau() {
     }
   }, [hideArchivedThreads]);
 
+  const refreshDisappearingSeq = useRef(0);
+
+  const refreshDisappearing = useCallback(async () => {
+    // Same stale-response guard as the archived refresh: a slow poll
+    // must not restore defaults a set or clear already moved. A failed
+    // poll leaves the last known defaults in place instead of flashing
+    // an error.
+    const requestId = ++refreshDisappearingSeq.current;
+    try {
+      const result = await apiGet<DisappearingDefaultsResponse>(
+        "/api/messages/disappearing",
+      );
+      if (requestId !== refreshDisappearingSeq.current) return;
+      setDisappearingDefaults(result);
+      setDisappearingError(null);
+    } catch (error) {
+      if (requestId !== refreshDisappearingSeq.current) return;
+      setDisappearingError(
+        error instanceof Error
+          ? error.message
+          : "could not load disappearing defaults",
+      );
+    }
+  }, []);
+
   const allowlistSeq = useRef(0);
 
   // Allow-list requests can resolve out of order: only the newest
@@ -877,6 +910,7 @@ export function useTau() {
         refreshHeldMail(),
         refreshDmRequests(),
         refreshArchived(),
+        refreshDisappearing(),
         refreshGroups(),
         refreshLeftGroups(),
         refreshSettings(),
@@ -888,7 +922,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshGroups, refreshLeftGroups, refreshSettings, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshDisappearing, refreshGroups, refreshLeftGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     (target: string) =>
@@ -2123,6 +2157,48 @@ export function useTau() {
     [refreshArchived, refreshMessages],
   );
 
+  const setDisappearingDefault = useCallback(
+    async (
+      target: { peer?: string; group?: string },
+      seconds: number | null,
+    ) => {
+      const result = await apiPost<DisappearingResponse>(
+        "/api/messages/disappearing",
+        {
+          ...(target.peer !== undefined
+            ? { peer: target.peer }
+            : { group: target.group }),
+          seconds,
+        },
+      );
+      // The write already succeeded: apply it to local state at once so
+      // the picker shows the new default without waiting on the poll,
+      // then re-read — a stale poll is discarded by its sequence.
+      const change = result.disappearing;
+      setDisappearingDefaults((previous) => {
+        if (change.group) {
+          const groups = { ...previous.groups };
+          if (change.disappearing_seconds === null) {
+            delete groups[change.target];
+          } else {
+            groups[change.target] = change.disappearing_seconds;
+          }
+          return { peers: previous.peers, groups };
+        }
+        const peers = { ...previous.peers };
+        if (change.disappearing_seconds === null) {
+          delete peers[change.target];
+        } else {
+          peers[change.target] = change.disappearing_seconds;
+        }
+        return { peers, groups: previous.groups };
+      });
+      await refreshDisappearing();
+      return change;
+    },
+    [refreshDisappearing],
+  );
+
   // Download the export document the bridge returns. The anchor
   // click is the download: a blob URL keeps the file local, and the
   // revoke is deferred a beat so the browser has started the save.
@@ -2418,6 +2494,10 @@ export function useTau() {
     archiveConversation,
     unarchiveConversation,
     refreshArchived,
+    disappearingDefaults,
+    disappearingError,
+    setDisappearingDefault,
+    refreshDisappearing,
     settings,
     settingsError,
     heldMail,
