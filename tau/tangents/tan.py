@@ -1826,10 +1826,10 @@ def annotate_quotes(
     posts: List[Dict[str, Any]],
     *,
     muted_keywords: Optional[Sequence[str]] = None,
-    muted_tags: Optional[Sequence[str]] = None,
     exclude_authors: Optional[Set[str]] = None,
     blocked_authors: Optional[Set[str]] = None,
     hidden_posts: Optional[Set[str]] = None,
+    muted_tags: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``quoted`` original summary to quote entries, in place.
 
@@ -1841,8 +1841,10 @@ def annotate_quotes(
     An original matching a muted keyword (see :func:`muted_keywords`)
     is reported the same way, with its text blanked and ``muted`` set,
     so the muted content does not leak through the preview.  An
-    original carrying a muted tag (see :func:`mute_tag`) is reported
-    the same way.  An original in *hidden_posts* is reported the same way, with its text
+    original whose current text carries a tag in *muted_tags* is
+    reported the same way, so muted-tag posts do not leak through a
+    quote preview either.  An
+    original in *hidden_posts* is reported the same way, with its text
     blanked and ``hidden`` set, so hiding a post never leaks its words
     through a quote preview.  An
     original whose author is in *exclude_authors* (muted) is reported
@@ -1887,6 +1889,10 @@ def annotate_quotes(
         ).fetchall()
         deleted = {(str(row["target"]), str(row["author"])) for row in rows}
     muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
+    muted_tag_set = set(muted_tags or [])
+    parent_tag_sets = (
+        _post_tag_sets(conn, list(parents.values())) if muted_tag_set else {}
+    )
     for post in posts:
         if post.get("kind") != KIND_QUOTE:
             continue
@@ -1912,8 +1918,7 @@ def annotate_quotes(
         is_muted = _text_matches_muted_keywords(
             str(parent.get("text") or ""), muted_pattern
         ) or bool(
-            set(extract_tags(str(parent.get("text") or "")))
-            & set(muted_tags or [])
+            muted_tag_set & parent_tag_sets.get(str(parent["hash"]), set())
         )
         is_hidden = hidden_posts is not None and parent["hash"] in hidden_posts
         is_expired_parent = is_expired(parent)
@@ -2747,7 +2752,7 @@ def timeline(
     blocked = set(_clean_excluded(exclude_authors))
     hidden = silenced | blocked
     keywords = _muted_keyword_list(conn)
-    muted_tag_names = _muted_tag_list(conn)
+    muted = _muted_tag_list(conn)
     wanted_tag = clean_tag(tag) if tag is not None else None
     keep_tag = _tag_page_filter(
         conn,
@@ -2760,7 +2765,7 @@ def timeline(
 
     def _drop_hidden(page: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         visible = keep_tag(page) if keep_tag is not None else page
-        visible = without_muted_tags(conn, visible, muted_tag_names)
+        visible = without_muted_tags(conn, visible, muted)
         return without_hidden_posts(visible, hidden_hashes)
     if include_all:
         posts = _fill_unmuted(
@@ -2798,10 +2803,10 @@ def timeline(
                         ),
                     ),
                     muted_keywords=keywords,
-                    muted_tags=muted_tag_names,
                     exclude_authors=silenced,
                     blocked_authors=blocked,
                     hidden_posts=hidden_hashes,
+                    muted_tags=muted,
                 ),
                 viewer=viewer,
             ),
@@ -2926,10 +2931,10 @@ def timeline(
                     ),
                 ),
                 muted_keywords=keywords,
-                muted_tags=muted_tag_names,
                 exclude_authors=silenced,
                 blocked_authors=blocked,
                 hidden_posts=hidden_hashes,
+                muted_tags=muted,
             ),
             viewer=viewer,
         ),
@@ -2971,7 +2976,7 @@ def author_timeline(
     if author in blocked:
         return []
     keywords = _muted_keyword_list(conn)
-    muted_tag_names = _muted_tag_list(conn)
+    muted = _muted_tag_list(conn)
     silenced = muted_author_set(conn)
     wanted_tag = clean_tag(tag) if tag is not None else None
     keep_tag = _tag_page_filter(
@@ -2981,7 +2986,7 @@ def author_timeline(
 
     def _drop_hidden(page: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         visible = keep_tag(page) if keep_tag is not None else page
-        visible = without_muted_tags(conn, visible, muted_tag_names)
+        visible = without_muted_tags(conn, visible, muted)
         return without_hidden_posts(visible, hidden_hashes)
 
     def page(cursor: int) -> List[Dict[str, Any]]:
@@ -3027,10 +3032,10 @@ def author_timeline(
                     ),
                 ),
                 muted_keywords=keywords,
-                muted_tags=muted_tag_names,
                 exclude_authors=silenced,
                 blocked_authors=blocked,
                 hidden_posts=hidden_hashes,
+                muted_tags=muted,
             ),
             viewer=viewer,
         ),
