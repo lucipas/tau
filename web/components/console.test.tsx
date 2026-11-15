@@ -561,6 +561,13 @@ describe("Console tabs", () => {
     window.location.hash = "";
   });
 
+  // The chat and social panels stay mounted while hidden, so a
+  // section's presence in the document is not visibility: only a
+  // panel without a `hidden` ancestor is actually shown.
+  function isShown(element: HTMLElement | null): boolean {
+    return element !== null && element.closest(".hidden") === null;
+  }
+
   function tabState(overrides: Record<string, unknown> = {}) {
     return {
       ...tauState([], []),
@@ -574,6 +581,9 @@ describe("Console tabs", () => {
       exportBundle: vi.fn(),
       importBundle: vi.fn(),
       runDoctor: vi.fn(),
+      backup: vi.fn(),
+      backingUp: false,
+      backupError: null,
       // Without these the feed reads pinnedMessages as undefined,
       // which counts as the pinned view instead of traffic.
       pinnedMessages: null,
@@ -588,10 +598,10 @@ describe("Console tabs", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
 
-    expect(screen.getByText("traffic")).toBeTruthy();
-    expect(screen.queryByText("sneakernet")).toBeNull();
-    expect(screen.queryByText("dm allow-list")).toBeNull();
-    expect(screen.queryByTestId("social-tab-feed")).toBeNull();
+    expect(isShown(screen.getByText("traffic"))).toBe(true);
+    expect(isShown(screen.queryByText("sneakernet"))).toBe(false);
+    expect(isShown(screen.queryByText("dm allow-list"))).toBe(false);
+    expect(isShown(screen.queryByTestId("social-tab-feed"))).toBe(false);
   });
 
   it("switches to the tools tab on click", () => {
@@ -600,10 +610,11 @@ describe("Console tabs", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "tools" }));
 
-    expect(screen.getByText("sneakernet")).toBeTruthy();
-    expect(screen.getByText("health")).toBeTruthy();
-    expect(screen.getByText("backup")).toBeTruthy();
-    expect(screen.queryByText("traffic")).toBeNull();
+    expect(isShown(screen.getByText("sneakernet"))).toBe(true);
+    expect(isShown(screen.getByText("health"))).toBe(true);
+    expect(isShown(screen.getByText("backup"))).toBe(true);
+    expect(isShown(screen.getByText("node backup"))).toBe(true);
+    expect(isShown(screen.queryByText("traffic"))).toBe(false);
   });
 
   it("switches to the settings tab on click", () => {
@@ -612,8 +623,8 @@ describe("Console tabs", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "settings" }));
 
-    expect(screen.getByText("dm allow-list")).toBeTruthy();
-    expect(screen.queryByText("sneakernet")).toBeNull();
+    expect(isShown(screen.getByText("dm allow-list"))).toBe(true);
+    expect(isShown(screen.queryByText("sneakernet"))).toBe(false);
   });
 
   it("opens on the tab named by the URL hash", () => {
@@ -621,22 +632,31 @@ describe("Console tabs", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
 
-    expect(screen.getByText("sneakernet")).toBeTruthy();
-    expect(screen.queryByText("traffic")).toBeNull();
+    expect(isShown(screen.getByText("sneakernet"))).toBe(true);
+    expect(isShown(screen.queryByText("traffic"))).toBe(false);
   });
 
   it("jumps between tabs with Alt+1 through Alt+4", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
 
-    fireEvent.keyDown(document.body, { key: "3", altKey: true });
-    expect(screen.getByText("sneakernet")).toBeTruthy();
+    fireEvent.keyDown(document.body, { key: "3", code: "Digit3", altKey: true });
+    expect(isShown(screen.getByText("sneakernet"))).toBe(true);
 
-    fireEvent.keyDown(document.body, { key: "2", altKey: true });
-    expect(screen.getByTestId("social-tab-feed")).toBeTruthy();
+    fireEvent.keyDown(document.body, { key: "2", code: "Digit2", altKey: true });
+    expect(isShown(screen.getByTestId("social-tab-feed"))).toBe(true);
 
-    fireEvent.keyDown(document.body, { key: "1", altKey: true });
-    expect(screen.getByText("traffic")).toBeTruthy();
+    fireEvent.keyDown(document.body, { key: "1", code: "Digit1", altKey: true });
+    expect(isShown(screen.getByText("traffic"))).toBe(true);
+  });
+
+  it("matches Alt+digit on the physical key, not the produced character", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    // macOS Option+2 produces a symbol in event.key.
+    fireEvent.keyDown(document.body, { key: "™", code: "Digit2", altKey: true });
+    expect(isShown(screen.getByTestId("social-tab-feed"))).toBe(true);
   });
 
   it("selecting a sidebar peer switches back to the chat tab", async () => {
@@ -651,14 +671,62 @@ describe("Console tabs", () => {
     window.location.hash = "#tools";
     mockedUseTau.mockReturnValue(tabState({ peers: [alice] }));
     render(<Console />);
-    expect(screen.getByText("sneakernet")).toBeTruthy();
+    expect(isShown(screen.getByText("sneakernet"))).toBe(true);
 
     fireEvent.click(
       screen.getByTitle(`Message alice (${alice.destination})`),
     );
 
-    await waitFor(() => expect(screen.getByText("traffic")).toBeTruthy());
-    expect(screen.queryByText("sneakernet")).toBeNull();
+    await waitFor(() =>
+      expect(isShown(screen.getByText("traffic"))).toBe(true),
+    );
+    expect(isShown(screen.queryByText("sneakernet"))).toBe(false);
+  });
+
+  it("keeps the composer draft across a tab switch", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    const composer = screen.getByPlaceholderText(
+      "Write something to the mesh…",
+    ) as HTMLTextAreaElement;
+    fireEvent.change(composer, { target: { value: "draft kept" } });
+
+    fireEvent.click(screen.getByRole("tab", { name: "tools" }));
+    fireEvent.click(screen.getByRole("tab", { name: "chat" }));
+
+    expect(
+      (screen.getByPlaceholderText(
+        "Write something to the mesh…",
+      ) as HTMLTextAreaElement).value,
+    ).toBe("draft kept");
+  });
+
+  it("offers the whole-node backup download in the tools tab", () => {
+    const backup = vi.fn();
+    mockedUseTau.mockReturnValue(
+      tabState({
+        node: {
+          name: "tester",
+          destination: "cd".repeat(16),
+          protocol: 1,
+          version: "0.1.0",
+          rns_version: "test",
+          uptime: 1,
+          peers: 0,
+          interfaces: [],
+        },
+        backup,
+      }),
+    );
+    render(<Console />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "tools" }));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "download backup" }),
+    );
+    expect(backup).toHaveBeenCalledTimes(1);
   });
 
   it("starts the outbox drawer open when mail is queued, and collapses it", () => {
@@ -685,10 +753,10 @@ describe("Console tabs", () => {
 
     const toggle = screen.getByRole("button", { name: /outbox.*queued/ });
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByText("hello queued")).toBeTruthy();
+    expect(isShown(screen.getByText("hello queued"))).toBe(true);
 
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(screen.queryByText("hello queued")).toBeNull();
+    expect(isShown(screen.queryByText("hello queued"))).toBe(false);
   });
 });
