@@ -6650,6 +6650,37 @@ def test_timeline_mutes_tagged_posts(identities, tmp_path):
     ]
 
 
+def test_timeline_blanks_muted_tag_quote_preview(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    original = create_post(conn, bob, "#spam secret plans", name="bob", now=1000)
+    quote = create_quote(
+        conn, carol, original["hash"], "look at this", name="carol", now=1001
+    )
+    follow(conn, author_of(carol), name="carol")
+    authors = [author_of(alice), author_of(carol)]
+
+    # Baseline: the quote shows the original's text in its preview.
+    found = timeline(conn, authors)
+    assert [post["hash"] for post in found] == [quote["hash"]]
+    assert found[0]["quoted"]["text"] == "#spam secret plans"
+
+    mute_tag(conn, "spam")
+    # The quote itself stays — its own comment is clean — but the
+    # preview of the muted-tag original is blanked and marked muted,
+    # the same protection a muted keyword gets.
+    found = timeline(conn, authors)
+    assert [post["hash"] for post in found] == [quote["hash"]]
+    assert found[0]["quoted"]["text"] == ""
+    assert found[0]["quoted"]["muted"] is True
+    # The author view blanks it the same way.
+    found = author_timeline(conn, author_of(carol))
+    assert [post["hash"] for post in found] == [quote["hash"]]
+    assert found[0]["quoted"]["text"] == ""
+    assert found[0]["quoted"]["muted"] is True
+
+
 def test_without_muted_tags_keeps_unmuted_posts(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
