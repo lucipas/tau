@@ -147,11 +147,21 @@ export function Console() {
   const openUnread =
     mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
 
+  // A deliberate mark-unread holds the badge for the open conversation:
+  // the auto-read below must not undo it the moment the count rises.
+  // The hold records the count the mark produced; new mail above that
+  // level releases it, so a conversation that gets new mail while open
+  // still reads as read. Reopening the conversation clears it too.
+  const manualUnread = useRef(new Map<string, number>());
+
   // The open conversation reads as read: the auto-selected one on load,
   // and one that gets new mail while it stays open. A failed call leaves
   // the badge in place until the count next changes.
   useEffect(() => {
     if (!target || openUnread === 0) return;
+    const held = manualUnread.current.get(target);
+    if (held !== undefined && openUnread <= held) return;
+    if (held !== undefined) manualUnread.current.delete(target);
     void markRead(target).catch(() => undefined);
   }, [target, openUnread, markRead]);
 
@@ -160,6 +170,9 @@ export function Console() {
     setMode("peer");
     setTarget(destination);
     setReplyTo(null);
+    // Reopening clears any mark-unread hold: opening the conversation
+    // marks it read, as before.
+    manualUnread.current.delete(destination);
     // Opening the conversation advances its read cursor on the node,
     // so the badge clears. A failed call leaves the badge in place.
     void tau.markRead(destination).catch(() => undefined);
@@ -273,7 +286,11 @@ export function Console() {
               await tau.unarchiveConversation(destination);
             }}
             onMarkUnread={async (destination) => {
-              await tau.markUnread(destination);
+              const counts = await tau.markUnread(destination);
+              manualUnread.current.set(
+                destination,
+                counts.per_peer[destination] ?? 0,
+              );
             }}
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
