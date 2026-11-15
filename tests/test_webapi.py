@@ -2827,6 +2827,137 @@ def test_mark_read_endpoint_rejects_a_bad_peer(bridge):
     assert "peer" in payload["error"]["message"]
 
 
+def test_mark_unread_endpoint_marks_newest_unread_again(bridge, node):
+    _inbound_record(node)
+    _inbound_record(node, id="m-2", received_at=102.0)
+
+    # Read first: the conversation shows nothing unread.
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
+
+    status, _, payload = _json(
+        bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "total": 1}
+
+    # Other tabs learn from the published unread event.
+    events = bridge.bus.replay(0)
+    unread_events = [event for event in events if event["type"] == "unread"]
+    assert _counts(unread_events[-1]["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "total": 1,
+    }
+
+    # Marking again is a no-op: the newest message is already unread.
+    status, _, payload = _json(
+        bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "total": 1}
+
+
+def test_mark_unread_endpoint_all_marks_whole_conversation(bridge, node):
+    _inbound_record(node)
+    _inbound_record(node, id="m-2", received_at=102.0)
+    _inbound_record(
+        node,
+        destination=OTHER_HASH,
+        **{"from": "carol", "id": "m-3", "received_at": 103.0},
+    )
+    _json(bridge, "/api/messages/read", method="POST", body={})
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/unread",
+        method="POST",
+        body={"peer": PEER_HASH, "all": True},
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "total": 2}
+
+
+def test_mark_unread_endpoint_rejects_bad_input(bridge, node):
+    for body in ({"peer": "  "}, {"peer": 42}, {"peer": PEER_HASH, "all": "yes"}, {}):
+        status, _, payload = _json(
+            bridge, "/api/messages/unread", method="POST", body=body
+        )
+        assert status == 400
+        assert (
+            "peer" in payload["error"]["message"]
+            or "all" in payload["error"]["message"]
+        )
+
+    # A peer with no stored messages has nothing to mark.
+    status, _, payload = _json(
+        bridge, "/api/messages/unread", method="POST", body={"peer": OTHER_HASH}
+    )
+    assert status == 400
+    assert "no stored messages" in payload["error"]["message"]
+
+
+def test_mark_unread_counts_exclude_archived_conversations(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        _inbound_record(node)
+        _inbound_record(node, id="m-2", received_at=102.0)
+        _inbound_record(
+            node,
+            destination=OTHER_HASH,
+            **{"from": "carol", "id": "m-3", "received_at": 103.0},
+        )
+        # Carol's conversation reads; alice's stays unread, then her
+        # thread is archived.
+        _json(bridge, "/api/messages/read", method="POST", body={"peer": OTHER_HASH})
+        bridge.archive_conversation("alice")
+
+        # Marking carol's whole conversation unread must not resurrect
+        # the archived thread's counts: the bridge reports unread the
+        # same way its unread endpoint does.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/unread",
+            method="POST",
+            body={"peer": OTHER_HASH, "all": True},
+        )
+        assert status == 200
+        assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "total": 1}
+    finally:
+        bridge.stop()
+
+
+def test_mark_unread_endpoint_reports_unsaved_cursor(
+    bridge, node, monkeypatch
+):
+    _inbound_record(node)
+    _json(bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH})
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(node.inbox, "_save", failing_save)
+    status, _, payload = _json(
+        bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 503
+    assert "could not save the read state" in payload["error"]["message"]
+
+
+def test_mark_unread_endpoint_without_inbox_is_an_error(
+    bridge, node, monkeypatch
+):
+    monkeypatch.setattr(node, "inbox", None)
+    status, _, payload = _json(
+        bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 400
+    assert "no inbox" in payload["error"]["message"]
+
+
 def test_send_validation(bridge):
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"to": "alice", "text": " "}

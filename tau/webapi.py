@@ -7315,6 +7315,33 @@ class WebBridge:
             self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 
+    def mark_unread(self, peer: str, *, all: bool = False) -> Dict[str, Any]:
+        """Move one conversation's read cursor back so it shows unread again.
+
+        The console marks a conversation read when it is opened, so this
+        is the way back — the mirror of :meth:`mark_read`, backed by
+        :meth:`Inbox.mark_unread`.  By default the newest received message
+        becomes unread again; ``all=True`` clears the cursor so the whole
+        conversation shows unread.  Other tabs learn from the ``unread``
+        SSE event, exactly as they do for a mark-read.  Read receipts are
+        untouched: a receipt already sent for a message stays sent, and
+        only the local display cursor moves.  Raises :class:`ValueError`
+        when the peer has no stored messages to mark, or when the node
+        has no inbox to mark them in.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise ValueError("this node has no inbox to mark unread")
+        with self._unread_lock:
+            moved = inbox.mark_unread(
+                peer, all=all, exclude_dm_from=self._archived_set()
+            )
+            if moved is None:
+                raise ValueError(f"no stored messages from {peer!r}")
+            stamped = self._stamp_unread(moved)
+        self.bus.publish({"type": "unread", "unread": stamped})
+        return stamped
+
     def snapshot(self) -> Dict[str, Any]:
         return {
             "node": self.node.info(),
@@ -8211,6 +8238,59 @@ class _WebHandler(BaseHTTPRequestHandler):
                 counts = self.bridge.mark_read(
                     peer.strip() if isinstance(peer, str) else None
                 )
+                self._send_json({"ok": True, "unread": counts}, head_only)
+                return
+            if path == "/api/messages/unread":
+                peer = body.get("peer")
+                if not isinstance(peer, str) or not peer.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'peer' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                mark_all = body.get("all", False)
+                if not isinstance(mark_all, bool):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'all' must be a boolean"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    counts = self.bridge.mark_unread(
+                        peer.strip(), all=mark_all
+                    )
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                except OSError:
+                    # The cursor moved in memory but could not be saved,
+                    # so the mark did not land: say so instead of the
+                    # generic 500, and leave the badge alone.
+                    log.warning(
+                        "Could not save the read state for mark-unread",
+                        exc_info=True,
+                    )
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": (
+                                    "could not save the read state; "
+                                    "the conversation was not marked unread"
+                                )
+                            }
+                        },
+                        head_only,
+                        503,
+                    )
+                    return
                 self._send_json({"ok": True, "unread": counts}, head_only)
                 return
             if path in (

@@ -1853,7 +1853,11 @@ class Inbox:
             )
 
     def mark_unread(
-        self, peer: str, *, all: bool = False
+        self,
+        peer: str,
+        *,
+        all: bool = False,
+        exclude_dm_from: Optional[Collection[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Move a conversation's read cursor back so mail shows unread again.
 
@@ -1866,7 +1870,8 @@ class Inbox:
         sent, and a delayed ``mark_read`` still cannot move a cursor
         backward on its own.  A peer with no stored messages is left
         alone and the return is ``None``; otherwise the unread counts
-        after the mark.  Raises ``OSError`` when the moved cursor
+        after the mark, with ``exclude_dm_from`` left out exactly as
+        :meth:`unread_counts` leaves them out.  Raises ``OSError`` when the moved cursor
         cannot be persisted, leaving the in-memory cursor untouched.
         """
         with self._transaction():
@@ -1907,7 +1912,7 @@ class Inbox:
                 except OSError:
                     self._read_cursors = snapshot
                     raise
-            return self._unread_counts_locked()
+            return self._unread_counts_locked(exclude_dm_from=exclude_dm_from)
 
 
     def find(
