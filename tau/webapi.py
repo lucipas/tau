@@ -200,6 +200,7 @@ from .config import (
 )
 from .groups import GroupStore, pinned_rosters, visible_reactions
 from .ignored_groups import (
+    IgnoredGroupsError,
     ignored_groups_lock,
     load_ignored_group_ids,
     load_ignored_groups,
@@ -6578,7 +6579,15 @@ class WebBridge:
         """
         if not isinstance(query, str) or not query.strip():
             raise ValueError("field 'group' is required")
-        group = self.node.groups.find(query.strip())
+        try:
+            group = self.node.groups.find(query.strip())
+        except ValueError:
+            # Leaving twice is not an error: a full id already on the
+            # left list reports as already left, as the CLI does.
+            full = query.strip().lower()
+            if len(full) == 32 and self.node.groups.is_left(full):
+                return {"id": full, "name": "", "already_left": True}
+            raise
         if group["local"]:
             raise ValueError(
                 "only members can leave a group they did not create —"
@@ -6859,7 +6868,11 @@ class WebBridge:
         updated = self.node.groups.set_topic(
             group["id"], "" if clear else topic, created_by=own_hash
         )
-        return {"group": self._describe_group(updated)}
+        # The id is unchanged, so the ignore flag must carry over too.
+        ignored = load_ignored_group_ids(
+            getattr(self.node.config, "ignored_groups_path", None)
+        )
+        return {"group": self._describe_group(updated, ignored)}
 
     def messages(
         self, limit: int = 200, *, strict_pins: bool = False
@@ -8274,6 +8287,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     ignored = self.bridge.ignore_group(target.strip())
+                except IgnoredGroupsError as exc:
+                    # Stored ignore data is damaged: the request was
+                    # valid, so this is a server failure, not a 400.
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 500)
+                    return
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
