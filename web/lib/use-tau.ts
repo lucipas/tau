@@ -1621,9 +1621,11 @@ export function useTau() {
       setGroups((previous) =>
         previous.filter((entry) => !leftIds.includes(entry.id)),
       );
+      // Every roster the leave removed needs a Rejoin entry, not just
+      // the requested id, until the authoritative list replaces these.
       setLeftGroups((previous) => [
         ...previous.filter((entry) => !leftIds.includes(entry.id)),
-        { id: result.id, left_at: Date.now() / 1000 },
+        ...leftIds.map((id) => ({ id, left_at: Date.now() / 1000 })),
       ]);
       try {
         await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
