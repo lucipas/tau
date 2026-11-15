@@ -908,6 +908,34 @@ export interface TanLikesResponse {
   total: number;
 }
 
+export interface TanReposter {
+  author: string;
+  name: string;
+  reposted_at: number;
+}
+
+export interface TanRepostersResponse {
+  target: string;
+  reposters: TanReposter[];
+  count: number;
+  total: number;
+}
+
+export interface TanQuoter {
+  author: string;
+  name: string;
+  hash: string;
+  text: string;
+  quoted_at: number;
+}
+
+export interface TanQuotesResponse {
+  target: string;
+  quoters: TanQuoter[];
+  count: number;
+  total: number;
+}
+
 export interface TanMutedAuthor {
   author: string;
   name: string;

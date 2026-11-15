@@ -1446,6 +1446,123 @@ def post_likers(
     return likers
 
 
+def post_reposters(
+    conn: sqlite3.Connection, target: str
+) -> List[Dict[str, Any]]:
+    """Return the reposters of one post, newest repost first.
+
+    Each entry is ``{"author": <hex>, "reposted_at": <created_at>}``.
+    Only linked reposts count and one author counts once: rows arrive
+    in chain order per reposter, so the last live write wins when a
+    chain somehow carries two reposts of the same target. A repost
+    its author deleted stops listing, the same way an unlike retires
+    a like. A target with no reposts (or no stored post at all) yields
+    an empty list.
+    """
+    clean = _require_hex(target, HASH_HEX_LENGTH, "target")
+    rows = conn.execute(
+        "SELECT hash, author, created_at FROM posts "
+        "WHERE kind = 'repost' AND linked = 1 AND target = ? "
+        "ORDER BY author, seq ASC",
+        (clean,),
+    ).fetchall()
+    latest: Dict[str, float] = {}
+    for row in rows:
+        if _is_deleted(
+            conn, {"hash": str(row["hash"]), "author": str(row["author"])}
+        ):
+            # A deleted repost never lists, but it does not retire an
+            # earlier live repost by the same author either.
+            continue
+        latest[str(row["author"])] = float(row["created_at"])
+    reposters = [
+        {"author": author, "reposted_at": reposted_at}
+        for author, reposted_at in latest.items()
+    ]
+    reposters.sort(key=lambda entry: entry["reposted_at"], reverse=True)
+    return reposters
+
+
+def post_quoters(
+    conn: sqlite3.Connection, target: str
+) -> List[Dict[str, Any]]:
+    """Return the standing quotes of one post, newest first.
+
+    Each entry carries the quote itself — ``{"author": <hex>,
+    "name": ..., "hash": ..., "text": ..., "quoted_at":
+    <created_at>}`` — so a reader can see what was said about the
+    post, not just who said it. Only linked quotes count, and a quote
+    its author deleted stops listing. Unlike likes and reposts, one
+    author may quote the same post more than once, and each standing
+    quote is listed: the comments differ, so collapsing them would
+    hide content. An expired quote stops listing, and an edited quote
+    carries its latest text. A target with no quotes (or no stored
+    post at all) yields an empty list.
+    """
+    clean = _require_hex(target, HASH_HEX_LENGTH, "target")
+    rows = conn.execute(
+        "SELECT hash, author, name, text, created_at, expires_at FROM posts "
+        "WHERE kind = 'quote' AND linked = 1 AND target = ? "
+        "ORDER BY created_at DESC, seq DESC",
+        (clean,),
+    ).fetchall()
+    quoters = []
+    for row in rows:
+        if is_expired({"expires_at": row["expires_at"]}):
+            continue
+        if _is_deleted(
+            conn, {"hash": str(row["hash"]), "author": str(row["author"])}
+        ):
+            continue
+        quoters.append(
+            {
+                "author": str(row["author"]),
+                "name": str(row["name"]),
+                "hash": str(row["hash"]),
+                "text": str(row["text"]),
+                "quoted_at": float(row["created_at"]),
+            }
+        )
+    return annotate_edits(conn, quoters)
+
+
+def without_hidden_quotes(
+    conn: sqlite3.Connection, quotes: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Drop quotes the viewer's timeline would hide, keeping the rest.
+
+    A quote matching a muted keyword, carrying a muted tag, or hidden
+    by the viewer is not disclosed as a quote of its target, the same
+    way the timeline hides it. Entries stay stored.
+    """
+    kept = without_muted_keywords(conn, quotes)
+    kept = without_muted_tags(conn, kept)
+    return without_hidden_posts(kept, hidden_post_set(conn))
+
+
+def ancestry_hidden(
+    conn: sqlite3.Connection, post: Dict[str, Any], excluded: Set[str]
+) -> bool:
+    """Whether a reply hangs beneath a deleted or blocked ancestor.
+
+    Walks the same ancestor chain as :func:`thread`, :func:`likers`,
+    :func:`reposters` and :func:`quoters`, without raising.
+    """
+    current = post
+    seen_ancestors = {current["hash"]}
+    while current.get("kind") == KIND_REPLY and current.get("target"):
+        parent = get_post(conn, str(current["target"]))
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            break
+        if parent["hash"] in seen_ancestors:
+            break
+        if _is_deleted(conn, parent) or parent["author"] in excluded:
+            return True
+        seen_ancestors.add(parent["hash"])
+        current = parent
+    return False
+
+
 def repost_counts(
     conn: sqlite3.Connection,
     targets: Sequence[str],
@@ -1585,6 +1702,169 @@ def likers(
         ]
     records.sort(key=lambda record: (record["name"].lower(), record["author"]))
     return {"post": _canonical_post(post), "likers": records}
+
+
+def reposters(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> Dict[str, Any]:
+    """Return the post *ref* names plus who currently reposted it.
+
+    Mirrors :func:`likers`: *ref* is resolved exactly as
+    :func:`resolve_post` does, an unlinked entry and a reply beneath
+    a deleted ancestor are refused the same way, and a post from a
+    blocked author — or a reply beneath one — is refused, so no
+    reposters are shown for a post the thread view would hide. The
+    result carries the resolved post under ``"post"`` and the current
+    reposters under ``"reposters"``: one ``{"author": ...,
+    "name": ..., "reposted_at": ...}`` record per author whose latest
+    repost of the post still stands, sorted by name then author hash.
+    The name is the one on the reposter's latest repost entry for the
+    post. Only linked reposts count, like :func:`repost_counts`.
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        # Like thread(): an unlinked entry is not shown, so its
+        # reposters are not either.
+        raise TanError(f"post has not linked yet: {ref!r}")
+    excluded = set(_clean_excluded(exclude_authors))
+    if exclude_all:
+        raise TanError("cannot show reposters: the block-list is unusable")
+    if post.get("author") in excluded:
+        raise TanError(f"post is from a blocked author: {ref!r}")
+    # Like thread(): a reply beneath a deleted ancestor stays hidden.
+    current_entry = post
+    seen_ancestors = {current_entry["hash"]}
+    while current_entry.get("kind") == KIND_REPLY and current_entry.get("target"):
+        parent = get_post(conn, str(current_entry["target"]))
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            break
+        if parent["hash"] in seen_ancestors:
+            break
+        if _is_deleted(conn, parent):
+            raise TanError(f"post has been deleted: {ref!r}")
+        if parent["author"] in excluded:
+            raise TanError(f"post is from a blocked author: {ref!r}")
+        seen_ancestors.add(parent["hash"])
+        current_entry = parent
+    target = str(post["hash"])
+    current = [
+        entry
+        for entry in post_reposters(conn, target)
+        if entry["author"] not in excluded
+    ]
+    records: List[Dict[str, Any]] = []
+    if current:
+        # One target-scoped query, no author list expanded into
+        # placeholders: the name lookup cannot hit SQLite's host
+        # parameter limit no matter how many reposters a post has.
+        rows = conn.execute(
+            "SELECT author, name FROM posts "
+            "WHERE kind = 'repost' AND linked = 1 AND target = ? "
+            "ORDER BY author, seq ASC",
+            (target,),
+        ).fetchall()
+        names: Dict[str, str] = {}
+        for row in rows:
+            # Rows arrive in chain order per reposter, so the last write
+            # wins — the name on the reposter's latest repost.
+            names[str(row["author"])] = str(row["name"])
+        records = [
+            {
+                "author": entry["author"],
+                "name": names.get(entry["author"], ""),
+                "reposted_at": entry["reposted_at"],
+            }
+            for entry in current
+        ]
+    records.sort(key=lambda record: (-record["reposted_at"], record["author"]))
+    return {"post": _canonical_post(post), "reposters": records}
+
+
+def quoters(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> Dict[str, Any]:
+    """Return the post *ref* names plus who currently quoted it.
+
+    Mirrors :func:`likers`: *ref* is resolved exactly as
+    :func:`resolve_post` does, an unlinked entry and a reply beneath
+    a deleted ancestor are refused the same way, and a post from a
+    blocked author — or a reply beneath one — is refused, so no
+    quoters are shown for a post the thread view would hide. The
+    result carries the resolved post under ``"post"`` and the standing
+    quotes under ``"quoters"``: one ``{"author": ..., "name": ...,
+    "hash": ..., "text": ..., "quoted_at": ...}`` record per standing
+    quote, newest first. The name and text come from the quote entry
+    itself. Only linked quotes count, like :func:`quote_counts`.
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        # Like thread(): an unlinked entry is not shown, so its
+        # quoters are not either.
+        raise TanError(f"post has not linked yet: {ref!r}")
+    excluded = set(_clean_excluded(exclude_authors))
+    if exclude_all:
+        raise TanError("cannot show quoters: the block-list is unusable")
+    if post.get("author") in excluded:
+        raise TanError(f"post is from a blocked author: {ref!r}")
+    # Like thread(): a reply beneath a deleted ancestor stays hidden.
+    current_entry = post
+    seen_ancestors = {current_entry["hash"]}
+    while current_entry.get("kind") == KIND_REPLY and current_entry.get("target"):
+        parent = get_post(conn, str(current_entry["target"]))
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            break
+        if parent["hash"] in seen_ancestors:
+            break
+        if _is_deleted(conn, parent):
+            raise TanError(f"post has been deleted: {ref!r}")
+        if parent["author"] in excluded:
+            raise TanError(f"post is from a blocked author: {ref!r}")
+        seen_ancestors.add(parent["hash"])
+        current_entry = parent
+    target = str(post["hash"])
+    current = without_hidden_quotes(
+        conn,
+        [
+            entry
+            for entry in post_quoters(conn, target)
+            if entry["author"] not in excluded
+        ],
+    )
+    records: List[Dict[str, Any]] = []
+    if current:
+        # One target-scoped query, no author list expanded into
+        # placeholders: the name lookup cannot hit SQLite's host
+        # parameter limit no matter how many quoters a post has.
+        rows = conn.execute(
+            "SELECT author, name FROM posts "
+            "WHERE kind = 'quote' AND linked = 1 AND target = ? "
+            "ORDER BY author, seq ASC",
+            (target,),
+        ).fetchall()
+        names: Dict[str, str] = {}
+        for row in rows:
+            # Rows arrive in chain order per quoter, so the last write
+            # wins — the name on the quoter's latest quote.
+            names[str(row["author"])] = str(row["name"])
+        records = [
+            {
+                "author": entry["author"],
+                "name": names.get(entry["author"], entry["name"]),
+                "hash": entry["hash"],
+                "text": entry["text"],
+                "quoted_at": entry["quoted_at"],
+            }
+            for entry in current
+        ]
+    return {"post": _canonical_post(post), "quoters": records}
 
 
 def annotate_reactions(

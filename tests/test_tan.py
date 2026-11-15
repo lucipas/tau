@@ -68,9 +68,13 @@ from tau.tangents.tan import (
     muted_keywords,
     muted_tags,
     post_likers,
+    post_quoters,
+    post_reposters,
     quote_counts,
+    quoters,
     reaction_states,
     repost_counts,
+    reposters,
     resolve_author,
     resolve_post,
     resolve_muted_name,
@@ -1827,6 +1831,240 @@ def test_likers_rejects_unlinked_entry(identities, tmp_path):
 
     with pytest.raises(TanError, match="has not linked yet"):
         likers(conn, digest)
+
+
+def test_post_reposters_lists_newest_first_and_drops_deleted(
+    identities, tmp_path
+):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "shareable", name="alice", now=1000)
+
+    # No reposts yet: an empty list, not an error.
+    assert post_reposters(conn, post["hash"]) == []
+
+    bob_repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    create_repost(conn, carol, post["hash"], name="carol", now=1002)
+    reposters = post_reposters(conn, post["hash"])
+    assert [entry["author"] for entry in reposters] == [
+        author_of(carol),
+        author_of(bob),
+    ]
+    assert [entry["reposted_at"] for entry in reposters] == [1002, 1001]
+
+    # A deleted repost stops listing, the same way an unlike retires
+    # a like.
+    create_delete(conn, bob, bob_repost["hash"], name="bob", now=1003)
+    assert [entry["author"] for entry in post_reposters(conn, post["hash"])] == [
+        author_of(carol)
+    ]
+
+    # Deleting first frees the author to repost again, at the newer
+    # timestamp.
+    create_repost(conn, bob, post["hash"], name="bob", now=1004)
+    assert [entry["author"] for entry in post_reposters(conn, post["hash"])] == [
+        author_of(bob),
+        author_of(carol),
+    ]
+
+    # A well-formed hash with no reposts is an empty list.
+    assert post_reposters(conn, "cd" * 32) == []
+
+    # A malformed target is rejected, not silently empty.
+    with pytest.raises(PostError):
+        post_reposters(conn, "not-a-hash")
+
+
+def test_post_quoters_lists_newest_first_and_drops_deleted(
+    identities, tmp_path
+):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "quotable", name="alice", now=1000)
+
+    # No quotes yet: an empty list, not an error.
+    assert post_quoters(conn, post["hash"]) == []
+
+    bob_quote = create_quote(
+        conn, bob, post["hash"], "seconded", name="bob", now=1001
+    )
+    create_quote(conn, carol, post["hash"], "hard agree", name="carol", now=1002)
+    quoters = post_quoters(conn, post["hash"])
+    assert [entry["author"] for entry in quoters] == [
+        author_of(carol),
+        author_of(bob),
+    ]
+    assert [entry["text"] for entry in quoters] == ["hard agree", "seconded"]
+    assert [entry["hash"] for entry in quoters] == [
+        quoters[0]["hash"],
+        bob_quote["hash"],
+    ]
+    assert [entry["quoted_at"] for entry in quoters] == [1002, 1001]
+
+    # A deleted quote stops listing.
+    create_delete(conn, bob, bob_quote["hash"], name="bob", now=1003)
+    assert [entry["author"] for entry in post_quoters(conn, post["hash"])] == [
+        author_of(carol)
+    ]
+
+    # One author may quote the same post more than once: each standing
+    # quote is listed, because the comments differ.
+    create_quote(conn, carol, post["hash"], "on reflection", name="carol", now=1004)
+    assert [entry["text"] for entry in post_quoters(conn, post["hash"])] == [
+        "on reflection",
+        "hard agree",
+    ]
+
+    # A well-formed hash with no quotes is an empty list.
+    assert post_quoters(conn, "cd" * 32) == []
+
+    # A malformed target is rejected, not silently empty.
+    with pytest.raises(PostError):
+        post_quoters(conn, "not-a-hash")
+
+
+def test_reposters_names_current_reposters(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "shareable", name="alice", now=1000)
+    bob_author = author_of(bob)
+    carol_author = author_of(carol)
+
+    assert reposters(conn, post["hash"])["reposters"] == []
+
+    bob_repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    create_repost(conn, carol, post["hash"], name="carol", now=1002)
+    result = reposters(conn, post["hash"][:16])
+    assert result["post"]["hash"] == post["hash"]
+    assert result["reposters"] == [
+        {"author": carol_author, "name": "carol", "reposted_at": 1002.0},
+        {"author": bob_author, "name": "bob", "reposted_at": 1001.0},
+    ]
+
+    # A delete retires the repost; a fresh repost restores it under the
+    # name on the latest repost entry.
+    create_delete(conn, bob, bob_repost["hash"], name="bob", now=1003)
+    assert reposters(conn, post["hash"])["reposters"] == [
+        {"author": carol_author, "name": "carol", "reposted_at": 1002.0}
+    ]
+    create_repost(conn, bob, post["hash"], name="robert", now=1004)
+    assert reposters(conn, post["hash"])["reposters"] == [
+        {"author": bob_author, "name": "robert", "reposted_at": 1004.0},
+        {"author": carol_author, "name": "carol", "reposted_at": 1002.0},
+    ]
+
+
+def test_quoters_lists_quotes_with_text(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "quotable", name="alice", now=1000)
+
+    assert quoters(conn, post["hash"])["quoters"] == []
+
+    bob_quote = create_quote(
+        conn, bob, post["hash"], "seconded", name="bob", now=1001
+    )
+    carol_quote = create_quote(
+        conn, carol, post["hash"], "hard agree", name="carol", now=1002
+    )
+    result = quoters(conn, post["hash"][:16])
+    assert result["post"]["hash"] == post["hash"]
+    assert result["quoters"] == [
+        {
+            "author": author_of(carol),
+            "name": "carol",
+            "hash": carol_quote["hash"],
+            "text": "hard agree",
+            "quoted_at": 1002.0,
+        },
+        {
+            "author": author_of(bob),
+            "name": "bob",
+            "hash": bob_quote["hash"],
+            "text": "seconded",
+            "quoted_at": 1001.0,
+        },
+    ]
+
+
+def test_reposters_and_quoters_reject_unknown_and_deleted(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "doomed", name="alice", now=1000)
+    create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    create_quote(conn, bob, post["hash"], "noted", name="bob", now=1001)
+
+    with pytest.raises(TanError, match="unknown post"):
+        reposters(conn, "cd" * 32)
+    with pytest.raises(TanError, match="unknown post"):
+        quoters(conn, "cd" * 32)
+
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+    with pytest.raises(TanError, match="has been deleted"):
+        reposters(conn, post["hash"])
+    with pytest.raises(TanError, match="has been deleted"):
+        quoters(conn, post["hash"])
+
+
+def test_reposters_works_on_replies(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "root", name="alice", now=1000)
+    reply = create_reply(conn, bob, post["hash"], "agreed", name="bob", now=1001)
+    create_repost(conn, alice, reply["hash"], name="alice", now=1002)
+    assert reposters(conn, reply["hash"][:12])["reposters"] == [
+        {"author": author_of(alice), "name": "alice", "reposted_at": 1002.0}
+    ]
+
+
+def test_tan_reposts_and_quotes_via_cli(identities, tmp_path, capsys):
+    alice, bob = identities
+    carol = RNS.Identity()
+    data_dir = tmp_path / "data"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = create_post(conn, alice, "shareable", name="alice", now=1000)
+        create_repost(conn, bob, post["hash"], name="bob", now=1001)
+        quote = create_quote(
+            conn, carol, post["hash"], "hard agree", name="carol", now=1002
+        )
+    finally:
+        conn.close()
+
+    assert (
+        main(["tan", "reposts", "--data-dir", str(data_dir), "--json", post["hash"]])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["reposters"] == [
+        {"author": author_of(bob), "name": "bob", "reposted_at": 1001.0}
+    ]
+
+    assert (
+        main(["tan", "quotes", "--data-dir", str(data_dir), "--json", post["hash"]])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["quoters"][0]["text"] == "hard agree"
+    assert payload["quoters"][0]["hash"] == quote["hash"]
+
+    # Text output names the post and the engagers.
+    assert main(["tan", "reposts", "--data-dir", str(data_dir), post["hash"]]) == 0
+    assert "bob" in capsys.readouterr().out
+    assert main(["tan", "quotes", "--data-dir", str(data_dir), post["hash"]]) == 0
+    out = capsys.readouterr().out
+    assert "carol" in out
+    assert "hard agree" in out
 
 
 def test_likers_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):

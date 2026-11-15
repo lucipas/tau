@@ -7474,6 +7474,211 @@ def test_tan_likers_via_api(tmp_path):
         bridge.stop()
 
 
+def _engagers_setup(tmp_path):
+    """A node with one post by bob, reposted and quoted by others.
+
+    Returns (node, post, authors, quotes) where authors maps a label
+    to the engager's author hex and quotes maps a label to the quote's
+    hash. Alice reposts at 1001 and quotes at 1001; dave reposts at
+    1003; carol quotes at 1002.
+    """
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import (
+        create_post,
+        create_quote,
+        create_repost,
+        init_db,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    carol = RNS.Identity()
+    dave = RNS.Identity()
+    # An engager the node knows as a peer resolves to the registry name,
+    # not the name on their stored posts.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=destination_hash(alice),
+            name="alice-on-record",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, bob, "shareable via api", name="bob", now=1000)
+        create_repost(conn, alice, post["hash"], name="alice", now=1001)
+        create_repost(conn, dave, post["hash"], name="dave", now=1003)
+        alice_quote = create_quote(
+            conn, alice, post["hash"], "seconded", name="alice", now=1001
+        )
+        carol_quote = create_quote(
+            conn, carol, post["hash"], "hard agree", name="carol", now=1002
+        )
+    finally:
+        conn.close()
+    authors = {
+        label: destination_hash(identity).hex()
+        for label, identity in (
+            ("alice", alice),
+            ("bob", bob),
+            ("carol", carol),
+            ("dave", dave),
+        )
+    }
+    quotes = {
+        "alice": alice_quote["hash"],
+        "carol": carol_quote["hash"],
+    }
+    return node, post, authors, quotes
+
+
+def test_tan_reposters_via_api(tmp_path):
+    node, post, authors, _ = _engagers_setup(tmp_path)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/reposts?target={post['hash']}")
+        assert status == 200
+        assert payload["target"] == post["hash"]
+        assert payload["count"] == 2
+        assert payload["total"] == 2
+        assert payload["reposters"] == [
+            {
+                "author": authors["dave"],
+                "name": "dave",
+                "reposted_at": 1003.0,
+            },
+            {
+                "author": authors["alice"],
+                "name": "alice-on-record",
+                "reposted_at": 1001.0,
+            },
+        ]
+
+        # An uppercase spelling of the same hash resolves, and the
+        # response carries the canonical lowercase hash.
+        status, _, payload = _json(
+            bridge, f"/api/tan/reposts?target={post['hash'].upper()}"
+        )
+        assert status == 200
+        assert payload["target"] == post["hash"]
+        assert payload["count"] == 2
+
+        # Unknown post hash -> 400, per the issue spec.
+        status, _, payload = _json(bridge, "/api/tan/reposts?target=" + "cd" * 32)
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target -> 400.
+        status, _, payload = _json(bridge, "/api/tan/reposts")
+        assert status == 400
+        assert "target is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_quoters_via_api(tmp_path):
+    node, post, authors, quotes = _engagers_setup(tmp_path)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/quotes?target={post['hash']}")
+        assert status == 200
+        assert payload["target"] == post["hash"]
+        assert payload["count"] == 2
+        assert payload["total"] == 2
+        assert payload["quoters"] == [
+            {
+                "author": authors["carol"],
+                "name": "carol",
+                "hash": quotes["carol"],
+                "text": "hard agree",
+                "quoted_at": 1002.0,
+            },
+            {
+                "author": authors["alice"],
+                "name": "alice-on-record",
+                "hash": quotes["alice"],
+                "text": "seconded",
+                "quoted_at": 1001.0,
+            },
+        ]
+
+        # An uppercase spelling of the same hash resolves, and the
+        # response carries the canonical lowercase hash.
+        status, _, payload = _json(
+            bridge, f"/api/tan/quotes?target={post['hash'].upper()}"
+        )
+        assert status == 200
+        assert payload["target"] == post["hash"]
+        assert payload["count"] == 2
+
+        # Unknown post hash -> 400, per the issue spec.
+        status, _, payload = _json(bridge, "/api/tan/quotes?target=" + "cd" * 32)
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target -> 400.
+        status, _, payload = _json(bridge, "/api/tan/quotes")
+        assert status == 400
+        assert "target is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_engagers_excludes_muted_and_blocked(tmp_path):
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.tangents.tan import init_db, mute
+
+    node, post, authors, _ = _engagers_setup(tmp_path)
+    conn = init_db(node.config.social_db_path)
+    try:
+        mute(conn, authors["dave"], name="dave")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The muted reposter is hidden, as in the timeline.
+        status, _, payload = _json(bridge, f"/api/tan/reposts?target={post['hash']}")
+        assert status == 200
+        assert [entry["author"] for entry in payload["reposters"]] == [
+            authors["alice"]
+        ]
+        assert payload["total"] == 1
+
+        # A blocked quoter is hidden too; the unblocked one stays.
+        node.blocklist = BlockList(blocked=frozenset({authors["alice"]}))
+        status, _, payload = _json(bridge, f"/api/tan/quotes?target={post['hash']}")
+        assert status == 200
+        assert [entry["author"] for entry in payload["quoters"]] == [
+            authors["carol"]
+        ]
+        assert payload["total"] == 1
+
+        # A fail-closed block-all list hides the post entirely,
+        # matching the timeline and the DM gate.
+        node.blocklist = BlockList(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, f"/api/tan/reposts?target={post['hash']}")
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+        status, _, payload = _json(bridge, f"/api/tan/quotes?target={post['hash']}")
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_rules_without_data_dir(tmp_path):
     # The node has no config, so there is no rules file to read. (The
     # fixture node always carries a config now, so build one here and

@@ -112,6 +112,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/thread    thread rooted at a post (``?ref=<hash-or-prefix>``)
     GET  /api/tan/following followed authors
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
+    GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
+    GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post
     POST /api/tan/schedule schedule a Tan post for later
     GET  /api/tan/scheduled queued Tan posts, soonest first
@@ -294,6 +296,10 @@ MAX_EVENT_LOG = 500
 # Most likers one /api/tan/likes response carries. The full count is
 # reported as ``total`` so the console can say when a list is truncated.
 MAX_LIKERS = 100
+# Most reposters one /api/tan/reposts response carries, same shape as likers.
+MAX_REPOSTERS = 100
+# Most quotes one /api/tan/quotes response carries, same shape as likers.
+MAX_QUOTERS = 100
 MAX_SUBSCRIBERS = 32
 # Backup archives in flight at once (being built or still streaming).  Each
 # one is a full copy of the data directory in temporary storage.
@@ -2554,6 +2560,224 @@ class WebBridge:
                 "target": clean,
                 "likers": likers,
                 "count": len(likers),
+                "total": total,
+            }
+        finally:
+            conn.close()
+
+    def tan_reposters(self, target: Any) -> Dict[str, Any]:
+        """List who reposted one Tan post, newest repost first.
+
+        Visibility matches the timeline: only a linked timeline-kind
+        post whose author is neither muted nor blocked discloses
+        anything, and when the owner's ruleset hides the repost kind
+        no reposters are disclosed at all. A post its author deleted is
+        reported as deleted, not unknown, matching the like endpoint.
+        Names resolve from the peer registry first, then from the name
+        on the reposter's latest stored post; an author with no known
+        name keeps an empty name and the console falls back to the
+        short hash. Only author identities are exposed, never repost
+        contents — a repost carries none. At most ``MAX_REPOSTERS``
+        entries are returned; ``total`` is the full count before that
+        cap.
+        """
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import (
+            _NOT_DELETED,
+            KIND_REPOST,
+            TIMELINE_KINDS_SQL,
+            TanError,
+            deleted_targets,
+            muted_author_set,
+            post_reposters,
+        )
+
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target is required")
+        # Hashes are stored lowercase; normalize before any lookup.
+        clean = target.strip().lower()
+        # Same author exclusions as tan_timeline, including fail-closed
+        # block-all, so a reposter list never shows hidden identities.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = set(blocklist.blocked) if blocklist is not None else set()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            if clean in deleted_targets(conn):
+                raise TanError(f"post has been deleted: {clean!r}")
+            # A target is visible only when the timeline would show it:
+            # linked, a timeline kind, not deleted by its author, and by
+            # an author who is neither muted nor blocked.
+            row = conn.execute(
+                "SELECT author FROM posts WHERE hash = ? AND linked = 1 "
+                f"AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}",
+                (clean,),
+            ).fetchone()
+            hidden = muted_author_set(conn) | blocked
+            if row is None or exclude_all or str(row["author"]) in hidden:
+                raise TanError(f"unknown post: {clean!r}")
+            app = self._tan_app()
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            if not ruleset.displays(KIND_REPOST):
+                # Reposts are hidden for this viewer, so the timeline
+                # shows no repost annotations; disclose no reposters
+                # either.
+                return {"target": clean, "reposters": [], "count": 0, "total": 0}
+            entries = [
+                entry
+                for entry in post_reposters(conn, clean)
+                if entry["author"] not in hidden
+            ]
+            total = len(entries)
+            shown = entries[:MAX_REPOSTERS]
+            names = self._tan_author_names(
+                conn, [entry["author"] for entry in shown]
+            )
+            reposters = []
+            for entry in shown:
+                author = entry["author"]
+                name = ""
+                peer = self.node.registry.get(author)
+                if peer is not None:
+                    name = peer.display_name
+                if not name:
+                    name = names.get(author, "")
+                reposters.append(
+                    {
+                        "author": author,
+                        "name": name,
+                        "reposted_at": entry["reposted_at"],
+                    }
+                )
+            return {
+                "target": clean,
+                "reposters": reposters,
+                "count": len(reposters),
+                "total": total,
+            }
+        finally:
+            conn.close()
+
+    def tan_quoters(self, target: Any) -> Dict[str, Any]:
+        """List the standing quotes of one Tan post, newest first.
+
+        Visibility matches the timeline: only a linked timeline-kind
+        post whose author is neither muted nor blocked discloses
+        anything, and when the owner's ruleset hides the quote kind
+        no quoters are disclosed at all. A post its author deleted is
+        reported as deleted, not unknown, matching the like endpoint.
+        Names resolve from the peer registry first, then from the name
+        on the quoter's latest stored post, then from the name on the
+        quote itself; an author with no known name keeps an empty name
+        and the console falls back to the short hash. Each quote's own
+        hash and comment text are exposed — a quote is a post in its
+        own right — so the console can show what was said about the
+        original. At most ``MAX_QUOTERS`` entries are returned;
+        ``total`` is the full count before that cap.
+        """
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import (
+            _NOT_DELETED,
+            KIND_QUOTE,
+            TIMELINE_KINDS_SQL,
+            TanError,
+            ancestry_hidden,
+            deleted_targets,
+            get_post,
+            muted_author_set,
+            post_quoters,
+            without_hidden_quotes,
+        )
+
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target is required")
+        # Hashes are stored lowercase; normalize before any lookup.
+        clean = target.strip().lower()
+        # Same author exclusions as tan_timeline, including fail-closed
+        # block-all, so a quoter list never shows hidden identities.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = set(blocklist.blocked) if blocklist is not None else set()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            if clean in deleted_targets(conn):
+                raise TanError(f"post has been deleted: {clean!r}")
+            # A target is visible only when the timeline would show it:
+            # linked, a timeline kind, not deleted by its author, and by
+            # an author who is neither muted nor blocked.
+            row = conn.execute(
+                "SELECT author FROM posts WHERE hash = ? AND linked = 1 "
+                f"AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}",
+                (clean,),
+            ).fetchone()
+            hidden = muted_author_set(conn) | blocked
+            if row is None or exclude_all or str(row["author"]) in hidden:
+                raise TanError(f"unknown post: {clean!r}")
+            app = self._tan_app()
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            if not ruleset.displays(KIND_QUOTE):
+                # Quotes are hidden for this viewer, so the timeline
+                # shows no quote annotations; disclose no quoters
+                # either.
+                return {"target": clean, "quoters": [], "count": 0, "total": 0}
+            post = get_post(conn, clean)
+            if post is None or ancestry_hidden(conn, post, blocked):
+                # A reply beneath a deleted or blocked ancestor is refused,
+                # as the thread view refuses it.
+                raise TanError(f"unknown post: {clean!r}")
+            entries = without_hidden_quotes(
+                conn,
+                [
+                    entry
+                    for entry in post_quoters(conn, clean)
+                    if entry["author"] not in hidden
+                ],
+            )
+            total = len(entries)
+            shown = entries[:MAX_QUOTERS]
+            names = self._tan_author_names(
+                conn, [entry["author"] for entry in shown]
+            )
+            quoters = []
+            for entry in shown:
+                author = entry["author"]
+                name = ""
+                peer = self.node.registry.get(author)
+                if peer is not None:
+                    name = peer.display_name
+                if not name:
+                    name = names.get(author, "")
+                if not name:
+                    name = entry.get("name", "")
+                quoters.append(
+                    {
+                        "author": author,
+                        "name": name,
+                        "hash": entry["hash"],
+                        "text": entry["text"],
+                        "quoted_at": entry["quoted_at"],
+                    }
+                )
+            return {
+                "target": clean,
+                "quoters": quoters,
+                "count": len(quoters),
                 "total": total,
             }
         finally:
@@ -8742,6 +8966,34 @@ class _WebHandler(BaseHTTPRequestHandler):
                 target = (query.get("target") or [None])[0]
                 try:
                     payload = self.bridge.tan_likers(target)
+                except (TanError, ValueError) as exc:
+                    # Only target validation is a client error; a
+                    # database or storage failure falls through to
+                    # _handle, which logs the traceback and answers 500.
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(payload, head_only)
+                return
+            if path == "/api/tan/reposts":
+                from .tangents.tan import TanError
+
+                target = (query.get("target") or [None])[0]
+                try:
+                    payload = self.bridge.tan_reposters(target)
+                except (TanError, ValueError) as exc:
+                    # Only target validation is a client error; a
+                    # database or storage failure falls through to
+                    # _handle, which logs the traceback and answers 500.
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(payload, head_only)
+                return
+            if path == "/api/tan/quotes":
+                from .tangents.tan import TanError
+
+                target = (query.get("target") or [None])[0]
+                try:
+                    payload = self.bridge.tan_quoters(target)
                 except (TanError, ValueError) as exc:
                     # Only target validation is a client error; a
                     # database or storage failure falls through to

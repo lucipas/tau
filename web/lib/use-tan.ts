@@ -25,6 +25,8 @@ import type {
   TanMutedTagsResponse,
   TanPost,
   TanPostResponse,
+  TanQuotesResponse,
+  TanRepostersResponse,
   TanRules,
   TanRulesResponse,
   TanRulesUpdateResponse,
@@ -1377,6 +1379,22 @@ export function useTan() {
     );
   }, []);
 
+  // Who reposted one post, newest repost first. Same on-demand shape
+  // as fetchLikers.
+  const fetchReposters = useCallback(async (target: string) => {
+    return apiGet<TanRepostersResponse>(
+      `/api/tan/reposts?target=${encodeURIComponent(target)}`,
+    );
+  }, []);
+
+  // The standing quotes of one post, newest first. Same on-demand
+  // shape as fetchLikers, plus each quote's own hash and comment.
+  const fetchQuoters = useCallback(async (target: string) => {
+    return apiGet<TanQuotesResponse>(
+      `/api/tan/quotes?target=${encodeURIComponent(target)}`,
+    );
+  }, []);
+
   const deletePost = useCallback(
     async (target: string) => {
       invalidateVerify();
@@ -1604,6 +1622,8 @@ export function useTan() {
     unlike,
     repost,
     fetchLikers,
+    fetchReposters,
+    fetchQuoters,
     deletePost,
     editPost,
     sync,

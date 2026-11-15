@@ -141,6 +141,7 @@ from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     DEFAULT_SUGGEST_LIMIT,
+    KIND_QUOTE,
     MAX_GOSSIP_TTL,
     MAX_TAN_POST_EXPIRY,
     TanApp,
@@ -173,11 +174,14 @@ from .tangents.tan import (
     mute_keyword,
     mute_tag,
     muted,
+    muted_author_set,
     muted_keywords,
     muted_tags,
     open_db_readonly,
     open_readonly_db,
     pin_post,
+    quoters,
+    reposters,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -2012,6 +2016,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_likes.set_defaults(func=cmd_tan_likes)
 
+    tan_reposts = tan_sub.add_parser(
+        "reposts",
+        parents=[common],
+        help="show who currently reposted a post",
+    )
+    tan_reposts.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post or reply hash (full hash or unique prefix)"
+    )
+    tan_reposts.set_defaults(func=cmd_tan_reposts)
+
+    tan_quotes = tan_sub.add_parser(
+        "quotes",
+        parents=[common],
+        help="show the standing quotes of a post",
+    )
+    tan_quotes.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post or reply hash (full hash or unique prefix)"
+    )
+    tan_quotes.set_defaults(func=cmd_tan_quotes)
+
     tan_follow = tan_sub.add_parser(
         "follow", parents=[common], help="follow a peer or author"
     )
@@ -3091,6 +3115,63 @@ def _print_tan_likes(result: Dict[str, Any], *, json_output: bool) -> None:
         print(f"  {liker_name} ({short_hash(str(liker.get('author', '')))})")
 
 
+def _print_tan_reposters(result: Dict[str, Any], *, json_output: bool) -> None:
+    """Print a post plus its current reposters, as returned by tan.reposters."""
+    post = result["post"]
+    reposters = result["reposters"]
+    if json_output:
+        _emit({"post": post, "reposters": reposters, "count": len(reposters)}, True)
+        return
+    name = post.get("name") or "anonymous"
+    author = short_hash(str(post.get("author", "")))
+    when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+        "%Y-%m-%d %H:%M"
+    )
+    print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+    for line in str(post.get("text", "")).splitlines() or [""]:
+        print(f"  {line}")
+    if not reposters:
+        print("No reposts yet.")
+        return
+    print(f"↻ {len(reposters)} repost(s):")
+    for reposter in reposters:
+        reposter_name = reposter.get("name") or "anonymous"
+        print(f"  {reposter_name} ({short_hash(str(reposter.get('author', '')))})")
+
+
+def _print_tan_quoters(result: Dict[str, Any], *, json_output: bool) -> None:
+    """Print a post plus its standing quotes, as returned by tan.quoters."""
+    post = result["post"]
+    quoters = result["quoters"]
+    if json_output:
+        _emit({"post": post, "quoters": quoters, "count": len(quoters)}, True)
+        return
+    name = post.get("name") or "anonymous"
+    author = short_hash(str(post.get("author", "")))
+    when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+        "%Y-%m-%d %H:%M"
+    )
+    print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+    for line in str(post.get("text", "")).splitlines() or [""]:
+        print(f"  {line}")
+    if not quoters:
+        print("No quotes yet.")
+        return
+    print(f"❝ {len(quoters)} quote(s):")
+    for quoter in quoters:
+        quoter_name = quoter.get("name") or "anonymous"
+        quoted_when = datetime.fromtimestamp(
+            float(quoter.get("quoted_at", 0))
+        ).strftime("%Y-%m-%d %H:%M")
+        print(
+            f"  [{quoted_when}] {quoter_name} "
+            f"({short_hash(str(quoter.get('author', '')))}) "
+            f"{short_hash(str(quoter.get('hash', '')))}"
+        )
+        for line in str(quoter.get("text", "")).splitlines() or [""]:
+            print(f"    {line}")
+
+
 def _tan_identity(config: TauConfig) -> Any:
     identity = load_identity(config.identity_path)
     if identity is None:
@@ -3870,6 +3951,65 @@ def cmd_tan_likes(args: argparse.Namespace) -> int:
         # hide is not shown here either.
         raise TanError(f"post is hidden by your Tan display rules: {args.ref!r}")
     _print_tan_likes(result, json_output=json_output)
+    return _EXIT_OK
+
+
+def cmd_tan_reposts(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        blocked = load_blocked_set(config.blocklist_path)
+        # Like the web route: muted authors are hidden as well as blocked.
+        hidden_authors = set(blocked or ()) | muted_author_set(conn)
+        result = reposters(
+            conn,
+            args.ref,
+            exclude_authors=hidden_authors,
+            exclude_all=blocked is None,
+        )
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    if not apply_display_rules([result["post"]], display_ruleset):
+        # Like thread() and search(): a post the owner's display rules
+        # hide is not shown here either.
+        raise TanError(f"post is hidden by your Tan display rules: {args.ref!r}")
+    _print_tan_reposters(result, json_output=json_output)
+    return _EXIT_OK
+
+
+def cmd_tan_quotes(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        blocked = load_blocked_set(config.blocklist_path)
+        # Like the web route: muted authors are hidden as well as blocked.
+        hidden_authors = set(blocked or ()) | muted_author_set(conn)
+        result = quoters(
+            conn,
+            args.ref,
+            exclude_authors=hidden_authors,
+            exclude_all=blocked is None,
+        )
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    if not apply_display_rules([result["post"]], display_ruleset):
+        # Like thread() and search(): a post the owner's display rules
+        # hide is not shown here either.
+        raise TanError(f"post is hidden by your Tan display rules: {args.ref!r}")
+    if not display_ruleset.displays(KIND_QUOTE):
+        # Quotes the owner hides disclose no quoters, as the web route does.
+        result["quoters"] = []
+    _print_tan_quoters(result, json_output=json_output)
     return _EXIT_OK
 
 
