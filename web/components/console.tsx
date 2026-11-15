@@ -10,12 +10,24 @@ import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
 import { DmRequestsSection } from "./dm-requests-section";
 import { DoctorSection } from "./doctor-section";
-import { Header } from "./header";
+import { CONSOLE_TABS, Header, type ConsoleTab } from "./header";
 import { MessageFeed } from "./message-feed";
 import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
 import { SettingsSection } from "./settings-section";
+import { SocialConsole } from "./social-console";
+import { SectionLabel } from "./ui";
+
+// The tab named by the URL hash, so a refresh or a shared link lands
+// on the same section; anything else falls back to chat.
+function tabFromHash(): ConsoleTab {
+  if (typeof window === "undefined") return "chat";
+  const hash = window.location.hash.replace(/^#/, "");
+  return CONSOLE_TABS.some((entry) => entry.id === hash)
+    ? (hash as ConsoleTab)
+    : "chat";
+}
 
 // Defaults are stored under canonical destination hashes, but a custom
 // target can be a name, a hash with stray whitespace, or mixed case.
@@ -49,6 +61,64 @@ export function Console() {
   const [target, setTarget] = useState("");
   const [mode, setMode] = useState<"peer" | "custom" | "group">("peer");
   const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
+  // Starts on chat so the prerendered HTML matches the first browser
+  // render; the hash is read after mount below.
+  const [tab, setTabState] = useState<ConsoleTab>("chat");
+  // The outbox drawer starts open when mail is already queued, so the
+  // pending work is visible without a click; it starts closed when the
+  // queue is empty.
+  const [outboxOpen, setOutboxOpen] = useState(
+    () => tau.outbox.length > 0 || tau.heldMail.length > 0,
+  );
+
+  function setTab(next: ConsoleTab) {
+    setTabState(next);
+    // replaceState keeps the tab in the URL without adding history
+    // entries or firing hashchange.
+    window.history.replaceState(null, "", `#${next}`);
+  }
+
+  // A hash edited by hand, or a back/forward step, switches tabs too.
+  // The initial hash is read here, not in the state initializer, so
+  // the server prerender and the first browser render agree.
+  useEffect(() => {
+    setTabState(tabFromHash());
+    const onHashChange = () => setTabState(tabFromHash());
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  // Alt+1 through Alt+4 jump between tabs, like the header pills.
+  // Ignored while typing in a field, so Alt+digit never hijacks
+  // text entry.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (!event.altKey) return;
+      // event.code is the physical key: on layouts where Alt+2
+      // produces a symbol, event.key is not a digit. Fall back to
+      // event.key where code is unavailable.
+      const key = (event.code ?? "").startsWith("Digit")
+        ? event.code.slice("Digit".length)
+        : event.key;
+      const index = ["1", "2", "3", "4"].indexOf(key);
+      if (index === -1) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target !== null &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      setTab(CONSOLE_TABS[index].id);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   const customPicked = useRef(false);
   // The selection as it is now, for async completions that must not act
   // on a conversation the user has since switched to.
@@ -207,8 +277,11 @@ export function Console() {
   // The open conversation reads as read: the auto-selected one on load,
   // and one that gets new mail while it stays open. A failed call leaves
   // the badge in place until the count next changes.
+  // Mail arriving while another tab is shown stays unread until the chat
+  // feed is visible again: the panel stays mounted, so without this
+  // guard the effect would mark it read behind the user's back.
   useEffect(() => {
-    if (!target) return;
+    if (!target || tab !== "chat") return;
     if (openUnread === 0) {
       // Read elsewhere (another tab, the CLI): the reminder is gone,
       // so the hold goes with it — new mail must auto-read again.
@@ -223,13 +296,16 @@ export function Console() {
     void (
       mode === "group" ? markRead(undefined, target) : markRead(target)
     ).catch(() => undefined);
-  }, [target, mode, openUnread, markRead]);
+  }, [target, mode, openUnread, markRead, tab]);
 
   function selectPeer(destination: string) {
     customPicked.current = false;
     setMode("peer");
     setTarget(destination);
     setReplyTo(null);
+    // A sidebar peer opens the chat tab: the composer it fills lives
+    // there, and the click means "message this peer".
+    setTab("chat");
     // Reopening clears any mark-unread hold: opening the conversation
     // marks it read, as before.
     manualUnread.current.delete(destination);
@@ -250,14 +326,14 @@ export function Console() {
   }
 
   return (
-    <div className="relative min-h-dvh">
+    <div className="relative flex h-dvh flex-col overflow-hidden">
       <div className="mesh-grid pointer-events-none fixed inset-0" aria-hidden="true" />
       <div
         className="pointer-events-none fixed inset-x-0 top-0 h-96 bg-[radial-gradient(60%_100%_at_50%_0%,rgba(45,212,191,0.13),transparent_72%)]"
         aria-hidden="true"
       />
 
-      <div className="relative">
+      <div className="relative flex min-h-0 flex-1 flex-col">
         <Header
           node={tau.node}
           connection={tau.connection}
@@ -268,11 +344,8 @@ export function Console() {
           onRename={async (name) => {
             await tau.renameNode(name);
           }}
-          backingUp={tau.backingUp}
-          backupError={tau.backupError}
-          onBackup={() => {
-            void tau.backup();
-          }}
+          tab={tab}
+          onTabChange={setTab}
         />
 
         {tau.connection === "reconnecting" ? (
@@ -282,8 +355,8 @@ export function Console() {
           </div>
         ) : null}
 
-        <main className="mx-auto grid w-full max-w-7xl gap-4 px-4 py-4 lg:grid-cols-[340px_minmax(0,1fr)] lg:gap-5 lg:px-8 lg:py-6">
-          <div className="flex min-w-0 flex-col gap-4">
+        <main className="mx-auto grid w-full max-w-7xl min-h-0 flex-1 gap-4 overflow-y-auto px-4 py-4 lg:grid-cols-[340px_minmax(0,1fr)] lg:gap-5 lg:overflow-visible lg:px-8 lg:py-6">
+          <div className="thin-scroll flex min-w-0 flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
           <PeerSidebar
             node={tau.node}
             peers={tau.peers}
@@ -431,15 +504,17 @@ export function Console() {
               tau.setGroupTopic(group, topic)
             }
           />
-            <AllowlistSection
-              allowlist={tau.allowlist}
-              onAdd={(value) => tau.addAllowlistPeer(value)}
-              onRemove={(value) => tau.removeAllowlistPeer(value)}
-              onToggle={(enabled) => tau.setAllowlistEnabled(enabled)}
-            />
           </div>
 
-          <div className="flex min-w-0 flex-col">
+          <div className="flex min-h-0 min-w-0 flex-col">
+            {/* Stays mounted while another tab is shown, so the
+                composer's draft, attachments, and send error survive
+                a tab switch. */}
+            <div
+              className={
+                tab === "chat" ? "flex min-h-0 flex-1 flex-col" : "hidden"
+              }
+            >
             <MessageFeed
               messages={
                 tau.searchQuery !== null
@@ -508,35 +583,7 @@ export function Console() {
                 }
               }}
             />
-            <div className="mt-4">
-              <DmRequestsSection
-                requests={tau.dmRequests}
-                onAccept={tau.acceptDmRequest}
-                onDecline={tau.declineDmRequest}
-              />
-            </div>
-            {/* Stays mounted when the queue empties so a retry's result
-                line survives the last entry leaving; it renders nothing
-                itself when there is nothing to show. */}
-            <div className="mt-4">
-              <OutboxSection
-                entries={tau.outbox}
-                heldForOthers={tau.heldForOthers}
-                held={tau.heldMail}
-                onCancel={tau.cancelOutbox}
-                onRetry={tau.retryOutbox}
-                onDropHeld={tau.dropHeldMail}
-              />
-            </div>
-            <div className="mt-4">
-              <BundleSection
-                onExport={tau.exportBundle}
-                onImport={tau.importBundle}
-              />
-            </div>
-            <div className="mt-4">
-              <DoctorSection onRun={tau.runDoctor} />
-            </div>
+            <div className="mt-4 shrink-0">
             <Composer
               peers={activePeersOf(tau.peers, tau.archivedConversations)}
               groups={tau.groups}
@@ -578,24 +625,132 @@ export function Console() {
                     }
               }
             />
-            <div className="mt-4">
-              <SettingsSection
-                settings={tau.settings}
-                loadError={tau.settingsError}
-                onToggle={tau.updateSetting}
+            </div>
+            {/* Below the composer so an expanded queue never pushes it
+                away from the feed. Capped in height so a long list
+                scrolls instead of clipping the composer. */}
+            <div className="thin-scroll mt-4 max-h-[30dvh] shrink-0 overflow-y-auto">
+              <DmRequestsSection
+                requests={tau.dmRequests}
+                onAccept={tau.acceptDmRequest}
+                onDecline={tau.declineDmRequest}
               />
             </div>
+            <div className="mt-4 shrink-0 rounded-2xl border border-line/80 bg-panel/40">
+              <button
+                type="button"
+                onClick={() => setOutboxOpen((open) => !open)}
+                aria-expanded={outboxOpen}
+                className="flex w-full items-center justify-between px-4 py-3 text-left"
+              >
+                <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-mist">
+                  outbox
+                </span>
+                <span className="font-mono text-[10px] text-mist">
+                  {tau.outbox.length} queued
+                  {tau.heldMail.length > 0
+                    ? ` · ${tau.heldMail.length} held`
+                    : ""}
+                  {outboxOpen ? " ▲" : " ▼"}
+                </span>
+              </button>
+              {/* Hidden rather than unmounted when collapsed, so a
+                  retry's result and any pending confirmation survive
+                  a collapse. OutboxSection renders nothing itself
+                  when there is nothing to show. The expanded list is
+                  capped so a long queue scrolls instead of pushing
+                  the composer out of reach. */}
+              <div
+                className={
+                  outboxOpen
+                    ? "thin-scroll max-h-[30dvh] overflow-y-auto border-t border-line/60 p-4"
+                    : "hidden"
+                }
+              >
+                <OutboxSection
+                  entries={tau.outbox}
+                  heldForOthers={tau.heldForOthers}
+                  held={tau.heldMail}
+                  onCancel={tau.cancelOutbox}
+                  onRetry={tau.retryOutbox}
+                  onDropHeld={tau.dropHeldMail}
+                />
+              </div>
+            </div>
+            </div>
+            {/* Stays mounted so the social composer's draft and reply or
+                quote target survive a tab switch. */}
+            <div
+              className={
+                tab === "social"
+                  ? "thin-scroll min-h-0 flex-1 overflow-y-auto"
+                  : "hidden"
+              }
+            >
+              <SocialConsole embedded />
+            </div>
+            {tab === "tools" ? (
+              <div className="thin-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto lg:pr-1">
+                <BundleSection
+                  onExport={tau.exportBundle}
+                  onImport={tau.importBundle}
+                />
+                <DoctorSection onRun={tau.runDoctor} />
+                <MessagesBackupSection
+                  exporting={tau.exporting}
+                  importing={tau.importing}
+                  onExport={tau.exportMessages}
+                  onImport={tau.importMessages}
+                />
+                <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+                  <SectionLabel>node backup</SectionLabel>
+                  <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                    Download the node data directory: identity, stores, and
+                    settings. This is the whole-node backup, not the
+                    message-only export above.
+                  </p>
+                  <div className="mt-3 flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void tau.backup();
+                      }}
+                      disabled={!tau.node || tau.backingUp}
+                      className="rounded-lg border border-line bg-void/70 px-2.5 py-2 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                    >
+                      {tau.backingUp ? "backing up…" : "download backup"}
+                    </button>
+                    {tau.backupError ? (
+                      <span
+                        role="alert"
+                        className="font-mono text-[11px] text-rose-300"
+                      >
+                        {tau.backupError}
+                      </span>
+                    ) : null}
+                  </div>
+                </section>
+              </div>
+            ) : null}
+            {tab === "settings" ? (
+              <div className="thin-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto lg:pr-1">
+                <AllowlistSection
+                  allowlist={tau.allowlist}
+                  onAdd={(value) => tau.addAllowlistPeer(value)}
+                  onRemove={(value) => tau.removeAllowlistPeer(value)}
+                  onToggle={(enabled) => tau.setAllowlistEnabled(enabled)}
+                />
+                <SettingsSection
+                  settings={tau.settings}
+                  loadError={tau.settingsError}
+                  onToggle={tau.updateSetting}
+                />
+              </div>
+            ) : null}
           </div>
-
-          <MessagesBackupSection
-            exporting={tau.exporting}
-            importing={tau.importing}
-            onExport={tau.exportMessages}
-            onImport={tau.importMessages}
-          />
         </main>
 
-        <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
+        <footer className="mx-auto flex w-full max-w-7xl shrink-0 flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
           <span>
             tau {tau.node?.version ?? "—"} · Reticulum{" "}
             {tau.node?.rns_version ?? "—"}

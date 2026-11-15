@@ -1868,3 +1868,93 @@ describe("SocialConsole tags sidebar", () => {
     expect(refresh).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("SocialConsole embedded", () => {
+  function makeTan(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
+      mutedAuthors: [],
+      mutedKeywords: [],
+      all: false,
+      setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      repost: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("drops its own page header and footer inside the console tab", () => {
+    mockTan.current = makeTan();
+    render(<SocialConsole embedded />);
+
+    // The console tab already has the tau header; the embedded feed
+    // must not render a second one with its own chat/social nav.
+    expect(screen.queryByText("social feed")).toBeNull();
+    expect(screen.queryByText("tan · the social layer of tau")).toBeNull();
+    // The feed itself still renders: the following panel's follow
+    // form is the giveaway (the "following" label also appears on
+    // the timeline filter toggle, so it is not unique).
+    expect(
+      screen.getByPlaceholderText("name or author hash"),
+    ).toBeTruthy();
+  });
+
+  it("keeps its own header on the standalone /social route", () => {
+    mockTan.current = makeTan();
+    render(<SocialConsole />);
+
+    expect(screen.getByText("social feed")).toBeTruthy();
+  });
+});

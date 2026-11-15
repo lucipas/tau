@@ -21,7 +21,9 @@ import { TAN_POLL_INTERVAL_MS, useTan } from "@/lib/use-tan";
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
 import { RulesSection } from "./rules-section";
 
-export function SocialConsole() {
+export function SocialConsole({
+  embedded = false,
+}: { embedded?: boolean } = {}) {
   const tan = useTan();
   const [text, setText] = useState("");
   const [target, setTarget] = useState("");
@@ -544,14 +546,19 @@ export function SocialConsole() {
   const visiblePosts = showingSearch ? tan.searchResults : tan.posts;
 
   return (
-    <div className="relative min-h-dvh">
-      <div className="mesh-grid pointer-events-none fixed inset-0" aria-hidden="true" />
-      <div
-        className="pointer-events-none fixed inset-x-0 top-0 h-96 bg-[radial-gradient(60%_100%_at_50%_0%,rgba(45,212,191,0.13),transparent_72%)]"
-        aria-hidden="true"
-      />
+    <div className={embedded ? undefined : "relative min-h-dvh"}>
+      {embedded ? null : (
+        <>
+          <div className="mesh-grid pointer-events-none fixed inset-0" aria-hidden="true" />
+          <div
+            className="pointer-events-none fixed inset-x-0 top-0 h-96 bg-[radial-gradient(60%_100%_at_50%_0%,rgba(45,212,191,0.13),transparent_72%)]"
+            aria-hidden="true"
+          />
+        </>
+      )}
 
-      <div className="relative">
+      <div className={embedded ? undefined : "relative"}>
+        {embedded ? null : (
         <header className="sticky top-0 z-30 border-b border-line/60 bg-void/80 backdrop-blur-xl">
           <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-5 gap-y-3 px-4 py-3 lg:px-8">
             <div className="flex items-center gap-3">
@@ -594,8 +601,9 @@ export function SocialConsole() {
             </span>
           </div>
         </header>
+        )}
 
-        <main className="mx-auto grid w-full max-w-6xl gap-4 px-4 py-4 lg:grid-cols-[290px_minmax(0,1fr)] lg:gap-5 lg:px-8 lg:py-6">
+        <main className={embedded ? "grid w-full gap-4 lg:grid-cols-[290px_minmax(0,1fr)] lg:gap-5" : "mx-auto grid w-full max-w-6xl gap-4 px-4 py-4 lg:grid-cols-[290px_minmax(0,1fr)] lg:gap-5 lg:px-8 lg:py-6"}>
           <aside className="space-y-3">
             <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
               <div className="flex items-center justify-between">
@@ -1608,10 +1616,12 @@ export function SocialConsole() {
           </div>
         </main>
 
-        <footer className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
-          <span>tan · the social layer of tau</span>
-          <span>signed posts · no servers · no accounts</span>
-        </footer>
+        {embedded ? null : (
+          <footer className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
+            <span>tan · the social layer of tau</span>
+            <span>signed posts · no servers · no accounts</span>
+          </footer>
+        )}
       </div>
     </div>
   );

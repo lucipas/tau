@@ -23,7 +23,7 @@ function renderHeader(
   onRename: (name: string) => Promise<void> = () => Promise.resolve(),
   overrides: Record<string, unknown> = {},
 ) {
-  const onBackup = vi.fn();
+  const onTabChange = vi.fn();
   render(
     <Header
       node={makeNode()}
@@ -31,13 +31,12 @@ function renderHeader(
       announcing={false}
       onAnnounce={() => {}}
       onRename={onRename}
-      backingUp={false}
-      backupError={null}
-      onBackup={onBackup}
+      tab="chat"
+      onTabChange={onTabChange}
       {...overrides}
     />,
   );
-  return { onBackup };
+  return { onTabChange };
 }
 
 describe("Header rename", () => {
@@ -118,41 +117,34 @@ describe("Header rename", () => {
   });
 });
 
-describe("Header backup button", () => {
-  it("calls onBackup when the back up button is clicked", () => {
-    const { onBackup } = renderHeader();
-
-    fireEvent.click(screen.getByRole("button", { name: "back up" }));
-
-    expect(onBackup).toHaveBeenCalledTimes(1);
-  });
-
-  it("disables the button and shows progress while a backup is running", () => {
-    renderHeader(undefined, { backingUp: true });
-
-    const button = screen.getByRole("button", { name: "backing up…" });
-    expect((button as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  it("disables the button without a node", () => {
-    renderHeader(undefined, { node: null });
+describe("Header tabs", () => {
+  it("marks the active tab selected and calls onTabChange for the rest", () => {
+    const { onTabChange } = renderHeader();
 
     expect(
-      (screen.getByRole("button", { name: "back up" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+      screen.getByRole("tab", { name: "chat" }).getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(
+      screen.getByRole("tab", { name: "tools" }).getAttribute("aria-selected"),
+    ).toBe("false");
+
+    fireEvent.click(screen.getByRole("tab", { name: "tools" }));
+    expect(onTabChange).toHaveBeenCalledWith("tools");
+    fireEvent.click(screen.getByRole("tab", { name: "settings" }));
+    expect(onTabChange).toHaveBeenCalledWith("settings");
   });
 
-  it("shows the backup error", () => {
-    renderHeader(undefined, { backupError: "no data directory" });
+  it("offers all four tabs", () => {
+    renderHeader();
 
-    const alert = screen.getByRole("alert");
-    expect(alert.textContent).toContain("no data directory");
+    for (const label of ["chat", "social", "tools", "settings"]) {
+      expect(screen.getByRole("tab", { name: label })).toBeTruthy();
+    }
   });
 
-  it("shows no error when the last backup succeeded", () => {
-    renderHeader(undefined, { backupError: null });
+  it("has no back up button: backup lives in the tools tab", () => {
+    renderHeader();
 
-    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "back up" })).toBeNull();
   });
 });
