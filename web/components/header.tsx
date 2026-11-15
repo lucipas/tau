@@ -114,7 +114,7 @@ export function Header({
         <nav
           role="tablist"
           aria-label="console sections"
-          className="flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-line/70 bg-panel/60 p-1 text-xs"
+          className="hidden items-center gap-1 rounded-xl border border-line/70 bg-panel/60 p-1 text-xs sm:flex"
         >
           {CONSOLE_TABS.map((entry) => (
             <button
