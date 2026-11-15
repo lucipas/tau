@@ -151,6 +151,12 @@ export function Console() {
     if (replyTo && value !== (replyTo.group ?? replyTo.peer ?? "")) {
       setReplyTo(null);
     }
+    // Leaving a conversation drops its hold: a restored or
+    // mark-unread hold only protects mail while the conversation
+    // stays open, so returning to it follows the normal read path
+    // instead of skipping markRead. A retarget to the same
+    // conversation keeps the hold.
+    if (value !== target) manualUnread.current.delete(target);
     setTarget(value);
   }
 
@@ -457,11 +463,15 @@ export function Console() {
               onReply={(message) => {
                 setReplyTo(message);
                 // A group message belongs to its group conversation, even
-                // though it also names a member peer.
+                // though it also names a member peer. Jumping to the
+                // conversation opens it, so clear any hold on it first:
+                // the auto-read below marks it read, like a reopen.
                 if (message.group) {
+                  manualUnread.current.delete(message.group);
                   setTarget(message.group);
                   setMode("group");
                 } else if (message.peer) {
+                  manualUnread.current.delete(message.peer);
                   setTarget(message.peer);
                   setMode("peer");
                 }
