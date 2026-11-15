@@ -9796,12 +9796,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                from .tangents.tan import TanError
+
                 try:
                     if path.endswith("unfollow-tag"):
                         result = self.bridge.tan_unfollow_tag(tag)
                     else:
                         result = self.bridge.tan_follow_tag(tag)
-                except Exception as exc:
+                except TanError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "follow": result}, head_only)
