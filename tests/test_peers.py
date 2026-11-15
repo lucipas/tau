@@ -718,7 +718,9 @@ def test_note_never_leaves_the_local_registry(tmp_path):
     registry.set_note(peer.hexhash, "private context")
     assert "note" not in peer.public_dict()
     assert "note" not in peer.exchange_dict()
-    assert peer.local_dict()["note"] == "private context"
+    # The console payload excludes it too: the console can be exposed
+    # remotely without owner authentication, and it has no note UI yet.
+    assert "note" not in peer.local_dict()
     assert peer.to_dict()["note"] == "private context"
 
 

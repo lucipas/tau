@@ -309,7 +309,11 @@ class Peer:
         """
         payload = self.public_dict(now)
         payload["alias"] = self.alias
-        payload["note"] = self.note
+        # No "note": the console payload is served to the web console,
+        # which can be exposed remotely (--http-allow-remote) without
+        # owner authentication, so private notes stay out of it until a
+        # console UI for notes exists.  The CLI reads notes from
+        # to_dict() instead.
         payload["verified"] = self.is_verified
         payload["verified_at"] = self.verified_at
         payload["key_change_at"] = self.key_change_at
