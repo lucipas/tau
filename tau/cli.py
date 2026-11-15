@@ -8657,8 +8657,21 @@ def cmd_group_ignored(args: argparse.Namespace) -> int:
 
 
 def _group_ids_spanning_renames(group: Dict[str, Any]) -> List[str]:
-    """This group's id plus its rename predecessors, for history lookups."""
-    return [group["id"], *(group.get("renamed_from") or [])]
+    """This group's id plus its rename predecessors, for history lookups.
+
+    Deduplicated in order: a malformed lineage can list the current id
+    among its predecessors (the store normalizer dedupes within the
+    lineage but keeps the current id when it appears there), and a
+    duplicated id would make the pin resolver count one message twice
+    and refuse it as ambiguous.
+    """
+    seen: Set[str] = set()
+    ids: List[str] = []
+    for group_id in [group["id"], *(group.get("renamed_from") or [])]:
+        if group_id not in seen:
+            seen.add(group_id)
+            ids.append(group_id)
+    return ids
 
 
 def cmd_group_pin(args: argparse.Namespace) -> int:

@@ -4990,6 +4990,40 @@ def test_resolve_group_pin_target_scopes_to_the_group(tmp_path):
         cli._resolve_group_pin_target(inbox, group_ids, "aaaa")
 
 
+def test_group_ids_spanning_renames_dedupes_own_id():
+    group = {"id": "aa" * 16, "renamed_from": ["aa" * 16, "bb" * 16, "bb" * 16]}
+    assert cli._group_ids_spanning_renames(group) == ["aa" * 16, "bb" * 16]
+    assert cli._group_ids_spanning_renames({"id": "aa" * 16}) == ["aa" * 16]
+
+
+def test_group_pin_survives_malformed_lineage_with_own_id(tmp_path, capsys):
+    """A lineage listing the group's own id must not block pins.
+
+    The store normalizer dedupes within the lineage but keeps the
+    current id when it appears there (a creator-sent lineage can carry
+    it); the resolver must still see each message once.
+    """
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    groups_path = data_dir / "groups.json"
+    raw = json.loads(groups_path.read_text(encoding="utf-8"))
+    for record in raw["groups"]:
+        if record["id"] == group["id"]:
+            record["renamed_from"] = [group["id"], "cd" * 16]
+    groups_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    code = cli.main(
+        ["group", "pin", "weekend", "aaaa", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "pinned [aaaaaaaa] from alice" in capsys.readouterr().out
+
+    code = cli.main(
+        ["group", "unpin", "weekend", "aaaa", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "unpinned [aaaaaaaa] from alice" in capsys.readouterr().out
+
+
 def test_group_pin_unpin_round_trip(tmp_path, capsys):
     data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
 
