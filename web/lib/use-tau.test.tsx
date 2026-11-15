@@ -2619,7 +2619,7 @@ describe("useTau archived conversations", () => {
     unmount();
   });
 
-  it("exposes restored mail from an unread event, and clears it on a plain one", async () => {
+  it("exposes restored mail from an unread event, and keeps it across a plain one", async () => {
     const { result, unmount } = renderHook(() => useTau());
     const source = FakeEventSource.instances[0];
     await act(async () => {
@@ -2647,13 +2647,17 @@ describe("useTau archived conversations", () => {
       { target: PEER_HASH, unread: 1 },
     ]);
 
-    // An ordinary unread update restores nothing, so the signal clears.
+    // An ordinary unread update restores nothing, so it must not erase
+    // the pending signal before the console's hold effect runs: the
+    // signal is replaced only by a newer restore.
     await act(async () => {
       source.emit("unread", {
         unread: { per_peer: { [PEER_HASH]: 2 }, per_group: {}, total: 2 },
       });
     });
-    expect(result.current.restoredUnread).toBeNull();
+    expect(result.current.restoredUnread).toEqual([
+      { target: PEER_HASH, unread: 1 },
+    ]);
     unmount();
   });
 

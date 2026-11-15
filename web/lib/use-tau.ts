@@ -390,7 +390,13 @@ export function useTau() {
   // count at least as new as the last one applied may replace state.
   // `restored` rides the same event, so a stale count drops its
   // restored signal with it instead of holding mail the counts no
-  // longer show.
+  // longer show.  A plain update carries no restored signal and must
+  // not erase a pending one: an ordinary message event or read
+  // response that lands before the console's effect runs would
+  // otherwise lose the restore and auto-read the restored mail.  The
+  // signal is replaced only by a newer restore; the console's hold
+  // effect acts on each new signal and ignores a stale one, since a
+  // conversation opened later marks itself read on open.
   const applyUnread = useCallback(
     (
       counts: UnreadCounts,
@@ -401,7 +407,7 @@ export function useTau() {
       if (!reset && revision < unreadRevision.current) return;
       unreadRevision.current = revision;
       setUnread(counts);
-      setRestoredUnread(restored);
+      if (restored !== null) setRestoredUnread(restored);
     },
     [],
   );
