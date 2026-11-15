@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiDownload, apiGet, apiPost, apiPostText, eventsUrl } from "./api";
+import { apiDownload, apiGet, apiPost, apiPostText, eventsUrl, websocketUrl } from "./api";
 import type {
   AcceptDmRequestResponse,
   AllowlistResponse,
@@ -429,15 +429,13 @@ export function useTau() {
     // Edits made before this connection opened are in its snapshot;
     // edits made after may not be.
     let editsAtOpen = groupEdits.current;
-    const source = new EventSource(eventsUrl(0));
 
     const onOpen = () => {
       editsAtOpen = groupEdits.current;
       if (!disposed) setConnection("live");
     };
 
-    const onSnapshot = (event: Event) => {
-      const payload = readEventData<{ snapshot: Snapshot }>(event);
+    const onSnapshot = (payload: { snapshot: Snapshot } | null) => {
       if (!payload?.snapshot) return;
       const snapshot = payload.snapshot;
       snapshotMax.current =
@@ -478,11 +476,9 @@ export function useTau() {
       setConnection("live");
     };
 
-    const onMessage = (event: Event) => {
-      const payload = readEventData<{
-        message: TauMessage;
-        unread?: UnreadCounts;
-      }>(event);
+    const onMessage = (
+      payload: { message: TauMessage; unread?: UnreadCounts } | null,
+    ) => {
       if (!payload?.message) return;
       const message = payload.message;
       if (payload.unread) applyUnread(payload.unread);
@@ -508,8 +504,7 @@ export function useTau() {
       });
     };
 
-    const onMessageUpdated = (event: Event) => {
-      const payload = readEventData<{ message: TauMessage }>(event);
+    const onMessageUpdated = (payload: { message: TauMessage } | null) => {
       if (!payload?.message) return;
       const message = payload.message;
       liveTouched.current.set(message.id, ++liveEpoch.current);
@@ -564,10 +559,9 @@ export function useTau() {
       });
     };
 
-    const onMessageDeleted = (event: Event) => {
+    const onMessageDeleted = (payload: { message_id: number } | null) => {
       // The bus stamps its own sequence into `id`, so the deleted
       // console id arrives under `message_id` instead.
-      const payload = readEventData<{ message_id: number }>(event);
       if (!payload || typeof payload.message_id !== "number") return;
       removedMessageIds.current.add(payload.message_id);
       // A delete that lands while a pinned GET is in flight makes its
@@ -586,8 +580,7 @@ export function useTau() {
       );
     };
 
-    const onPeer = (event: Event) => {
-      const payload = readEventData<{ peer: Peer }>(event);
+    const onPeer = (payload: { peer: Peer } | null) => {
       if (!payload?.peer) return;
       const peer = payload.peer;
       if (predatesForget(forgottenPeers.current, peer)) return;
@@ -635,11 +628,9 @@ export function useTau() {
       });
     };
 
-    const onUnread = (event: Event) => {
-      const payload = readEventData<{
-        unread: UnreadCounts;
-        restored?: RestoredUnread[];
-      }>(event);
+    const onUnread = (
+      payload: { unread: UnreadCounts; restored?: RestoredUnread[] } | null,
+    ) => {
       if (!payload?.unread) return;
       applyUnread(payload.unread, false, payload.restored ?? null);
     };
@@ -655,28 +646,152 @@ export function useTau() {
       if (!disposed) setConnection("reconnecting");
     };
 
-    source.addEventListener("open", onOpen);
-    source.addEventListener("snapshot", onSnapshot);
-    source.addEventListener("message", onMessage);
-    source.addEventListener("message_updated", onMessageUpdated);
-    source.addEventListener("message_deleted", onMessageDeleted);
-    source.addEventListener("peer", onPeer);
-    source.addEventListener("unread", onUnread);
-    source.addEventListener("status", onStatus);
-    source.addEventListener("error", onError);
+    // Both live transports speak the same events: a WebSocket frame
+    // carries the event itself (`type` plus payload), an SSE event
+    // carries the payload under its type name.
+    const dispatchLiveEvent = (type: string, payload: unknown) => {
+      switch (type) {
+        case "snapshot":
+          onSnapshot(payload as { snapshot: Snapshot } | null);
+          break;
+        case "message":
+          onMessage(payload as { message: TauMessage } | null);
+          break;
+        case "message_updated":
+          onMessageUpdated(payload as { message: TauMessage } | null);
+          break;
+        case "message_deleted":
+          onMessageDeleted(payload as { message_id: number } | null);
+          break;
+        case "peer":
+          onPeer(payload as { peer: Peer } | null);
+          break;
+        case "unread":
+          onUnread(payload as { unread: UnreadCounts } | null);
+          break;
+        case "status":
+          onStatus();
+          break;
+        default:
+          break;
+      }
+    };
+
+    // The SSE transport, as before: EventSource reconnects on its own,
+    // so it only reports the drop.
+    const connectEventSource = () => {
+      const source = new EventSource(eventsUrl(0));
+      const onSseEvent = (type: string) => (event: Event) =>
+        dispatchLiveEvent(type, readEventData(event));
+      const listeners: [string, (event: Event) => void][] = [
+        ["snapshot", onSseEvent("snapshot")],
+        ["message", onSseEvent("message")],
+        ["message_updated", onSseEvent("message_updated")],
+        ["message_deleted", onSseEvent("message_deleted")],
+        ["peer", onSseEvent("peer")],
+        ["unread", onSseEvent("unread")],
+        ["status", onSseEvent("status")],
+      ];
+      source.addEventListener("open", onOpen);
+      for (const [type, listener] of listeners) {
+        source.addEventListener(type, listener);
+      }
+      source.addEventListener("error", onError);
+      return () => {
+        source.removeEventListener("open", onOpen);
+        for (const [type, listener] of listeners) {
+          source.removeEventListener(type, listener);
+        }
+        source.removeEventListener("error", onError);
+        source.close();
+      };
+    };
+
+    // The WebSocket transport: one JSON frame per event, with
+    // exponential-backoff reconnect (1s, doubling to a 30s cap) when
+    // a live socket drops. A socket that never opens — an older
+    // bridge, or a proxy that strips the upgrade — falls back to SSE
+    // for the rest of the session instead of retrying forever.
+    let cleanupTransport: (() => void) | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let backoffMs = 1000;
+    let everOpened = false;
+
+    const scheduleWebSocketReconnect = () => {
+      setConnection("reconnecting");
+      const delay = backoffMs;
+      backoffMs = Math.min(backoffMs * 2, 30000);
+      reconnectTimer = setTimeout(connectWebSocket, delay);
+    };
+
+    const connectWebSocket = () => {
+      if (disposed) return;
+      let socket: WebSocket;
+      try {
+        socket = new WebSocket(websocketUrl());
+      } catch {
+        // The constructor throws synchronously for a URL it cannot
+        // parse; treat it like a socket that never opened.
+        if (!everOpened) {
+          cleanupTransport = connectEventSource();
+        } else {
+          scheduleWebSocketReconnect();
+        }
+        return;
+      }
+      let opened = false;
+      const onSocketOpen = () => {
+        opened = true;
+        everOpened = true;
+        backoffMs = 1000;
+        onOpen();
+      };
+      const onSocketMessage = (event: MessageEvent) => {
+        let data: unknown = null;
+        try {
+          data = JSON.parse(event.data) as unknown;
+        } catch {
+          return;
+        }
+        if (
+          typeof data !== "object" ||
+          data === null ||
+          typeof (data as { type?: unknown }).type !== "string"
+        ) {
+          return;
+        }
+        dispatchLiveEvent((data as { type: string }).type, data);
+      };
+      const onSocketClose = () => {
+        if (disposed) return;
+        if (!opened && !everOpened) {
+          // The upgrade never succeeded: fall back to SSE.
+          cleanupTransport = connectEventSource();
+          return;
+        }
+        scheduleWebSocketReconnect();
+      };
+      socket.addEventListener("open", onSocketOpen);
+      socket.addEventListener("message", onSocketMessage);
+      socket.addEventListener("close", onSocketClose);
+      cleanupTransport = () => {
+        socket.removeEventListener("open", onSocketOpen);
+        socket.removeEventListener("message", onSocketMessage);
+        socket.removeEventListener("close", onSocketClose);
+        socket.close();
+      };
+    };
+
+    if (typeof WebSocket === "undefined") {
+      cleanupTransport = connectEventSource();
+    } else {
+      connectWebSocket();
+    }
 
     return () => {
       disposed = true;
-      source.removeEventListener("open", onOpen);
-      source.removeEventListener("snapshot", onSnapshot);
-      source.removeEventListener("message", onMessage);
-      source.removeEventListener("message_updated", onMessageUpdated);
-      source.removeEventListener("message_deleted", onMessageDeleted);
-      source.removeEventListener("peer", onPeer);
-      source.removeEventListener("unread", onUnread);
-      source.removeEventListener("status", onStatus);
-      source.removeEventListener("error", onError);
-      source.close();
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+      cleanupTransport?.();
     };
   }, [applyUnread, refreshGroups, refreshNode, refreshActiveSearch]);
 

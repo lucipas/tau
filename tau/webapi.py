@@ -297,6 +297,20 @@ _BACKUP_SHUTDOWN_WAIT = 3.0
 SUBSCRIBER_QUEUE_SIZE = 256
 SSE_HEARTBEAT_SECONDS = 15.0
 
+# WebSocket (RFC 6455) framing for the /ws live stream. The console
+# speaks stdlib-only HTTP, so the upgrade and the frames are implemented
+# here instead of adding a dependency.
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_WS_MAX_FRAME_BYTES = 1 << 20  # 1 MiB: a client frame is a control message
+_WS_OPCODE_CONTINUATION = 0x0
+_WS_OPCODE_TEXT = 0x1
+_WS_OPCODE_BINARY = 0x2
+_WS_OPCODE_CLOSE = 0x8
+_WS_OPCODE_PING = 0x9
+_WS_OPCODE_PONG = 0xA
+# Initial reconnect delay is the console's; the server only needs its
+# ping heartbeat, which reuses the SSE interval.
+
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 _LOCAL_ORIGIN_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -498,6 +512,121 @@ class EventBus:
                 subscriber.put_nowait(None)
             except queue.Full:
                 pass
+
+
+def _ws_accept_key(key: str) -> str:
+    """The Sec-WebSocket-Accept value for a client's Sec-WebSocket-Key."""
+    digest = hashlib.sha1((key + _WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _ws_key_is_valid(key: str) -> bool:
+    """A Sec-WebSocket-Key is ASCII base64 of exactly 16 bytes (RFC 6455)."""
+    if not key.isascii():
+        return False
+    try:
+        return len(base64.b64decode(key, validate=True)) == 16
+    except ValueError:
+        return False
+
+
+def _ws_encode_frame(payload: bytes, *, opcode: int = _WS_OPCODE_TEXT) -> bytes:
+    """Encode one server-to-client frame (servers never mask)."""
+    header = bytearray([0x80 | opcode])
+    length = len(payload)
+    if length < 126:
+        header.append(length)
+    elif length < 65536:
+        header.append(126)
+        header.extend(length.to_bytes(2, "big"))
+    else:
+        header.append(127)
+        header.extend(length.to_bytes(8, "big"))
+    return bytes(header) + payload
+
+
+class _WebSocketFrameError(ValueError):
+    """A client frame the server cannot or will not honour."""
+
+
+class _WebSocketReader:
+    """Read RFC 6455 frames from a buffered stream, one message at a time.
+
+    Client frames must be masked; fragmented messages are reassembled
+    before they are returned. Ping frames are answered in-line, pong
+    frames are ignored, and a close frame ends the stream (``None``).
+    Partial reads survive a socket timeout: bytes already read stay
+    buffered, so the next call resumes the same frame.
+    """
+
+    def __init__(self, stream: Any, *, send_frame: Any) -> None:
+        self._stream = stream
+        self._send_frame = send_frame
+        self._buffer = bytearray()
+
+    def _read_exact(self, count: int) -> bytes:
+        while len(self._buffer) < count:
+            chunk = self._stream.read(count - len(self._buffer))
+            if not chunk:
+                raise ConnectionResetError("websocket closed")
+            self._buffer.extend(chunk)
+        data = bytes(self._buffer[:count])
+        del self._buffer[:count]
+        return data
+
+    def read_message(self) -> Optional[bytes]:
+        """Return one complete text/binary message, or ``None`` on close."""
+        message = bytearray()
+        first = True
+        while True:
+            header = self._read_exact(2)
+            fin = bool(header[0] & 0x80)
+            opcode = header[0] & 0x0F
+            masked = bool(header[1] & 0x80)
+            length = header[1] & 0x7F
+            if length == 126:
+                length = int.from_bytes(self._read_exact(2), "big")
+            elif length == 127:
+                length = int.from_bytes(self._read_exact(8), "big")
+            if not masked:
+                raise _WebSocketFrameError("client frames must be masked")
+            if length > _WS_MAX_FRAME_BYTES:
+                raise _WebSocketFrameError("websocket frame too large")
+            mask = self._read_exact(4)
+            payload = bytearray(self._read_exact(length))
+            for index, byte in enumerate(payload):
+                payload[index] = byte ^ mask[index % 4]
+            if opcode & 0x08 and (not fin or length > 125):
+                # Control frames (close/ping/pong) must not be fragmented
+                # and carry at most 125 bytes (RFC 6455 section 5.5).
+                raise _WebSocketFrameError("invalid control frame")
+            if opcode == _WS_OPCODE_CLOSE:
+                return None
+            if opcode == _WS_OPCODE_PING:
+                self._send_frame(bytes(payload), opcode=_WS_OPCODE_PONG)
+                continue
+            if opcode == _WS_OPCODE_PONG:
+                continue
+            if len(message) + len(payload) > _WS_MAX_FRAME_BYTES:
+                # Bound the reassembled message, not just each frame.
+                raise _WebSocketFrameError("websocket message too large")
+            if opcode == _WS_OPCODE_CONTINUATION:
+                if first:
+                    raise _WebSocketFrameError(
+                        "unexpected continuation frame"
+                    )
+                message.extend(payload)
+            elif opcode in (_WS_OPCODE_TEXT, _WS_OPCODE_BINARY):
+                if not first:
+                    raise _WebSocketFrameError(
+                        "new message before previous finished"
+                    )
+                message.extend(payload)
+            else:
+                raise _WebSocketFrameError(f"unknown opcode {opcode}")
+            first = False
+            if fin:
+                return bytes(message)
 
 
 def _clean_stored_reaction(entry: Any) -> Optional[Dict[str, Any]]:
@@ -8172,6 +8301,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._handle_api(path, parse_qs(parsed.query), head_only)
+            elif path == "/ws":
+                if self.command == "GET" and not head_only:
+                    self._serve_websocket()
+                else:
+                    self._send_error(
+                        HTTPStatus.METHOD_NOT_ALLOWED,
+                        "websocket upgrade required",
+                        head_only,
+                    )
             elif path == "/healthz":
                 self._send_json({"ok": True, "version": __version__}, head_only)
             else:
@@ -10726,6 +10864,145 @@ class _WebHandler(BaseHTTPRequestHandler):
         self._send_json(result, head_only)
 
     # -- server-sent events ------------------------------------------------
+
+    def _serve_websocket(self) -> None:
+        """Serve the /ws live stream: RFC 6455 upgrade, then JSON frames.
+
+        The first frame is the snapshot, like the SSE stream's, and every
+        bus event after it goes out as one text frame carrying the event
+        itself (``type`` plus payload). A sender thread owns the bus
+        subscription and the ping heartbeat; this thread reads client
+        frames — ping is answered, text is ignored (the console sends
+        nothing but pings today), and a close frame ends the stream.
+        """
+        upgrade = (self.headers.get("Upgrade") or "").strip().lower()
+        connection = (self.headers.get("Connection") or "").lower()
+        key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        version = (self.headers.get("Sec-WebSocket-Version") or "").strip()
+        # Browsers do not apply CORS to WebSocket handshakes, so a page
+        # on another origin could otherwise read the console over /ws.
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and not _is_local_origin(origin):
+            host_header = (self.headers.get("Host") or "").strip().lower()
+            try:
+                origin_netloc = urlsplit(origin).netloc.lower()
+            except ValueError:
+                origin_netloc = ""
+            if not host_header or origin_netloc != host_header:
+                self._send_error(
+                    HTTPStatus.FORBIDDEN,
+                    "cross-origin websocket connections are not allowed",
+                )
+                return
+        if (
+            upgrade != "websocket"
+            or "upgrade" not in connection
+            or not key
+            or not _ws_key_is_valid(key)
+            or version != "13"
+        ):
+            self._send_error(
+                HTTPStatus.BAD_REQUEST, "websocket upgrade required"
+            )
+            return
+        try:
+            subscriber = self.bridge.bus.subscribe()
+        except WebBridgeError as exc:
+            self._send_error(HTTPStatus.TOO_MANY_REQUESTS, str(exc))
+            return
+
+        try:
+            self.close_connection = True
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", _ws_accept_key(key))
+            self._cors_headers()
+            self.end_headers()
+        except BaseException:
+            self.bridge.bus.unsubscribe(subscriber)
+            raise
+
+        stopped = threading.Event()
+        send_lock = threading.Lock()
+
+        def stop() -> None:
+            # Unblock the reader thread, which is parked in a blocking
+            # read on the client socket, so the handler can unwind.
+            stopped.set()
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        def send_frame(payload: bytes, *, opcode: int = _WS_OPCODE_TEXT) -> bool:
+            try:
+                with send_lock:
+                    self.wfile.write(
+                        _ws_encode_frame(payload, opcode=opcode)
+                    )
+                    self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                stop()
+                return False
+
+        def send_json(payload: Dict[str, Any]) -> bool:
+            data = json.dumps(
+                payload, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            return send_frame(data)
+
+        def pump() -> None:
+            try:
+                while not stopped.is_set() and not self.bridge.closing:
+                    try:
+                        event = subscriber.get(timeout=SSE_HEARTBEAT_SECONDS)
+                    except queue.Empty:
+                        if not send_frame(b"", opcode=_WS_OPCODE_PING):
+                            return
+                        continue
+                    if event is None:
+                        return
+                    if not send_json(dict(event)):
+                        return
+            finally:
+                stop()
+
+        sender = threading.Thread(
+            target=pump, name="tau-ws-pump", daemon=True
+        )
+        try:
+            if not send_json(
+                {"type": "snapshot", "snapshot": self.bridge.snapshot()}
+            ):
+                return
+            # A client just opened the console, so the thread view is
+            # displaying these messages: send their read receipts.
+            self.bridge.mark_displayed_read()
+            sender.start()
+            # Blocking reads: a socket timeout would poison the buffered
+            # rfile (later reads raise OSError), dropping idle clients.
+            # The pump's stop() shuts the socket down to wake this read.
+            reader = _WebSocketReader(self.rfile, send_frame=send_frame)
+            while not stopped.is_set() and not self.bridge.closing:
+                try:
+                    message = reader.read_message()
+                except (_WebSocketFrameError, ConnectionResetError, OSError):
+                    break
+                if message is None:  # close frame
+                    send_frame(b"", opcode=_WS_OPCODE_CLOSE)
+                    break
+                # Text frames from the client are a no-op: a future
+                # client message must not mutate node state unasked.
+        finally:
+            stopped.set()
+            try:
+                subscriber.put_nowait(None)
+            except queue.Full:
+                pass
+            sender.join(timeout=2.0)
+            self.bridge.bus.unsubscribe(subscriber)
 
     def _serve_events(self, query: Dict[str, List[str]]) -> None:
         since = _int_param(query, "since", default=0, minimum=0, maximum=2**31 - 1)

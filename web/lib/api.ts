@@ -114,6 +114,29 @@ export function eventsUrl(since = 0): string {
   return `${API_BASE}/api/events?since=${since}`;
 }
 
+export function websocketUrl(): string {
+  if (API_BASE) {
+    if (/^https?:/i.test(API_BASE) || typeof window === "undefined") {
+      // http(s)://host:port -> ws(s)://host:port, e.g. the :8787 bridge
+      // under `next dev`.
+      return `${API_BASE.replace(/^http/, "ws")}/ws`;
+    }
+    // A relative base such as "/tau" needs the page's origin to resolve.
+    const url = new URL(`${API_BASE}/ws`, window.location.href);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+  }
+  if (typeof window === "undefined") {
+    return "";
+  }
+  const { protocol, hostname, port } = window.location;
+  const wsProtocol = protocol === "https:" ? "wss:" : "ws:";
+  if ((port === "3000" || port === "3001") && isLocalHost(hostname)) {
+    return `${wsProtocol}//${hostname}:8787/ws`;
+  }
+  return `${wsProtocol}//${hostname}${port ? `:${port}` : ""}/ws`;
+}
+
 export interface DownloadResult {
   blob: Blob;
   filename: string;

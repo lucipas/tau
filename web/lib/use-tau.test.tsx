@@ -18,6 +18,7 @@ vi.mock("./api", () => ({
   apiGet: vi.fn(),
   apiPost: vi.fn(),
   eventsUrl: vi.fn(() => "/api/events"),
+  websocketUrl: vi.fn(() => "/ws"),
 }));
 
 import { apiGet, apiPost } from "./api";
@@ -155,6 +156,10 @@ beforeEach(() => {
   vi.resetAllMocks();
   FakeEventSource.instances.length = 0;
   vi.stubGlobal("EventSource", FakeEventSource);
+  // jsdom ships a WebSocket global; the live transport is exercised by
+  // the websocket describe block below, and everything else here keeps
+  // the SSE path it was written against.
+  vi.stubGlobal("WebSocket", undefined);
   // Default answers for the hook's background reads: the outbox poll
   // and any other GET the hook issues on mount.
   mockedGet.mockImplementation((path: string) =>
@@ -2962,6 +2967,137 @@ describe("useTau muted conversations", () => {
     });
     expect(result.current.mutedConversations.peers).toEqual([PEER_HASH]);
     expect(result.current.mutedError).toBe("bridge down");
+    unmount();
+  });
+});
+
+// The live transport prefers WebSocket and falls back to SSE; these
+// tests drive it through a fake socket.
+class FakeWebSocket {
+  static instances: FakeWebSocket[] = [];
+  listeners: Record<string, ((event: never) => void)[]> = {};
+  url: string;
+
+  constructor(url: string) {
+    this.url = url;
+    FakeWebSocket.instances.push(this);
+  }
+
+  addEventListener(type: string, fn: (event: never) => void) {
+    (this.listeners[type] ??= []).push(fn);
+  }
+
+  removeEventListener(type: string, fn: (event: never) => void) {
+    this.listeners[type] = (this.listeners[type] ?? []).filter(
+      (entry) => entry !== fn,
+    );
+  }
+
+  open() {
+    for (const fn of this.listeners.open ?? []) fn({} as never);
+  }
+
+  receive(data: unknown) {
+    const event = { data: JSON.stringify(data) } as MessageEvent;
+    for (const fn of this.listeners.message ?? []) fn(event as never);
+  }
+
+  close() {
+    for (const fn of this.listeners.close ?? []) fn({} as never);
+  }
+}
+
+describe("useTau websocket transport", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances.length = 0;
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function snapshotIntoSocket(socket: FakeWebSocket, peers: Peer[]) {
+    act(() => {
+      socket.receive({ type: "snapshot", snapshot: makeSnapshot(peers) });
+    });
+  }
+
+  it("streams the snapshot and messages over the socket", async () => {
+    const peer = makePeer();
+    const { result, unmount } = renderHook(() => useTau());
+    const socket = FakeWebSocket.instances[0];
+    expect(socket.url).toBe("/ws");
+    act(() => {
+      socket.open();
+    });
+    snapshotIntoSocket(socket, [peer]);
+    await waitFor(() => expect(result.current.peers).toEqual([peer]));
+    expect(result.current.connection).toBe("live");
+
+    act(() => {
+      socket.receive({
+        type: "message",
+        message: makeMessage({ id: 7, text: "over ws" }),
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.messages.some((entry) => entry.text === "over ws"),
+      ).toBe(true),
+    );
+    unmount();
+  });
+
+  it("reconnects with backoff after a live socket drops", async () => {
+    const { result, unmount } = renderHook(() => useTau());
+    const socket = FakeWebSocket.instances[0];
+    act(() => {
+      socket.open();
+    });
+    snapshotIntoSocket(socket, [makePeer()]);
+    await waitFor(() => expect(result.current.connection).toBe("live"));
+
+    act(() => {
+      socket.close();
+    });
+    await waitFor(() => expect(result.current.connection).toBe("reconnecting"));
+    // The first retry is after the 1s backoff.
+    await waitFor(
+      () => expect(FakeWebSocket.instances.length).toBe(2),
+      { timeout: 3000 },
+    );
+    unmount();
+  });
+
+  it("falls back to SSE when the socket never opens", async () => {
+    const { result, unmount } = renderHook(() => useTau());
+    const socket = FakeWebSocket.instances[0];
+    // No open: the upgrade failed (older bridge, stripping proxy).
+    act(() => {
+      socket.close();
+    });
+    await waitFor(() =>
+      expect(FakeEventSource.instances.length).toBe(1),
+    );
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [makePeer()]);
+    await waitFor(() => expect(result.current.peers).toHaveLength(1));
+    unmount();
+  });
+
+  it("falls back to SSE when the socket constructor throws", async () => {
+    class ThrowingSocket {
+      constructor(_url: string) {
+        throw new SyntaxError("bad url");
+      }
+    }
+    vi.stubGlobal("WebSocket", ThrowingSocket);
+    const { result, unmount } = renderHook(() => useTau());
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [makePeer()]);
+    await waitFor(() => expect(result.current.peers).toHaveLength(1));
     unmount();
   });
 });
