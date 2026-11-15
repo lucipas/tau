@@ -7475,6 +7475,24 @@ class WebBridge:
                     counts = self._fold_group_counts(counts)
             return self._stamp_unread(counts)
 
+    def _readable_group_lineage(
+        self, group_id: str, ignored: FrozenSet[str]
+    ) -> List[str]:
+        """A group's lineage minus its ignored predecessors.
+
+        Ignored groups keep their own read state: opening the current
+        group must never advance a hidden predecessor's cursor, or
+        unignoring it later shows no unread history from before the
+        rename — and marking unread must never move one either.  The
+        current id always stays: its own read behavior does not change.
+        """
+        lineage = self._group_lineage(group_id)
+        if not lineage:
+            return lineage
+        return [
+            gid for gid in lineage if gid == lineage[0] or gid not in ignored
+        ]
+
     def mark_read(
         self, peer: Optional[str] = None, *, group: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -7486,26 +7504,26 @@ class WebBridge:
         conversation; each advances only its own cursor, so opening a
         DM never consumes a group post from the same sender.  A group
         mark advances the whole rename lineage, so opening a renamed
-        group clears its older posts too.  Read state never leaves
-        this node.
+        group clears its older posts too — except an ignored
+        predecessor, whose read state stays frozen until it is
+        unignored.  Read state never leaves this node.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "per_group": {}, "total": 0}
             if inbox is not None:
+                ignored = load_ignored_group_ids(
+                    getattr(self.node.config, "ignored_groups_path", None)
+                )
                 counts = inbox.mark_read(
                     peer=peer,
                     group=(
-                        self._group_lineage(group)
+                        self._readable_group_lineage(group, ignored)
                         if group is not None
                         else None
                     ),
                     exclude_dm_from=self._archived_set(),
-                    exclude_group=load_ignored_group_ids(
-                        getattr(
-                            self.node.config, "ignored_groups_path", None
-                        )
-                    ),
+                    exclude_group=ignored,
                 )
                 counts = self._fold_group_counts(counts)
             stamped = self._stamp_unread(counts)
@@ -7529,27 +7547,32 @@ class WebBridge:
         cursor so the whole conversation shows unread.  ``peer`` names a
         DM conversation and ``group`` a group conversation; a group mark
         covers the whole rename lineage, so a renamed group's older
-        posts mark unread together.  Other tabs learn from the
-        ``unread`` SSE event, exactly as they do for a mark-read.  Read
-        receipts are untouched: a receipt already sent for a message
-        stays sent, and only the local display cursor moves.  Raises
-        :class:`ValueError` when the conversation has no stored messages
-        to mark, or when the node has no inbox to mark them in.
+        posts mark unread together — except an ignored predecessor,
+        whose read state stays frozen until it is unignored.  Other
+        tabs learn from the ``unread`` SSE event, exactly as they do
+        for a mark-read.  Read receipts are untouched: a receipt
+        already sent for a message stays sent, and only the local
+        display cursor moves.  Raises :class:`ValueError` when the
+        conversation has no stored messages to mark, or when the node
+        has no inbox to mark them in.
         """
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
             raise ValueError("this node has no inbox to mark unread")
         with self._unread_lock:
+            ignored = load_ignored_group_ids(
+                getattr(self.node.config, "ignored_groups_path", None)
+            )
             moved = inbox.mark_unread(
                 peer,
                 group=(
-                    self._group_lineage(group) if group is not None else None
+                    self._readable_group_lineage(group, ignored)
+                    if group is not None
+                    else None
                 ),
                 all=all,
                 exclude_dm_from=self._archived_set(),
-                exclude_group=load_ignored_group_ids(
-                    getattr(self.node.config, "ignored_groups_path", None)
-                ),
+                exclude_group=ignored,
             )
             if moved is None:
                 target = group if group is not None else peer

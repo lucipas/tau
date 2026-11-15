@@ -2981,6 +2981,57 @@ def test_mark_read_group_ignores_poisoned_lineage(bridge, node, tmp_path):
     }
 
 
+def test_mark_read_group_leaves_ignored_predecessor_unread(
+    bridge, node, tmp_path
+):
+    """Opening a renamed group never consumes an ignored predecessor."""
+    from tau.groups import derive_group_id
+
+    old_id = _learned_group(node, tmp_path)
+    # The group is ignored before it is renamed.
+    _json(bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"})
+    new_id = derive_group_id(
+        PEER_HASH,
+        "weekend",
+        [PEER_HASH, node.destination_hexhash, OTHER_HASH],
+    )
+    assert node.groups.record(
+        new_id,
+        "weekend",
+        [PEER_HASH, node.destination_hexhash, OTHER_HASH],
+        creator=PEER_HASH,
+        sender=PEER_HASH,
+        renamed_from=[old_id],
+    )
+    _inbound_record(
+        node,
+        id="g-old",
+        received_at=101.0,
+        kind="group",
+        group=old_id,
+        group_name="weekend",
+    )
+    _inbound_record(
+        node,
+        id="g-new",
+        received_at=102.0,
+        kind="group",
+        group=new_id,
+        group_name="weekend",
+    )
+
+    # Opening the renamed group clears only its own post; the
+    # published counts hide the ignored predecessor entirely.
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"group": new_id}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    # And the predecessor's cursor never moved: its unread post is
+    # still there in the raw inbox counts, for when it is unignored.
+    assert node.inbox.unread_counts()["per_group"] == {old_id: 1}
+
+
 def test_mark_read_endpoint_rejects_peer_and_group_together(bridge):
     status, _, payload = _json(
         bridge,
