@@ -1835,7 +1835,11 @@ class Inbox:
             return self._unread_counts_locked(exclude_dm_from=exclude_dm_from)
 
     def mark_unread(
-        self, peer: str, *, all: bool = False
+        self,
+        peer: str,
+        *,
+        all: bool = False,
+        exclude_dm_from: Optional[Collection[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Move a conversation's read cursor back so mail shows unread again.
 

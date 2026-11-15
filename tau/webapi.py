@@ -7032,7 +7032,9 @@ class WebBridge:
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
             if inbox is not None:
-                moved = inbox.mark_unread(peer, all=all)
+                moved = inbox.mark_unread(
+                    peer, all=all, exclude_dm_from=self._archived_set()
+                )
                 if moved is None:
                     raise ValueError(f"no stored messages from {peer!r}")
                 counts = moved
