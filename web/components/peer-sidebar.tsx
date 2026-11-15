@@ -45,6 +45,7 @@ export function PeerSidebar({
   blocks,
   verifications,
   unread,
+  unreadGroups,
   archived,
   archivedError,
   muted,
@@ -87,6 +88,7 @@ export function PeerSidebar({
   blocks: Record<string, BlockState>;
   verifications: Record<string, VerifyState>;
   unread: Record<string, number>;
+  unreadGroups?: Record<string, number>;
   archived: ArchivedConversation[];
   archivedError: string | null;
   muted: MutedConversations;
@@ -1566,6 +1568,16 @@ export function PeerSidebar({
                   <div className="min-w-0">
                     <p className="truncate text-xs font-medium text-zinc-200">
                       {group.name}{" "}
+                      {(unreadGroups?.[group.id] ?? 0) > 0 ? (
+                        <span
+                          className="shrink-0 rounded-full bg-signal px-1.5 py-px font-mono text-[10px] font-semibold text-void"
+                          title={`${unreadGroups?.[group.id] ?? 0} unread message${(unreadGroups?.[group.id] ?? 0) === 1 ? "" : "s"}`}
+                        >
+                          {(unreadGroups?.[group.id] ?? 0) > 99
+                            ? "99+"
+                            : unreadGroups?.[group.id]}
+                        </span>
+                      ) : null}
                       {group.ignored ? (
                         <span className="rounded-full border border-line bg-void/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-mist">
                           ignored
