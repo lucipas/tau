@@ -499,4 +499,51 @@ describe("Console restored unread", () => {
       expect(markRead).toHaveBeenCalledWith(undefined, crew.id),
     );
   });
+
+  it("clears the hold on leaving, so returning reads as read", async () => {
+    const crew = makeGroup("a".repeat(32), "crew");
+    const team = makeGroup("b".repeat(32), "team");
+    const markRead = vi.fn().mockResolvedValue({ per_peer: {}, per_group: {}, total: 0 });
+    mockedUseTau.mockReturnValue({
+      ...tauState([crew, team], []),
+      markRead,
+    });
+
+    const { rerender } = render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("crew · 2 members")).toBeTruthy(),
+    );
+    expect(markRead).not.toHaveBeenCalled();
+
+    // Another console unmutes the open group: its restored post is held.
+    mockedUseTau.mockReturnValue({
+      ...tauState([crew, team], []),
+      markRead,
+      unread: { per_peer: {}, per_group: { [crew.id]: 1 }, total: 1 },
+      restoredUnread: [{ target: crew.id, unread: 1 }],
+    });
+    rerender(<Console />);
+    await waitFor(() =>
+      expect(screen.getByTitle("1 unread message")).toBeTruthy(),
+    );
+    expect(markRead).not.toHaveBeenCalled();
+
+    // Leaving the group drops the hold, so returning to it follows
+    // the normal read path instead of skipping markRead.
+    fireEvent.change(screen.getByDisplayValue("crew · 2 members"), {
+      target: { value: team.id },
+    });
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("team · 2 members")).toBeTruthy(),
+    );
+    fireEvent.change(screen.getByDisplayValue("team · 2 members"), {
+      target: { value: crew.id },
+    });
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("crew · 2 members")).toBeTruthy(),
+    );
+    await waitFor(() =>
+      expect(markRead).toHaveBeenCalledWith(undefined, crew.id),
+    );
+  });
 });
