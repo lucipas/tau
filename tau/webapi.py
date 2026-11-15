@@ -10513,34 +10513,3 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
-
-> bool:
-    values = query.get(name) or []
-    if not values:
-        return False
-    return values[0].strip().lower() in ("1", "true", "yes", "on")
-
-
-def _int_param(
-    query: Dict[str, List[str]],
-    name: str,
-    *,
-    default: int,
-    minimum: int,
-    maximum: int,
-) -> int:
-    values = query.get(name)
-    if not values:
-        return default
-    try:
-        value = int(values[0])
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(value, maximum))
-
-:
-        value = int(values[0])
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(value, maximum))
-

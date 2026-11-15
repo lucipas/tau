@@ -6871,7 +6871,10 @@ def _resolve_inbox_peer(
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
     A full destination hash filters directly, and an exact name match
-    wins over any prefix.  For a hash prefix, registered peers and
+    wins over any prefix.  Aliases resolve before names, matching
+    ``PeerRegistry.resolve`` and the message-send path: when one peer's
+    name equals another peer's alias, ``--peer`` must pick the same
+    peer a send would.  For a hash prefix, registered peers and
     senders stored in the inbox are combined before selecting: a
     prefix shared by two distinct senders is ambiguous, even when one
     of them is registered and the other is not (pruned, or never
@@ -6883,6 +6886,18 @@ def _resolve_inbox_peer(
     if _is_hex32(target):
         return target.lower()
     peers = registry.all()
+    by_alias = [
+        peer
+        for peer in peers
+        if peer.alias and peer.alias.casefold() == target.casefold()
+    ]
+    if len(by_alias) == 1:
+        return by_alias[0].hexhash
+    if len(by_alias) > 1:
+        raise NodeError(
+            f"{len(by_alias)} peers share the alias {target!r}; "
+            "use a destination hash"
+        )
     by_name = [peer for peer in peers if peer.name.casefold() == target.casefold()]
     if len(by_name) == 1:
         return by_name[0].hexhash
@@ -10565,4 +10580,3 @@ def _cmd_messages_sent(
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
-eturn _EXIT_OK

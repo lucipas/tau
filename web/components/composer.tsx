@@ -516,24 +516,3 @@ export function Composer({
     </section>
   );
 }
-e="300">5m</option>
-              <option value="3600">1h</option>
-              <option value="86400">1d</option>
-              <option value="604800">7d</option>
-            </select>
-          </label>
-        ) : null}
-        {disappearingError ? (
-          <span className="font-mono text-[10px] text-amber-300">
-            {disappearingError}
-          </span>
-        ) : null}
-        {defaultHint ? (
-          <span className="font-mono text-[10px] text-mist/70">
-            {defaultHint}
-          </span>
-        ) : null}
-      </div>
-    </section>
-  );
-}

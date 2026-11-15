@@ -7505,7 +7505,7 @@ def _queue_send(node, mail_id="mail-1"):
             "queued": True,
             "id": mail_id,
             "to": peer.hexhash,
-            "expires_at": 9999.0,
+            "expires_at": time.time() + 3600,
         }
 
     node.send_message = _send
@@ -7717,7 +7717,7 @@ def test_delivery_before_record_is_not_lost(bridge, node):
             "queued": True,
             "id": "mail-1",
             "to": peer.hexhash,
-            "expires_at": 9999.0,
+            "expires_at": time.time() + 3600,
         }
 
     node.send_message = _send

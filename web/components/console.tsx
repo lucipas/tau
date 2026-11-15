@@ -522,16 +522,3 @@ export function Console() {
     </div>
   );
 }
-       </main>
-
-        <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
-          <span>
-            tau {tau.node?.version ?? "—"} · Reticulum{" "}
-            {tau.node?.rns_version ?? "—"}
-          </span>
-          <span>no servers · no accounts · encrypted links</span>
-        </footer>
-      </div>
-    </div>
-  );
-}

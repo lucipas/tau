@@ -352,6 +352,43 @@ def test_parser_disappearing_arguments():
     assert args.off is False
 
 
+def test_resolve_inbox_peer_prefers_alias_over_name(tmp_path):
+    # CodeRabbit Major on #403: --peer "work" must pick the peer aliased
+    # "work", matching PeerRegistry.resolve and the send path — not the
+    # peer whose asserted name is "work".
+    from tau.identity import destination_hash
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    named = RNS.Identity()
+    named_hash = destination_hash(named)
+    registry.upsert(named_hash, named.get_public_key(), name="work", now=100.0)
+    aliased = RNS.Identity()
+    aliased_hash = destination_hash(aliased)
+    registry.upsert(aliased_hash, aliased.get_public_key(), name="bob", now=100.0)
+    registry.set_alias(aliased_hash, "work")
+    registry.save()
+
+    assert cli._resolve_inbox_peer(inbox, registry, "work") == aliased_hash.hex()
+    # A plain name with no alias collision still resolves by name.
+    assert cli._resolve_inbox_peer(inbox, registry, "bob") == aliased_hash.hex()
+
+
+def test_resolve_inbox_peer_ambiguous_alias_raises(tmp_path):
+    # Defensive: the registry API keeps aliases unique, but a hand-edited
+    # peers file could still hold two — the helper must refuse, not guess.
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    inbox = Inbox(config.inbox_path)
+    first = _make_peer("alice")
+    first.alias = "work"
+    second = _make_peer("bob")
+    second.alias = "work"
+    registry = types.SimpleNamespace(all=lambda: [first, second])
+    with pytest.raises(cli.NodeError, match="share the alias"):
+        cli._resolve_inbox_peer(inbox, registry, "work")
+
+
 def test_disappearing_peer_roundtrip(tmp_path, capsys):
     data_dir, senders = _seed_two_peers(tmp_path)
 
