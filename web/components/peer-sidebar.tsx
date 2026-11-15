@@ -285,8 +285,14 @@ export function PeerSidebar({
     null,
   );
   const [leavingId, setLeavingId] = useState<string | null>(null);
-  const [rejoiningId, setRejoiningId] = useState<string | null>(null);
-  const [ignoringId, setIgnoringId] = useState<string | null>(null);
+  // Pending ids are tracked per group: one finishing must not clear
+  // the guard on another request that is still in flight.
+  const [rejoiningIds, setRejoiningIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [ignoringIds, setIgnoringIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const leaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -342,7 +348,7 @@ export function PeerSidebar({
 
   async function submitRejoin(id: string) {
     if (!onRejoinGroup) return;
-    setRejoiningId(id);
+    setRejoiningIds((previous) => new Set(previous).add(id));
     setGroupError(null);
     try {
       await onRejoinGroup(id);
@@ -351,14 +357,18 @@ export function PeerSidebar({
         caught instanceof Error ? caught.message : "rejoin failed",
       );
     } finally {
-      setRejoiningId(null);
+      setRejoiningIds((previous) => {
+        const next = new Set(previous);
+        next.delete(id);
+        return next;
+      });
     }
   }
 
   async function submitIgnoreToggle(group: TauGroup) {
     const apply = group.ignored ? onUnignoreGroup : onIgnoreGroup;
     if (!apply) return;
-    setIgnoringId(group.id);
+    setIgnoringIds((previous) => new Set(previous).add(group.id));
     setGroupError(null);
     try {
       await apply(group.id);
@@ -367,13 +377,17 @@ export function PeerSidebar({
         caught instanceof Error ? caught.message : "ignore failed",
       );
     } finally {
-      setIgnoringId(null);
+      setIgnoringIds((previous) => {
+        const next = new Set(previous);
+        next.delete(group.id);
+        return next;
+      });
     }
   }
 
   async function submitUnignoreOrphan(id: string) {
     if (!onUnignoreGroup) return;
-    setIgnoringId(id);
+    setIgnoringIds((previous) => new Set(previous).add(id));
     setGroupError(null);
     try {
       await onUnignoreGroup(id);
@@ -382,7 +396,11 @@ export function PeerSidebar({
         caught instanceof Error ? caught.message : "unignore failed",
       );
     } finally {
-      setIgnoringId(null);
+      setIgnoringIds((previous) => {
+        const next = new Set(previous);
+        next.delete(id);
+        return next;
+      });
     }
   }
 
@@ -1451,11 +1469,11 @@ export function PeerSidebar({
                     {onIgnoreGroup && onUnignoreGroup ? (
                       <button
                         type="button"
-                        disabled={ignoringId === group.id}
+                        disabled={ignoringIds.has(group.id)}
                         onClick={() => void submitIgnoreToggle(group)}
                         className="rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
                       >
-                        {ignoringId === group.id
+                        {ignoringIds.has(group.id)
                           ? "saving…"
                           : group.ignored
                             ? "unignore"
@@ -1678,11 +1696,11 @@ export function PeerSidebar({
                   </div>
                   <button
                     type="button"
-                    disabled={rejoiningId === entry.id}
+                    disabled={rejoiningIds.has(entry.id)}
                     onClick={() => void submitRejoin(entry.id)}
                     className="shrink-0 rounded-md border border-signal/50 bg-signal/10 px-2 py-1 font-mono text-[11px] text-signal transition hover:bg-signal/20 disabled:opacity-50"
                   >
-                    {rejoiningId === entry.id ? "rejoining…" : "rejoin"}
+                    {rejoiningIds.has(entry.id) ? "rejoining…" : "rejoin"}
                   </button>
                 </li>
               ))}
@@ -1712,11 +1730,11 @@ export function PeerSidebar({
                   </div>
                   <button
                     type="button"
-                    disabled={ignoringId === entry.id}
+                    disabled={ignoringIds.has(entry.id)}
                     onClick={() => void submitUnignoreOrphan(entry.id)}
                     className="shrink-0 rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
                   >
-                    {ignoringId === entry.id ? "saving…" : "unignore"}
+                    {ignoringIds.has(entry.id) ? "saving…" : "unignore"}
                   </button>
                 </li>
               ))}
