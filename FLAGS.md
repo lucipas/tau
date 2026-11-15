@@ -45,6 +45,9 @@ Global options may appear before or after the command:
 | `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline; `--expire 30s` makes it a disappearing message, purged from receivers' inboxes after the duration; `--reply-to ID` replies to an earlier message in the group, quoting it; `--wait SECONDS` waits for queued legs to be delivered, exiting non-zero if one is still queued when the wait expires — options come before the group name, as with `--timeout`) |
 | `tau group topic GROUP [TEXT]` | Set the topic of a group you created (`--clear` removes it; omit TEXT to show it; travels with group messages, members pin it from the creator) |
 | `tau group send-file GROUP FILE` | Send a file (at most 10 MiB) to every member of a group, one direct transfer per member (a member that cannot be reached or refuses is reported as failed, not queued) |
+| `tau group pin GROUP MESSAGE` | Pin one stored message in a group (message id or unique prefix within the group's history, received or sent; a message from another conversation is refused) — local-only, like `tau pin` |
+| `tau group unpin GROUP MESSAGE` | Remove the pin from a message in a group (no-op when it was never pinned) |
+| `tau group pinned GROUP` | List a group's pinned messages, newest first (`--limit N`, default 30; `--json` for scripting) |
 | `tau group ignore GROUP` | Hide a group's messages from `tau messages` (history kept, mail keeps arriving; idempotent) |
 | `tau group unignore GROUP` | Show an ignored group's messages in `tau messages` again (idempotent) |
 | `tau group ignored` | List ignored groups (group name + id, message count) |
