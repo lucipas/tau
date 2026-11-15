@@ -45,6 +45,11 @@ export function Console() {
 
   useEffect(() => {
     if (tau.peers.length === 0 && tau.groups.length === 0) {
+      // A group that just left must not stay behind as the destination.
+      if (mode === "group") {
+        setTarget("");
+        setReplyTo(null);
+      }
       setMode("custom");
       return;
     }
