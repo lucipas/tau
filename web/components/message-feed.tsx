@@ -14,7 +14,7 @@ import {
   shortHash,
 } from "@/lib/format";
 
-import { CopyButton, RadarIcon, SectionLabel } from "./ui";
+import { RadarIcon, SectionLabel } from "./ui";
 
 // One emoji or short text token per the protocol limit (32 chars);
 // a fixed picker keeps every reaction inside it by construction.
@@ -224,7 +224,7 @@ export function MessageFeed({
         onScroll={onScroll}
         aria-live="polite"
         aria-label="Message traffic"
-        className="thin-scroll min-h-[320px] flex-1 space-y-4 overflow-y-auto px-4 py-5 lg:max-h-[calc(100dvh-330px)]"
+        className="thin-scroll min-h-[320px] flex-1 space-y-4 overflow-y-auto px-4 py-5"
       >
         {messages.length === 0 ? (
           searching ? (
@@ -314,14 +314,6 @@ function EmptyState({ node }: { node: NodeInfo | null }) {
         </code>
         .
       </p>
-      {node ? (
-        <div className="mt-4 flex flex-col items-center gap-2">
-          <p className="max-w-md break-all font-mono text-[10px] text-mist/80">
-            {node.destination}
-          </p>
-          <CopyButton value={node.destination} label="copy destination" />
-        </div>
-      ) : null}
     </div>
   );
 }

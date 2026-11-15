@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Peer, TauGroup } from "@/lib/types";
 
@@ -8,6 +8,12 @@ import { Console } from "./console";
 const { mockedUseTau } = vi.hoisted(() => ({ mockedUseTau: vi.fn() }));
 
 vi.mock("@/lib/use-tau", () => ({ useTau: mockedUseTau }));
+
+// The social tab embeds the real feed; its internals are covered by
+// social-console.test.tsx, so the tab tests only need its presence.
+vi.mock("./social-console", () => ({
+  SocialConsole: () => <div data-testid="social-tab-feed">social feed</div>,
+}));
 
 // jsdom does not implement scrollIntoView, which the feed calls to
 // stick to the newest message.
@@ -545,5 +551,144 @@ describe("Console restored unread", () => {
     await waitFor(() =>
       expect(markRead).toHaveBeenCalledWith(undefined, crew.id),
     );
+  });
+});
+
+describe("Console tabs", () => {
+  // A tab switch writes the tab into the URL hash; clear it between
+  // tests so each one starts on the chat tab.
+  afterEach(() => {
+    window.location.hash = "";
+  });
+
+  function tabState(overrides: Record<string, unknown> = {}) {
+    return {
+      ...tauState([], []),
+      settings: { accept_files: true, send_read_receipts: true },
+      settingsError: null,
+      updateSetting: vi.fn(),
+      exporting: false,
+      importing: false,
+      exportMessages: vi.fn(),
+      importMessages: vi.fn(),
+      exportBundle: vi.fn(),
+      importBundle: vi.fn(),
+      runDoctor: vi.fn(),
+      // Without these the feed reads pinnedMessages as undefined,
+      // which counts as the pinned view instead of traffic.
+      pinnedMessages: null,
+      pinnedError: null,
+      showPinned: vi.fn(),
+      clearPinned: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("shows the chat tab by default and hides the other tabs", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    expect(screen.getByText("traffic")).toBeTruthy();
+    expect(screen.queryByText("sneakernet")).toBeNull();
+    expect(screen.queryByText("dm allow-list")).toBeNull();
+    expect(screen.queryByTestId("social-tab-feed")).toBeNull();
+  });
+
+  it("switches to the tools tab on click", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "tools" }));
+
+    expect(screen.getByText("sneakernet")).toBeTruthy();
+    expect(screen.getByText("health")).toBeTruthy();
+    expect(screen.getByText("backup")).toBeTruthy();
+    expect(screen.queryByText("traffic")).toBeNull();
+  });
+
+  it("switches to the settings tab on click", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "settings" }));
+
+    expect(screen.getByText("dm allow-list")).toBeTruthy();
+    expect(screen.queryByText("sneakernet")).toBeNull();
+  });
+
+  it("opens on the tab named by the URL hash", () => {
+    window.location.hash = "#tools";
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    expect(screen.getByText("sneakernet")).toBeTruthy();
+    expect(screen.queryByText("traffic")).toBeNull();
+  });
+
+  it("jumps between tabs with Alt+1 through Alt+4", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    fireEvent.keyDown(document.body, { key: "3", altKey: true });
+    expect(screen.getByText("sneakernet")).toBeTruthy();
+
+    fireEvent.keyDown(document.body, { key: "2", altKey: true });
+    expect(screen.getByTestId("social-tab-feed")).toBeTruthy();
+
+    fireEvent.keyDown(document.body, { key: "1", altKey: true });
+    expect(screen.getByText("traffic")).toBeTruthy();
+  });
+
+  it("selecting a sidebar peer switches back to the chat tab", async () => {
+    const alice = {
+      destination: "ab".repeat(16),
+      name: "alice",
+      last_seen: Date.now() / 1000,
+      age: 5,
+      hops: 1,
+      protocol: 1,
+    };
+    window.location.hash = "#tools";
+    mockedUseTau.mockReturnValue(tabState({ peers: [alice] }));
+    render(<Console />);
+    expect(screen.getByText("sneakernet")).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByTitle(`Message alice (${alice.destination})`),
+    );
+
+    await waitFor(() => expect(screen.getByText("traffic")).toBeTruthy());
+    expect(screen.queryByText("sneakernet")).toBeNull();
+  });
+
+  it("starts the outbox drawer open when mail is queued, and collapses it", () => {
+    mockedUseTau.mockReturnValue(
+      tabState({
+        outbox: [
+          {
+            id: "1",
+            to: "ab".repeat(16),
+            to_name: "alice",
+            text: "hello queued",
+            created_at: 1000,
+            expires_at: 2000,
+            attempts: 0,
+            last_attempt_at: null,
+            last_error: null,
+            held_by: [],
+            scheduled_at: null,
+          },
+        ],
+      }),
+    );
+    render(<Console />);
+
+    const toggle = screen.getByRole("button", { name: /outbox.*queued/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("hello queued")).toBeTruthy();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("hello queued")).toBeNull();
   });
 });

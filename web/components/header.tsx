@@ -1,13 +1,21 @@
 "use client";
 
 import { useState } from "react";
-import Link from "next/link";
 
 import type { ConnectionState } from "@/lib/use-tau";
 import type { NodeInfo } from "@/lib/types";
 import { shortHash } from "@/lib/format";
 
-import { BoltIcon, CopyButton, DownloadIcon, SignalIcon, StatusDot } from "./ui";
+import { BoltIcon, CopyButton, SignalIcon, StatusDot } from "./ui";
+
+export const CONSOLE_TABS = [
+  { id: "chat", label: "chat" },
+  { id: "social", label: "social" },
+  { id: "tools", label: "tools" },
+  { id: "settings", label: "settings" },
+] as const;
+
+export type ConsoleTab = (typeof CONSOLE_TABS)[number]["id"];
 
 const connectionLabel: Record<ConnectionState, string> = {
   live: "live",
@@ -27,18 +35,16 @@ export function Header({
   announcing,
   onAnnounce,
   onRename,
-  backingUp,
-  backupError,
-  onBackup,
+  tab,
+  onTabChange,
 }: {
   node: NodeInfo | null;
   connection: ConnectionState;
   announcing: boolean;
   onAnnounce: () => void;
   onRename: (name: string) => Promise<void>;
-  backingUp: boolean;
-  backupError: string | null;
-  onBackup: () => void;
+  tab: ConsoleTab;
+  onTabChange: (tab: ConsoleTab) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -105,19 +111,27 @@ export function Header({
           </div>
         </div>
 
-        <nav className="hidden items-center gap-1 rounded-xl border border-line/70 bg-panel/60 p-1 text-xs sm:flex">
-          <Link
-            href="/"
-            className="rounded-lg bg-signal/15 px-2.5 py-1.5 text-signal"
-          >
-            chat
-          </Link>
-          <Link
-            href="/social/"
-            className="rounded-lg px-2.5 py-1.5 text-mist transition hover:text-zinc-100"
-          >
-            social
-          </Link>
+        <nav
+          role="tablist"
+          aria-label="console sections"
+          className="hidden items-center gap-1 rounded-xl border border-line/70 bg-panel/60 p-1 text-xs sm:flex"
+        >
+          {CONSOLE_TABS.map((entry) => (
+            <button
+              key={entry.id}
+              type="button"
+              role="tab"
+              aria-selected={tab === entry.id}
+              onClick={() => onTabChange(entry.id)}
+              className={
+                tab === entry.id
+                  ? "rounded-lg bg-signal/15 px-2.5 py-1.5 text-signal"
+                  : "rounded-lg px-2.5 py-1.5 text-mist transition hover:text-zinc-100"
+              }
+            >
+              {entry.label}
+            </button>
+          ))}
         </nav>
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -204,26 +218,6 @@ export function Header({
             <BoltIcon className="h-3.5 w-3.5" />
             {announcing ? "announcing…" : "announce"}
           </button>
-
-          <button
-            type="button"
-            onClick={onBackup}
-            disabled={!node || backingUp}
-            title="Download a backup archive of this node's data directory"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-panel/70 px-3 py-1.5 text-xs font-medium text-zinc-300 transition hover:border-mist/50 hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <DownloadIcon className="h-3.5 w-3.5" />
-            {backingUp ? "backing up…" : "back up"}
-          </button>
-          {backupError ? (
-            <span
-              role="alert"
-              className="max-w-64 truncate font-mono text-[11px] text-rose-300"
-              title={backupError}
-            >
-              backup failed: {backupError}
-            </span>
-          ) : null}
         </div>
       </div>
     </header>
