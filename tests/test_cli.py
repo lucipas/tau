@@ -4420,6 +4420,101 @@ def test_parser_peers_alias_arguments():
     assert plain.peers_command is None
 
 
+# -- peers note ---------------------------------------------------------------
+
+def test_peers_note_sets_shows_and_clears(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    code = cli.main(
+        ["peers", "note", peer_hash.hex(), "met at ATO",
+         "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "note for alice" in out
+    assert "met at ATO" in out
+
+    code = cli.main(["peers", "note", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "note for alice" in out
+    assert "met at ATO" in out
+
+    code = cli.main(
+        ["peers", "show", "alice", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "note:         met at ATO" in capsys.readouterr().out
+
+    code = cli.main(
+        ["peers", "note", "alice", "--clear", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "removed note for alice" in capsys.readouterr().out
+
+    code = cli.main(["peers", "note", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "no note set for alice" in capsys.readouterr().out
+
+
+def test_peers_note_json_and_errors(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    code = cli.main(
+        ["peers", "note", "alice", "roof node operator",
+         "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["note"] == "roof node operator"
+    assert payload["name"] == "alice"
+
+    code = cli.main(
+        ["peers", "note", "nobody", "hello", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+    code = cli.main(
+        ["peers", "note", "alice", "   ", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+
+    code = cli.main(
+        ["peers", "note", "alice", "hello", "--clear",
+         "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "cannot save a note and --clear" in capsys.readouterr().err
+
+    code = cli.main(
+        ["peers", "note", "alice", "--clear", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    capsys.readouterr()
+    code = cli.main(
+        ["peers", "note", "alice", "--clear", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "has no note" in capsys.readouterr().err
+
+
+def test_parser_peers_note_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["peers", "note", "bob", "hello there"])
+    assert args.command == "peers"
+    assert args.peers_command == "note"
+    assert args.peer == "bob"
+    assert args.text == "hello there"
+    assert args.clear is False
+    assert args.func is cli.cmd_peers_note
+
+    args = parser.parse_args(["peers", "note", "bob"])
+    assert args.text is None
+
+    args = parser.parse_args(["peers", "note", "bob", "--clear"])
+    assert args.clear is True
+
+
 def test_allowlist_add_ignores_aliases_and_lists_asserted_names(tmp_path, capsys):
     data_dir, peer_hash = _seed_alias_peer(tmp_path)
     # A second peer aliased "alice" must not be the one allow-listed when

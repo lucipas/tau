@@ -9,6 +9,7 @@ import pytest
 
 from tau.peers import (
     AmbiguousPeer,
+    MAX_NOTE_LENGTH,
     Peer,
     PeerError,
     PeerRegistry,
@@ -656,6 +657,83 @@ def test_from_dict_drops_hash_like_alias(tmp_path):
     assert Peer.from_dict(raw).alias is None
 
 
+# -- peer notes ---------------------------------------------------------------
+
+def test_note_roundtrip_persists(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    peer = make_peer(registry, 16, "pam", now=100.0)
+    registry.set_note(peer.hexhash, "  met at ATO, runs the roof node  ")
+
+    reloaded = PeerRegistry(path)
+    stored = reloaded.get(peer.destination_hash)
+    assert stored is not None
+    assert stored.note == "met at ATO, runs the roof node"
+    assert stored.to_dict()["note"] == "met at ATO, runs the roof node"
+
+
+def test_set_note_rejects_empty_overlong_and_unknown_peer(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 17, "quinn", now=100.0)
+    with pytest.raises(PeerError, match="must not be empty"):
+        registry.set_note(peer.hexhash, "   ")
+    with pytest.raises(PeerError, match="unknown peer"):
+        registry.set_note("missing", "hello")
+    with pytest.raises(PeerError, match="at most"):
+        registry.set_note(peer.hexhash, "x" * (MAX_NOTE_LENGTH + 1))
+    assert peer.note is None
+    # Exactly at the cap is fine.
+    assert registry.set_note(peer.hexhash, "x" * MAX_NOTE_LENGTH) is peer
+    assert len(peer.note) == MAX_NOTE_LENGTH
+
+
+def test_clear_note_and_clearing_without_one(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 18, "rachel", now=100.0)
+    with pytest.raises(PeerError, match="has no note"):
+        registry.clear_note(peer.hexhash)
+    registry.set_note(peer.hexhash, "owes me a reply")
+    assert registry.clear_note(peer.hexhash) is peer
+    assert peer.note is None
+
+
+def test_upsert_preserves_note(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 19, "sam", now=100.0)
+    registry.set_note(peer.hexhash, "relay operator")
+    registry.upsert(
+        peer.destination_hash,
+        peer.public_key,
+        name="sam-new",
+        hops=1,
+        now=200.0,
+    )
+    assert peer.note == "relay operator"
+    assert peer.name == "sam-new"
+
+
+def test_note_never_leaves_the_local_registry(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 20, "tina", now=100.0)
+    registry.set_note(peer.hexhash, "private context")
+    assert "note" not in peer.public_dict()
+    assert "note" not in peer.exchange_dict()
+    assert peer.local_dict()["note"] == "private context"
+    assert peer.to_dict()["note"] == "private context"
+
+
+def test_from_dict_tolerates_bad_note_values(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 21, "uma", now=100.0)
+    raw = peer.to_dict()
+    raw["note"] = 42
+    assert Peer.from_dict(raw).note is None
+    raw["note"] = "   "
+    assert Peer.from_dict(raw).note is None
+    raw["note"] = "x" * (MAX_NOTE_LENGTH + 10)
+    assert Peer.from_dict(raw).note == "x" * MAX_NOTE_LENGTH
+
+
 def test_refresh_aliases_picks_up_another_process(tmp_path):
     path = tmp_path / "peers.json"
     cli = PeerRegistry(path)
@@ -675,6 +753,31 @@ def test_refresh_aliases_picks_up_another_process(tmp_path):
     cli.clear_alias(peer.hexhash)
     assert node_view.refresh_aliases() == 1
     assert node_view.get(peer.destination_hash).alias is None
+    assert node_view.refresh_aliases() == 0
+
+
+def test_refresh_aliases_picks_up_note_changes(tmp_path):
+    path = tmp_path / "peers.json"
+    cli = PeerRegistry(path)
+    peer = make_peer(cli, 22, "victor", now=100.0)
+    cli.save()
+    # A second registry loaded earlier, as a running node's snapshot.
+    node_view = PeerRegistry(path)
+    assert node_view.get(peer.destination_hash).note is None
+
+    cli.set_note(peer.hexhash, "met at the mesh meetup")
+    assert node_view.refresh_aliases() == 1
+    assert node_view.get(peer.destination_hash).note == "met at the mesh meetup"
+    # The node's next save keeps the note instead of erasing it.
+    node_view.save()
+    assert (
+        PeerRegistry(path).get(peer.destination_hash).note
+        == "met at the mesh meetup"
+    )
+
+    cli.clear_note(peer.hexhash)
+    assert node_view.refresh_aliases() == 1
+    assert node_view.get(peer.destination_hash).note is None
     assert node_view.refresh_aliases() == 0
 
 
