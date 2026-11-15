@@ -2738,7 +2738,7 @@ export function PostCard({
                 ❝ {post.quotes}
               </span>
             ) : null}
-            {(post.quotes ?? 0) > 0 ? (
+            {(post.quotes ?? 0) > 0 && onToggleQuoters ? (
               <button
                 type="button"
                 onClick={() => onToggleQuoters?.(post)}
