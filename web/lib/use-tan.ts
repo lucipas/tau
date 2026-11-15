@@ -1263,20 +1263,22 @@ export function useTan() {
     [load],
   );
 
+  // The tag edit has committed before the refresh runs, so a refresh
+  // failure is reported as a warning rather than as the edit failing.
   const followTag = useCallback(
     async (tag: string) => {
       await apiPost("/api/tan/follow-tag", { tag });
-      await load();
+      await runRefreshes([load()]);
     },
-    [load],
+    [load, runRefreshes],
   );
 
   const unfollowTag = useCallback(
     async (tag: string) => {
       await apiPost("/api/tan/unfollow-tag", { tag });
-      await load();
+      await runRefreshes([load()]);
     },
-    [load],
+    [load, runRefreshes],
   );
 
   const like = useCallback(
