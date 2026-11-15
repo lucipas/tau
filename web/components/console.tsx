@@ -285,8 +285,8 @@ export function Console() {
             onUnarchivePeer={async (destination) => {
               await tau.unarchiveConversation(destination);
             }}
-            onMarkUnread={async (destination) => {
-              const counts = await tau.markUnread(destination);
+            onMarkUnread={async (destination, all = false) => {
+              const counts = await tau.markUnread(destination, all);
               manualUnread.current.set(
                 destination,
                 counts.per_peer[destination] ?? 0,

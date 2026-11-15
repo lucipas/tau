@@ -79,7 +79,7 @@ export function PeerSidebar({
   onUnblock: (destination: string) => void;
   onArchivePeer: (destination: string) => Promise<void>;
   onUnarchivePeer: (destination: string) => Promise<void>;
-  onMarkUnread?: (destination: string) => Promise<void>;
+  onMarkUnread?: (destination: string, all: boolean) => Promise<void>;
   onVerify: (destination: string) => void;
   onShowSafetyNumber: (destination: string) => void;
   onDismissVerification: (destination: string) => void;

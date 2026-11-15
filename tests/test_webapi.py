@@ -2540,6 +2540,36 @@ def test_mark_unread_endpoint_rejects_bad_input(bridge, node):
     assert "no stored messages" in payload["error"]["message"]
 
 
+def test_mark_unread_counts_exclude_archived_conversations(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        _inbound_record(node)
+        _inbound_record(node, id="m-2", received_at=102.0)
+        _inbound_record(
+            node,
+            destination=OTHER_HASH,
+            **{"from": "carol", "id": "m-3", "received_at": 103.0},
+        )
+        # Carol's conversation reads; alice's stays unread, then her
+        # thread is archived.
+        _json(bridge, "/api/messages/read", method="POST", body={"peer": OTHER_HASH})
+        bridge.archive_conversation("alice")
+
+        # Marking carol's whole conversation unread must not resurrect
+        # the archived thread's counts: the bridge reports unread the
+        # same way its unread endpoint does.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/unread",
+            method="POST",
+            body={"peer": OTHER_HASH, "all": True},
+        )
+        assert status == 200
+        assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "total": 1}
+    finally:
+        bridge.stop()
+
+
 def test_send_validation(bridge):
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"to": "alice", "text": " "}

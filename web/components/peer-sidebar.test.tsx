@@ -951,7 +951,21 @@ describe("PeerSidebar archived conversations", () => {
       }),
     );
     await waitFor(() =>
-      expect(onMarkUnread).toHaveBeenCalledWith(aliceHash),
+      expect(onMarkUnread).toHaveBeenCalledWith(aliceHash, false),
+    );
+  });
+
+  it("marks a whole conversation unread from the peer row", async () => {
+    const onMarkUnread = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), { onMarkUnread });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Mark whole conversation with alice unread",
+      }),
+    );
+    await waitFor(() =>
+      expect(onMarkUnread).toHaveBeenCalledWith(aliceHash, true),
     );
   });
 

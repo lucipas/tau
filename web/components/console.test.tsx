@@ -253,7 +253,16 @@ describe("Console mark unread", () => {
       }),
     );
     await waitFor(() =>
-      expect(markUnread).toHaveBeenCalledWith(alice.destination),
+      expect(markUnread).toHaveBeenCalledWith(alice.destination, false),
+    );
+    // The mark-all action forwards its flag too.
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Mark whole conversation with alice unread",
+      }),
+    );
+    await waitFor(() =>
+      expect(markUnread).toHaveBeenCalledWith(alice.destination, true),
     );
     mockedUseTau.mockReturnValue({
       ...tauState([], [alice, bob]),
