@@ -794,6 +794,63 @@ def test_peers_alias_endpoint_sets_lists_and_clears(bridge, node, tmp_path):
     assert payload["peer"]["alias"] is None
 
 
+def test_peers_snapshot_and_alias_response_exclude_notes(bridge, node, tmp_path):
+    """Private peer notes never reach the web console: it can be exposed
+    remotely without owner authentication, and it has no note UI yet."""
+    from tau.peers import PeerRegistry
+
+    registry = _seed_alias_registry(node, tmp_path)
+    registry.set_note(PEER_HASH, "met at the mesh meetup")
+
+    _, _, listed = _json(bridge, "/api/peers")
+    entry = next(
+        item
+        for item in listed["peers"]
+        if item["destination"] == PEER_HASH
+    )
+    assert "note" not in entry
+    assert entry["alias"] is None
+
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/alias",
+        method="POST",
+        body={"destination": PEER_HASH, "alias": "laptop"},
+    )
+    assert status == 200
+    assert "note" not in payload["peer"]
+    assert payload["peer"]["alias"] == "laptop"
+
+
+def test_console_alias_edit_keeps_cli_set_note(bridge, node, tmp_path):
+    """A note saved by a one-shot CLI command while the node serves must
+    survive a console alias edit: the edit saves the whole registry, so
+    it refreshes from disk first instead of writing back its stale copy."""
+    from tau.peers import PeerRegistry
+
+    _seed_alias_registry(node, tmp_path)
+    # The CLI is a separate registry instance on the same file, so the
+    # seeded registry must be on disk first.
+    node.registry.save()
+    cli_registry = PeerRegistry(tmp_path / "peers.json")
+    cli_registry.set_note(PEER_HASH, "met at the mesh meetup")
+
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/alias",
+        method="POST",
+        body={"destination": PEER_HASH, "alias": "laptop"},
+    )
+    assert status == 200
+    assert payload["peer"]["alias"] == "laptop"
+
+    reloaded = PeerRegistry(tmp_path / "peers.json")
+    stored = reloaded.get(PEER_HASH)
+    assert stored is not None
+    assert stored.note == "met at the mesh meetup"
+    assert stored.alias == "laptop"
+
+
 def test_peers_alias_response_keeps_blocked_flag(bridge, node, tmp_path):
     """The alias response replaces the console's peer record, so it must
     carry the same annotations as the peer list — a bare local_dict
@@ -3649,6 +3706,18 @@ def test_backup_without_a_data_directory_is_unavailable(bridge):
     status, _, payload = _json(bridge, "/api/backup")
     assert status == 503
     assert "no data directory" in payload["error"]["message"]
+
+
+def test_backup_download_rejects_remote_client(bridge, monkeypatch):
+    # The archive holds the node identity and peers.json — which now
+    # stores private peer notes — so a remote client must not be able
+    # to download it even when the bridge is bound to a remote interface.
+    import tau.webapi as webapi
+
+    monkeypatch.setattr(webapi, "_is_loopback_client", lambda client: False)
+    status, _, payload = _json(bridge, "/api/backup")
+    assert status == 403
+    assert "only available from localhost" in payload["error"]["message"]
 
 
 def test_live_backup_never_splits_seen_marker_from_inbox(tmp_path, capsys):

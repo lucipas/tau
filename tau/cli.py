@@ -784,6 +784,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="peer name, alias, destination hash, or hash prefix",
     )
     peers_unalias.set_defaults(func=cmd_peers_unalias)
+
+    peers_note = peers_sub.add_parser(
+        "note",
+        parents=[common],
+        help="save, show, or clear a private note on a peer",
+    )
+    peers_note.add_argument(
+        "peer",
+        metavar="PEER",
+        help="peer name, alias, destination hash, or hash prefix",
+    )
+    peers_note.add_argument(
+        "text",
+        metavar="TEXT",
+        nargs="?",
+        default=None,
+        help="private note to save (omit to show the current note)",
+    )
+    peers_note.add_argument(
+        "--clear",
+        action="store_true",
+        help="remove the peer's note",
+    )
+    peers_note.set_defaults(func=cmd_peers_note)
     peers_verify = peers_sub.add_parser(
         "verify",
         parents=[common],
@@ -5450,6 +5474,46 @@ def cmd_peers_unalias(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_peers_note(args: argparse.Namespace) -> int:
+    """Save, show, or clear a private note on a known peer.
+
+    Local-only: the note lives on the peer record in the registry and
+    is never sent to anyone.  With TEXT it saves the note, with
+    ``--clear`` it removes it, and with neither it prints the current
+    note (or that none is set).
+    """
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    if args.clear and args.text is not None:
+        raise PeerError("cannot save a note and --clear it at once")
+    if args.clear:
+        peer = registry.clear_note(args.peer)
+        if _json_mode(args):
+            _emit(peer.to_dict(), True)
+        else:
+            print(f"removed note for {peer.name} ({peer.hexhash[:8]})")
+        return _EXIT_OK
+    if args.text is not None:
+        peer = registry.set_note(args.peer, args.text)
+        if _json_mode(args):
+            _emit(peer.to_dict(), True)
+        else:
+            print(
+                f"note for {peer.name} ({peer.hexhash[:8]}): {peer.note}"
+            )
+        return _EXIT_OK
+    peer = registry.resolve(args.peer)
+    if peer is None:
+        raise PeerError(f"unknown peer {args.peer!r}")
+    if _json_mode(args):
+        _emit(peer.to_dict(), True)
+    elif peer.note:
+        print(f"note for {peer.name} ({peer.hexhash[:8]}): {peer.note}")
+    else:
+        print(f"no note set for {peer.name} ({peer.hexhash[:8]})")
+    return _EXIT_OK
+
+
 def cmd_peers_show(args: argparse.Namespace) -> int:
     """Show everything the local stores know about one peer.
 
@@ -5480,6 +5544,8 @@ def cmd_peers_show(args: argparse.Namespace) -> int:
         "protocol": peer.protocol,
         "caps": list(peer.caps),
         "via_exchange": peer.via_exchange,
+        "alias": peer.alias,
+        "note": peer.note,
         "queued": len(queued),
         "held": len(held),
         "received": len(received),
@@ -5489,6 +5555,7 @@ def cmd_peers_show(args: argparse.Namespace) -> int:
         return _EXIT_OK
     print(f"name:         {peer.display_name}")
     print(f"destination:  {peer.hexhash}")
+    print(f"note:         {peer.note or '—'}")
     print(f"lxmf:         {peer.lxmf_hash or '—'}")
     print(f"public key:   {peer.public_key.hex()}")
     print(
