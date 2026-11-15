@@ -133,6 +133,7 @@ MAX_FOLLOWS = 512
 MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_FOLLOWED_TAGS = 256
+MAX_MUTED_TAGS = 256
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
 MAX_HIDDEN_POSTS = 512
@@ -565,6 +566,12 @@ CREATE TABLE IF NOT EXISTS muted_keywords (
 );
 
 CREATE TABLE IF NOT EXISTS followed_tags (
+    tag TEXT PRIMARY KEY,
+    display TEXT NOT NULL,
+    added_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS muted_tags (
     tag TEXT PRIMARY KEY,
     display TEXT NOT NULL,
     added_at REAL NOT NULL
@@ -2704,8 +2711,10 @@ def timeline(
     a muted keyword (see :func:`muted_keywords`) never appear either,
     and a reply to one keeps its ``reply_to`` preview text blanked —
     muting is display-only, so entries stay stored and unmuting
-    restores them.  Posts by muted authors never appear either, for the
-    same reason.  Hidden posts never appear either, and a reply to
+    restores them.  Posts carrying a muted tag (see :func:`mute_tag`)
+    never appear either — a muted tag wins over a followed tag and
+    over a followed author — for the same reason.  Posts by muted
+    authors never appear either, for the same reason.  Hidden posts never appear either, and a reply to
     one keeps its ``reply_to`` preview text blanked — hiding is
     display-only, so unhiding restores them.  A repost of a post by
     a muted or blocked author, or
@@ -2715,7 +2724,8 @@ def timeline(
     :func:`follow_tag`) also appear when their author is not
     followed, marked with ``via_tag`` — but the silencing rules
     above still win: a muted or blocked author's tagged post never
-    appears, and neither does one matching a muted keyword.  Pages are read until ``limit`` unmuted posts are
+    appears, and neither does one matching a muted keyword or carrying
+    a muted tag.  Pages are read until ``limit`` unmuted posts are
     collected or the feed is exhausted, so muted posts never shrink the
     result below what is available.  ``exclude_authors`` hides posts
     from blocked authors — and blanks their words from reply
@@ -2732,6 +2742,7 @@ def timeline(
     blocked = set(_clean_excluded(exclude_authors))
     hidden = silenced | blocked
     keywords = _muted_keyword_list(conn)
+    muted = _muted_tag_list(conn)
     wanted_tag = clean_tag(tag) if tag is not None else None
     keep_tag = _tag_page_filter(
         conn,
@@ -2744,6 +2755,7 @@ def timeline(
 
     def _drop_hidden(page: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         visible = keep_tag(page) if keep_tag is not None else page
+        visible = without_muted_tags(conn, visible, muted)
         return without_hidden_posts(visible, hidden_hashes)
     if include_all:
         posts = _fill_unmuted(
@@ -2934,7 +2946,8 @@ def author_timeline(
     """Return one author's posts newest first, with muted and hidden posts skipped.
 
     Pages through the author's chain until *limit* unmuted posts are
-    collected, so muted posts never shrink the result.  Reply previews
+    collected, so muted posts never shrink the result.  Posts carrying
+    a muted tag never appear either, as in :func:`timeline`.  Reply previews
     are redacted for muted parents, as in :func:`timeline`.  The page
     reads rows with their sequence numbers attached — :func:`feed`
     strips ``seq`` from its results, so paging on it would fail as
@@ -2951,6 +2964,7 @@ def author_timeline(
     if author in blocked:
         return []
     keywords = _muted_keyword_list(conn)
+    muted = _muted_tag_list(conn)
     silenced = muted_author_set(conn)
     wanted_tag = clean_tag(tag) if tag is not None else None
     keep_tag = _tag_page_filter(
@@ -2960,6 +2974,7 @@ def author_timeline(
 
     def _drop_hidden(page: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         visible = keep_tag(page) if keep_tag is not None else page
+        visible = without_muted_tags(conn, visible, muted)
         return without_hidden_posts(visible, hidden_hashes)
 
     def page(cursor: int) -> List[Dict[str, Any]]:
@@ -4067,6 +4082,105 @@ def followed_tags(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 def _followed_tag_list(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute("SELECT tag FROM followed_tags").fetchall()
     return [str(row["tag"]) for row in rows]
+
+
+def mute_tag(
+    conn: sqlite3.Connection,
+    tag: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Mute *tag* so its posts stay out of the timeline.  Re-muting is a
+    no-op returning the original record, so the first mute time is kept."""
+    clean = clean_tag(tag)
+    display = str(tag).strip()
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking for an existing mute and the
+    # capacity, so a concurrent mute cannot slip in between check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT tag, display, added_at FROM muted_tags WHERE tag = ?",
+            (clean,),
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            return {
+                "tag": str(existing["tag"]),
+                "display": str(existing["display"]),
+                "added_at": float(existing["added_at"]),
+            }
+        count = conn.execute("SELECT COUNT(*) AS n FROM muted_tags").fetchone()["n"]
+        if int(count) >= MAX_MUTED_TAGS:
+            raise TanError(
+                f"muted tag list is limited to {MAX_MUTED_TAGS} tags"
+            )
+        conn.execute(
+            "INSERT INTO muted_tags(tag, display, added_at) "
+            "VALUES(?, ?, ?)",
+            (clean, display, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {"tag": clean, "display": display, "added_at": timestamp}
+
+
+def unmute_tag(conn: sqlite3.Connection, tag: str) -> bool:
+    """Stop muting *tag*.  Returns whether one was removed."""
+    clean = clean_tag(tag)
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM muted_tags WHERE tag = ?", (clean,)
+        )
+    return cursor.rowcount > 0
+
+
+def muted_tags(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Muted tags, newest first."""
+    rows = conn.execute(
+        "SELECT tag, display, added_at FROM muted_tags "
+        "ORDER BY added_at DESC"
+    ).fetchall()
+    return [
+        {
+            "tag": str(row["tag"]),
+            "display": str(row["display"]),
+            "added_at": float(row["added_at"]),
+        }
+        for row in rows
+    ]
+
+
+def _muted_tag_list(conn: sqlite3.Connection) -> List[str]:
+    rows = conn.execute("SELECT tag FROM muted_tags").fetchall()
+    return [str(row["tag"]) for row in rows]
+
+
+def without_muted_tags(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+    tags: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Drop posts carrying a muted tag, keeping the rest.
+
+    Muting is display-only: entries stay stored and keep syncing, so
+    unmuting restores them.  Tags come from each post's current text —
+    a repost matches on the text of the post it reposts, so muting a
+    tag hides reposts of muted-tag posts too, and an edited post
+    matches on its edited text.  Pass *tags* when the caller already
+    loaded them to avoid a second lookup.
+    """
+    muted = set(tags) if tags is not None else set(_muted_tag_list(conn))
+    if not muted:
+        return list(posts)
+    tag_sets = _post_tag_sets(conn, posts)
+    return [
+        post
+        for post in posts
+        if not (muted & tag_sets.get(str(post["hash"]), set()))
+    ]
 
 
 def without_muted_keywords(
