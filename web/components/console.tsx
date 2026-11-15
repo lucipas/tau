@@ -156,7 +156,7 @@ export function Console() {
     // stays open, so returning to it follows the normal read path
     // instead of skipping markRead. A retarget to the same
     // conversation keeps the hold.
-    if (value !== target) leaveConversation(target);
+    if (value !== target) manualUnread.current.delete(target);
     setTarget(value);
   }
 
@@ -466,16 +466,14 @@ export function Console() {
                 // though it also names a member peer. Jumping to the
                 // conversation opens it, so clear any hold on it first:
                 // the auto-read below marks it read, like a reopen.
-                const destination = message.group ?? message.peer;
-                if (destination) {
-                  // Jumping to another conversation leaves the open one,
-                  // so its hold goes too. Staying put keeps the hold.
-                  if (destination !== target) {
-                    leaveConversation(target);
-                    leaveConversation(destination);
-                  }
-                  setTarget(destination);
-                  setMode(message.group ? "group" : "peer");
+                if (message.group) {
+                  manualUnread.current.delete(message.group);
+                  setTarget(message.group);
+                  setMode("group");
+                } else if (message.peer) {
+                  manualUnread.current.delete(message.peer);
+                  setTarget(message.peer);
+                  setMode("peer");
                 }
               }}
               onDelete={async (message) => {
@@ -598,17 +596,6 @@ export function Console() {
         </main>
 
         <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
-          <span>
-            tau {tau.node?.version ?? "—"} · Reticulum{" "}
-            {tau.node?.rns_version ?? "—"}
-          </span>
-          <span>no servers · no accounts · encrypted links</span>
-        </footer>
-      </div>
-    </div>
-  );
-}
- <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
           <span>
             tau {tau.node?.version ?? "—"} · Reticulum{" "}
             {tau.node?.rns_version ?? "—"}
