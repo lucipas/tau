@@ -7,12 +7,18 @@ import type {
   ArchivedConversation,
   BridgeInfo,
   ChangeGroupMembersResponse,
+  IgnoredGroupEntry,
+  IgnoreGroupResponse,
+  LeaveGroupResponse,
+  LeftGroup,
   NodeInfo,
   Peer,
+  RejoinGroupResponse,
   RenameGroupResponse,
   SetGroupTopicResponse,
   SocialInfo,
   TauGroup,
+  UnignoreGroupResponse,
   VerifyState,
 } from "@/lib/types";
 import type { BlockState, PeerInfoState, PingState } from "@/lib/use-tau";import {
@@ -29,6 +35,8 @@ export function PeerSidebar({
   node,
   peers,
   groups,
+  leftGroups,
+  ignoredGroups,
   bridge,
   social,
   pings,
@@ -53,6 +61,10 @@ export function PeerSidebar({
   onSetAlias,
   onCreateGroup,
   onDeleteGroup,
+  onLeaveGroup,
+  onRejoinGroup,
+  onIgnoreGroup,
+  onUnignoreGroup,
   onAddGroupMembers,
   onRemoveGroupMembers,
   onRenameGroup,
@@ -61,6 +73,8 @@ export function PeerSidebar({
   node: NodeInfo | null;
   peers: Peer[];
   groups: TauGroup[];
+  leftGroups: LeftGroup[];
+  ignoredGroups: IgnoredGroupEntry[];
   bridge: BridgeInfo | null;
   social: SocialInfo | null;
   pings: Record<string, PingState>;
@@ -85,6 +99,10 @@ export function PeerSidebar({
   onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
   onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
   onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
+  onLeaveGroup?: (group: string) => Promise<LeaveGroupResponse>;
+  onRejoinGroup?: (group: string) => Promise<RejoinGroupResponse>;
+  onIgnoreGroup?: (group: string) => Promise<IgnoreGroupResponse>;
+  onUnignoreGroup?: (group: string) => Promise<UnignoreGroupResponse>;
   onAddGroupMembers?: (
     group: string,
     members: string[],
@@ -260,10 +278,27 @@ export function PeerSidebar({
   // finishes later only touches the editor it was started from.
   const memberEditSession = useRef(0);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Leaving silences a whole group, so like delete it takes two
+  // clicks: arm on the first, confirm on the second. Rejoining and
+  // unignoring are directly reversible and need only one.
+  const [confirmingLeaveId, setConfirmingLeaveId] = useState<string | null>(
+    null,
+  );
+  const [leavingId, setLeavingId] = useState<string | null>(null);
+  // Pending ids are tracked per group: one finishing must not clear
+  // the guard on another request that is still in flight.
+  const [rejoiningIds, setRejoiningIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [ignoringIds, setIgnoringIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const leaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     return () => {
       if (confirmTimer.current) clearTimeout(confirmTimer.current);
+      if (leaveTimer.current) clearTimeout(leaveTimer.current);
     };
   }, []);
 
@@ -286,6 +321,86 @@ export function PeerSidebar({
       setGroupError(caught instanceof Error ? caught.message : "delete failed");
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  function armLeaveConfirm(id: string) {
+    setGroupError(null);
+    setConfirmingLeaveId(id);
+    if (leaveTimer.current) clearTimeout(leaveTimer.current);
+    leaveTimer.current = setTimeout(() => setConfirmingLeaveId(null), 5000);
+  }
+
+  async function confirmLeave(id: string) {
+    if (!onLeaveGroup) return;
+    if (leaveTimer.current) clearTimeout(leaveTimer.current);
+    setConfirmingLeaveId(null);
+    setLeavingId(id);
+    setGroupError(null);
+    try {
+      await onLeaveGroup(id);
+    } catch (caught) {
+      setGroupError(caught instanceof Error ? caught.message : "leave failed");
+    } finally {
+      setLeavingId(null);
+    }
+  }
+
+  async function submitRejoin(id: string) {
+    if (!onRejoinGroup) return;
+    setRejoiningIds((previous) => new Set(previous).add(id));
+    setGroupError(null);
+    try {
+      await onRejoinGroup(id);
+    } catch (caught) {
+      setGroupError(
+        caught instanceof Error ? caught.message : "rejoin failed",
+      );
+    } finally {
+      setRejoiningIds((previous) => {
+        const next = new Set(previous);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
+  async function submitIgnoreToggle(group: TauGroup) {
+    const apply = group.ignored ? onUnignoreGroup : onIgnoreGroup;
+    if (!apply) return;
+    setIgnoringIds((previous) => new Set(previous).add(group.id));
+    setGroupError(null);
+    try {
+      await apply(group.id);
+    } catch (caught) {
+      setGroupError(
+        caught instanceof Error ? caught.message : "ignore failed",
+      );
+    } finally {
+      setIgnoringIds((previous) => {
+        const next = new Set(previous);
+        next.delete(group.id);
+        return next;
+      });
+    }
+  }
+
+  async function submitUnignoreOrphan(id: string) {
+    if (!onUnignoreGroup) return;
+    setIgnoringIds((previous) => new Set(previous).add(id));
+    setGroupError(null);
+    try {
+      await onUnignoreGroup(id);
+    } catch (caught) {
+      setGroupError(
+        caught instanceof Error ? caught.message : "unignore failed",
+      );
+    } finally {
+      setIgnoringIds((previous) => {
+        const next = new Set(previous);
+        next.delete(id);
+        return next;
+      });
     }
   }
 
@@ -418,6 +533,12 @@ export function PeerSidebar({
   // Archived conversations live in their own section below: the peer
   // list is the live feed's roster, so a hidden thread never sits in it.
   const archivedSet = new Set(archived.map((entry) => entry.destination));
+  // Ignored groups with no stored record: the id survives in the
+  // ignore list after the group itself was deleted, so they need
+  // their own unignore path instead of a row in the group list.
+  const orphanedIgnored = ignoredGroups.filter(
+    (entry) => !groups.some((group) => group.id === entry.id),
+  );
   const activePeers = peers.filter(
     (peer) => !archivedSet.has(peer.destination),
   );
@@ -1260,7 +1381,12 @@ export function PeerSidebar({
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <p className="truncate text-xs font-medium text-zinc-200">
-                      {group.name}
+                      {group.name}{" "}
+                      {group.ignored ? (
+                        <span className="rounded-full border border-line bg-void/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-mist">
+                          ignored
+                        </span>
+                      ) : null}
                     </p>
                     <p className="mt-0.5 truncate font-mono text-[10px] text-mist">
                       {group.members.map((member) => member.name).join(", ")}
@@ -1314,6 +1440,46 @@ export function PeerSidebar({
                           : confirmingId === group.id
                             ? "confirm delete"
                             : "delete"}
+                      </button>
+                    ) : null}
+                    {group.created_by_me === false &&
+                    group.can_leave !== false &&
+                    onLeaveGroup ? (
+                      <button
+                        type="button"
+                        disabled={leavingId === group.id}
+                        onClick={() => {
+                          if (confirmingLeaveId === group.id) {
+                            void confirmLeave(group.id);
+                          } else {
+                            armLeaveConfirm(group.id);
+                          }
+                        }}
+                        className={`rounded-md border px-2 py-1 font-mono text-[11px] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50 ${
+                          confirmingLeaveId === group.id
+                            ? "border-amber/60 bg-amber/10 text-amber"
+                            : "border-line/80 bg-panel/60 text-mist hover:border-rose-400/50 hover:text-rose-300"
+                        }`}
+                      >
+                        {leavingId === group.id
+                          ? "leaving…"
+                          : confirmingLeaveId === group.id
+                            ? "confirm leave"
+                            : "leave"}
+                      </button>
+                    ) : null}
+                    {onIgnoreGroup && onUnignoreGroup ? (
+                      <button
+                        type="button"
+                        disabled={ignoringIds.has(group.id)}
+                        onClick={() => void submitIgnoreToggle(group)}
+                        className="rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                      >
+                        {ignoringIds.has(group.id)
+                          ? "saving…"
+                          : group.ignored
+                            ? "unignore"
+                            : "ignore"}
                       </button>
                     ) : null}
                   </div>
@@ -1508,6 +1674,75 @@ export function PeerSidebar({
             })}
           </ul>
         )}
+        {onRejoinGroup && leftGroups.length > 0 ? (
+          <div className="mt-3 border-t border-line/50 pt-3">
+            <SectionLabel>left groups</SectionLabel>
+            <ul className="mt-2 space-y-2">
+              {leftGroups.map((entry) => (
+                <li
+                  key={entry.id}
+                  className="flex items-center justify-between gap-2 rounded-xl border border-line/70 bg-void/40 px-2.5 py-2"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-mono text-[11px] text-zinc-200">
+                      {shortHash(entry.id, 10)}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-mist">
+                      left{" "}
+                      {now
+                        ? formatAge(
+                            Math.max(0, now / 1000 - entry.left_at),
+                          )
+                        : "recently"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={rejoiningIds.has(entry.id)}
+                    onClick={() => void submitRejoin(entry.id)}
+                    className="shrink-0 rounded-md border border-signal/50 bg-signal/10 px-2 py-1 font-mono text-[11px] text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                  >
+                    {rejoiningIds.has(entry.id) ? "rejoining…" : "rejoin"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-2 text-[11px] leading-relaxed text-mist">
+              Rejoining lets the next message pin the group again.
+            </p>
+          </div>
+        ) : null}
+        {onUnignoreGroup && orphanedIgnored.length > 0 ? (
+          <div className="mt-3 border-t border-line/50 pt-3">
+            <SectionLabel>ignored, no group</SectionLabel>
+            <ul className="mt-2 space-y-2">
+              {orphanedIgnored.map((entry) => (
+                <li
+                  key={entry.id}
+                  className="flex items-center justify-between gap-2 rounded-xl border border-line/70 bg-void/40 px-2.5 py-2"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-mono text-[11px] text-zinc-200">
+                      {shortHash(entry.id, 10)}
+                    </p>
+                    <p className="mt-0.5 text-[11px] leading-relaxed text-mist">
+                      Its group record is gone; the ignore list still
+                      holds the id.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={ignoringIds.has(entry.id)}
+                    onClick={() => void submitUnignoreOrphan(entry.id)}
+                    className="shrink-0 rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                  >
+                    {ignoringIds.has(entry.id) ? "saving…" : "unignore"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
       </section>
 
       <div className="hidden items-start gap-2 rounded-2xl border border-line/60 bg-panel/40 p-3 text-[11px] leading-relaxed text-mist lg:flex">

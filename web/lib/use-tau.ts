@@ -30,6 +30,11 @@ import type {
   GroupsResponse,
   HeldMailEntry,
   HeldMailResponse,
+  IgnoreGroupResponse,
+  IgnoredGroupEntry,
+  LeaveGroupResponse,
+  LeftGroup,
+  LeftGroupsResponse,
   MarkReadResponse,
   MessagesExportDocument,
   MessagesImportResponse,
@@ -47,6 +52,7 @@ import type {
   PingResult,
   PinMessageResponse,
   ReactResponse,
+  RejoinGroupResponse,
   RenameGroupResponse,
   RenameResponse,
   RetractMessageResponse,
@@ -61,6 +67,7 @@ import type {
   SocialInfo,
   TauGroup,
   TauMessage,
+  UnignoreGroupResponse,
   UnpinMessageResponse,
   UnreadCounts,
   UpdateSettingsResponse,
@@ -117,6 +124,16 @@ function isArchivedThread(entry: TauMessage, archived: Set<string>): boolean {
   return !entry.group && archived.has(entry.peer ?? "");
 }
 
+/** True when a message belongs to an ignored group, matching the
+ * server listing, which hides an ignored group's posts — inbound
+ * and outbound legs alike — from the default feed. */
+function isIgnoredGroupMessage(
+  entry: TauMessage,
+  ignored: Set<string>,
+): boolean {
+  return typeof entry.group === "string" && ignored.has(entry.group);
+}
+
 function readEventData<T>(event: Event): T | null {
   try {
     return JSON.parse((event as MessageEvent).data) as T;
@@ -154,6 +171,13 @@ export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [groups, setGroups] = useState<TauGroup[]>([]);
+  // Groups this node has left, plus the ignored groups: the left
+  // list is the way back in, and the ignored list covers groups
+  // whose record is gone but whose ignored id survives.
+  const [leftGroups, setLeftGroups] = useState<LeftGroup[]>([]);
+  const [ignoredGroups, setIgnoredGroups] = useState<IgnoredGroupEntry[]>(
+    [],
+  );
   // The latest roster swap: the console uses it to keep a selected old
   // group id pointing at its successor.
   const [groupSwap, setGroupSwap] = useState<{
@@ -190,6 +214,10 @@ export function useTau() {
   // message that arrives for one (archived from another tab or the CLI)
   // is dropped on arrival, the same way a blocked sender's is.
   const archivedDestinations = useRef(new Set<string>());
+  // Ignored group ids, for the live feed: a post that arrives for one
+  // (ignored from another tab or the CLI) is dropped on arrival, the
+  // same way an archived thread's is.
+  const ignoredGroupIds = useRef(new Set<string>());
   const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [social, setSocial] = useState<SocialInfo | null>(null);
@@ -232,6 +260,41 @@ export function useTau() {
     if (requestId !== groupsSeq.current) return;
     setGroups(result.groups);
   }, []);
+
+  const leftGroupsSeq = useRef(0);
+
+  const refreshLeftGroups = useCallback(async () => {
+    // Same polling shape as the groups: a leave or ignore from
+    // another tab or the CLI shows up here without a reload.
+    const requestId = ++leftGroupsSeq.current;
+    const result = await apiGet<LeftGroupsResponse>("/api/groups/left");
+    if (requestId !== leftGroupsSeq.current) return;
+    setLeftGroups(result.left);
+    setIgnoredGroups(result.ignored);
+    // The CLI or another tab can ignore or unignore a group without
+    // this console acting: reconcile the open views with the new
+    // membership, as the local ignore and unignore paths do.
+    const previous = ignoredGroupIds.current;
+    const next = new Set((result.ignored ?? []).map((entry) => entry.id));
+    ignoredGroupIds.current = next;
+    hideIgnoredGroupMessages(
+      new Set([...next].filter((id) => !previous.has(id))),
+    );
+    if ([...previous].some((id) => !next.has(id))) {
+      // A restored group's history was left out of the feed:
+      // re-read it, and re-run an open pinned view.
+      try {
+        await refreshMessages();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      refreshPinnedView.current?.();
+    }
+  }, []);
+  // Note: hideIgnoredGroupMessages is intentionally not a dep, like
+  // refreshMessages in refreshArchived — it is a stable callback
+  // declared below, and listing it here would read it before its
+  // declaration when the hook first renders.
 
   // A roster change or a rename is a successor group: swap the old id
   // for the new one at once, so the console can move a selected old id
@@ -398,6 +461,10 @@ export function useTau() {
         archivedDestinations.current.has(message.peer ?? "")
       )
         return;
+      // A post that arrives for an ignored group stays hidden the
+      // same way: the server's snapshots already filter it, so the
+      // live feed must too.
+      if (isIgnoredGroupMessage(message, ignoredGroupIds.current)) return;
       snapshotMax.current = Math.max(snapshotMax.current, message.id);
       setMessages((previous) => {
         if (previous.some((entry) => entry.id === message.id)) return previous;
@@ -453,6 +520,10 @@ export function useTau() {
           );
         }
         if (message.pinned !== true) return previous;
+        // A pin that lands for an ignored group must not insert its
+        // post into the pinned view: the server listing hides it.
+        if (isIgnoredGroupMessage(message, ignoredGroupIds.current))
+          return previous;
         return [message, ...previous].sort((a, b) => b.id - a.id);
       });
     };
@@ -678,6 +749,22 @@ export function useTau() {
     });
   }, []);
 
+  // Removes received posts of ignored groups from the views that may
+  // still hold them: the feed and the pinned view. Search hits stay:
+  // search is an explicit lookup and still finds ignored-group mail.
+  // Unread badges are not adjusted here — the server publishes fresh
+  // counts when the ignore list changes, and per-peer counts cannot
+  // tell how much of a sender's unread belongs to one group.
+  const hideIgnoredGroupMessages = useCallback((groupIds: Set<string>) => {
+    if (groupIds.size === 0) return;
+    const visible = (entry: TauMessage) =>
+      !isIgnoredGroupMessage(entry, groupIds);
+    setMessages((previous) => previous.filter(visible));
+    setPinnedMessages((previous) =>
+      previous === null ? null : previous.filter(visible),
+    );
+  }, []);
+
   const refreshArchived = useCallback(async () => {
     // Same stale-response guard as the DM-requests refresh: a slow poll
     // must not restore a conversation an archive or unarchive already
@@ -790,6 +877,7 @@ export function useTau() {
         refreshDmRequests(),
         refreshArchived(),
         refreshGroups(),
+        refreshLeftGroups(),
         refreshSettings(),
         refreshAllowlist(),
       ]);
@@ -799,7 +887,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshGroups, refreshSettings, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshGroups, refreshLeftGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     (target: string) =>
@@ -1579,6 +1667,133 @@ export function useTau() {
     [refreshGroups],
   );
 
+  const leaveGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<LeaveGroupResponse>(
+        "/api/groups/leave",
+        { group },
+      );
+      // Drop the group locally at once; a left group has no record
+      // to reappear from, so the refresh below must not be the only
+      // thing that removes it. The left entry carries a local time
+      // until the refresh replaces it with the stored one.
+      const leftIds = [result.id, ...(result.also_left ?? [])];
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.filter((entry) => !leftIds.includes(entry.id)),
+      );
+      // Every roster the leave removed needs a Rejoin entry, not just
+      // the requested id, until the authoritative list replaces these.
+      setLeftGroups((previous) => [
+        ...previous.filter((entry) => !leftIds.includes(entry.id)),
+        ...leftIds.map((id) => ({ id, left_at: Date.now() / 1000 })),
+      ]);
+      try {
+        await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups, refreshLeftGroups],
+  );
+
+  const rejoinGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<RejoinGroupResponse>(
+        "/api/groups/rejoin",
+        { group },
+      );
+      // Rejoining clears the left list; the record itself only
+      // returns when the next message pins the group again, so there
+      // is nothing to add back to the roster here.
+      groupEdits.current += 1;
+      setLeftGroups((previous) =>
+        previous.filter((entry) => entry.id !== result.rejoined),
+      );
+      try {
+        await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups, refreshLeftGroups],
+  );
+
+  const ignoreGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<IgnoreGroupResponse>(
+        "/api/groups/ignore",
+        { group },
+      );
+      // Flip the flag in place at once, then refresh best-effort so
+      // a failed GET cannot leave the stale flag on screen.
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.map((entry) =>
+          entry.id === result.group ? { ...entry, ignored: true } : entry,
+        ),
+      );
+      // The group's posts leave the feed at once; the server's unread
+      // event carries the fresh badge counts, and a reload no longer
+      // returns the posts. Search hits keep them: search is an
+      // explicit lookup.
+      ignoredGroupIds.current = new Set([
+        ...ignoredGroupIds.current,
+        result.group,
+      ]);
+      hideIgnoredGroupMessages(new Set([result.group]));
+      try {
+        await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups, refreshLeftGroups, hideIgnoredGroupMessages],
+  );
+
+  const unignoreGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<UnignoreGroupResponse>(
+        "/api/groups/unignore",
+        { group },
+      );
+      // Flip the flag in place, and drop an orphaned ignored entry
+      // (no stored group to flip) at once.
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.map((entry) =>
+          entry.id === result.group ? { ...entry, ignored: false } : entry,
+        ),
+      );
+      setIgnoredGroups((previous) =>
+        previous.filter((entry) => entry.id !== result.group),
+      );
+      // Stored history returns on unignore: re-read the feed, which
+      // the server no longer filters for this group, and re-run an
+      // open pinned view. The server's unread event carries the
+      // fresh badge counts.
+      const restored = new Set(ignoredGroupIds.current);
+      restored.delete(result.group);
+      ignoredGroupIds.current = restored;
+      try {
+        await refreshMessages();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      refreshPinnedView.current?.();
+      try {
+        await Promise.allSettled([refreshGroups(), refreshLeftGroups()]);
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups, refreshLeftGroups],
+  );
+
   const editBlock = useCallback(
     async (destination: string, block: boolean) => {
       setBlocks((previous) => ({
@@ -1808,6 +2023,10 @@ export function useTau() {
         // Likewise a thread archived while this GET was in flight: the
         // archive already removed it, so the stale response must not.
         if (isArchivedThread(entry, archivedDestinations.current)) continue;
+        // Likewise a group ignored while this GET was in flight: the
+        // ignore already removed it, so the stale response must not
+        // put it back.
+        if (isIgnoredGroupMessage(entry, ignoredGroupIds.current)) continue;
         byId.set(entry.id, entry);
       }
       const merged = [...byId.values()].sort((a, b) => a.id - b.id);
@@ -2033,7 +2252,8 @@ export function useTau() {
           .filter(
             (entry) =>
               !removedMessageIds.current.has(entry.id) &&
-              !isArchivedThread(entry, archivedDestinations.current),
+              !isArchivedThread(entry, archivedDestinations.current) &&
+              !isIgnoredGroupMessage(entry, ignoredGroupIds.current),
           )
           .reverse(),
       );
@@ -2133,6 +2353,8 @@ export function useTau() {
     node,
     peers,
     groups,
+    leftGroups,
+    ignoredGroups,
     messages,
     searchResults,
     searchQuery,
@@ -2199,12 +2421,17 @@ export function useTau() {
     clearReaction,
     createGroup,
     deleteGroup,
+    leaveGroup,
+    rejoinGroup,
+    ignoreGroup,
+    unignoreGroup,
     addGroupMembers,
     removeGroupMembers,
     renameGroup,
     setGroupTopic,
     refreshOutbox,
     refreshGroups,
+    refreshLeftGroups,
     groupSwap,
     refreshSettings,
     updateSetting,

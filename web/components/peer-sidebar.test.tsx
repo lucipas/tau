@@ -5,12 +5,18 @@ import { ApiError } from "@/lib/api";
 import type {
   ArchivedConversation,
   ChangeGroupMembersResponse,
+  IgnoredGroupEntry,
+  IgnoreGroupResponse,
+  LeaveGroupResponse,
+  LeftGroup,
   NodeInfo,
   Peer,
+  RejoinGroupResponse,
   RenameGroupResponse,
   SetGroupTopicResponse,
   SocialInfo,
   TauGroup,
+  UnignoreGroupResponse,
 } from "@/lib/types";
 import type { PeerInfoState } from "@/lib/use-tau";
 
@@ -62,8 +68,14 @@ type SidebarOptions = {
   peers?: Peer[];
   onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
   groups?: TauGroup[];
+  leftGroups?: LeftGroup[];
+  ignoredGroups?: IgnoredGroupEntry[];
   onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
   onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
+  onLeaveGroup?: (group: string) => Promise<LeaveGroupResponse>;
+  onRejoinGroup?: (group: string) => Promise<RejoinGroupResponse>;
+  onIgnoreGroup?: (group: string) => Promise<IgnoreGroupResponse>;
+  onUnignoreGroup?: (group: string) => Promise<UnignoreGroupResponse>;
   onAddGroupMembers?: (
     group: string,
     members: string[],
@@ -135,6 +147,8 @@ function renderSidebar(
         ]
       }
       groups={options.groups ?? []}
+      leftGroups={options.leftGroups ?? []}
+      ignoredGroups={options.ignoredGroups ?? []}
       bridge={null}
       social={options.social ?? null}
       pings={{}}
@@ -159,6 +173,10 @@ function renderSidebar(
       onSetAlias={onSetAlias}
       onCreateGroup={options.onCreateGroup}
       onDeleteGroup={options.onDeleteGroup}
+      onLeaveGroup={options.onLeaveGroup}
+      onRejoinGroup={options.onRejoinGroup}
+      onIgnoreGroup={options.onIgnoreGroup}
+      onUnignoreGroup={options.onUnignoreGroup}
       onAddGroupMembers={options.onAddGroupMembers}
       onRemoveGroupMembers={options.onRemoveGroupMembers}
       onRenameGroup={options.onRenameGroup}
@@ -811,6 +829,173 @@ describe("PeerSidebar group management", () => {
 
     await screen.findByText("only the creator can rename a group");
     expect(screen.getByRole("button", { name: "save name" })).toBeTruthy();
+  });
+});
+
+describe("PeerSidebar group leave / ignore", () => {
+  it("asks for confirmation before leaving a learned group", async () => {
+    const onLeaveGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      id: group,
+      name: "weekend",
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: false })],
+      onLeaveGroup,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "leave" }));
+    expect(onLeaveGroup).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "confirm leave" }));
+    expect(onLeaveGroup).toHaveBeenCalledWith("11".repeat(16));
+    await screen.findByRole("button", { name: "leave" });
+  });
+
+  it("hides the leave button on groups this node created", () => {
+    const onLeaveGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      id: group,
+      name: "weekend",
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: true })],
+      onLeaveGroup,
+    });
+
+    expect(screen.queryByRole("button", { name: "leave" })).toBeNull();
+  });
+
+  it("hides the leave button when the server says it cannot be left", () => {
+    // A group this node created under an earlier identity reports
+    // created_by_me false but can_leave false: the button must not
+    // offer a leave the bridge will refuse.
+    const onLeaveGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      id: group,
+      name: "weekend",
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: false, can_leave: false })],
+      onLeaveGroup,
+    });
+
+    expect(screen.queryByRole("button", { name: "leave" })).toBeNull();
+  });
+
+  it("offers ignore on a group", async () => {
+    const onIgnoreGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      group,
+      name: "weekend",
+      ignored: true,
+      changed: true,
+    }));
+    const onUnignoreGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      group,
+      name: "weekend",
+      ignored: false,
+      changed: true,
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: false })],
+      onIgnoreGroup,
+      onUnignoreGroup,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "ignore" }));
+    expect(onIgnoreGroup).toHaveBeenCalledWith("11".repeat(16));
+    expect(screen.queryByText("ignored")).toBeNull();
+    await screen.findByRole("button", { name: "ignore" });
+  });
+
+  it("shows the ignored badge and offers unignore on an ignored group", async () => {
+    const onIgnoreGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      group,
+      name: "weekend",
+      ignored: true,
+      changed: true,
+    }));
+    const onUnignoreGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      group,
+      name: "weekend",
+      ignored: false,
+      changed: true,
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: false, ignored: true })],
+      onIgnoreGroup,
+      onUnignoreGroup,
+    });
+
+    expect(screen.getByText("ignored")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "unignore" }));
+    expect(onUnignoreGroup).toHaveBeenCalledWith("11".repeat(16));
+    await screen.findByRole("button", { name: "unignore" });
+  });
+
+  it("shows left groups with a rejoin button", async () => {
+    const onRejoinGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      rejoined: group,
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [],
+      leftGroups: [{ id: "22".repeat(16), left_at: Date.now() / 1000 - 3600 }],
+      onRejoinGroup,
+    });
+
+    expect(screen.getByText("left groups")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "rejoin" }));
+    expect(onRejoinGroup).toHaveBeenCalledWith("22".repeat(16));
+    await screen.findByRole("button", { name: "rejoin" });
+  });
+
+  it("offers unignore for an ignored group with no record", async () => {
+    const onUnignoreGroup = vi.fn(async (group: string) => ({
+      ok: true,
+      group,
+      name: "",
+      ignored: false,
+      changed: true,
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [],
+      ignoredGroups: [{ id: "33".repeat(16), name: "" }],
+      onUnignoreGroup,
+    });
+
+    expect(screen.getByText("ignored, no group")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "unignore" }));
+    expect(onUnignoreGroup).toHaveBeenCalledWith("33".repeat(16));
+    await screen.findByRole("button", { name: "unignore" });
+  });
+
+  it("does not list an ignored group with a record as an orphan", () => {
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ ignored: true })],
+      ignoredGroups: [{ id: "11".repeat(16), name: "weekend" }],
+      onIgnoreGroup: vi.fn(async (group: string) => ({
+        ok: true,
+        group,
+        name: "weekend",
+        ignored: true,
+        changed: true,
+      })),
+      onUnignoreGroup: vi.fn(async (group: string) => ({
+        ok: true,
+        group,
+        name: "weekend",
+        ignored: false,
+        changed: true,
+      })),
+    });
+
+    expect(screen.queryByText("ignored, no group")).toBeNull();
+    expect(screen.getByText("ignored")).toBeTruthy();
   });
 });
 

@@ -85,10 +85,18 @@ export interface TauGroup {
   // Absent on snapshots from an older bridge; only groups this node
   // created offer member changes in the console.
   created_by_me?: boolean;
+  // False when the bridge will refuse a leave — a group this node
+  // created, under this identity or an earlier one — so the sidebar
+  // never offers a leave that always fails. Absent on snapshots from
+  // an older bridge, which the sidebar treats as leavable.
+  can_leave?: boolean;
   // The group's topic, as set with `tau group topic` or from the
   // console; empty when none is set. Absent on snapshots from an older
   // bridge.
   topic?: string;
+  // True when the group's messages are ignored (muted) locally.
+  // Absent on snapshots from an older bridge.
+  ignored?: boolean;
 }
 
 export interface GroupsResponse {
@@ -121,6 +129,51 @@ export interface RenameGroupResponse {
 export interface SetGroupTopicResponse {
   ok: boolean;
   group: TauGroup;
+}
+
+export interface LeftGroup {
+  id: string;
+  left_at: number;
+}
+
+export interface IgnoredGroupEntry {
+  id: string;
+  // Empty when the group record is gone and only the ignored id
+  // survives.
+  name: string;
+}
+
+export interface LeftGroupsResponse {
+  left: LeftGroup[];
+  ignored: IgnoredGroupEntry[];
+}
+
+export interface LeaveGroupResponse {
+  ok: boolean;
+  id: string;
+  name: string;
+  also_left?: string[];
+}
+
+export interface RejoinGroupResponse {
+  ok: boolean;
+  rejoined: string;
+}
+
+export interface IgnoreGroupResponse {
+  ok: boolean;
+  group: string;
+  name: string;
+  ignored: boolean;
+  changed: boolean;
+}
+
+export interface UnignoreGroupResponse {
+  ok: boolean;
+  group: string;
+  name: string;
+  ignored: boolean;
+  changed: boolean;
 }
 
 export interface Peer {

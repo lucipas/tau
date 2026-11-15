@@ -1741,7 +1741,10 @@ class Inbox:
         return annotated
 
     def _unread_counts_locked(
-        self, *, exclude_dm_from: Optional[Collection[str]] = None
+        self,
+        *,
+        exclude_dm_from: Optional[Collection[str]] = None,
+        exclude_group: Optional[Collection[str]] = None,
     ) -> Dict[str, Any]:
         """Per-conversation unread counts from the in-memory state.
 
@@ -1753,6 +1756,9 @@ class Inbox:
         conversation never lights the badge — but their group posts
         still count: a group post belongs to the group, not to the
         hidden conversation, and the group thread stays visible.
+        ``exclude_group`` hides the posts of the named groups instead:
+        an ignored group never lights any badge, while its members'
+        direct messages still count.
         """
         per_peer: Dict[str, int] = {}
         for entry in self._messages:
@@ -1768,11 +1774,16 @@ class Inbox:
                     and not entry.get("group")
                 ):
                     continue
+                if exclude_group and str(entry.get("group") or "") in exclude_group:
+                    continue
                 per_peer[destination] = per_peer.get(destination, 0) + 1
         return {"per_peer": per_peer, "total": sum(per_peer.values())}
 
     def unread_counts(
-        self, *, exclude_dm_from: Optional[Collection[str]] = None
+        self,
+        *,
+        exclude_dm_from: Optional[Collection[str]] = None,
+        exclude_group: Optional[Collection[str]] = None,
     ) -> Dict[str, Any]:
         """Per-conversation unread counts, reloaded from disk first.
 
@@ -1781,7 +1792,10 @@ class Inbox:
         advanced (and vice versa).
         """
         with self._transaction():
-            return self._unread_counts_locked(exclude_dm_from=exclude_dm_from)
+            return self._unread_counts_locked(
+                exclude_dm_from=exclude_dm_from,
+                exclude_group=exclude_group,
+            )
 
     def mark_read(
         self,
@@ -1790,6 +1804,7 @@ class Inbox:
         up_to_seq: Optional[int] = None,
         at: Optional[float] = None,
         exclude_dm_from: Optional[Collection[str]] = None,
+        exclude_group: Optional[Collection[str]] = None,
     ) -> Any:
         """Advance the read cursor for one conversation, or all of them.
 
@@ -1832,7 +1847,10 @@ class Inbox:
                     "last_read_id": newest.get("id"),
                 }
             self._save()
-            return self._unread_counts_locked(exclude_dm_from=exclude_dm_from)
+            return self._unread_counts_locked(
+                exclude_dm_from=exclude_dm_from,
+                exclude_group=exclude_group,
+            )
 
     def mark_unread(
         self, peer: str, *, all: bool = False

@@ -45,6 +45,11 @@ export function Console() {
 
   useEffect(() => {
     if (tau.peers.length === 0 && tau.groups.length === 0) {
+      // A group that just left must not stay behind as the destination.
+      if (mode === "group") {
+        setTarget("");
+        setReplyTo(null);
+      }
       setMode("custom");
       return;
     }
@@ -275,6 +280,12 @@ export function Console() {
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
             onDeleteGroup={(group) => tau.deleteGroup(group)}
+            onLeaveGroup={(group) => tau.leaveGroup(group)}
+            onRejoinGroup={(group) => tau.rejoinGroup(group)}
+            onIgnoreGroup={(group) => tau.ignoreGroup(group)}
+            onUnignoreGroup={(group) => tau.unignoreGroup(group)}
+            leftGroups={tau.leftGroups}
+            ignoredGroups={tau.ignoredGroups}
             onAddGroupMembers={(group, members) =>
               tau.addGroupMembers(group, members)
             }

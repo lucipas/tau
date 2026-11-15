@@ -555,6 +555,286 @@ describe("useTau group management", () => {
   });
 });
 
+describe("useTau group leave / ignore", () => {
+  it("drops a left group and records it left even when the refresh fails", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+    expect(result.current.groups).toEqual([created]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      id: created.id,
+      name: "crew",
+    });
+    mockedGet.mockRejectedValue(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.leaveGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/leave", {
+      group: created.id,
+    });
+    expect(result.current.groups).toEqual([]);
+    expect(result.current.leftGroups).toHaveLength(1);
+    expect(result.current.leftGroups[0].id).toBe(created.id);
+  });
+
+  it("clears the left entry when a group is rejoined", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      id: created.id,
+      name: "crew",
+    });
+    mockedGet.mockRejectedValue(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.leaveGroup(created.id);
+    });
+    expect(result.current.leftGroups).toHaveLength(1);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      rejoined: created.id,
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({ left: [], ignored: [] })
+        : Promise.resolve({ groups: [], count: 0 }),
+    );
+    await act(async () => {
+      await result.current.rejoinGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/rejoin", {
+      group: created.id,
+    });
+    expect(result.current.leftGroups).toEqual([]);
+  });
+
+  it("flips the ignored flag when a group is ignored and unignored", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: created.id,
+      name: "crew",
+      ignored: true,
+      changed: true,
+    });
+    mockedGet.mockRejectedValue(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.ignoreGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/ignore", {
+      group: created.id,
+    });
+    expect(result.current.groups).toEqual([
+      { ...created, ignored: true },
+    ]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: created.id,
+      name: "crew",
+      ignored: false,
+      changed: true,
+    });
+    await act(async () => {
+      await result.current.unignoreGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/unignore", {
+      group: created.id,
+    });
+    expect(result.current.groups).toEqual([
+      { ...created, ignored: false },
+    ]);
+  });
+
+  it("drops an orphaned ignored entry when it is unignored", async () => {
+    const orphanId = "dd".repeat(16);
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({
+            left: [],
+            ignored: [{ id: orphanId, name: "" }],
+          })
+        : Promise.resolve({ groups: [], count: 0 }),
+    );
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.refreshLeftGroups();
+    });
+    expect(result.current.ignoredGroups).toEqual([
+      { id: orphanId, name: "" },
+    ]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: orphanId,
+      name: "",
+      ignored: false,
+      changed: true,
+    });
+    mockedGet.mockRejectedValue(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.unignoreGroup(orphanId);
+    });
+
+    expect(result.current.ignoredGroups).toEqual([]);
+  });
+
+  it("hides an ignored group's posts at once and drops live arrivals", async () => {
+    const created = makeGroup();
+    const thread = [
+      makeMessage({ id: 1, peer: PEER_HASH, group: undefined, text: "hi" }),
+      makeMessage({ id: 2, peer: PEER_HASH, text: "crew hello" }),
+      makeMessage({
+        id: 3,
+        peer: "cd".repeat(16),
+        peer_name: "carol",
+        group: undefined,
+        text: "hey",
+      }),
+    ];
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({ left: [], ignored: [] })
+        : path === "/api/groups"
+          ? Promise.resolve({ groups: [created], count: 1 })
+          : Promise.resolve({ groups: [], count: 0 }),
+    );
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], thread) });
+    });
+    await waitFor(() =>
+      expect(result.current.messages.map((m) => m.id)).toEqual([1, 2, 3]),
+    );
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: created.id,
+      name: "crew",
+      ignored: true,
+      changed: true,
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({
+            left: [],
+            ignored: [{ id: created.id, name: "crew" }],
+          })
+        : path === "/api/groups"
+          ? Promise.resolve({ groups: [created], count: 1 })
+          : Promise.resolve({ groups: [], count: 0 }),
+    );
+    await act(async () => {
+      await result.current.ignoreGroup(created.id);
+    });
+
+    // The group post leaves the feed at once; the DMs stay.
+    expect(result.current.messages.map((m) => m.id)).toEqual([1, 3]);
+    expect(result.current.ignoredGroups).toEqual([
+      { id: created.id, name: "crew" },
+    ]);
+
+    // A new arrival for the ignored group stays hidden; one for
+    // another peer lands in the feed.
+    await act(async () => {
+      source.emit("message", {
+        message: makeMessage({ id: 4, peer: PEER_HASH, text: "still hidden" }),
+      });
+      source.emit("message", {
+        message: makeMessage({
+          id: 5,
+          peer: "cd".repeat(16),
+          peer_name: "carol",
+          group: undefined,
+          text: "visible",
+        }),
+      });
+    });
+    expect(result.current.messages.map((m) => m.id)).toEqual([1, 3, 5]);
+  });
+
+  it("restores an ignored group's posts when it is unignored", async () => {
+    const created = makeGroup();
+    const thread = [
+      makeMessage({ id: 1, peer: PEER_HASH, group: undefined, text: "hi" }),
+      makeMessage({ id: 2, peer: PEER_HASH, text: "crew hello" }),
+    ];
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/groups/left"
+        ? Promise.resolve({
+            left: [],
+            ignored: [{ id: created.id, name: "crew" }],
+          })
+        : path === "/api/groups"
+          ? Promise.resolve({ groups: [created], count: 1 })
+          : Promise.resolve({ groups: [], count: 0 }),
+    );
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], thread) });
+    });
+    // The left-groups poll lands after the snapshot and hides the
+    // ignored group's post, like another tab ignoring it would.
+    await waitFor(() =>
+      expect(result.current.messages.map((m) => m.id)).toEqual([1]),
+    );
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: created.id,
+      name: "crew",
+      ignored: false,
+      changed: true,
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/messages?limit=200"
+        ? Promise.resolve({ messages: thread })
+        : path === "/api/groups/left"
+          ? Promise.resolve({ left: [], ignored: [] })
+          : path === "/api/groups"
+            ? Promise.resolve({ groups: [created], count: 1 })
+            : Promise.resolve({ groups: [], count: 0 }),
+    );
+    await act(async () => {
+      await result.current.unignoreGroup(created.id);
+    });
+
+    expect(result.current.messages.map((m) => m.id)).toEqual([1, 2]);
+    expect(result.current.ignoredGroups).toEqual([]);
+  });
+});
+
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {
   const { result } = renderHook(() => useTau());
   const source = FakeEventSource.instances[0];
