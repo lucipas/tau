@@ -36,6 +36,7 @@ from tau.webapi import (
     WebBridgeError,
     _WebSocketFrameError,
     _WebSocketReader,
+    _WS_MAX_FRAME_BYTES,
     _backup_name,
     _clean_stored_message,
     _ws_accept_key,
@@ -4029,6 +4030,35 @@ def test_ws_reader_close_frame_returns_none():
     assert reader.read_message() is None
 
 
+def test_ws_reader_rejects_message_over_cap():
+    half = b"x" * (_WS_MAX_FRAME_BYTES // 2 + 1)
+    frames = _ws_client_frame(half, opcode=1, fin=False)
+    frames += _ws_client_frame(half, opcode=0, fin=True)
+    reader = _WebSocketReader(
+        io.BytesIO(frames),
+        send_frame=lambda *args, **kwargs: None,
+    )
+    with pytest.raises(_WebSocketFrameError):
+        reader.read_message()
+
+
+def test_ws_reader_rejects_bad_control_frames():
+    oversized_ping = _ws_client_frame(b"x" * 126, opcode=9)
+    reader = _WebSocketReader(
+        io.BytesIO(oversized_ping),
+        send_frame=lambda *args, **kwargs: None,
+    )
+    with pytest.raises(_WebSocketFrameError):
+        reader.read_message()
+    fragmented_ping = _ws_client_frame(b"p", opcode=9, fin=False)
+    reader = _WebSocketReader(
+        io.BytesIO(fragmented_ping),
+        send_frame=lambda *args, **kwargs: None,
+    )
+    with pytest.raises(_WebSocketFrameError):
+        reader.read_message()
+
+
 class _WSBuffer:
     """Buffered reads over a socket: the handshake and the first frame
     can arrive in one segment, so bytes past the headers must survive."""
@@ -4074,6 +4104,78 @@ def test_websocket_requires_upgrade(bridge):
     assert payload["error"]["message"] == "websocket upgrade required"
 
 
+def _ws_raw_request(bridge, *, key="dGhlIHNhbXBsZSBub25jZQ==", extra=""):
+    sock = socket.create_connection(("127.0.0.1", bridge.port), timeout=5)
+    sock.sendall(
+        (
+            "GET /ws HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            f"{extra}\r\n"
+        ).encode("latin-1")
+    )
+    return sock, _WSBuffer(sock)
+
+
+def test_websocket_rejects_malformed_keys(bridge):
+    bad_keys = (
+        "not-base64!!",
+        "café",
+        base64.b64encode(b"short").decode("ascii"),
+    )
+    for bad_key in bad_keys:
+        before = bridge.bus.subscriber_count()
+        sock, buffer = _ws_raw_request(bridge, key=bad_key)
+        try:
+            headers = buffer.read_until(b"\r\n\r\n")
+            assert headers.startswith(b"HTTP/1.1 400")
+            assert bridge.bus.subscriber_count() == before
+        finally:
+            sock.close()
+
+
+def test_websocket_rejects_foreign_origin(bridge):
+    before = bridge.bus.subscriber_count()
+    sock, buffer = _ws_raw_request(
+        bridge, extra="Origin: https://evil.example\r\n"
+    )
+    try:
+        headers = buffer.read_until(b"\r\n\r\n")
+        assert headers.startswith(b"HTTP/1.1 403")
+        assert bridge.bus.subscriber_count() == before
+    finally:
+        sock.close()
+
+
+def test_websocket_survives_idle_client(bridge):
+    # A client that sends nothing for longer than the read timeout
+    # must stay connected: its next event and ping still arrive.
+    sock, buffer = _ws_raw_request(bridge)
+    try:
+        headers = buffer.read_until(b"\r\n\r\n")
+        assert headers.startswith(b"HTTP/1.1 101")
+        opcode, payload = _ws_read_frame(buffer)
+        assert opcode == 1
+        assert json.loads(payload)["type"] == "snapshot"
+        time.sleep(6)
+        bridge.bus.publish({"type": "status", "node": {"name": "tester"}})
+        opcode, payload = _ws_read_frame(buffer)
+        assert opcode == 1
+        assert json.loads(payload)["type"] == "status"
+        sock.sendall(_ws_client_frame(b"ping-me", opcode=9))
+        opcode, payload = _ws_read_frame(buffer)
+        assert opcode == 10
+        assert payload == b"ping-me"
+        sock.sendall(_ws_client_frame(b"", opcode=8))
+        opcode, payload = _ws_read_frame(buffer)
+        assert opcode == 8
+    finally:
+        sock.close()
+
+
 def test_websocket_streams_snapshot_events_and_ping(bridge):
     sock = socket.create_connection(("127.0.0.1", bridge.port), timeout=5)
     try:
@@ -4085,7 +4187,8 @@ def test_websocket_streams_snapshot_events_and_ping(bridge):
                 "Upgrade: websocket\r\n"
                 "Connection: Upgrade\r\n"
                 f"Sec-WebSocket-Key: {key}\r\n"
-                "Sec-WebSocket-Version: 13\r\n\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "Origin: http://127.0.0.1\r\n\r\n"
             ).encode("ascii")
         )
         buffer = _WSBuffer(sock)

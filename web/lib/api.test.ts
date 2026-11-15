@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, apiDownload } from "./api";
+import { ApiError, apiDownload, websocketUrl } from "./api";
 
 function mockFetch(response: Response) {
   const fetchMock = vi.fn().mockResolvedValue(response);
@@ -10,6 +10,28 @@ function mockFetch(response: Response) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
+
+describe("websocketUrl", () => {
+  it("targets the bridge port under next dev", () => {
+    // jsdom runs at http://localhost:3000/ with no API base set.
+    expect(websocketUrl()).toBe("ws://localhost:8787/ws");
+  });
+
+  it("swaps an http API base to ws", async () => {
+    vi.stubEnv("NEXT_PUBLIC_API_BASE", "http://127.0.0.1:8787");
+    vi.resetModules();
+    const fresh = await import("./api");
+    expect(fresh.websocketUrl()).toBe("ws://127.0.0.1:8787/ws");
+  });
+
+  it("resolves a relative API base against the page", async () => {
+    vi.stubEnv("NEXT_PUBLIC_API_BASE", "/tau");
+    vi.resetModules();
+    const fresh = await import("./api");
+    expect(fresh.websocketUrl()).toBe("ws://localhost:3000/tau/ws");
+  });
 });
 
 describe("apiDownload", () => {

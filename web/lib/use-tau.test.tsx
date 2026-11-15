@@ -3085,4 +3085,19 @@ describe("useTau websocket transport", () => {
     await waitFor(() => expect(result.current.peers).toHaveLength(1));
     unmount();
   });
+
+  it("falls back to SSE when the socket constructor throws", async () => {
+    class ThrowingSocket {
+      constructor(_url: string) {
+        throw new SyntaxError("bad url");
+      }
+    }
+    vi.stubGlobal("WebSocket", ThrowingSocket);
+    const { result, unmount } = renderHook(() => useTau());
+    await waitFor(() => expect(FakeEventSource.instances.length).toBe(1));
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [makePeer()]);
+    await waitFor(() => expect(result.current.peers).toHaveLength(1));
+    unmount();
+  });
 });
