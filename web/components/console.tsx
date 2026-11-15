@@ -147,11 +147,20 @@ export function Console() {
   const openUnread =
     mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
 
+  // The peer the user deliberately marked unread while it is open. Its
+  // auto-read is suppressed so the reminder sticks until the user leaves
+  // and reopens the conversation.
+  const manualUnreadRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (manualUnreadRef.current !== target) manualUnreadRef.current = null;
+  }, [target]);
+
   // The open conversation reads as read: the auto-selected one on load,
   // and one that gets new mail while it stays open. A failed call leaves
   // the badge in place until the count next changes.
   useEffect(() => {
     if (!target || openUnread === 0) return;
+    if (manualUnreadRef.current === target) return;
     void markRead(target).catch(() => undefined);
   }, [target, openUnread, markRead]);
 
@@ -160,6 +169,7 @@ export function Console() {
     setMode("peer");
     setTarget(destination);
     setReplyTo(null);
+    manualUnreadRef.current = null;
     // Opening the conversation advances its read cursor on the node,
     // so the badge clears. A failed call leaves the badge in place.
     void tau.markRead(destination).catch(() => undefined);
@@ -419,6 +429,21 @@ export function Console() {
             importing={tau.importing}
             onExport={tau.exportMessages}
             onImport={tau.importMessages}
+          />
+        </main>
+
+        <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
+          <span>
+            tau {tau.node?.version ?? "—"} · Reticulum{" "}
+            {tau.node?.rns_version ?? "—"}
+          </span>
+          <span>no servers · no accounts · encrypted links</span>
+        </footer>
+      </div>
+    </div>
+  );
+}
+onImport={tau.importMessages}
           />
         </main>
 

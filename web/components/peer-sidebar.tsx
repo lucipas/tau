@@ -202,7 +202,7 @@ export function PeerSidebar({
   // Marking unread only moves the local display cursor back — nothing
   // is deleted and no receipt changes — so like archiving it needs no
   // confirm step, but a failed write still surfaces under the row.
-  async function runMarkUnread(destination: string) {
+  async function runMarkUnread(destination: string, all = false) {
     if (!onMarkUnread) return;
     setMarkingUnreadId(destination);
     setMarkUnreadErrors((previous) => {
@@ -211,7 +211,7 @@ export function PeerSidebar({
       return next;
     });
     try {
-      await onMarkUnread(destination);
+      await onMarkUnread(destination, all);
     } catch (caught) {
       setMarkUnreadErrors((previous) => ({
         ...previous,
@@ -852,6 +852,20 @@ export function PeerSidebar({
                           {markingUnreadId === peer.destination
                             ? "marking…"
                             : "mark unread"}
+                        </button>
+                      ) : null}
+                      {onMarkUnread ? (
+                        <button
+                          type="button"
+                          disabled={markingUnreadId === peer.destination}
+                          onClick={() =>
+                            void runMarkUnread(peer.destination, true)
+                          }
+                          aria-label={`Mark whole conversation with ${peer.name} unread`}
+                          title="Mark all unread — the whole conversation shows unread again; read receipts already sent stay sent"
+                          className="shrink-0 rounded-md border border-line/70 px-1.5 py-1 font-mono text-[10px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                        >
+                          mark all unread
                         </button>
                       ) : null}
                       <button
