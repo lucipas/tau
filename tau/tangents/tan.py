@@ -1495,18 +1495,21 @@ def post_quoters(
     its author deleted stops listing. Unlike likes and reposts, one
     author may quote the same post more than once, and each standing
     quote is listed: the comments differ, so collapsing them would
-    hide content. A target with no quotes (or no stored post at all)
-    yields an empty list.
+    hide content. An expired quote stops listing, and an edited quote
+    carries its latest text. A target with no quotes (or no stored
+    post at all) yields an empty list.
     """
     clean = _require_hex(target, HASH_HEX_LENGTH, "target")
     rows = conn.execute(
-        "SELECT hash, author, name, text, created_at FROM posts "
+        "SELECT hash, author, name, text, created_at, expires_at FROM posts "
         "WHERE kind = 'quote' AND linked = 1 AND target = ? "
         "ORDER BY created_at DESC, seq DESC",
         (clean,),
     ).fetchall()
     quoters = []
     for row in rows:
+        if is_expired({"expires_at": row["expires_at"]}):
+            continue
         if _is_deleted(
             conn, {"hash": str(row["hash"]), "author": str(row["author"])}
         ):
@@ -1520,7 +1523,44 @@ def post_quoters(
                 "quoted_at": float(row["created_at"]),
             }
         )
-    return quoters
+    return annotate_edits(conn, quoters)
+
+
+def without_hidden_quotes(
+    conn: sqlite3.Connection, quotes: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Drop quotes the viewer's timeline would hide, keeping the rest.
+
+    A quote matching a muted keyword, carrying a muted tag, or hidden
+    by the viewer is not disclosed as a quote of its target, the same
+    way the timeline hides it. Entries stay stored.
+    """
+    kept = without_muted_keywords(conn, quotes)
+    kept = without_muted_tags(conn, kept)
+    return without_hidden_posts(kept, hidden_post_set(conn))
+
+
+def ancestry_hidden(
+    conn: sqlite3.Connection, post: Dict[str, Any], excluded: Set[str]
+) -> bool:
+    """Whether a reply hangs beneath a deleted or blocked ancestor.
+
+    Walks the same ancestor chain as :func:`thread`, :func:`likers`,
+    :func:`reposters` and :func:`quoters`, without raising.
+    """
+    current = post
+    seen_ancestors = {current["hash"]}
+    while current.get("kind") == KIND_REPLY and current.get("target"):
+        parent = get_post(conn, str(current["target"]))
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            break
+        if parent["hash"] in seen_ancestors:
+            break
+        if _is_deleted(conn, parent) or parent["author"] in excluded:
+            return True
+        seen_ancestors.add(parent["hash"])
+        current = parent
+    return False
 
 
 def repost_counts(
@@ -1711,7 +1751,11 @@ def reposters(
         seen_ancestors.add(parent["hash"])
         current_entry = parent
     target = str(post["hash"])
-    current = post_reposters(conn, target)
+    current = [
+        entry
+        for entry in post_reposters(conn, target)
+        if entry["author"] not in excluded
+    ]
     records: List[Dict[str, Any]] = []
     if current:
         # One target-scoped query, no author list expanded into
@@ -1736,7 +1780,7 @@ def reposters(
             }
             for entry in current
         ]
-    records.sort(key=lambda record: (record["name"].lower(), record["author"]))
+    records.sort(key=lambda record: (-record["reposted_at"], record["author"]))
     return {"post": _canonical_post(post), "reposters": records}
 
 
@@ -1786,7 +1830,14 @@ def quoters(
         seen_ancestors.add(parent["hash"])
         current_entry = parent
     target = str(post["hash"])
-    current = post_quoters(conn, target)
+    current = without_hidden_quotes(
+        conn,
+        [
+            entry
+            for entry in post_quoters(conn, target)
+            if entry["author"] not in excluded
+        ],
+    )
     records: List[Dict[str, Any]] = []
     if current:
         # One target-scoped query, no author list expanded into
@@ -6254,3 +6305,4 @@ class TanApp:
                 self._gossip_slots.release()
 
         threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
+aemon=True).start()

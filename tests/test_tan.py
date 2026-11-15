@@ -1940,8 +1940,8 @@ def test_reposters_names_current_reposters(identities, tmp_path):
     result = reposters(conn, post["hash"][:16])
     assert result["post"]["hash"] == post["hash"]
     assert result["reposters"] == [
-        {"author": bob_author, "name": "bob", "reposted_at": 1001.0},
         {"author": carol_author, "name": "carol", "reposted_at": 1002.0},
+        {"author": bob_author, "name": "bob", "reposted_at": 1001.0},
     ]
 
     # A delete retires the repost; a fresh repost restores it under the

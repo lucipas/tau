@@ -2733,11 +2733,19 @@ class WebBridge:
                 # shows no quote annotations; disclose no quoters
                 # either.
                 return {"target": clean, "quoters": [], "count": 0, "total": 0}
-            entries = [
-                entry
-                for entry in post_quoters(conn, clean)
-                if entry["author"] not in hidden
-            ]
+            post = get_post(conn, clean)
+            if post is None or ancestry_hidden(conn, post, blocked):
+                # A reply beneath a deleted or blocked ancestor is refused,
+                # as the thread view refuses it.
+                raise TanError(f"unknown post: {clean!r}")
+            entries = without_hidden_quotes(
+                conn,
+                [
+                    entry
+                    for entry in post_quoters(conn, clean)
+                    if entry["author"] not in hidden
+                ],
+            )
             total = len(entries)
             shown = entries[:MAX_QUOTERS]
             names = self._tan_author_names(

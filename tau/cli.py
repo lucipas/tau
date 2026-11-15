@@ -173,6 +173,7 @@ from .tangents.tan import (
     mute_keyword,
     mute_tag,
     muted,
+    muted_author_set,
     muted_keywords,
     muted_tags,
     open_db_readonly,
@@ -3958,10 +3959,12 @@ def cmd_tan_reposts(args: argparse.Namespace) -> int:
     conn = init_db(config.social_db_path)
     try:
         blocked = load_blocked_set(config.blocklist_path)
+        # Like the web route: muted authors are hidden as well as blocked.
+        hidden_authors = set(blocked or ()) | muted_author_set(conn)
         result = reposters(
             conn,
             args.ref,
-            exclude_authors=blocked,
+            exclude_authors=hidden_authors,
             exclude_all=blocked is None,
         )
     finally:
@@ -3984,10 +3987,12 @@ def cmd_tan_quotes(args: argparse.Namespace) -> int:
     conn = init_db(config.social_db_path)
     try:
         blocked = load_blocked_set(config.blocklist_path)
+        # Like the web route: muted authors are hidden as well as blocked.
+        hidden_authors = set(blocked or ()) | muted_author_set(conn)
         result = quoters(
             conn,
             args.ref,
-            exclude_authors=blocked,
+            exclude_authors=hidden_authors,
             exclude_all=blocked is None,
         )
     finally:
@@ -4000,6 +4005,9 @@ def cmd_tan_quotes(args: argparse.Namespace) -> int:
         # Like thread() and search(): a post the owner's display rules
         # hide is not shown here either.
         raise TanError(f"post is hidden by your Tan display rules: {args.ref!r}")
+    if not display_ruleset.displays(KIND_QUOTE):
+        # Quotes the owner hides disclose no quoters, as the web route does.
+        result["quoters"] = []
     _print_tan_quoters(result, json_output=json_output)
     return _EXIT_OK
 
@@ -11397,3 +11405,4 @@ def _cmd_messages_sent(
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
+n _EXIT_OK
