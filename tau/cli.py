@@ -7182,10 +7182,7 @@ def _resolve_group_reply_target(
 
 
 def _resolve_group_pin_target(
-    inbox: Inbox,
-    group_ids: Sequence[str],
-    ref: str,
-    mailbox: Optional[Mailbox] = None,
+    inbox: Inbox, group_ids: Sequence[str], ref: str
 ) -> Dict[str, Any]:
     """Resolve ``tau group pin`` / ``unpin`` to one stored group message.
 
@@ -7194,9 +7191,13 @@ def _resolve_group_pin_target(
     to pin and is never a candidate.  ``group_ids`` spans renames, so a
     message stored under a predecessor id still resolves.  An exact id
     wins over a longer id that merely starts with it, as in
-    :meth:`Inbox.pin`.  A send whose every leg is still in the outbox is
-    refused when ``mailbox`` is given.  A prefix matching more than one
-    record, or nothing at all, is refused.
+    :meth:`Inbox.pin` (via :func:`_match_ref`).  A prefix matching more
+    than one record, or nothing at all, is refused.
+
+    A sent group message pins like any sent record — ``tau pin`` pins
+    sent DMs regardless of delivery — so there is deliberately no
+    refusal for sends whose legs are still queued: the stored record
+    is what the pin attaches to, not the delivery state.
     """
     ref = ref.strip()
     if not ref:
@@ -7210,29 +7211,6 @@ def _resolve_group_pin_target(
         exact = [m for m in matches if str(m["id"]).lower() == folded]
     if exact:
         matches = exact
-    if mailbox is not None and matches:
-        queued_ids = {
-            entry.id
-            for entry in mailbox.outbox_list()
-            if entry.group_id in group_ids
-        }
-
-        def _all_legs_queued(item: Dict[str, Any]) -> bool:
-            # An outbound group send is one record with every leg id; it
-            # is queued-only while each of its legs is still in the outbox.
-            if item.get("direction") != "out":
-                return False
-            legs = [
-                leg for leg in item.get("leg_ids") or [] if isinstance(leg, str)
-            ] or [str(item["id"])]
-            return all(leg in queued_ids for leg in legs)
-
-        if all(_all_legs_queued(m) for m in matches):
-            raise NodeError(
-                f"message {ref!r} is still queued for every member;"
-                " pin it once delivered"
-            )
-        matches = [m for m in matches if not _all_legs_queued(m)]
     if len(matches) > 1:
         raise NodeError(
             f"{len(matches)} messages in this group match {ref!r};"
@@ -8689,8 +8667,7 @@ def cmd_group_pin(args: argparse.Namespace) -> int:
     group_ids = _group_ids_spanning_renames(group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    mailbox = Mailbox(config.mailbox_path)
-    entry = _resolve_group_pin_target(inbox, group_ids, args.message, mailbox)
+    entry = _resolve_group_pin_target(inbox, group_ids, args.message)
     try:
         pinned, changed = inbox.pin(str(entry["id"]), groups=group_ids)
     except InboxError as exc:
@@ -8722,8 +8699,7 @@ def cmd_group_unpin(args: argparse.Namespace) -> int:
     group_ids = _group_ids_spanning_renames(group)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    mailbox = Mailbox(config.mailbox_path)
-    entry = _resolve_group_pin_target(inbox, group_ids, args.message, mailbox)
+    entry = _resolve_group_pin_target(inbox, group_ids, args.message)
     try:
         unpinned, changed = inbox.unpin(str(entry["id"]), groups=group_ids)
     except InboxError as exc:
