@@ -3708,6 +3708,18 @@ def test_backup_without_a_data_directory_is_unavailable(bridge):
     assert "no data directory" in payload["error"]["message"]
 
 
+def test_backup_download_rejects_remote_client(bridge, monkeypatch):
+    # The archive holds the node identity and peers.json — which now
+    # stores private peer notes — so a remote client must not be able
+    # to download it even when the bridge is bound to a remote interface.
+    import tau.webapi as webapi
+
+    monkeypatch.setattr(webapi, "_is_loopback_client", lambda client: False)
+    status, _, payload = _json(bridge, "/api/backup")
+    assert status == 403
+    assert "only available from localhost" in payload["error"]["message"]
+
+
 def test_live_backup_never_splits_seen_marker_from_inbox(tmp_path, capsys):
     # A delivery marks a message seen (mailbox) and then records it
     # (inbox).  A backup read between those two writes would restore a
