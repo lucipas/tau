@@ -12,6 +12,8 @@ import type {
   TanImportResult,
   TanLiker,
   TanPost,
+  TanQuoter,
+  TanReposter,
   TanScheduledPost,
   TanSuggestion,
   TanVerifyReport,
@@ -133,6 +135,35 @@ export function SocialConsole({
     setLikersOpen(null);
     setLikers(null);
     setLikersTotal(0);
+  }
+  // Same on-demand shape as the liker list, for the reposters of one
+  // post. Only one engagement list is open at a time: opening one
+  // closes the other two, so a stale list can never sit under a fresh
+  // one on the same card.
+  const [repostersOpen, setRepostersOpen] = useState<string | null>(null);
+  const [reposters, setReposters] = useState<TanReposter[] | null>(null);
+  const [repostersTotal, setRepostersTotal] = useState(0);
+  const repostersGeneration = useRef(0);
+
+  function closeReposters() {
+    repostersGeneration.current += 1;
+    setRepostersOpen(null);
+    setReposters(null);
+    setRepostersTotal(0);
+  }
+  // Same on-demand shape as the liker list, for the standing quotes of
+  // one post. Each quote carries its own comment, so the list shows the
+  // comment under the quoter's name.
+  const [quotersOpen, setQuotersOpen] = useState<string | null>(null);
+  const [quoters, setQuoters] = useState<TanQuoter[] | null>(null);
+  const [quotersTotal, setQuotersTotal] = useState(0);
+  const quotersGeneration = useRef(0);
+
+  function closeQuoters() {
+    quotersGeneration.current += 1;
+    setQuotersOpen(null);
+    setQuoters(null);
+    setQuotersTotal(0);
   }
   // Author hashes with a mute request in flight; same guard as deleting.
   const [muting, setMuting] = useState<ReadonlySet<string>>(() => new Set());
@@ -329,8 +360,17 @@ export function SocialConsole({
     if (repostingRef.current.has(post.hash)) return;
     repostingRef.current.add(post.hash);
     setError(null);
+    const generation = repostersGeneration.current;
+    const listOpenForPost = repostersOpen === post.hash;
     try {
       await tan.repost(post.hash);
+      // The repost count changed, so an open reposter list for this post
+      // is stale; close it and let the count button fetch a fresh one. If
+      // the list was closed or reopened while the repost was pending,
+      // leave the current list alone.
+      if (listOpenForPost && repostersGeneration.current === generation) {
+        closeReposters();
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not repost");
     } finally {
@@ -347,6 +387,8 @@ export function SocialConsole({
     setLikersOpen(post.hash);
     setLikers(null);
     setLikersTotal(0);
+    closeReposters();
+    closeQuoters();
     setError(null);
     try {
       const result = await tan.fetchLikers(post.hash);
@@ -361,6 +403,62 @@ export function SocialConsole({
         caught instanceof Error ? caught.message : "could not load likers",
       );
       closeLikers();
+    }
+  }
+
+  async function toggleReposters(post: TanPost) {
+    if (repostersOpen === post.hash) {
+      closeReposters();
+      return;
+    }
+    const generation = ++repostersGeneration.current;
+    setRepostersOpen(post.hash);
+    setReposters(null);
+    setRepostersTotal(0);
+    closeLikers();
+    closeQuoters();
+    setError(null);
+    try {
+      const result = await tan.fetchReposters(post.hash);
+      // A newer open supersedes this response: opening another post's
+      // list first must not show this post's names under that post.
+      if (repostersGeneration.current !== generation) return;
+      setReposters(result.reposters);
+      setRepostersTotal(result.total);
+    } catch (caught) {
+      if (repostersGeneration.current !== generation) return;
+      setError(
+        caught instanceof Error ? caught.message : "could not load reposters",
+      );
+      closeReposters();
+    }
+  }
+
+  async function toggleQuoters(post: TanPost) {
+    if (quotersOpen === post.hash) {
+      closeQuoters();
+      return;
+    }
+    const generation = ++quotersGeneration.current;
+    setQuotersOpen(post.hash);
+    setQuoters(null);
+    setQuotersTotal(0);
+    closeLikers();
+    closeReposters();
+    setError(null);
+    try {
+      const result = await tan.fetchQuoters(post.hash);
+      // A newer open supersedes this response: opening another post's
+      // list first must not show this post's comments under that post.
+      if (quotersGeneration.current !== generation) return;
+      setQuoters(result.quoters);
+      setQuotersTotal(result.total);
+    } catch (caught) {
+      if (quotersGeneration.current !== generation) return;
+      setError(
+        caught instanceof Error ? caught.message : "could not load quotes",
+      );
+      closeQuoters();
     }
   }
 
@@ -1443,6 +1541,14 @@ export function SocialConsole({
                           likersOpen={likersOpen === post.hash}
                           likers={likersOpen === post.hash ? likers : null}
                           likersTotal={likersOpen === post.hash ? likersTotal : 0}
+                          onToggleReposters={toggleReposters}
+                          repostersOpen={repostersOpen === post.hash}
+                          reposters={repostersOpen === post.hash ? reposters : null}
+                          repostersTotal={repostersOpen === post.hash ? repostersTotal : 0}
+                          onToggleQuoters={toggleQuoters}
+                          quotersOpen={quotersOpen === post.hash}
+                          quoters={quotersOpen === post.hash ? quoters : null}
+                          quotersTotal={quotersOpen === post.hash ? quotersTotal : 0}
                           onToggleSave={toggleSave}
                           onTogglePin={togglePin}
                           onHide={submitHide}
@@ -1610,6 +1716,14 @@ export function SocialConsole({
                       likersOpen={likersOpen === post.hash}
                       likers={likersOpen === post.hash ? likers : null}
                       likersTotal={likersOpen === post.hash ? likersTotal : 0}
+                      onToggleReposters={toggleReposters}
+                      repostersOpen={repostersOpen === post.hash}
+                      reposters={repostersOpen === post.hash ? reposters : null}
+                      repostersTotal={repostersOpen === post.hash ? repostersTotal : 0}
+                      onToggleQuoters={toggleQuoters}
+                      quotersOpen={quotersOpen === post.hash}
+                      quoters={quotersOpen === post.hash ? quoters : null}
+                      quotersTotal={quotersOpen === post.hash ? quotersTotal : 0}
                       onToggleSave={toggleSave}
                       onTogglePin={togglePin}
                       onHide={submitHide}
@@ -2310,6 +2424,14 @@ export function PostCard({
   likersOpen,
   likers,
   likersTotal,
+  onToggleReposters,
+  repostersOpen,
+  reposters,
+  repostersTotal,
+  onToggleQuoters,
+  quotersOpen,
+  quoters,
+  quotersTotal,
   onToggleSave,
   onTogglePin,
   onHide,
@@ -2335,6 +2457,22 @@ export function PostCard({
   likers?: TanLiker[] | null;
   // Full liker count before the server's cap; 0 when unknown.
   likersTotal?: number;
+  // Optional like onToggleLikers: when absent the repost count button
+  // is inert.
+  onToggleReposters?: (post: TanPost) => void;
+  repostersOpen?: boolean;
+  // The reposters for the open list, or null while it is loading.
+  reposters?: TanReposter[] | null;
+  // Full reposter count before the server's cap; 0 when unknown.
+  repostersTotal?: number;
+  // Optional like onToggleLikers: when absent the quote count button
+  // is inert.
+  onToggleQuoters?: (post: TanPost) => void;
+  quotersOpen?: boolean;
+  // The quotes for the open list, or null while it is loading.
+  quoters?: TanQuoter[] | null;
+  // Full quote count before the server's cap; 0 when unknown.
+  quotersTotal?: number;
   onToggleSave?: (post: TanPost) => void;
   // Pins are own-posts-only, so the button renders only on your own
   // cards; when absent the card shows no pin control.
@@ -2570,6 +2708,17 @@ export function PostCard({
                 ↻ {post.reposts ?? 0}
               </span>
             )}
+            {(post.reposts ?? 0) > 0 ? (
+              <button
+                type="button"
+                onClick={() => onToggleReposters?.(post)}
+                aria-expanded={Boolean(repostersOpen)}
+                title="Show who reposted this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-emerald-300"
+              >
+                who reposted
+              </button>
+            ) : null}
             {(post.likes ?? 0) > 0 ? (
               <button
                 type="button"
@@ -2580,13 +2729,25 @@ export function PostCard({
               >
                 who liked
               </button>
-            ) : null}            {(post.quotes ?? 0) > 0 ? (
+            ) : null}
+            {(post.quotes ?? 0) > 0 ? (
               <span
                 title="Quotes of this post"
                 className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5"
               >
                 ❝ {post.quotes}
               </span>
+            ) : null}
+            {(post.quotes ?? 0) > 0 ? (
+              <button
+                type="button"
+                onClick={() => onToggleQuoters?.(post)}
+                aria-expanded={Boolean(quotersOpen)}
+                title="Show the quotes of this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-amber-300"
+              >
+                who quoted
+              </button>
             ) : null}
             {onToggleSave ? (
               <button
@@ -2776,6 +2937,70 @@ export function PostCard({
                   {(likersTotal ?? 0) > likers.length ? (
                     <p className="mt-1 text-[11px] text-mist/70">
                       showing first {likers.length} of {likersTotal} likers
+                    </p>
+                  ) : null}
+                </>
+              )}
+            </div>
+          ) : null}
+          {repostersOpen ? (
+            <div className="mt-2 rounded border border-line/70 bg-panel/60 px-2 py-1.5">
+              <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-mist/70">
+                reposted by
+              </p>
+              {reposters === null || reposters === undefined ? (
+                <p className="mt-1 text-[12px] text-mist/80">loading…</p>
+              ) : reposters.length === 0 ? (
+                <p className="mt-1 text-[12px] text-mist/80">no reposts yet</p>
+              ) : (
+                <>
+                  <ul className="mt-1 space-y-0.5">
+                    {reposters.map((reposter) => (
+                      <li
+                        key={reposter.author}
+                        className="text-[12px] text-zinc-200"
+                      >
+                        {reposter.name || shortHash(reposter.author, 16)}
+                      </li>
+                    ))}
+                  </ul>
+                  {(repostersTotal ?? 0) > reposters.length ? (
+                    <p className="mt-1 text-[11px] text-mist/70">
+                      showing first {reposters.length} of {repostersTotal}{" "}
+                      reposters
+                    </p>
+                  ) : null}
+                </>
+              )}
+            </div>
+          ) : null}
+          {quotersOpen ? (
+            <div className="mt-2 rounded border border-line/70 bg-panel/60 px-2 py-1.5">
+              <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-mist/70">
+                quoted by
+              </p>
+              {quoters === null || quoters === undefined ? (
+                <p className="mt-1 text-[12px] text-mist/80">loading…</p>
+              ) : quoters.length === 0 ? (
+                <p className="mt-1 text-[12px] text-mist/80">no quotes yet</p>
+              ) : (
+                <>
+                  <ul className="mt-1 space-y-1">
+                    {quoters.map((quoter) => (
+                      <li
+                        key={quoter.hash}
+                        className="text-[12px] text-zinc-200"
+                      >
+                        {quoter.name || shortHash(quoter.author, 16)}
+                        <span className="block text-mist/80">
+                          {quoter.text}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  {(quotersTotal ?? 0) > quoters.length ? (
+                    <p className="mt-1 text-[11px] text-mist/70">
+                      showing first {quoters.length} of {quotersTotal} quotes
                     </p>
                   ) : null}
                 </>
