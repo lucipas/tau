@@ -2265,6 +2265,114 @@ def test_group_store_lineage_drops_predecessor_without_evidence(tmp_path):
     assert store.lineage(new_id) == [new_id]
 
 
+def test_group_store_lineage_seeds_evidence_from_retired_records(tmp_path):
+    import json
+
+    from tau.groups import derive_group_id
+
+    old_id = derive_group_id(OWN_HASH, "weekend", [OWN_HASH, OTHER_HASH])
+    new_id = derive_group_id(OWN_HASH, "road trip", [OWN_HASH, OTHER_HASH])
+    # A store written before creator evidence was kept: the retired
+    # record is there, but there is no lineage_creators key.
+    path = tmp_path / "groups.json"
+    path.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "id": new_id,
+                        "name": "road trip",
+                        "members": [OWN_HASH, OTHER_HASH],
+                        "created_at": 1000.0,
+                        "creator": OWN_HASH,
+                        "created_by": OWN_HASH,
+                        "local": True,
+                        "renamed_from": [old_id],
+                    }
+                ],
+                "retired": [old_id],
+                "retired_groups": [
+                    {
+                        "id": old_id,
+                        "name": "weekend",
+                        "members": [OWN_HASH, OTHER_HASH],
+                        "created_at": 900.0,
+                        "creator": OWN_HASH,
+                        "created_by": OWN_HASH,
+                        "local": True,
+                        "renamed_from": [],
+                    }
+                ],
+                "left": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = GroupStore(path)
+    assert store.lineage(new_id) == [new_id, old_id]
+    # A later save persists the seeded evidence, so evicting the
+    # retired record afterwards still leaves the lineage intact.
+    store.create("extra", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["lineage_creators"] == {old_id: OWN_HASH}
+    del saved["retired_groups"]
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    reloaded = GroupStore(path)
+    assert reloaded.lineage(new_id) == [new_id, old_id]
+
+
+def test_group_store_lineage_prunes_unreferenced_evidence(tmp_path):
+    import json
+
+    from tau.groups import derive_group_id
+
+    old_id = derive_group_id(OWN_HASH, "weekend", [OWN_HASH, OTHER_HASH])
+    new_id = derive_group_id(OWN_HASH, "road trip", [OWN_HASH, OTHER_HASH])
+    stray_id = derive_group_id(OWN_HASH, "stray", [OWN_HASH, OTHER_HASH])
+    path = tmp_path / "groups.json"
+    path.write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "id": new_id,
+                        "name": "road trip",
+                        "members": [OWN_HASH, OTHER_HASH],
+                        "created_at": 1000.0,
+                        "creator": OWN_HASH,
+                        "created_by": OWN_HASH,
+                        "local": True,
+                        "renamed_from": [old_id],
+                    }
+                ],
+                "retired": [old_id],
+                "retired_groups": [
+                    {
+                        "id": old_id,
+                        "name": "weekend",
+                        "members": [OWN_HASH, OTHER_HASH],
+                        "created_at": 900.0,
+                        "creator": OWN_HASH,
+                        "created_by": OWN_HASH,
+                        "local": True,
+                        "renamed_from": [],
+                    }
+                ],
+                "left": [],
+                "lineage_creators": {old_id: OWN_HASH, stray_id: OWN_HASH},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = GroupStore(path)
+    assert store.lineage(new_id) == [new_id, old_id]
+    # A later save persists the pruned map: the entry no stored
+    # lineage references is gone, the referenced one stays.
+    store.create("extra", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["lineage_creators"] == {old_id: OWN_HASH}
+
+
 def test_group_store_rename_refusals(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)

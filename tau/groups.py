@@ -257,8 +257,9 @@ class GroupStore:
         self._left: List[Dict[str, Any]] = []
         # Retired group id -> its creator, for verifying rename
         # lineage after the retired record itself is evicted (see
-        # :meth:`lineage`).  One small entry per retirement; it is
-        # never capped, unlike the full retired records.
+        # :meth:`lineage`).  One small entry per retirement, pruned
+        # on load to ids a stored lineage still references, so the
+        # map cannot grow forever as groups are retired.
         self._lineage_creators: Dict[str, str] = {}
         self._load()
 
@@ -343,6 +344,27 @@ class GroupStore:
                 except ValueError:
                     continue
                 self._lineage_creators[group_id.lower()] = creator.lower()
+        # Seed missing evidence from retained retired records, so a
+        # store written before the map existed keeps verifying its
+        # predecessors after those records are evicted.  Entries
+        # already in the file win: they were written at retire time.
+        for group_id, record in self._retired_groups.items():
+            if group_id not in self._lineage_creators and record.get("creator"):
+                self._lineage_creators[group_id] = record["creator"]
+        # Keep only evidence a stored lineage can still reference:
+        # an entry for an id no live group names can never verify
+        # anything, and must not grow the file forever as groups are
+        # retired.  A live group's own record verifies itself, so
+        # only renamed_from references count here.
+        referenced = set()
+        for group in self._groups.values():
+            for pred_id in group.get("renamed_from") or []:
+                referenced.add(str(pred_id).lower())
+        self._lineage_creators = {
+            group_id: creator
+            for group_id, creator in self._lineage_creators.items()
+            if group_id in referenced
+        }
 
     def _save(self) -> None:
         """Persist the store; raises :class:`OSError` when the write fails."""
