@@ -164,8 +164,13 @@ export function Console() {
   }, [replyTo, tau.messages]);
 
   const { markRead } = tau;
-  const openUnread =
-    mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
+  const openUnread = target
+    ? mode === "peer"
+      ? (tau.unread.per_peer[target] ?? 0)
+      : mode === "group"
+        ? (tau.unread.per_group[target] ?? 0)
+        : 0
+    : 0;
 
   // A deliberate mark-unread holds the badge for the open conversation:
   // the auto-read below must not undo it the moment the count rises.
@@ -191,8 +196,12 @@ export function Console() {
     const held = manualUnread.current.get(target);
     if (held !== undefined && openUnread <= held) return;
     if (held !== undefined) manualUnread.current.delete(target);
-    void markRead(target).catch(() => undefined);
-  }, [target, openUnread, markRead]);
+    // A group target marks the group's posts read; a peer target
+    // marks only that DM, never the sender's group posts.
+    void (
+      mode === "group" ? markRead(undefined, target) : markRead(target)
+    ).catch(() => undefined);
+  }, [target, mode, openUnread, markRead]);
 
   function selectPeer(destination: string) {
     customPicked.current = false;
@@ -264,8 +273,11 @@ export function Console() {
             verifications={tau.verifications}
             blocks={tau.blocks}
             unread={tau.unread.per_peer}
+            unreadGroups={tau.unread.per_group}
             archived={tau.archivedConversations}
             archivedError={tau.archivedError}
+            muted={tau.mutedConversations}
+            mutedError={tau.mutedError}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
@@ -317,6 +329,42 @@ export function Console() {
             }}
             onUnarchivePeer={async (destination) => {
               await tau.unarchiveConversation(destination);
+            }}
+            onSetMuted={async (muteTarget, muted) => {
+              // Unmuting the open conversation restores the unread mail
+              // that arrived while it was muted. That mail is not new, so
+              // hold the count until the unmute answers: the auto-read
+              // below must not mark it read. The hold starts unbounded
+              // (an event may land before the response) and settles on
+              // the restored count.
+              const heldPeer =
+                !muted &&
+                muteTarget.peer !== undefined &&
+                mode === "peer" &&
+                targetRef.current === muteTarget.peer
+                  ? muteTarget.peer
+                  : undefined;
+              if (heldPeer !== undefined) {
+                manualUnread.current.set(heldPeer, Number.POSITIVE_INFINITY);
+              }
+              try {
+                const change = await tau.setMuted(muteTarget, muted);
+                if (heldPeer !== undefined) {
+                  if (targetRef.current === heldPeer) {
+                    manualUnread.current.set(
+                      heldPeer,
+                      change.unread?.per_peer[heldPeer] ?? 0,
+                    );
+                  } else {
+                    manualUnread.current.delete(heldPeer);
+                  }
+                }
+              } catch (error) {
+                if (heldPeer !== undefined) {
+                  manualUnread.current.delete(heldPeer);
+                }
+                throw error;
+              }
             }}
             onMarkUnread={async (destination, all = false) => {
               const gen = unreadGen.current.get(destination) ?? 0;

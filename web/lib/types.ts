@@ -255,6 +255,33 @@ export interface DisappearingResponse {
   disappearing: DisappearingResult;
 }
 
+// Muted conversations: peer destination hashes and group ids, each
+// listed once. A muted conversation still lists its messages, but
+// never counts as unread.
+export interface MutedConversations {
+  peers: string[];
+  groups: string[];
+}
+
+export interface MutedConversationsResponse {
+  peers: string[];
+  groups: string[];
+}
+
+export interface MuteResult {
+  target: string;
+  group: boolean;
+  muted: boolean;
+  changed: boolean;
+  // The unread counts after the change, when it changed anything.
+  unread?: UnreadCounts | null;
+}
+
+export interface MuteResponse {
+  ok: boolean;
+  mute: MuteResult;
+}
+
 export interface InterfaceInfo {
   name: string;
   online: boolean;
@@ -304,10 +331,12 @@ export interface Counts {
 }
 
 // Per-conversation unread counts from the node inbox: how many
-// received DMs sit after each sender's read cursor. Read state is
-// local to the node; the console only displays and clears it.
+// received DMs sit after each sender's read cursor, and how many
+// received group posts sit after each group's read cursor. Read state
+// is local to the node; the console only displays and clears it.
 export interface UnreadCounts {
   per_peer: Record<string, number>;
+  per_group: Record<string, number>;
   total: number;
   // Stamped by the node; a count with an older revision than one
   // already applied is stale and is ignored.

@@ -45,6 +45,9 @@ import type {
   MessagesImportResult,
   MessagesResponse,
   MessagesSearchResponse,
+  MuteResponse,
+  MutedConversations,
+  MutedConversationsResponse,
   NodeInfo,
   NodeSettings,
   OutboxEntry,
@@ -84,7 +87,7 @@ export type ConnectionState =
   | "live"
   | "reconnecting";
 
-export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, total: 0 };
+export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, per_group: {}, total: 0 };
 
 export interface PingState {
   pending?: boolean;
@@ -219,6 +222,9 @@ export function useTau() {
   const [disappearingError, setDisappearingError] = useState<string | null>(
     null,
   );
+  const [mutedConversations, setMutedConversations] =
+    useState<MutedConversations>({ peers: [], groups: [] });
+  const [mutedError, setMutedError] = useState<string | null>(null);
   // Destinations with an archived conversation, for the live feed: a
   // message that arrives for one (archived from another tab or the CLI)
   // is dropped on arrival, the same way a blocked sender's is.
@@ -754,7 +760,12 @@ export function useTau() {
         changed = true;
       }
       if (!changed) return previous;
-      return { per_peer: perPeer, total, revision: previous.revision };
+      return {
+        per_peer: perPeer,
+        per_group: previous.per_group,
+        total,
+        revision: previous.revision,
+      };
     });
   }, []);
 
@@ -840,6 +851,31 @@ export function useTau() {
     }
   }, []);
 
+  const refreshMutedSeq = useRef(0);
+
+  const refreshMuted = useCallback(async () => {
+    // Same stale-response guard as the disappearing refresh: a slow
+    // poll must not restore mutes a set or clear already moved. A
+    // failed poll keeps the last known mutes in place and reports the
+    // error in mutedError.
+    const requestId = ++refreshMutedSeq.current;
+    try {
+      const result = await apiGet<MutedConversationsResponse>(
+        "/api/messages/muted",
+      );
+      if (requestId !== refreshMutedSeq.current) return;
+      setMutedConversations(result);
+      setMutedError(null);
+    } catch (error) {
+      if (requestId !== refreshMutedSeq.current) return;
+      setMutedError(
+        error instanceof Error
+          ? error.message
+          : "could not load muted conversations",
+      );
+    }
+  }, []);
+
   const allowlistSeq = useRef(0);
 
   // Allow-list requests can resolve out of order: only the newest
@@ -911,6 +947,7 @@ export function useTau() {
         refreshDmRequests(),
         refreshArchived(),
         refreshDisappearing(),
+        refreshMuted(),
         refreshGroups(),
         refreshLeftGroups(),
         refreshSettings(),
@@ -922,7 +959,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshDisappearing, refreshGroups, refreshLeftGroups, refreshSettings, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshDisappearing, refreshMuted, refreshGroups, refreshLeftGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     (target: string) =>
@@ -2003,21 +2040,22 @@ export function useTau() {
     [],
   );
 
-  const markRead = useCallback(async (peer?: string) => {
+  const markRead = useCallback(async (peer?: string, group?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
-    // next snapshot reconciles.
+    // next snapshot reconciles. A group id marks that group's posts
+    // read without touching any member's DM cursor.
     return chainReadWrite(async () => {
       const result = await apiPost<MarkReadResponse>(
         "/api/messages/read",
-        peer ? { peer } : {},
+        group ? { group } : peer ? { peer } : {},
       );
       applyUnread(result.unread);
       return result.unread;
     });
   }, [applyUnread, chainReadWrite]);
 
-  const markUnread = useCallback(async (peer: string, all = false) => {
+  const markUnread = useCallback(async (peer: string, all = false, group?: string) => {
     // The way back from a mark-read: the newest received message shows
     // unread again (or the whole conversation, with all=true), so a
     // read DM the owner has not answered yet stays visible as a
@@ -2026,7 +2064,7 @@ export function useTau() {
     return chainReadWrite(async () => {
       const result = await apiPost<MarkUnreadResponse>(
         "/api/messages/unread",
-        { peer, all },
+        group ? { group, all } : { peer, all },
       );
       applyUnread(result.unread);
       return result.unread;
@@ -2197,6 +2235,41 @@ export function useTau() {
       return change;
     },
     [refreshDisappearing],
+  );
+
+  const setMuted = useCallback(
+    async (
+      target: { peer?: string; group?: string },
+      muted: boolean,
+    ) => {
+      const result = await apiPost<MuteResponse>("/api/messages/mute", {
+        ...(target.peer !== undefined
+          ? { peer: target.peer }
+          : { group: target.group }),
+        muted,
+      });
+      // The write already succeeded: apply it to local state at once
+      // so the toggle shows the new state without waiting on the
+      // poll, then re-read — a stale poll is discarded by its
+      // sequence. The server publishes the new unread counts on the
+      // event stream, so the badge follows without a poll.
+      const change = result.mute;
+      setMutedConversations((previous) => {
+        if (change.group) {
+          const groups = new Set(previous.groups);
+          if (change.muted) groups.add(change.target);
+          else groups.delete(change.target);
+          return { peers: previous.peers, groups: [...groups].sort() };
+        }
+        const peers = new Set(previous.peers);
+        if (change.muted) peers.add(change.target);
+        else peers.delete(change.target);
+        return { peers: [...peers].sort(), groups: previous.groups };
+      });
+      await refreshMuted();
+      return change;
+    },
+    [refreshMuted],
   );
 
   // Download the export document the bridge returns. The anchor
@@ -2498,6 +2571,10 @@ export function useTau() {
     disappearingError,
     setDisappearingDefault,
     refreshDisappearing,
+    mutedConversations,
+    mutedError,
+    setMuted,
+    refreshMuted,
     settings,
     settingsError,
     heldMail,

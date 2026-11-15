@@ -415,9 +415,9 @@ def test_group_view_does_not_clear_hidden_dm_unread(tmp_path, capsys):
     cli.main(["archive", "--data-dir", str(data_dir), "alice"])
     capsys.readouterr()
 
-    # Viewing the group shows the group post, but alice's hidden DM
-    # must stay unread: the shared per-sender cursor stops just
-    # before it.
+    # Viewing the group shows the group post and marks it read, but
+    # alice's hidden DM must stay unread: each conversation has its
+    # own cursor.
     code = cli.main(["messages", "--data-dir", str(data_dir), "--group", "weekend"])
     assert code == 0
     assert "group hello" in capsys.readouterr().out
@@ -427,8 +427,8 @@ def test_group_view_does_not_clear_hidden_dm_unread(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["archived_unread"] == 1
 
-    # Once the DM is read via --archived, the next group listing
-    # advances past the group post too.
+    # Reading the DM via --archived leaves the group post as it was:
+    # it was already read by the group listing above.
     code = cli.main(["messages", "--data-dir", str(data_dir), "--archived"])
     assert code == 0
     assert "first hello" in capsys.readouterr().out
@@ -439,9 +439,7 @@ def test_group_view_does_not_clear_hidden_dm_unread(tmp_path, capsys):
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 1
-    # The listing annotates read state before its own mark-read, so
-    # the post still shows unread here; the next listing sees it read.
-    assert payload["messages"][0]["unread"] is True
+    assert payload["messages"][0]["unread"] is False
 
     code = cli.main(
         ["messages", "--data-dir", str(data_dir), "--group", "weekend", "--json"]
