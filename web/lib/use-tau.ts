@@ -211,8 +211,9 @@ export function useTau() {
   // The latest restored-mail signal from an unread event: mail an
   // unmute or unignore in another console restored, not new
   // arrivals. The console holds the restored count for its open
-  // conversation instead of auto-reading it; null means the last
-  // unread update restored nothing.
+  // conversation instead of auto-reading it. The signal stays until a
+  // newer restored event or a snapshot replaces it, so a batched
+  // ordinary update cannot erase it first; null means none is pending.
   const [restoredUnread, setRestoredUnread] =
     useState<RestoredUnread[] | null>(null);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
@@ -401,7 +402,11 @@ export function useTau() {
       if (!reset && revision < unreadRevision.current) return;
       unreadRevision.current = revision;
       setUnread(counts);
-      setRestoredUnread(restored);
+      // An ordinary update must not erase a pending restored signal: a
+      // batch can carry one alongside a plain count, and the console
+      // has not consumed it yet. Only a snapshot (reset) or a newer
+      // restored event replaces it.
+      if (reset || restored !== null) setRestoredUnread(restored);
     },
     [],
   );
