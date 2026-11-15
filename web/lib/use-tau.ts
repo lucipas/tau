@@ -62,6 +62,7 @@ import type {
   RejoinGroupResponse,
   RenameGroupResponse,
   RenameResponse,
+  RestoredUnread,
   RetractMessageResponse,
   RetryOutboxResponse,
   SafetyNumberResponse,
@@ -207,6 +208,14 @@ export function useTau() {
   );
   const [pinnedError, setPinnedError] = useState<string | null>(null);
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
+  // The latest restored-mail signal from an unread event: mail an
+  // unmute or unignore in another console restored, not new
+  // arrivals. The console holds the restored count for its open
+  // conversation instead of auto-reading it. The signal stays until a
+  // newer restored event or a snapshot replaces it, so a batched
+  // ordinary update cannot erase it first; null means none is pending.
+  const [restoredUnread, setRestoredUnread] =
+    useState<RestoredUnread[] | null>(null);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
   const [settings, setSettings] = useState<NodeSettings | null>(null);
@@ -380,12 +389,24 @@ export function useTau() {
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
   // count at least as new as the last one applied may replace state.
+  // `restored` rides the same event, so a stale count drops its
+  // restored signal with it instead of holding mail the counts no
+  // longer show.
   const applyUnread = useCallback(
-    (counts: UnreadCounts, reset = false) => {
+    (
+      counts: UnreadCounts,
+      reset = false,
+      restored: RestoredUnread[] | null = null,
+    ) => {
       const revision = counts.revision ?? 0;
       if (!reset && revision < unreadRevision.current) return;
       unreadRevision.current = revision;
       setUnread(counts);
+      // An ordinary update must not erase a pending restored signal: a
+      // batch can carry one alongside a plain count, and the console
+      // has not consumed it yet. Only a snapshot (reset) or a newer
+      // restored event replaces it.
+      if (reset || restored !== null) setRestoredUnread(restored);
     },
     [],
   );
@@ -615,9 +636,12 @@ export function useTau() {
     };
 
     const onUnread = (event: Event) => {
-      const payload = readEventData<{ unread: UnreadCounts }>(event);
+      const payload = readEventData<{
+        unread: UnreadCounts;
+        restored?: RestoredUnread[];
+      }>(event);
       if (!payload?.unread) return;
-      applyUnread(payload.unread);
+      applyUnread(payload.unread, false, payload.restored ?? null);
     };
 
     const onStatus = () => {
@@ -2556,6 +2580,7 @@ export function useTau() {
     pinMessage,
     unpinMessage,
     unread,
+    restoredUnread,
     outbox,
     heldForOthers,
     dmRequests,

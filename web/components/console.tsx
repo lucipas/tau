@@ -182,6 +182,22 @@ export function Console() {
   // response that arrives after a reopen must not reinstall its hold.
   const unreadGen = useRef(new Map<string, number>());
 
+  // Restored mail is not new mail: when another console unmutes or
+  // unignores the open conversation, the server names the restored
+  // count in the unread event, and this console holds it — the same
+  // hold the initiating console sets from the unmute response — so
+  // the auto-read below does not clear it the moment the badge
+  // rises. New mail above the held level releases the hold, like a
+  // mark-unread hold. Only the conversation open when the restore
+  // lands is held: opening one later marks it read, as before.
+  useEffect(() => {
+    if (!tau.restoredUnread) return;
+    const open = targetRef.current;
+    if (!open) return;
+    const entry = tau.restoredUnread.find((item) => item.target === open);
+    if (entry !== undefined) manualUnread.current.set(open, entry.unread);
+  }, [tau.restoredUnread]);
+
   // The open conversation reads as read: the auto-selected one on load,
   // and one that gets new mail while it stays open. A failed call leaves
   // the badge in place until the count next changes.
@@ -336,7 +352,8 @@ export function Console() {
               // hold the count until the unmute answers: the auto-read
               // below must not mark it read. The hold starts unbounded
               // (an event may land before the response) and settles on
-              // the restored count.
+              // the restored count. Other open consoles get the same
+              // hold from the restored signal in the unread event.
               const heldPeer =
                 !muted &&
                 muteTarget.peer !== undefined &&
@@ -344,24 +361,33 @@ export function Console() {
                 targetRef.current === muteTarget.peer
                   ? muteTarget.peer
                   : undefined;
-              if (heldPeer !== undefined) {
-                manualUnread.current.set(heldPeer, Number.POSITIVE_INFINITY);
+              const heldGroup =
+                !muted &&
+                muteTarget.group !== undefined &&
+                mode === "group" &&
+                targetRef.current === muteTarget.group
+                  ? muteTarget.group
+                  : undefined;
+              const held = heldPeer ?? heldGroup;
+              if (held !== undefined) {
+                manualUnread.current.set(held, Number.POSITIVE_INFINITY);
               }
               try {
                 const change = await tau.setMuted(muteTarget, muted);
-                if (heldPeer !== undefined) {
-                  if (targetRef.current === heldPeer) {
-                    manualUnread.current.set(
-                      heldPeer,
-                      change.unread?.per_peer[heldPeer] ?? 0,
-                    );
+                if (held !== undefined) {
+                  if (targetRef.current === held) {
+                    const restored =
+                      heldPeer !== undefined
+                        ? (change.unread?.per_peer[held] ?? 0)
+                        : (change.unread?.per_group[held] ?? 0);
+                    manualUnread.current.set(held, restored);
                   } else {
-                    manualUnread.current.delete(heldPeer);
+                    manualUnread.current.delete(held);
                   }
                 }
               } catch (error) {
-                if (heldPeer !== undefined) {
-                  manualUnread.current.delete(heldPeer);
+                if (held !== undefined) {
+                  manualUnread.current.delete(held);
                 }
                 throw error;
               }

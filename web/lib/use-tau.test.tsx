@@ -2619,6 +2619,52 @@ describe("useTau archived conversations", () => {
     unmount();
   });
 
+  it("exposes restored mail from an unread event, and keeps it through a plain one", async () => {
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() => expect(result.current.peers).toHaveLength(1));
+    expect(result.current.restoredUnread).toBeNull();
+
+    // An unmute in another console restores mail that arrived while
+    // muted: the event names it, so the open conversation can hold it
+    // instead of auto-reading it as new mail.
+    await act(async () => {
+      source.emit("unread", {
+        unread: { per_peer: { [PEER_HASH]: 1 }, per_group: {}, total: 1 },
+        restored: [{ target: PEER_HASH, unread: 1 }],
+      });
+    });
+    expect(result.current.unread).toEqual({
+      per_peer: { [PEER_HASH]: 1 },
+      per_group: {},
+      total: 1,
+      revision: undefined,
+    });
+    expect(result.current.restoredUnread).toEqual([
+      { target: PEER_HASH, unread: 1 },
+    ]);
+
+    // An ordinary unread update restores nothing, so the signal clears.
+    await act(async () => {
+      source.emit("unread", {
+        unread: { per_peer: { [PEER_HASH]: 2 }, per_group: {}, total: 2 },
+      });
+    });
+    expect(result.current.restoredUnread).toEqual([
+      { target: PEER_HASH, unread: 1 },
+    ]);
+
+    // A snapshot is authoritative, so it clears the signal.
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    expect(result.current.restoredUnread).toBeNull();
+    unmount();
+  });
+
   it("drops live messages for an archived peer, keeps the rest", async () => {
     mockArchivedGet();
     const { result, unmount } = renderHook(() => useTau());

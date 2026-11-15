@@ -343,6 +343,17 @@ export interface UnreadCounts {
   revision?: number;
 }
 
+// Mail whose unread count a change restored, not new arrivals: an
+// unmute or unignore in another console restores mail that arrived
+// while the conversation was hidden. `target` is the bare peer hash
+// or group id the console holds its badges under, and `unread` is
+// the restored count for that conversation. A console with the
+// conversation open holds that count instead of auto-reading it.
+export interface RestoredUnread {
+  target: string;
+  unread: number;
+}
+
 export interface MarkReadResponse {
   ok: boolean;
   unread: UnreadCounts;
