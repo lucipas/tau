@@ -11,6 +11,7 @@ import type {
   IgnoreGroupResponse,
   LeaveGroupResponse,
   LeftGroup,
+  MutedConversations,
   NodeInfo,
   Peer,
   RejoinGroupResponse,
@@ -44,8 +45,11 @@ export function PeerSidebar({
   blocks,
   verifications,
   unread,
+  unreadGroups,
   archived,
   archivedError,
+  muted,
+  mutedError,
   selected,
   onPing,
   onInfo,
@@ -54,6 +58,7 @@ export function PeerSidebar({
   onUnblock,
   onArchivePeer,
   onUnarchivePeer,
+  onSetMuted,
   onMarkUnread,
   onVerify,
   onShowSafetyNumber,
@@ -83,8 +88,11 @@ export function PeerSidebar({
   blocks: Record<string, BlockState>;
   verifications: Record<string, VerifyState>;
   unread: Record<string, number>;
+  unreadGroups?: Record<string, number>;
   archived: ArchivedConversation[];
   archivedError: string | null;
+  muted: MutedConversations;
+  mutedError: string | null;
   selected: string;
   onPing: (destination: string) => void;
   onInfo: (destination: string) => void;
@@ -93,6 +101,10 @@ export function PeerSidebar({
   onUnblock: (destination: string) => void;
   onArchivePeer: (destination: string) => Promise<void>;
   onUnarchivePeer: (destination: string) => Promise<void>;
+  onSetMuted?: (
+    target: { peer?: string; group?: string },
+    muted: boolean,
+  ) => Promise<void>;
   onMarkUnread?: (destination: string, all: boolean) => Promise<void>;
   onVerify: (destination: string) => void;
   onShowSafetyNumber: (destination: string) => void;
@@ -143,6 +155,16 @@ export function PeerSidebar({
   const [markUnreadErrors, setMarkUnreadErrors] = useState<
     Record<string, string>
   >({});
+  // Pending mute toggles, one entry each: the key is a peer
+  // destination or a group id, and a single shared id would let one
+  // row's finish re-enable another row's button while its own
+  // request is still running.
+  const [mutingIds, setMutingIds] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
+  const [muteErrors, setMuteErrors] = useState<Record<string, string>>(
+    {},
+  );
   const forgetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -245,6 +267,42 @@ export function PeerSidebar({
       setMarkingUnread((previous) => {
         const next = new Set(previous);
         next.delete(destination);
+        return next;
+      });
+    }
+  }
+
+  // Muting only quiets the unread badge — messages keep arriving
+  // and the thread stays visible — so like archiving it needs no
+  // confirm step, but a failed write still surfaces under the row.
+  async function runMute(
+    key: string,
+    target: { peer?: string; group?: string },
+    muted: boolean,
+  ) {
+    if (!onSetMuted) return;
+    setMutingIds((previous) => new Set(previous).add(key));
+    setMuteErrors((previous) => {
+      const next = { ...previous };
+      delete next[key];
+      return next;
+    });
+    try {
+      await onSetMuted(target, muted);
+    } catch (caught) {
+      setMuteErrors((previous) => ({
+        ...previous,
+        [key]:
+          caught instanceof Error
+            ? caught.message
+            : muted
+              ? "could not mute conversation"
+              : "could not unmute conversation",
+      }));
+    } finally {
+      setMutingIds((previous) => {
+        const next = new Set(previous);
+        next.delete(key);
         return next;
       });
     }
@@ -733,6 +791,12 @@ export function PeerSidebar({
           </span>
         </div>
 
+        {mutedError ? (
+          <p className="mt-2 font-mono text-[11px] text-rose-400">
+            {mutedError}
+          </p>
+        ) : null}
+
         {activePeers.length === 0 ? (
           <div className="mt-3 rounded-xl border border-dashed border-line/80 p-3">
             {peers.length === 0 ? (
@@ -780,7 +844,12 @@ export function PeerSidebar({
                 ? Math.max(0, now / 1000 - peer.last_seen)
                 : peer.age;
               const isSelected = peer.destination === selected;
-              const unreadCount = unread[peer.destination] ?? 0;
+              // A muted peer's row never shows a badge: its per-peer count
+              // can hold posts from unmuted groups, which belong to the
+              // group and still count in the total.
+              const unreadCount = muted.peers.includes(peer.destination)
+                ? 0
+                : (unread[peer.destination] ?? 0);
               const displayName = peer.alias || peer.name || "unknown";
               const isEditingAlias = editingAlias === peer.destination;
               const armingBlock = confirmBlock === peer.destination;
@@ -830,6 +899,14 @@ export function PeerSidebar({
                                 title="Blocked: their DMs are dropped and their Tan posts hidden"
                               >
                                 blocked
+                              </span>
+                            ) : null}
+                            {muted.peers.includes(peer.destination) ? (
+                              <span
+                                className="ml-1.5 rounded-full border border-line bg-void/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-mist"
+                                title="Muted: messages still arrive, but never light the unread badge"
+                              >
+                                muted
                               </span>
                             ) : null}
                             {unreadCount > 0 ? (
@@ -966,6 +1043,32 @@ export function PeerSidebar({
                           ? "archiving…"
                           : "archive"}
                       </button>
+                      {onSetMuted ? (
+                        <button
+                          type="button"
+                          disabled={mutingIds.has(peer.destination)}
+                          onClick={() =>
+                            void runMute(
+                              peer.destination,
+                              { peer: peer.destination },
+                              !muted.peers.includes(peer.destination),
+                            )
+                          }
+                          aria-label={`${muted.peers.includes(peer.destination) ? "Unmute" : "Mute"} conversation with ${peer.name}`}
+                          title={
+                            muted.peers.includes(peer.destination)
+                              ? "Unmute — this conversation counts as unread again, including messages that arrived while muted"
+                              : "Mute — messages still arrive, but never light the unread badge"
+                          }
+                          className="shrink-0 rounded-md border border-line/70 px-1.5 py-1 font-mono text-[10px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                        >
+                          {mutingIds.has(peer.destination)
+                            ? "saving…"
+                            : muted.peers.includes(peer.destination)
+                              ? "unmute"
+                              : "mute"}
+                        </button>
+                      ) : null}
                       {onMarkUnread ? (
                         <button
                           type="button"
@@ -1240,6 +1343,11 @@ export function PeerSidebar({
                         {markUnreadErrors[peer.destination]}
                       </p>
                     ) : null}
+                    {muteErrors[peer.destination] ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        {muteErrors[peer.destination]}
+                      </p>
+                    ) : null}
                   </div>
                 </li>
               );
@@ -1460,9 +1568,27 @@ export function PeerSidebar({
                   <div className="min-w-0">
                     <p className="truncate text-xs font-medium text-zinc-200">
                       {group.name}{" "}
+                      {(unreadGroups?.[group.id] ?? 0) > 0 ? (
+                        <span
+                          className="shrink-0 rounded-full bg-signal px-1.5 py-px font-mono text-[10px] font-semibold text-void"
+                          title={`${unreadGroups?.[group.id] ?? 0} unread message${(unreadGroups?.[group.id] ?? 0) === 1 ? "" : "s"}`}
+                        >
+                          {(unreadGroups?.[group.id] ?? 0) > 99
+                            ? "99+"
+                            : unreadGroups?.[group.id]}
+                        </span>
+                      ) : null}
                       {group.ignored ? (
                         <span className="rounded-full border border-line bg-void/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-mist">
                           ignored
+                        </span>
+                      ) : null}
+                      {muted.groups.includes(group.id) ? (
+                        <span
+                          className="rounded-full border border-line bg-void/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-mist"
+                          title="Muted: messages still arrive, but never light the unread badge"
+                        >
+                          muted
                         </span>
                       ) : null}
                     </p>
@@ -1560,8 +1686,39 @@ export function PeerSidebar({
                             : "ignore"}
                       </button>
                     ) : null}
+                    {onSetMuted ? (
+                      <button
+                        type="button"
+                        disabled={mutingIds.has(group.id)}
+                        onClick={() =>
+                          void runMute(
+                            group.id,
+                            { group: group.id },
+                            !muted.groups.includes(group.id),
+                          )
+                        }
+                        aria-label={`${muted.groups.includes(group.id) ? "Unmute" : "Mute"} group ${group.name}`}
+                        title={
+                          muted.groups.includes(group.id)
+                            ? "Unmute — this group counts as unread again, including messages that arrived while muted"
+                            : "Mute — messages still arrive, but never light the unread badge"
+                        }
+                        className="rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                      >
+                        {mutingIds.has(group.id)
+                          ? "saving…"
+                          : muted.groups.includes(group.id)
+                            ? "unmute"
+                            : "mute"}
+                      </button>
+                    ) : null}
                   </div>
                 </div>
+                {muteErrors[group.id] ? (
+                  <p className="mt-1 font-mono text-[10px] text-rose-300">
+                    {muteErrors[group.id]}
+                  </p>
+                ) : null}
                 {canEditDetails && detailsId === group.id ? (
                   <div className="mt-2 space-y-2 border-t border-line/50 pt-2">
                     <div>
