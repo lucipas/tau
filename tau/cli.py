@@ -7430,7 +7430,17 @@ def cmd_messages(args: argparse.Namespace) -> int:
         counts = inbox.unread_counts()
         per_peer = counts["per_peer"]
         per_group = counts["per_group"]
-        if peer_hash is not None:
+        if peer_hash is not None and group_ids is not None:
+            # Both filters list the group posts this sender made in the
+            # group, so count that intersection as the listing shows it.
+            here = sum(
+                1
+                for entry in inbox.list_messages(peer=peer_hash, group=group_ids)
+                if entry.get("unread")
+            )
+            per_peer = {}
+            per_group = {group_id: here} if here else {}
+        elif peer_hash is not None:
             # A peer filter is a DM filter: group posts are not that
             # conversation's mail.
             per_peer = {
@@ -7439,7 +7449,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
                 if destination == peer_hash
             }
             per_group = {}
-        if group_ids is not None:
+        elif group_ids is not None:
             per_group = {
                 group: count
                 for group, count in per_group.items()
