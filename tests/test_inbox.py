@@ -1499,7 +1499,7 @@ def test_list_messages_clears_unread_marker_for_excluded_conversations(
     assert [entry["unread"] for entry in listed] == [True, False, False]
     assert inbox.unread_counts(
         exclude_dm_from={"aa" * 16}, exclude_group={"11" * 16}
-    ) == {"per_peer": {"bb" * 16: 1}, "total": 1}
+    ) == {"per_peer": {"bb" * 16: 1}, "per_group": {}, "total": 1}
 
 
 def test_mark_read_advances_only_to_up_to(tmp_path):
