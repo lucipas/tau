@@ -7678,7 +7678,6 @@ class WebBridge:
         with self._unread_lock:
             counts: Dict[str, Any] = {"per_peer": {}, "per_group": {}, "total": 0}
             if inbox is not None:
-            if inbox is not None:
                 muted_peers, muted_groups = self._muted_sets()
                 ignored = load_ignored_group_ids(
                     getattr(self.node.config, "ignored_groups_path", None)
