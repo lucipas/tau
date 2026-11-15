@@ -6619,6 +6619,27 @@ def test_timeline_followed_tag_silenced_repost_does_not_consume_limit(
     assert found[0].get("via_tag") == "meshnet"
 
 
+def test_timeline_followed_tag_repost_of_muted_keyword_post_does_not_consume_limit(
+    identities, tmp_path
+):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    original = create_post(conn, bob, "#meshnet crypto", name="bob", now=1000)
+    create_repost(conn, alice, original["hash"], name="alice", now=1001)
+    tagged = create_post(conn, carol, "#meshnet from carol", name="carol", now=999)
+    authors = [author_of(alice)]
+
+    mute_keyword(conn, "crypto")
+    follow_tag(conn, "meshnet")
+    # The repost matches the followed tag through its original's text,
+    # but the original matches a muted keyword, so the repost must not
+    # consume the one slot the limit allows.
+    found = timeline(conn, authors, limit=1)
+    assert [post["hash"] for post in found] == [tagged["hash"]]
+    assert found[0].get("via_tag") == "meshnet"
+
+
 def test_timeline_followed_tag_pages_past_shared_timestamps(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
