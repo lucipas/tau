@@ -2610,9 +2610,29 @@ def test_wait_for_delivery_keeps_retries_at_poll_interval(tmp_path, monkeypatch)
     # Retries stay at poll_interval: growing the pause would let the
     # last attempt land long before the deadline, so a peer that
     # becomes reachable late in the wait would be missed.
+    #
+    # The timing is driven by a fake clock, not the wall clock: the
+    # poll loop used to be measured live, so on a loaded or
+    # CPU-throttled machine a late wake-up could push a gap over the
+    # bound (or drop the retry count below it) and fail the test
+    # intermittently.  ``wait_for_delivery`` reads ``time.monotonic``
+    # and ``time.sleep`` through the ``time`` module, as does the
+    # mailbox lock it waits on, so patching both here makes the whole
+    # wait deterministic: every sleep advances the clock by exactly
+    # ``poll_interval``.
     node = make_node(tmp_path)
     entry = _seed_wait_entry(node)
     stamps = []
+    clock = [0.0]
+
+    def fake_monotonic():
+        return clock[0]
+
+    def fake_sleep(seconds):
+        clock[0] += max(0.0, seconds)
+
+    monkeypatch.setattr(time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(time, "sleep", fake_sleep)
 
     def fake_flush(**kwargs):
         stamps.append(time.monotonic())
