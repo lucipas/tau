@@ -2322,11 +2322,16 @@ def feed(
     limit: int = DEFAULT_FEED_LIMIT,
     all_authors: bool = False,
     before: Optional[float] = None,
+    before_hash: Optional[str] = None,
     posts_only: bool = False,
     exclude_authors: Optional[Sequence[str]] = None,
     exclude_all: bool = False,
 ) -> List[Dict[str, Any]]:
     """Read cached entries in chain order or reverse chronological order.
+
+    With *before_hash*, reverse chronological paging resumes after the
+    entry ``(before, before_hash)`` in feed order, so entries sharing a
+    timestamp are not skipped.
 
     Sync needs every entry (reactions, deletes, replies and quotes
     included) to keep chains complete; display callers pass
@@ -2381,7 +2386,10 @@ def feed(
         # cannot exceed SQLite's bound-variable limit.
         where += " AND author NOT IN (SELECT value FROM json_each(?))"
         params.append(json.dumps(excluded))
-    if before is not None:
+    if before is not None and before_hash is not None:
+        where += " AND (created_at < ? OR (created_at = ? AND hash < ?))"
+        params.extend([float(before), float(before), str(before_hash)])
+    elif before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
     params.append(count)
@@ -2575,6 +2583,20 @@ def _filter_posts_by_tag(
 ) -> List[Dict[str, Any]]:
     """Keep only the posts in *posts* carrying *tag*.
 
+    See :func:`_post_tag_sets` for how each post's text is matched.
+    """
+    tag_sets = _post_tag_sets(conn, posts)
+    return [
+        post for post in posts if tag in tag_sets.get(str(post["hash"]), set())
+    ]
+
+
+def _post_tag_sets(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> Dict[str, Set[str]]:
+    """Map each post's hash to the set of tags its text carries.
+
     The match runs on each post's current text — an edited post matches
     its edited text, not the original — and a repost matches on the
     text of the post it reposts, since a repost carries no text of its
@@ -2583,7 +2605,7 @@ def _filter_posts_by_tag(
     in one query, the same way :func:`annotate_reposts` fetches them.
     """
     if not posts:
-        return []
+        return {}
     states = edit_states(conn, [str(post["hash"]) for post in posts])
     targets = [
         str(post["target"])
@@ -2608,7 +2630,7 @@ def _filter_posts_by_tag(
                 "text", original["text"]
             )
             originals[original["hash"]] = str(text)
-    kept: List[Dict[str, Any]] = []
+    tag_sets: Dict[str, Set[str]] = {}
     for post in posts:
         if post.get("kind") == KIND_REPOST:
             text = originals.get(str(post.get("target") or ""), "")
@@ -2616,9 +2638,8 @@ def _filter_posts_by_tag(
             text = states.get(str(post["hash"]), {}).get(
                 "text", str(post.get("text") or "")
             )
-        if tag in extract_tags(text):
-            kept.append(post)
-    return kept
+        tag_sets[str(post["hash"])] = set(extract_tags(text))
+    return tag_sets
 
 
 def _tag_page_filter(
@@ -2787,32 +2808,49 @@ def timeline(
         def _keep_followed_or_tagged(
             page: List[Dict[str, Any]],
         ) -> List[Dict[str, Any]]:
-            visible = _drop_hidden(page)
-            via: Dict[str, str] = {}
-            for tag in followed:
-                for post in _filter_posts_by_tag(conn, visible, tag):
-                    via.setdefault(str(post["hash"]), tag)
+            # Drop reposts the final annotation would hide before tag
+            # matching, so they never consume the paging limit.
+            visible = annotate_reposts(
+                conn,
+                _drop_hidden(page),
+                muted_keywords=keywords,
+                exclude_authors=silenced,
+                blocked_authors=blocked,
+                hidden_posts=hidden_hashes,
+            )
+            tag_sets = _post_tag_sets(conn, visible)
             kept: List[Dict[str, Any]] = []
             for post in visible:
                 if post.get("author") in followed_set:
                     kept.append(post)
-                elif str(post["hash"]) in via:
-                    kept.append(dict(post, via_tag=via[str(post["hash"])]))
+                    continue
+                tags = tag_sets.get(str(post["hash"]), set())
+                via = next((tag for tag in followed if tag in tags), None)
+                if via is not None:
+                    kept.append(dict(post, via_tag=via))
             return kept
+
+        def _fetch_followed_page(cursor: Any) -> List[Dict[str, Any]]:
+            if isinstance(cursor, tuple):
+                before_created, before_hash = cursor
+            else:
+                before_created, before_hash = cursor, None
+            return feed(
+                conn,
+                limit=MAX_FEED_POSTS,
+                before=before_created,
+                before_hash=before_hash,
+                posts_only=True,
+                exclude_authors=hidden,
+            )
 
         posts = _fill_unmuted(
             conn,
             keywords,
             limit,
-            lambda cursor: feed(
-                conn,
-                limit=MAX_FEED_POSTS,
-                before=cursor,
-                posts_only=True,
-                exclude_authors=hidden,
-            ),
+            _fetch_followed_page,
             before,
-            lambda post: float(post["created_at"]),
+            lambda post: (float(post["created_at"]), str(post["hash"])),
             filter_page=_keep_followed_or_tagged,
         )
     else:
@@ -3964,27 +4002,35 @@ def follow_tag(
     clean = clean_tag(tag)
     display = str(tag).strip()
     timestamp = float(now if now is not None else time.time())
-    existing = conn.execute(
-        "SELECT tag, display, added_at FROM followed_tags WHERE tag = ?",
-        (clean,),
-    ).fetchone()
-    if existing is not None:
-        return {
-            "tag": str(existing["tag"]),
-            "display": str(existing["display"]),
-            "added_at": float(existing["added_at"]),
-        }
-    count = conn.execute("SELECT COUNT(*) AS n FROM followed_tags").fetchone()["n"]
-    if int(count) >= MAX_FOLLOWED_TAGS:
-        raise TanError(
-            f"followed tag list is limited to {MAX_FOLLOWED_TAGS} tags"
-        )
-    with conn:
+    # Take the write lock before checking for an existing follow and the
+    # capacity, so a concurrent follow cannot slip in between check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT tag, display, added_at FROM followed_tags WHERE tag = ?",
+            (clean,),
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            return {
+                "tag": str(existing["tag"]),
+                "display": str(existing["display"]),
+                "added_at": float(existing["added_at"]),
+            }
+        count = conn.execute("SELECT COUNT(*) AS n FROM followed_tags").fetchone()["n"]
+        if int(count) >= MAX_FOLLOWED_TAGS:
+            raise TanError(
+                f"followed tag list is limited to {MAX_FOLLOWED_TAGS} tags"
+            )
         conn.execute(
             "INSERT INTO followed_tags(tag, display, added_at) "
             "VALUES(?, ?, ?)",
             (clean, display, timestamp),
         )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     return {"tag": clean, "display": display, "added_at": timestamp}
 
 
