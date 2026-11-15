@@ -132,6 +132,7 @@ SUGGEST_FOLLOWED_WEIGHT = 2
 MAX_FOLLOWS = 512
 MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
+MAX_FOLLOWED_TAGS = 256
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
 MAX_HIDDEN_POSTS = 512
@@ -559,6 +560,12 @@ CREATE TABLE IF NOT EXISTS follows (
 
 CREATE TABLE IF NOT EXISTS muted_keywords (
     keyword TEXT PRIMARY KEY,
+    display TEXT NOT NULL,
+    added_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS followed_tags (
+    tag TEXT PRIMARY KEY,
     display TEXT NOT NULL,
     added_at REAL NOT NULL
 );
@@ -2679,7 +2686,11 @@ def timeline(
     a muted or blocked author, or
     of a post matching a muted keyword, never appears either — a
     repost carries no text of its own, so hiding the original hides
-    the repost.  Pages are read until ``limit`` unmuted posts are
+    the repost.  Posts carrying a tag the viewer follows (see
+    :func:`follow_tag`) also appear when their author is not
+    followed, marked with ``via_tag`` — but the silencing rules
+    above still win: a muted or blocked author's tagged post never
+    appears, and neither does one matching a muted keyword.  Pages are read until ``limit`` unmuted posts are
     collected or the feed is exhausted, so muted posts never shrink the
     result below what is available.  ``exclude_authors`` hides posts
     from blocked authors — and blanks their words from reply
@@ -2760,37 +2771,81 @@ def timeline(
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
     ]
     clean_authors = [author for author in clean_authors if author not in hidden]
-    if not clean_authors:
+    followed = _followed_tag_list(conn)
+    if not clean_authors and not followed:
         return []
-    placeholders = ", ".join("?" for _ in clean_authors)
-    def page(cursor: Optional[float]) -> List[Dict[str, Any]]:
-        params: List[Any] = list(clean_authors)
-        where = (
-            f"linked = 1 AND kind IN ({TIMELINE_KINDS_SQL}) "
-            f"AND author IN ({placeholders}) AND {_NOT_DELETED} "
-            "AND (expires_at IS NULL OR expires_at > ?)"
-        )
-        params.append(time.time())
-        if cursor is not None:
-            where += " AND created_at < ?"
-            params.append(float(cursor))
-        params.append(MAX_FEED_POSTS)
-        rows = conn.execute(
-            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
-            "ORDER BY created_at DESC, hash DESC LIMIT ?",
-            params,
-        ).fetchall()
-        return _public_posts(rows)
+    if followed:
+        # A followed tag pulls in posts from authors the viewer does
+        # not follow, so a topic is followed, not just its authors.
+        # The page then scans every author's posts and keeps followed
+        # authors' posts plus tag matches; without followed tags the
+        # author-filtered query below stays the cheaper path.  A post
+        # that enters only through a tag is marked with ``via_tag``,
+        # so the owner can tell why an unfamiliar author appears.
+        followed_set = set(clean_authors)
 
-    posts = _fill_unmuted(
-        conn,
-        keywords,
-        limit,
-        page,
-        before,
-        lambda post: float(post["created_at"]),
-        filter_page=_drop_hidden,
-    )
+        def _keep_followed_or_tagged(
+            page: List[Dict[str, Any]],
+        ) -> List[Dict[str, Any]]:
+            visible = _drop_hidden(page)
+            via: Dict[str, str] = {}
+            for tag in followed:
+                for post in _filter_posts_by_tag(conn, visible, tag):
+                    via.setdefault(str(post["hash"]), tag)
+            kept: List[Dict[str, Any]] = []
+            for post in visible:
+                if post.get("author") in followed_set:
+                    kept.append(post)
+                elif str(post["hash"]) in via:
+                    kept.append(dict(post, via_tag=via[str(post["hash"])]))
+            return kept
+
+        posts = _fill_unmuted(
+            conn,
+            keywords,
+            limit,
+            lambda cursor: feed(
+                conn,
+                limit=MAX_FEED_POSTS,
+                before=cursor,
+                posts_only=True,
+                exclude_authors=hidden,
+            ),
+            before,
+            lambda post: float(post["created_at"]),
+            filter_page=_keep_followed_or_tagged,
+        )
+    else:
+        placeholders = ", ".join("?" for _ in clean_authors)
+
+        def page(cursor: Optional[float]) -> List[Dict[str, Any]]:
+            params: List[Any] = list(clean_authors)
+            where = (
+                f"linked = 1 AND kind IN ({TIMELINE_KINDS_SQL}) "
+                f"AND author IN ({placeholders}) AND {_NOT_DELETED} "
+                "AND (expires_at IS NULL OR expires_at > ?)"
+            )
+            params.append(time.time())
+            if cursor is not None:
+                where += " AND created_at < ?"
+                params.append(float(cursor))
+            params.append(MAX_FEED_POSTS)
+            rows = conn.execute(
+                f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
+                "ORDER BY created_at DESC, hash DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return _public_posts(rows)
+
+        posts = _fill_unmuted(
+            conn,
+            keywords,
+            limit,
+            page,
+            before,
+            lambda post: float(post["created_at"]),
+            filter_page=_drop_hidden,
+        )
     return annotate_reposts(
         conn,
         annotate_repost_counts(
@@ -3896,6 +3951,72 @@ def muted(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 def _muted_keyword_list(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute("SELECT keyword FROM muted_keywords").fetchall()
     return [str(row["keyword"]) for row in rows]
+
+
+def follow_tag(
+    conn: sqlite3.Connection,
+    tag: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Follow *tag* so its posts join the timeline.  Re-following is a
+    no-op returning the original record, so the first follow time is kept."""
+    clean = clean_tag(tag)
+    display = str(tag).strip()
+    timestamp = float(now if now is not None else time.time())
+    existing = conn.execute(
+        "SELECT tag, display, added_at FROM followed_tags WHERE tag = ?",
+        (clean,),
+    ).fetchone()
+    if existing is not None:
+        return {
+            "tag": str(existing["tag"]),
+            "display": str(existing["display"]),
+            "added_at": float(existing["added_at"]),
+        }
+    count = conn.execute("SELECT COUNT(*) AS n FROM followed_tags").fetchone()["n"]
+    if int(count) >= MAX_FOLLOWED_TAGS:
+        raise TanError(
+            f"followed tag list is limited to {MAX_FOLLOWED_TAGS} tags"
+        )
+    with conn:
+        conn.execute(
+            "INSERT INTO followed_tags(tag, display, added_at) "
+            "VALUES(?, ?, ?)",
+            (clean, display, timestamp),
+        )
+    return {"tag": clean, "display": display, "added_at": timestamp}
+
+
+def unfollow_tag(conn: sqlite3.Connection, tag: str) -> bool:
+    """Stop following *tag*.  Returns whether one was removed."""
+    clean = clean_tag(tag)
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM followed_tags WHERE tag = ?", (clean,)
+        )
+    return cursor.rowcount > 0
+
+
+def followed_tags(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Followed tags, newest first."""
+    rows = conn.execute(
+        "SELECT tag, display, added_at FROM followed_tags "
+        "ORDER BY added_at DESC"
+    ).fetchall()
+    return [
+        {
+            "tag": str(row["tag"]),
+            "display": str(row["display"]),
+            "added_at": float(row["added_at"]),
+        }
+        for row in rows
+    ]
+
+
+def _followed_tag_list(conn: sqlite3.Connection) -> List[str]:
+    rows = conn.execute("SELECT tag FROM followed_tags").fetchall()
+    return [str(row["tag"]) for row in rows]
 
 
 def without_muted_keywords(

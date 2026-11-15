@@ -48,6 +48,8 @@ from tau.tangents.tan import (
     extract_tags,
     feed,
     follow,
+    follow_tag,
+    followed_tags,
     following,
     get_post,
     hash,
@@ -90,6 +92,7 @@ from tau.tangents.tan import (
     timeline,
     top_posts,
     unfollow,
+    unfollow_tag,
     unhide_post,
     unmute,
     unmute_keyword,
@@ -6459,6 +6462,199 @@ def test_timeline_tag_hidden_repost_does_not_consume_limit(identities, tmp_path)
     assert [post["hash"] for post in author_timeline(conn, author_of(carol), tag="meshnet")] == [
         repost["hash"]
     ]
+
+
+def test_follow_tag_round_trip(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    record = follow_tag(conn, "#MeshNet", now=1000)
+    assert record == {"tag": "meshnet", "display": "#MeshNet", "added_at": 1000.0}
+    follow_tag(conn, "ato", now=1001)
+
+    # Newest first; the display form the user typed is kept.
+    assert followed_tags(conn) == [
+        {"tag": "ato", "display": "ato", "added_at": 1001.0},
+        {"tag": "meshnet", "display": "#MeshNet", "added_at": 1000.0},
+    ]
+
+    # Re-following is a no-op: same tag, original time and display.
+    assert follow_tag(conn, "MESHNET", now=1002) == {
+        "tag": "meshnet",
+        "display": "#MeshNet",
+        "added_at": 1000.0,
+    }
+    assert len(followed_tags(conn)) == 2
+
+    assert unfollow_tag(conn, "#meshnet") is True
+    assert unfollow_tag(conn, "meshnet") is False
+    assert [record["tag"] for record in followed_tags(conn)] == ["ato"]
+
+    with pytest.raises(TanError, match="not a tag"):
+        follow_tag(conn, "two words")
+    with pytest.raises(TanError, match="not a tag"):
+        unfollow_tag(conn, "")
+
+
+def test_timeline_includes_followed_tag_posts(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    tagged = create_post(conn, bob, "hello #meshnet", name="bob", now=1000)
+    plain = create_post(conn, bob, "plain post", name="bob", now=1001)
+    own_tagged = create_post(conn, alice, "mine #meshnet", name="alice", now=1002)
+    authors = [author_of(alice)]
+
+    follow_tag(conn, "#meshnet")
+    found = timeline(conn, authors)
+    assert [post["hash"] for post in found] == [
+        own_tagged["hash"],
+        tagged["hash"],
+    ]
+    # Only the post that arrived through the tag is marked: the
+    # followed author's own tagged post needs no marker.
+    assert [post.get("via_tag") for post in found] == [None, "meshnet"]
+
+    # Unfollowing the tag drops the stranger's post again.
+    unfollow_tag(conn, "meshnet")
+    assert [post["hash"] for post in timeline(conn, authors)] == [
+        own_tagged["hash"]
+    ]
+
+
+def test_timeline_followed_tag_respects_silencing(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    dave = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    muted_post = create_post(conn, bob, "#meshnet from bob", name="bob", now=1000)
+    noisy_post = create_post(conn, carol, "#meshnet crypto", name="carol", now=1001)
+    dave_post = create_post(conn, dave, "#meshnet from dave", name="dave", now=1002)
+    hidden_post = create_post(conn, carol, "#meshnet hidden", name="carol", now=1003)
+    authors = [author_of(alice)]
+
+    follow_tag(conn, "meshnet")
+    mute_keyword(conn, "crypto")
+    mute(conn, author_of(bob), name="bob")
+    hide_post(conn, hidden_post["hash"])
+    # The muted author's tagged post stays out, and so does the one
+    # matching a muted keyword and the hidden one — following a tag
+    # never re-shows silenced content. Only the stranger's clean post
+    # comes in through the tag.
+    found = timeline(conn, authors)
+    assert [post["hash"] for post in found] == [dave_post["hash"]]
+    assert found[0].get("via_tag") == "meshnet"
+
+    # A blocked author stays out too, even with the tag followed.
+    assert timeline(conn, authors, exclude_authors=[author_of(dave)]) == []
+
+    # Unmuting and unhiding restores the posts through the tag.
+    unmute(conn, author_of(bob))
+    unmute_keyword(conn, "crypto")
+    unhide_post(conn, hidden_post["hash"])
+    found = timeline(conn, authors, exclude_authors=[author_of(dave)])
+    assert [post["hash"] for post in found] == [
+        hidden_post["hash"],
+        noisy_post["hash"],
+        muted_post["hash"],
+    ]
+    assert [post.get("via_tag") for post in found] == ["meshnet", "meshnet", "meshnet"]
+
+
+def test_timeline_followed_tag_repost_and_edit(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    original = create_post(conn, bob, "tagged #meshnet", name="bob", now=1000)
+    repost = create_repost(conn, carol, original["hash"], name="carol", now=1001)
+    edited = create_post(conn, bob, "hello", name="bob", now=1002)
+    create_edit(conn, bob, edited["hash"], "hello #meshnet", name="bob", now=1003)
+    authors = [author_of(alice)]
+
+    follow_tag(conn, "meshnet")
+    # A repost counts when the post it reposts carries the tag, and an
+    # edited post matches on its edited text — the same matching the
+    # --tag view already uses.
+    found = timeline(conn, authors)
+    assert [post["hash"] for post in found] == [
+        edited["hash"],
+        repost["hash"],
+        original["hash"],
+    ]
+    assert [post.get("via_tag") for post in found] == [
+        "meshnet",
+        "meshnet",
+        "meshnet",
+    ]
+
+
+def test_timeline_followed_tag_with_no_followed_authors(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    tagged = create_post(conn, bob, "#meshnet from a stranger", name="bob", now=1000)
+    create_post(conn, bob, "plain post", name="bob", now=1001)
+
+    follow_tag(conn, "meshnet")
+    # Nobody followed at all: the tag alone still brings its posts in.
+    found = timeline(conn, [])
+    assert [post["hash"] for post in found] == [tagged["hash"]]
+    assert found[0].get("via_tag") == "meshnet"
+
+
+def test_cli_tan_follow_tag(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    # A stranger's tagged post in the local store: the viewer follows
+    # nobody, so only the followed tag can bring it into the timeline.
+    config = TauConfig.resolve(data_dir=data_dir)
+    stranger = RNS.Identity()
+    conn = init_db(config.social_db_path)
+    try:
+        create_post(
+            conn, stranger, "#meshnet hello from a stranger", name="stranger", now=1000
+        )
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "tan",
+                "follow-tag",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "#meshnet",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["tag"] == "meshnet"
+
+    assert main(["tan", "followed-tags", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["followed_tags"][0]["tag"] == "meshnet"
+
+    assert main(["tan", "timeline", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "hello from a stranger" in out
+    assert "via #meshnet" in out
+
+    assert (
+        main(
+            [
+                "tan",
+                "unfollow-tag",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "meshnet",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"tag": "meshnet", "unfollowed": True}
 
 
 # -- disappearing posts -------------------------------------------------------
