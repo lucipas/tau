@@ -308,9 +308,6 @@ _WS_OPCODE_BINARY = 0x2
 _WS_OPCODE_CLOSE = 0x8
 _WS_OPCODE_PING = 0x9
 _WS_OPCODE_PONG = 0xA
-# How long the reader thread waits for the next client frame before
-# checking whether the bridge is closing.
-_WS_READ_TIMEOUT_SECONDS = 5.0
 # Initial reconnect delay is the console's; the server only needs its
 # ping heartbeat, which reuses the SSE interval.
 
@@ -523,6 +520,16 @@ def _ws_accept_key(key: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
+def _ws_key_is_valid(key: str) -> bool:
+    """A Sec-WebSocket-Key is ASCII base64 of exactly 16 bytes (RFC 6455)."""
+    if not key.isascii():
+        return False
+    try:
+        return len(base64.b64decode(key, validate=True)) == 16
+    except ValueError:
+        return False
+
+
 def _ws_encode_frame(payload: bytes, *, opcode: int = _WS_OPCODE_TEXT) -> bytes:
     """Encode one server-to-client frame (servers never mask)."""
     header = bytearray([0x80 | opcode])
@@ -589,6 +596,10 @@ class _WebSocketReader:
             payload = bytearray(self._read_exact(length))
             for index, byte in enumerate(payload):
                 payload[index] = byte ^ mask[index % 4]
+            if opcode & 0x08 and (not fin or length > 125):
+                # Control frames (close/ping/pong) must not be fragmented
+                # and carry at most 125 bytes (RFC 6455 section 5.5).
+                raise _WebSocketFrameError("invalid control frame")
             if opcode == _WS_OPCODE_CLOSE:
                 return None
             if opcode == _WS_OPCODE_PING:
@@ -596,6 +607,9 @@ class _WebSocketReader:
                 continue
             if opcode == _WS_OPCODE_PONG:
                 continue
+            if len(message) + len(payload) > _WS_MAX_FRAME_BYTES:
+                # Bound the reassembled message, not just each frame.
+                raise _WebSocketFrameError("websocket message too large")
             if opcode == _WS_OPCODE_CONTINUATION:
                 if first:
                     raise _WebSocketFrameError(
@@ -10865,10 +10879,26 @@ class _WebHandler(BaseHTTPRequestHandler):
         connection = (self.headers.get("Connection") or "").lower()
         key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
         version = (self.headers.get("Sec-WebSocket-Version") or "").strip()
+        # Browsers do not apply CORS to WebSocket handshakes, so a page
+        # on another origin could otherwise read the console over /ws.
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and not _is_local_origin(origin):
+            host_header = (self.headers.get("Host") or "").strip().lower()
+            try:
+                origin_netloc = urlsplit(origin).netloc.lower()
+            except ValueError:
+                origin_netloc = ""
+            if not host_header or origin_netloc != host_header:
+                self._send_error(
+                    HTTPStatus.FORBIDDEN,
+                    "cross-origin websocket connections are not allowed",
+                )
+                return
         if (
             upgrade != "websocket"
             or "upgrade" not in connection
             or not key
+            or not _ws_key_is_valid(key)
             or version != "13"
         ):
             self._send_error(
@@ -10881,16 +10911,29 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_error(HTTPStatus.TOO_MANY_REQUESTS, str(exc))
             return
 
-        self.close_connection = True
-        self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
-        self.send_header("Upgrade", "websocket")
-        self.send_header("Connection", "Upgrade")
-        self.send_header("Sec-WebSocket-Accept", _ws_accept_key(key))
-        self._cors_headers()
-        self.end_headers()
+        try:
+            self.close_connection = True
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", _ws_accept_key(key))
+            self._cors_headers()
+            self.end_headers()
+        except BaseException:
+            self.bridge.bus.unsubscribe(subscriber)
+            raise
 
         stopped = threading.Event()
         send_lock = threading.Lock()
+
+        def stop() -> None:
+            # Unblock the reader thread, which is parked in a blocking
+            # read on the client socket, so the handler can unwind.
+            stopped.set()
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
         def send_frame(payload: bytes, *, opcode: int = _WS_OPCODE_TEXT) -> bool:
             try:
@@ -10901,7 +10944,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 return True
             except (BrokenPipeError, ConnectionResetError, OSError):
-                stopped.set()
+                stop()
                 return False
 
         def send_json(payload: Dict[str, Any]) -> bool:
@@ -10924,7 +10967,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     if not send_json(dict(event)):
                         return
             finally:
-                stopped.set()
+                stop()
 
         sender = threading.Thread(
             target=pump, name="tau-ws-pump", daemon=True
@@ -10938,13 +10981,13 @@ class _WebHandler(BaseHTTPRequestHandler):
             # displaying these messages: send their read receipts.
             self.bridge.mark_displayed_read()
             sender.start()
-            self.connection.settimeout(_WS_READ_TIMEOUT_SECONDS)
+            # Blocking reads: a socket timeout would poison the buffered
+            # rfile (later reads raise OSError), dropping idle clients.
+            # The pump's stop() shuts the socket down to wake this read.
             reader = _WebSocketReader(self.rfile, send_frame=send_frame)
             while not stopped.is_set() and not self.bridge.closing:
                 try:
                     message = reader.read_message()
-                except TimeoutError:
-                    continue
                 except (_WebSocketFrameError, ConnectionResetError, OSError):
                     break
                 if message is None:  # close frame
@@ -11190,6 +11233,25 @@ def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
     if not values:
         return False
     return values[0].strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_param(
+    query: Dict[str, List[str]],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    values = query.get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+turn values[0].strip().lower() in ("1", "true", "yes", "on")
 
 
 def _int_param(
