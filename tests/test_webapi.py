@@ -3095,6 +3095,34 @@ def test_mark_unread_counts_exclude_archived_conversations(node, tmp_path):
         bridge.stop()
 
 
+def test_mark_unread_counts_exclude_ignored_groups(bridge, node, tmp_path):
+    group_id = _learned_group(node, tmp_path)
+    _inbound_record(node, id="dm-1", received_at=101.0)
+    _inbound_record(
+        node,
+        id="group-1",
+        received_at=103.0,
+        kind="group",
+        group=group_id,
+        group_name="weekend",
+    )
+    # The DM reads; the group post stays unread, then its group is ignored.
+    _json(bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH})
+    _json(bridge, "/api/groups/ignore", method="POST", body={"group": "weekend"})
+
+    # Marking the DM unread must not resurrect the ignored group's
+    # hidden count: the bridge reports unread the same way its unread
+    # endpoint does, so no console is told to clear it.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/unread",
+        method="POST",
+        body={"peer": PEER_HASH, "all": True},
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "total": 1}
+
+
 def test_mark_unread_endpoint_reports_unsaved_cursor(
     bridge, node, monkeypatch
 ):
