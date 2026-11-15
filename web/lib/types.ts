@@ -304,10 +304,12 @@ export interface Counts {
 }
 
 // Per-conversation unread counts from the node inbox: how many
-// received DMs sit after each sender's read cursor. Read state is
-// local to the node; the console only displays and clears it.
+// received DMs sit after each sender's read cursor, and how many
+// received group posts sit after each group's read cursor. Read state
+// is local to the node; the console only displays and clears it.
 export interface UnreadCounts {
   per_peer: Record<string, number>;
+  per_group: Record<string, number>;
   total: number;
   // Stamped by the node; a count with an older revision than one
   // already applied is stale and is ignored.

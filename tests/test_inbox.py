@@ -362,7 +362,7 @@ def test_prune_leaves_read_cursor_and_unread_counts(tmp_path):
 
     result = inbox.prune(1500.0, now=2000.0)
     assert result["pruned"] == 1
-    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
 
 
 def test_prune_rejects_non_positive_cutoff(tmp_path):
@@ -1338,19 +1338,20 @@ def test_new_messages_are_unread_until_marked_read(tmp_path):
 
     assert inbox.unread_counts() == {
         "per_peer": {"aa" * 16: 2, "bb" * 16: 1},
+        "per_group": {},
         "total": 3,
     }
     assert all(entry["unread"] for entry in inbox.list_messages())
 
     counts = inbox.mark_read(peer="aa" * 16)
-    assert counts == {"per_peer": {"bb" * 16: 1}, "total": 1}
+    assert counts == {"per_peer": {"bb" * 16: 1}, "per_group": {}, "total": 1}
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["a2", "b1", "a1"]
     assert [entry["unread"] for entry in listed] == [False, True, False]
 
     # Marking one peer leaves the other's cursor alone.
     inbox.mark_read(peer="bb" * 16)
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
 
 
 def test_unread_counts_ignore_sent_records(tmp_path):
@@ -1369,11 +1370,11 @@ def test_unread_counts_ignore_sent_records(tmp_path):
             direction="out",
         )
     )
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
 
     # Received mail after the sent record still counts.
     inbox.append(_record(id="a3", destination="aa" * 16, received_at=4.0))
-    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "per_group": {}, "total": 1}
 
 
 def test_unread_counts_exclude_dm_from_keeps_group_posts(tmp_path):
@@ -1391,27 +1392,30 @@ def test_unread_counts_exclude_dm_from_keeps_group_posts(tmp_path):
     )
     inbox.append(_record(id="dm-2", destination="bb" * 16, received_at=3.0))
 
-    # Without the exclusion, the sender's DM and group post count
-    # together under the same destination.
+    # Without the exclusion, the sender's DM counts under the sender
+    # and the group post under its group.
     assert inbox.unread_counts() == {
-        "per_peer": {"aa" * 16: 2, "bb" * 16: 1},
+        "per_peer": {"aa" * 16: 1, "bb" * 16: 1},
+        "per_group": {"11" * 16: 1},
         "total": 3,
     }
     # Excluding the sender hides only the DM: the group post belongs
     # to the group thread, which stays visible, so it still counts.
     assert inbox.unread_counts(exclude_dm_from={"aa" * 16}) == {
-        "per_peer": {"aa" * 16: 1, "bb" * 16: 1},
+        "per_peer": {"bb" * 16: 1},
+        "per_group": {"11" * 16: 1},
         "total": 2,
     }
     # A sender with only DMs disappears from the counts entirely.
     assert inbox.unread_counts(exclude_dm_from={"bb" * 16}) == {
-        "per_peer": {"aa" * 16: 2},
+        "per_peer": {"aa" * 16: 1},
+        "per_group": {"11" * 16: 1},
         "total": 2,
     }
     # mark_read reports the same filtered counts after the mark.
     assert inbox.mark_read(
         peer="bb" * 16, exclude_dm_from={"aa" * 16}
-    ) == {"per_peer": {"aa" * 16: 1}, "total": 1}
+    ) == {"per_peer": {}, "per_group": {"11" * 16: 1}, "total": 1}
 
 
 def test_unread_counts_exclude_group_hides_its_posts_only(tmp_path):
@@ -1429,22 +1433,24 @@ def test_unread_counts_exclude_group_hides_its_posts_only(tmp_path):
     )
     inbox.append(_record(id="dm-2", destination="bb" * 16, received_at=3.0))
 
-    # Without the exclusion, the sender's DM and group post count
-    # together under the same destination.
+    # Without the exclusion, the sender's DM counts under the sender
+    # and the group post under its group.
     assert inbox.unread_counts() == {
-        "per_peer": {"aa" * 16: 2, "bb" * 16: 1},
+        "per_peer": {"aa" * 16: 1, "bb" * 16: 1},
+        "per_group": {"11" * 16: 1},
         "total": 3,
     }
     # Excluding the group hides only its post: the sender's DM still
     # counts, and the other sender is untouched.
     assert inbox.unread_counts(exclude_group={"11" * 16}) == {
         "per_peer": {"aa" * 16: 1, "bb" * 16: 1},
+        "per_group": {},
         "total": 2,
     }
     # mark_read reports the same filtered counts after the mark.
     assert inbox.mark_read(
         peer="bb" * 16, exclude_group={"11" * 16}
-    ) == {"per_peer": {"aa" * 16: 1}, "total": 1}
+    ) == {"per_peer": {"aa" * 16: 1}, "per_group": {}, "total": 1}
 
 
 def test_mark_read_advances_only_to_up_to(tmp_path):
@@ -1468,7 +1474,7 @@ def test_mark_unread_marks_newest_message_unread_again(tmp_path):
     inbox.mark_read()
 
     counts = inbox.mark_unread(peer="ab" * 16)
-    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert counts == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["a2", "a1"]
     assert [entry["unread"] for entry in listed] == [True, False]
@@ -1481,7 +1487,7 @@ def test_mark_unread_all_marks_whole_conversation_unread(tmp_path):
     inbox.mark_read()
 
     counts = inbox.mark_unread(peer="ab" * 16, all=True)
-    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    assert counts == {"per_peer": {"ab" * 16: 2}, "per_group": {}, "total": 2}
     assert all(entry["unread"] for entry in inbox.list_messages())
 
 
@@ -1490,7 +1496,7 @@ def test_mark_unread_is_noop_when_nothing_was_read(tmp_path):
     inbox.append(_record(id="a1", received_at=1.0))
 
     counts = inbox.mark_unread(peer="ab" * 16)
-    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert counts == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
 
 
 def test_mark_unread_on_peer_with_no_messages_is_a_noop(tmp_path):
@@ -1498,7 +1504,7 @@ def test_mark_unread_on_peer_with_no_messages_is_a_noop(tmp_path):
     inbox.append(_record(id="a1", received_at=1.0))
 
     assert inbox.mark_unread(peer="bb" * 16) is None
-    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
 
 
 def test_mark_unread_leaves_other_peers_alone(tmp_path):
@@ -1508,7 +1514,7 @@ def test_mark_unread_leaves_other_peers_alone(tmp_path):
     inbox.mark_read()
 
     inbox.mark_unread(peer="aa" * 16)
-    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "per_group": {}, "total": 1}
 
 
 def test_mark_unread_ignores_a_trailing_sent_record(tmp_path):
@@ -1519,7 +1525,7 @@ def test_mark_unread_ignores_a_trailing_sent_record(tmp_path):
     inbox.mark_read()
 
     counts = inbox.mark_unread(peer="ab" * 16)
-    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert counts == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["a2", "a1"]
     assert [entry["unread"] for entry in listed] == [True, False]
@@ -1533,7 +1539,7 @@ def test_mark_unread_does_not_mark_unread_messages_read(tmp_path):
     inbox.mark_read(up_to_seq=1)
 
     counts = inbox.mark_unread(peer="ab" * 16)
-    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    assert counts == {"per_peer": {"ab" * 16: 2}, "per_group": {}, "total": 2}
     listed = inbox.list_messages()
     assert [entry["unread"] for entry in listed] == [True, True, False]
 
@@ -1545,7 +1551,7 @@ def test_sent_records_do_not_inflate_unread_counts(tmp_path):
     inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
 
     # A reply this node sent is never unread for its owner.
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
 
 
 def test_mark_unread_and_unread_counts_agree_with_a_trailing_sent_record(tmp_path):
@@ -1555,7 +1561,7 @@ def test_mark_unread_and_unread_counts_agree_with_a_trailing_sent_record(tmp_pat
     inbox.mark_read()
 
     counts = inbox.mark_unread(peer="ab" * 16, all=True)
-    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert counts == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
     assert inbox.unread_counts() == counts
 
 
@@ -1573,9 +1579,10 @@ def test_mark_unread_raises_when_the_cursor_cannot_persist(tmp_path, monkeypatch
         inbox.mark_unread(peer="ab" * 16)
 
     # The in-memory cursor is restored, and the on-disk state is untouched.
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
     assert Inbox(tmp_path / "inbox.json").unread_counts() == {
         "per_peer": {},
+        "per_group": {},
         "total": 0,
     }
 
@@ -1589,7 +1596,7 @@ def test_mark_read_never_moves_a_cursor_backward(tmp_path):
     # A delayed mark covering only the older message must not restore
     # the newer one to unread.
     inbox.mark_read(up_to_seq=1)
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
 
 
 def test_clock_going_backward_does_not_hide_new_mail(tmp_path):
@@ -1599,7 +1606,7 @@ def test_clock_going_backward_does_not_hide_new_mail(tmp_path):
 
     # Arrives later, but the wall clock says it is earlier.
     inbox.append(_record(id="a2", received_at=50.0))
-    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
 
 
 def test_legacy_file_with_descending_timestamps_starts_read(tmp_path):
@@ -1617,7 +1624,7 @@ def test_legacy_file_with_descending_timestamps_starts_read(tmp_path):
     )
 
     inbox = Inbox(path)
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
 
 
 def test_read_cursors_persist_across_instances(tmp_path):
@@ -1628,7 +1635,7 @@ def test_read_cursors_persist_across_instances(tmp_path):
     inbox.append(_record(id="a2", received_at=2.0))
 
     reloaded = Inbox(path)
-    assert reloaded.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert reloaded.unread_counts() == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
     assert [entry["unread"] for entry in reloaded.list_messages()] == [True, False]
 
 
@@ -1640,12 +1647,183 @@ def test_old_file_without_cursors_starts_read(tmp_path):
     )
 
     inbox = Inbox(path)
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
     assert inbox.list_messages()[0]["unread"] is False
 
     # But mail that arrives after the upgrade is unread.
     inbox.append(_record(id="new", received_at=6.0))
-    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
+
+
+def test_mark_read_peer_leaves_same_senders_group_post_unread(tmp_path):
+    """Reading a DM must not consume a group post from the same sender."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="dm-1", destination="aa" * 16, received_at=1.0))
+    inbox.append(
+        _record(
+            id="group-1",
+            destination="aa" * 16,
+            received_at=2.0,
+            kind="group",
+            group="11" * 16,
+            group_name="crew",
+        )
+    )
+
+    inbox.mark_read(peer="aa" * 16)
+    assert inbox.unread_counts() == {
+        "per_peer": {},
+        "per_group": {"11" * 16: 1},
+        "total": 1,
+    }
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["group-1", "dm-1"]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_mark_read_group_leaves_same_senders_dm_unread(tmp_path):
+    """Reading a group post must not consume a DM from the same sender."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="dm-1", destination="aa" * 16, received_at=1.0))
+    inbox.append(
+        _record(
+            id="group-1",
+            destination="aa" * 16,
+            received_at=2.0,
+            kind="group",
+            group="11" * 16,
+            group_name="crew",
+        )
+    )
+
+    inbox.mark_read(group="11" * 16)
+    assert inbox.unread_counts() == {
+        "per_peer": {"aa" * 16: 1},
+        "per_group": {},
+        "total": 1,
+    }
+    listed = inbox.list_messages()
+    assert [entry["unread"] for entry in listed] == [False, True]
+
+
+def test_mark_read_all_advances_each_conversation(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="dm-1", destination="aa" * 16, received_at=1.0))
+    inbox.append(
+        _record(
+            id="group-1",
+            destination="aa" * 16,
+            received_at=2.0,
+            kind="group",
+            group="11" * 16,
+            group_name="crew",
+        )
+    )
+
+    inbox.mark_read()
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert [entry["unread"] for entry in inbox.list_messages()] == [False, False]
+
+
+def test_mark_read_up_to_seq_scopes_to_the_conversation(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="dm-1", destination="aa" * 16, received_at=1.0))
+    inbox.append(
+        _record(
+            id="group-1",
+            destination="aa" * 16,
+            received_at=2.0,
+            kind="group",
+            group="11" * 16,
+            group_name="crew",
+        )
+    )
+    inbox.append(_record(id="dm-2", destination="aa" * 16, received_at=3.0))
+
+    # The cap is a sequence within the DM conversation: it lands on
+    # the older DM and leaves the group post alone.
+    inbox.mark_read(peer="aa" * 16, up_to_seq=2)
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["dm-2", "group-1", "dm-1"]
+    assert [entry["unread"] for entry in listed] == [True, True, False]
+
+
+def test_mark_unread_group_scopes_to_the_group(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="dm-1", destination="aa" * 16, received_at=1.0))
+    inbox.append(
+        _record(
+            id="group-1",
+            destination="aa" * 16,
+            received_at=2.0,
+            kind="group",
+            group="11" * 16,
+            group_name="crew",
+        )
+    )
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="aa" * 16, group="11" * 16)
+    assert counts == {
+        "per_peer": {},
+        "per_group": {"11" * 16: 1},
+        "total": 1,
+    }
+    # And the DM mark leaves the group alone the other way round.
+    inbox.mark_read()
+    counts = inbox.mark_unread(peer="aa" * 16)
+    assert counts == {
+        "per_peer": {"aa" * 16: 1},
+        "per_group": {},
+        "total": 1,
+    }
+
+
+def test_old_per_sender_cursor_fans_out_to_each_conversation(tmp_path):
+    """A pre-#409 file's bare-destination cursor migrates per conversation."""
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id="dm-1", destination="aa" * 16, received_at=1.0),
+                    _record(
+                        id="group-1",
+                        destination="aa" * 16,
+                        received_at=2.0,
+                        kind="group",
+                        group="11" * 16,
+                        group_name="crew",
+                    ),
+                    _record(id="dm-2", destination="aa" * 16, received_at=3.0),
+                ],
+                "read_cursors": {
+                    "aa" * 16: {"last_read_seq": 1, "last_read_id": "dm-1"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inbox = Inbox(path)
+    # The old cursor covered the first DM; the group post and the
+    # second DM arrived after it, each in its own conversation.
+    assert inbox.unread_counts() == {
+        "per_peer": {"aa" * 16: 1},
+        "per_group": {"11" * 16: 1},
+        "total": 2,
+    }
+    listed = inbox.list_messages()
+    assert [entry["unread"] for entry in listed] == [True, True, False]
+
+    # The migrated cursors persist in the new key format on the next
+    # save.
+    inbox.mark_read()
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert set(stored["read_cursors"]) == {
+        f"dm:{'aa' * 16}",
+        f"group:{'11' * 16}",
+    }
 
 
 def test_same_timestamp_messages_are_all_read_after_marking(tmp_path):
@@ -1659,7 +1837,7 @@ def test_same_timestamp_messages_are_all_read_after_marking(tmp_path):
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["second", "first"]
     assert [entry["unread"] for entry in listed] == [False, False]
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
 
 
 def test_unread_counts_see_another_handles_mark(tmp_path):
@@ -1671,13 +1849,13 @@ def test_unread_counts_see_another_handles_mark(tmp_path):
     assert server.unread_counts()["total"] == 1
 
     cli.mark_read()
-    assert server.unread_counts() == {"per_peer": {}, "total": 0}
+    assert server.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
 
 
 def test_mark_read_on_empty_inbox_is_a_noop(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
-    assert inbox.mark_read(peer="aa" * 16) == {"per_peer": {}, "total": 0}
-    assert inbox.mark_read() == {"per_peer": {}, "total": 0}
+    assert inbox.mark_read(peer="aa" * 16) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert inbox.mark_read() == {"per_peer": {}, "per_group": {}, "total": 0}
 
 
 def test_sent_records_do_not_evict_received_history(tmp_path, monkeypatch):
@@ -2477,7 +2655,7 @@ def test_add_note_stores_a_read_note_from_self(tmp_path):
     listed = inbox.list_messages()
     assert [item["id"] for item in listed] == [entry["id"]]
     assert listed[0]["unread"] is False
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
 
     # Found by the kind filter and by search, hidden by other kinds.
     assert [item["id"] for item in inbox.list_messages(kind="note")] == [
@@ -2520,7 +2698,7 @@ def test_note_cursor_does_not_cover_peer_mail(tmp_path):
     inbox.append(_record(id="peer-1", destination="ab" * 16, text="hello"))
 
     # The note's own-hash cursor advanced, the peer's did not.
-    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "per_group": {}, "total": 1}
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["peer-1", note["id"]]
     assert [entry["unread"] for entry in listed] == [True, False]
@@ -2537,7 +2715,7 @@ def test_add_note_raises_when_persist_fails(tmp_path, monkeypatch):
         inbox.add_note("lost note", sender_name="alice", destination="cc" * 16)
     # Nothing was kept in memory, and nothing landed on disk.
     assert len(inbox) == 0
-    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.unread_counts() == {"per_peer": {}, "per_group": {}, "total": 0}
     assert len(Inbox(tmp_path / "inbox.json")) == 0
 
 

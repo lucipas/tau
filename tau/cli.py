@@ -91,7 +91,7 @@ from .ignored_groups import (
     load_ignored_groups,
     save_ignored_groups,
 )
-from .inbox import Inbox, InboxError
+from .inbox import Inbox, InboxError, _conversation_key
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
 from .node import (
@@ -1201,7 +1201,15 @@ def build_parser() -> argparse.ArgumentParser:
     messages_unread.add_argument(
         "peer",
         metavar="PEER",
+        nargs="?",
+        default=None,
         help="peer name, destination hash or hash prefix",
+    )
+    messages_unread.add_argument(
+        "--group",
+        default=None,
+        metavar="ID|NAME",
+        help="mark a group's posts unread instead of a peer's",
     )
     messages_unread.add_argument(
         "--all",
@@ -7421,23 +7429,47 @@ def cmd_messages(args: argparse.Namespace) -> int:
         # A count is for scripting: it never advances the read cursor.
         counts = inbox.unread_counts()
         per_peer = counts["per_peer"]
+        per_group = counts["per_group"]
         if peer_hash is not None:
+            # A peer filter is a DM filter: group posts are not that
+            # conversation's mail.
             per_peer = {
                 destination: count
                 for destination, count in per_peer.items()
                 if destination == peer_hash
             }
-        total = sum(per_peer.values())
+            per_group = {}
+        if group_ids is not None:
+            per_group = {
+                group: count
+                for group, count in per_group.items()
+                if group in group_ids
+            }
+            per_peer = {}
+        total = sum(per_peer.values()) + sum(per_group.values())
         if _json_mode(args):
-            _emit({"unread": per_peer, "total": total}, True)
+            _emit(
+                {"unread": per_peer, "unread_groups": per_group, "total": total},
+                True,
+            )
             return _EXIT_OK
-        if not per_peer:
+        if not per_peer and not per_group:
             print("No unread messages.")
             return _EXIT_OK
         for destination, count in sorted(per_peer.items()):
             peer = registry.get(destination)
             name = peer.display_name if peer is not None else "unknown"
             print(f"{name} ({short_hash(destination)}): {count} unread")
+        groups = GroupStore(config.groups_path)
+        for group, count in sorted(per_group.items()):
+            # A group can be gone while its posts stay stored: fall
+            # back to a bare label instead of failing the count.
+            try:
+                found = groups.find(group)
+            except ValueError:
+                found = None
+            name = found["name"] if found else "group"
+            print(f"{name} ({short_hash(group)}): {count} unread")
         print(f"Total: {total} unread")
         return _EXIT_OK
     limit = getattr(args, "limit", 30)
@@ -7643,48 +7675,50 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # out — otherwise an older unread message that did not match would
     # silently lose its unread state.
     if query is None:
+        # Read cursors are per-conversation, so a DM and a group post
+        # from the same sender advance independently — but a listing
+        # that only shows part of one conversation must still not
+        # advance past mail it did not show.  Track the newest shown
+        # sequence per conversation, skipping a conversation entirely
+        # when the limit cut off one of its unread messages.
         partially_listed = {
-            str(entry.get("destination") or "")
-            for entry in omitted
-            if entry.get("unread")
+            _conversation_key(entry) for entry in omitted if entry.get("unread")
         }
         newest_shown: Dict[str, int] = {}
         for entry in shown:
-            destination = str(entry.get("destination") or "")
-            if destination in partially_listed:
+            key = _conversation_key(entry)
+            if key in partially_listed:
                 continue
-            newest_shown[destination] = max(
-                newest_shown.get(destination, 0), int(entry["seq"])
-            )
-        # A read cursor is per-sender, shared by DMs and group posts,
-        # A read cursor is per-sender, shared by DMs and group posts,
-        # so showing a DM would otherwise mark an older hidden group
-        # post read, and showing a group post would otherwise mark an
-        # older hidden DM read, without the owner ever seeing it.  Cap
-        # each destination's advance just before its oldest unread
-        # message that this listing did not show — ignored-group mail,
-        # archived mail, or mail a filtered view (group, --ignored,
-        # --archived) left out.  The capped
-        # message stays unread until the owner displays it; the next
-        # listing that does advances past it.
+            newest_shown[key] = max(newest_shown.get(key, 0), int(entry["seq"]))
+        # Cap each conversation's advance just before its oldest
+        # unread message that this listing did not show — ignored-group
+        # mail, archived mail, or mail a filtered view (group,
+        # --ignored, --archived) left out.  The capped message stays
+        # unread until the owner displays it; the next listing that
+        # does advances past it.
         shown_seqs = {int(entry["seq"]) for entry in shown}
         hidden_floor: Dict[str, int] = {}
         for entry in inbox.list_messages(limit=None):
-            destination = str(entry.get("destination") or "")
-            if destination not in newest_shown:
+            key = _conversation_key(entry)
+            if key not in newest_shown:
                 continue
             if not entry.get("unread"):
                 continue
             if int(entry["seq"]) in shown_seqs:
                 continue
             seq = int(entry["seq"])
-            if destination not in hidden_floor or seq < hidden_floor[destination]:
-                hidden_floor[destination] = seq
-        for destination, up_to_seq in newest_shown.items():
-            floor = hidden_floor.get(destination)
+            if key not in hidden_floor or seq < hidden_floor[key]:
+                hidden_floor[key] = seq
+        for key, up_to_seq in newest_shown.items():
+            floor = hidden_floor.get(key)
             if floor is not None:
                 up_to_seq = min(up_to_seq, floor - 1)
-            inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
+            if key.startswith("group:"):
+                inbox.mark_read(group=key[len("group:"):], up_to_seq=up_to_seq)
+            else:
+                inbox.mark_read(
+                    peer=key[len("dm:"):], up_to_seq=up_to_seq
+                )
         # Listing a DM is reading it: send the sender a receipt, unless
         # this node opted out.  Best-effort — failures stay silent.
         outcome = _send_displayed_receipts(config, inbox, shown)
@@ -7728,6 +7762,26 @@ def cmd_messages_unread(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
+    if getattr(args, "group", None):
+        if getattr(args, "peer", None):
+            raise NodeError("pass a peer or --group, not both")
+        group = GroupStore(config.groups_path).find(args.group)
+        group_id = group["id"]
+        counts = inbox.mark_unread(group=group_id, all=getattr(args, "all", False))
+        if counts is None:
+            raise NodeError(f"no stored messages in group {args.group!r}")
+        unread = counts["per_group"].get(group_id, 0)
+        noun = "message" if unread == 1 else "messages"
+        if _json_mode(args):
+            _emit(
+                {"group": group_id, "unread": unread, "total": counts["total"]},
+                True,
+            )
+        else:
+            print(f"marked {unread} {noun} in group {group['name']} unread")
+        return _EXIT_OK
+    if not getattr(args, "peer", None):
+        raise NodeError("pass a peer or --group")
     peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
     counts = inbox.mark_unread(peer_hash, all=getattr(args, "all", False))
     if counts is None:

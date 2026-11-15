@@ -9,13 +9,19 @@ this store is the node's own, and it exists whether or not ``--http``
 is in use.
 
 Read state lives here too, as a per-conversation cursor: for each
-sender destination, the arrival sequence (and id) of the newest message
-the owner has read.  A message is unread when it arrived after the
-cursor for its sender.  Arrival order comes from the append sequence,
-not the wall clock, so a clock change cannot hide new mail.  Read state is strictly local — it never leaves
-the node — and files written before cursors existed migrate with every
-stored message marked read, so an upgrade does not surface a wall of
-"unread" for mail the owner already saw.
+conversation — a DM with one sender, or one group — the arrival
+sequence (and id) of the newest message the owner has read.  A
+message is unread when it arrived after the cursor for its own
+conversation, so reading a DM never consumes a group post from the
+same sender, and vice versa.  Arrival order comes from the append
+sequence, not the wall clock, so a clock change cannot hide new
+mail.  Read state is strictly local — it never leaves the node — and
+files written before per-conversation cursors existed migrate with
+each old per-sender cursor fanned out to the conversations that
+sender participates in, so an upgrade does not surface a wall of
+"unread" for mail the owner already saw; files written before
+cursors existed at all migrate with every stored message marked
+read.
 """
 
 from __future__ import annotations
@@ -257,27 +263,72 @@ def _number_sequence(messages: List[Dict[str, Any]]) -> None:
         last = seq
 
 
+def _conversation_key(entry: Dict[str, Any]) -> str:
+    """The read-cursor key for *entry*'s conversation.
+
+    A DM belongs to its sender's conversation (``dm:<destination>``);
+    a group post belongs to its group (``group:<group id>``), whatever
+    member sent it.  Group records always carry a 32-hex group id
+    (see :func:`_valid_record`); a group-kind record without one
+    falls back to its sender, so it can never share another
+    conversation's cursor.
+    """
+    group = entry.get("group")
+    if entry.get("kind") == "group" and isinstance(group, str) and group:
+        return f"group:{group}"
+    return f"dm:{entry.get('destination') or ''}"
+
+
+def _cursor_conversations(key: str, messages: List[Dict[str, Any]]) -> List[str]:
+    """The conversation keys one stored cursor key covers.
+
+    A ``dm:`` or ``group:`` key covers exactly its own conversation.
+    A bare destination is the pre-#409 format — one cursor shared by
+    the sender's DM and every group they posted in — so it fans out
+    to each of those conversations, and the migration neither reads
+    nor unreads mail the owner already saw.
+    """
+    if key.startswith("dm:") or key.startswith("group:"):
+        return [key]
+    conversations = {f"dm:{key}"}
+    for entry in messages:
+        if (
+            (entry.get("destination") or "") == key
+            and entry.get("kind") == "group"
+            and isinstance(entry.get("group"), str)
+            and entry.get("group")
+        ):
+            conversations.add(f"group:{entry['group']}")
+    return sorted(conversations)
+
+
 def _valid_cursors(
     raw: Any, messages: List[Dict[str, Any]]
 ) -> Optional[Dict[str, Dict[str, Any]]]:
     """Normalize stored read cursors, or ``None`` when the file predates them.
 
     A cursor is ``{"last_read_seq": int, "last_read_id": str | None}``
-    per sender destination.  A cursor saved before sequence numbers
-    carries only ``last_read_at``; it is resolved to the newest stored
-    message it covered.  Malformed entries are skipped; a missing or
-    non-object ``read_cursors`` section means the file was written
-    before read state existed, and the caller migrates instead.
+    per conversation (see :func:`_conversation_key`).  A cursor saved
+    before sequence numbers carries only ``last_read_at``; it is
+    resolved to the newest stored message it covered in that
+    conversation.  A cursor saved before per-conversation cursors
+    is keyed by bare sender destination and fans out to every
+    conversation that sender participates in (see
+    :func:`_cursor_conversations`).  Malformed entries are skipped;
+    a missing or non-object ``read_cursors`` section means the file
+    was written before read state existed, and the caller migrates
+    instead.
     """
     if raw is None or not isinstance(raw, dict):
         return None
     cursors: Dict[str, Dict[str, Any]] = {}
-    for destination, value in raw.items():
-        if not isinstance(destination, str) or not isinstance(value, dict):
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
             continue
         last_read_id = value.get("last_read_id")
         if last_read_id is not None and not isinstance(last_read_id, str):
             continue
+        targets = _cursor_conversations(key, messages)
         seq = value.get("last_read_seq")
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
             try:
@@ -286,23 +337,29 @@ def _valid_cursors(
                 continue
             if not math.isfinite(last_read_at):
                 continue
-            covered = [
-                entry["seq"]
-                for entry in messages
-                if (entry.get("destination") or "") == destination
-                and entry["received_at"] <= last_read_at
-            ]
-            seq = max(covered, default=0)
-        cursors[destination] = {"last_read_seq": seq, "last_read_id": last_read_id}
+            for target in targets:
+                covered = [
+                    entry["seq"]
+                    for entry in messages
+                    if _conversation_key(entry) == target
+                    and entry["received_at"] <= last_read_at
+                ]
+                cursors[target] = {
+                    "last_read_seq": max(covered, default=0),
+                    "last_read_id": last_read_id,
+                }
+            continue
+        for target in targets:
+            cursors[target] = {"last_read_seq": seq, "last_read_id": last_read_id}
     return cursors
 
 
 def _is_unread(entry: Dict[str, Any], cursor: Optional[Dict[str, Any]]) -> bool:
-    """Whether *entry* arrived after its sender's read cursor.
+    """Whether *entry* arrived after its conversation's read cursor.
 
-    No cursor means nothing from that sender has been read yet.  The
-    comparison is on the arrival sequence, not the wall clock, so a
-    clock that moves backward cannot hide newly arrived mail.
+    No cursor means nothing in that conversation has been read yet.
+    The comparison is on the arrival sequence, not the wall clock, so
+    a clock that moves backward cannot hide newly arrived mail.
     """
     if cursor is None:
         return True
@@ -632,13 +689,14 @@ class Inbox:
             # No read state on disk: every stored message starts as
             # read, so an upgrade never surfaces old mail as unread.
             # The arrival sequence is ordered, so the newest message
-            # per sender is the greatest sequence, whatever its time.
+            # per conversation is the greatest sequence, whatever its
+            # time.
             cursors = {}
             for entry in self._messages:
-                destination = entry.get("destination") or ""
-                current = cursors.get(destination)
+                key = _conversation_key(entry)
+                current = cursors.get(key)
                 if current is None or entry["seq"] > current["last_read_seq"]:
-                    cursors[destination] = {
+                    cursors[key] = {
                         "last_read_seq": entry["seq"],
                         "last_read_id": entry.get("id"),
                     }
@@ -787,7 +845,7 @@ class Inbox:
         refused).  The note is read the moment it is written: the read
         cursor for this node's own destination is advanced past it, so
         it never counts as unread and never shows the unread marker.
-        The cursor is keyed by destination, and no peer message ever
+        The cursor is keyed by conversation, and no peer message ever
         carries our own hash, so the advance touches notes only.
         """
         cleaned = normalize_message(text)
@@ -827,13 +885,13 @@ class Inbox:
     def _advance_own_cursor(self, entry: Dict[str, Any]) -> None:
         """Move this node's read cursor up to a note (caller holds the lock).
 
-        The cursor is keyed by destination, and no peer message carries
-        our own hash, so this only ever marks notes read.
+        The cursor is keyed by conversation, and no peer message
+        carries our own hash, so this only ever marks notes read.
         """
-        destination = entry.get("destination") or ""
-        current = self._read_cursors.get(destination)
+        key = _conversation_key(entry)
+        current = self._read_cursors.get(key)
         if current is None or current["last_read_seq"] < entry["seq"]:
-            self._read_cursors[destination] = {
+            self._read_cursors[key] = {
                 "last_read_seq": entry["seq"],
                 "last_read_id": entry.get("id"),
             }
@@ -1703,7 +1761,7 @@ class Inbox:
         ``direction=None`` to see them.  ``pinned_only`` keeps only
         messages flagged by :meth:`pin`.
         Each entry carries ``unread``: whether it arrived after its
-        sender's read cursor, and a ``reactions`` list when the message
+        conversation's read cursor, and a ``reactions`` list when the message
         has any — derived from the reaction store, never stored counters.
         Sent messages are never unread: the cursor belongs to the
         conversation's received side, so comparing a sent record's
@@ -1752,7 +1810,7 @@ class Inbox:
             # sent is never unread, whatever the conversation's read
             # cursor says about its arrival sequence.
             unread = item.get("direction") != "out" and _is_unread(
-                item, cursors.get(item.get("destination") or "")
+                item, cursors.get(_conversation_key(item))
             )
             copy = dict(item, unread=unread)
             reactions = by_target.get(str(item.get("id") or ""))
@@ -1773,33 +1831,41 @@ class Inbox:
         Only received messages count: a reply this node sent is never
         unread for its owner, so sent records past the cursor must not
         inflate the counts (see :meth:`mark_unread`, which reports the
-        same received-only totals).  ``exclude_dm_from`` hides the
-        direct messages of the named senders — an archived
-        conversation never lights the badge — but their group posts
-        still count: a group post belongs to the group, not to the
-        hidden conversation, and the group thread stays visible.
+        same received-only totals).  ``per_peer`` counts direct
+        messages per sender; ``per_group`` counts group posts per
+        group id; ``total`` is the sum of both.  A group post belongs
+        to the group, not to its sender, so it never lights the
+        sender's DM badge.  ``exclude_dm_from`` hides the direct
+        messages of the named senders — an archived conversation
+        never lights the badge — but their group posts still count in
+        ``per_group``: the group thread stays visible.
         ``exclude_group`` hides the posts of the named groups instead:
         an ignored group never lights any badge, while its members'
         direct messages still count.
         """
         per_peer: Dict[str, int] = {}
+        per_group: Dict[str, int] = {}
         for entry in self._messages:
             if entry.get("direction") != "in":
                 continue
             if _is_unread(
-                entry, self._read_cursors.get(entry.get("destination") or "")
+                entry, self._read_cursors.get(_conversation_key(entry))
             ):
-                destination = entry.get("destination") or ""
-                if (
-                    exclude_dm_from
-                    and destination in exclude_dm_from
-                    and not entry.get("group")
-                ):
-                    continue
-                if exclude_group and str(entry.get("group") or "") in exclude_group:
-                    continue
-                per_peer[destination] = per_peer.get(destination, 0) + 1
-        return {"per_peer": per_peer, "total": sum(per_peer.values())}
+                if entry.get("kind") == "group" and entry.get("group"):
+                    group = str(entry["group"])
+                    if exclude_group and group in exclude_group:
+                        continue
+                    per_group[group] = per_group.get(group, 0) + 1
+                else:
+                    destination = entry.get("destination") or ""
+                    if exclude_dm_from and destination in exclude_dm_from:
+                        continue
+                    per_peer[destination] = per_peer.get(destination, 0) + 1
+        return {
+            "per_peer": per_peer,
+            "per_group": per_group,
+            "total": sum(per_peer.values()) + sum(per_group.values()),
+        }
 
     def unread_counts(
         self,
@@ -1823,6 +1889,7 @@ class Inbox:
         self,
         peer: Union[None, str, List[str]] = None,
         *,
+        group: Optional[str] = None,
         up_to_seq: Optional[int] = None,
         at: Optional[float] = None,
         exclude_dm_from: Optional[Collection[str]] = None,
@@ -1830,41 +1897,48 @@ class Inbox:
     ) -> Any:
         """Advance the read cursor for one conversation, or all of them.
 
-        The cursor lands on the newest message for the peer with an
-        arrival sequence at or before ``up_to_seq`` (every message for
-        the peer when ``up_to_seq`` is ``None``), so listing what was
-        just shown marks exactly that much read.  A cursor never moves
-        backward, so a delayed mark cannot restore read mail as unread.
-        A peer with no messages is left alone.  Returns the unread
-        counts after the mark.
+        The cursor lands on the newest message in the conversation
+        with an arrival sequence at or before ``up_to_seq`` (every
+        message in the conversation when ``up_to_seq`` is ``None``),
+        so listing what was just shown marks exactly that much read.
+        A cursor never moves backward, so a delayed mark cannot
+        restore read mail as unread.  A conversation with no messages
+        is left alone.  Returns the unread counts after the mark.
 
-        Called with a list of message ids instead of a peer, it stamps
-        those messages' ``read_at`` for the read-receipt handoff (see
-        :meth:`_stamp_read_ids`) and returns the ids stamped.
+        ``peer`` names a DM conversation: only that sender's direct
+        messages move — their group posts keep their own cursor.
+        ``group`` names a group instead: only that group's posts move.
+        With neither, every conversation's cursor advances to its own
+        newest message.  Called with a list of message ids instead of
+        a peer, it stamps those messages' ``read_at`` for the
+        read-receipt handoff (see :meth:`_stamp_read_ids`) and returns
+        the ids stamped.
         """
         if isinstance(peer, (list, tuple)):
             return self._stamp_read_ids(list(peer), at=at)
         with self._transaction():
-            if peer is not None:
-                targets = [peer]
+            if group is not None:
+                scopes = [f"group:{group}"]
+            elif peer is not None:
+                scopes = [f"dm:{peer}"]
             else:
-                targets = sorted(
-                    {entry.get("destination") or "" for entry in self._messages}
+                scopes = sorted(
+                    {_conversation_key(entry) for entry in self._messages}
                 )
-            for destination in targets:
+            for key in scopes:
                 candidates = [
                     entry
                     for entry in self._messages
-                    if (entry.get("destination") or "") == destination
+                    if _conversation_key(entry) == key
                     and (up_to_seq is None or entry["seq"] <= up_to_seq)
                 ]
                 if not candidates:
                     continue
                 newest = max(candidates, key=lambda entry: entry["seq"])
-                current = self._read_cursors.get(destination)
+                current = self._read_cursors.get(key)
                 if current is not None and current["last_read_seq"] >= newest["seq"]:
                     continue
-                self._read_cursors[destination] = {
+                self._read_cursors[key] = {
                     "last_read_seq": newest["seq"],
                     "last_read_id": newest.get("id"),
                 }
@@ -1876,55 +1950,73 @@ class Inbox:
 
     def mark_unread(
         self,
-        peer: str,
+        peer: Optional[str] = None,
         *,
         all: bool = False,
+        group: Optional[str] = None,
         exclude_dm_from: Optional[Collection[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Move a conversation's read cursor back so mail shows unread again.
 
         ``tau messages`` marks what it shows as read, so a read DM the
         owner has not answered yet disappears from the unread view.
-        This is the way back: by default the newest received message for
-        the peer becomes unread again; ``all=True`` clears the cursor so
-        the whole conversation shows unread.  Only the local display
-        state moves — a read receipt already sent for a message stays
-        sent, and a delayed ``mark_read`` still cannot move a cursor
-        backward on its own.  A peer with no stored messages is left
-        alone and the return is ``None``; otherwise the unread counts
-        after the mark, with ``exclude_dm_from`` left out exactly as
-        :meth:`unread_counts` leaves them out.  Raises ``OSError`` when the moved cursor
+        This is the way back: by default the newest received message
+        in the conversation becomes unread again; ``all=True`` clears
+        the cursor so the whole conversation shows unread.  Only the
+        local display state moves — a read receipt already sent for a
+        message stays sent, and a delayed ``mark_read`` still cannot
+        move a cursor backward on its own.  ``peer`` names a DM
+        conversation; ``group`` names a group instead, and the peer's
+        group posts are untouched by a DM mark.  A conversation with
+        no stored messages is left alone and the return is ``None``;
+        otherwise the unread counts after the mark, with
+        ``exclude_dm_from`` left out exactly as :meth:`unread_counts`
+        leaves them out.  Raises ``OSError`` when the moved cursor
         cannot be persisted, leaving the in-memory cursor untouched.
         """
         with self._transaction():
             # Only received messages count: a reply we sent must neither
             # stand in for the unread reminder nor satisfy the presence check.
-            entries = [
-                entry
-                for entry in self._messages
-                if (entry.get("destination") or "") == peer
-                and entry.get("direction") == "in"
-            ]
+            if group is not None:
+                key = f"group:{group}"
+                entries = [
+                    entry
+                    for entry in self._messages
+                    if entry.get("kind") == "group"
+                    and entry.get("group") == group
+                    and entry.get("direction") == "in"
+                ]
+            elif peer is not None:
+                key = f"dm:{peer}"
+                entries = [
+                    entry
+                    for entry in self._messages
+                    if (entry.get("destination") or "") == peer
+                    and entry.get("direction") == "in"
+                    and entry.get("kind") != "group"
+                ]
+            else:
+                raise ValueError("mark_unread needs a peer or a group")
             if not entries:
                 return None
             snapshot = dict(self._read_cursors)
             if all:
-                self._read_cursors.pop(peer, None)
+                self._read_cursors.pop(key, None)
             else:
                 newest = max(entries, key=lambda entry: entry["seq"])
-                cursor = self._read_cursors.get(peer)
+                cursor = self._read_cursors.get(key)
                 # Already unread: the newest received message is past the cursor.
                 if not _is_unread(newest, cursor):
                     earlier = [
                         entry for entry in entries if entry["seq"] < newest["seq"]
                     ]
                     if not earlier:
-                        self._read_cursors.pop(peer, None)
+                        self._read_cursors.pop(key, None)
                     else:
                         # The newest is read, so the cursor is at or past it;
                         # stepping to the previous received message only moves backward.
                         previous = max(earlier, key=lambda entry: entry["seq"])
-                        self._read_cursors[peer] = {
+                        self._read_cursors[key] = {
                             "last_read_seq": previous["seq"],
                             "last_read_id": previous.get("id"),
                         }

@@ -84,7 +84,7 @@ export type ConnectionState =
   | "live"
   | "reconnecting";
 
-export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, total: 0 };
+export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, per_group: {}, total: 0 };
 
 export interface PingState {
   pending?: boolean;
@@ -754,7 +754,12 @@ export function useTau() {
         changed = true;
       }
       if (!changed) return previous;
-      return { per_peer: perPeer, total, revision: previous.revision };
+      return {
+        per_peer: perPeer,
+        per_group: previous.per_group,
+        total,
+        revision: previous.revision,
+      };
     });
   }, []);
 
@@ -2003,21 +2008,22 @@ export function useTau() {
     [],
   );
 
-  const markRead = useCallback(async (peer?: string) => {
+  const markRead = useCallback(async (peer?: string, group?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
-    // next snapshot reconciles.
+    // next snapshot reconciles. A group id marks that group's posts
+    // read without touching any member's DM cursor.
     return chainReadWrite(async () => {
       const result = await apiPost<MarkReadResponse>(
         "/api/messages/read",
-        peer ? { peer } : {},
+        group ? { group } : peer ? { peer } : {},
       );
       applyUnread(result.unread);
       return result.unread;
     });
   }, [applyUnread, chainReadWrite]);
 
-  const markUnread = useCallback(async (peer: string, all = false) => {
+  const markUnread = useCallback(async (peer: string, all = false, group?: string) => {
     // The way back from a mark-read: the newest received message shows
     // unread again (or the whole conversation, with all=true), so a
     // read DM the owner has not answered yet stays visible as a
@@ -2026,7 +2032,7 @@ export function useTau() {
     return chainReadWrite(async () => {
       const result = await apiPost<MarkUnreadResponse>(
         "/api/messages/unread",
-        { peer, all },
+        group ? { group, all } : { peer, all },
       );
       applyUnread(result.unread);
       return result.unread;

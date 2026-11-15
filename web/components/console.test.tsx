@@ -39,7 +39,7 @@ function tauState(groups: TauGroup[], peers: Peer[] = []) {
     ignoreGroup: vi.fn(),
     unignoreGroup: vi.fn(),
     messages: [],
-    unread: { per_peer: {}, total: 0 },
+    unread: { per_peer: {}, per_group: {}, total: 0 },
     outbox: [],
     heldForOthers: 0,
     bridge: null,
@@ -87,8 +87,8 @@ function tauState(groups: TauGroup[], peers: Peer[] = []) {
     retryOutbox: vi.fn(),
     ping: vi.fn(),
     announce: vi.fn(),
-    markRead: vi.fn().mockResolvedValue({ per_peer: {}, total: 0 }),
-    markUnread: vi.fn().mockResolvedValue({ per_peer: {}, total: 0 }),
+    markRead: vi.fn().mockResolvedValue({ per_peer: {}, per_group: {}, total: 0 }),
+    markUnread: vi.fn().mockResolvedValue({ per_peer: {}, per_group: {}, total: 0 }),
     refreshOutbox: vi.fn(),
     refreshGroups: vi.fn(),
     addGroupMembers: vi.fn(),
@@ -169,6 +169,24 @@ describe("Console group target", () => {
       expect(screen.getByDisplayValue("crew · 1 member")).toBeTruthy(),
     );
   });
+
+  it("marks the open group read by group id, not by a member peer", async () => {
+    const crew = makeGroup("a".repeat(32), "crew");
+    const markRead = vi.fn().mockResolvedValue({ per_peer: {}, per_group: {}, total: 0 });
+    mockedUseTau.mockReturnValue({
+      ...tauState([crew]),
+      markRead,
+      unread: { per_peer: {}, per_group: { [crew.id]: 1 }, total: 1 },
+    });
+
+    render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("crew · 2 members")).toBeTruthy(),
+    );
+    await waitFor(() =>
+      expect(markRead).toHaveBeenCalledWith(undefined, crew.id),
+    );
+  });
 });
 
 describe("Console archived target", () => {
@@ -238,9 +256,10 @@ describe("Console mark unread", () => {
   it("holds the badge for the open conversation until new mail arrives", async () => {
     const alice = makePeer("ab".repeat(16), "alice");
     const bob = makePeer("cd".repeat(16), "bob");
-    const markRead = vi.fn().mockResolvedValue({ per_peer: {}, total: 0 });
+    const markRead = vi.fn().mockResolvedValue({ per_peer: {}, per_group: {}, total: 0 });
     const markUnread = vi.fn().mockResolvedValue({
       per_peer: { [alice.destination]: 1 },
+      per_group: {},
       total: 1,
     });
     mockedUseTau.mockReturnValue({
@@ -278,7 +297,7 @@ describe("Console mark unread", () => {
       ...tauState([], [alice, bob]),
       markRead,
       markUnread,
-      unread: { per_peer: { [alice.destination]: 1 }, total: 1 },
+      unread: { per_peer: { [alice.destination]: 1 }, per_group: {}, total: 1 },
     });
     rerender(<Console />);
     await waitFor(() =>
@@ -292,14 +311,14 @@ describe("Console mark unread", () => {
       ...tauState([], [alice, bob]),
       markRead,
       markUnread,
-      unread: { per_peer: {}, total: 0 },
+      unread: { per_peer: {}, per_group: {}, total: 0 },
     });
     rerender(<Console />);
     mockedUseTau.mockReturnValue({
       ...tauState([], [alice, bob]),
       markRead,
       markUnread,
-      unread: { per_peer: { [alice.destination]: 1 }, total: 1 },
+      unread: { per_peer: { [alice.destination]: 1 }, per_group: {}, total: 1 },
     });
     rerender(<Console />);
     await waitFor(() =>
@@ -312,7 +331,7 @@ describe("Console mark unread", () => {
       ...tauState([], [alice, bob]),
       markRead,
       markUnread,
-      unread: { per_peer: { [alice.destination]: 2 }, total: 2 },
+      unread: { per_peer: { [alice.destination]: 2 }, per_group: {}, total: 2 },
     });
     rerender(<Console />);
     await waitFor(() =>
@@ -323,15 +342,17 @@ describe("Console mark unread", () => {
   it("does not reinstall a hold after the conversation was reopened", async () => {
     const alice = makePeer("ab".repeat(16), "alice");
     const bob = makePeer("cd".repeat(16), "bob");
-    const markRead = vi.fn().mockResolvedValue({ per_peer: {}, total: 0 });
+    const markRead = vi.fn().mockResolvedValue({ per_peer: {}, per_group: {}, total: 0 });
     let resolveMark!: (value: {
       per_peer: Record<string, number>;
+      per_group: Record<string, number>;
       total: number;
     }) => void;
     const markUnread = vi.fn(
       () =>
         new Promise<{
           per_peer: Record<string, number>;
+          per_group: Record<string, number>;
           total: number;
         }>((resolve) => {
           resolveMark = resolve;
@@ -367,13 +388,13 @@ describe("Console mark unread", () => {
     // The late response must not reinstall the hold: the count it
     // produced auto-reads like any new mail.
     await act(async () => {
-      resolveMark({ per_peer: { [alice.destination]: 1 }, total: 1 });
+      resolveMark({ per_peer: { [alice.destination]: 1 }, per_group: {}, total: 1 });
     });
     mockedUseTau.mockReturnValue({
       ...tauState([], [alice, bob]),
       markRead,
       markUnread,
-      unread: { per_peer: { [alice.destination]: 1 }, total: 1 },
+      unread: { per_peer: { [alice.destination]: 1 }, per_group: {}, total: 1 },
     });
     rerender(<Console />);
     await waitFor(() => expect(markRead).toHaveBeenCalledTimes(2));

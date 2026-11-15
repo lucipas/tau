@@ -7390,7 +7390,7 @@ class WebBridge:
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
-            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            counts: Dict[str, Any] = {"per_peer": {}, "per_group": {}, "total": 0}
             if inbox is not None:
                 try:
                     counts = inbox.unread_counts(
@@ -7407,19 +7407,25 @@ class WebBridge:
                     log.debug("Could not read inbox unread counts", exc_info=True)
             return self._stamp_unread(counts)
 
-    def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
+    def mark_read(
+        self, peer: Optional[str] = None, *, group: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Advance the inbox read cursor for one conversation, or all.
 
         The console calls this when a conversation is opened, so its
         unread badge clears; other tabs learn from the ``unread`` SSE
-        event.  Read state never leaves this node.
+        event.  ``peer`` names a DM conversation and ``group`` a group
+        conversation; each advances only its own cursor, so opening a
+        DM never consumes a group post from the same sender.  Read
+        state never leaves this node.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
-            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            counts: Dict[str, Any] = {"per_peer": {}, "per_group": {}, "total": 0}
             if inbox is not None:
                 counts = inbox.mark_read(
                     peer=peer,
+                    group=group,
                     exclude_dm_from=self._archived_set(),
                     exclude_group=load_ignored_group_ids(
                         getattr(
@@ -7432,29 +7438,38 @@ class WebBridge:
             self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 
-    def mark_unread(self, peer: str, *, all: bool = False) -> Dict[str, Any]:
+    def mark_unread(
+        self,
+        peer: Optional[str] = None,
+        *,
+        group: Optional[str] = None,
+        all: bool = False,
+    ) -> Dict[str, Any]:
         """Move one conversation's read cursor back so it shows unread again.
 
         The console marks a conversation read when it is opened, so this
         is the way back — the mirror of :meth:`mark_read`, backed by
         :meth:`Inbox.mark_unread`.  By default the newest received message
-        becomes unread again; ``all=True`` clears the cursor so the whole
-        conversation shows unread.  Other tabs learn from the ``unread``
-        SSE event, exactly as they do for a mark-read.  Read receipts are
-        untouched: a receipt already sent for a message stays sent, and
-        only the local display cursor moves.  Raises :class:`ValueError`
-        when the peer has no stored messages to mark, or when the node
-        has no inbox to mark them in.
+        in the conversation becomes unread again; ``all=True`` clears the
+        cursor so the whole conversation shows unread.  ``peer`` names a
+        DM conversation and ``group`` a group conversation.  Other tabs
+        learn from the ``unread`` SSE event, exactly as they do for a
+        mark-read.  Read receipts are untouched: a receipt already sent
+        for a message stays sent, and only the local display cursor
+        moves.  Raises :class:`ValueError` when the conversation has no
+        stored messages to mark, or when the node has no inbox to mark
+        them in.
         """
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
             raise ValueError("this node has no inbox to mark unread")
         with self._unread_lock:
             moved = inbox.mark_unread(
-                peer, all=all, exclude_dm_from=self._archived_set()
+                peer, group=group, all=all, exclude_dm_from=self._archived_set()
             )
             if moved is None:
-                raise ValueError(f"no stored messages from {peer!r}")
+                target = group if group is not None else peer
+                raise ValueError(f"no stored messages in {target!r}")
             stamped = self._stamp_unread(moved)
         self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
@@ -8392,16 +8407,61 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                group = body.get("group")
+                if group is not None and (
+                    not isinstance(group, str) or not group.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'group' must be a group id"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if peer is not None and group is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "pass 'peer' or 'group', not both"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 counts = self.bridge.mark_read(
-                    peer.strip() if isinstance(peer, str) else None
+                    peer.strip() if isinstance(peer, str) else None,
+                    group=group.strip() if isinstance(group, str) else None,
                 )
                 self._send_json({"ok": True, "unread": counts}, head_only)
                 return
             if path == "/api/messages/unread":
                 peer = body.get("peer")
-                if not isinstance(peer, str) or not peer.strip():
+                if peer is not None and (
+                    not isinstance(peer, str) or not peer.strip()
+                ):
                     self._send_json(
-                        {"error": {"message": "field 'peer' is required"}},
+                        {"error": {"message": "field 'peer' must be a peer hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                group = body.get("group")
+                if group is not None and (
+                    not isinstance(group, str) or not group.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'group' must be a group id"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if (peer is None) == (group is None):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "pass exactly one of 'peer' and 'group'"
+                            }
+                        },
                         head_only,
                         400,
                     )
@@ -8420,7 +8480,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     counts = self.bridge.mark_unread(
-                        peer.strip(), all=mark_all
+                        peer.strip() if isinstance(peer, str) else None,
+                        group=group.strip() if isinstance(group, str) else None,
+                        all=mark_all,
                     )
                 except ValueError as exc:
                     self._send_json(

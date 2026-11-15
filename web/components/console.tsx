@@ -164,8 +164,13 @@ export function Console() {
   }, [replyTo, tau.messages]);
 
   const { markRead } = tau;
-  const openUnread =
-    mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
+  const openUnread = target
+    ? mode === "peer"
+      ? (tau.unread.per_peer[target] ?? 0)
+      : mode === "group"
+        ? (tau.unread.per_group[target] ?? 0)
+        : 0
+    : 0;
 
   // A deliberate mark-unread holds the badge for the open conversation:
   // the auto-read below must not undo it the moment the count rises.
@@ -191,8 +196,12 @@ export function Console() {
     const held = manualUnread.current.get(target);
     if (held !== undefined && openUnread <= held) return;
     if (held !== undefined) manualUnread.current.delete(target);
-    void markRead(target).catch(() => undefined);
-  }, [target, openUnread, markRead]);
+    // A group target marks the group's posts read; a peer target
+    // marks only that DM, never the sender's group posts.
+    void (
+      mode === "group" ? markRead(undefined, target) : markRead(target)
+    ).catch(() => undefined);
+  }, [target, mode, openUnread, markRead]);
 
   function selectPeer(destination: string) {
     customPicked.current = false;
@@ -264,6 +273,7 @@ export function Console() {
             verifications={tau.verifications}
             blocks={tau.blocks}
             unread={tau.unread.per_peer}
+            unreadGroups={tau.unread.per_group}
             archived={tau.archivedConversations}
             archivedError={tau.archivedError}
             selected={target}

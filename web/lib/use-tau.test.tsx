@@ -120,7 +120,7 @@ function makeSnapshot(
     messages,
     groups,
     counts: { messages: messages.length, peers: peers.length },
-    unread: { per_peer: {}, total: 0 },
+    unread: { per_peer: {}, per_group: {}, total: 0 },
     bridge: { version: "0.1.0", web: true, url: "http://127.0.0.1:8787" },
   };
 }
@@ -2400,7 +2400,7 @@ describe("useTau archived conversations", () => {
       source.emit("snapshot", {
         snapshot: {
           ...makeSnapshot([alice, carol], thread),
-          unread: { per_peer: { [PEER_HASH]: 1 }, total: 1 },
+          unread: { per_peer: { [PEER_HASH]: 1 }, per_group: {}, total: 1 },
         },
       });
     });
@@ -2429,6 +2429,7 @@ describe("useTau archived conversations", () => {
     expect(result.current.messages.map((m) => m.id)).toEqual([3]);
     expect(result.current.unread).toEqual({
       per_peer: {},
+      per_group: {},
       total: 0,
       revision: undefined,
     });
@@ -2495,7 +2496,7 @@ describe("useTau archived conversations", () => {
 
     mockedPost.mockResolvedValue({
       ok: true,
-      unread: { per_peer: { [PEER_HASH]: 1 }, total: 1 },
+      unread: { per_peer: { [PEER_HASH]: 1 }, per_group: {}, total: 1 },
     });
     await act(async () => {
       await result.current.markUnread(PEER_HASH);
@@ -2507,13 +2508,14 @@ describe("useTau archived conversations", () => {
     });
     expect(result.current.unread).toEqual({
       per_peer: { [PEER_HASH]: 1 },
+      per_group: {},
       total: 1,
       revision: undefined,
     });
 
     mockedPost.mockResolvedValue({
       ok: true,
-      unread: { per_peer: { [PEER_HASH]: 2 }, total: 2 },
+      unread: { per_peer: { [PEER_HASH]: 2 }, per_group: {}, total: 2 },
     });
     await act(async () => {
       await result.current.markUnread(PEER_HASH, true);
@@ -2524,6 +2526,7 @@ describe("useTau archived conversations", () => {
     });
     expect(result.current.unread).toEqual({
       per_peer: { [PEER_HASH]: 2 },
+      per_group: {},
       total: 2,
       revision: undefined,
     });
@@ -2552,7 +2555,7 @@ describe("useTau archived conversations", () => {
 
     // The read's response releases the unread write, in issue order.
     await act(async () => {
-      first.resolve({ ok: true, unread: { per_peer: {}, total: 0 } });
+      first.resolve({ ok: true, unread: { per_peer: {}, per_group: {}, total: 0 } });
       await readDone;
     });
     await waitFor(() => expect(mockedPost).toHaveBeenCalledTimes(2));
@@ -2563,12 +2566,53 @@ describe("useTau archived conversations", () => {
     await act(async () => {
       second.resolve({
         ok: true,
-        unread: { per_peer: { [PEER_HASH]: 1 }, total: 1 },
+        unread: { per_peer: { [PEER_HASH]: 1 }, per_group: {}, total: 1 },
       });
       await unreadDone;
     });
     expect(result.current.unread).toEqual({
       per_peer: { [PEER_HASH]: 1 },
+      per_group: {},
+      total: 1,
+      revision: undefined,
+    });
+    unmount();
+  });
+
+  it("marks a group read and unread by group id, not by member peer", async () => {
+    const groupId = "11".repeat(16);
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([makePeer()], []) });
+    });
+    await waitFor(() => expect(result.current.peers).toHaveLength(1));
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      unread: { per_peer: {}, per_group: {}, total: 0 },
+    });
+    await act(async () => {
+      await result.current.markRead(undefined, groupId);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/read", {
+      group: groupId,
+    });
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      unread: { per_peer: {}, per_group: { [groupId]: 1 }, total: 1 },
+    });
+    await act(async () => {
+      await result.current.markUnread(PEER_HASH, false, groupId);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/unread", {
+      group: groupId,
+      all: false,
+    });
+    expect(result.current.unread).toEqual({
+      per_peer: {},
+      per_group: { [groupId]: 1 },
       total: 1,
       revision: undefined,
     });
