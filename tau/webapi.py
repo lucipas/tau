@@ -133,6 +133,9 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/followed-tags followed tags
     POST /api/tan/follow-tag follow a tag
     POST /api/tan/unfollow-tag unfollow a tag
+    GET  /api/tan/muted-tags muted tags
+    POST /api/tan/mute-tag mute a tag
+    POST /api/tan/unmute-tag unmute a tag
     POST /api/tan/sync     pull missing posts from peers
     GET  /api/tan/export   export stored posts (``?scope=mine|all``)
     POST /api/tan/import   import an export document (every entry verified)
@@ -2760,6 +2763,38 @@ class WebBridge:
         conn = self._tan_conn()
         try:
             return followed_tags(conn)
+        finally:
+            conn.close()
+
+    def tan_mute_tag(self, tag: str) -> Dict[str, Any]:
+        from .tangents.tan import mute_tag
+
+        conn = self._tan_conn()
+        try:
+            return mute_tag(conn, tag)
+        finally:
+            conn.close()
+
+    def tan_unmute_tag(self, tag: str) -> Dict[str, Any]:
+        from .tangents.tan import clean_tag, unmute_tag
+
+        conn = self._tan_conn()
+        try:
+            clean = clean_tag(tag)
+            removed = unmute_tag(conn, tag)
+            return {
+                "tag": clean,
+                "unmuted": removed,
+            }
+        finally:
+            conn.close()
+
+    def tan_muted_tags(self) -> List[Dict[str, Any]]:
+        from .tangents.tan import muted_tags
+
+        conn = self._tan_conn()
+        try:
+            return muted_tags(conn)
         finally:
             conn.close()
 
@@ -8735,6 +8770,13 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path == "/api/tan/muted-tags":
+                records = self.bridge.tan_muted_tags()
+                self._send_json(
+                    {"muted_tags": records, "count": len(records)},
+                    head_only,
+                )
+                return
 
             if path == "/api/tan/saved":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
@@ -9807,6 +9849,27 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "follow": result}, head_only)
+                return
+            if path in ("/api/tan/mute-tag", "/api/tan/unmute-tag"):
+                tag = body.get("tag")
+                if not isinstance(tag, str) or not tag.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'tag' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    if path.endswith("unmute-tag"):
+                        result = self.bridge.tan_unmute_tag(tag)
+                    else:
+                        result = self.bridge.tan_mute_tag(tag)
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "mute": result}, head_only)
                 return
             if path in ("/api/tan/like", "/api/tan/unlike"):
                 target = body.get("target") or body.get("hash")
