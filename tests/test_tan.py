@@ -1952,8 +1952,8 @@ def test_reposters_names_current_reposters(identities, tmp_path):
     ]
     create_repost(conn, bob, post["hash"], name="robert", now=1004)
     assert reposters(conn, post["hash"])["reposters"] == [
-        {"author": carol_author, "name": "carol", "reposted_at": 1002.0},
         {"author": bob_author, "name": "robert", "reposted_at": 1004.0},
+        {"author": carol_author, "name": "carol", "reposted_at": 1002.0},
     ]
 
 

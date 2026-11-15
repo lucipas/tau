@@ -2689,9 +2689,12 @@ class WebBridge:
             KIND_QUOTE,
             TIMELINE_KINDS_SQL,
             TanError,
+            ancestry_hidden,
             deleted_targets,
+            get_post,
             muted_author_set,
             post_quoters,
+            without_hidden_quotes,
         )
 
         if not isinstance(target, str) or not target.strip():

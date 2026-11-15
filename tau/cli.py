@@ -141,6 +141,7 @@ from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     DEFAULT_SUGGEST_LIMIT,
+    KIND_QUOTE,
     MAX_GOSSIP_TTL,
     MAX_TAN_POST_EXPIRY,
     TanApp,
@@ -11405,4 +11406,3 @@ def _cmd_messages_sent(
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
-n _EXIT_OK
