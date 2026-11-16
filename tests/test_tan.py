@@ -1250,36 +1250,37 @@ def test_export_import_roundtrip(identities, tmp_path):
     assert document["format"] == TAN_EXPORT_FORMAT
     assert document["version"] == 1
     assert document["authors"] == [author_of(alice)]
-    # Two posts plus the like and the delete on alice's chain; bob excluded.
+    # The deleted post is purged from the store, so the export carries
+    # the first post plus the like and the delete on alice's chain;
+    # bob excluded.
     assert [entry["hash"] for entry in document["entries"]] == [
         first["hash"],
-        second["hash"],
+        document["entries"][1]["hash"],
         document["entries"][2]["hash"],
-        document["entries"][3]["hash"],
     ]
     assert [entry["kind"] for entry in document["entries"]] == [
-        "post",
         "post",
         "like",
         "delete",
     ]
     assert all_document["authors"] == sorted([author_of(alice), author_of(bob)])
-    assert len(all_document["entries"]) == 5
+    assert len(all_document["entries"]) == 4
 
     target = init_db(tmp_path / "target.sqlite3")
     try:
         result = import_entries(target, document)
         assert result == {
-            "imported": 4,
+            "imported": 3,
             "present": 0,
             "skipped": 0,
             "errors": [],
         }
         posts = feed(target, author=author_of(alice), posts_only=True)
-        # "second" is deleted, so the posts-only feed hides it — but the
-        # entry itself is still stored, keeping the chain verifiable.
+        # "second" is deleted, so the posts-only feed hides it — and the
+        # entry itself is purged, so the import carries no trace of it
+        # beyond the tombstone.
         assert [post["text"] for post in posts] == ["first"]
-        assert get_post(target, second["hash"]) is not None
+        assert get_post(target, second["hash"]) is None
         assert like_counts(target, [first["hash"]])[first["hash"]]["likes"] == 1
         # The imported delete still hides the second post from the timeline.
         shown = timeline(target, [author_of(alice)])
@@ -1287,7 +1288,7 @@ def test_export_import_roundtrip(identities, tmp_path):
         assert feed(target, author=author_of(bob)) == []
         again = import_entries(target, document)
         assert again["imported"] == 0
-        assert again["present"] == 4
+        assert again["present"] == 3
         assert again["skipped"] == 0
     finally:
         target.close()
@@ -2919,7 +2920,13 @@ def test_delete_hides_own_post_from_timeline_and_feed(identities, tmp_path):
     assert delete["text"] == ""
     assert verify_post(delete)["hash"] == delete["hash"]
     assert head(conn, post["author"]) == delete["hash"]
-    assert deleted_targets(conn) == {post["hash"]}
+    # The post row is purged from the store — its text is gone, not
+    # just hidden — while the signed delete entry stays as the
+    # tombstone.  The chain still verifies: the gap the purge leaves
+    # is explained by that tombstone.
+    assert get_post(conn, post["hash"]) is None
+    assert deleted_targets(conn) == set()
+    assert verify_store(conn)["ok"] is True
 
     # Display surfaces hide the post (and the like on it goes with it).
     assert [item["hash"] for item in timeline(conn, [post["author"]])] == [
@@ -2932,9 +2939,10 @@ def test_delete_hides_own_post_from_timeline_and_feed(identities, tmp_path):
     assert [
         item["hash"] for item in feed(conn, author=post["author"], posts_only=True)
     ] == [other["hash"]]
-    # The sync feed still carries the whole chain, delete included.
+    # The sync feed carries the surviving chain, delete included — the
+    # purged post itself is gone from it.
     chain = feed(conn, author=post["author"])
-    assert [entry["kind"] for entry in chain] == ["post", "post", "delete"]
+    assert [entry["kind"] for entry in chain] == ["post", "delete"]
 
     with pytest.raises(TanError, match="has been deleted"):
         resolve_post(conn, post["hash"])
@@ -2942,6 +2950,64 @@ def test_delete_hides_own_post_from_timeline_and_feed(identities, tmp_path):
     # A second delete fails at the lowest layer, not just in the CLI/API.
     with pytest.raises(TanError, match="has been deleted"):
         create_delete(conn, alice, post["hash"], name="alice", now=1004)
+
+
+def test_delete_purges_post_on_receipt(identities, tmp_path):
+    # A peer that already cached the post purges it when the author's
+    # delete entry arrives: the delete is federated, not just local.
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    post = create_post(source, alice, "going away", name="alice", now=1000)
+    other = create_post(source, alice, "staying", name="alice", now=1001)
+    delete = create_delete(source, alice, post["hash"], name="alice", now=1002)
+
+    destination = init_db(tmp_path / "destination.sqlite3")
+    try:
+        store_post(destination, post)
+        store_post(destination, other)
+        record, is_new = store_post(destination, delete)
+        assert is_new is True
+        assert record["kind"] == "delete"
+        assert get_post(destination, post["hash"]) is None
+        assert [item["hash"] for item in timeline(destination, [post["author"]])] == [
+            other["hash"]
+        ]
+        assert verify_store(destination)["ok"] is True
+    finally:
+        destination.close()
+
+
+def test_import_after_purge_keeps_later_entries_linked(identities, tmp_path):
+    # A fresh store importing a chain after a purge still links the
+    # entries created after the deleted post: they point at a parent
+    # that never arrives, and the tombstone is what links them up.
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        first = create_post(source, alice, "doomed", name="alice", now=1000)
+        second = create_post(source, alice, "keeper", name="alice", now=1001)
+        create_reaction(source, alice, second["hash"], liked=True, name="alice", now=1002)
+        delete = create_delete(source, alice, first["hash"], name="alice", now=1003)
+        document = export_entries(source, author=author_of(alice))
+    finally:
+        source.close()
+
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        result = import_entries(target, document)
+        assert result["errors"] == []
+        assert result["imported"] == 3
+        assert get_post(target, first["hash"]) is None
+        kept = get_post(target, second["hash"])
+        assert kept is not None and kept["linked"] is True
+        assert get_post(target, delete["hash"])["linked"] is True
+        assert [item["hash"] for item in timeline(target, [first["author"]])] == [
+            second["hash"]
+        ]
+        assert like_counts(target, [second["hash"]])[second["hash"]]["likes"] == 1
+        assert verify_store(target)["ok"] is True
+    finally:
+        target.close()
 
 
 def test_search_matches_substring_case_insensitively(identities, tmp_path):
@@ -3255,12 +3321,15 @@ def test_sync_hides_deleted_posts(identities, tmp_path):
     app.node = node  # type: ignore[assignment]
 
     summary = app.sync(node, authors=[first["author"]], limit=20)
-    assert summary["stored"] == 3
+    # The deleted post is purged from the source, so the sync carries
+    # only the first post and the tombstone — the post never lands.
+    assert summary["stored"] == 2
     assert summary["errors"] == []
 
     conn = app.connect()
     try:
-        assert deleted_targets(conn) == {second["hash"]}
+        assert get_post(conn, second["hash"]) is None
+        assert deleted_targets(conn) == set()
         assert [item["text"] for item in timeline(conn, [first["author"]])] == [
             "bob one"
         ]
@@ -3303,9 +3372,12 @@ def test_delete_arriving_before_its_post_applies_on_arrival(identities, tmp_path
     store_post(conn, delete)
     assert deleted_targets(conn) == set()
 
-    # Once the post itself is synced in, the earlier delete hides it.
-    store_post(conn, post)
-    assert deleted_targets(conn) == {post["hash"]}
+    # Once the post itself is synced in, the earlier delete drops it:
+    # the tombstone stays authoritative, so the post never lands.
+    record, is_new = store_post(conn, post)
+    assert is_new is False
+    assert get_post(conn, post["hash"]) is None
+    assert deleted_targets(conn) == set()
     assert timeline(conn, [post["author"]]) == []
 
 
@@ -3351,7 +3423,10 @@ def test_delete_handler_roundtrip(identities, tmp_path):
 
     conn = init_db(config.social_db_path)
     try:
-        assert deleted_targets(conn) == {post["hash"]}
+        # The delete entry arrived and purged the post: no row, no
+        # text, and the timeline stays empty.
+        assert get_post(conn, post["hash"]) is None
+        assert deleted_targets(conn) == set()
         assert timeline(conn, [post["author"]]) == []
     finally:
         conn.close()
@@ -3589,7 +3664,11 @@ def test_edit_then_delete_hides_post(identities, tmp_path):
 
     assert timeline(conn, [post["author"]]) == []
     assert search_posts(conn, "typo") == []
-    assert deleted_targets(conn) == {post["hash"]}
+    # The post row is purged, and the edit entry on it goes with it —
+    # an edit carries the post's text, so leaving it would leave the
+    # content behind.
+    assert get_post(conn, post["hash"]) is None
+    assert deleted_targets(conn) == set()
 
 
 def test_cli_edit(tmp_path):
@@ -4264,7 +4343,8 @@ def test_reply_can_be_liked_deleted_and_replied_to(identities, tmp_path):
     # Deleting the reply hides it (and the nested reply's parent
     # annotation reports the deletion without resurfacing the text).
     create_delete(conn, bob, reply["hash"], name="bob", now=1004)
-    assert deleted_targets(conn) == {reply["hash"]}
+    assert get_post(conn, reply["hash"]) is None
+    assert deleted_targets(conn) == set()
     items = timeline(conn, [post["author"], author_of(bob)])
     assert [item["hash"] for item in items] == [nested["hash"], post["hash"]]
     assert items[0]["reply_to"] == {
@@ -4549,7 +4629,8 @@ def test_repost_can_be_deleted_and_reposted_again(identities, tmp_path):
 
     # Deleting your own repost removes it from views and from the count.
     create_delete(conn, bob, repost["hash"], name="bob", now=1002)
-    assert deleted_targets(conn) == {repost["hash"]}
+    assert get_post(conn, repost["hash"]) is None
+    assert deleted_targets(conn) == set()
     items = timeline(conn, [post["author"], author_of(bob)])
     assert [item["hash"] for item in items] == [post["hash"]]
     assert items[0]["reposts"] == 0
@@ -4850,7 +4931,8 @@ def test_quote_can_be_liked_deleted_and_replied_to(identities, tmp_path):
     # it stays in the timeline, with its parent annotation reporting
     # the deletion without resurfacing the text.
     create_delete(conn, bob, quote["hash"], name="bob", now=1004)
-    assert deleted_targets(conn) == {quote["hash"]}
+    assert get_post(conn, quote["hash"]) is None
+    assert deleted_targets(conn) == set()
     assert quote_counts(conn, [post["hash"]])[post["hash"]]["quotes"] == 0
     items = timeline(conn, [post["author"], author_of(bob)])
     assert [item["hash"] for item in items] == [reply["hash"], post["hash"]]
@@ -5937,15 +6019,12 @@ def test_save_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
     create_delete(source, alice, first["hash"], name="alice", now=1002)
     with pytest.raises(TanError, match="has been deleted"):
         save_post(source, first["hash"])
-    # ... but a post deleted after being saved stays listed, blanked.
+    # ... but a post deleted after being saved leaves the list with
+    # the post: deleting purges the save ref along with the post row.
     keep = create_post(source, bob, "keep me", name="bob", now=1003)
     save_post(source, keep["hash"], now=2000)
     create_delete(source, bob, keep["hash"], name="bob", now=1004)
-    saved = saved_posts(source)
-    assert len(saved) == 1
-    assert saved[0]["hash"] == keep["hash"]
-    assert saved[0]["deleted"] is True
-    assert saved[0]["text"] == ""
+    assert saved_posts(source) == []
 
 
 def test_hide_post_round_trip(identities, tmp_path):
@@ -5998,19 +6077,16 @@ def test_hide_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
     create_delete(source, alice, first["hash"], name="alice", now=1002)
     with pytest.raises(TanError, match="has been deleted"):
         hide_post(source, first["hash"])
-    # ... but a post deleted after being hidden stays listed, blanked.
+    # ... but a post deleted after being hidden leaves the list with
+    # the post: deleting purges the hidden ref along with the post row.
     keep = create_post(source, bob, "keep me", name="bob", now=1003)
     hide_post(source, keep["hash"], now=2000)
     create_delete(source, bob, keep["hash"], name="bob", now=1004)
-    hidden = hidden_posts(source)
-    assert len(hidden) == 1
-    assert hidden[0]["hash"] == keep["hash"]
-    assert hidden[0]["deleted"] is True
-    assert hidden[0]["text"] == ""
-    # ... and unhiding still works after the delete.
+    assert hidden_posts(source) == []
+    # ... and unhiding is a clean no-op once the ref is gone.
     assert unhide_post(source, keep["hash"]) == {
         "hash": keep["hash"],
-        "unhidden": True,
+        "unhidden": False,
     }
 
 
@@ -6483,14 +6559,11 @@ def test_annotated_saved_posts_applies_edits(identities, tmp_path):
     posts, _ = annotated_saved_posts(conn)
     assert posts == []
 
-    # ... and an edit that landed before a delete stays blanked.
+    # ... and a delete purges the post from the saved list with it.
     unmute_keyword(conn, "crypto")
     create_delete(conn, bob, post["hash"], name="bob", now=1003)
     posts, _ = annotated_saved_posts(conn)
-    assert len(posts) == 1
-    assert posts[0]["text"] == ""
-    assert posts[0]["deleted"] is True
-    assert posts[0]["edited"] is False
+    assert posts == []
 
 
 def test_pin_post_round_trip(identities, tmp_path):
@@ -6551,19 +6624,15 @@ def test_pin_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
     with pytest.raises(TanError, match="has been deleted"):
         pin_post(source, first["hash"], owner=owner)
 
-    # ... but a post deleted after being pinned stays listed, blanked,
-    # and can still be unpinned.
+    # ... but a post deleted after being pinned leaves the list with
+    # the post: deleting purges the pin ref along with the post row.
     keep = create_post(source, bob, "keep me", name="bob", now=1003)
     pin_post(source, keep["hash"], owner=author_of(bob), now=2000)
     create_delete(source, bob, keep["hash"], name="bob", now=1004)
-    pinned = pinned_posts(source)
-    assert len(pinned) == 1
-    assert pinned[0]["hash"] == keep["hash"]
-    assert pinned[0]["deleted"] is True
-    assert pinned[0]["text"] == ""
+    assert pinned_posts(source) == []
     assert unpin_post(source, keep["hash"]) == {
         "hash": keep["hash"],
-        "unpinned": True,
+        "unpinned": False,
     }
 
 
@@ -6612,13 +6681,10 @@ def test_annotated_pinned_posts_applies_edits(identities, tmp_path):
     assert posts[0]["text"] == "fixed"
     assert posts[0]["edited"] is True
 
-    # ... and an edit that landed before a delete stays blanked.
+    # ... and a delete purges the post from the pinned list with it.
     create_delete(conn, alice, post["hash"], name="alice", now=1002)
     posts, _ = annotated_pinned_posts(conn, viewer=owner)
-    assert len(posts) == 1
-    assert posts[0]["text"] == ""
-    assert posts[0]["deleted"] is True
-    assert posts[0]["edited"] is False
+    assert posts == []
 
 
 def test_cli_tan_pin(tmp_path, capsys):
@@ -6808,22 +6874,21 @@ def test_cli_tan_saved_deleted_post(tmp_path, capsys):
     )
     capsys.readouterr()
 
-    # Text output keeps the save but marks the post as deleted.
+    # Deleting the saved post purges the save with it: the saved list
+    # is empty, in both text and JSON output.
     assert main(["tan", "saved", "--data-dir", str(data_dir)]) == 0
     out = capsys.readouterr().out
-    assert "(deleted post)" in out
+    assert "No saved posts yet" in out
     assert "soon to be deleted" not in out
 
-    # JSON output lists it as deleted with blank text.
     assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["count"] == 1
-    assert payload["saved"][0]["deleted"] is True
-    assert payload["saved"][0]["text"] == ""
+    assert payload["count"] == 0
 
-    # Unsaving the deleted post succeeds and empties the list.
+    # Unsaving the deleted post still succeeds: the save is already
+    # gone with the post, so the CLI reports a clean no-op.
     assert main(["tan", "unsave", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
-    assert "unsaved" in capsys.readouterr().out
+    assert "was not saved" in capsys.readouterr().out
     assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["count"] == 0
 

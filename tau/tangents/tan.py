@@ -1001,6 +1001,12 @@ def _promote_children(
             _advance_head(
                 conn, author, child_hash, child_seq, float(child["created_at"])
             )
+            if str(child["kind"]) == KIND_DELETE:
+                # A delete that arrived before its parent links up here:
+                # it is authoritative now, so its target goes with it.
+                _apply_delete(
+                    conn, str(child["author"]), str(child["target"] or "")
+                )
             queue.append((child_hash, child_seq))
 
 
@@ -1011,7 +1017,13 @@ def store_post(
     now: Optional[float] = None,
     verify: bool = True,
 ) -> Tuple[Dict[str, Any], bool]:
-    """Validate and store a post, returning ``(post, is_new)``."""
+    """Validate and store a post, returning ``(post, is_new)``.
+
+    A timeline post or edit its author deleted is dropped instead of
+    stored — the tombstone stays authoritative after the purge, so a
+    re-offered post must not resurrect the row.  The drop reports
+    ``is_new`` as ``False``, like a duplicate.
+    """
     timestamp = float(now if now is not None else time.time())
     if verify:
         post = verify_post(mesg, now=timestamp)
@@ -1026,6 +1038,17 @@ def store_post(
     if existing is not None:
         return _canonical_post(dict(existing)), False
 
+    # A post its author deleted never lands again: the tombstone stays
+    # authoritative after the purge, so a peer re-offering the post on
+    # a later sync must not resurrect it — and a post arriving after
+    # its delete is dropped outright instead of being stored hidden.
+    # An edit carries the post's text, so an edit of a deleted post is
+    # dropped the same way; reactions and votes carry no content and
+    # stay inert without the post row.
+    if post.get("kind") in TIMELINE_KINDS or post.get("kind") == KIND_EDIT:
+        if _delete_entry_exists(conn, digest, post["author"]):
+            return _canonical_post(post), False
+
     author = post["author"]
     prev = post["prev"]
     linked = True
@@ -1033,8 +1056,25 @@ def store_post(
     if prev:
         parent = _fetch_post(conn, prev)
         if parent is None:
-            linked = False
-            seq = 0
+            # The parent may have been purged: a delete entry from this
+            # author targeting it means the parent is gone by design,
+            # not by partial sync, so this entry links up here instead
+            # of waiting for a parent that never comes.  The delete
+            # need not be linked itself yet — it may have arrived
+            # before its own parent — its authorship is already
+            # verified, and a forged delete from anyone else cannot
+            # match this author.
+            row = conn.execute(
+                "SELECT 1 FROM posts d WHERE d.kind = 'delete' "
+                "AND d.target = ? AND d.author = ? LIMIT 1",
+                (prev, author),
+            ).fetchone()
+            if row is not None:
+                linked = True
+                seq = max_seq(conn, author) + 1
+            else:
+                linked = False
+                seq = 0
         else:
             if str(parent["author"]) != author:
                 raise PostError("previous post belongs to a different author")
@@ -1072,6 +1112,12 @@ def store_post(
             if linked:
                 _advance_head(conn, author, digest, seq, post["created_at"])
                 _promote_children(conn, author, digest, seq)
+            if post.get("kind") == KIND_DELETE:
+                # A stored delete is authoritative, linked or not: the
+                # target post leaves the store now, here and on every
+                # peer that syncs the tombstone, and the entries created
+                # after it link up again.
+                _apply_delete(conn, author, str(post.get("target") or ""))
     except sqlite3.IntegrityError:
         # Another thread or process inserted the same post first.
         existing = _fetch_post(conn, digest)
@@ -1231,7 +1277,7 @@ def create_reply(
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
-    existing = get_post(conn, target)
+    existing = _target_post_or_raise(conn, target, "post has been deleted")
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
     if existing.get("kind", KIND_POST) not in REPLYABLE_KINDS + (KIND_QUOTE, KIND_POLL):
@@ -1310,7 +1356,7 @@ def create_quote(
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
-    existing = get_post(conn, target)
+    existing = _target_post_or_raise(conn, target, "post has been deleted")
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
     if existing.get("kind", KIND_POST) not in QUOTABLE_KINDS:
@@ -1367,8 +1413,14 @@ def create_delete(
     Only the post's author can delete it.  When the target post is
     cached locally and belongs to someone else — or is not a post at
     all — this raises; a delete for a post that is not cached yet is
-    stored anyway and stays inert until the post arrives and its
-    author matches (see :func:`deleted_targets`).
+    stored anyway, and the post is dropped instead of stored when it
+    later arrives (see :func:`store_post`).
+
+    Deleting also purges the post from the local store: its row, its
+    author's edit entries on it, and its saved, pinned and hidden refs
+    are removed (see :func:`_purge_post`).  The signed delete entry
+    itself stays, so peers learn of the deletion, the chain stays
+    linked, and a second delete still fails as "has been deleted".
     """
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
@@ -1381,6 +1433,10 @@ def create_delete(
             raise TanError("cannot delete a post you did not author")
         if _is_deleted(conn, existing):
             raise TanError("post has been deleted")
+    elif _delete_entry_exists(conn, target, author):
+        # The post itself is already purged: the tombstone is the only
+        # trace left, and it still refuses a second delete.
+        raise TanError("post has been deleted")
     # The head read and the append must be one atomic step: see
     # _chain_write — two writers racing this window would fork the chain.
     with _chain_write(conn):
@@ -1440,7 +1496,7 @@ def create_repost(
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
-    existing = get_post(conn, target)
+    existing = _target_post_or_raise(conn, target, "post has been deleted")
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
     if existing.get("kind", KIND_POST) not in REPLYABLE_KINDS:
@@ -1516,7 +1572,7 @@ def create_edit(
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
-    existing = get_post(conn, target)
+    existing = _target_post_or_raise(conn, target, "post has been deleted")
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
     if existing.get("kind", KIND_POST) not in (KIND_POST, KIND_REPLY):
@@ -1648,7 +1704,7 @@ def create_vote(
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
-    existing = get_post(conn, target)
+    existing = _target_post_or_raise(conn, target, "poll has been deleted")
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
     if existing.get("kind", KIND_POST) != KIND_POLL:
@@ -1724,7 +1780,7 @@ def create_close_poll(
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
-    existing = get_post(conn, target)
+    existing = _target_post_or_raise(conn, target, "poll has been deleted")
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
     if existing.get("kind", KIND_POST) != KIND_POLL:
@@ -2253,7 +2309,13 @@ def likers(
     seen_ancestors = {current_entry["hash"]}
     while current_entry.get("kind") == KIND_REPLY and current_entry.get("target"):
         parent = get_post(conn, str(current_entry["target"]))
-        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+        if parent is None:
+            if _delete_entry_exists(conn, str(current_entry["target"])):
+                # The parent was purged when its author deleted it; the
+                # tombstone still hides the subtree.
+                raise TanError(f"post has been deleted: {ref!r}")
+            break
+        if parent.get("kind") not in TIMELINE_KINDS:
             break
         if parent["hash"] in seen_ancestors:
             break
@@ -2326,7 +2388,13 @@ def reposters(
     seen_ancestors = {current_entry["hash"]}
     while current_entry.get("kind") == KIND_REPLY and current_entry.get("target"):
         parent = get_post(conn, str(current_entry["target"]))
-        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+        if parent is None:
+            if _delete_entry_exists(conn, str(current_entry["target"])):
+                # The parent was purged when its author deleted it; the
+                # tombstone still hides the subtree.
+                raise TanError(f"post has been deleted: {ref!r}")
+            break
+        if parent.get("kind") not in TIMELINE_KINDS:
             break
         if parent["hash"] in seen_ancestors:
             break
@@ -2405,7 +2473,13 @@ def quoters(
     seen_ancestors = {current_entry["hash"]}
     while current_entry.get("kind") == KIND_REPLY and current_entry.get("target"):
         parent = get_post(conn, str(current_entry["target"]))
-        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+        if parent is None:
+            if _delete_entry_exists(conn, str(current_entry["target"])):
+                # The parent was purged when its author deleted it; the
+                # tombstone still hides the subtree.
+                raise TanError(f"post has been deleted: {ref!r}")
+            break
+        if parent.get("kind") not in TIMELINE_KINDS:
             break
         if parent["hash"] in seen_ancestors:
             break
@@ -2564,6 +2638,41 @@ def annotate_pinned(
     return posts
 
 
+def _purged_previews(
+    conn: sqlite3.Connection, targets: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Deleted-parent previews for targets whose post row is gone.
+
+    A post deleted through :func:`create_delete` is purged from the
+    store, so a reply, quote or repost pointing at it finds no parent
+    row — but the linked delete entry still names the deleter, who is
+    the post's author, and carries the name they used when deleting.
+    Returns ``{target: preview}`` with the text blanked and
+    ``deleted`` set, so the thread stays readable without resurfacing
+    removed content.  Targets with no delete entry are simply absent:
+    the parent has not arrived yet.
+    """
+    missing = [str(target) for target in targets]
+    if not missing:
+        return {}
+    placeholders = ", ".join("?" for _ in missing)
+    rows = conn.execute(
+        "SELECT target, author, name FROM posts WHERE kind = 'delete' "
+        f"AND linked = 1 AND target IN ({placeholders})",
+        missing,
+    ).fetchall()
+    return {
+        str(row["target"]): {
+            "hash": str(row["target"]),
+            "author": str(row["author"]),
+            "name": str(row["name"]),
+            "text": "",
+            "deleted": True,
+        }
+        for row in rows
+    }
+
+
 def annotate_replies(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],
@@ -2629,13 +2738,33 @@ def annotate_replies(
         # A parent's snippet shows its current text, so apply its
         # author's latest edit before the summary is built.
         annotate_edits(conn, list(parents.values()))
+    purged = _purged_previews(
+        conn, [target for target in targets if target not in parents]
+    )
     muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
     for post in posts:
         if post.get("kind") != KIND_REPLY:
             continue
         parent = parents.get(str(post.get("target") or ""))
         if parent is None:
-            post["reply_to"] = None
+            preview = purged.get(str(post.get("target") or ""))
+            if preview is None:
+                post["reply_to"] = None
+                continue
+            if exclude_authors and preview["author"] in exclude_authors:
+                post["reply_to"] = None
+                continue
+            if blocked_authors and preview["author"] in blocked_authors:
+                # Redact identity too, as for a stored blocked parent.
+                post["reply_to"] = {
+                    **preview,
+                    "author": "",
+                    "blocked": True,
+                }
+                continue
+            # The normal preview carries the edited flag; a purged post
+            # has no edit to show (its edits were purged with it).
+            post["reply_to"] = {**preview, "edited": False}
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
         is_expired_parent = is_expired(parent)
@@ -2796,14 +2925,29 @@ def annotate_quotes(
             list(parents),
         ).fetchall()
         deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    purged = _purged_previews(
+        conn, [target for target in targets if target not in parents]
+    )
     muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
     for post in posts:
         if post.get("kind") != KIND_QUOTE:
             continue
         parent = parents.get(str(post.get("target") or ""))
-        if parent is None or (
-            exclude_authors and parent["author"] in exclude_authors
-        ):
+        if parent is None:
+            preview = purged.get(str(post.get("target") or ""))
+            if preview is None:
+                post["quoted"] = None
+                continue
+            if exclude_authors and preview["author"] in exclude_authors:
+                post["quoted"] = None
+                continue
+            if blocked_authors and preview["author"] in blocked_authors:
+                # Redact identity too, as for a stored blocked original.
+                post["quoted"] = {**preview, "author": "", "blocked": True}
+                continue
+            post["quoted"] = dict(preview)
+            continue
+        if exclude_authors and parent["author"] in exclude_authors:
             post["quoted"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
@@ -2920,6 +3064,9 @@ def annotate_reposts(
         # A repost's summary shows its original's current text, so
         # apply its author's latest edit before the summary is built.
         annotate_edits(conn, list(originals.values()))
+    purged = _purged_previews(
+        conn, [target for target in targets if target not in originals]
+    )
     muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
     kept: List[Dict[str, Any]] = []
     for post in posts:
@@ -2928,7 +3075,18 @@ def annotate_reposts(
             continue
         original = originals.get(str(post.get("target") or ""))
         if original is None:
-            post["repost_of"] = None
+            preview = purged.get(str(post.get("target") or ""))
+            if preview is None:
+                post["repost_of"] = None
+                kept.append(post)
+                continue
+            # A repost of a blocked or muted original is dropped, the
+            # same as for a stored original.
+            if blocked_authors and preview["author"] in blocked_authors:
+                continue
+            if exclude_authors and preview["author"] in exclude_authors:
+                continue
+            post["repost_of"] = dict(preview)
             kept.append(post)
             continue
         if blocked_authors and original["author"] in blocked_authors:
@@ -3022,22 +3180,52 @@ def edit_states(
 
 
 def _chain_hashes(conn: sqlite3.Connection, author: str) -> Set[str]:
-    """Hashes of linked entries on *author*'s chain, from the retained head back."""
+    """Hashes of linked entries on *author*'s chain, from the retained head back.
+
+    Walks back from the head through ``prev``.  A purged post breaks
+    the walk — its row is gone — so when the missing parent is
+    targeted by a linked delete entry from the same author, the walk
+    bridges the gap: sequences increase along the chain, so every
+    linked entry with a smaller sequence precedes the gap and is on
+    the retained chain, and the walk is complete.  (A fork sibling
+    that predates the gap is swept in with the bridge; without a purge
+    gap the walk still follows the head's path alone, so sibling
+    forks with the same sequence stay ignored as before.)
+    """
     head_row = conn.execute(
         "SELECT hash FROM heads WHERE author = ?", (author,)
     ).fetchone()
     if head_row is None:
         return set()
-    rows = conn.execute(
-        "WITH RECURSIVE chain(hash, prev) AS ("
-        "SELECT hash, prev FROM posts WHERE hash = ? AND author = ? AND linked = 1 "
-        "UNION ALL "
-        "SELECT p.hash, p.prev FROM posts p JOIN chain c ON p.hash = c.prev "
-        "WHERE p.author = ? AND p.linked = 1"
-        ") SELECT hash FROM chain",
-        (str(head_row["hash"]), author, author),
-    ).fetchall()
-    return {str(row["hash"]) for row in rows}
+    chain: Set[str] = set()
+    current = str(head_row["hash"])
+    while current and current not in chain:
+        row = conn.execute(
+            "SELECT hash, prev, seq, linked FROM posts "
+            "WHERE hash = ? AND author = ?",
+            (current, author),
+        ).fetchone()
+        if row is None or not int(row["linked"]):
+            break
+        chain.add(str(row["hash"]))
+        prev = str(row["prev"] or "")
+        if not prev:
+            break
+        parent = conn.execute(
+            "SELECT 1 FROM posts WHERE hash = ? AND author = ?",
+            (prev, author),
+        ).fetchone()
+        if parent is None:
+            if _delete_entry_exists(conn, prev, author):
+                rows = conn.execute(
+                    "SELECT hash FROM posts "
+                    "WHERE author = ? AND linked = 1 AND seq < ?",
+                    (author, int(row["seq"])),
+                ).fetchall()
+                chain.update(str(entry["hash"]) for entry in rows)
+            break
+        current = prev
+    return chain
 
 
 def annotate_edits(
@@ -3076,15 +3264,141 @@ _NOT_DELETED = (
 )
 
 
+def _delete_entry_exists(
+    conn: sqlite3.Connection, target: str, author: Optional[str] = None
+) -> bool:
+    """Whether a linked delete entry targets *target*.
+
+    With *author* given, only a delete from that author counts — the
+    authorship check :func:`create_delete` needs when the target post
+    itself has already been purged.  Without it, any linked delete
+    counts: callers that only know the target hash (a thread climb
+    past a missing parent, :func:`resolve_post` on a hash with no row)
+    treat the tombstone as the deletion signal, since a genuine purge
+    leaves no row to check authorship against.  A forged delete from
+    the wrong author can only mislead those callers about a post that
+    is not stored here — it cannot hide a post whose row exists, where
+    :func:`_is_deleted` still applies the author match.
+    """
+    if author is not None:
+        row = conn.execute(
+            "SELECT 1 FROM posts d WHERE d.kind = 'delete' AND d.linked = 1 "
+            "AND d.target = ? AND d.author = ? LIMIT 1",
+            (target, author),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM posts d WHERE d.kind = 'delete' AND d.linked = 1 "
+            "AND d.target = ? LIMIT 1",
+            (target,),
+        ).fetchone()
+    return row is not None
+
+
+def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> bool:
+    """Drop a deleted post's row — and its content-carrying traces — from the store.
+
+    Removes the target row itself when it is a timeline post by
+    *author*, the author's own edit entries on it (an edit carries
+    the post's text, so leaving one would leave the content behind),
+    and the saved, pinned and hidden refs pointing at it (they exist
+    to surface the post; with the post gone they surface nothing).
+    The signed delete entry itself is untouched: it is the tombstone
+    peers sync, and the chain stays linked through it.  A delete from
+    anyone but the post's author purges nothing.  Returns whether a
+    row was removed.  The caller owns the transaction: this runs inside
+    :func:`store_post`'s insert or :func:`_promote_children`, so it
+    commits with the entry that authorised the purge.
+    """
+    row = conn.execute(
+        "SELECT author, kind FROM posts WHERE hash = ?", (target,)
+    ).fetchone()
+    if row is None:
+        return False
+    if str(row["author"]) != author or str(row["kind"]) not in TIMELINE_KINDS:
+        return False
+    conn.execute("DELETE FROM posts WHERE hash = ?", (target,))
+    conn.execute(
+        "DELETE FROM posts WHERE kind = 'edit' AND target = ? AND author = ?",
+        (target, author),
+    )
+    for table in ("saved_posts", "pinned_posts", "hidden_posts"):
+        conn.execute(f"DELETE FROM {table} WHERE hash = ?", (target,))
+    return True
+
+
+def _link_children_of_purged(
+    conn: sqlite3.Connection, author: str, purged_hash: str
+) -> None:
+    """Link orphaned children of a purged post once its delete is known.
+
+    Entries created after a deleted post point at it as their parent.
+    On a store that never held the post — a fresh sync or import after
+    the delete — they arrive unlinked and would stay that way forever,
+    since the parent never comes back.  Once the delete entry is
+    stored, the purge is known and these children link up in chain
+    order, taking the next sequence each, so they show and count again.
+    Their own children are promoted in turn, and a child that is
+    itself a delete applies the same way.
+    """
+    children = conn.execute(
+        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+        "WHERE author = ? AND prev = ? AND linked = 0 ORDER BY created_at ASC",
+        (author, purged_hash),
+    ).fetchall()
+    for child in children:
+        seq = max_seq(conn, author) + 1
+        conn.execute(
+            "UPDATE posts SET linked = 1, seq = ? WHERE hash = ?",
+            (seq, str(child["hash"])),
+        )
+        _advance_head(
+            conn, author, str(child["hash"]), seq, float(child["created_at"])
+        )
+        _promote_children(conn, author, str(child["hash"]), seq)
+        if str(child["kind"]) == KIND_DELETE:
+            _apply_delete(conn, author, str(child["target"] or ""))
+
+
+def _apply_delete(conn: sqlite3.Connection, author: str, target: str) -> None:
+    """Apply a stored delete entry: purge its target, re-link orphans.
+
+    The purge removes the target post's row and its content-carrying
+    traces; the re-link attaches the entries created after the deleted
+    post, which would otherwise stay orphaned on a store that never
+    held the parent.  Idempotent: a second application finds nothing
+    left to purge or link.
+    """
+    _purge_post(conn, author, target)
+    _link_children_of_purged(conn, author, target)
+
+
+def _target_post_or_raise(
+    conn: sqlite3.Connection, target: str, deleted_message: str
+) -> Optional[Dict[str, Any]]:
+    """Fetch the target post row, or raise the right error for a missing one.
+
+    A post its author deleted is purged from the store, so a missing
+    row still reports deleted — with the caller's message — when a
+    linked delete entry targets it.  Otherwise the row is simply
+    unknown, and the caller reports that.
+    """
+    existing = get_post(conn, target)
+    if existing is None and _delete_entry_exists(conn, target):
+        raise TanError(deleted_message)
+    return existing
+
+
 def deleted_targets(conn: sqlite3.Connection) -> Set[str]:
     """Hashes of posts hidden by a delete entry from their own author.
 
     A post is deleted when a linked ``delete`` entry exists whose author
     is the post's author.  Deletes from anyone else are inert, and a
     delete that arrives before its post applies as soon as the post is
-    stored.  Deleted posts stay in the database — the chain must stay
-    verifiable and sync must keep carrying them — they are only hidden
-    from display surfaces.
+    stored.  Posts deleted through :func:`create_delete` are purged
+    from the store (see :func:`_purge_post`), so they no longer appear
+    here — this still covers posts stored before the purge change, and
+    any retained row a linked delete hides.
     """
     rows = conn.execute(
         "SELECT p.hash FROM posts p "
@@ -3118,10 +3432,11 @@ def is_poll_closed(conn: sqlite3.Connection, post: Dict[str, Any]) -> bool:
 def is_expired(post: Dict[str, Any], *, now: Optional[float] = None) -> bool:
     """Whether *post*'s expiry has passed.
 
-    A post without an expiry never expires.  Like a deleted post, an
-    expired one stays in the store — the chain must stay verifiable
-    and sync must keep carrying it — it is only hidden from display
-    surfaces.
+    A post without an expiry never expires.  An expired post stays in
+    the store — the chain must stay verifiable and sync must keep
+    carrying it — it is only hidden from display surfaces.  (A deleted
+    post is different: deleting purges its row, see
+    :func:`_purge_post`.)
     """
     expires_at = post.get("expires_at")
     if expires_at is None:
@@ -3178,7 +3493,10 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     """Resolve a post or reply hash or unique hash prefix to a stored entry.
 
     A post its author deleted resolves as deleted, not as unknown, so
-    callers can tell the two apart.
+    callers can tell the two apart.  A deleted post's row is purged
+    from the store, so a full hash with no row still reports deleted
+    when a linked delete entry targets it — the tombstone is the only
+    trace left, and it is authoritative.
     """
     if not isinstance(ref, str) or not ref.strip():
         raise TanError("post reference must not be empty")
@@ -3191,6 +3509,8 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
             if is_expired(post):
                 raise TanError(f"post has expired: {ref!r}")
             return post
+        if _delete_entry_exists(conn, value):
+            raise TanError(f"post has been deleted: {ref!r}")
         raise TanError(f"unknown post: {ref!r}")
     if len(value) >= 8:
         try:
@@ -4254,7 +4574,13 @@ def thread(
     cursor = start
     while cursor.get("kind") in (KIND_REPLY, KIND_REPOST) and cursor.get("target"):
         parent = get_post(conn, str(cursor["target"]))
-        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+        if parent is None:
+            if _delete_entry_exists(conn, str(cursor["target"])):
+                # The parent was purged when its author deleted it; the
+                # tombstone still hides the subtree.
+                raise TanError(f"post has been deleted: {ref!r}")
+            break
+        if parent.get("kind") not in TIMELINE_KINDS:
             break
         if parent["hash"] in ancestors:
             break
@@ -4535,7 +4861,11 @@ def _hidden_under_deleted(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
     while parent_hash and parent_hash not in seen:
         seen.add(parent_hash)
         parent = get_post(conn, parent_hash)
-        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+        if parent is None:
+            # The parent was purged when its author deleted it; the
+            # tombstone still hides the subtree.
+            return _delete_entry_exists(conn, parent_hash)
+        if parent.get("kind") not in TIMELINE_KINDS:
             return False
         if _is_deleted(conn, parent):
             return True
@@ -5236,7 +5566,10 @@ def _resolve_saved_ref(conn: sqlite3.Connection, ref: str) -> str:
 
     Unlike :func:`resolve_post`, a post its author deleted still
     resolves: unsaving must keep working after the save's target is
-    deleted.  A reference to nothing cached fails as unknown.
+    deleted — and the save ref itself is purged with the post, so
+    resolving the hash is what lets the unsave report a clean no-op
+    instead of failing as unknown.  A reference to nothing cached
+    fails as unknown.
     """
     if not isinstance(ref, str) or not ref.strip():
         raise TanError("post reference must not be empty")
@@ -5245,6 +5578,8 @@ def _resolve_saved_ref(conn: sqlite3.Connection, ref: str) -> str:
         post = get_post(conn, _require_hex(value, HASH_HEX_LENGTH, "post"))
         if post is not None and post.get("kind", KIND_POST) in TIMELINE_KINDS:
             return str(post["hash"])
+        if _delete_entry_exists(conn, value):
+            return value
         raise TanError(f"unknown post: {ref!r}")
     if len(value) >= 8:
         try:
@@ -5259,6 +5594,18 @@ def _resolve_saved_ref(conn: sqlite3.Connection, ref: str) -> str:
         ).fetchall()
         if len(rows) == 1:
             return str(rows[0]["hash"])
+        if len(rows) > 1:
+            raise TanError(f"{len(rows)} posts match prefix {value!r}")
+        # A purged post has no row left: a delete entry targeting the
+        # prefix still resolves it, so unsaving a deleted post keeps
+        # working by prefix too.
+        rows = conn.execute(
+            "SELECT target FROM posts WHERE kind = 'delete' "
+            "AND linked = 1 AND target LIKE ? LIMIT 8",
+            (value + "%",),
+        ).fetchall()
+        if len(rows) == 1:
+            return str(rows[0]["target"])
         if len(rows) > 1:
             raise TanError(f"{len(rows)} posts match prefix {value!r}")
     raise TanError(f"unknown post: {ref!r}")
@@ -5643,10 +5990,10 @@ def saved_posts(
 ) -> List[Dict[str, Any]]:
     """Saved posts, newest save first.
 
-    A post deleted after being saved stays in the list with its text
-    blanked and ``deleted`` set, so the save is not silently lost.
-    *offset* pages through the list in save order, so a caller can
-    reach saves older than one page.
+    A post deleted after being saved leaves the list with the post:
+    deleting purges the save ref along with the post row, so there is
+    no blanked stub to keep.  *offset* pages through the list in save
+    order, so a caller can reach saves older than one page.
     """
     count = max(1, min(int(limit), MAX_SAVED_POSTS))
     start = max(0, int(offset))
@@ -5928,10 +6275,10 @@ def pinned_posts(
 ) -> List[Dict[str, Any]]:
     """Pinned posts, newest pin first.
 
-    A post deleted after being pinned stays in the list with its text
-    blanked and ``deleted`` set, so the pin is not silently lost.
-    *offset* pages through the list in pin order, so a caller can
-    reach pins older than one page.
+    A post deleted after being pinned leaves the list with the post:
+    deleting purges the pin ref along with the post row, so there is
+    no blanked stub to keep.  *offset* pages through the list in pin
+    order, so a caller can reach pins older than one page.
     """
     count = max(1, min(int(limit), MAX_PINNED_POSTS))
     start = max(0, int(offset))
@@ -6036,12 +6383,13 @@ def hidden_posts(
 ) -> List[Dict[str, Any]]:
     """Hidden posts, newest hide first.
 
-    A post deleted after being hidden stays in the list with its text
-    blanked and ``deleted`` set, so the hide is not silently lost.
-    The list shows each post's current text: an edit that landed
-    after the hide replaces the stored text, the way the saved view
-    shows edited text.  *offset* pages through the list in hide
-    order, so a caller can reach hides older than one page.
+    A post deleted after being hidden leaves the list with the post:
+    deleting purges the hidden ref along with the post row, so there
+    is no blanked stub to keep.  The list shows each post's current
+    text: an edit that landed after the hide replaces the stored
+    text, the way the saved view shows edited text.  *offset* pages
+    through the list in hide order, so a caller can reach hides older
+    than one page.
     """
     count = max(1, min(int(limit), MAX_HIDDEN_POSTS))
     start = max(0, int(offset))
@@ -6369,6 +6717,12 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
     unlinked entry whose parent is *linked* is an inconsistency and is
     reported, as is an unlinked entry with no parent or a nonzero sequence.
 
+    A linked entry whose parent is missing is also legitimate when a
+    linked delete entry from the same author targets the parent: the
+    parent was purged when its author deleted it (see
+    :func:`_purge_post`), and the tombstone explains the gap — the
+    chain is intact apart from the deliberately removed post.
+
     Returns ``{"entries", "authors", "unlinked", "problems", "ok"}``,
     where each problem is ``{"hash", "author", "problem"}``. Read-only:
     nothing in the database is changed.
@@ -6428,6 +6782,12 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
         except (PostError, ProtocolError, ValueError, TypeError, KeyError) as exc:
             _report(row, str(exc))
 
+    purged_parents = {
+        (str(row["author"]), str(row["target"]))
+        for row in rows
+        if str(row["kind"]) == KIND_DELETE
+        and _int_or_none(row["linked"]) == 1
+    }
     for author, entries in linked_by_author.items():
         entries.sort(key=lambda item: item[1])
         seq_by_hash = {str(row["hash"]): seq for row, seq in entries}
@@ -6442,6 +6802,10 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
                 continue
             parent_seq = seq_by_hash.get(parent)
             if parent_seq is None:
+                if (author, parent) in purged_parents:
+                    # The parent was purged when its author deleted it;
+                    # the tombstone explains the gap.
+                    continue
                 _report(
                     entry,
                     "entry does not point at the previous entry in its chain",
