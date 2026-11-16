@@ -1027,6 +1027,16 @@ export interface TanPollResponse {
   poll: TanPost;
 }
 
+// The response to sharing a Tan post with a peer or a group: the sent
+// copy (peer) or one entry per leg (group), plus the node's send
+// response — mirroring the forward endpoint's shape.
+export interface TanShareResponse {
+  ok: boolean;
+  message?: TauMessage | null;
+  messages?: TauMessage[];
+  response: Record<string, unknown>;
+}
+
 // One queued Tan post, waiting for its publish time — the shape of
 // `tau.scheduled_posts.ScheduledPost.to_dict()`.
 export interface TanScheduledPost {

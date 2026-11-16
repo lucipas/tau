@@ -532,6 +532,58 @@ describe("useTan repost", () => {
   });
 });
 
+describe("useTan sharePost", () => {
+  it("posts the hash and peer to /api/tan/share without reloading the feed", async () => {
+    const post = makePost();
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [post], count: 1 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true, message: null, response: {} });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([post]));
+    const loadsBefore = mockedGet.mock.calls.length;
+
+    let shared;
+    await act(async () => {
+      shared = await result.current.sharePost(post.hash, { to: "alice" });
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/share", {
+      target: post.hash,
+      to: "alice",
+    });
+    expect(shared).toEqual({ ok: true, message: null, response: {} });
+    // Sharing sends a DM, not a Tan entry: the feed has nothing new to
+    // show, so no reload runs — the sent copy appears in the chat tab.
+    expect(mockedGet.mock.calls.length).toBe(loadsBefore);
+  });
+
+  it("posts the hash and group to /api/tan/share", async () => {
+    const post = makePost();
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [post], count: 1 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true, messages: [], response: {} });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([post]));
+
+    await act(async () => {
+      await result.current.sharePost(post.hash, { group: "crew" });
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/share", {
+      target: post.hash,
+      group: "crew",
+    });
+  });
+});
+
 describe("useTan voteOnPoll", () => {
   it("posts the hash and option index to /api/tan/vote and reloads the feed", async () => {
     const poll = makePost({

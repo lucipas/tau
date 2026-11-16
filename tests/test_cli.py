@@ -6344,6 +6344,205 @@ def test_forward_ambiguous_prefix_is_an_error(tmp_path, capsys, monkeypatch):
     assert _FakeSendNode.instances == []
 
 
+def _seed_tan_post(tmp_path, *, text="worth sharing", poll=False):
+    """A node with one foreign Tan post by a registered peer named alice."""
+    from tau.tangents.tan import create_poll, create_post, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    peer_identity = RNS.Identity()
+    peer_hash = destination_hash(peer_identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(peer_hash, peer_identity.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    conn = init_db(config.social_db_path)
+    try:
+        if poll:
+            post = create_poll(
+                conn,
+                peer_identity,
+                text,
+                ["red", "blue"],
+                name="alice",
+                now=1000,
+            )
+        else:
+            post = create_post(conn, peer_identity, text, name="alice", now=1000)
+    finally:
+        conn.close()
+    return data_dir, post, peer_hash.hex()
+
+
+def _run_share(tmp_path, monkeypatch, argv):
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    _FakeSendNode.deliver_on_flush = False
+    return cli.main(
+        ["tan", "share", "--data-dir", str(tmp_path / "node"), *argv]
+    )
+
+
+def test_parser_tan_share_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["tan", "share", "--to", "bob", "abcdef12"]
+    )
+    assert args.command == "tan"
+    assert args.to == ["bob"]
+    assert args.target == "abcdef12"
+    assert args.timeout == 20.0
+    assert args.wait is None
+    assert args.no_queue is False
+
+    multi = parser.parse_args(
+        ["tan", "share", "--to", "alice", "--to", "bob", "--wait", "5", "abcdef12"]
+    )
+    assert multi.to == ["alice", "bob"]
+    assert multi.wait == 5.0
+
+    group = parser.parse_args(
+        ["tan", "share", "--group", "weekend", "abcdef12"]
+    )
+    assert group.to is None
+    assert group.group == "weekend"
+    assert group.target == "abcdef12"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["tan", "share", "abcdef12"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["tan", "share", "--to", "bob", "--group", "weekend", "abcdef12"]
+        )
+
+
+def test_tan_share_sends_attributed_text(tmp_path, capsys, monkeypatch):
+    _, post, _ = _seed_tan_post(tmp_path)
+    code = _run_share(tmp_path, monkeypatch, ["--to", "bob", post["hash"][:12]])
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.sent) == 1
+    target, text, _ = node.sent[0]
+    assert target == "bob"
+    assert text == (
+        f"Shared Tan post by alice:\nworth sharing\n(tan {post['hash']})"
+    )
+    assert "delivered to bob" in capsys.readouterr().out
+
+
+def test_tan_share_to_group_fans_out_attributed_text(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.groups import GroupStore
+
+    _, post, _ = _seed_tan_post(tmp_path)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    store = GroupStore(config.groups_path)
+    store.create("weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "tan",
+            "share",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--group",
+            "weekend",
+            post["hash"][:12],
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.sent) == 1
+    group, text, _ = node.sent[0]
+    assert group["name"] == "weekend"
+    assert text == (
+        f"Shared Tan post by alice:\nworth sharing\n(tan {post['hash']})"
+    )
+    assert "delivered to alice" in capsys.readouterr().out
+
+
+def test_tan_share_own_post_labels_you(tmp_path, monkeypatch):
+    from tau.tangents.tan import create_post, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = load_identity(config.identity_path)
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(conn, identity, "my own thought", name="bob", now=1000)
+    finally:
+        conn.close()
+    code = _run_share(tmp_path, monkeypatch, ["--to", "carol", post["hash"][:12]])
+    assert code == 0
+    assert _FakeSendNode.instances[0].sent[0][1] == (
+        f"Shared Tan post by you:\nmy own thought\n(tan {post['hash']})"
+    )
+
+
+def test_tan_share_poll_includes_question_and_options(
+    tmp_path, monkeypatch
+):
+    _, poll, _ = _seed_tan_post(tmp_path, text="best colour?", poll=True)
+    code = _run_share(tmp_path, monkeypatch, ["--to", "bob", poll["hash"][:12]])
+    assert code == 0
+    assert _FakeSendNode.instances[0].sent[0][1] == (
+        "Shared Tan poll by alice:\nbest colour?\n1. red\n2. blue\n"
+        f"(tan {poll['hash']})"
+    )
+
+
+def test_tan_share_repost_shares_the_original(tmp_path, monkeypatch):
+    from tau.tangents.tan import create_post, create_repost, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    carol = RNS.Identity()
+    conn = init_db(config.social_db_path)
+    try:
+        original = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+        repost = create_repost(conn, carol, original["hash"], name="carol", now=1001)
+    finally:
+        conn.close()
+    code = _run_share(tmp_path, monkeypatch, ["--to", "bob", repost["hash"][:12]])
+    assert code == 0
+    assert _FakeSendNode.instances[0].sent[0][1] == (
+        f"Shared Tan post by alice:\nworth sharing\n(tan {original['hash']})"
+    )
+
+
+def test_tan_share_blocked_author_is_an_error(tmp_path, capsys, monkeypatch):
+    _, post, peer_hash = _seed_tan_post(tmp_path)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({peer_hash})))
+    code = _run_share(tmp_path, monkeypatch, ["--to", "carol", post["hash"][:12]])
+    assert code == 1
+    assert "blocked peer" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_tan_share_unknown_post_is_an_error(tmp_path, capsys, monkeypatch):
+    _seed_tan_post(tmp_path)
+    code = _run_share(tmp_path, monkeypatch, ["--to", "bob", "cd" * 32])
+    assert code == 1
+    assert "unknown post" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_tan_share_truncates_long_post_to_the_message_limit(
+    tmp_path, monkeypatch
+):
+    _, post, _ = _seed_tan_post(tmp_path, text="x" * 2000)
+    code = _run_share(tmp_path, monkeypatch, ["--to", "bob", post["hash"][:12]])
+    assert code == 0
+    text = _FakeSendNode.instances[0].sent[0][1]
+    assert len(text) <= 2000
+    assert text.endswith(f"(tan {post['hash']})")
+    assert "…" in text
+
+
 def test_forward_file_message_is_an_error(tmp_path, capsys, monkeypatch):
     data_dir = tmp_path / "node"
     config = TauConfig.resolve(data_dir=data_dir, name="bob")

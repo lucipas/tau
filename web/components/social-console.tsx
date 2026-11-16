@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 
 import { casefoldTag, formatDateTime, shortHash } from "@/lib/format";
 import type {
+  Peer,
   TanAuthor,
   TanExportDocument,
   TanImportError,
@@ -17,6 +18,7 @@ import type {
   TanScheduledPost,
   TanSuggestion,
   TanVerifyReport,
+  TauGroup,
 } from "@/lib/types";
 import { TAN_POLL_INTERVAL_MS, useTan } from "@/lib/use-tan";
 
@@ -25,7 +27,16 @@ import { RulesSection } from "./rules-section";
 
 export function SocialConsole({
   embedded = false,
-}: { embedded?: boolean } = {}) {
+  peers,
+  groups,
+}: {
+  embedded?: boolean;
+  // Known peers and groups to offer as share targets; the picker
+  // reports none when both lists are empty. Passed down from the
+  // console, which already holds them for the chat tab.
+  peers?: Peer[];
+  groups?: TauGroup[];
+} = {}) {
   const tan = useTan();
   const [text, setText] = useState("");
   const [target, setTarget] = useState("");
@@ -133,6 +144,10 @@ export function SocialConsole({
   );
   // Hashes with a repost request in flight; see submitRepost.
   const repostingRef = useRef<Set<string>>(new Set());
+  // Hashes with a share request in flight; see submitShare. A ref, not
+  // state: two clicks before React re-renders must not both send the
+  // share, or the peer gets the post twice.
+  const sharingRef = useRef<Set<string>>(new Set());
   // Hash of the post whose liker list is open, if any, and the likers for
   // it (null while the list is loading). Only one list is open at a time,
   // and it is always fetched fresh on open so a like toggle cannot leave
@@ -460,6 +475,48 @@ export function SocialConsole({
       setError(caught instanceof Error ? caught.message : "could not repost");
     } finally {
       repostingRef.current.delete(post.hash);
+    }
+  }
+
+  async function submitShare(post: TanPost, to: string) {
+    if (sharingRef.current.has(post.hash)) return;
+    sharingRef.current.add(post.hash);
+    setError(null);
+    try {
+      const result = await tan.sharePost(post.hash, { to });
+      if (!result.ok) {
+        setError("could not share this post");
+        return;
+      }
+      const peer = (peers ?? []).find(
+        (candidate) => candidate.destination === to,
+      );
+      setMessage(`shared with ${peer?.alias ?? peer?.name ?? to}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not share");
+    } finally {
+      sharingRef.current.delete(post.hash);
+    }
+  }
+
+  async function submitShareGroup(post: TanPost, group: string) {
+    if (sharingRef.current.has(post.hash)) return;
+    sharingRef.current.add(post.hash);
+    setError(null);
+    try {
+      const result = await tan.sharePost(post.hash, { group });
+      if (!result.ok) {
+        setError("could not share this post");
+        return;
+      }
+      const target = (groups ?? []).find(
+        (candidate) => candidate.id === group,
+      );
+      setMessage(`shared with #${target?.name ?? group}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not share");
+    } finally {
+      sharingRef.current.delete(post.hash);
     }
   }
 
@@ -1599,6 +1656,10 @@ export function SocialConsole({
                     onToggleLike={toggleLike}
                     onVotePoll={votePoll}
                     onRepost={submitRepost}
+                    onShare={submitShare}
+                    onShareGroup={submitShareGroup}
+                    sharePeers={peers}
+                    shareGroups={groups}
                     onReply={(target) => setReplyTarget(target)}
                     onDelete={submitDelete}
                     onHide={submitHide}
@@ -1624,6 +1685,10 @@ export function SocialConsole({
                           onToggleLike={toggleLike}
                           onVotePoll={votePoll}
                           onRepost={submitRepost}
+                          onShare={submitShare}
+                          onShareGroup={submitShareGroup}
+                          sharePeers={peers}
+                          shareGroups={groups}
                           onToggleLikers={toggleLikers}
                           likersOpen={likersOpen === post.hash}
                           likers={likersOpen === post.hash ? likers : null}
@@ -1699,6 +1764,10 @@ export function SocialConsole({
                           onToggleLike={toggleLike}
                           onVotePoll={votePoll}
                           onRepost={submitRepost}
+                          onShare={submitShare}
+                          onShareGroup={submitShareGroup}
+                          sharePeers={peers}
+                          shareGroups={groups}
                           onToggleSave={toggleSave}
                           onTogglePin={togglePin}
                           onHide={submitHide}
@@ -1740,6 +1809,10 @@ export function SocialConsole({
                           onToggleLike={toggleLike}
                           onVotePoll={votePoll}
                           onRepost={submitRepost}
+                          onShare={submitShare}
+                          onShareGroup={submitShareGroup}
+                          sharePeers={peers}
+                          shareGroups={groups}
                           onToggleSave={toggleSave}
                           onTogglePin={togglePin}
                           onUnhide={submitUnhide}
@@ -1778,6 +1851,10 @@ export function SocialConsole({
                         onToggleLike={toggleLike}
                         onVotePoll={votePoll}
                         onRepost={submitRepost}
+                        onShare={submitShare}
+                        onShareGroup={submitShareGroup}
+                        sharePeers={peers}
+                        shareGroups={groups}
                         onToggleSave={toggleSave}
                         onTogglePin={togglePin}
                         onHide={submitHide}
@@ -1803,6 +1880,10 @@ export function SocialConsole({
                       onToggleLike={toggleLike}
                       onVotePoll={votePoll}
                       onRepost={submitRepost}
+                      onShare={submitShare}
+                      onShareGroup={submitShareGroup}
+                      sharePeers={peers}
+                      shareGroups={groups}
                       onToggleLikers={toggleLikers}
                       likersOpen={likersOpen === post.hash}
                       likers={likersOpen === post.hash ? likers : null}
@@ -2270,6 +2351,10 @@ function ThreadView({
   error,
   onToggleLike,
   onRepost,
+  onShare,
+  onShareGroup,
+  sharePeers,
+  shareGroups,
   onVotePoll,
   onReply,
   onDelete,
@@ -2283,6 +2368,12 @@ function ThreadView({
   error: string | null;
   onToggleLike: (post: TanPost) => void;
   onRepost: (post: TanPost) => void;
+  // Optional like onQuote: views that do not wire sharing render the
+  // card without a share button.
+  onShare?: (post: TanPost, to: string) => Promise<void>;
+  onShareGroup?: (post: TanPost, group: string) => Promise<void>;
+  sharePeers?: Peer[];
+  shareGroups?: TauGroup[];
   // Optional like onToggleLikers: views that do not wire voting render
   // the poll tally without vote buttons.
   onVotePoll?: (post: TanPost, option: number) => void;
@@ -2311,6 +2402,10 @@ function ThreadView({
             post={post}
             onToggleLike={onToggleLike}
             onRepost={onRepost}
+            onShare={onShare}
+            onShareGroup={onShareGroup}
+            sharePeers={sharePeers}
+            shareGroups={shareGroups}
             onVotePoll={onVotePoll}
             onReply={onReply}
             onDelete={onDelete}
@@ -2595,6 +2690,14 @@ export function PostCard({
   post,
   onToggleLike,
   onRepost,
+  // Optional like onQuote: views that do not wire sharing render the
+  // card without a share button.
+  onShare,
+  onShareGroup,
+  // Known peers and groups to offer as share targets; the picker
+  // reports none when both lists are empty.
+  sharePeers,
+  shareGroups,
   onVotePoll,
   onToggleLikers,
   likersOpen,
@@ -2625,6 +2728,14 @@ export function PostCard({
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
   onRepost: (post: TanPost) => void;
+  // Optional like onQuote: views that do not wire sharing render the
+  // card without a share button.
+  onShare?: (post: TanPost, to: string) => Promise<void>;
+  onShareGroup?: (post: TanPost, group: string) => Promise<void>;
+  // Known peers and groups to offer as share targets; the picker
+  // reports none when both lists are empty.
+  sharePeers?: Peer[];
+  shareGroups?: TauGroup[];
   // Optional like onToggleLikers: views that do not wire voting render
   // the poll tally without vote buttons.
   onVotePoll?: (post: TanPost, option: number) => void;
@@ -2679,6 +2790,43 @@ export function PostCard({
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState("");
   const [saving, setSaving] = useState(false);
+  // Whether the share target picker is open, and the in-flight share.
+  // A ref, not state: two clicks before React re-renders must not both
+  // send the share, or the peer gets the post twice.
+  const [shareOpen, setShareOpen] = useState(false);
+  const [sharePending, setSharePending] = useState(false);
+  const [shareError, setShareError] = useState<string | null>(null);
+  const shareInFlight = useRef(false);
+
+  async function handleShare(to: string) {
+    if (!onShare || shareInFlight.current) return;
+    shareInFlight.current = true;
+    setSharePending(true);
+    try {
+      await onShare(post, to);
+      setShareOpen(false);
+    } catch (caught) {
+      setShareError(caught instanceof Error ? caught.message : "share failed");
+    } finally {
+      shareInFlight.current = false;
+      setSharePending(false);
+    }
+  }
+
+  async function handleShareGroup(group: string) {
+    if (!onShareGroup || shareInFlight.current) return;
+    shareInFlight.current = true;
+    setSharePending(true);
+    try {
+      await onShareGroup(post, group);
+      setShareOpen(false);
+    } catch (caught) {
+      setShareError(caught instanceof Error ? caught.message : "share failed");
+    } finally {
+      shareInFlight.current = false;
+      setSharePending(false);
+    }
+  }
 
   async function submitEditForm() {
     if (saving || !onEdit) return;
@@ -3061,6 +3209,22 @@ export function PostCard({
                 quote
               </button>
             ) : null}
+            {post.deleted || (!onShare && !onShareGroup) ? null : (
+              <button
+                type="button"
+                onClick={() => {
+                  setShareError(null);
+                  setShareOpen((open) => !open);
+                }}
+                title="Share this post with a peer or a group"
+                aria-label="Share this post"
+                aria-expanded={shareOpen}
+                disabled={sharePending}
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-signal"
+              >
+                {sharePending ? "sharing…" : "↗ share"}
+              </button>
+            )}
             {onEdit && post.own && post.kind !== "quote" && !editing && !deleting ? (
               <button
                 type="button"
@@ -3147,6 +3311,55 @@ export function PostCard({
               )
             )}
           </div>
+          {shareOpen ? (
+            <div
+              className="mt-2 flex flex-wrap gap-1"
+              role="group"
+              aria-label="Share to a peer or group"
+            >
+              {(sharePeers ?? []).length === 0 &&
+              (shareGroups ?? []).length === 0 ? (
+                <span className="font-mono text-[10px] text-mist/60">
+                  no known peers or groups yet
+                </span>
+              ) : (
+                <>
+                  {(sharePeers ?? []).map((peer) => (
+                    <button
+                      key={peer.destination}
+                      type="button"
+                      title={`Share with ${peer.alias ?? peer.name}`}
+                      disabled={sharePending}
+                      onClick={() => void handleShare(peer.destination)}
+                      className="rounded-lg border border-line/80 bg-void/60 px-2 py-1 font-mono text-[11px] text-zinc-200 transition hover:border-signal/35 hover:bg-void"
+                    >
+                      {peer.alias ?? peer.name}
+                    </button>
+                  ))}
+                  {(shareGroups ?? []).map((group) => (
+                    <button
+                      key={group.id}
+                      type="button"
+                      title={`Share with group ${group.name}`}
+                      disabled={sharePending}
+                      onClick={() => void handleShareGroup(group.id)}
+                      className="rounded-lg border border-signal/30 bg-signal/10 px-2 py-1 font-mono text-[11px] text-signal transition hover:border-signal/50 hover:bg-signal/15"
+                    >
+                      #{group.name}
+                    </button>
+                  ))}
+                </>
+              )}
+            </div>
+          ) : null}
+          {shareError ? (
+            <p
+              className="mt-1 font-mono text-[10px] text-amber"
+              role="alert"
+            >
+              share failed: {shareError}
+            </p>
+          ) : null}
           {likersOpen ? (
             <div className="mt-2 rounded border border-line/70 bg-panel/60 px-2 py-1.5">
               <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-mist/70">

@@ -148,6 +148,97 @@ describe("PostCard delete control", () => {
   });
 });
 
+describe("PostCard share control", () => {
+  const peers = [
+    {
+      destination: "a".repeat(64),
+      name: "alice",
+      last_seen: 1000,
+      age: 0,
+      hops: 1,
+      protocol: 1,
+    },
+  ];
+  const groups = [
+    { id: "g".repeat(32), name: "crew", members: [], created_at: 1000 },
+  ];
+
+  function renderCard(props: Record<string, unknown> = {}) {
+    const post = makePost();
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+        {...props}
+      />,
+    );
+    return post;
+  }
+
+  it("offers peers and groups, and shares with the picked peer", async () => {
+    const onShare = vi.fn().mockResolvedValue(undefined);
+    const post = renderCard({
+      onShare,
+      onShareGroup: vi.fn(),
+      sharePeers: peers,
+      shareGroups: groups,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    expect(screen.getByRole("button", { name: "alice" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "#crew" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "alice" }));
+    await waitFor(() => expect(onShare).toHaveBeenCalledWith(post, peers[0].destination));
+  });
+
+  it("shares with the picked group", async () => {
+    const onShareGroup = vi.fn().mockResolvedValue(undefined);
+    renderCard({
+      onShare: vi.fn(),
+      onShareGroup,
+      sharePeers: peers,
+      shareGroups: groups,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    fireEvent.click(screen.getByRole("button", { name: "#crew" }));
+    await waitFor(() =>
+      expect(onShareGroup).toHaveBeenCalledWith(
+        expect.objectContaining({ hash: "c".repeat(64) }),
+        groups[0].id,
+      ),
+    );
+  });
+
+  it("says so when there are no known peers or groups", () => {
+    renderCard({ onShare: vi.fn(), sharePeers: [], shareGroups: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    expect(screen.getByText("no known peers or groups yet")).toBeTruthy();
+  });
+
+  it("shows no share button when sharing is not wired", () => {
+    renderCard();
+    expect(
+      screen.queryByRole("button", { name: "Share this post" }),
+    ).toBeNull();
+  });
+
+  it("reports a failed share and keeps the picker open", async () => {
+    const onShare = vi.fn().mockRejectedValue(new Error("peer is offline"));
+    renderCard({ onShare, sharePeers: peers, shareGroups: groups });
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    fireEvent.click(screen.getByRole("button", { name: "alice" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("share failed: peer is offline"),
+      ).toBeTruthy(),
+    );
+    expect(screen.getByRole("button", { name: "alice" })).toBeTruthy();
+  });
+});
+
 describe("VerifyResult", () => {
   function makeReport(overrides: Partial<TanVerifyReport> = {}): TanVerifyReport {
     return {

@@ -201,9 +201,11 @@ from .tangents.tan import (
     resolve_delete_target,
     resolve_muted_name,
     resolve_post,
+    resolve_share_post,
     save_draft,
     save_post,
     search_posts,
+    share_text,
     suggest_authors,
     tags,
     thread,
@@ -1980,6 +1982,52 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=15.0, metavar="SECONDS"
     )
     tan_repost.set_defaults(func=cmd_tan_repost)
+
+    # `tau tan share` shares `tau forward`'s delivery flags: a share is a
+    # new message carrying the post's text plus an attribution line.
+    tan_share = tan_sub.add_parser(
+        "share",
+        parents=[common],
+        help="share a Tan post with a peer or a group (sends it as a message)",
+    )
+    share_target = tan_share.add_mutually_exclusive_group(required=True)
+    share_target.add_argument(
+        "--to",
+        action="append",
+        metavar="NAME|HASH",
+        help="peer name or destination hash (repeatable: share with several peers)",
+    )
+    share_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: share into the group instead of with a peer",
+    )
+    tan_share.add_argument(
+        "target", metavar="POST", help="post hash or unique hash prefix"
+    )
+    tan_share.add_argument(
+        "--timeout", type=float, default=20.0, metavar="SECONDS"
+    )
+    tan_share.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    tan_share.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    tan_share.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    tan_share.set_defaults(func=cmd_tan_share)
 
     tan_delete = tan_sub.add_parser(
         "delete",
@@ -4305,6 +4353,63 @@ def cmd_tan_repost(args: argparse.Namespace) -> int:
             for error in published["errors"]:
                 print(f"  failed {short_hash(error['peer'])}: {error['error']}")
     return _EXIT_OK
+
+
+def cmd_tan_share(args: argparse.Namespace) -> int:
+    """Share a Tan post with a peer or a group, as an attributed message.
+
+    Mirrors :func:`cmd_forward`: the share is a new DM or group message
+    carrying the post's text plus an attribution line, so the recipient
+    reads it on any transport with no protocol change.  Delivery reuses
+    :func:`cmd_send` wholesale for a peer target — or
+    :func:`cmd_group_send` for a group target, fanning out one leg per
+    member.  Either way the share is a new message, so it carries no
+    expiry, kind, or reply chain from the post.  A repost shares its
+    original (see :func:`resolve_share_post`); a poll shares its
+    question and options.
+    """
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        post = resolve_share_post(conn, args.target)
+    finally:
+        conn.close()
+    author = str(post.get("author") or "")
+    identity = load_identity(config.identity_path)
+    own_hash = destination_hash(identity).hex() if identity is not None else None
+    if author and own_hash is not None and author != own_hash:
+        # A post by a blocked peer must not be amplified, mirroring the
+        # forward guard.  An unreadable block-list fails closed.
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            raise NodeError("cannot share: the block-list could not be read")
+        if author in blocked:
+            raise NodeError("cannot share a post by a blocked peer")
+    if own_hash is not None and author == own_hash:
+        # The post is one this node wrote; the recipient already knows
+        # the sharer, so the attribution names the sharer as "you".
+        label = "you"
+    else:
+        # Re-resolve the author so a newer alias wins, falling back to
+        # the name recorded when the post arrived (or the short hash).
+        peer = (
+            PeerRegistry(config.peers_path).get(author)
+            if author
+            else None
+        )
+        label = peer.display_name if peer is not None else None
+        if not label:
+            label = str(post.get("name") or "") or None
+        if not label:
+            label = short_hash(author) if author else "unknown"
+    # `cmd_send` reads its text from `args.message`; hand it the
+    # attributed text and let it own delivery, queueing, and output.
+    # A group target takes the group-send path instead: the same
+    # attributed text, fanned out one leg per member.
+    args.message = share_text(post, label)
+    if getattr(args, "group", None):
+        return cmd_group_send(args)
+    return cmd_send(args)
 
 
 def cmd_tan_delete(args: argparse.Namespace) -> int:

@@ -7220,6 +7220,164 @@ def test_tan_repost_via_api(tmp_path):
     assert [entry["kind"] for entry in entries] == ["post"]
 
 
+def test_tan_share_via_api(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        TanApp,
+        create_poll,
+        create_post,
+        create_repost,
+        init_db,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    third = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1000)
+        mine = create_post(conn, identity, "my own thought", name="tester", now=1001)
+        poll = create_poll(
+            conn, other, "best colour?", ["red", "blue"], name="other", now=1002
+        )
+        repost = create_repost(conn, third, foreign["hash"], name="third", now=1003)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.set_blocklist(BlockList(blocked=frozenset()))
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Sharing a post sends it as an attributed DM; the author is
+        # not in the registry, so the recorded name is used.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"][:16], "to": "alice"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert node.sent[0] == (
+            "alice",
+            f"Shared Tan post by other:\nworth sharing\n(tan {foreign['hash']})",
+            None,
+        )
+
+        # Your own post attributes you.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": mine["hash"], "to": "alice"},
+        )
+        assert status == 200
+        assert "Shared Tan post by you:\nmy own thought" in node.sent[1][1]
+
+        # A poll shares its question and options.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": poll["hash"], "to": "alice"},
+        )
+        assert status == 200
+        assert node.sent[2][1] == (
+            "Shared Tan poll by other:\nbest colour?\n1. red\n2. blue\n"
+            f"(tan {poll['hash']})"
+        )
+
+        # A repost shares its original, not the repost.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": repost["hash"], "to": "alice"},
+        )
+        assert status == 200
+        assert node.sent[3][1] == (
+            f"Shared Tan post by other:\nworth sharing\n(tan {foreign['hash']})"
+        )
+
+        # Sharing into a group fans out one leg per member.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"], "group": "crew"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert node.group_sent[0][0] == "crew"
+        assert node.group_sent[0][1].startswith("Shared Tan post by other:")
+
+        # A post by a blocked author is refused.
+        node.set_blocklist(BlockList(blocked=frozenset({foreign["author"]})))
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"], "to": "alice"},
+        )
+        assert status == 400
+        assert "blocked peer" in payload["error"]["message"]
+
+        # An unreadable block-list fails closed.
+        node.set_blocklist(None)
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"], "to": "alice"},
+        )
+        assert status == 400
+        assert "could not be read" in payload["error"]["message"]
+
+        # A post this node has never seen cannot be shared.
+        node.set_blocklist(BlockList(blocked=frozenset()))
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": "cd" * 32, "to": "alice"},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # Exactly one of `to` and `group` is required.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"]},
+        )
+        assert status == 400
+        assert "exactly one of" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"], "to": "alice", "group": "crew"},
+        )
+        assert status == 400
+        assert "exactly one of" in payload["error"]["message"]
+
+        # A missing target is a bad request, not a server error.
+        status, _, payload = _json(
+            bridge, "/api/tan/share", method="POST", body={"to": "alice"}
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_repost_state_on_mentions_and_saved(tmp_path):
     # Regression test for the repost-annotation gap Qodo's review caught:
     # mentions and saved posts did not carry repost counts, so a card

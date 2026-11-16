@@ -725,7 +725,11 @@ export function Console() {
                   : "hidden"
               }
             >
-              <SocialConsole embedded />
+              <SocialConsole
+                embedded
+                peers={tau.peers}
+                groups={tau.groups}
+              />
             </div>
             {tab === "tools" ? (
               <div className="thin-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto lg:pr-1">
