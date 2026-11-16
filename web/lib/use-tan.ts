@@ -1358,7 +1358,9 @@ export function useTan() {
       // audit exactly like a post does.
       invalidateVerify();
       await apiPost("/api/tan/vote", { target, option });
-      await Promise.all([
+      // The vote is already committed; a refresh failure must not be
+      // reported as the vote failing (a retry would add another entry).
+      await runRefreshes([
         load(),
         refreshSavedIfLoaded(),
         refreshPinnedIfLoaded(),
@@ -1371,6 +1373,7 @@ export function useTan() {
       refreshHiddenIfLoaded,
       refreshSavedIfLoaded,
       refreshPinnedIfLoaded,
+      runRefreshes,
     ],
   );
 
