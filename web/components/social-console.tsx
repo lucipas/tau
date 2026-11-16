@@ -116,6 +116,10 @@ export function SocialConsole({
   // picking a reply or quote leaves poll mode (see the effect below).
   const [pollMode, setPollMode] = useState(false);
   const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
+  // The latest poll draft, read after an awaited submit to tell whether
+  // the user edited the draft while the request was in flight.
+  const pollDraftRef = useRef({ text, pollOptions });
+  pollDraftRef.current = { text, pollOptions };
   // A reply or quote picked from any card leaves poll mode: a poll is
   // a top-level entry and cannot carry a reply or quote target.
   useEffect(() => {
@@ -290,7 +294,16 @@ export function SocialConsole({
           ? ["", ""]
           : current,
       );
-      setPollMode(false);
+      // Leave poll mode only when the submitted draft was not revised
+      // while the request was in flight; a revised draft stays a poll.
+      const latest = pollDraftRef.current;
+      const draftUnchanged =
+        latest.text.trim() === submittedQuestion &&
+        latest.pollOptions
+          .map((option) => option.trim())
+          .filter(Boolean)
+          .join("\n") === submittedOptions.join("\n");
+      if (draftUnchanged) setPollMode(false);
       setExpireSeconds((current) =>
         current === submittedExpire ? null : current,
       );
