@@ -136,6 +136,7 @@ MAX_FOLLOWED_TAGS = 256
 MAX_MUTED_TAGS = 256
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
+MAX_DRAFTS = 100
 MAX_HIDDEN_POSTS = 512
 MAX_PINNED_POSTS = 10
 MAX_GOSSIP_TTL = 3
@@ -596,6 +597,14 @@ CREATE TABLE IF NOT EXISTS pinned_posts (
 CREATE TABLE IF NOT EXISTS hidden_posts (
     hash TEXT PRIMARY KEY,
     hidden_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    reply_to TEXT NOT NULL DEFAULT '',
+    expires_in REAL,
+    created_at REAL NOT NULL
 );
 """
 
@@ -4626,6 +4635,118 @@ def unsave_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     with conn:
         cursor = conn.execute("DELETE FROM saved_posts WHERE hash = ?", (digest,))
     return {"hash": digest, "unsaved": cursor.rowcount > 0}
+
+
+def _draft_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "text": str(row["text"]),
+        "reply_to": str(row["reply_to"] or ""),
+        "expires_in": (
+            float(row["expires_in"]) if row["expires_in"] is not None else None
+        ),
+        "created_at": float(row["created_at"]),
+    }
+
+
+def _parse_draft_id(ref: Any) -> int:
+    try:
+        draft_id = int(str(ref).strip())
+    except (TypeError, ValueError):
+        raise TanError(f"unknown draft: {ref!r}") from None
+    if draft_id <= 0:
+        raise TanError(f"unknown draft: {ref!r}")
+    return draft_id
+
+
+def save_draft(
+    conn: sqlite3.Connection,
+    text: str,
+    *,
+    reply_to: str = "",
+    expires_in: Optional[float] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Save a local-only Tan post draft.
+
+    Drafts are private to this node — no signed entry, nothing
+    gossiped — so a half-written post can wait until its author is
+    ready to publish it.  The text is validated exactly like a post's
+    (``normalize_message``), so a draft can never hold text the post
+    path would reject.  ``reply_to`` is the resolved hash of the post
+    being replied to, or ``""``; ``expires_in`` is seconds from
+    publish time, or ``None`` for a post that never expires — the
+    expiry clock starts when the draft is published, not when it is
+    saved.
+    """
+    clean_text = normalize_message(text)
+    target = (reply_to or "").strip().lower()
+    if target:
+        _require_hex(target, HASH_HEX_LENGTH, "reply_to")
+    if expires_in is not None:
+        expires_in = float(expires_in)
+        if not expires_in > 0:
+            raise TanError("expires_in must be positive")
+        if expires_in > MAX_TAN_POST_EXPIRY:
+            raise TanError(
+                "draft expiry must be at most "
+                f"{MAX_TAN_POST_EXPIRY} seconds"
+            )
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking the capacity, so a competing
+    # save cannot slip in between check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        count = conn.execute("SELECT COUNT(*) AS n FROM drafts").fetchone()["n"]
+        if int(count) >= MAX_DRAFTS:
+            raise TanError(f"drafts are limited to {MAX_DRAFTS} entries")
+        cursor = conn.execute(
+            "INSERT INTO drafts(text, reply_to, expires_in, created_at)"
+            " VALUES(?, ?, ?, ?)",
+            (clean_text, target, expires_in, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return _draft_dict(
+        conn.execute(
+            "SELECT * FROM drafts WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+    )
+
+
+def list_drafts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Saved drafts, newest first."""
+    count = max(1, min(int(limit), MAX_DRAFTS))
+    rows = conn.execute(
+        "SELECT * FROM drafts ORDER BY created_at DESC, id DESC LIMIT ?",
+        (count,),
+    ).fetchall()
+    return [_draft_dict(row) for row in rows]
+
+
+def get_draft(conn: sqlite3.Connection, ref: Any) -> Dict[str, Any]:
+    """Resolve a draft id to its stored draft, or raise ``TanError``."""
+    draft_id = _parse_draft_id(ref)
+    row = conn.execute(
+        "SELECT * FROM drafts WHERE id = ?", (draft_id,)
+    ).fetchone()
+    if row is None:
+        raise TanError(f"unknown draft: {ref!r}")
+    return _draft_dict(row)
+
+
+def delete_draft(conn: sqlite3.Connection, ref: Any) -> Dict[str, Any]:
+    """Delete a draft and return it, or raise ``TanError`` when unknown."""
+    draft = get_draft(conn, ref)
+    with conn:
+        conn.execute("DELETE FROM drafts WHERE id = ?", (draft["id"],))
+    return draft
 
 
 # Shelf tables whose rows are pageable posts, for the shared

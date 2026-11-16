@@ -11,7 +11,7 @@ from tau.cli import main
 from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
 from tau.peers import Peer
-from tau.protocol import APP_NAME, ASPECT, ProtocolError, decode, encode
+from tau.protocol import APP_NAME, ASPECT, MAX_MESSAGE_CHARS, ProtocolError, decode, encode
 from tau.tangents import tan as tan_module
 from tau.tangents.rules import Ruleset
 from tau.tangents.tan import (
@@ -43,6 +43,7 @@ from tau.tangents.tan import (
     create_repost,
     clean_tag,
     deleted_targets,
+    delete_draft,
     edit_states,
     export_entries,
     extract_tags,
@@ -52,6 +53,7 @@ from tau.tangents.tan import (
     followed_tags,
     following,
     get_post,
+    get_draft,
     hash,
     head,
     hidden_posts,
@@ -63,6 +65,7 @@ from tau.tangents.tan import (
     like_counts,
     likers,
     list_authors,
+    list_drafts,
     mute_keyword,
     mute_tag,
     muted_keywords,
@@ -87,11 +90,14 @@ from tau.tangents.tan import (
     pin_post,
     pinned_posts,
     save_post,
+    save_draft,
     saved_posts,
     search_posts,
     store,
     store_post,
+    MAX_DRAFTS,
     MAX_MUTED_TAGS,
+    MAX_TAN_POST_EXPIRY,
     SUGGEST_FOLLOWED_WEIGHT,
     suggest_authors,
     tags,
@@ -7594,3 +7600,242 @@ def test_timeline_survives_newest_expired_posts(identities, tmp_path):
     assert [item["hash"] for item in timeline(conn, [author])] == expected
     assert [item["hash"] for item in author_timeline(conn, author)] == expected
     assert [item["hash"] for item in feed(conn, posts_only=True)] == expected
+
+
+def test_drafts_crud_and_validation(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    try:
+        # Empty and over-long text are rejected exactly like a post's.
+        with pytest.raises(ProtocolError):
+            save_draft(conn, "   ")
+        with pytest.raises(ProtocolError):
+            save_draft(conn, "x" * (MAX_MESSAGE_CHARS + 1))
+
+        # A bad reply target and a bad expiry are refused at save time.
+        with pytest.raises(PostError):
+            save_draft(conn, "hello", reply_to="not-hex")
+        with pytest.raises(TanError):
+            save_draft(conn, "hello", expires_in=0)
+        with pytest.raises(TanError):
+            save_draft(conn, "hello", expires_in=MAX_TAN_POST_EXPIRY + 1)
+
+        first = save_draft(conn, "  first draft  ", now=1000)
+        second = save_draft(
+            conn, "second draft", reply_to="ab" * 32, expires_in=3600, now=1001
+        )
+        assert first["text"] == "first draft"
+        assert first["reply_to"] == ""
+        assert first["expires_in"] is None
+        assert first["created_at"] == 1000
+        assert second["reply_to"] == "ab" * 32
+        assert second["expires_in"] == 3600
+
+        # Newest first, with a limit.
+        assert [d["id"] for d in list_drafts(conn)] == [
+            second["id"],
+            first["id"],
+        ]
+        assert [d["id"] for d in list_drafts(conn, limit=1)] == [second["id"]]
+        assert get_draft(conn, str(second["id"])) == second
+
+        # Unknown ids — numeric, non-numeric, non-positive — all refuse.
+        for bad in ("999", "nope", "0", "-3"):
+            with pytest.raises(TanError):
+                get_draft(conn, bad)
+
+        removed = delete_draft(conn, first["id"])
+        assert removed["id"] == first["id"]
+        assert [d["id"] for d in list_drafts(conn)] == [second["id"]]
+        with pytest.raises(TanError):
+            delete_draft(conn, first["id"])
+    finally:
+        conn.close()
+
+
+def test_drafts_cap(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    try:
+        for n in range(MAX_DRAFTS):
+            save_draft(conn, f"draft {n}")
+        with pytest.raises(TanError):
+            save_draft(conn, "one too many")
+    finally:
+        conn.close()
+
+
+def test_cli_tan_drafts(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+
+    # Save a draft from the CLI; JSON reports it back.
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "hello draft"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    draft_id = payload["draft"]["id"]
+    assert payload["draft"]["text"] == "hello draft"
+    assert payload["draft"]["expires_in"] is None
+
+    # The list shows it; publishing stores the post and clears the draft.
+    assert main(["tan", "drafts", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [d["id"] for d in payload["drafts"]] == [draft_id]
+
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                str(draft_id),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["post"]["text"] == "hello draft"
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+        assert [p["text"] for p in feed(conn, all_authors=True)] == ["hello draft"]
+    finally:
+        conn.close()
+
+    # Discarding removes a draft without publishing it; unknown ids fail.
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "to discard"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    doomed = payload["draft"]["id"]
+    assert (
+        main(
+            [
+                "tan",
+                "discard-draft",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                str(doomed),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["discarded"]["id"] == doomed
+    assert main(["tan", "drafts", "--data-dir", str(data_dir)]) == 0
+    assert "No Tan post drafts saved." in capsys.readouterr().out
+    assert main(["tan", "discard-draft", "--data-dir", str(data_dir), "999"]) == 1
+    assert "unknown draft" in capsys.readouterr().err
+    assert main(["tan", "publish-draft", "--data-dir", str(data_dir), "999"]) == 1
+
+
+def test_cli_tan_draft_expiry_starts_at_publish(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "draft",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "--expire",
+                "1h",
+                "expiring draft",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    draft_id = payload["draft"]["id"]
+    assert payload["draft"]["expires_in"] == 3600
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                str(draft_id),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    post = payload["post"]
+    assert post["expires_at"] is not None
+    remaining = post["expires_at"] - time.time()
+    assert 3590 <= remaining <= 3600
+
+
+def test_cli_tan_publish_draft_keeps_draft_when_reply_target_gone(
+    tmp_path, capsys
+):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "target post",
+            ]
+        )
+        == 0
+    )
+    target = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(
+            [
+                "tan",
+                "draft",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "--reply-to",
+                target,
+                "reply draft",
+            ]
+        )
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+    assert (
+        main(
+            ["tan", "delete", "--data-dir", str(data_dir), "--no-publish", target]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                str(draft_id),
+            ]
+        )
+        == 1
+    )
+    assert "has been deleted" in capsys.readouterr().err
+    assert main(["tan", "drafts", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [d["id"] for d in payload["drafts"]] == [draft_id]
