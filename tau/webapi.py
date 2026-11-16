@@ -2533,11 +2533,11 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             _NOT_DELETED,
+            _delete_entry_exists,
             KIND_LIKE,
             KIND_UNLIKE,
             TIMELINE_KINDS_SQL,
             TanError,
-            deleted_targets,
             muted_author_set,
             post_likers,
         )
@@ -2553,8 +2553,6 @@ class WebBridge:
         exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
-            if clean in deleted_targets(conn):
-                raise TanError(f"post has been deleted: {clean!r}")
             # A target is visible only when the timeline would show it:
             # linked, a timeline kind, not deleted by its author, and by
             # an author who is neither muted nor blocked.
@@ -2564,7 +2562,18 @@ class WebBridge:
                 (clean,),
             ).fetchone()
             hidden = muted_author_set(conn) | blocked
-            if row is None or exclude_all or str(row["author"]) in hidden:
+            if row is None:
+                # The row is gone when its author deleted it: deleting
+                # purges the post, so the tombstone is the only trace
+                # left.  The row query already excludes a retained post
+                # its author deleted, and a delete from anyone else
+                # leaves the row visible — so a missing row with a
+                # linked delete entry still reports deleted, not
+                # unknown, matching the like endpoint.
+                if _delete_entry_exists(conn, clean):
+                    raise TanError(f"post has been deleted: {clean!r}")
+                raise TanError(f"unknown post: {clean!r}")
+            if exclude_all or str(row["author"]) in hidden:
                 raise TanError(f"unknown post: {clean!r}")
             app = self._tan_app()
             if app is not None:
@@ -2634,10 +2643,10 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             _NOT_DELETED,
+            _delete_entry_exists,
             KIND_REPOST,
             TIMELINE_KINDS_SQL,
             TanError,
-            deleted_targets,
             muted_author_set,
             post_reposters,
         )
@@ -2653,8 +2662,6 @@ class WebBridge:
         exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
-            if clean in deleted_targets(conn):
-                raise TanError(f"post has been deleted: {clean!r}")
             # A target is visible only when the timeline would show it:
             # linked, a timeline kind, not deleted by its author, and by
             # an author who is neither muted nor blocked.
@@ -2664,7 +2671,18 @@ class WebBridge:
                 (clean,),
             ).fetchone()
             hidden = muted_author_set(conn) | blocked
-            if row is None or exclude_all or str(row["author"]) in hidden:
+            if row is None:
+                # The row is gone when its author deleted it: deleting
+                # purges the post, so the tombstone is the only trace
+                # left.  The row query already excludes a retained post
+                # its author deleted, and a delete from anyone else
+                # leaves the row visible — so a missing row with a
+                # linked delete entry still reports deleted, not
+                # unknown, matching the like endpoint.
+                if _delete_entry_exists(conn, clean):
+                    raise TanError(f"post has been deleted: {clean!r}")
+                raise TanError(f"unknown post: {clean!r}")
+            if exclude_all or str(row["author"]) in hidden:
                 raise TanError(f"unknown post: {clean!r}")
             app = self._tan_app()
             if app is not None:
@@ -2736,11 +2754,11 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             _NOT_DELETED,
+            _delete_entry_exists,
             KIND_QUOTE,
             TIMELINE_KINDS_SQL,
             TanError,
             ancestry_hidden,
-            deleted_targets,
             get_post,
             muted_author_set,
             post_quoters,
@@ -2758,8 +2776,6 @@ class WebBridge:
         exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
-            if clean in deleted_targets(conn):
-                raise TanError(f"post has been deleted: {clean!r}")
             # A target is visible only when the timeline would show it:
             # linked, a timeline kind, not deleted by its author, and by
             # an author who is neither muted nor blocked.
@@ -2769,7 +2785,18 @@ class WebBridge:
                 (clean,),
             ).fetchone()
             hidden = muted_author_set(conn) | blocked
-            if row is None or exclude_all or str(row["author"]) in hidden:
+            if row is None:
+                # The row is gone when its author deleted it: deleting
+                # purges the post, so the tombstone is the only trace
+                # left.  The row query already excludes a retained post
+                # its author deleted, and a delete from anyone else
+                # leaves the row visible — so a missing row with a
+                # linked delete entry still reports deleted, not
+                # unknown, matching the like endpoint.
+                if _delete_entry_exists(conn, clean):
+                    raise TanError(f"post has been deleted: {clean!r}")
+                raise TanError(f"unknown post: {clean!r}")
+            if exclude_all or str(row["author"]) in hidden:
                 raise TanError(f"unknown post: {clean!r}")
             app = self._tan_app()
             if app is not None:
