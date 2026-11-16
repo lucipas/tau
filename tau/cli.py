@@ -3516,6 +3516,18 @@ def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
         # A failed publish keeps the draft, so it can be retried or
         # discarded by hand instead of silently lost.
         return result
+    # cmd_tan_post reports peer failures without failing, so check the
+    # delivery result too: a draft is only consumed once every requested
+    # peer accepted the post. --no-publish leaves no delivery to check.
+    published = getattr(args, "_tan_post_published", None)
+    if published is not None and published["errors"]:
+        print(
+            f"error: draft {draft['id']} kept — delivered to "
+            f"{published['delivered']}/{published['peers']} peer(s); "
+            "the draft was not deleted",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
     conn = init_db(config.social_db_path)
     try:
         delete_draft(conn, draft["id"])
