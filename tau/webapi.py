@@ -124,6 +124,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
     POST /api/tan/vote     vote on a Tan poll (signed vote entry on your chain)
+    POST /api/tan/poll     ask a Tan poll question (signed poll entry on your chain)
     POST /api/tan/repost   repost a post (signed repost entry on your chain)
     POST /api/tan/delete   delete one of your own posts
     POST /api/tan/edit     edit one of your own posts
@@ -3206,6 +3207,23 @@ class WebBridge:
         finally:
             conn.close()
         return app.vote(post_hash, option, publish=True)
+
+    def tan_poll(
+        self,
+        question: str,
+        options: List[str],
+        *,
+        expires_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        expires_at = None
+        if expires_in is not None:
+            expires_at = time.time() + float(expires_in)
+        return app.create_poll(
+            question, options, publish=True, expires_at=expires_at
+        )
 
     def tan_repost(self, target: str) -> Dict[str, Any]:
         app = self._tan_app()
@@ -10267,6 +10285,57 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "vote": record}, head_only)
+                return
+            if path == "/api/tan/poll":
+                question = body.get("question") or body.get("text")
+                if not isinstance(question, str) or not question.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'question' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                options = body.get("options")
+                if not isinstance(options, list):
+                    self._send_json(
+                        {"error": {"message": "field 'options' must be a list"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                expires_in = body.get("expires_in")
+                if expires_in is not None:
+                    if (
+                        not isinstance(expires_in, (int, float))
+                        or isinstance(expires_in, bool)
+                        or not _valid_tan_expires_in(expires_in)
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'expires_in' must be a number of "
+                                    "seconds (0 < expires_in <= 604800)"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                try:
+                    poll = self.bridge.tan_poll(
+                        question,
+                        options,
+                        expires_in=(
+                            float(expires_in) if expires_in is not None else None
+                        ),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "poll": poll}, head_only)
                 return
             if path == "/api/tan/repost":
                 target = body.get("target") or body.get("hash")

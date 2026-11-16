@@ -569,6 +569,81 @@ describe("useTan voteOnPoll", () => {
   });
 });
 
+describe("useTan createPoll", () => {
+  it("posts the question and options to /api/tan/poll and shows the new poll", async () => {
+    const created = makePost({
+      kind: "poll",
+      text: "which day?",
+      poll: {
+        options: ["Thursday", "Friday"],
+        counts: [0, 0],
+        total: 0,
+        voted: null,
+      },
+    });
+    let timelinePosts: TanPost[] = [];
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: timelinePosts, count: timelinePosts.length })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockImplementation(async () => {
+      // The serving node has the poll once the POST succeeds, so the
+      // reload after creation brings it back in the timeline.
+      timelinePosts = [created];
+      return { ok: true, poll: created };
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([]));
+
+    const returned = await act(async () =>
+      result.current.createPoll("which day?", ["Thursday", "Friday"]),
+    );
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/poll", {
+      question: "which day?",
+      options: ["Thursday", "Friday"],
+    });
+    // The created poll is returned and the reload shows it in the feed,
+    // like a published post.
+    expect(returned).toEqual(created);
+    expect(result.current.posts).toEqual([created]);
+  });
+
+  it("passes expires_in through when an expiry is given", async () => {
+    const created = makePost({
+      kind: "poll",
+      text: "which day?",
+      poll: {
+        options: ["Thursday", "Friday"],
+        counts: [0, 0],
+        total: 0,
+        voted: null,
+      },
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [], count: 0 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true, poll: created });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([]));
+
+    await act(async () => {
+      await result.current.createPoll("which day?", ["Thursday", "Friday"], 3600);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/poll", {
+      question: "which day?",
+      options: ["Thursday", "Friday"],
+      expires_in: 3600,
+    });
+  });
+});
+
 describe("useTan deletePost", () => {
   it("posts the hash to /api/tan/delete and reloads the feed", async () => {
     const mine = makePost();

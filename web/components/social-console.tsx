@@ -110,6 +110,17 @@ export function SocialConsole({
   // post only. Quotes never take an expiry — the CLI's quote has no
   // --expire — so picking a quote clears it too (see onQuote).
   const [expireSeconds, setExpireSeconds] = useState<number | null>(null);
+  // Whether the composer asks a poll question instead of posting
+  // text, and the poll's option fields. Polls cannot be replies,
+  // quotes, or scheduled — entering poll mode clears those — and
+  // picking a reply or quote leaves poll mode (see the effect below).
+  const [pollMode, setPollMode] = useState(false);
+  const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
+  // A reply or quote picked from any card leaves poll mode: a poll is
+  // a top-level entry and cannot carry a reply or quote target.
+  useEffect(() => {
+    if (replyTarget !== null || quoteTarget !== null) setPollMode(false);
+  }, [replyTarget, quoteTarget]);
   // Hashes with a delete request in flight. While one is pending the card
   // shows a disabled state instead of the confirm button, so a second
   // click cannot report the already-deleted post as a failure.
@@ -233,6 +244,58 @@ export function SocialConsole({
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not publish");
+    }
+  }
+
+  function togglePollMode() {
+    if (pollMode) {
+      setPollMode(false);
+      return;
+    }
+    // Polls cannot be replies, quotes, or scheduled.
+    setReplyTarget(null);
+    setQuoteTarget(null);
+    setPostLaterSeconds(null);
+    setPollMode(true);
+  }
+
+  async function submitPoll() {
+    const submittedQuestion = text.trim();
+    const submittedOptions = pollOptions
+      .map((option) => option.trim())
+      .filter(Boolean);
+    // Unreachable from the composer — the ask button stays disabled
+    // until the question and two options are filled — but a direct
+    // call must never send a malformed poll.
+    if (!submittedQuestion || submittedOptions.length < 2) return;
+    setError(null);
+    try {
+      const submittedExpire = expireSeconds;
+      await tan.createPoll(
+        submittedQuestion,
+        submittedOptions,
+        submittedExpire ?? undefined,
+      );
+      // Clear only the composer state that still belongs to this poll,
+      // so a question or option edited while the request was in flight
+      // survives.
+      setText((current) =>
+        current.trim() === submittedQuestion ? "" : current,
+      );
+      setPollOptions((current) =>
+        current
+          .map((option) => option.trim())
+          .filter(Boolean)
+          .join("\n") === submittedOptions.join("\n")
+          ? ["", ""]
+          : current,
+      );
+      setPollMode(false);
+      setExpireSeconds((current) =>
+        current === submittedExpire ? null : current,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not ask poll");
     }
   }
 
@@ -1812,6 +1875,7 @@ export function SocialConsole({
                   onKeyDown={(event) => {
                     if (
                       event.key === "Enter" &&
+                      !pollMode &&
                       !event.shiftKey &&
                       !event.nativeEvent.isComposing
                     ) {
@@ -1822,30 +1886,91 @@ export function SocialConsole({
                   rows={2}
                   maxLength={2000}
                   placeholder={
-                    quoteTarget
-                      ? `Quote ${quoteTarget.name || "anonymous"}…`
-                      : replyTarget
-                        ? `Reply to ${replyTarget.name || "anonymous"}…`
-                        : "Write something to the mesh…"
+                    pollMode
+                      ? "Ask a question…"
+                      : quoteTarget
+                        ? `Quote ${quoteTarget.name || "anonymous"}…`
+                        : replyTarget
+                          ? `Reply to ${replyTarget.name || "anonymous"}…`
+                          : "Write something to the mesh…"
                   }
                   className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
                 />
                 <button
                   type="button"
-                  onClick={() => void submitPost()}
-                  disabled={tan.posting || !text.trim()}
+                  onClick={() => void (pollMode ? submitPoll() : submitPost())}
+                  disabled={
+                    tan.posting ||
+                    !text.trim() ||
+                    (pollMode &&
+                      pollOptions.filter((option) => option.trim()).length < 2)
+                  }
                   className="inline-flex h-[52px] shrink-0 items-center gap-2 rounded-xl border border-signal/40 bg-signal/15 px-4 text-xs font-medium text-signal transition hover:border-signal/70 hover:bg-signal/25 disabled:cursor-not-allowed disabled:border-line disabled:bg-void/60 disabled:text-mist/60"
                 >
                   <SendIcon className="h-4 w-4" />
                   <span className="hidden sm:inline">
                     {tan.posting
                       ? "signing…"
-                      : postLaterSeconds !== null
-                        ? "schedule"
-                        : "post"}
+                      : pollMode
+                        ? "ask poll"
+                        : postLaterSeconds !== null
+                          ? "schedule"
+                          : "post"}
                   </span>
                 </button>
               </div>
+              {pollMode ? (
+                <div className="mt-2 space-y-1.5">
+                  {pollOptions.map((option, index) => (
+                    <div key={index} className="flex items-center gap-2">
+                      <input
+                        value={option}
+                        onChange={(event) =>
+                          setPollOptions((current) =>
+                            current.map((currentOption, currentIndex) =>
+                              currentIndex === index
+                                ? event.target.value.slice(0, 100)
+                                : currentOption,
+                            ),
+                          )
+                        }
+                        maxLength={100}
+                        placeholder={`Option ${index + 1}`}
+                        aria-label={`Poll option ${index + 1}`}
+                        className="w-full rounded-xl border border-line bg-void/70 px-3 py-2 text-[13px] text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+                      />
+                      {pollOptions.length > 2 ? (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPollOptions((current) =>
+                              current.filter(
+                                (_currentOption, currentIndex) =>
+                                  currentIndex !== index,
+                              ),
+                            )
+                          }
+                          aria-label={`Remove option ${index + 1}`}
+                          className="shrink-0 rounded-lg border border-line px-2 py-1 font-mono text-[11px] text-mist/80 transition hover:border-rose-300/50 hover:text-rose-300"
+                        >
+                          remove
+                        </button>
+                      ) : null}
+                    </div>
+                  ))}
+                  {pollOptions.length < 8 ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPollOptions((current) => [...current, ""])
+                      }
+                      className="font-mono text-[11px] text-signal transition hover:text-zinc-100"
+                    >
+                      + add option
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
                 <p
                   className={`text-[11px] ${
@@ -1856,35 +1981,39 @@ export function SocialConsole({
                 >
                   {error ??
                     (showingSearch && tan.error) ??
-                    "Enter to post · Shift+Enter for a new line"}
+                    (pollMode
+                      ? "Ask the question, add 2–8 options, then ask poll"
+                      : "Enter to post · Shift+Enter for a new line")}
                 </p>
                 <span className="font-mono text-[10px] text-mist/60">
                   {text.length}/2000
                 </span>
                 {quoteTarget ? null : (
                   <>
-                    <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
-                      post later
-                      <select
-                        aria-label="Post later"
-                        value={
-                          postLaterSeconds === null
-                            ? ""
-                            : String(postLaterSeconds)
-                        }
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          setPostLaterSeconds(value === "" ? null : Number(value));
-                        }}
-                        className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
-                      >
-                        <option value="">now</option>
-                        <option value="1800">in 30 minutes</option>
-                        <option value="3600">in 1 hour</option>
-                        <option value="10800">in 3 hours</option>
-                        <option value="86400">in 24 hours</option>
-                      </select>
-                    </label>
+                    {pollMode ? null : (
+                      <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+                        post later
+                        <select
+                          aria-label="Post later"
+                          value={
+                            postLaterSeconds === null
+                              ? ""
+                              : String(postLaterSeconds)
+                          }
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setPostLaterSeconds(value === "" ? null : Number(value));
+                          }}
+                          className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
+                        >
+                          <option value="">now</option>
+                          <option value="1800">in 30 minutes</option>
+                          <option value="3600">in 1 hour</option>
+                          <option value="10800">in 3 hours</option>
+                          <option value="86400">in 24 hours</option>
+                        </select>
+                      </label>
+                    )}
                     <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
                       disappears
                       <select
@@ -1905,6 +2034,19 @@ export function SocialConsole({
                         <option value="604800">in 7 days</option>
                       </select>
                     </label>
+                    {replyTarget ? null : (
+                      <button
+                        type="button"
+                        onClick={togglePollMode}
+                        className={`font-mono text-[10px] transition ${
+                          pollMode
+                            ? "text-signal"
+                            : "text-mist/70 hover:text-zinc-100"
+                        }`}
+                      >
+                        {pollMode ? "cancel poll" : "ask a poll"}
+                      </button>
+                    )}
                   </>
                 )}
               </div>

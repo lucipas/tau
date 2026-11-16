@@ -1020,6 +1020,13 @@ export interface TanPostResponse {
   post: TanPost;
 }
 
+// The response to creating a poll: the same shape as a post response,
+// but the created entry rides under `poll`, matching the API.
+export interface TanPollResponse {
+  ok: boolean;
+  poll: TanPost;
+}
+
 // One queued Tan post, waiting for its publish time — the shape of
 // `tau.scheduled_posts.ScheduledPost.to_dict()`.
 export interface TanScheduledPost {

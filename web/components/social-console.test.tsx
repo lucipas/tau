@@ -544,6 +544,154 @@ describe("PostCard poll voting", () => {
   });
 });
 
+describe("SocialConsole poll composer", () => {
+  const mockCreatePoll = vi.fn();
+
+  function setTan(overrides: Record<string, unknown> = {}) {
+    mockTan.current = {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
+      mutedAuthors: [],
+      mutedKeywords: [],
+      followedTags: [],
+      mutedTags: [],
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
+      all: false,
+      setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      schedulePost: vi.fn(),
+      quote: vi.fn(),
+      createPoll: mockCreatePoll,
+      voteOnPoll: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
+      muteTag: vi.fn(),
+      unmuteTag: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      repost: vi.fn(),
+      deletePost: vi.fn(),
+      editPost: vi.fn(),
+      sync: vi.fn(),
+      ...overrides,
+    };
+    return mockTan.current;
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  function openPollMode() {
+    setTan({});
+    render(<SocialConsole />);
+    fireEvent.click(screen.getByText("ask a poll"));
+    expect(
+      screen.getByPlaceholderText("Ask a question…"),
+    ).toBeTruthy();
+  }
+
+  it("asks a poll with the question and the filled options", async () => {
+    openPollMode();
+    mockCreatePoll.mockResolvedValue(undefined);
+
+    fireEvent.change(screen.getByPlaceholderText("Ask a question…"), {
+      target: { value: "which day?" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 1"), {
+      target: { value: "Thursday" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 2"), {
+      target: { value: "Friday" },
+    });
+    fireEvent.click(screen.getByText("ask poll"));
+
+    await waitFor(() =>
+      expect(mockCreatePoll).toHaveBeenCalledWith(
+        "which day?",
+        ["Thursday", "Friday"],
+        undefined,
+      ),
+    );
+  });
+
+  it("adds and removes option rows", () => {
+    openPollMode();
+
+    expect(screen.queryByLabelText("Poll option 3")).toBeNull();
+    fireEvent.click(screen.getByText("+ add option"));
+    expect(screen.getByLabelText("Poll option 3")).toBeTruthy();
+
+    fireEvent.click(screen.getByLabelText("Remove option 3"));
+    expect(screen.queryByLabelText("Poll option 3")).toBeNull();
+  });
+
+  it("refuses to ask with fewer than two filled options", async () => {
+    openPollMode();
+
+    fireEvent.change(screen.getByPlaceholderText("Ask a question…"), {
+      target: { value: "which day?" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 1"), {
+      target: { value: "Thursday" },
+    });
+    // The second option is still blank, so the ask button stays disabled.
+    expect(
+      (screen.getByText("ask poll").closest("button") as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.click(screen.getByText("ask poll"));
+
+    expect(mockCreatePoll).not.toHaveBeenCalled();
+  });
+});
+
 describe("TanBackupSection", () => {
   const doc: TanExportDocument = {
     format: "tau-tan-export",
