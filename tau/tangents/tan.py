@@ -1754,11 +1754,14 @@ def vote_states(
     Only linked votes count; an orphaned vote starts counting as soon
     as its chain links up.  The latest vote per voter wins, so voting
     again changes your vote.  A vote whose text is not a plain option
-    index never reaches the store (see :func:`_normalize_post`), so
-    every index here is in range for the poll's option count — except
-    a vote stored before its poll arrived, whose option count is
-    unknown until then: callers check the index against the poll's
-    options and ignore the ones that do not name a real option.
+    index never reaches the store (see :func:`_normalize_post`), but a
+    signed vote can still name an option the poll does not have: such
+    a vote stays stored, yet it never replaces a valid standing vote,
+    or it would silently un-vote its author in both tally consumers.
+    A vote stored before its poll arrived has an option count that is
+    unknown until then, so it is returned as-is and callers check the
+    index against the poll's options and ignore the ones that do not
+    name a real option.
     """
     clean = []
     for target in targets:
@@ -1770,6 +1773,15 @@ def vote_states(
     if not clean:
         return states
     placeholders = ", ".join("?" for _ in clean)
+    option_counts: Dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT hash, options FROM posts "
+        f"WHERE kind = 'poll' AND hash IN ({placeholders})",
+        clean,
+    ).fetchall():
+        options = _decode_options(row["options"])
+        if options is not None:
+            option_counts[str(row["hash"])] = len(options)
     rows = conn.execute(
         "SELECT target, author, text, expires_at FROM posts "
         f"WHERE kind = 'vote' AND linked = 1 AND target IN ({placeholders}) "
@@ -1784,8 +1796,14 @@ def vote_states(
             # An expired vote no longer stands, and it does not
             # supersede an earlier live vote by the same voter.
             continue
+        index = int(text)
+        option_count = option_counts.get(str(row["target"]))
+        if option_count is not None and not 0 <= index < option_count:
+            # The poll has arrived and this choice names no option:
+            # keep the voter's earlier valid vote standing.
+            continue
         # Rows arrive in chain order per voter, so the last write wins.
-        states[str(row["target"])][str(row["author"])] = int(text)
+        states[str(row["target"])][str(row["author"])] = index
     return states
 
 

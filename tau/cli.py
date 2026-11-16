@@ -4439,26 +4439,44 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
         published = None
     else:
         node = TauNode(config, name=config.name)
-        node.start()
         try:
-            app = TanApp(
-                config,
-                node.identity,
-                name=config.name,
-                request_timeout=float(getattr(args, "timeout", 15.0)),
-            )
-            node.attach_app(app)
-            targets = None
-            if getattr(args, "to", None):
-                targets = [node.resolve_peer(target) for target in args.to]
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            # The serving node owns the data directory: create the
+            # poll locally, then ask the running node to publish it,
+            # the same way publish-draft re-delivers a stored post.
+            from .local_publish import publish_running
+
+            app = TanApp(config, _tan_identity(config), name=config.name)
             record = app.create_poll(question, options, expires_at=expires_at)
-            published = app.publish(
-                record,
-                targets=targets,
+            result = publish_running(
+                config.data_dir,
+                post_hash=record["hash"],
+                to=getattr(args, "to", None),
                 ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                timeout=float(getattr(args, "timeout", 15.0)),
             )
-        finally:
-            node.stop()
+            published = result["published"]
+        else:
+            try:
+                app = TanApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                node.attach_app(app)
+                targets = None
+                if getattr(args, "to", None):
+                    targets = [node.resolve_peer(target) for target in args.to]
+                record = app.create_poll(question, options, expires_at=expires_at)
+                published = app.publish(
+                    record,
+                    targets=targets,
+                    ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                )
+            finally:
+                node.stop()
 
     if json_output:
         _emit({"poll": record, "published": published}, True)
@@ -4504,26 +4522,44 @@ def cmd_tan_vote(args: argparse.Namespace) -> int:
         published = None
     else:
         node = TauNode(config, name=config.name)
-        node.start()
         try:
-            app = TanApp(
-                config,
-                node.identity,
-                name=config.name,
-                request_timeout=float(getattr(args, "timeout", 15.0)),
-            )
-            node.attach_app(app)
-            targets = None
-            if getattr(args, "to", None):
-                targets = [node.resolve_peer(target) for target in args.to]
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            # The serving node owns the data directory: cast the vote
+            # locally, then ask the running node to publish it, the
+            # same way publish-draft re-delivers a stored post.
+            from .local_publish import publish_running
+
+            app = TanApp(config, _tan_identity(config), name=config.name)
             record = app.vote(poll["hash"], option)
-            published = app.publish(
-                record,
-                targets=targets,
+            result = publish_running(
+                config.data_dir,
+                post_hash=record["hash"],
+                to=getattr(args, "to", None),
                 ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                timeout=float(getattr(args, "timeout", 15.0)),
             )
-        finally:
-            node.stop()
+            published = result["published"]
+        else:
+            try:
+                app = TanApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                node.attach_app(app)
+                targets = None
+                if getattr(args, "to", None):
+                    targets = [node.resolve_peer(target) for target in args.to]
+                record = app.vote(poll["hash"], option)
+                published = app.publish(
+                    record,
+                    targets=targets,
+                    ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                )
+            finally:
+                node.stop()
 
     if json_output:
         _emit({"vote": record, "published": published}, True)

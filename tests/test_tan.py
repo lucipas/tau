@@ -2219,6 +2219,51 @@ def test_expired_vote_does_not_supersede_live_vote(identities, tmp_path):
     assert result["voters"][0]["option"] == 0
 
 
+def test_out_of_range_vote_does_not_supersede_live_vote(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    create_vote(conn, bob, poll["hash"], 0, name="bob", now=1001)
+
+    # A later signed vote naming an option the poll does not have —
+    # hand-built, since create_vote rejects it — must neither count
+    # nor supersede the earlier live vote. It stays stored.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "7",
+        "created_at": 1002.0,
+        "prev": head(conn, author_of(bob)),
+        "kind": "vote",
+        "target": poll["hash"],
+    }
+    digest = hash(body, previous=body["prev"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    store_post(conn, mesg, now=1004)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [1, 0]
+    assert result["total"] == 1
+    assert result["voters"][0]["option"] == 0
+    assert vote_states(conn, [poll["hash"]]) == {
+        poll["hash"]: {author_of(bob): 0}
+    }
+
+    # The timeline tally keeps the valid vote too.
+    posts = timeline(conn, [author_of(alice)], viewer=author_of(bob))
+    assert len(posts) == 1
+    assert posts[0]["poll"] == {
+        "options": ["Thursday", "Friday"],
+        "counts": [1, 0],
+        "total": 1,
+        "voted": 0,
+    }
+
+
 def test_create_vote_rejects_bad_targets_and_options(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
