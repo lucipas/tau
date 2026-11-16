@@ -4374,6 +4374,15 @@ def cmd_tan_share(args: argparse.Namespace) -> int:
         post = resolve_share_post(conn, args.target)
     finally:
         conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    if not apply_display_rules([post], display_ruleset):
+        # Like thread() and likes(): a post the owner's display rules
+        # hide is not amplified, even by hash — a hidden poll's
+        # question and options must not go out in a share.
+        raise NodeError("cannot share a post hidden by your Tan display rules")
     author = str(post.get("author") or "")
     identity = load_identity(config.identity_path)
     own_hash = destination_hash(identity).hex() if identity is not None else None

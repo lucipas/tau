@@ -7374,6 +7374,24 @@ def test_tan_share_via_api(tmp_path):
         )
         assert status == 400
         assert "target" in payload["error"]["message"]
+
+        # A poll the owner's display rules hide is refused, not shared.
+        from tau.tangents.rules import Ruleset, save_ruleset
+
+        save_ruleset(
+            node.config.tan_rules_path,
+            Ruleset(kinds=frozenset({"post"})),
+        )
+        sent_before = len(node.sent)
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": poll["hash"], "to": "alice"},
+        )
+        assert status == 400
+        assert "hidden by your Tan display rules" in payload["error"]["message"]
+        assert len(node.sent) == sent_before
     finally:
         bridge.stop()
 

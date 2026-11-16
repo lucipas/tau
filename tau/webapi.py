@@ -3295,6 +3295,19 @@ class WebBridge:
             post = resolve_share_post(conn, target)
         finally:
             conn.close()
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import apply_display_rules
+
+        try:
+            display_ruleset = load_ruleset(
+                getattr(self.node.config, "tan_rules_path", None)
+            )
+        except RulesError:
+            display_ruleset = Ruleset()
+        if not apply_display_rules([post], display_ruleset):
+            # Like the CLI: a post the owner's display rules hide is
+            # not amplified, even by hash.
+            raise ValueError("cannot share a post hidden by your Tan display rules")
         author = str(post.get("author") or "")
         viewer = self._tan_viewer()
         if author and viewer is not None and author != viewer:

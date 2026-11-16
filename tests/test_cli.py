@@ -6523,6 +6523,28 @@ def test_tan_share_blocked_author_is_an_error(tmp_path, capsys, monkeypatch):
     assert _FakeSendNode.instances == []
 
 
+def test_tan_share_hidden_poll_is_an_error(tmp_path, capsys, monkeypatch):
+    _, poll, _ = _seed_tan_post(tmp_path, text="best colour?", poll=True)
+    assert (
+        cli.main(
+            [
+                "tan",
+                "rules",
+                "--data-dir",
+                str(tmp_path / "node"),
+                "--kinds",
+                "post",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    code = _run_share(tmp_path, monkeypatch, ["--to", "bob", poll["hash"][:12]])
+    assert code == 1
+    assert "hidden by your Tan display rules" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
 def test_tan_share_unknown_post_is_an_error(tmp_path, capsys, monkeypatch):
     _seed_tan_post(tmp_path)
     code = _run_share(tmp_path, monkeypatch, ["--to", "bob", "cd" * 32])
