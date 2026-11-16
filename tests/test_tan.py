@@ -7895,3 +7895,228 @@ def test_cli_tan_publish_draft_keeps_draft_on_partial_delivery(
         assert [d["id"] for d in list_drafts(conn)] == [draft_id]
     finally:
         conn.close()
+
+
+def test_cli_tan_publish_draft_retry_resends_same_post(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    # A real stored post stands in for the one the first attempt signs:
+    # the retry loads it back from the local database.
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "seed post",
+            ]
+        )
+        == 0
+    )
+    stored_hash = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "retry draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    # Stub the transport layer, not the post command: the real
+    # cmd_tan_post must run, so the test fails if it ever stops
+    # recording the post hash for publish-draft to reuse.
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    calls = []
+
+    def fake_publish_local_post(node, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {
+                "post": {"hash": stored_hash, "text": "retry draft"},
+                "published": {
+                    "delivered": 0,
+                    "peers": 1,
+                    "errors": [{"peer": "aa" * 32, "error": "no route"}],
+                },
+            }
+        return {
+            "post": {"hash": stored_hash, "text": "retry draft"},
+            "published": {"delivered": 1, "peers": 1, "errors": []},
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        kept = get_draft(conn, draft_id)
+    finally:
+        conn.close()
+    assert kept["post_hash"] == stored_hash
+    assert kept["pending_peers"] == ["aa" * 32]
+
+    # The retry re-sends the stored post to the peer that missed it —
+    # no new post is signed, so the peers that accepted the first
+    # attempt see no duplicate.
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 0
+    )
+    assert len(calls) == 2
+    assert calls[1]["post_hash"] == stored_hash
+    assert calls[1]["to"] == ["aa" * 32]
+    assert "text" not in calls[1]
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+    finally:
+        conn.close()
+
+
+def test_cli_tan_publish_draft_retry_keeps_draft_when_post_gone(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "seed post",
+            ]
+        )
+        == 0
+    )
+    stored_hash = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "doomed draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    def fake_publish_local_post(node, **kwargs):
+        return {
+            "post": {"hash": stored_hash, "text": "doomed draft"},
+            "published": {
+                "delivered": 0,
+                "peers": 1,
+                "errors": [{"peer": "aa" * 32, "error": "no route"}],
+            },
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+
+    # Delete the stored post, then retry: signing a fresh post would
+    # hand the peers that accepted the first a duplicate, so the
+    # draft stays for the author to discard by hand.
+    assert (
+        main(
+            [
+                "tan",
+                "delete",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                stored_hash,
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert [d["id"] for d in list_drafts(conn)] == [draft_id]
+    finally:
+        conn.close()
+
+
+def test_drafts_table_migrates_post_hash_columns(tmp_path):
+    db_path = tmp_path / "tan.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE drafts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "text TEXT NOT NULL, "
+            "reply_to TEXT NOT NULL DEFAULT '', "
+            "expires_in REAL, "
+            "created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO drafts(text, reply_to, expires_in, created_at) "
+            "VALUES('old draft', '', NULL, 123.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
+        }
+        assert {"post_hash", "pending_peers"} <= columns
+        draft = get_draft(conn, 1)
+        assert draft["text"] == "old draft"
+        assert draft["post_hash"] == ""
+        assert draft["pending_peers"] == []
+    finally:
+        conn.close()

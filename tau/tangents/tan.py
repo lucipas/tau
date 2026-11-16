@@ -604,6 +604,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     text TEXT NOT NULL,
     reply_to TEXT NOT NULL DEFAULT '',
     expires_in REAL,
+    post_hash TEXT,
+    pending_peers TEXT,
     created_at REAL NOT NULL
 );
 """
@@ -648,6 +650,16 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         )
     if columns and "expires_at" not in columns:  # migrate a pre-expiry database
         conn.execute("ALTER TABLE posts ADD COLUMN expires_at REAL")
+    draft_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
+    }
+    if draft_columns and "post_hash" not in draft_columns:
+        # migrate a pre-retry database: drafts could not remember
+        # the signed post a partial publish had already created
+        conn.execute("ALTER TABLE drafts ADD COLUMN post_hash TEXT")
+    if draft_columns and "pending_peers" not in draft_columns:
+        conn.execute("ALTER TABLE drafts ADD COLUMN pending_peers TEXT")
     # Created after the migration above: the index references columns a
     # pre-reactions database does not have yet when _SCHEMA first runs.
     conn.execute("CREATE INDEX IF NOT EXISTS posts_target ON posts(target)")
@@ -4637,6 +4649,19 @@ def unsave_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     return {"hash": digest, "unsaved": cursor.rowcount > 0}
 
 
+def _parse_pending_peers(raw: Any) -> List[str]:
+    """Peer hashes still owed a draft's post, or ``[]`` for a fresh draft."""
+    if not raw:
+        return []
+    try:
+        peers = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(peers, list):
+        return []
+    return [str(peer) for peer in peers if peer and str(peer) != "?"]
+
+
 def _draft_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": int(row["id"]),
@@ -4645,6 +4670,8 @@ def _draft_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "expires_in": (
             float(row["expires_in"]) if row["expires_in"] is not None else None
         ),
+        "post_hash": str(row["post_hash"] or ""),
+        "pending_peers": _parse_pending_peers(row["pending_peers"]),
         "created_at": float(row["created_at"]),
     }
 
@@ -4747,6 +4774,39 @@ def delete_draft(conn: sqlite3.Connection, ref: Any) -> Dict[str, Any]:
     with conn:
         conn.execute("DELETE FROM drafts WHERE id = ?", (draft["id"],))
     return draft
+
+
+def record_draft_publish(
+    conn: sqlite3.Connection,
+    ref: Any,
+    *,
+    post_hash: str,
+    pending_peers: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """Remember the signed post a draft published as, and who still owes it.
+
+    A draft whose first publish reached only some peers keeps the post's
+    hash and the failed peers' hashes, so a retry re-sends that same
+    signed post to the peers that missed it instead of signing a
+    second copy the first peers would see as a duplicate.  Unknown
+    peer hashes are dropped — the retry then falls back to the
+    draft's original targets.
+    """
+    draft = get_draft(conn, ref)
+    digest = (post_hash or "").strip().lower()
+    if digest:
+        _require_hex(digest, HASH_HEX_LENGTH, "post_hash")
+    pending = [
+        str(peer)
+        for peer in dict.fromkeys(pending_peers)
+        if peer and str(peer) != "?"
+    ]
+    with conn:
+        conn.execute(
+            "UPDATE drafts SET post_hash = ?, pending_peers = ? WHERE id = ?",
+            (digest, json.dumps(pending), draft["id"]),
+        )
+    return get_draft(conn, draft["id"])
 
 
 # Shelf tables whose rows are pageable posts, for the shared
