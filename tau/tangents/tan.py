@@ -1045,8 +1045,13 @@ def store_post(
     # An edit carries the post's text, so an edit of a deleted post is
     # dropped the same way; reactions and votes carry no content and
     # stay inert without the post row.
-    if post.get("kind") in TIMELINE_KINDS or post.get("kind") == KIND_EDIT:
+    if post.get("kind") in TIMELINE_KINDS:
         if _delete_entry_exists(conn, digest, post["author"]):
+            return _canonical_post(post), False
+    if post.get("kind") == KIND_EDIT:
+        # An edit is dropped when its author deleted the edited post,
+        # so the check targets the post, not the edit's own hash.
+        if _delete_entry_exists(conn, str(post.get("target") or ""), post["author"]):
             return _canonical_post(post), False
 
     author = post["author"]
@@ -1112,11 +1117,11 @@ def store_post(
             if linked:
                 _advance_head(conn, author, digest, seq, post["created_at"])
                 _promote_children(conn, author, digest, seq)
-            if post.get("kind") == KIND_DELETE:
-                # A stored delete is authoritative, linked or not: the
-                # target post leaves the store now, here and on every
-                # peer that syncs the tombstone, and the entries created
-                # after it link up again.
+            if post.get("kind") == KIND_DELETE and linked:
+                # A delete takes effect once it is linked on the chain:
+                # the target leaves the store and the entries created
+                # after it link up again.  An unlinked delete purges
+                # nothing yet; _promote_children applies it on linking.
                 _apply_delete(conn, author, str(post.get("target") or ""))
     except sqlite3.IntegrityError:
         # Another thread or process inserted the same post first.
@@ -2943,7 +2948,12 @@ def annotate_quotes(
                 continue
             if blocked_authors and preview["author"] in blocked_authors:
                 # Redact identity too, as for a stored blocked original.
-                post["quoted"] = {**preview, "author": "", "blocked": True}
+                post["quoted"] = {
+                    **preview,
+                    "author": "",
+                    "name": "",
+                    "blocked": True,
+                }
                 continue
             post["quoted"] = dict(preview)
             continue
@@ -3300,7 +3310,8 @@ def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> bool:
 
     Removes the target row itself when it is a timeline post by
     *author*, the author's own edit entries on it (an edit carries
-    the post's text, so leaving one would leave the content behind),
+    the post's text, so its text is blanked; the row stays so the
+    chain through it is kept),
     and the saved, pinned and hidden refs pointing at it (they exist
     to surface the post; with the post gone they surface nothing).
     The signed delete entry itself is untouched: it is the tombstone
@@ -3346,8 +3357,10 @@ def _link_children_of_purged(
         "WHERE author = ? AND prev = ? AND linked = 0 ORDER BY created_at ASC",
         (author, purged_hash),
     ).fetchall()
+    # Direct children share the purged predecessor's position, so they
+    # all take one sequence rather than successive ones.
+    seq = max_seq(conn, author) + 1 if children else 0
     for child in children:
-        seq = max_seq(conn, author) + 1
         conn.execute(
             "UPDATE posts SET linked = 1, seq = ? WHERE hash = ?",
             (seq, str(child["hash"])),
@@ -7707,3 +7720,4 @@ class TanApp:
                 self._gossip_slots.release()
 
         threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
+eading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
