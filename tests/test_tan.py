@@ -3361,6 +3361,105 @@ def test_delete_by_non_author_is_inert(identities, tmp_path):
         create_delete(conn, bob, forged["hash"], name="bob", now=1002)
 
 
+def test_import_after_purge_keeps_earlier_edit_visible(identities, tmp_path):
+    # Qodo Critical (fresh peers show outdated edits after a purge):
+    # purge records were local-only, so a fresh peer importing a chain
+    # with a purge gap could not walk past it — the older post's edit
+    # was excluded and the post showed its original text.  The export
+    # now carries the purge records and the import restores them, so
+    # the edit still renders on the fresh peer.
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    post = create_post(source, alice, "original", name="alice", now=1000)
+    create_edit(source, alice, post["hash"], "edited", name="alice", now=1001)
+    doomed = create_post(source, alice, "doomed", name="alice", now=1002)
+    create_post(source, alice, "later", name="alice", now=1003)
+    create_delete(source, alice, doomed["hash"], name="alice", now=1004)
+    items = {item["hash"]: item for item in timeline(source, [post["author"]])}
+    assert items[post["hash"]]["text"] == "edited"
+
+    document = export_entries(source, author=author_of(alice))
+    target = init_db(tmp_path / "target.sqlite3")
+    result = import_entries(target, document)
+    assert result["skipped"] == 0
+    items = {item["hash"]: item for item in timeline(target, [post["author"]])}
+    assert items[post["hash"]]["text"] == "edited"
+    assert verify_store(target)["ok"] is True
+
+
+def test_import_ignores_purged_record_without_delete(identities, tmp_path):
+    # A purge record in an export is trusted only when its signed
+    # delete backs it.  A bare record — no delete entry for the hash —
+    # is not restored, so it cannot excuse an invented gap.
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    post = create_post(source, alice, "first", name="alice", now=1000)
+    document = export_entries(source, author=author_of(alice))
+    forged = "cd" * 32
+    document["purged"] = [
+        {
+            "hash": forged,
+            "author": author_of(alice),
+            "name": "alice",
+            "prev": post["hash"],
+        }
+    ]
+    target = init_db(tmp_path / "target.sqlite3")
+    import_entries(target, document)
+    # An entry naming the forged hash as its parent must not link on
+    # the bare record alone.
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    child = create_post(
+        scratch, alice, "child", name="alice", now=1001, previous=forged
+    )
+    store_post(target, child)
+    assert get_post(target, child["hash"])["linked"] == 0
+
+
+def test_unlinked_edit_purge_does_not_link_its_child(identities, tmp_path):
+    # Qodo Warning (unlinked entries gain a false chain position):
+    # _purge_post records edits without checking their linked status,
+    # so an edit stored while its own predecessor was missing, then
+    # purged, used to hand its later child a chain position it never
+    # had.  The purge record now carries the entry's linked status,
+    # and only a linked record bridges a gap — so the child keeps
+    # waiting instead of gaining a false position.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "target", name="alice", now=1000)
+    other = create_post(scratch, alice, "other", name="alice", now=1001)
+    edit = create_edit(
+        scratch, alice, post["hash"], "edited", name="alice", now=1002,
+        previous=other["hash"],
+    )
+    child = create_post(
+        scratch, alice, "child", name="alice", now=1003,
+        previous=edit["hash"],
+    )
+    delete = create_delete(
+        scratch, alice, post["hash"], name="alice", now=1004,
+        previous=post["hash"],
+    )
+
+    # The edit lands before its own predecessor, so it never links;
+    # the delete then purges it with the post.
+    store_post(conn, edit)
+    assert get_post(conn, edit["hash"])["linked"] == 0
+    store_post(conn, post)
+    store_post(conn, delete)
+    assert get_post(conn, post["hash"]) is None
+    assert get_post(conn, edit["hash"]) is None
+
+    # The child of the purged, never-linked edit must not link on
+    # the record alone — the edit never had a chain position to
+    # stand on.
+    store_post(conn, child)
+    assert get_post(conn, child["hash"])["linked"] == 0
+    assert timeline(conn, [post["author"]]) == []
+    assert verify_store(conn)["ok"] is True
+
+
 def test_delete_arriving_before_its_post_applies_on_arrival(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
