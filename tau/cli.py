@@ -6972,6 +6972,51 @@ def _edit_group_local_message(
     )
 
 
+def _typing_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    state: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Send one DM typing event on the running node, for the local send server."""
+    response = node.send_typing(
+        target,
+        state,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+    )
+    peer = node.registry.get(str(response.get("to") or ""))
+    return dict(response, to_name=peer.display_name if peer is not None else "")
+
+
+def _typing_group_local_message(
+    node: TauNode,
+    *,
+    group: str,
+    state: str,
+    timeout: float = 20.0,
+    leg_timeout: Optional[float] = None,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fan a group typing event out on the running node, for the local send server.
+
+    ``leg_timeout`` is the per-leg bound forwarded by the client; see
+    :func:`_edit_group_local_message` for why it is not the reply wait.
+    """
+    node.groups.list_groups()  # reload: a group made by another process
+    record = node.groups.find(group)
+    if record is None:
+        raise ValueError(f"unknown group: {group!r}")
+    return node.send_group_typing(
+        record,
+        state,
+        timeout=float(leg_timeout if leg_timeout is not None else timeout),
+        discover_timeout=discover_timeout,
+    )
+
+
 def _dispatch_local_send(
     node: TauNode, *, bridge: Any = None, **request: Any
 ) -> Dict[str, Any]:
@@ -7017,6 +7062,10 @@ def _dispatch_local_send(
         return _edit_local_message(node, **request)
     if op == "edit_group":
         return _edit_group_local_message(node, **request)
+    if op == "typing":
+        return _typing_local_message(node, **request)
+    if op == "typing_group":
+        return _typing_group_local_message(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
@@ -7351,6 +7400,62 @@ def _edit_via_running_node(
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "the running node stopped answering mid-edit; retry the edit"
+        ) from exc
+
+
+def _typing_via_running_node(
+    config: TauConfig,
+    target: str,
+    state: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Send a DM typing event through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="typing",
+            target=target,
+            state=state,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-typing; retry shortly"
+        ) from exc
+
+
+def _typing_group_via_running_node(
+    config: TauConfig,
+    group_id: str,
+    state: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Fan a group typing event out through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        # The per-leg timeout travels in the request; the reply wait stays
+        # unbounded because a fan-out can outlast any single leg's bound.
+        return send_running(
+            config.data_dir,
+            op="typing_group",
+            group=group_id,
+            state=state,
+            leg_timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-typing; retry shortly"
         ) from exc
 
 
@@ -10578,52 +10683,72 @@ def cmd_typing(args: argparse.Namespace) -> int:
     """
     state = str(args.state)
     config = _make_config(args)
-    node = TauNode(config, name=config.name)
-    node.start()
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    group = getattr(args, "group", None)
+    target = getattr(args, "to", None)
+    if not group and not target:
+        raise NodeError("give a peer with --to, or a group with --group")
+    # A serving node owns the data directory: type through it instead of
+    # starting a second Reticulum instance on the same identity (a second
+    # instance cannot bind the serving node's TCP listen port).
     try:
-        timeout = float(getattr(args, "timeout", 20.0))
-        discover_timeout = float(getattr(args, "discover_timeout", 10.0))
-        if getattr(args, "group", None):
-            group = node.groups.find(args.group)
-            try:
-                response = node.send_group_typing(
-                    group,
+        if _send_routes_via_running_node(config):
+            if group:
+                response = _typing_group_via_running_node(
+                    config,
+                    str(group),
                     state,
                     timeout=timeout,
                     discover_timeout=discover_timeout,
                 )
-            except NodeError as exc:
-                # Typing rides the live link only in v1 — there is no
-                # outbox queue for it — so an unreachable member is a
-                # plain failure, not a silent queue.
-                raise NodeError(
-                    f"could not deliver group typing event: {exc} "
-                    "(typing needs the members online in v1)"
-                ) from exc
-            return _report_group_typing(args, response, state)
-        target = getattr(args, "to", None)
-        if not target:
-            raise NodeError("give a peer with --to, or a group with --group")
-        try:
-            response = node.send_typing(
-                target,
-                state,
-                timeout=timeout,
-                discover_timeout=discover_timeout,
-            )
-        except NodeError as exc:
-            # Typing rides the live link only in v1 — there is no
-            # outbox queue for it — so an unreachable peer is a plain
-            # failure, not a silent queue.
+            else:
+                response = _typing_via_running_node(
+                    config,
+                    str(target),
+                    state,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+        else:
+            node = TauNode(config, name=config.name)
+            node.start()
+            try:
+                if group:
+                    response = _typing_group_local_message(
+                        node,
+                        group=str(group),
+                        state=state,
+                        timeout=timeout,
+                        discover_timeout=discover_timeout,
+                    )
+                else:
+                    response = _typing_local_message(
+                        node,
+                        target=str(target),
+                        state=state,
+                        timeout=timeout,
+                        discover_timeout=discover_timeout,
+                    )
+            finally:
+                node.stop()
+    except NodeError as exc:
+        # Typing rides the live link only in v1 — there is no outbox
+        # queue for it — so an unreachable peer or member is a plain
+        # failure, not a silent queue.
+        if group:
             raise NodeError(
-                f"could not deliver typing event: {exc} "
-                "(typing needs the peer online in v1)"
+                f"could not deliver group typing event: {exc} "
+                "(typing needs the members online in v1)"
             ) from exc
-    finally:
-        node.stop()
+        raise NodeError(
+            f"could not deliver typing event: {exc} "
+            "(typing needs the peer online in v1)"
+        ) from exc
 
-    peer = node.registry.get(str(response.get("to") or ""))
-    name = peer.display_name if peer is not None else str(target)
+    if group:
+        return _report_group_typing(args, response, state)
+    name = str(response.get("to_name") or target)
     if _json_mode(args):
         _emit(response, True)
         return _EXIT_OK
@@ -12039,6 +12164,10 @@ def _cmd_messages_sent(
         else:
             state = entry["state"]
         print(f"[{when}] to {name} — {state}")
+        for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+     print(f"[{when}] to {name} — {state}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
