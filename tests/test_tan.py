@@ -7855,18 +7855,36 @@ def test_cli_tan_publish_draft_keeps_draft_on_partial_delivery(
     )
     draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
 
-    # The post path reports success even when a peer refuses delivery,
-    # so publish-draft must read the delivery result back and keep
-    # the draft instead of deleting it.
-    def fake_post(args):
-        args._tan_post_published = {
-            "delivered": 0,
-            "peers": 1,
-            "errors": [{"peer": "aa" * 32, "error": "no route"}],
-        }
-        return 0
+    # Stub the transport layer, not the post command: the real
+    # cmd_tan_post must run, so the test fails if it ever stops
+    # recording its delivery result for publish-draft to check.
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
 
-    monkeypatch.setattr(cli_module, "cmd_tan_post", fake_post)
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    def fake_publish_local_post(node, **kwargs):
+        return {
+            "post": {"hash": "cc" * 32, "text": "doomed draft"},
+            "published": {
+                "delivered": 0,
+                "peers": 1,
+                "errors": [{"peer": "aa" * 32, "error": "no route"}],
+            },
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
     assert (
         main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
         == 1
