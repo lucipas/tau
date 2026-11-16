@@ -3295,16 +3295,23 @@ class WebBridge:
             post = resolve_share_post(conn, target)
         finally:
             conn.close()
-        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.rules import RulesError, load_ruleset
         from .tangents.tan import apply_display_rules
 
+        # Use the running Tan app's ruleset, like the timeline and
+        # thread: the share guard must agree with what the console
+        # shows as hidden. A rules file changed by another process
+        # without reloading the app must not let a share send a post
+        # the console still hides. The file is still read once to
+        # prove it parses: a malformed rules file fails the share
+        # instead of silently becoming "display everything".
         try:
-            display_ruleset = load_ruleset(
-                getattr(self.node.config, "tan_rules_path", None)
-            )
-        except RulesError:
-            display_ruleset = Ruleset()
-        if not apply_display_rules([post], display_ruleset):
+            load_ruleset(getattr(self.node.config, "tan_rules_path", None))
+        except RulesError as exc:
+            raise ValueError(
+                f"cannot share: the Tan rules could not be read: {exc}"
+            ) from exc
+        if not apply_display_rules([post], app.ruleset):
             # Like the CLI: a post the owner's display rules hide is
             # not amplified, even by hash.
             raise ValueError("cannot share a post hidden by your Tan display rules")

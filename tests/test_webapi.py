@@ -7382,6 +7382,9 @@ def test_tan_share_via_api(tmp_path):
             node.config.tan_rules_path,
             Ruleset(kinds=frozenset({"post"})),
         )
+        # The console's rules save reloads the running app, so the
+        # share guard sees the new ruleset.
+        node.app.reload_ruleset()
         sent_before = len(node.sent)
         status, _, payload = _json(
             bridge,
@@ -7392,6 +7395,107 @@ def test_tan_share_via_api(tmp_path):
         assert status == 400
         assert "hidden by your Tan display rules" in payload["error"]["message"]
         assert len(node.sent) == sent_before
+    finally:
+        bridge.stop()
+
+
+def test_tan_share_uses_cached_app_ruleset(tmp_path):
+    # Regression test for Qodo's Critical on PR #450: the share guard
+    # must agree with what the console shows. A rules file changed by
+    # another process without reloading the app must not let a share
+    # send a poll the console still hides.
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.tangents.rules import Ruleset, save_ruleset
+    from tau.tangents.tan import TanApp, create_poll, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    save_ruleset(
+        node.config.tan_rules_path,
+        Ruleset(kinds=frozenset({"post"})),
+    )
+    conn = init_db(node.config.social_db_path)
+    try:
+        poll = create_poll(
+            conn, other, "best colour?", ["red", "blue"], name="other", now=1002
+        )
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.set_blocklist(BlockList(blocked=frozenset()))
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The app loads the hide-polls ruleset, so the poll is refused.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": poll["hash"], "to": "alice"},
+        )
+        assert status == 400
+        assert "hidden by your Tan display rules" in payload["error"]["message"]
+        assert node.sent == []
+
+        # Another process rewrites the file to allow polls, without
+        # reloading the app: the console still hides the poll, so the
+        # share is still refused.
+        save_ruleset(node.config.tan_rules_path, Ruleset())
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": poll["hash"], "to": "alice"},
+        )
+        assert status == 400
+        assert "hidden by your Tan display rules" in payload["error"]["message"]
+        assert node.sent == []
+    finally:
+        bridge.stop()
+
+
+def test_tan_share_malformed_rules_is_an_error(tmp_path):
+    # A rules file that cannot be parsed fails the share instead of
+    # silently becoming "display everything".
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_poll, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        poll = create_poll(
+            conn, other, "best colour?", ["red", "blue"], name="other", now=1002
+        )
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.set_blocklist(BlockList(blocked=frozenset()))
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        node.config.tan_rules_path.write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": poll["hash"], "to": "alice"},
+        )
+        assert status == 400
+        assert "could not be read" in payload["error"]["message"]
+        assert node.sent == []
     finally:
         bridge.stop()
 

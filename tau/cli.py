@@ -4376,8 +4376,14 @@ def cmd_tan_share(args: argparse.Namespace) -> int:
         conn.close()
     try:
         display_ruleset = load_ruleset(config.tan_rules_path)
-    except RulesError:
-        display_ruleset = Ruleset()
+    except RulesError as exc:
+        # A rules file that cannot be parsed must not silently become
+        # "display everything": a corrupt file hiding a kind would let
+        # a share send that kind out. A missing file still loads as
+        # the default ruleset inside load_ruleset.
+        raise NodeError(
+            f"cannot share: the Tan rules could not be read: {exc}"
+        ) from exc
     if not apply_display_rules([post], display_ruleset):
         # Like thread() and likes(): a post the owner's display rules
         # hide is not amplified, even by hash — a hidden poll's

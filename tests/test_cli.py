@@ -6545,6 +6545,19 @@ def test_tan_share_hidden_poll_is_an_error(tmp_path, capsys, monkeypatch):
     assert _FakeSendNode.instances == []
 
 
+def test_tan_share_malformed_rules_is_an_error(tmp_path, capsys, monkeypatch):
+    # A rules file that cannot be parsed must fail the share, not
+    # silently become "display everything" and send a kind the file
+    # used to hide.
+    _, poll, _ = _seed_tan_post(tmp_path, text="best colour?", poll=True)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    config.tan_rules_path.write_text("{not json", encoding="utf-8")
+    code = _run_share(tmp_path, monkeypatch, ["--to", "bob", poll["hash"][:12]])
+    assert code == 1
+    assert "could not be read" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
 def test_tan_share_unknown_post_is_an_error(tmp_path, capsys, monkeypatch):
     _seed_tan_post(tmp_path)
     code = _run_share(tmp_path, monkeypatch, ["--to", "bob", "cd" * 32])
