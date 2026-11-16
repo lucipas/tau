@@ -6459,8 +6459,8 @@ def test_tan_saved_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/saved")
         assert [item["text"] for item in payload["posts"]] == ["save me"]
 
-        # A post deleted after being saved stays in the list with its
-        # text blanked, so the save is not silently lost.
+        # A post deleted after being saved leaves the list with the
+        # post: deleting purges the save ref along with the post row.
         node.app = TanApp(node.config, identity, name="tester", gossip=False)
         status, _, payload = _json(
             bridge,
@@ -6471,10 +6471,7 @@ def test_tan_saved_via_api(tmp_path):
         assert status == 200
         status, _, payload = _json(bridge, "/api/tan/saved")
         assert status == 200
-        assert len(payload["posts"]) == 1
-        assert payload["posts"][0]["text"] == ""
-        assert payload["posts"][0]["deleted"] is True
-        assert payload["posts"][0]["saved"] is True
+        assert payload["posts"] == []
     finally:
         bridge.stop()
 
@@ -6644,8 +6641,10 @@ def test_tan_pinned_via_api(tmp_path):
         assert by_hash[mine["hash"]]["pinned"] is True
         assert by_hash[theirs["hash"]]["pinned"] is False
 
-        # A post deleted after being pinned stays in the list with its
-        # text blanked, so the pin is not silently lost.
+        # A post deleted after being pinned leaves the list with the
+        # post: deleting purges the pin ref along with the post row,
+        # while the eight other pins stay (extra[0] was unpinned
+        # earlier in this test, extra[9] never fit on the shelf).
         status, _, payload = _json(
             bridge,
             "/api/tan/delete",
@@ -6656,9 +6655,8 @@ def test_tan_pinned_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/pinned")
         assert status == 200
         pinned = {item["hash"]: item for item in payload["posts"]}
-        assert pinned[mine["hash"]]["text"] == ""
-        assert pinned[mine["hash"]]["deleted"] is True
-        assert pinned[mine["hash"]]["pinned"] is True
+        assert mine["hash"] not in pinned
+        assert len(payload["posts"]) == 8
     finally:
         bridge.stop()
 
@@ -6990,8 +6988,10 @@ def test_tan_delete_via_api(tmp_path):
         entries = feed(conn, author=post["author"])
     finally:
         conn.close()
+    # The deleted post is purged from the store, so the feed carries
+    # the keeper post and the two deletes — the purged post itself is
+    # gone from it.
     assert [entry["kind"] for entry in entries] == [
-        "post",
         "post",
         "delete",
         "delete",
@@ -7858,8 +7858,10 @@ def test_tan_edit_via_api(tmp_path):
         entries = feed(conn, author=post["author"])
     finally:
         conn.close()
+    # The deleted post is purged from the store, so the feed carries
+    # the two surviving posts, both edits, and the delete — the purged
+    # post itself is gone from it.
     assert [entry["kind"] for entry in entries] == [
-        "post",
         "post",
         "post",
         "edit",
@@ -8486,6 +8488,100 @@ def test_tan_likers_rejects_deleted_post(tmp_path):
         status, _, payload = _json(bridge, f"/api/tan/likes?target={own['hash']}")
         assert status == 400
         assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_reposters_rejects_deleted_post(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_delete, create_post, create_repost, init_db
+
+    node, _, _ = _likers_setup(tmp_path)
+    # A post deleted by its own author: build one with an identity held
+    # in this test, have another identity repost it, then delete it.
+    # (Reposting your own post is refused, so the reposter differs.)
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        own = create_post(conn, identity, "delete me", name="me", now=2000)
+        create_repost(conn, other, own["hash"], name="other", now=2001)
+        create_delete(conn, identity, own["hash"], name="me", now=2002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/reposts?target={own['hash']}")
+        assert status == 400
+        assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_quoters_rejects_deleted_post(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_delete, create_post, create_quote, init_db
+
+    node, _, _ = _likers_setup(tmp_path)
+    # A post deleted by its own author: build one with an identity held
+    # in this test, quote it, then delete it.
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        own = create_post(conn, identity, "delete me", name="me", now=2000)
+        create_quote(conn, identity, own["hash"], "quoting this", name="me", now=2001)
+        create_delete(conn, identity, own["hash"], name="me", now=2002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/quotes?target={own['hash']}")
+        assert status == 400
+        assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_likers_ignores_forged_delete(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_delete, init_db, store_post
+
+    node, post, authors = _likers_setup(tmp_path)
+    # A delete from anyone but the post's author is inert: the post
+    # stays visible, so its likers stay disclosed.  The handler checks
+    # the row before the tombstone, so a forged delete smuggled in
+    # through the store path must not hide a stored post.
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    forger = RNS.Identity()
+    forged = create_delete(scratch, forger, post["hash"], name="forger", now=2000)
+    conn = init_db(node.config.social_db_path)
+    try:
+        record, is_new = store_post(conn, forged)
+        assert is_new is True
+        assert record["kind"] == "delete"
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 200
+        assert [entry["author"] for entry in payload["likers"]] == [
+            authors["dave"],
+            authors["alice"],
+        ]
+        assert payload["total"] == 2
     finally:
         bridge.stop()
 
@@ -10529,7 +10625,13 @@ def test_tan_cancel_scheduled_post_removes_stored_post(tmp_path):
         new_scheduled_post_id,
         save_scheduled_posts,
     )
-    from tau.tangents.tan import TanApp, create_post, deleted_targets, init_db
+    from tau.tangents.tan import (
+        TanApp,
+        _delete_entry_exists,
+        create_post,
+        get_post,
+        init_db,
+    )
 
     node = FakeNode()
     node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
@@ -10568,11 +10670,12 @@ def test_tan_cancel_scheduled_post_removes_stored_post(tmp_path):
         assert payload["deleted_local"] is True
         status, _, payload = _json(bridge, "/api/tan/scheduled")
         assert payload == {"scheduled": [], "count": 0}
-        # The stored post is hidden by a delete entry, like the CLI's
-        # cancel, and the post itself is still in the store.
+        # The stored post is purged by the delete entry, like the CLI's
+        # cancel: the row is gone, and the tombstone is the only trace.
         conn = init_db(node.config.social_db_path)
         try:
-            assert post["hash"] in deleted_targets(conn)
+            assert get_post(conn, post["hash"]) is None
+            assert _delete_entry_exists(conn, post["hash"])
         finally:
             conn.close()
     finally:
