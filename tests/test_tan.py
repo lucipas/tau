@@ -18,6 +18,7 @@ from tau.tangents.rules import Ruleset
 from tau.tangents.tan import (
     HASH_FIELDS,
     TAN_EXPORT_FORMAT,
+    TAN_EXPORT_VERSION,
     TAN_FEED_PATH,
     TAN_POST_PATH,
     TAN_VERSION,
@@ -3892,6 +3893,16 @@ def test_import_after_purge_of_edited_post_keeps_later_entry_linked(identities, 
         assert verify_store(target)["ok"] is True
     finally:
         target.close()
+    # The relink must survive the connection closing: the entries
+    # linked through the restored records are committed with the
+    # restore, not left in a transaction the close throws away.
+    # Reopening the database must still show the later entry linked.
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        assert get_post(target, later["hash"])["linked"] == 1
+        assert verify_store(target)["ok"] is True
+    finally:
+        target.close()
 
 
 def test_dropped_edit_reoffer_upgrades_purge_record(identities, tmp_path):
@@ -4040,6 +4051,287 @@ def test_limited_export_bounds_purge_records(identities, tmp_path):
     assert old["hash"] not in {
         record["hash"] for record in limited["purged"]
     }
+
+
+def test_import_unsupported_record_is_not_stored(identities, tmp_path):
+    # Qodo Critical (peers can label unknown posts deleted): the
+    # restore used to write every candidate as pending when the
+    # pass made no progress — including ones that failed the
+    # delete-backing or reference checks.  A peer could then label
+    # an arbitrary hash deleted with a single well-formed record.
+    # Candidates failing provenance are now rejected outright.
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    post = create_post(source, alice, "first", name="alice", now=1000)
+    later = create_post(source, alice, "later", name="alice", now=1001)
+    document = export_entries(source, author=author_of(alice))
+    # A record for a hash that never existed, with no delete
+    # backing it and nothing referencing it.
+    document["purged"] = [
+        {
+            "hash": "a" * 64,
+            "author": author_of(alice),
+            "name": "alice",
+            "prev": post["hash"],
+            "linked": 1,
+            "target": "",
+        }
+    ]
+    source.close()
+
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        result = import_entries(target, document)
+        assert result["errors"] == []
+        assert get_post(target, later["hash"])["linked"] == 1
+        assert _purge_record(target, "a" * 64) is None
+        assert verify_store(target)["ok"] is True
+    finally:
+        target.close()
+
+
+def test_pending_record_upgrades_when_predecessor_arrives_later(identities, tmp_path):
+    # Qodo Critical (late ancestors leave descendants unlinked):
+    # a record kept pending because its predecessor had not arrived
+    # was never reconsidered — a later import bringing the
+    # predecessor left the waiting entries unlinked unless the
+    # record was re-offered.  A predecessor taking a chain position
+    # now resolves dependent pending records and links their
+    # children, repeating for consecutive gaps.
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        post = create_post(source, alice, "first", name="alice", now=1000)
+        doomed = create_post(source, alice, "doomed", name="alice", now=1001)
+        edit = create_edit(
+            source, alice, doomed["hash"], "doomed, fixed", name="alice", now=1002,
+        )
+        later = create_post(
+            source, alice, "after the edit", name="alice", now=1003,
+            previous=edit["hash"],
+        )
+        delete = create_delete(source, alice, doomed["hash"], name="alice", now=1004)
+        document = export_entries(source, author=author_of(alice))
+    finally:
+        source.close()
+
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        # First import: everything but the predecessor — both
+        # records are backed and referenced, but neither resolves,
+        # so both are kept pending and the later entry waits.
+        first = dict(document)
+        first["entries"] = [
+            entry
+            for entry in document["entries"]
+            if entry["hash"] in {later["hash"], delete["hash"]}
+        ]
+        result = import_entries(target, first)
+        assert result["errors"] == []
+        assert _purge_record(target, doomed["hash"]) == 0
+        assert _purge_record(target, edit["hash"]) == 0
+        assert get_post(target, later["hash"])["linked"] == 0
+        # Second import: only the predecessor, and the purge
+        # records are NOT re-offered — the pending records must
+        # still upgrade when it links.
+        second = dict(document)
+        second["entries"] = [
+            entry for entry in document["entries"] if entry["hash"] == post["hash"]
+        ]
+        second["purged"] = []
+        result = import_entries(target, second)
+        assert result["errors"] == []
+        assert _purge_record(target, doomed["hash"]) == 1
+        assert _purge_record(target, edit["hash"]) == 1
+        assert get_post(target, later["hash"])["linked"] == 1
+        assert get_post(target, delete["hash"])["linked"] == 1
+        assert verify_store(target)["ok"] is True
+    finally:
+        target.close()
+
+
+def test_restored_record_cannot_claim_another_authors_post(identities, tmp_path):
+    # Qodo Critical (any author can claim another user's post as
+    # purged): the restore used to accept a record's author on the
+    # strength of a delete and a child the claimant signed — both
+    # forgeable for any hash.  The claim then mislabelled the other
+    # user's post as deleted and squatted the hash, blocking their
+    # genuine record.  A record for a hash a stored row proves
+    # belongs to someone else is now skipped, and a verified local
+    # purge displaces a restored claim for the same hash.
+    alice, bob = identities
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    theirs = create_post(scratch, bob, "mine", name="bob", now=1000)
+    mine = create_post(scratch, alice, "first", name="alice", now=1001)
+    # The forged delete is signed in a store where the target is not
+    # cached: create_delete refuses a delete of someone else's post
+    # when it can see the post, but a delete for a not-yet-seen post
+    # is stored anyway — exactly how a peer's forgery arrives.
+    forger = init_db(tmp_path / "forger.sqlite3")
+    delete = create_delete(forger, alice, theirs["hash"], name="alice", now=1002)
+    forger.close()
+    # No child entry is needed: the delete alone backs the record
+    # (its target is the hash) and references it, which is exactly
+    # the forgeable evidence the old restore trusted.  A child with
+    # a cross-author prev cannot exist — create_post refuses a
+    # previous post belonging to a different author.
+    document = {
+        "format": TAN_EXPORT_FORMAT,
+        "version": TAN_EXPORT_VERSION,
+        "exported_at": 1004.0,
+        "authors": [author_of(alice)],
+        "entries": [mine, delete],
+        "purged": [
+            {
+                "hash": theirs["hash"],
+                "author": author_of(alice),
+                "name": "alice",
+                "prev": mine["hash"],
+                "linked": 1,
+                "target": "",
+            }
+        ],
+    }
+
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        store_post(target, theirs)
+        result = import_entries(target, document)
+        assert result["errors"] == []
+        # Bob's post is untouched, and no record claims it for alice.
+        assert get_post(target, theirs["hash"]) is not None
+        row = target.execute(
+            "SELECT author FROM purged_posts WHERE hash = ?",
+            (theirs["hash"],),
+        ).fetchone()
+        assert row is None
+        # The genuine purge still works afterwards, and the record
+        # it makes names bob — a restored claim could not squat it.
+        genuine = create_delete(target, bob, theirs["hash"], name="bob", now=1005)
+        assert get_post(target, theirs["hash"]) is None
+        row = target.execute(
+            "SELECT author FROM purged_posts WHERE hash = ?",
+            (theirs["hash"],),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == author_of(bob)
+        assert verify_store(target)["ok"] is True
+    finally:
+        target.close()
+
+
+def test_migrated_edit_record_gains_target_on_reoffer(identities, tmp_path):
+    # Qodo Warning (old edit gaps remain broken on import): a
+    # record made before targets were carried keeps an empty
+    # target, and the upsert used to update only ``linked`` — so a
+    # re-offered edit could never fill it, and the export carried
+    # an edit record the import could not associate with its
+    # post's delete.  A verified re-offer now fills an empty
+    # target without touching established metadata.
+    alice, _ = identities
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "gone", name="alice", now=1000)
+    edit = create_edit(
+        scratch, alice, post["hash"], "gone, fixed", name="alice", now=1001,
+        previous="",
+    )
+    delete = create_delete(
+        scratch, alice, post["hash"], name="alice", now=1002,
+        previous=post["hash"],
+    )
+
+    conn = init_db(tmp_path / "tan.sqlite3")
+    store_post(conn, delete)
+    assert get_post(conn, delete["hash"])["linked"] == 1
+    # A pre-target record, as the migration leaves it: the edit's
+    # target is empty and the chain position unproven.
+    conn.execute(
+        "INSERT INTO purged_posts(hash, author, name, prev, linked, target) "
+        "VALUES(?, ?, ?, ?, ?, ?)",
+        (edit["hash"], author_of(alice), "alice", "", 0, ""),
+    )
+    conn.commit()
+    # Re-offering the edit drops it at the guard — and fills the
+    # target from the verified entry.
+    _, is_new = store_post(conn, edit)
+    assert is_new is False
+    row = conn.execute(
+        "SELECT linked, target FROM purged_posts WHERE hash = ?",
+        (edit["hash"],),
+    ).fetchone()
+    assert row is not None
+    assert row[1] == post["hash"]
+    assert row[0] == 1
+    # The export now carries the record with its delete behind it.
+    document = export_entries(conn, author=author_of(alice))
+    by_hash = {record["hash"]: record for record in document["purged"]}
+    assert by_hash[edit["hash"]]["target"] == post["hash"]
+
+
+class _TamperedFeedNode(_FeedNode):
+    """A feed node that appends a malformed purge record to a page."""
+
+    def request(self, peer, path, payload, *, timeout=20.0):
+        response = super().request(peer, path, payload, timeout=timeout)
+        response.setdefault("purged", []).append(
+            {"hash": "not-a-hash", "author": "x"}
+        )
+        return response
+
+
+def test_sync_malformed_purge_record_is_reported(identities, tmp_path):
+    # Qodo Warning (malformed sync records go unnoticed): both
+    # sync receive paths discarded the restore's validation errors,
+    # so a peer sending malformed purge metadata left no diagnostic
+    # for the missing chain evidence.  The errors now reach the
+    # sync result with peer and author context, while the valid
+    # records on the same page still restore.
+    alice, bob = identities
+    source_config = TauConfig.resolve(data_dir=tmp_path / "source-app", name="bob")
+    source_app = TanApp(source_config, bob, name="bob", gossip=False)
+    source = source_app.connect()
+    post = create_post(source, bob, "original", name="bob", now=1000)
+    create_edit(source, bob, post["hash"], "edited", name="bob", now=1001)
+    doomed = create_post(source, bob, "doomed", name="bob", now=1002)
+    later = create_post(source, bob, "later", name="bob", now=1003)
+    create_delete(source, bob, doomed["hash"], name="bob", now=1004)
+    source.close()
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = TanApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(post["author"]),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _TamperedFeedNode(peer, source_app)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, authors=[post["author"]], limit=20)
+    assert summary["stored"] == 4
+    purge_errors = [
+        error for error in summary["errors"] if "purge record" in error["error"]
+    ]
+    # The tampered node appends the malformed record to every page
+    # it serves, so the same error may surface once per page — what
+    # matters is that it reaches the sync result at all, once per
+    # distinct malformed record, with the author's context.
+    assert len(purge_errors) >= 1
+    assert {error["error"] for error in purge_errors} == {
+        "purge record not-a-hash: hash must be 64 hex characters"
+    }
+    assert purge_errors[0]["author"] == post["author"]
+
+    conn = app.connect()
+    try:
+        assert get_post(conn, later["hash"])["linked"] == 1
+        shown = {item["hash"]: item for item in timeline(conn, [post["author"]])}
+        assert shown[post["hash"]]["text"] == "edited"
+        assert verify_store(conn)["ok"] is True
+    finally:
+        conn.close()
 
 
 def test_unlinked_delete_does_not_purge_cached_target(identities, tmp_path):

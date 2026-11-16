@@ -739,7 +739,8 @@ CREATE TABLE IF NOT EXISTS purged_posts (
     name TEXT NOT NULL DEFAULT '',
     prev TEXT NOT NULL DEFAULT '',
     linked INTEGER NOT NULL DEFAULT 0,
-    target TEXT NOT NULL DEFAULT ''
+    target TEXT NOT NULL DEFAULT '',
+    restored INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS drafts (
@@ -851,6 +852,11 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         # target was carried cannot name the deleted original, so an
         # edit record stays unbacked until it is re-recorded.
         _add_column(conn, "purged_posts", "target", "TEXT NOT NULL DEFAULT ''")
+    if purged_columns and "restored" not in purged_columns:
+        # migrate a pre-provenance database: records made before the
+        # restored flag existed were all made locally, so they count
+        # as verified — the column defaults to 0.
+        _add_column(conn, "purged_posts", "restored", "INTEGER NOT NULL DEFAULT 0")
     # Created after the migration above: the index references columns a
     # pre-reactions database does not have yet when _SCHEMA first runs.
     conn.execute("CREATE INDEX IF NOT EXISTS posts_target ON posts(target)")
@@ -1002,10 +1008,53 @@ def _advance_head(
         )
 
 
+def _resolve_pending_purged(
+    conn: sqlite3.Connection, author: str, resolved_hash: str
+) -> None:
+    """Upgrade pending purge records whose predecessor just linked.
+
+    A record kept pending because its predecessor had not arrived
+    yet is reconsidered whenever an entry takes a chain position:
+    if its predecessor now resolves, the record upgrades to linked
+    and its waiting children link up.  The upgrade repeats for
+    consecutive gaps — a record upgraded here may itself resolve
+    another pending record naming it as predecessor.  Only the
+    linked flag moves: the record's metadata stands as restored,
+    and the upgrade never re-judges the backing delete (a pending
+    record was already backed and referenced when stored).
+    """
+    queue = [resolved_hash]
+    seen: Set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        rows = conn.execute(
+            "SELECT hash, name, prev, target FROM purged_posts "
+            "WHERE author = ? AND prev = ? AND linked = 0",
+            (author, current),
+        ).fetchall()
+        for row in rows:
+            digest = str(row["hash"])
+            if not _purge_prev_resolves(conn, author, str(row["prev"] or "")):
+                continue
+            conn.execute(
+                "UPDATE purged_posts SET linked = 1 WHERE hash = ? AND author = ?",
+                (digest, author),
+            )
+            _link_children_of_purged(conn, author, digest)
+            queue.append(digest)
+
+
 def _promote_children(
     conn: sqlite3.Connection, author: str, parent_hash: str, parent_seq: int
 ) -> None:
     """Attach orphaned descendants once their parent becomes linked."""
+    # The parent just took a chain position: a pending purge record
+    # naming it as predecessor may now resolve — upgrade it and
+    # link its waiting children (see _resolve_pending_purged).
+    _resolve_pending_purged(conn, author, parent_hash)
     queue: List[Tuple[str, int]] = [(parent_hash, parent_seq)]
     while queue:
         parent, parent_sequence = queue.pop(0)
@@ -1033,6 +1082,7 @@ def _promote_children(
                     str(child["target"] or ""),
                     linked=True,
                 )
+            _resolve_pending_purged(conn, author, child_hash)
             queue.append((child_hash, child_seq))
 
 
@@ -2775,10 +2825,14 @@ def _purged_previews(
     missing = [str(target) for target in targets]
     if not missing:
         return {}
+    # Only a locally verified purge names the author: a restored
+    # record's author is asserted by the document that carried it,
+    # and a peer could claim any hash as its own — so a restored
+    # record never supplies a parent identity here.
     placeholders = ", ".join("?" for _ in missing)
     rows = conn.execute(
         "SELECT hash, author, name FROM purged_posts "
-        f"WHERE hash IN ({placeholders})",
+        f"WHERE hash IN ({placeholders}) AND restored = 0",
         missing,
     ).fetchall()
     return {
@@ -3399,6 +3453,7 @@ def _record_purged(
     *,
     linked: bool = False,
     target: str = "",
+    restored: bool = False,
 ) -> None:
     """Record author-bound evidence that (``hash``, ``author``) was purged.
 
@@ -3435,13 +3490,56 @@ def _record_purged(
     to linked when the position is later established — a re-offered
     entry whose parent has since linked, or an imported record whose
     predecessor has arrived — but a linked record is never downgraded
-    by a later unlinked claim for the same hash.
+    by a later unlinked claim for the same hash.  A verified re-offer
+    also fills an empty ``target`` left by the migration (a record
+    made before targets were carried), without replacing established
+    metadata with conflicting values.
+
+    ``restored`` marks a record that arrived in an export document
+    or a sync page rather than from an entry this node held.  Such a
+    record is gap proof only — it never supplies an identity: the
+    previews and the author-less deletion lookup ignore it, because
+    its author is asserted by the document, not proven by a held
+    entry.  A restored claim never displaces another author's
+    record, and a verified claim for the same hash displaces a
+    restored one: the held entry's authorship is proven by its
+    signature, so the verified record wins and the restored claim
+    is dropped rather than squatting the hash.
     """
+    existing = conn.execute(
+        "SELECT author, restored FROM purged_posts WHERE hash = ?", (hash,)
+    ).fetchone()
+    if existing is not None and str(existing["author"]) != author:
+        if restored:
+            # A restored claim never displaces another author's
+            # record for the same hash — the first claim stands
+            # until a verified entry proves the authorship.
+            return
+        # A verified claim displaces a restored one: the entry was
+        # held here and its signature proves its author.
+        conn.execute("DELETE FROM purged_posts WHERE hash = ?", (hash,))
+        existing = None
+    if (
+        existing is not None
+        and int(existing["restored"])
+        and not restored
+    ):
+        # A verified claim upgrades a restored record to verified,
+        # with the held entry's metadata as ground truth.
+        conn.execute(
+            "UPDATE purged_posts SET name = ?, prev = ?, target = ?, "
+            "linked = MAX(linked, ?), restored = 0 WHERE hash = ?",
+            (name, prev, target, 1 if linked else 0, hash),
+        )
+        return
     conn.execute(
-        "INSERT INTO purged_posts(hash, author, name, prev, linked, target) "
-        "VALUES(?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(hash) DO UPDATE SET linked = 1 WHERE excluded.linked = 1",
-        (hash, author, name, prev, 1 if linked else 0, target),
+        "INSERT INTO purged_posts(hash, author, name, prev, linked, target, restored) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(hash) DO UPDATE SET "
+        "linked = MAX(purged_posts.linked, excluded.linked), "
+        "target = CASE WHEN purged_posts.target = '' AND excluded.restored = 0 "
+        "THEN excluded.target ELSE purged_posts.target END",
+        (hash, author, name, prev, 1 if linked else 0, target, 1 if restored else 0),
     )
 
 
@@ -3469,7 +3567,8 @@ def _purged_post(
     """
     if author is not None:
         row = conn.execute(
-            "SELECT hash, author, name, prev, linked, target FROM purged_posts "
+            "SELECT hash, author, name, prev, linked, target, restored "
+            "FROM purged_posts "
             "WHERE hash = ? AND author = ?"
             + (" AND linked = 1" if linked_only else "")
             + " LIMIT 1",
@@ -3477,7 +3576,8 @@ def _purged_post(
         ).fetchone()
     else:
         row = conn.execute(
-            "SELECT hash, author, name, prev, linked, target FROM purged_posts "
+            "SELECT hash, author, name, prev, linked, target, restored "
+            "FROM purged_posts "
             "WHERE hash = ?" + (" AND linked = 1" if linked_only else "")
             + " LIMIT 1",
             (target,),
@@ -3500,7 +3600,10 @@ def _delete_entry_exists(
     author — or for a hash that never existed — can only mislead them
     about a post that is not stored here.  A proven purge cannot hide
     a post whose row exists, where :func:`_is_deleted` still applies
-    the author match.
+    the author match.  A restored purge record never counts here:
+    its author is asserted by the document that carried it, not
+    proven by an entry this node held, so it cannot supply the
+    identity these callers need.
     """
     if author is not None:
         row = conn.execute(
@@ -3510,7 +3613,7 @@ def _delete_entry_exists(
         ).fetchone()
     else:
         row = conn.execute(
-            "SELECT 1 FROM purged_posts WHERE hash = ? LIMIT 1",
+            "SELECT 1 FROM purged_posts WHERE hash = ? AND restored = 0 LIMIT 1",
             (target,),
         ).fetchone()
     return row is not None
@@ -4020,6 +4123,18 @@ TAN_EXPORT_FORMAT = "tau-tan-export"
 TAN_EXPORT_VERSION = 1
 
 
+def _chunked(values: Sequence[str], size: int) -> Iterator[List[str]]:
+    """Yield *values* in chunks of at most *size*.
+
+    SQLite caps the number of bound variables per statement, so an
+    ``IN (...)`` list built from an unbounded document must be
+    split; 400 stays well under the limit with room for the rest
+    of the statement's parameters.
+    """
+    for start in range(0, len(values), size):
+        yield list(values[start : start + size])
+
+
 def _purge_prev_resolves(conn: sqlite3.Connection, author: str, prev: str) -> bool:
     """Whether the chain below *prev* is established on this store.
 
@@ -4120,15 +4235,31 @@ def _restore_purged(
       is never trusted — the stored flag is derived from that
       resolution instead, so an altered export cannot fabricate a
       chain position by flipping it.
+    * the hash must not be a stored entry by a different author: a
+      stored row is signature-verified proof of who authored it, so
+      a record claiming it for someone else is forged and skipped.
 
-    A record that is backed and referenced but whose predecessor has
-    not arrived yet is kept pending (``linked=0``): the deletion is
-    proven, but the gap is not — it bridges nothing, and a later
-    re-offer or re-import upgrades it when the predecessor arrives
-    (see :func:`_record_purged`).  Records are restored in
-    predecessor order, so a chain of consecutive purges resolves in
-    one pass.  A record this store already has wins on its name,
-    ``prev`` and ``target``; only its ``linked`` flag can advance.
+    Candidates failing the backing, reference or authorship checks
+    are rejected outright — they are never stored, not even as
+    pending: an unbacked record is exactly how a peer could label
+    an arbitrary hash deleted.  Only a candidate passing all three
+    checks is stored, and only as pending (``linked=0``) while its
+    predecessor is unresolved: the deletion is proven, but the gap
+    is not — it bridges nothing, and a later re-offer, re-import or
+    predecessor arrival upgrades it when the chain catches up (see
+    :func:`_record_purged` and :func:`_resolve_pending_purged`).
+    Records are restored in predecessor order, so a chain of
+    consecutive purges resolves in one pass.  A record this store
+    already has wins on its name, ``prev`` and ``target``; only its
+    ``linked`` flag can advance — and a restored record never
+    displaces another author's record (see :func:`_record_purged`).
+
+    A restored record is marked as such: it is gap proof only, and
+    never supplies an identity — the previews and the author-less
+    deletion lookup ignore it.  The provenance checks run on
+    scoped queries over the candidate hashes and targets, not full
+    table scans, so a sync page costs lookups proportional to the
+    records it carries.
     """
     errors: List[Dict[str, str]] = []
     if not isinstance(records, list):
@@ -4160,41 +4291,69 @@ def _restore_purged(
             errors.append({"hash": digest, "error": str(exc)})
     if not candidates:
         return [], errors
-    backed = {
-        (str(row["author"]), str(row["target"]))
+    # Provenance is settled before anything is stored: only
+    # candidates passing the backing, reference and authorship
+    # checks below are restored at all.  The lookups are scoped to
+    # the candidate hashes and targets, chunked to stay under
+    # SQLite's variable limit, so a page costs work proportional
+    # to the records it carries rather than a full table scan.
+    hashes = sorted({digest for digest, _, _, _, _ in candidates})
+    targets = sorted(
+        {target for _, _, _, _, target in candidates if target}
+    )
+    wanted = sorted(set(hashes) | set(targets))
+    backed: Set[Tuple[str, str]] = set()
+    referenced: Set[Tuple[str, str]] = set()
+    stored_authors: Dict[str, str] = {}
+    for chunk in _chunked(wanted, 400):
+        placeholders = ", ".join("?" for _ in chunk)
         for row in conn.execute(
-            "SELECT author, target FROM posts WHERE kind = 'delete'"
-        ).fetchall()
-    }
-    referenced = {
-        (str(row["author"]), str(row["prev"]))
+            "SELECT author, target FROM posts WHERE kind = 'delete' "
+            f"AND target IN ({placeholders})",
+            chunk,
+        ).fetchall():
+            backed.add((str(row["author"]), str(row["target"])))
         for row in conn.execute(
-            "SELECT author, prev FROM posts WHERE prev != ''"
-        ).fetchall()
-    } | {
-        (str(row["author"]), str(row["target"]))
+            "SELECT author, prev FROM posts WHERE prev IN "
+            f"({placeholders})",
+            chunk,
+        ).fetchall():
+            referenced.add((str(row["author"]), str(row["prev"])))
         for row in conn.execute(
-            "SELECT author, target FROM posts "
-            "WHERE kind = 'delete' AND target != ''"
-        ).fetchall()
-    }
+            "SELECT author, target FROM posts WHERE kind = 'delete' "
+            f"AND target IN ({placeholders})",
+            chunk,
+        ).fetchall():
+            referenced.add((str(row["author"]), str(row["target"])))
+    for chunk in _chunked(hashes, 400):
+        placeholders = ", ".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT hash, author FROM posts WHERE hash IN ({placeholders})",
+            chunk,
+        ).fetchall():
+            stored_authors[str(row["hash"])] = str(row["author"])
+    validated: List[Tuple[str, str, str, str, str]] = []
+    for digest, author, name, prev, target in candidates:
+        if (author, digest) not in backed and (
+            not target or (author, target) not in backed
+        ):
+            continue
+        if (author, digest) not in referenced:
+            continue
+        if stored_authors.get(digest, author) != author:
+            continue
+        validated.append((digest, author, name, prev, target))
     linked: List[Tuple[str, str]] = []
-    pending = list(candidates)
+    pending = list(validated)
     with conn:
         while pending:
             progressed = False
             remaining: List[Tuple[str, str, str, str, str]] = []
             for digest, author, name, prev, target in pending:
-                if (author, digest) not in backed and (
-                    not target or (author, target) not in backed
-                ):
-                    continue
-                if (author, digest) not in referenced:
-                    continue
                 if _purge_prev_resolves(conn, author, prev):
                     _record_purged(
                         conn, digest, author, name, prev,
-                        linked=True, target=target,
+                        linked=True, target=target, restored=True,
                     )
                     linked.append((author, digest))
                     progressed = True
@@ -4206,7 +4365,7 @@ def _restore_purged(
         for digest, author, name, prev, target in pending:
             _record_purged(
                 conn, digest, author, name, prev,
-                linked=False, target=target,
+                linked=False, target=target, restored=True,
             )
     return linked, errors
 
@@ -4219,10 +4378,18 @@ def _relink_purged_children(
     Runs after a restore (import or sync page): a child stored
     unlinked while its parent's record was missing links up once the
     record is there, and the promotion carries through its own
-    descendants, including a delete that follows it.
+    descendants, including a delete that follows it.  The relink
+    commits here, in its own transaction: the callers close the
+    connection right after (the CLI and web imports, the last sync
+    page), and an uncommitted relink would be rolled back on close
+    — the entries would stay unlinked on disk while the process
+    that just linked them still sees them linked.
     """
-    for author, digest in restored:
-        _link_children_of_purged(conn, author, digest)
+    if not restored:
+        return
+    with conn:
+        for author, digest in restored:
+            _link_children_of_purged(conn, author, digest)
 
 
 def _close_purge_seeds(
@@ -8095,11 +8262,26 @@ class TanApp:
                         # serves; restore them after the page's
                         # entries, then link up any entries that
                         # arrived unlinked while a record was missing.
-                        # A malformed record is skipped, never fatal.
-                        linked, _ = _restore_purged(
+                        # A malformed record is skipped, but its
+                        # error is reported — the missing chain
+                        # evidence is a real gap in what this page
+                        # proved, not silent noise.
+                        linked, record_errors = _restore_purged(
                             conn, response.get("purged") or []
                         )
                         _relink_purged_children(conn, linked)
+                        for record_error in record_errors:
+                            errors.append(
+                                {
+                                    "peer": getattr(peer, "hexhash", "?"),
+                                    "author": author,
+                                    "error": (
+                                        "purge record "
+                                        f"{record_error['hash'] or '?'}: "
+                                        f"{record_error['error']}"
+                                    ),
+                                }
+                            )
                         new_seq = max_seq(conn, author)
                         if new_seq <= local_seq:
                             break
@@ -8152,10 +8334,22 @@ class TanApp:
                             stored += 1
                         else:
                             duplicates += 1
-                    linked, _ = _restore_purged(
+                    linked, record_errors = _restore_purged(
                         conn, response.get("purged") or []
                     )
                     _relink_purged_children(conn, linked)
+                    for record_error in record_errors:
+                        errors.append(
+                            {
+                                "peer": getattr(peer, "hexhash", "?"),
+                                "author": "",
+                                "error": (
+                                    "purge record "
+                                    f"{record_error['hash'] or '?'}: "
+                                    f"{record_error['error']}"
+                                ),
+                            }
+                        )
         finally:
             conn.close()
 
