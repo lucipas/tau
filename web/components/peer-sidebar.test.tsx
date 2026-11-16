@@ -533,26 +533,44 @@ describe("PeerSidebar peer notes", () => {
     );
   });
 
+  it("caps a note at 500 code points, not 500 UTF-16 units", async () => {
+    const onSetPeerNote = vi.fn(async (destination: string) =>
+      makePeer({ destination, note: "😀".repeat(500) }),
+    );
+    renderSidebar({}, vi.fn(), { onSetPeerNote });
+
+    fireEvent.click(screen.getByLabelText("Set note for alice"));
+    fireEvent.change(screen.getByLabelText("Private note for alice"), {
+      target: { value: "😀".repeat(600) },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    // 600 emoji are 1200 UTF-16 units: a maxLength cap would have cut
+    // the note at 250 emoji, but the server counts code points.
+    await waitFor(() =>
+      expect(onSetPeerNote).toHaveBeenCalledWith(
+        "ab".repeat(16),
+        "😀".repeat(500),
+      ),
+    );
+  });
+
   it("shows the server's message when saving fails", async () => {
     const onSetPeerNote = vi.fn(async () => {
-      throw new Error("note must be at most 500 characters (501 given)");
+      throw new Error("unknown peer");
     });
     renderSidebar({}, vi.fn(), { onSetPeerNote });
 
     fireEvent.click(screen.getByLabelText("Set note for alice"));
     fireEvent.change(screen.getByLabelText("Private note for alice"), {
-      target: { value: "x".repeat(501) },
+      target: { value: "runs the relay" },
     });
     fireEvent.click(screen.getByText("save"));
 
-    expect(
-      await screen.findByText(
-        "note must be at most 500 characters (501 given)",
-      ),
-    ).toBeTruthy();
+    expect(await screen.findByText("unknown peer")).toBeTruthy();
     expect(onSetPeerNote).toHaveBeenCalledWith(
       "ab".repeat(16),
-      "x".repeat(501),
+      "runs the relay",
     );
   });
 });

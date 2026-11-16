@@ -1279,12 +1279,17 @@ export function PeerSidebar({
                         <textarea
                           id={`note-${peer.destination}`}
                           value={noteDraft}
-                          maxLength={500}
                           rows={3}
                           autoFocus
                           placeholder="Private note — only visible on this console"
                           onChange={(event) =>
-                            setNoteDraft(event.target.value)
+                            // Count by code point, like the server's
+                            // 500-character cap: maxLength counts UTF-16
+                            // units, so an emoji note would hit the limit
+                            // at 250 emoji while the server allows 500.
+                            setNoteDraft(
+                              [...event.target.value].slice(0, 500).join(""),
+                            )
                           }
                           className="w-full rounded-md border border-line bg-void/60 px-2 py-1 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
                         />
