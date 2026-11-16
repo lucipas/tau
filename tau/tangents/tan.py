@@ -1743,11 +1743,13 @@ def create_close_poll(
         raise TanError("poll has expired")
     if existing["author"] != author:
         raise TanError("cannot close a poll you did not author")
-    if is_poll_closed(conn, existing):
-        raise TanError("poll is already closed")
     # The head read and the append must be one atomic step: see
     # _chain_write — two writers racing this window would fork the chain.
     with _chain_write(conn):
+        # Checked under the write lock so a concurrent close that
+        # committed first is seen here rather than appended twice.
+        if is_poll_closed(conn, existing):
+            raise TanError("poll is already closed")
         prev = previous
         if prev is None:
             prev = head(conn, author) or ""
@@ -1822,6 +1824,28 @@ def like_counts(
     return result
 
 
+def _poll_close_cutoffs(
+    conn: sqlite3.Connection, targets: Sequence[str]
+) -> Dict[str, float]:
+    """Map each closed poll hash to the ``created_at`` of its earliest close.
+
+    Only linked close entries written by the poll's own author count,
+    the same rule :func:`is_poll_closed` applies. Votes created after
+    the cutoff are not part of the frozen tally.
+    """
+    if not targets:
+        return {}
+    placeholders = ", ".join("?" for _ in targets)
+    rows = conn.execute(
+        "SELECT c.target AS target, MIN(c.created_at) AS closed_at "
+        "FROM posts c JOIN posts p ON p.hash = c.target AND p.author = c.author "
+        "WHERE c.kind = 'close' AND c.linked = 1 AND p.kind = 'poll' "
+        f"AND c.target IN ({placeholders}) GROUP BY c.target",
+        list(targets),
+    ).fetchall()
+    return {str(row["target"]): float(row["closed_at"]) for row in rows}
+
+
 def vote_states(
     conn: sqlite3.Connection, targets: Sequence[str]
 ) -> Dict[str, Dict[str, int]]:
@@ -1858,8 +1882,9 @@ def vote_states(
         options = _decode_options(row["options"])
         if options is not None:
             option_counts[str(row["hash"])] = len(options)
+    closed_at = _poll_close_cutoffs(conn, clean)
     rows = conn.execute(
-        "SELECT target, author, text, expires_at FROM posts "
+        "SELECT target, author, text, created_at, expires_at FROM posts "
         f"WHERE kind = 'vote' AND linked = 1 AND target IN ({placeholders}) "
         "ORDER BY target, author, seq ASC",
         clean,
@@ -1871,6 +1896,11 @@ def vote_states(
         if is_expired({"expires_at": row["expires_at"]}):
             # An expired vote no longer stands, and it does not
             # supersede an earlier live vote by the same voter.
+            continue
+        cutoff = closed_at.get(str(row["target"]))
+        if cutoff is not None and float(row["created_at"]) > cutoff:
+            # Cast after the poll's author closed it: never counts,
+            # and does not supersede the voter's pre-close vote.
             continue
         index = int(text)
         option_count = option_counts.get(str(row["target"]))
@@ -2046,9 +2076,13 @@ def poll_results(
             "ORDER BY author, seq ASC",
             (target,),
         ).fetchall()
+        cutoff = _poll_close_cutoffs(conn, [target]).get(target)
         names: Dict[str, str] = {}
         voted_at: Dict[str, float] = {}
         for row in rows:
+            if cutoff is not None and float(row["created_at"]) > cutoff:
+                # A vote cast after the close is not part of the tally.
+                continue
             # Rows arrive in chain order per voter, so the last write
             # wins — the name and time on the voter's latest vote.
             names[str(row["author"])] = str(row["name"])
