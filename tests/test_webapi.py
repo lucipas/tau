@@ -31,6 +31,7 @@ from tau.mailbox import Mailbox
 from tau.node import NodeError
 from tau.peers import AmbiguousPeer, Peer, PeerError
 from tau.webapi import (
+    SUBSCRIBER_QUEUE_SIZE,
     PeerForgetBlocked,
     WebBridge,
     WebBridgeError,
@@ -4295,6 +4296,110 @@ def test_websocket_survives_idle_client(bridge):
         sock.sendall(_ws_client_frame(b"", opcode=8))
         opcode, payload = _ws_read_frame(buffer)
         assert opcode == 8
+    finally:
+        sock.close()
+
+
+def test_websocket_slow_client_does_not_outlive_bridge_stop(bridge):
+    # A client that stops reading must not keep the bridge alive: once
+    # its TCP buffers fill, the sender blocks in wfile.flush(), and
+    # bridge.stop() must still return promptly with the connection
+    # closed (see #425).
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # A small receive buffer caps the bytes in flight, so the sender
+    # blocks after a modest flood instead of megabytes of buffering.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.settimeout(5)
+    sock.connect(("127.0.0.1", bridge.port))
+    sock.sendall(
+        (
+            "GET /ws HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("latin-1")
+    )
+    buffer = _WSBuffer(sock)
+    try:
+        headers = buffer.read_until(b"\r\n\r\n")
+        assert headers.startswith(b"HTTP/1.1 101")
+        opcode, payload = _ws_read_frame(buffer)
+        assert opcode == 1
+        assert json.loads(payload)["type"] == "snapshot"
+        # Flood the stream and never read again: the sender drains the
+        # subscriber queue into the socket until the kernel send buffer
+        # fills, then blocks in wfile.flush(). The flood must attempt
+        # far more than the send buffer can absorb (several MiB) plus
+        # the subscriber queue, so the sender is parked in a write
+        # rather than merely behind.
+        flooding = threading.Event()
+        published = [0]
+
+        def flood() -> None:
+            while not flooding.is_set():
+                bridge.bus.publish(
+                    {"type": "status", "node": {"name": "x" * 1024}}
+                )
+                published[0] += 1
+
+        flooder = threading.Thread(target=flood, daemon=True)
+        flooder.start()
+        try:
+            deadline = time.monotonic() + 30
+            while published[0] < 65536 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert published[0] >= 65536, "flooder did not publish enough"
+            # Keep flooding a moment so the sender is parked in a
+            # write, then stop: a sender keeping up would drain the
+            # queue to empty within milliseconds.
+            time.sleep(1.0)
+            flooding.set()
+            flooder.join(timeout=5)
+            subscribers = list(bridge.bus._subscribers)
+            assert len(subscribers) == 1
+            assert (
+                subscribers[0].qsize() >= SUBSCRIBER_QUEUE_SIZE - 1
+            ), "sender was not blocked on the slow client"
+        finally:
+            flooding.set()
+            flooder.join(timeout=5)
+        stopped = []
+        stopper = threading.Thread(
+            target=lambda: (bridge.stop(), stopped.append(True)),
+            daemon=True,
+        )
+        stopper.start()
+        stopper.join(timeout=10)
+        assert not stopper.is_alive(), "bridge.stop() hung on a slow client"
+        assert stopped == [True]
+        # The sender was parked in wfile.flush(): on the fixed code the
+        # shutdown fails that write and the pump thread exits. Draining
+        # the client socket cannot be the check — reading frees window
+        # and unblocks the sender on its own, so the pump would drain
+        # its queue, notice bridge.closing, and exit even unfixed.
+        deadline = time.monotonic() + 5
+        while any(
+            thread.name == "tau-ws-pump" and thread.is_alive()
+            for thread in threading.enumerate()
+        ):
+            assert time.monotonic() < deadline, (
+                "ws pump thread outlived bridge.stop()"
+            )
+            time.sleep(0.05)
+        # With the pump gone the connection is closed: drain whatever
+        # the client already buffered, then expect EOF.
+        sock.settimeout(5)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                pytest.fail("server left the slow client's connection open")
+            if not chunk:
+                break
+            assert time.monotonic() < deadline
     finally:
         sock.close()
 
