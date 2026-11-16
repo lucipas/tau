@@ -7978,10 +7978,10 @@ def _send_via_running_node(
             reply_ids[target] = reply_id
         if result.get("queued"):
             outcome = f"queued (id {short_hash(str(result.get('id', '')))})"
-        elif result.get("delivered"):
-            outcome = "delivered"
-        else:
+        elif result.get("delivered") is False:
             outcome = "sent (no delivery confirmation)"
+        else:
+            outcome = "delivered"
         log.debug(
             "send to %s finished in %.2fs: %s",
             target,
