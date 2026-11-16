@@ -10,11 +10,13 @@ at 64 KiB; the server replies ``{"result": ...}`` or ``{"error": ...}``.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
 import socketserver
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -28,6 +30,12 @@ _MAX_BYTES = 64 * 1024
 # A reply may carry a peer's response (up to the protocol's 64 KiB) plus
 # the local message id, result fields, JSON escaping and the IPC wrapper.
 _MAX_RESPONSE_BYTES = 1024 * 1024
+
+# How long a client waits for a connect to a listener whose backlog is
+# full before giving up.  The listener is still a running worker, so
+# the wait is bounded rather than a fallback: a group op must not be
+# rerouted to the main socket just because the fan-out worker is busy.
+_CONNECT_TIMEOUT_SECONDS = 10.0
 
 # Error types the one-shot path lets reach the caller, re-raised as the same
 # type on the client so both paths treat them identically.  ValueError is
@@ -113,7 +121,51 @@ class LocalServer:
         self.path.unlink(missing_ok=True)
 
 
-def call_local(path: Path, *, reply_timeout: Optional[float] = None, **request: Any) -> Dict[str, Any]:
+def _is_absent_listener(exc: OSError) -> bool:
+    """True when a connect failure means no listener is there at all.
+
+    The socket file is missing, or nothing is listening on it (a stale
+    file left by a crashed serve).  A timeout, or a full backlog
+    (``EAGAIN``), means the opposite — a listener exists — so neither
+    is absent.
+    """
+    return exc.errno in (errno.ENOENT, errno.ECONNREFUSED)
+
+
+def _is_full_backlog(exc: OSError) -> bool:
+    """True when a connect failed only because the listener's backlog is full.
+
+    The listener exists and is running; the client just has to wait
+    for a slot to free.
+    """
+    return exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
+
+
+def _connect(path: Path, timeout: float = _CONNECT_TIMEOUT_SECONDS) -> socket.socket:
+    """Connect to a local socket, waiting for a full backlog to drain.
+
+    A listener whose backlog is full is still a running worker, so a
+    connect that fails with ``EAGAIN`` is retried — on a fresh socket
+    each time, since a failed connect leaves the socket unusable —
+    until *timeout* seconds have passed.  A failure that proves the
+    listener absent, or any other error, is raised at once.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.settimeout(timeout)
+            client.connect(str(path))
+            return client
+        except OSError as exc:
+            client.close()
+            if _is_full_backlog(exc) and time.monotonic() < deadline:
+                time.sleep(0.05)
+                continue
+            raise
+
+
+def call_local(path: Path, *, reply_timeout: Optional[float] = None, fallback_path: Optional[Path] = None, **request: Any) -> Dict[str, Any]:
     """Send once: a lost reply may mean the request was already handled.
 
     ``reply_timeout`` bounds the wait for the reply in seconds, on the
@@ -122,11 +174,34 @@ def call_local(path: Path, *, reply_timeout: Optional[float] = None, **request: 
     retracts, whose handling can wait on network peers — but a
     best-effort notification (the console-copy drop) must never hang
     the caller, so it passes a bound.
+
+    ``fallback_path`` names a second socket that may carry the request
+    when the first has no listener: socket selection and connection
+    are one operation, so a request is never sent twice.  Only a
+    connect failure that proves the listener absent (a missing socket
+    file, or a stale one nothing listens on) falls back, and only
+    before any request bytes are sent.  A connect that fails because
+    the listener's backlog is full means the worker is running, so
+    the call waits for a slot (bounded by the connect timeout) and
+    then fails loudly rather than silently routing the request
+    somewhere it does not belong.  Once the request is written,
+    nothing is retried anywhere.
     """
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(10)
-            client.connect(str(path))
+        client = _connect(path)
+    except OSError as exc:
+        if fallback_path is not None and _is_absent_listener(exc):
+            # Nothing was sent, so the fallback socket can carry the
+            # request instead.  This return sits outside the try below:
+            # a remote error the fallback server reports (a usage
+            # error re-raised as ValueError, say) must reach the caller
+            # as that error, never re-wrapped as unavailable.
+            return call_local(
+                fallback_path, reply_timeout=reply_timeout, **request
+            )
+        raise LocalIPCUnavailable(str(exc)) from exc
+    try:
+        with client:
             client.sendall(json.dumps(request).encode() + b"\n")
             # Handling can wait on network peers. Do not retry on timeout.
             # A caller that passes `reply_timeout` keeps that bound instead:
@@ -143,16 +218,20 @@ def call_local(path: Path, *, reply_timeout: Optional[float] = None, **request: 
 
 
 def local_server_available(path: Path) -> bool:
-    """True when something answers on the local socket at *path*.
+    """True when a serving node is answering on the local socket at *path*.
 
     A stale socket file left by a crashed serve answers nothing, so this
     is the probe one-shot commands use before deciding whether a serving
-    node is really there.
+    node is really there.  A connect that times out, or fails with a
+    full backlog, is not an absence: a listener exists, only busy, so
+    the serving node is there and the probe reports it present.
     """
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(2)
             client.connect(str(path))
-    except OSError:
-        return False
+    except TimeoutError:
+        return True
+    except OSError as exc:
+        return _is_full_backlog(exc)
     return True

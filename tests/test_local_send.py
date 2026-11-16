@@ -556,6 +556,128 @@ def test_fanout_ops_fall_back_to_main_socket(tmp_path):
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_fanout_op_falls_back_when_fanout_socket_is_stale(tmp_path):
+    # The probe-then-connect race of issue #457, second half: the
+    # fan-out socket file is there but nothing listens on it — the
+    # fan-out worker stopped after the route was chosen — so the group
+    # op falls back to the main socket instead of failing, and nothing
+    # is sent twice.
+    from tau.local_send import send_running
+
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(tmp_path / "send-fanout.sock"))
+    stale.close()
+    server = SendServer(
+        tmp_path, lambda **request: cli._dispatch_local_send(node, **request)
+    )
+    try:
+        assert send_server_available(tmp_path)
+        send_running(
+            tmp_path, op="group_send", group="weekend", text="hi", leg_timeout=5.0
+        )
+        assert node.calls == [
+            ("group_send", node.groups.find("weekend")["id"], "hi")
+        ]
+    finally:
+        server.stop()
+        (tmp_path / "send-fanout.sock").unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_saturated_fanout_listener_keeps_group_ops_off_main_socket(tmp_path):
+    # The regression test for issue #457, first half: a fan-out worker
+    # busy with a slow group send, with enough connections queued to
+    # saturate its listener, must not route the next group op to the
+    # main socket — the op waits for a fan-out slot instead.
+    from tau.local_send import FanoutServer, send_running
+
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    entered = threading.Event()
+    release = threading.Event()
+    main_calls: list = []
+
+    def fanout_dispatch(**request):
+        entered.set()
+        assert release.wait(timeout=10)
+        return cli._dispatch_local_send(node, **request)
+
+    main_server = SendServer(tmp_path, lambda **request: main_calls.append(request))
+    fanout_server = FanoutServer(tmp_path, fanout_dispatch)
+    queued: list = []
+    try:
+        first = threading.Thread(
+            target=lambda: send_running(
+                tmp_path, op="group_send", group="weekend", text="one", leg_timeout=5.0
+            ),
+            daemon=True,
+        )
+        first.start()
+        assert entered.wait(timeout=5)
+        # Fill the fan-out listener's backlog with connections that
+        # send nothing: a further connect blocks until a slot frees.
+        # Keep opening until one connect times out — the backlog is
+        # full — then stop; the queued ones stay queued.
+        while True:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(1)
+            try:
+                probe.connect(str(tmp_path / "send-fanout.sock"))
+            except OSError:
+                probe.close()
+                break
+            queued.append(probe)
+        assert queued, "backlog never filled: connects kept succeeding"
+        second: dict = {}
+        thread = threading.Thread(
+            target=lambda: second.__setitem__(
+                "result",
+                send_running(
+                    tmp_path,
+                    op="group_send",
+                    group="weekend",
+                    text="two",
+                    leg_timeout=5.0,
+                ),
+            ),
+            daemon=True,
+        )
+        thread.start()
+        # The second group op is stuck on the saturated fan-out
+        # listener — and still has not touched the main socket.
+        time.sleep(1)
+        assert thread.is_alive()
+        assert main_calls == []
+        for probe in queued:
+            probe.close()
+        queued.clear()
+        release.set()
+        first.join(timeout=5)
+        thread.join(timeout=5)
+        assert not first.is_alive()
+        assert not thread.is_alive()
+        assert second["result"]["results"][0]["delivered"] is True
+        assert main_calls == []
+        assert [call[2] for call in node.calls] == ["one", "two"]
+    finally:
+        release.set()
+        for probe in queued:
+            probe.close()
+        fanout_server.stop()
+        main_server.stop()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
 def test_slow_group_send_does_not_block_main_socket(tmp_path):
     # The regression test for issue #455: a group send stalled on
     # the fan-out worker must not delay a DM send on the main socket.
