@@ -66,16 +66,23 @@ def send_running(data_dir: Path, *, reply_timeout: Optional[float] = None, **req
     in *request* is the operation timeout and is forwarded to the server.
 
     A fan-out op (see :data:`FANOUT_OPS`) goes to the fan-out socket
-    when a fan-out worker is answering there, so it cannot block the
-    main socket; when no fan-out worker answers — an older serving
+    when a fan-out worker is listening there, so it cannot block the
+    main socket; when no fan-out worker is there — an older serving
     node, or a fan-out server that could not bind — it falls back to
-    the main socket instead of failing.  The probe only connects, so
-    a fallback decision is made before anything is sent: a request
-    is never sent twice.
+    the main socket instead of failing.  Socket selection and
+    connection are one operation (see :func:`call_local`): only a
+    connect failure that proves the fan-out listener absent falls
+    back, and only before anything is sent, so a request is never
+    sent twice.  A fan-out listener whose backlog is full is not
+    absent — the worker is running — so the op waits for a slot on
+    the fan-out socket rather than occupying the main one.
     """
-    if request.get("op") in FANOUT_OPS and send_fanout_server_available(data_dir):
+    if request.get("op") in FANOUT_OPS:
         return call_local(
-            data_dir / _FANOUT_SOCKET_NAME, reply_timeout=reply_timeout, **request
+            data_dir / _FANOUT_SOCKET_NAME,
+            fallback_path=data_dir / _SEND_SOCKET_NAME,
+            reply_timeout=reply_timeout,
+            **request,
         )
     return call_local(data_dir / _SEND_SOCKET_NAME, reply_timeout=reply_timeout, **request)
 
@@ -86,5 +93,11 @@ def send_server_available(data_dir: Path) -> bool:
 
 
 def send_fanout_server_available(data_dir: Path) -> bool:
-    """True when a serving node is answering fan-out requests on its local socket."""
+    """True when a serving node is answering fan-out requests on its local socket.
+
+    A fan-out listener whose backlog is full counts as present: the
+    worker is running, only busy.  Used by callers that only need to
+    know whether a fan-out worker exists; :func:`send_running` routes
+    without probing, so a group op is never misrouted by a probe.
+    """
     return local_server_available(data_dir / _FANOUT_SOCKET_NAME)
