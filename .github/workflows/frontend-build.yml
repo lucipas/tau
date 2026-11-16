@@ -1,0 +1,104 @@
+name: Frontend build
+
+# Builds the Next.js console export (web/out) whenever the frontend
+# changes and keeps the committed export fresh, so `tau serve --http`
+# serves a working console from a plain checkout with no Node build step.
+#
+# - pull_request touching web/** (except web/out itself): build only,
+#   proving the change compiles. Nothing is committed back to a PR
+#   branch: CI pushes there would race the branch owner's own pushes.
+# - push to main touching web/** (except web/out itself), or a manual
+#   dispatch: build, and if web/out changed, open (or update) a PR
+#   carrying the fresh export. The export lands on main through a PR
+#   like any other change, because the Guard:Main ruleset blocks direct
+#   pushes to main (the `update` rule) for every actor except its
+#   bypass roles — the workflow's GITHUB_TOKEN cannot push to main
+#   directly, so there is no direct commit-back.
+#
+# Why web/out is excluded from the triggers (negative `!web/out/**`
+# pattern in `paths`): `next build` assigns a random build id, so a
+# rebuild always differs from the committed export. Without the
+# exclusion, merging an export PR (which touches only web/out) would
+# trigger another rebuild, which would open another export PR,
+# forever. With the exclusion, only real frontend source changes
+# trigger a rebuild. (Note: `paths` and `paths-ignore` cannot be
+# combined on one event — GitHub Actions rejects the workflow — so
+# the exclusion lives as a negative pattern inside `paths`.)
+#
+# The export branch (ci/frontend-export) is reset to main on every run:
+# it carries only generated export commits, so resetting is safe and
+# avoids merge conflicts in generated files. Pushing it uses
+# --force-with-lease.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "!web/out/**"
+  pull_request:
+    paths:
+      - "web/**"
+      - "!web/out/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: frontend-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build console export
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Build
+        # rm -rf out first: the export step does not delete files for
+        # pages that were removed, so a stale page would otherwise be
+        # committed back.
+        run: |
+          rm -rf out
+          npm run build
+      - name: Open or update the export PR
+        # Pushes to main (and manual dispatches on main) only. PRs get
+        # the build check above, nothing more.
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git status --porcelain -- web/out | grep -q .; then
+            echo "web/out unchanged, nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          # Fetch the export branch too, when it exists: --force-with-lease
+          # below needs the origin/ci/frontend-export tracking ref as the
+          # lease, and the checkout above fetches only main. First run
+          # there is no export branch yet, hence `|| true`.
+          git fetch origin ci/frontend-export || true
+          git checkout -B ci/frontend-export origin/main
+          git add web/out
+          git commit -m "build: refresh web console export"
+          git push --force-with-lease origin ci/frontend-export
+          if ! gh pr list --head ci/frontend-export --state open --json number --jq '.[0].number // empty' | grep -q .; then
+            gh pr create --base main --head ci/frontend-export \
+              --title "build: refresh web console export" \
+              --body "Automated refresh of the committed web console export (web/out), built from main by the frontend-build workflow. Merging this keeps \`tau serve --http\` serving the current console with no local Node build."
+          fi
