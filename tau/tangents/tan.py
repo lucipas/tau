@@ -87,6 +87,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
@@ -612,6 +613,7 @@ CREATE TABLE IF NOT EXISTS drafts (
     post_hash TEXT,
     pending_peers TEXT,
     claimed_at REAL,
+    claim_token TEXT,
     created_at REAL NOT NULL
 );
 """
@@ -670,6 +672,10 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         # migrate a pre-claim database: drafts could not be claimed,
         # so two concurrent publish-draft runs could sign two posts
         conn.execute("ALTER TABLE drafts ADD COLUMN claimed_at REAL")
+    if draft_columns and "claim_token" not in draft_columns:
+        # the claim's owner token, so only the publisher that won
+        # the claim can refresh or release it
+        conn.execute("ALTER TABLE drafts ADD COLUMN claim_token TEXT")
     # Created after the migration above: the index references columns a
     # pre-reactions database does not have yet when _SCHEMA first runs.
     conn.execute("CREATE INDEX IF NOT EXISTS posts_target ON posts(target)")
@@ -4828,45 +4834,101 @@ def claim_draft(
     *,
     now: Optional[float] = None,
     ttl: float = DRAFT_CLAIM_TTL,
-) -> Optional[float]:
+) -> Optional[str]:
     """Atomically claim a draft for publishing, or report it is taken.
 
     The claim is one ``UPDATE`` that only wins when the draft is
     unclaimed or its claim is older than *ttl*, so two concurrent
     ``publish-draft`` runs can never both sign a post for the same
-    draft: the loser's update touches zero rows.  Returns the claim's
-    ``claimed_at`` stamp, which identifies this claim to
-    ``release_draft_claim``, when this caller won; ``None`` when the
-    draft is taken.  Raises ``TanError`` for an unknown draft.
+    draft: the loser's update touches zero rows.  Returns the claim
+    token when this caller won the claim, ``None`` otherwise.  The
+    token is the claim's owner: only its holder can refresh or
+    release the claim, so a publisher that lost its lease cannot
+    clear the claim its successor just took.  Raises ``TanError``
+    for an unknown draft.
     """
     draft = get_draft(conn, ref)
     stamp = float(now if now is not None else time.time())
+    token = uuid.uuid4().hex
     with conn:
         cursor = conn.execute(
-            "UPDATE drafts SET claimed_at = ? WHERE id = ? "
+            "UPDATE drafts SET claimed_at = ?, claim_token = ? WHERE id = ? "
             "AND (claimed_at IS NULL OR claimed_at <= ?)",
-            (stamp, draft["id"], stamp - float(ttl)),
+            (stamp, token, draft["id"], stamp - float(ttl)),
         )
-    return stamp if cursor.rowcount == 1 else None
+    return token if cursor.rowcount == 1 else None
 
 
-def release_draft_claim(
-    conn: sqlite3.Connection, ref: Any, claimed_at: float
-) -> None:
-    """Drop a draft's publish claim, if this claim still holds it.
+def refresh_draft_claim(
+    conn: sqlite3.Connection,
+    ref: Any,
+    token: str,
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """Renew a live claim, or report it is no longer owned.
+
+    Only the token that won the claim can renew it, and only while
+    the claim is still live: returns ``False`` when another
+    publisher has taken the draft over, or the claim was released.
+    A live publisher calls this on a timer so a slow publish never
+    lets its own claim go stale.
+    """
+    draft_id = _parse_draft_id(ref)
+    stamp = float(now if now is not None else time.time())
+    with conn:
+        cursor = conn.execute(
+            "UPDATE drafts SET claimed_at = ? WHERE id = ? AND claim_token = ?",
+            (stamp, draft_id, token),
+        )
+    return cursor.rowcount == 1
+
+
+def draft_claim_held(
+    conn: sqlite3.Connection,
+    ref: Any,
+    token: str,
+    *,
+    now: Optional[float] = None,
+    ttl: float = DRAFT_CLAIM_TTL,
+) -> bool:
+    """True when *token* still owns the draft's live claim."""
+    try:
+        draft_id = _parse_draft_id(ref)
+    except TanError:
+        return False
+    row = conn.execute(
+        "SELECT claimed_at, claim_token FROM drafts WHERE id = ?",
+        (draft_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["claim_token"] != token:
+        return False
+    if row["claimed_at"] is None:
+        return False
+    stamp = float(now if now is not None else time.time())
+    return float(row["claimed_at"]) > stamp - float(ttl)
+
+
+def release_draft_claim(conn: sqlite3.Connection, ref: Any, token: str) -> None:
+    """Drop a draft's publish claim, if *token* still owns it.
 
     Called whenever a publish attempt leaves the draft behind — a
     failed publish, a partial delivery — so an immediate retry is not
-    blocked by this run's own claim.  Only the claim identified by
-    *claimed_at* is cleared: if it went stale and another publisher
-    took the draft over, that newer claim is left intact.  A no-op
-    when the draft was already deleted by a successful publish.
+    blocked by this run's own claim.  A no-op when the draft was
+    already deleted by a successful publish, was never claimed, or
+    the claim has passed to another publisher: clearing a
+    successor's claim would reopen the duplicate-post race.  A claim
+    a crashed publisher left behind goes stale on its own after
+    ``DRAFT_CLAIM_TTL`` instead.
     """
     draft_id = _parse_draft_id(ref)
     with conn:
         conn.execute(
-            "UPDATE drafts SET claimed_at = NULL WHERE id = ? AND claimed_at = ?",
-            (draft_id, float(claimed_at)),
+            "UPDATE drafts SET claimed_at = NULL, claim_token = NULL "
+            "WHERE id = ? AND claim_token = ?",
+            (draft_id, token),
         )
 
 

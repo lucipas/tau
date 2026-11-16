@@ -45,6 +45,7 @@ from tau.tangents.tan import (
     clean_tag,
     deleted_targets,
     delete_draft,
+    draft_claim_held,
     edit_states,
     export_entries,
     extract_tags,
@@ -77,6 +78,7 @@ from tau.tangents.tan import (
     quote_counts,
     quoters,
     reaction_states,
+    refresh_draft_claim,
     release_draft_claim,
     repost_counts,
     reposters,
@@ -7914,7 +7916,7 @@ def test_cli_tan_publish_draft_refuses_claimed_draft(tmp_path, capsys):
     # Another process is already publishing this draft.
     conn = init_db(data_dir / "tan.sqlite3")
     try:
-        assert claim_draft(conn, draft_id) is True
+        assert claim_draft(conn, draft_id) is not None
     finally:
         conn.close()
     assert (
@@ -8026,11 +8028,74 @@ def test_cli_tan_drafts_shows_claimed_draft_as_publishing(tmp_path, capsys):
     draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
     conn = init_db(data_dir / "tan.sqlite3")
     try:
-        assert claim_draft(conn, draft_id) is True
+        assert claim_draft(conn, draft_id) is not None
     finally:
         conn.close()
     assert main(["tan", "drafts", "--data-dir", str(data_dir)]) == 0
     assert "publishing…" in capsys.readouterr().out
+
+
+def test_cli_tan_publish_draft_refreshes_claim_during_slow_publish(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    # A publish that outlasts the claim TTL must keep its own claim
+    # alive: shrink the TTL so the test does not wait ten minutes.
+    monkeypatch.setattr(cli_module, "DRAFT_CLAIM_TTL", 0.6)
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "slow draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    attempts = []
+
+    def fake_publish_local_post(node, **kwargs):
+        # Publish longer than two TTLs, then try to steal the draft
+        # the way a second concurrent publish-draft would: the
+        # refresher must have kept the claim live, so this fails.
+        time.sleep(1.2)
+        conn = init_db(data_dir / "tan.sqlite3")
+        try:
+            attempts.append(claim_draft(conn, draft_id, ttl=0.6))
+        finally:
+            conn.close()
+        return {
+            "post": {"hash": "dd" * 32, "text": "slow draft"},
+            "published": {"delivered": 1, "peers": 1, "errors": []},
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 0
+    )
+    assert attempts == [None]
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+    finally:
+        conn.close()
 
 
 def test_cli_tan_publish_draft_retry_resends_same_post(
@@ -8249,7 +8314,7 @@ def test_drafts_table_migrates_post_hash_columns(tmp_path):
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
         }
-        assert {"post_hash", "pending_peers", "claimed_at"} <= columns
+        assert {"post_hash", "pending_peers", "claimed_at", "claim_token"} <= columns
         draft = get_draft(conn, 1)
         assert draft["text"] == "old draft"
         assert draft["post_hash"] == ""
@@ -8269,13 +8334,16 @@ def test_draft_claim_atomicity_across_connections(tmp_path):
         # The first connection wins the claim; a second connection
         # for the same draft loses it — the two publishers cannot
         # both sign a post for this draft.
-        assert claim_draft(first, draft["id"], now=1000) is True
-        assert claim_draft(second, draft["id"], now=1001) is False
+        token = claim_draft(first, draft["id"], now=1000)
+        assert token
+        assert claim_draft(second, draft["id"], now=1001) is None
         assert get_draft(second, draft["id"])["claimed_at"] == 1000
+        assert draft_claim_held(second, draft["id"], token, now=1001) is True
+        assert draft_claim_held(second, draft["id"], "not-the-token") is False
         # Releasing the claim lets the other connection take it.
-        release_draft_claim(first, draft["id"])
+        release_draft_claim(first, draft["id"], token)
         assert get_draft(second, draft["id"])["claimed_at"] is None
-        assert claim_draft(second, draft["id"], now=1002) is True
+        assert claim_draft(second, draft["id"], now=1002) is not None
     finally:
         first.close()
         second.close()
@@ -8285,18 +8353,43 @@ def test_draft_claim_goes_stale(tmp_path):
     conn = init_db(tmp_path / "tan.sqlite3")
     try:
         draft = save_draft(conn, "stale claim", now=1000)
-        assert claim_draft(conn, draft["id"], now=1000) is True
+        token = claim_draft(conn, draft["id"], now=1000)
+        assert token
         # Inside the TTL the claim still holds, even for the same
         # connection: a second publish attempt must wait.
-        assert claim_draft(conn, draft["id"], now=1000 + 10) is False
-        # Past the TTL a crashed publisher's claim can be taken over.
-        assert (
-            claim_draft(conn, draft["id"], now=1000 + DRAFT_CLAIM_TTL + 1)
-            is True
+        assert claim_draft(conn, draft["id"], now=1000 + 10) is None
+        # Past the TTL a crashed publisher's claim can be taken over,
+        # and the old token can no longer refresh or release it.
+        successor = claim_draft(
+            conn, draft["id"], now=1000 + DRAFT_CLAIM_TTL + 1
         )
-        release_draft_claim(conn, draft["id"])
+        assert successor and successor != token
+        assert refresh_draft_claim(conn, draft["id"], token) is False
+        release_draft_claim(conn, draft["id"], token)
+        assert get_draft(conn, draft["id"])["claimed_at"] is not None
         with pytest.raises(TanError):
             claim_draft(conn, 999, now=1000)
+    finally:
+        conn.close()
+
+
+def test_draft_claim_refresh_and_token_scoped_release(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    try:
+        draft = save_draft(conn, "leased draft", now=1000)
+        token = claim_draft(conn, draft["id"], now=1000)
+        assert token
+        # Only the winning token can renew the claim, and renewing
+        # moves its timestamp forward.
+        assert refresh_draft_claim(conn, draft["id"], "not-the-token") is False
+        assert refresh_draft_claim(conn, draft["id"], token, now=1000 + 500) is True
+        assert get_draft(conn, draft["id"])["claimed_at"] == 1500
+        # A wrong token cannot release the claim either.
+        release_draft_claim(conn, draft["id"], "not-the-token")
+        assert get_draft(conn, draft["id"])["claimed_at"] == 1500
+        release_draft_claim(conn, draft["id"], token)
+        assert get_draft(conn, draft["id"])["claimed_at"] is None
+        assert draft_claim_held(conn, draft["id"], token) is False
     finally:
         conn.close()
 

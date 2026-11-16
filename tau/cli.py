@@ -161,6 +161,7 @@ from .tangents.tan import (
     claim_draft,
     clean_tag,
     delete_draft,
+    draft_claim_held,
     export_entries,
     follow,
     follow_tag,
@@ -187,6 +188,7 @@ from .tangents.tan import (
     pin_post,
     quoters,
     record_draft_publish,
+    refresh_draft_claim,
     release_draft_claim,
     reposters,
     resolve_author,
@@ -3575,8 +3577,59 @@ def _deliver_stored_post(
             node.stop()
 
 
+def _draft_claim_held(config: TauConfig, draft_id: int, token: str) -> bool:
+    """True when *token* still owns the draft's live publish claim."""
+    conn = init_db(config.social_db_path)
+    try:
+        return draft_claim_held(conn, draft_id, token, ttl=DRAFT_CLAIM_TTL)
+    finally:
+        conn.close()
+
+
+def _draft_claim_lost(draft_id: int) -> int:
+    print(
+        f"error: draft {draft_id} publish claim lost — leaving the draft "
+        "for its new publisher",
+        file=sys.stderr,
+    )
+    return _EXIT_ERROR
+
+
+def _refresh_draft_claim_loop(
+    config: TauConfig,
+    draft_id: int,
+    token: str,
+    stop: threading.Event,
+) -> None:
+    """Keep a draft's publish claim alive until *stop* is set.
+
+    A slow publish — a long --timeout, sequential peer requests —
+    must never let its own claim go stale, or a second run could
+    take the draft over and sign a duplicate post while the first
+    run is still delivering.  Refreshes at a third of the TTL, on
+    its own connection so the publishing thread is never blocked.
+    Stops quietly when the claim is gone: another publisher owns
+    the draft now, and only the fencing checks in the publish path
+    still apply.
+    """
+    conn = init_db(config.social_db_path)
+    try:
+        interval = max(0.05, DRAFT_CLAIM_TTL / 3)
+        while not stop.wait(interval):
+            try:
+                if not refresh_draft_claim(conn, draft_id, token):
+                    return
+            except Exception:  # pragma: no cover - transient DB errors
+                log.debug("draft claim refresh failed", exc_info=True)
+    finally:
+        conn.close()
+
+
 def _retry_draft_post(
-    args: argparse.Namespace, config: TauConfig, draft: Dict[str, Any]
+    args: argparse.Namespace,
+    config: TauConfig,
+    draft: Dict[str, Any],
+    token: str,
 ) -> int:
     """Re-send a draft's already-signed post to the peers that missed it."""
     json_output = _json_mode(args)
@@ -3597,6 +3650,8 @@ def _retry_draft_post(
     post = {k: v for k, v in stored.items() if k not in ("seq", "linked")}
     if getattr(args, "no_publish", False):
         # The post is already stored locally; there is nothing to send.
+        if not _draft_claim_held(config, draft["id"], token):
+            return _draft_claim_lost(draft["id"])
         conn = init_db(config.social_db_path)
         try:
             delete_draft(conn, draft["id"])
@@ -3628,6 +3683,10 @@ def _retry_draft_post(
         for error in published["errors"]:
             print(f"  failed {short_hash(error['peer'])}: {error['error']}")
     if published["errors"]:
+        if not _draft_claim_held(config, draft["id"], token):
+            # Another publisher owns the draft now: leave it — and
+            # its post association — for that publisher to retry.
+            return _draft_claim_lost(draft["id"])
         conn = init_db(config.social_db_path)
         try:
             record_draft_publish(
@@ -3645,6 +3704,8 @@ def _retry_draft_post(
             file=sys.stderr,
         )
         return _EXIT_ERROR
+    if not _draft_claim_held(config, draft["id"], token):
+        return _draft_claim_lost(draft["id"])
     conn = init_db(config.social_db_path)
     try:
         delete_draft(conn, draft["id"])
@@ -3654,12 +3715,15 @@ def _retry_draft_post(
 
 
 def _publish_draft_claimed(
-    args: argparse.Namespace, config: TauConfig, draft: Dict[str, Any]
+    args: argparse.Namespace,
+    config: TauConfig,
+    draft: Dict[str, Any],
+    token: str,
 ) -> int:
     if draft["post_hash"]:
         # A previous attempt already signed this post: re-send that
         # post to the peers that missed it, never a second copy.
-        return _retry_draft_post(args, config, draft)
+        return _retry_draft_post(args, config, draft, token)
     # Publish through the normal post path, so signing, storing and
     # delivery are identical for drafts and fresh posts.  The draft's
     # expiry is a duration from publish time, so it is handed over as
@@ -3672,6 +3736,11 @@ def _publish_draft_claimed(
         str(draft["expires_in"]) if draft["expires_in"] is not None else None
     )
     args.delay = None
+    # The sign happens inside cmd_tan_post: re-check the lease
+    # immediately before it, so a publisher that lost its claim
+    # while loading the draft can never sign a second copy.
+    if not _draft_claim_held(config, draft["id"], token):
+        return _draft_claim_lost(draft["id"])
     result = cmd_tan_post(args)
     if result != _EXIT_OK:
         # A failed publish keeps the draft, so it can be retried or
@@ -3685,6 +3754,8 @@ def _publish_draft_claimed(
         # Remember the signed post and who still owes it, so a retry
         # re-sends that post instead of signing a second copy.
         post_hash = getattr(args, "_tan_post_hash", "")
+        if not _draft_claim_held(config, draft["id"], token):
+            return _draft_claim_lost(draft["id"])
         if post_hash:
             conn = init_db(config.social_db_path)
             try:
@@ -3703,6 +3774,8 @@ def _publish_draft_claimed(
             file=sys.stderr,
         )
         return _EXIT_ERROR
+    if not _draft_claim_held(config, draft["id"], token):
+        return _draft_claim_lost(draft["id"])
     conn = init_db(config.social_db_path)
     try:
         delete_draft(conn, draft["id"])
@@ -3716,7 +3789,12 @@ def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
 
     The claim is taken before anything is signed or sent, so a
     second concurrent ``publish-draft`` for the same draft loses the
-    claim and publishes nothing.  It is released whenever the draft
+    claim and publishes nothing.  A background thread renews the
+    claim while the publish runs, so a slow publish never lets its
+    own claim go stale for a successor to take over; the publish
+    path also re-checks the claim before signing and before
+    deleting the draft, so a publisher that lost its lease stops
+    touching the draft.  The claim is released whenever the draft
     survives the attempt — a failed publish, a partial delivery —
     so a retry is never blocked by this run's own claim; a
     successful publish deletes the draft, making the release a
@@ -3727,27 +3805,31 @@ def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
     conn = init_db(config.social_db_path)
     try:
         draft = get_draft(conn, args.draft)
-        claimed_at = claim_draft(conn, draft["id"])
-        if claimed_at is not None:
-            # Re-read after winning the claim: a publisher that finished
-            # between the first read and the claim may have recorded a
-            # signed post, which this run must retry instead of re-signing.
-            draft = get_draft(conn, draft["id"])
+        token = claim_draft(conn, draft["id"], ttl=DRAFT_CLAIM_TTL)
     finally:
         conn.close()
-    if claimed_at is None:
+    if token is None:
         print(
             f"error: draft {draft['id']} is already being published — "
             "try again when it finishes",
             file=sys.stderr,
         )
         return _EXIT_ERROR
+    stop = threading.Event()
+    refresher = threading.Thread(
+        target=_refresh_draft_claim_loop,
+        args=(config, draft["id"], token, stop),
+        daemon=True,
+    )
+    refresher.start()
     try:
-        return _publish_draft_claimed(args, config, draft)
+        return _publish_draft_claimed(args, config, draft, token)
     finally:
+        stop.set()
+        refresher.join(timeout=5)
         conn = init_db(config.social_db_path)
         try:
-            release_draft_claim(conn, draft["id"], claimed_at)
+            release_draft_claim(conn, draft["id"], token)
         finally:
             conn.close()
 
