@@ -3310,8 +3310,7 @@ def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> bool:
 
     Removes the target row itself when it is a timeline post by
     *author*, the author's own edit entries on it (an edit carries
-    the post's text, so its text is blanked; the row stays so the
-    chain through it is kept),
+    the post's text, so leaving one would leave the content behind),
     and the saved, pinned and hidden refs pointing at it (they exist
     to surface the post; with the post gone they surface nothing).
     The signed delete entry itself is untouched: it is the tombstone
@@ -7720,4 +7719,3 @@ class TanApp:
                 self._gossip_slots.release()
 
         threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
-eading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
