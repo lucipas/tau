@@ -478,6 +478,8 @@ export function SocialConsole({
     }
   }
 
+  // Failures are rethrown so the PostCard keeps its picker open and
+  // shows the error in its own alert.
   async function submitShare(post: TanPost, to: string) {
     if (sharingRef.current.has(post.hash)) return;
     sharingRef.current.add(post.hash);
@@ -485,15 +487,12 @@ export function SocialConsole({
     try {
       const result = await tan.sharePost(post.hash, { to });
       if (!result.ok) {
-        setError("could not share this post");
-        return;
+        throw new Error("could not share this post");
       }
       const peer = (peers ?? []).find(
         (candidate) => candidate.destination === to,
       );
       setMessage(`shared with ${peer?.alias ?? peer?.name ?? to}`);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "could not share");
     } finally {
       sharingRef.current.delete(post.hash);
     }
@@ -506,15 +505,29 @@ export function SocialConsole({
     try {
       const result = await tan.sharePost(post.hash, { group });
       if (!result.ok) {
-        setError("could not share this post");
-        return;
+        // Name the members who missed the message: a leg is missed when
+        // the node neither delivered nor queued it.
+        const legs = Array.isArray(result.response?.results)
+          ? (result.response.results as {
+              to?: string;
+              to_name?: string;
+              queued?: boolean;
+              delivered?: boolean;
+            }[])
+          : [];
+        const missed = legs
+          .filter((leg) => !leg.queued && !leg.delivered)
+          .map((leg) => leg.to_name || leg.to || "unknown");
+        throw new Error(
+          missed.length > 0
+            ? `could not reach ${missed.join(", ")}`
+            : "could not share this post",
+        );
       }
       const target = (groups ?? []).find(
         (candidate) => candidate.id === group,
       );
       setMessage(`shared with #${target?.name ?? group}`);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "could not share");
     } finally {
       sharingRef.current.delete(post.hash);
     }
