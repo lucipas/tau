@@ -96,6 +96,14 @@ SIG_HEX_LENGTH = 128
 MAX_CHANNEL_NAME_LENGTH = 64
 MAX_CHANNEL_MESSAGE_CHARS = MAX_MESSAGE_CHARS
 MAX_CHANNEL_HISTORY = 50
+# Bound on what one channel may hold on disk: history serves the
+# last 50, so 500 (10 pages) leaves ample headroom for sync while a
+# peer flooding one room cannot grow the store without limit.
+MAX_STORED_PER_CHANNEL = 500
+# Bound on how many distinct rooms a node caches messages for: joined
+# channels are never evicted, so a peer spraying random room names
+# cannot grow the store without limit either.
+MAX_CACHED_CHANNELS = 100
 DEFAULT_CHANNEL_LIMIT = 20
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
@@ -166,7 +174,12 @@ def _require_hex(value: Any, length: int, field: str) -> str:
 def _require_timestamp(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ChannelError(f"{field} must be a number")
-    timestamp = float(value)
+    try:
+        timestamp = float(value)
+    except OverflowError as exc:
+        # A peer can send an integer far larger than a double holds;
+        # that is a bad value, not a crash past the handler's catches.
+        raise ChannelError(f"{field} is too large") from exc
     if not math.isfinite(timestamp) or timestamp < 0:
         raise ChannelError(f"{field} must be a finite, non-negative timestamp")
     return timestamp
@@ -210,10 +223,20 @@ def _author_from_identity(identity: RNS.Identity) -> str:
 
 
 def _check_wire_size(message: Dict[str, Any]) -> None:
-    """Reject a message whose publish envelope exceeds the budget."""
+    """Reject a message whose publish envelope exceeds the budget.
+
+    The envelope is measured with the message's own ``hash`` and
+    ``sig`` (or placeholders of the same length before signing), so
+    a message that passes here can actually be published: measuring
+    the unsigned body would admit a multibyte message that only fails
+    once the signature is attached.
+    """
+    envelope = dict(message)
+    envelope.setdefault("hash", "0" * HASH_HEX_LENGTH)
+    envelope.setdefault("sig", "0" * SIG_HEX_LENGTH)
     try:
         encode(
-            {"message": message, "ttl": MAX_GOSSIP_TTL},
+            {"message": envelope, "ttl": MAX_GOSSIP_TTL},
             max_bytes=MAX_REQUEST_BYTES,
         )
     except ProtocolError as exc:
@@ -236,7 +259,13 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
     key = _require_hex(mesg.get("key"), KEY_HEX_LENGTH, "key")
 
     raw_text = mesg.get("text")
-    text = normalize_message(raw_text)
+    try:
+        text = normalize_message(raw_text)
+    except ProtocolError as exc:
+        # normalize_message raises ProtocolError, but every channel
+        # handler catches ChannelError: wrap it so a malformed peer
+        # entry is a validation failure, never an unhandled error.
+        raise ChannelError(f"invalid channel message text: {exc}") from exc
     if text != raw_text:
         # Messages are hashed before they reach us.  Silently cleaning
         # the text would produce a hash that no longer matches what
@@ -415,6 +444,7 @@ def store_message(
                     message["sig"],
                 ),
             )
+            _prune_store(conn, message["channel"])
     except sqlite3.IntegrityError:
         # Another thread or process inserted the same message first.
         existing = _fetch_message(conn, digest)
@@ -426,6 +456,42 @@ def store_message(
     if record is None:  # pragma: no cover - insert should guarantee this
         raise ChannelError("channel message disappeared after it was stored")
     return _canonical_message(record), True
+
+
+def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
+    """Bound the channel store so one peer cannot fill the disk.
+
+    *channel* keeps its newest ``MAX_STORED_PER_CHANNEL`` messages,
+    and the store keeps messages for at most ``MAX_CACHED_CHANNELS``
+    distinct channels.  Joined channels are never evicted — only rooms
+    this node merely relays for are dropped, least-recently-active
+    first — so a peer spraying random room names cannot grow the
+    store without limit.  Runs inside the caller's transaction, and
+    only touches the channel just written plus the eviction check, so
+    a busy relay does not rescan the whole store per message.
+    """
+    conn.execute(
+        "DELETE FROM messages WHERE channel = ? AND hash NOT IN ("
+        "SELECT hash FROM messages WHERE channel = ? "
+        "ORDER BY created_at DESC, hash DESC "
+        f"LIMIT {MAX_STORED_PER_CHANNEL})",
+        (channel, channel),
+    )
+    while True:
+        count = conn.execute(
+            "SELECT COUNT(DISTINCT channel) FROM messages"
+        ).fetchone()[0]
+        if count <= MAX_CACHED_CHANNELS:
+            return
+        row = conn.execute(
+            "SELECT channel FROM messages "
+            "WHERE channel NOT IN (SELECT channel FROM memberships) "
+            "GROUP BY channel ORDER BY MAX(received_at) ASC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            # Every cached channel is joined: nothing evictable.
+            return
+        conn.execute("DELETE FROM messages WHERE channel = ?", (row[0],))
 
 
 def create_message(
@@ -453,8 +519,63 @@ def create_message(
     mesg = dict(body)
     mesg["hash"] = digest
     mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    # Measure the signed envelope, not the unsigned body: a multibyte
+    # message near the budget would otherwise store locally and only
+    # fail when publish() encodes it for peers.
+    _check_wire_size(mesg)
     record, _ = store_message(conn, mesg, now=timestamp)
     return record
+
+
+def channel_history_page(
+    conn: sqlite3.Connection,
+    channel: str,
+    *,
+    limit: int = DEFAULT_CHANNEL_LIMIT,
+    before: Optional[float] = None,
+    before_hash: Optional[str] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Return one page of stored messages for *channel*, newest first.
+
+    Returns ``(messages, has_more)``: ``has_more`` says whether older
+    messages exist past this page, so a reader never mistakes a
+    shortened page for the end of history.  One extra row is fetched
+    to decide that, then dropped.
+
+    The page cursor is ``(before, before_hash)`` — a timestamp plus
+    the hash of the last message on the previous page.  A timestamp
+    alone would drop records when a page cuts through a tie: several
+    messages can share one ``created_at``, and ordering breaks ties
+    by hash.  The predicate matches the ``(created_at DESC, hash
+    DESC)`` order exactly, so every message is returned once.
+    """
+    name = clean_channel_name(channel)
+    count = max(1, min(int(limit), MAX_CHANNEL_HISTORY))
+    clauses = ["channel = ?"]
+    params: List[Any] = [name]
+    if before is not None:
+        stamp = _require_timestamp(before, "before")
+        if before_hash is not None:
+            cursor_hash = _require_hex(before_hash, HASH_HEX_LENGTH, "before_hash")
+            clauses.append("(created_at < ? OR (created_at = ? AND hash < ?))")
+            params.extend([stamp, stamp, cursor_hash])
+        else:
+            clauses.append("created_at < ?")
+            params.append(stamp)
+    excluded = [author for author in (exclude_authors or []) if author]
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(f"author NOT IN ({placeholders})")
+        params.extend(excluded)
+    rows = conn.execute(
+        f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at DESC, hash DESC LIMIT ?",
+        (*params, count + 1),
+    ).fetchall()
+    has_more = len(rows) > count
+    return [_row_to_message(row) for row in rows[:count]], has_more
 
 
 def channel_history(
@@ -470,22 +591,10 @@ def channel_history(
     that timestamp are returned, so a sync loop can walk history
     without seeing the same page twice.
     """
-    name = clean_channel_name(channel)
-    count = max(1, min(int(limit), MAX_CHANNEL_HISTORY))
-    if before is None:
-        rows = conn.execute(
-            f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
-            "WHERE channel = ? ORDER BY created_at DESC, hash DESC LIMIT ?",
-            (name, count),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
-            "WHERE channel = ? AND created_at < ? "
-            "ORDER BY created_at DESC, hash DESC LIMIT ?",
-            (name, _require_timestamp(before, "before"), count),
-        ).fetchall()
-    return [_row_to_message(row) for row in rows]
+    messages, _ = channel_history_page(
+        conn, channel, limit=limit, before=before
+    )
+    return messages
 
 
 def join_channel(conn: sqlite3.Connection, channel: str) -> Dict[str, Any]:
@@ -572,20 +681,48 @@ class ChannelApp:
         self.node: Any = None
         self._gossip_slots = threading.BoundedSemaphore(4)
         self._closed = False
-        self._blocklist = None
 
     def _blocked(self, author: str) -> bool:
-        """Whether *author* is on this node's block-list, failing closed."""
-        if self._blocklist is None:
-            try:
-                self._blocklist = load_blocklist(
-                    getattr(self.config, "blocklist_path", None)
-                )
-            except Exception:
-                # A block-list that cannot be read fails closed: refuse
-                # remote messages rather than serve a list we cannot see.
-                return True
-        return self._blocklist.is_blocked(author)
+        """Whether *author* is on this node's block-list, right now.
+
+        The running node's list when attached — the console replaces
+        it in place when the owner blocks someone, so a block takes
+        effect without a restart.  Otherwise the list is re-read from
+        disk on every check, never cached: a snapshot taken at startup
+        would keep admitting an author blocked while the service runs.
+        A list that cannot be read fails closed.
+        """
+        node = self.node
+        blocklist = getattr(node, "blocklist", None) if node is not None else None
+        if blocklist is not None:
+            return blocklist.is_blocked(author)
+        try:
+            return load_blocklist(
+                getattr(self.config, "blocklist_path", None)
+            ).is_blocked(author)
+        except Exception:
+            return True
+
+    def _blocked_authors(self) -> Optional[Sequence[str]]:
+        """The current blocked authors, or ``None`` when fail-closed.
+
+        ``None`` means the list cannot be trusted (corrupt or
+        unreadable): callers must hide everything, not just the names
+        they can see.
+        """
+        node = self.node
+        blocklist = getattr(node, "blocklist", None) if node is not None else None
+        if blocklist is not None:
+            if blocklist.block_all:
+                return None
+            return sorted(blocklist.blocked)
+        try:
+            loaded = load_blocklist(getattr(self.config, "blocklist_path", None))
+        except Exception:
+            return None
+        if loaded.block_all:
+            return None
+        return sorted(loaded.blocked)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -712,11 +849,13 @@ class ChannelApp:
         try:
             for peer in peers:
                 before: Optional[float] = None
+                before_hash: Optional[str] = None
                 for _ in range(MAX_SYNC_PAGES):
                     payload = encode(
                         {
                             "channel": name,
                             "before": before,
+                            "before_hash": before_hash,
                             "limit": page_limit,
                         },
                         max_bytes=MAX_REQUEST_BYTES,
@@ -739,15 +878,24 @@ class ChannelApp:
                     messages = response.get("messages")
                     if not isinstance(messages, list) or not messages:
                         break
+                    # Entries arrive from an untrusted peer: a bad one
+                    # is recorded, never allowed to abort the peers
+                    # and channels still to sync.
                     for raw in messages:
                         if not isinstance(raw, dict):
+                            errors.append(
+                                {
+                                    "peer": getattr(peer, "hexhash", "?"),
+                                    "error": "feed entry is not an object",
+                                }
+                            )
                             continue
                         if self._blocked(str(raw.get("author", ""))):
                             skipped += 1
                             continue
                         try:
                             _, is_new = store_message(conn, raw)
-                        except ChannelError as exc:
+                        except (ChannelError, ProtocolError) as exc:
                             errors.append(
                                 {
                                     "peer": getattr(peer, "hexhash", "?"),
@@ -759,16 +907,26 @@ class ChannelApp:
                             stored += 1
                         else:
                             duplicates += 1
-                    # Page backwards from the oldest message seen, so a
-                    # short page means the peer is out of history.
+                    # Page backwards from the last message actually
+                    # received — its (timestamp, hash) cursor, not the
+                    # page length: a trimmed page can be short while
+                    # older history still exists, and a page can end
+                    # inside a timestamp tie.  Only valid entries
+                    # count as a cursor; a page of nothing usable
+                    # ends the walk for this peer.
                     stamps = [
-                        float(msg["created_at"])
-                        for msg in messages
-                        if isinstance(msg.get("created_at"), (int, float))
+                        (float(raw["created_at"]), str(raw["hash"]))
+                        for raw in messages
+                        if isinstance(raw, dict)
+                        and isinstance(raw.get("created_at"), (int, float))
+                        and not isinstance(raw.get("created_at"), bool)
+                        and isinstance(raw.get("hash"), str)
                     ]
-                    if len(messages) < page_limit or not stamps:
+                    if not stamps:
                         break
-                    before = min(stamps)
+                    before, before_hash = min(stamps)
+                    if not response.get("has_more"):
+                        break
         finally:
             conn.close()
 
@@ -867,17 +1025,34 @@ class ChannelApp:
             before = request.get("before")
             if before is not None:
                 before = _require_timestamp(before, "before")
+            before_hash = request.get("before_hash")
+            if before_hash is not None:
+                before_hash = _require_hex(before_hash, HASH_HEX_LENGTH, "before_hash")
             limit = request.get("limit", DEFAULT_CHANNEL_LIMIT)
             if isinstance(limit, bool) or not isinstance(limit, int):
                 limit = DEFAULT_CHANNEL_LIMIT
 
-            conn = self.connect()
-            try:
-                messages = channel_history(
-                    conn, channel, limit=limit, before=before
-                )
-            finally:
-                conn.close()
+            # Blocked authors are not served to peers either: a block
+            # placed after their messages were cached must stop them
+            # travelling further, not just hide them locally.  A
+            # block-list that fails closed serves nothing at all.
+            excluded = self._blocked_authors()
+            if excluded is None:
+                messages: List[Dict[str, Any]] = []
+                has_more = False
+            else:
+                conn = self.connect()
+                try:
+                    messages, has_more = channel_history_page(
+                        conn,
+                        channel,
+                        limit=limit,
+                        before=before,
+                        before_hash=before_hash,
+                        exclude_authors=excluded,
+                    )
+                finally:
+                    conn.close()
         except (ProtocolError, ChannelError) as exc:
             return response_error("invalid_feed_request", str(exc))
         while True:
@@ -886,11 +1061,16 @@ class ChannelApp:
                     messages=messages,
                     count=len(messages),
                     channel=channel,
+                    has_more=has_more,
                 )
             except ProtocolError as exc:
                 if len(messages) <= 1:
                     return response_error("feed_too_large", str(exc))
                 messages = messages[:-1]
+                # The page was shortened to fit: older messages still
+                # exist past it, so say so instead of letting the
+                # requester mistake a short page for the end.
+                has_more = True
 
     def _handle_post(
         self,

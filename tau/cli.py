@@ -2695,7 +2695,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="join a channel by name, then fetch its recent history with `tau channel sync`",
     )
-    channel_join.add_argument("name", metavar="NAME", help="channel name to join")
+    channel_join.add_argument("channel", metavar="NAME", help="channel name to join")
     channel_join.set_defaults(func=cmd_channel_join)
 
     channel_leave = channel_sub.add_parser(
@@ -2703,7 +2703,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="leave a channel (cached messages are kept)",
     )
-    channel_leave.add_argument("name", metavar="NAME", help="channel name to leave")
+    channel_leave.add_argument("channel", metavar="NAME", help="channel name to leave")
     channel_leave.set_defaults(func=cmd_channel_leave)
 
     channel_list = channel_sub.add_parser(
@@ -2718,7 +2718,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="send a message to a joined channel",
     )
-    channel_send.add_argument("name", metavar="NAME", help="channel to send to")
+    channel_send.add_argument("channel", metavar="NAME", help="channel to send to")
     channel_send.add_argument(
         "text", nargs="?", help="message text (reads stdin when omitted)"
     )
@@ -2744,7 +2744,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="show stored messages for a channel, oldest first",
     )
-    channel_read.add_argument("name", metavar="NAME", help="channel to read")
+    channel_read.add_argument("channel", metavar="NAME", help="channel to read")
     channel_read.add_argument(
         "--limit",
         type=int,
@@ -2760,7 +2760,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="pull missing history for a channel (or every joined channel)",
     )
     channel_sync.add_argument(
-        "name", nargs="?", default=None, metavar="NAME",
+        "channel", nargs="?", default=None, metavar="NAME",
         help="channel to sync (default: every joined channel)",
     )
     channel_sync.add_argument(
@@ -6080,7 +6080,7 @@ def cmd_channel_join(args: argparse.Namespace) -> int:
     json_output = _json_mode(args)
     try:
         app = ChannelApp(config, _tan_identity(config), name=config.name)
-        membership = app.join(args.name)
+        membership = app.join(args.channel)
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -6097,8 +6097,8 @@ def cmd_channel_leave(args: argparse.Namespace) -> int:
     json_output = _json_mode(args)
     try:
         app = ChannelApp(config, _tan_identity(config), name=config.name)
-        left = app.leave(args.name)
-        name = clean_channel_name(args.name)
+        left = app.leave(args.channel)
+        name = clean_channel_name(args.channel)
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -6138,7 +6138,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
     try:
-        name = clean_channel_name(args.name)
+        name = clean_channel_name(args.channel)
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -6207,7 +6207,7 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
     try:
-        name = clean_channel_name(args.name)
+        name = clean_channel_name(args.channel)
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -6250,9 +6250,9 @@ def cmd_channel_sync(args: argparse.Namespace) -> int:
         if getattr(args, "to", None):
             targets = [node.resolve_peer(target) for target in args.to]
 
-        if getattr(args, "name", None):
+        if getattr(args, "channel", None):
             try:
-                name = clean_channel_name(args.name)
+                name = clean_channel_name(args.channel)
             except ChannelError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 2

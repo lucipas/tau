@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -9,9 +10,11 @@ from tau.blocklist import BlockList, save_blocklist
 from tau.channels import (
     CHANNEL_FEED_PATH,
     CHANNEL_POST_PATH,
+    MAX_STORED_PER_CHANNEL,
     ChannelApp,
     ChannelError,
     channel_history,
+    channel_history_page,
     clean_channel_name,
     create_message,
     get_message,
@@ -292,15 +295,14 @@ class _FakeNode:
         request = decode(payload)
         self.requests.append((path, request))
         assert path == CHANNEL_FEED_PATH
-        return {
-            "ok": True,
-            "messages": channel_history(
-                self.source,
-                request["channel"],
-                limit=request.get("limit", 20),
-                before=request.get("before"),
-            ),
-        }
+        messages, has_more = channel_history_page(
+            self.source,
+            request["channel"],
+            limit=request.get("limit", 20),
+            before=request.get("before"),
+            before_hash=request.get("before_hash"),
+        )
+        return {"ok": True, "messages": messages, "has_more": has_more}
 
 
 def test_sync_pulls_missing_history(identities, tmp_path):
@@ -328,6 +330,219 @@ def test_sync_pulls_missing_history(identities, tmp_path):
         "bob two",
         "bob one",
     ]
+
+
+def test_sync_pages_through_a_timestamp_tie(identities, tmp_path):
+    # Three messages share one created_at; a page of two ends inside
+    # the tie.  A timestamp-only cursor would drop the third message
+    # for good — the (timestamp, hash) cursor must fetch it.
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    for text in ("one", "two", "three"):
+        create_message(source, bob, "general", text, name="bob", now=1000)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(author_of(bob)),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _FakeNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, "general", limit=2)
+    assert summary["stored"] == 3
+    assert summary["errors"] == []
+    assert sorted(item["text"] for item in app.history("general")) == [
+        "one",
+        "three",
+        "two",
+    ]
+
+
+def test_sync_survives_bad_peer_entries(identities, tmp_path):
+    # A peer page with a non-object entry and a malformed message must
+    # not abort the sync: the good entry still lands, the bad ones are
+    # recorded as errors.
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    good = create_message(source, bob, "general", "good", name="bob", now=1000)
+    bad_text = dict(good, hash="00" * 32, text=123)
+    bad_sig = dict(good, hash="11" * 32, sig="zz" * 64)
+
+    class _MessyNode(_FakeNode):
+        def request(self, peer, path, payload, *, timeout=20.0):
+            return {
+                "ok": True,
+                "messages": ["junk", bad_text, bad_sig, good],
+                "has_more": False,
+            }
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(author_of(bob)),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _MessyNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, "general", limit=20)
+    assert summary["stored"] == 1
+    assert len(summary["errors"]) == 3
+    assert [item["text"] for item in app.history("general")] == ["good"]
+
+
+def test_handle_feed_trims_large_pages_and_reports_more(identities, tmp_path):
+    # Fifty 2,000-character messages exceed the 64 KiB response
+    # budget, so the feed must trim — and say so, so sync keeps paging.
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        for index in range(50):
+            create_message(
+                conn, bob, "general", "x" * 2000, name="bob", now=1000 + index
+            )
+    finally:
+        conn.close()
+
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 50}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert payload["has_more"] is True
+    assert 0 < payload["count"] < 50
+
+    # The cursor from the last returned message fetches the rest.
+    last = payload["messages"][-1]
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode(
+            {
+                "channel": "general",
+                "before": last["created_at"],
+                "before_hash": last["hash"],
+                "limit": 50,
+            }
+        ),
+        b"id",
+        None,
+        time.time(),
+    )
+    second = decode(response)
+    assert second["ok"] is True
+    assert payload["count"] + second["count"] == 50
+    assert second["has_more"] is False
+
+
+def test_handle_feed_hides_blocked_authors(identities, tmp_path):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        create_message(conn, alice, "general", "from alice", name="alice", now=1000)
+        create_message(conn, bob, "general", "from bob", name="bob", now=1001)
+    finally:
+        conn.close()
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({author_of(bob)}))
+    )
+    # The app was built before the block: the feed must still hide bob,
+    # reading the live list rather than a startup snapshot.
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert [item["text"] for item in payload["messages"]] == ["from alice"]
+    assert payload["has_more"] is False
+
+
+def test_blocked_check_follows_live_blocklist(identities, tmp_path):
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+
+    class _StubNode:
+        def __init__(self, blocklist):
+            self.blocklist = blocklist
+
+    app.node = _StubNode(BlockList())  # type: ignore[assignment]
+    assert app._blocked(author_of(bob)) is False
+    app.node = _StubNode(BlockList(blocked=frozenset({author_of(bob)})))  # type: ignore[assignment]
+    assert app._blocked(author_of(bob)) is True
+
+
+def test_huge_timestamps_are_rejected_not_crashed(identities, tmp_path):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "before": 10**400, "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    assert decode(response)["ok"] is False
+
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi", name="bob", now=1000)
+    with pytest.raises(ChannelError):
+        verify_message(dict(message, created_at=10**400))
+
+
+def test_wire_size_measures_the_signed_envelope(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    # 2,000 four-byte characters: the unsigned body fits, but the
+    # signed envelope does not — creation must refuse it rather than
+    # store a message that can never be published.
+    with pytest.raises(ChannelError, match="too large"):
+        create_message(conn, alice, "general", "\U0001f600" * 2000, name="alice", now=1000)
+    message = create_message(conn, alice, "general", "a" * 2000, name="alice", now=1000)
+    assert message["text"] == "a" * 2000
+
+
+def test_store_prunes_per_channel_and_evicted_rooms(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    # Joined channels are never evicted, so join before filling it.
+    join_channel(conn, "general")
+    for index in range(MAX_STORED_PER_CHANNEL + 5):
+        create_message(conn, alice, "general", f"msg {index}", name="alice", now=1000 + index)
+    stored = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE channel = 'general'"
+    ).fetchone()[0]
+    assert stored == MAX_STORED_PER_CHANNEL
+    assert channel_history(conn, "general", limit=1)[0]["text"] == (
+        f"msg {MAX_STORED_PER_CHANNEL + 4}"
+    )
+
+    # One message in each of 101 unjoined rooms: only 100 rooms survive.
+    for index in range(101):
+        create_message(
+            conn, alice, f"room-{index:03d}", "hello", name="alice", now=2000 + index
+        )
+    rooms = conn.execute("SELECT DISTINCT channel FROM messages").fetchall()
+    assert len(rooms) == 100
+    assert len(channel_history(conn, "general", limit=1)) == 1
 
 
 def test_sync_skips_blocked_authors(identities, tmp_path):
@@ -460,3 +675,84 @@ def test_cli_join_rejects_bad_name(tmp_path, capsys):
         main(["channel", "join", "--data-dir", str(data_dir), "has space"]) == 2
     )
     assert "channel name" in capsys.readouterr().err
+
+
+def test_cli_channel_name_does_not_clobber_node_name(tmp_path, capsys):
+    # The channel positional used to share argparse's "name" destination
+    # with the shared --name node option, so `tau channel send mesh hi`
+    # signed the message as "mesh" and renamed the node.  The channel
+    # now has its own destination: --name names the node, the
+    # positional names the channel, in either position.
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "channel",
+                "join",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "alice",
+                "general",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "alice",
+                "--no-publish",
+                "general",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        messages = channel_history(conn, "general")
+    finally:
+        conn.close()
+    assert len(messages) == 1
+    assert messages[0]["name"] == "alice"
+    assert messages[0]["channel"] == "general"
+    # The node's own name is still alice, not "general".
+    capsys.readouterr()
+    assert main(["id", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["name"] == "alice"
+
+
+def test_cli_channel_send_without_name_flag_keeps_node_name(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        messages = channel_history(conn, "general")
+    finally:
+        conn.close()
+    assert messages[0]["name"] == "alice"
+    capsys.readouterr()
+    assert main(["id", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["name"] == "alice"
