@@ -158,17 +158,20 @@ from .tangents.tan import (
     author_stats,
     author_timeline,
     clean_tag,
+    delete_draft,
     export_entries,
     follow,
     follow_tag,
     followed_tags,
     following,
+    get_draft,
     hidden_posts,
     hide_post,
     import_entries,
     init_db,
     likers,
     list_authors,
+    list_drafts,
     mentions,
     mute,
     mute_keyword,
@@ -181,12 +184,14 @@ from .tangents.tan import (
     open_readonly_db,
     pin_post,
     quoters,
+    record_draft_publish,
     reposters,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
     resolve_muted_name,
     resolve_post,
+    save_draft,
     save_post,
     search_posts,
     suggest_authors,
@@ -1758,6 +1763,80 @@ def build_parser() -> argparse.ArgumentParser:
     tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_post.set_defaults(func=cmd_tan_post)
 
+    tan_draft = tan_sub.add_parser(
+        "draft",
+        parents=[common],
+        help="save a post draft to publish later",
+    )
+    tan_draft.add_argument(
+        "text", nargs="?", help="draft text (reads stdin when omitted)"
+    )
+    tan_draft.add_argument(
+        "--file", type=Path, help="read the draft text from a file"
+    )
+    tan_draft.add_argument(
+        "--reply-to",
+        default=None,
+        metavar="POST",
+        help="draft a reply to this post (post hash or unique hash prefix)",
+    )
+    tan_draft.add_argument(
+        "--expire",
+        default=None,
+        metavar="DURATION",
+        help="disappearing post: hide it from timelines and searches "
+        "after this long once published (e.g. 30s, 5m, 2h, 7d; at most 7d)",
+    )
+    tan_draft.set_defaults(func=cmd_tan_draft)
+
+    tan_drafts = tan_sub.add_parser(
+        "drafts",
+        parents=[common],
+        help="list saved post drafts",
+    )
+    tan_drafts.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="show the newest N drafts (default 20)",
+    )
+    tan_drafts.set_defaults(func=cmd_tan_drafts)
+
+    tan_publish_draft = tan_sub.add_parser(
+        "publish-draft",
+        parents=[common],
+        help="publish a saved draft as a post",
+    )
+    tan_publish_draft.add_argument("draft", metavar="ID", help="draft id")
+    tan_publish_draft.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_publish_draft.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_publish_draft.add_argument(
+        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
+    )
+    tan_publish_draft.add_argument(
+        "--timeout", type=float, default=15.0, metavar="SECONDS"
+    )
+    tan_publish_draft.set_defaults(func=cmd_tan_publish_draft)
+
+    tan_discard_draft = tan_sub.add_parser(
+        "discard-draft",
+        parents=[common],
+        help="delete a saved draft without publishing it",
+    )
+    tan_discard_draft.add_argument("draft", metavar="ID", help="draft id")
+    tan_discard_draft.set_defaults(func=cmd_tan_discard_draft)
+
     tan_scheduled = tan_sub.add_parser(
         "scheduled",
         parents=[common],
@@ -3182,7 +3261,8 @@ def _tan_identity(config: TauConfig) -> Any:
 def _publish_local_post(
     node: TauNode,
     *,
-    text: str,
+    text: Optional[str] = None,
+    post_hash: Optional[str] = None,
     reply_to: Optional[str] = None,
     quote_of: Optional[str] = None,
     to: Optional[List[str]] = None,
@@ -3196,9 +3276,25 @@ def _publish_local_post(
     )
     publisher.node = node
     targets = [node.resolve_peer(target) for target in to] if to else None
-    if quote_of is not None:
+    if post_hash is not None:
+        # Re-deliver a post that is already signed and stored — a
+        # draft retry, for example — so the same post goes out again
+        # instead of a second copy being signed for the same text.
+        stored = publisher.get_post(post_hash)
+        if stored is None:
+            raise TanError(f"unknown post: {post_hash!r}")
+        # get_post returns the canonical post plus storage-only
+        # "seq"/"linked" fields; publish() encodes the dict
+        # unchanged, so strip them — _check_wire_size only
+        # measures the canonical post.
+        post = {k: v for k, v in stored.items() if k not in ("seq", "linked")}
+    elif quote_of is not None:
+        if text is None:
+            raise TanError("nothing to publish")
         post = publisher.quote(quote_of, text)
     else:
+        if text is None:
+            raise TanError("nothing to publish")
         post = publisher.create_post(text, reply_to=reply_to, expires_at=expires_at)
     published = publisher.publish(
         post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
@@ -3322,6 +3418,14 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             finally:
                 node.stop()
 
+    # Publish-draft reads these back: a draft is only consumed once
+    # every requested peer accepted the post.  It is None for
+    # --no-publish, where there is no delivery to check.  The hash
+    # lets a kept draft re-send the same signed post on retry
+    # instead of signing a second copy.
+    args._tan_post_published = published
+    args._tan_post_hash = post["hash"]
+
     if json_output:
         _emit({"post": post, "published": published}, True)
     else:
@@ -3339,6 +3443,280 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             )
             for error in published["errors"]:
                 print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_draft(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    reply_to = ""
+    if getattr(args, "reply_to", None):
+        conn = init_db(config.social_db_path)
+        try:
+            reply_to = resolve_post(conn, args.reply_to)["hash"]
+        finally:
+            conn.close()
+
+    expires_in = None
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        try:
+            expires_in = _parse_duration(
+                expire_text,
+                flag="--expire",
+                max_seconds=MAX_TAN_POST_EXPIRY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    conn = init_db(config.social_db_path)
+    try:
+        draft = save_draft(
+            conn, text, reply_to=reply_to, expires_in=expires_in
+        )
+    finally:
+        conn.close()
+    if json_output:
+        _emit({"draft": draft}, True)
+    else:
+        print(
+            f"draft {draft['id']} saved — publish it with "
+            f"`tau tan publish-draft {draft['id']}`"
+        )
+        if reply_to:
+            print(f"  in reply to {short_hash(reply_to)}")
+        if expires_in is not None:
+            print(f"  expires {_ago(expires_in)} after publishing")
+    return _EXIT_OK
+
+
+def cmd_tan_drafts(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        drafts = list_drafts(conn, limit=getattr(args, "limit", DEFAULT_FEED_LIMIT))
+    finally:
+        conn.close()
+    if json_output:
+        _emit({"drafts": drafts}, True)
+        return _EXIT_OK
+    if not drafts:
+        print("No Tan post drafts saved.")
+        return _EXIT_OK
+    for draft in drafts:
+        print(f"{draft['id']}  {_stamp(draft['created_at'])}")
+        if draft["reply_to"]:
+            print(f"  in reply to {short_hash(draft['reply_to'])}")
+        if draft["expires_in"] is not None:
+            print(f"  expires {_ago(draft['expires_in'])} after publishing")
+        if draft["post_hash"]:
+            owed = len(draft["pending_peers"])
+            suffix = f" to {owed} peer(s)" if owed else ""
+            print(
+                f"  post {short_hash(draft['post_hash'])} — retry resends it{suffix}"
+            )
+        for line in draft["text"].splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
+def _pending_publish_peers(published: Dict[str, Any]) -> List[str]:
+    """Peer hashes still owed a post: failed sends plus never-attempted ones."""
+    pending = [str(err.get("peer") or "") for err in published.get("errors") or []]
+    pending.extend(str(item) for item in published.get("unsent") or [])
+    return [peer for peer in dict.fromkeys(pending) if peer and peer != "?"]
+
+
+def _deliver_stored_post(
+    config: TauConfig,
+    post: Dict[str, Any],
+    *,
+    to: Optional[List[str]],
+    ttl: int,
+    timeout: float,
+) -> Dict[str, Any]:
+    """Deliver an already-signed post through a fresh node or the running one.
+
+    Mirrors the publish half of ``cmd_tan_post`` but takes the post
+    instead of signing a new one, so a retried ``publish-draft``
+    re-sends the same post rather than signing a second copy.
+    """
+    request = {
+        "post_hash": post["hash"],
+        "to": to,
+        "ttl": ttl,
+        "timeout": timeout,
+    }
+    node = TauNode(config, name=config.name)
+    try:
+        node.start(exclusive=True)
+    except InstanceAlreadyRunning:
+        from .local_publish import publish_running
+
+        return publish_running(config.data_dir, **request)
+    else:
+        try:
+            return _publish_local_post(node, **request)
+        finally:
+            node.stop()
+
+
+def _retry_draft_post(
+    args: argparse.Namespace, config: TauConfig, draft: Dict[str, Any]
+) -> int:
+    """Re-send a draft's already-signed post to the peers that missed it."""
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        stored = resolve_post(conn, draft["post_hash"])
+    except TanError as exc:
+        # The post is gone, deleted or expired: signing a fresh one
+        # would hand the peers that accepted the first a duplicate,
+        # so keep the draft for the author to discard by hand.
+        print(
+            f"error: draft {draft['id']} kept — {exc}; the draft was not deleted",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    finally:
+        conn.close()
+    post = {k: v for k, v in stored.items() if k not in ("seq", "linked")}
+    if getattr(args, "no_publish", False):
+        # The post is already stored locally; there is nothing to send.
+        conn = init_db(config.social_db_path)
+        try:
+            delete_draft(conn, draft["id"])
+        finally:
+            conn.close()
+        if json_output:
+            _emit({"post": post, "published": None}, True)
+        else:
+            print(f"stored locally (not published) {short_hash(post['hash'])}")
+        return _EXIT_OK
+    # An explicit --to joins the peers already owed the post instead
+    # of replacing them: a retry that only reached its new peer
+    # would otherwise drop the original peers from the draft.
+    explicit = getattr(args, "to", None) or []
+    targets = list(dict.fromkeys([*(draft["pending_peers"] or []), *explicit])) or None
+    result = _deliver_stored_post(
+        config,
+        post,
+        to=targets,
+        ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+        timeout=float(getattr(args, "timeout", 15.0)),
+    )
+    published = result["published"]
+    if json_output:
+        _emit({"post": post, "published": published}, True)
+    else:
+        print(f"published {short_hash(post['hash'])}")
+        print(f"  published to {published['delivered']}/{published['peers']} peer(s)")
+        for error in published["errors"]:
+            print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    if published["errors"]:
+        conn = init_db(config.social_db_path)
+        try:
+            record_draft_publish(
+                conn,
+                draft["id"],
+                post_hash=post["hash"],
+                pending_peers=_pending_publish_peers(published),
+            )
+        finally:
+            conn.close()
+        print(
+            f"error: draft {draft['id']} kept — delivered to "
+            f"{published['delivered']}/{published['peers']} peer(s); "
+            "the draft was not deleted",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    conn = init_db(config.social_db_path)
+    try:
+        delete_draft(conn, draft["id"])
+    finally:
+        conn.close()
+    return _EXIT_OK
+
+
+def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        draft = get_draft(conn, args.draft)
+    finally:
+        conn.close()
+    if draft["post_hash"]:
+        # A previous attempt already signed this post: re-send that
+        # post to the peers that missed it, never a second copy.
+        return _retry_draft_post(args, config, draft)
+    # Publish through the normal post path, so signing, storing and
+    # delivery are identical for drafts and fresh posts.  The draft's
+    # expiry is a duration from publish time, so it is handed over as
+    # a fresh --expire value, not as the absolute time it would have
+    # been had the post gone out when the draft was saved.
+    args.text = draft["text"]
+    args.file = None
+    args.reply_to = draft["reply_to"] or None
+    args.expire = (
+        str(draft["expires_in"]) if draft["expires_in"] is not None else None
+    )
+    args.delay = None
+    result = cmd_tan_post(args)
+    if result != _EXIT_OK:
+        # A failed publish keeps the draft, so it can be retried or
+        # discarded by hand instead of silently lost.
+        return result
+    # cmd_tan_post reports peer failures without failing, so check the
+    # delivery result too: a draft is only consumed once every requested
+    # peer accepted the post. --no-publish leaves no delivery to check.
+    published = getattr(args, "_tan_post_published", None)
+    if published is not None and published["errors"]:
+        # Remember the signed post and who still owes it, so a retry
+        # re-sends that post instead of signing a second copy.
+        post_hash = getattr(args, "_tan_post_hash", "")
+        if post_hash:
+            conn = init_db(config.social_db_path)
+            try:
+                record_draft_publish(
+                    conn,
+                    draft["id"],
+                    post_hash=post_hash,
+                    pending_peers=_pending_publish_peers(published),
+                )
+            finally:
+                conn.close()
+        print(
+            f"error: draft {draft['id']} kept — delivered to "
+            f"{published['delivered']}/{published['peers']} peer(s); "
+            "the draft was not deleted",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    conn = init_db(config.social_db_path)
+    try:
+        delete_draft(conn, draft["id"])
+    finally:
+        conn.close()
+    return _EXIT_OK
+
+
+def cmd_tan_discard_draft(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        draft = delete_draft(conn, args.draft)
+    finally:
+        conn.close()
+    if json_output:
+        _emit({"discarded": draft}, True)
+    else:
+        print(f"discarded draft {draft['id']}")
     return _EXIT_OK
 
 

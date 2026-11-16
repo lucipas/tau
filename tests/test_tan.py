@@ -11,7 +11,7 @@ from tau.cli import main
 from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
 from tau.peers import Peer
-from tau.protocol import APP_NAME, ASPECT, ProtocolError, decode, encode
+from tau.protocol import APP_NAME, ASPECT, MAX_MESSAGE_CHARS, ProtocolError, decode, encode
 from tau.tangents import tan as tan_module
 from tau.tangents.rules import Ruleset
 from tau.tangents.tan import (
@@ -43,6 +43,7 @@ from tau.tangents.tan import (
     create_repost,
     clean_tag,
     deleted_targets,
+    delete_draft,
     edit_states,
     export_entries,
     extract_tags,
@@ -52,6 +53,7 @@ from tau.tangents.tan import (
     followed_tags,
     following,
     get_post,
+    get_draft,
     hash,
     head,
     hidden_posts,
@@ -63,6 +65,7 @@ from tau.tangents.tan import (
     like_counts,
     likers,
     list_authors,
+    list_drafts,
     mute_keyword,
     mute_tag,
     muted_keywords,
@@ -87,11 +90,14 @@ from tau.tangents.tan import (
     pin_post,
     pinned_posts,
     save_post,
+    save_draft,
     saved_posts,
     search_posts,
     store,
     store_post,
+    MAX_DRAFTS,
     MAX_MUTED_TAGS,
+    MAX_TAN_POST_EXPIRY,
     SUGGEST_FOLLOWED_WEIGHT,
     suggest_authors,
     tags,
@@ -7594,3 +7600,647 @@ def test_timeline_survives_newest_expired_posts(identities, tmp_path):
     assert [item["hash"] for item in timeline(conn, [author])] == expected
     assert [item["hash"] for item in author_timeline(conn, author)] == expected
     assert [item["hash"] for item in feed(conn, posts_only=True)] == expected
+
+
+def test_drafts_crud_and_validation(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    try:
+        # Empty and over-long text are rejected exactly like a post's.
+        with pytest.raises(ProtocolError):
+            save_draft(conn, "   ")
+        with pytest.raises(ProtocolError):
+            save_draft(conn, "x" * (MAX_MESSAGE_CHARS + 1))
+
+        # A bad reply target and a bad expiry are refused at save time.
+        with pytest.raises(PostError):
+            save_draft(conn, "hello", reply_to="not-hex")
+        with pytest.raises(TanError):
+            save_draft(conn, "hello", expires_in=0)
+        with pytest.raises(TanError):
+            save_draft(conn, "hello", expires_in=MAX_TAN_POST_EXPIRY + 1)
+
+        first = save_draft(conn, "  first draft  ", now=1000)
+        second = save_draft(
+            conn, "second draft", reply_to="ab" * 32, expires_in=3600, now=1001
+        )
+        assert first["text"] == "first draft"
+        assert first["reply_to"] == ""
+        assert first["expires_in"] is None
+        assert first["created_at"] == 1000
+        assert second["reply_to"] == "ab" * 32
+        assert second["expires_in"] == 3600
+
+        # Newest first, with a limit.
+        assert [d["id"] for d in list_drafts(conn)] == [
+            second["id"],
+            first["id"],
+        ]
+        assert [d["id"] for d in list_drafts(conn, limit=1)] == [second["id"]]
+        assert get_draft(conn, str(second["id"])) == second
+
+        # Unknown ids — numeric, non-numeric, non-positive — all refuse.
+        for bad in ("999", "nope", "0", "-3"):
+            with pytest.raises(TanError):
+                get_draft(conn, bad)
+
+        removed = delete_draft(conn, first["id"])
+        assert removed["id"] == first["id"]
+        assert [d["id"] for d in list_drafts(conn)] == [second["id"]]
+        with pytest.raises(TanError):
+            delete_draft(conn, first["id"])
+    finally:
+        conn.close()
+
+
+def test_drafts_cap(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    try:
+        for n in range(MAX_DRAFTS):
+            save_draft(conn, f"draft {n}")
+        with pytest.raises(TanError):
+            save_draft(conn, "one too many")
+    finally:
+        conn.close()
+
+
+def test_cli_tan_drafts(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+
+    # Save a draft from the CLI; JSON reports it back.
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "hello draft"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    draft_id = payload["draft"]["id"]
+    assert payload["draft"]["text"] == "hello draft"
+    assert payload["draft"]["expires_in"] is None
+
+    # The list shows it; publishing stores the post and clears the draft.
+    assert main(["tan", "drafts", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [d["id"] for d in payload["drafts"]] == [draft_id]
+
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                str(draft_id),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["post"]["text"] == "hello draft"
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+        assert [p["text"] for p in feed(conn, all_authors=True)] == ["hello draft"]
+    finally:
+        conn.close()
+
+    # Discarding removes a draft without publishing it; unknown ids fail.
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "to discard"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    doomed = payload["draft"]["id"]
+    assert (
+        main(
+            [
+                "tan",
+                "discard-draft",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                str(doomed),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["discarded"]["id"] == doomed
+    assert main(["tan", "drafts", "--data-dir", str(data_dir)]) == 0
+    assert "No Tan post drafts saved." in capsys.readouterr().out
+    assert main(["tan", "discard-draft", "--data-dir", str(data_dir), "999"]) == 1
+    assert "unknown draft" in capsys.readouterr().err
+    assert main(["tan", "publish-draft", "--data-dir", str(data_dir), "999"]) == 1
+
+
+def test_cli_tan_draft_expiry_starts_at_publish(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "draft",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "--expire",
+                "1h",
+                "expiring draft",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    draft_id = payload["draft"]["id"]
+    assert payload["draft"]["expires_in"] == 3600
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                str(draft_id),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    post = payload["post"]
+    assert post["expires_at"] is not None
+    remaining = post["expires_at"] - time.time()
+    assert 3590 <= remaining <= 3600
+
+
+def test_cli_tan_publish_draft_keeps_draft_when_reply_target_gone(
+    tmp_path, capsys
+):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "target post",
+            ]
+        )
+        == 0
+    )
+    target = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(
+            [
+                "tan",
+                "draft",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "--reply-to",
+                target,
+                "reply draft",
+            ]
+        )
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+    assert (
+        main(
+            ["tan", "delete", "--data-dir", str(data_dir), "--no-publish", target]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                str(draft_id),
+            ]
+        )
+        == 1
+    )
+    assert "has been deleted" in capsys.readouterr().err
+    assert main(["tan", "drafts", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [d["id"] for d in payload["drafts"]] == [draft_id]
+
+
+def test_cli_tan_publish_draft_keeps_draft_on_partial_delivery(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "doomed draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    # Stub the transport layer, not the post command: the real
+    # cmd_tan_post must run, so the test fails if it ever stops
+    # recording its delivery result for publish-draft to check.
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    def fake_publish_local_post(node, **kwargs):
+        return {
+            "post": {"hash": "cc" * 32, "text": "doomed draft"},
+            "published": {
+                "delivered": 0,
+                "peers": 1,
+                "errors": [{"peer": "aa" * 32, "error": "no route"}],
+            },
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert [d["id"] for d in list_drafts(conn)] == [draft_id]
+    finally:
+        conn.close()
+
+
+def test_cli_tan_publish_draft_retry_resends_same_post(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    # A real stored post stands in for the one the first attempt signs:
+    # the retry loads it back from the local database.
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "seed post",
+            ]
+        )
+        == 0
+    )
+    stored_hash = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "retry draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    # Stub the transport layer, not the post command: the real
+    # cmd_tan_post must run, so the test fails if it ever stops
+    # recording the post hash for publish-draft to reuse.
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    calls = []
+
+    def fake_publish_local_post(node, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {
+                "post": {"hash": stored_hash, "text": "retry draft"},
+                "published": {
+                    "delivered": 0,
+                    "peers": 1,
+                    "errors": [{"peer": "aa" * 32, "error": "no route"}],
+                },
+            }
+        return {
+            "post": {"hash": stored_hash, "text": "retry draft"},
+            "published": {"delivered": 1, "peers": 1, "errors": []},
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        kept = get_draft(conn, draft_id)
+    finally:
+        conn.close()
+    assert kept["post_hash"] == stored_hash
+    assert kept["pending_peers"] == ["aa" * 32]
+
+    # The retry re-sends the stored post to the peer that missed it —
+    # no new post is signed, so the peers that accepted the first
+    # attempt see no duplicate.
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 0
+    )
+    assert len(calls) == 2
+    assert calls[1]["post_hash"] == stored_hash
+    assert calls[1]["to"] == ["aa" * 32]
+    assert "text" not in calls[1]
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+    finally:
+        conn.close()
+
+
+def test_cli_tan_publish_draft_retry_keeps_draft_when_post_gone(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "seed post",
+            ]
+        )
+        == 0
+    )
+    stored_hash = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "doomed draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    def fake_publish_local_post(node, **kwargs):
+        return {
+            "post": {"hash": stored_hash, "text": "doomed draft"},
+            "published": {
+                "delivered": 0,
+                "peers": 1,
+                "errors": [{"peer": "aa" * 32, "error": "no route"}],
+            },
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+
+    # Delete the stored post, then retry: signing a fresh post would
+    # hand the peers that accepted the first a duplicate, so the
+    # draft stays for the author to discard by hand.
+    assert (
+        main(
+            [
+                "tan",
+                "delete",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                stored_hash,
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert [d["id"] for d in list_drafts(conn)] == [draft_id]
+    finally:
+        conn.close()
+
+
+def test_drafts_table_migrates_post_hash_columns(tmp_path):
+    db_path = tmp_path / "tan.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE drafts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "text TEXT NOT NULL, "
+            "reply_to TEXT NOT NULL DEFAULT '', "
+            "expires_in REAL, "
+            "created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO drafts(text, reply_to, expires_in, created_at) "
+            "VALUES('old draft', '', NULL, 123.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
+        }
+        assert {"post_hash", "pending_peers"} <= columns
+        draft = get_draft(conn, 1)
+        assert draft["text"] == "old draft"
+        assert draft["post_hash"] == ""
+        assert draft["pending_peers"] == []
+    finally:
+        conn.close()
+
+
+def test_cli_tan_publish_draft_retry_to_joins_pending_peers(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "seed post",
+            ]
+        )
+        == 0
+    )
+    stored_hash = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "retry draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    calls = []
+
+    def fake_publish_local_post(node, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {
+                "post": {"hash": stored_hash, "text": "retry draft"},
+                "published": {
+                    "delivered": 0,
+                    "peers": 1,
+                    "errors": [{"peer": "aa" * 32, "error": "no route"}],
+                },
+            }
+        if len(calls) == 2:
+            # Both the owed peer and the new --to peer fail: neither
+            # may be dropped from the draft.
+            return {
+                "post": {"hash": stored_hash, "text": "retry draft"},
+                "published": {
+                    "delivered": 0,
+                    "peers": 2,
+                    "errors": [
+                        {"peer": "aa" * 32, "error": "no route"},
+                        {"peer": "bb" * 32, "error": "no route"},
+                    ],
+                },
+            }
+        return {
+            "post": {"hash": stored_hash, "text": "retry draft"},
+            "published": {"delivered": 2, "peers": 2, "errors": []},
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+
+    # Retrying with a different --to peer must not abandon the peer
+    # already owed the post: both are targeted, and a failed retry
+    # keeps both pending.
+    assert (
+        main(
+            [
+                "tan",
+                "publish-draft",
+                "--data-dir",
+                str(data_dir),
+                "--to",
+                "bb" * 32,
+                str(draft_id),
+            ]
+        )
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    assert calls[1]["to"] == ["aa" * 32, "bb" * 32]
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        kept = get_draft(conn, draft_id)
+    finally:
+        conn.close()
+    assert kept["post_hash"] == stored_hash
+    assert kept["pending_peers"] == ["aa" * 32, "bb" * 32]
+
+    # A plain retry then reaches both owed peers and consumes the draft.
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 0
+    )
+    assert calls[2]["to"] == ["aa" * 32, "bb" * 32]
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+    finally:
+        conn.close()
