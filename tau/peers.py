@@ -298,7 +298,9 @@ class Peer:
             "lxmf": self.lxmf_hash,
         }
 
-    def local_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
+    def local_dict(
+        self, now: Optional[float] = None, *, include_note: bool = False
+    ) -> Dict[str, Any]:
         """``public_dict`` plus this node's own trust state about the peer.
 
         Verification is a local judgement, never shared with other peers:
@@ -306,14 +308,17 @@ class Peer:
         payloads) and is only shown to this node's owner — the CLI, the
         web console, and the persisted registry.  The local alias is the
         same kind of owner-only label.
+
+        The private note is owner-only too, and stricter: the console
+        can be exposed remotely (``--http-allow-remote``) without owner
+        authentication, so it is included only when *include_note* is
+        set — the web bridge asks for it only for loopback clients.
+        The CLI reads notes from to_dict() instead.
         """
         payload = self.public_dict(now)
         payload["alias"] = self.alias
-        # No "note": the console payload is served to the web console,
-        # which can be exposed remotely (--http-allow-remote) without
-        # owner authentication, so private notes stay out of it until a
-        # console UI for notes exists.  The CLI reads notes from
-        # to_dict() instead.
+        if include_note:
+            payload["note"] = self.note
         payload["verified"] = self.is_verified
         payload["verified_at"] = self.verified_at
         payload["key_change_at"] = self.key_change_at

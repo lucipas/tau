@@ -14,6 +14,9 @@ script) can read what arrives from the mesh and send messages back:
     ``{"target": "alice"}`` without recording anything
     POST /api/peers/block   block ``{"target": "<name, hash or prefix>"}``
     POST /api/peers/unblock unblock ``{"target": "<name, hash or prefix>"}``
+    POST /api/peers/alias   set a peer's local alias
+    POST /api/peers/note    set a peer's private note — loopback only,
+    a blank note clears it
     GET  /api/conversations/archived archived DM conversations
     POST /api/conversations/archive archive ``{"target": "<name, hash or prefix>"}``
     POST /api/conversations/unarchive unarchive ``{"target": "<name, hash or prefix>"}``
@@ -1479,11 +1482,17 @@ class WebBridge:
 
     # -- node callbacks ----------------------------------------------------
 
-    def _local_peer_payload(self, peer: Peer) -> Dict[str, Any]:
+    def _local_peer_payload(
+        self, peer: Peer, *, include_note: bool = False
+    ) -> Dict[str, Any]:
         # local_dict: the console replaces its record with this payload, so
         # it must carry the same trust fields — a public_dict payload would
         # silently drop the verified badge and any key-change warning.
-        payload = peer.local_dict()
+        # The private note is included only on request: peer events go to
+        # every connected console, including remote ones, so they never
+        # carry notes — only a loopback-only reply (the note endpoint) or
+        # a loopback-gated listing does.
+        payload = peer.local_dict(include_note=include_note)
         # Annotate like the snapshot does, so a live update or alias
         # response does not erase the frontend's blocked badge.
         blocklist = getattr(self.node, "blocklist", None)
@@ -6834,12 +6843,18 @@ class WebBridge:
 
     # -- snapshots ---------------------------------------------------------
 
-    def peers(self) -> List[Dict[str, Any]]:
+    def peers(self, *, include_notes: bool = False) -> List[Dict[str, Any]]:
         now = time.time()
         try:
             # local_dict: verification is this node's own trust state, so
             # it is shown to the console owner but never sent to peers.
-            items = [peer.local_dict(now) for peer in self.node.registry.all()]
+            # Notes are stricter still — a remote console must never see
+            # them — so they are included only when the caller asked,
+            # which the HTTP layer does only for loopback clients.
+            items = [
+                peer.local_dict(now, include_note=include_notes)
+                for peer in self.node.registry.all()
+            ]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
@@ -6900,6 +6915,36 @@ class WebBridge:
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.
         return self._local_peer_payload(peer)
+
+    def set_peer_note(
+        self, destination: str, note: Optional[str]
+    ) -> Dict[str, Any]:
+        """Set a peer's private note, or clear it when *note* is blank.
+
+        The note rules stay in the registry — trimmed, capped at
+        ``MAX_NOTE_LENGTH``, never sent to peers — this only routes the
+        console's request through them.  Like :meth:`set_peer_alias` a
+        peer event goes out so every open console updates its peer list
+        at once; the event itself carries no note (remote consoles must
+        never see one), and the returned payload does — it goes only to
+        the loopback client that made this request.
+        """
+        # Same lock discipline as set_peer_alias: hold the node's
+        # peer-save lock across the edit and its save, and pick up a
+        # note or alias a one-shot command saved since the last
+        # periodic refresh, so this save does not write back stale ones.
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock:
+            self.node.registry.refresh_aliases()
+            if note is not None and note.strip():
+                peer = self.node.registry.set_note(destination, note)
+            else:
+                peer = self.node.registry.clear_note(destination)
+        self.record_peer(peer)
+        # The annotated payload, not bare local_dict: the hook replaces
+        # its peer record with this response, and a bare dict would drop
+        # the blocked badge until the next snapshot.
+        return self._local_peer_payload(peer, include_note=True)
 
     def peers_safety_number(self, target: str) -> Dict[str, Any]:
         """Show a peer's pairwise safety number without recording anything.
@@ -8459,10 +8504,10 @@ class WebBridge:
         self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self, *, include_notes: bool = False) -> Dict[str, Any]:
         return {
             "node": self.node.info(),
-            "peers": self.peers(),
+            "peers": self.peers(include_notes=include_notes),
             "groups": self.groups(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
@@ -8471,6 +8516,10 @@ class WebBridge:
                 "version": __version__,
                 "web": self.web_dir is not None,
                 "url": self.url,
+                # Private notes are readable and writable only from a
+                # loopback client; the console offers note editing only
+                # when this is true.
+                "notes_editable": include_notes,
             },
             "social": {
                 "enabled": self._tan_app() is not None,
@@ -8852,10 +8901,21 @@ class _WebHandler(BaseHTTPRequestHandler):
 
         if self.command == "GET":
             if path == "/api/status":
-                self._send_json(self.bridge.snapshot(), head_only)
+                self._send_json(
+                    self.bridge.snapshot(
+                        include_notes=_is_loopback_client(
+                            self.client_address[0]
+                        )
+                    ),
+                    head_only,
+                )
                 return
             if path == "/api/peers":
-                peers = self.bridge.peers()
+                peers = self.bridge.peers(
+                    include_notes=_is_loopback_client(
+                        self.client_address[0]
+                    )
+                )
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
                 return
             if path == "/api/heard":
@@ -10052,6 +10112,49 @@ class _WebHandler(BaseHTTPRequestHandler):
                 try:
                     peer = self.bridge.set_peer_alias(
                         destination.strip(), alias
+                    )
+                except PeerError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "peer": peer}, head_only)
+                return
+            if path == "/api/peers/note":
+                # Private notes are owner-only: a remote console can be
+                # opened without authentication, so only the local
+                # machine may write them — like the backup/export
+                # endpoints, which are loopback-only for the same reason.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "peer notes are only available from localhost"
+                            }
+                        },
+                        head_only,
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                destination = body.get("destination") or body.get("target")
+                if not isinstance(destination, str) or not destination.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'destination' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                note = body.get("note")
+                if note is not None and not isinstance(note, str):
+                    self._send_json(
+                        {"error": {"message": "field 'note' must be a string"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    peer = self.bridge.set_peer_note(
+                        destination.strip(), note
                     )
                 except PeerError as exc:
                     self._send_json(
@@ -11783,7 +11886,17 @@ class _WebHandler(BaseHTTPRequestHandler):
         )
         try:
             if not send_json(
-                {"type": "snapshot", "snapshot": self.bridge.snapshot()}
+                {
+                    "type": "snapshot",
+                    # Notes are owner-only: a remote console opening the
+                    # live stream gets a snapshot without them, like the
+                    # GET /api/status listing.
+                    "snapshot": self.bridge.snapshot(
+                        include_notes=_is_loopback_client(
+                            self.client_address[0]
+                        )
+                    ),
+                }
             ):
                 return
             # A client just opened the console, so the thread view is
@@ -11832,7 +11945,18 @@ class _WebHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            self._write_event("snapshot", {"snapshot": self.bridge.snapshot()})
+            self._write_event(
+                "snapshot",
+                {
+                    # Notes are owner-only: see the WebSocket snapshot
+                    # above — a remote console gets none here either.
+                    "snapshot": self.bridge.snapshot(
+                        include_notes=_is_loopback_client(
+                            self.client_address[0]
+                        )
+                    )
+                },
+            )
             # A client just opened the console, so the thread view is
             # displaying these messages: send their read receipts.
             self.bridge.mark_displayed_read()

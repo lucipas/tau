@@ -274,6 +274,110 @@ describe("useTau setPeerAlias", () => {
   });
 });
 
+describe("useTau setPeerNote", () => {
+  it("applies the returned peer, note included", async () => {
+    const peer = makePeer();
+    mockedPost.mockResolvedValue({
+      ok: true,
+      peer: makePeer({ note: "runs the relay" }),
+    });
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [peer]);
+    await waitFor(() => expect(result.current.peers).toEqual([peer]));
+
+    let updated: Peer | undefined;
+    await act(async () => {
+      updated = await result.current.setPeerNote(
+        peer.destination,
+        "runs the relay",
+      );
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/peers/note", {
+      destination: peer.destination,
+      note: "runs the relay",
+    });
+    expect(updated?.note).toBe("runs the relay");
+    expect(result.current.peers[0].note).toBe("runs the relay");
+  });
+
+  it("drops a delayed response when a newer snapshot landed meanwhile", async () => {
+    const peer = makePeer();
+    const pending = deferred<{ ok: boolean; peer: Peer }>();
+    mockedPost.mockReturnValue(pending.promise);
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [peer]);
+    await waitFor(() => expect(result.current.peers).toEqual([peer]));
+
+    let settled: Promise<Peer>;
+    act(() => {
+      settled = result.current.setPeerNote(peer.destination, "runs the relay");
+    });
+    // A reconnect snapshot arrives while the save is in flight, with a
+    // fresher last_seen and no note yet.
+    snapshotInto(source, [makePeer({ last_seen: 200 })]);
+    await waitFor(() => expect(result.current.peers[0].last_seen).toBe(200));
+
+    // The stale response carries the old last_seen: it must not
+    // overwrite the snapshot.
+    await act(async () => {
+      pending.resolve({ ok: true, peer: makePeer({ note: "runs the relay" }) });
+      await settled;
+    });
+
+    expect(result.current.peers[0].last_seen).toBe(200);
+    expect(result.current.peers[0].note).toBeUndefined();
+  });
+
+  it("keeps a known note when a peer event arrives without one", async () => {
+    const peer = makePeer({ note: "met at the mesh meetup" });
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [peer]);
+    await waitFor(() =>
+      expect(result.current.peers[0].note).toBe("met at the mesh meetup"),
+    );
+
+    // Peer events never carry notes (a remote console must never see
+    // one), so the event's record has no note key at all — the known
+    // note must survive it.
+    act(() => {
+      source.emit("peer", { peer: makePeer({ last_seen: 300 }) });
+    });
+    await waitFor(() =>
+      expect(result.current.peers[0].last_seen).toBe(300),
+    );
+
+    expect(result.current.peers[0].note).toBe("met at the mesh meetup");
+  });
+
+  it("keeps a known note when an alias reply arrives without one", async () => {
+    const peer = makePeer({ note: "met at the mesh meetup" });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      peer: makePeer({ alias: "laptop" }),
+    });
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [peer]);
+    await waitFor(() =>
+      expect(result.current.peers[0].note).toBe("met at the mesh meetup"),
+    );
+
+    await act(async () => {
+      await result.current.setPeerAlias(peer.destination, "laptop");
+    });
+
+    expect(result.current.peers[0].alias).toBe("laptop");
+    expect(result.current.peers[0].note).toBe("met at the mesh meetup");
+  });
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });

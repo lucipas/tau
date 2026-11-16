@@ -186,6 +186,10 @@ export interface Peer {
   // Local-only label for this peer, set with `tau peers alias` or from
   // the console. Never sent to peers.
   alias?: string | null;
+  // Private note about this peer, set with `tau peers note` or from
+  // the console. Never sent to peers — and only ever served to a
+  // loopback console, never to a remote one.
+  note?: string | null;
   // LXMF delivery destination hash, derived from the peer's public key.
   lxmf?: string | null;
   // Local trust state, shown only to this node's owner (never sent to peers).
@@ -368,6 +372,9 @@ export interface BridgeInfo {
   version: string;
   web: boolean;
   url: string;
+  // True when this console may read and write private peer notes
+  // (loopback clients only). Absent on snapshots from an older bridge.
+  notes_editable?: boolean;
 }
 
 export interface Snapshot {

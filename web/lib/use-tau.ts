@@ -465,6 +465,25 @@ export function useTau() {
     setNode(snapshot.node);
   }, []);
 
+  // Peer events and mutation replies never carry a private note — a
+  // remote console must never see one — so a record that arrives
+  // without one keeps the note this console already knows. A record
+  // that does carry one (the note endpoint's own reply, a loopback
+  // listing or snapshot) is authoritative, including an explicit null
+  // for a cleared note. That leaves one stale corner: a note set or
+  // cleared in another tab only reaches this one on its next snapshot
+  // or reconnect — the peer list is owned by snapshot and events, and
+  // a wholesale peers poll would fight that ownership.
+  const keepKnownNote = (previous: Peer[], incoming: Peer): Peer => {
+    if (incoming.note !== undefined) return incoming;
+    const known = previous.find(
+      (entry) => entry.destination === incoming.destination,
+    );
+    return known?.note !== undefined
+      ? { ...incoming, note: known.note }
+      : incoming;
+  };
+
   useEffect(() => {
     let disposed = false;
     // Edits made before this connection opened are in its snapshot;
@@ -664,7 +683,7 @@ export function useTau() {
         const next = previous.filter(
           (entry) => entry.destination !== currentPeer.destination,
         );
-        next.push(currentPeer);
+        next.push(keepKnownNote(previous, currentPeer));
         return sortPeers(next);
       });
     };
@@ -2314,6 +2333,35 @@ export function useTau() {
         setPeers((previous) =>
           sortPeers([
             ...previous.filter((entry) => entry.destination !== destination),
+            keepKnownNote(previous, result.peer),
+          ]),
+        );
+      }
+      return result.peer;
+    },
+    [],
+  );
+
+  const setPeerNote = useCallback(
+    async (destination: string, note: string | null) => {
+      // Same shape as setPeerAlias: the server publishes a peer event
+      // (which never carries a note) and this reply is the immediate
+      // feedback, so it is applied only when nothing newer arrived
+      // meanwhile. The reply does carry the note — it goes only to
+      // the loopback client that made this request.
+      const versionBefore = peerEventVersion.current[destination] ?? 0;
+      const snapshotBefore = snapshotGeneration.current;
+      const result = await apiPost<{ ok: boolean; peer: Peer }>(
+        "/api/peers/note",
+        { destination, note },
+      );
+      if (
+        (peerEventVersion.current[destination] ?? 0) === versionBefore &&
+        snapshotGeneration.current === snapshotBefore
+      ) {
+        setPeers((previous) =>
+          sortPeers([
+            ...previous.filter((entry) => entry.destination !== destination),
             result.peer,
           ]),
         );
@@ -2845,6 +2893,7 @@ export function useTau() {
     markRead,
     markUnread,
     setPeerAlias,
+    setPeerNote,
     reactToMessage,
     clearReaction,
     sendTyping,

@@ -414,6 +414,11 @@ export function Console() {
             onSetAlias={(destination, alias) =>
               tau.setPeerAlias(destination, alias)
             }
+            onSetPeerNote={
+              tau.bridge?.notes_editable
+                ? (destination, note) => tau.setPeerNote(destination, note)
+                : undefined
+            }
             onVerify={(destination) => {
               void tau.verifyPeer(destination).catch(() => undefined);
             }}
