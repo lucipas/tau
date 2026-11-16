@@ -3107,6 +3107,8 @@ def resolve_share_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     than trusted).
     """
     post = resolve_post(conn, ref)
+    if not post.get("linked", True):
+        raise TanError(f"post is not linked yet: {ref!r}")
     hops = 0
     while post.get("kind") == KIND_REPOST:
         target = post.get("target") or ""
@@ -3116,7 +3118,10 @@ def resolve_share_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
         if hops > 8:
             raise TanError(f"repost chain too deep: {ref!r}")
         post = resolve_post(conn, target)
-    return post
+        if not post.get("linked", True):
+            raise TanError(f"post is not linked yet: {ref!r}")
+    # Share the author's latest edit, matching what Tan views display.
+    return annotate_edits(conn, [post])[0]
 
 
 def share_text(post: Dict[str, Any], label: str) -> str:
