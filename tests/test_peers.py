@@ -1212,6 +1212,65 @@ def test_clear_verifications_drops_all_markers(tmp_path):
     assert registry.clear_verifications() == 0
 
 
+def test_clear_verifications_drops_rename_state(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    registry.mark_verified(peer.destination_hash, "00001", now=150.0)
+    registry.upsert(peer.destination_hash, peer.public_key, name="alicia", now=200.0)
+    assert peer.name_change_at == 200.0
+
+    registry.clear_verifications()
+    assert peer.name_change_at is None
+    assert peer.previous_name is None
+
+
+def test_rename_chain_keeps_verified_baseline(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    registry.mark_verified(peer.destination_hash, "00001", now=150.0)
+    registry.upsert(peer.destination_hash, peer.public_key, name="bob", now=200.0)
+    registry.upsert(peer.destination_hash, peer.public_key, name="carol", now=300.0)
+    assert peer.previous_name == "alice"
+    assert peer.name_change_at == 300.0
+
+    # Returning to the unverified intermediate name does not clear the warning.
+    registry.upsert(peer.destination_hash, peer.public_key, name="bob", now=400.0)
+    assert peer.name_change_at is not None
+    assert peer.previous_name == "alice"
+
+    # Returning to the verified name does.
+    registry.upsert(peer.destination_hash, peer.public_key, name="alice", now=500.0)
+    assert peer.name_change_at is None
+    assert peer.previous_name is None
+
+
+def test_prune_spares_saved_contacts(tmp_path):
+    registry = PeerRegistry()
+    contact = make_peer(registry, 1, "old", now=100.0)
+    contact.alias = "Old Friend"
+    make_peer(registry, 2, "new", now=1000.0)
+
+    assert registry.prune(max_age=500.0, now=1100.0) == 0
+    assert registry.get(contact.destination_hash) is contact
+
+
+def test_first_direct_announce_after_exchange_logs_collision(tmp_path, caplog):
+    registry = PeerRegistry()
+    verified = make_peer(registry, 1, "Alice", now=100.0)
+    registry.mark_verified(verified.destination_hash, "00001", now=150.0)
+    lookalike = make_peer(registry, 2, "Alice", now=200.0)
+    lookalike.via_exchange = True
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="tau.peers"):
+        registry.upsert(
+            lookalike.destination_hash, lookalike.public_key, name="Alice", now=300.0
+        )
+
+    assert lookalike.via_exchange is False
+    assert any("possible lookalike" in r.message for r in caplog.records)
+
+
 def test_forget_removes_peer_and_rejects_unknown(tmp_path):
     registry = PeerRegistry()
     peer = make_peer(registry, 1, "alice", now=100.0)

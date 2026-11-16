@@ -2985,7 +2985,9 @@ def _print_peer_table(
                 "until its safety number is compared out of band.",
                 file=sys.stderr,
             )
-    renamed = [p for p in rows if p.name_change_at is not None]
+    renamed = [
+        p for p in rows if p.is_verified and p.name_change_at is not None
+    ]
     for peer in renamed:
         previous = (
             f" from {peer.previous_name!r}" if peer.previous_name else ""

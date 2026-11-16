@@ -1494,7 +1494,13 @@ class WebBridge:
         # a loopback-gated listing does.
         payload = peer.local_dict(include_note=include_note)
         # Annotate like the snapshot does, so a live update or alias
-        # response does not erase the frontend's blocked badge.
+        # response does not erase the frontend's blocked badge or the
+        # lookalike warning.  The collision uses the same note boundary
+        # as the snapshot, so a live event never reveals a note-only contact.
+        collided = self.node.registry.lookalike_for(peer, include_notes=include_note)
+        payload["lookalike_of"] = (
+            collided.display_name if collided is not None else None
+        )
         blocklist = getattr(self.node, "blocklist", None)
         payload["blocked"] = bool(
             blocklist is not None and blocklist.is_blocked(payload.get("destination"))
@@ -1503,6 +1509,29 @@ class WebBridge:
 
     def record_peer(self, peer: Peer) -> None:
         self.bus.publish({"type": "peer", "peer": self._local_peer_payload(peer)})
+
+    def _refresh_lookalike_neighbours(
+        self, changed: Peer, *previous_names: Optional[str]
+    ) -> None:
+        """Re-publish peers whose lookalike state *changed* may have affected.
+
+        A lookalike warning depends on other peers' aliases and
+        verification, so editing one contact changes the rows of peers
+        announcing the same name.  Those rows are republished here, using
+        the names *changed* carries now or carried before (*previous_names*).
+        """
+        names = {
+            name.casefold()
+            for name in (changed.name, changed.alias, *previous_names)
+            if name and name.casefold() != "unknown"
+        }
+        if not names:
+            return
+        for other in self.node.registry.all():
+            if other.destination_hash == changed.destination_hash:
+                continue
+            if other.name.casefold() in names:
+                self.record_peer(other)
 
     def _remember_removed_wire_id(self, wire_id: str) -> None:
         """Remember a wire id whose console entry is gone (caller holds the lock).
@@ -6880,11 +6909,15 @@ class WebBridge:
             # which the HTTP layer does only for loopback clients.
             # lookalike_of is the same kind of local-only trust state:
             # the display name of the verified peer or saved contact
-            # this unverified peer may be impersonating, or None.
+            # this unverified peer may be impersonating, or None.  A
+            # note-only contact counts only when notes are included, so a
+            # remote listing cannot reveal which peers carry a note.
             items = []
             for peer in self.node.registry.all():
                 item = peer.local_dict(now, include_note=include_notes)
-                collided = self.node.registry.lookalike_for(peer)
+                collided = self.node.registry.lookalike_for(
+                    peer, include_notes=include_notes
+                )
                 item["lookalike_of"] = (
                     collided.display_name if collided is not None else None
                 )
@@ -6936,6 +6969,8 @@ class WebBridge:
         # Mirrors peers_verify; a node-like without the lock (e.g. in
         # tests) simply edits.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        before = self.node.registry.get(destination)
+        previous_alias = before.alias if before is not None else None
         with lock:
             # Pick up notes a one-shot command saved since the last
             # periodic refresh, so this save does not write back stale ones.
@@ -6945,6 +6980,7 @@ class WebBridge:
             else:
                 peer = self.node.registry.clear_alias(destination)
         self.record_peer(peer)
+        self._refresh_lookalike_neighbours(peer, previous_alias)
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.
@@ -7036,6 +7072,10 @@ class WebBridge:
             self.node.registry.refresh_aliases()
             self.node.registry.mark_verified(peer.destination_hash, number)
             self.node.registry.save()
+        # Rows of unverified peers announcing this name lose or gain their
+        # warning with this verification; the verified row itself is
+        # updated by the console from the response.
+        self._refresh_lookalike_neighbours(peer)
         return {
             "peer": peer.hexhash,
             "name": peer.display_name,

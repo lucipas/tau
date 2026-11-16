@@ -142,7 +142,7 @@ class FakeRegistry:
     def refresh_aliases(self):
         return 0
 
-    def lookalike_for(self, peer):
+    def lookalike_for(self, peer, *, include_notes=True):
         # The fixture holds a single peer, so nothing can collide with
         # it; the real registry (PeerRegistry.lookalike_for) is covered
         # by tests that swap one in (see _seed_alias_registry).
