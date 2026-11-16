@@ -1093,20 +1093,28 @@ def store_post(
         parent = _fetch_post(conn, prev)
         if parent is None:
             # The parent may have been purged: a linked delete entry
-            # from this author targeting it means the parent is gone
-            # by design, not by partial sync, so this entry links up
-            # here instead of waiting for a parent that never comes.
-            # The delete must be linked itself — an unlinked tombstone
-            # may have arrived before its own parent, and its chain
-            # position is not established yet, so the child waits
-            # until the tombstone links and the purge is applied.  A
-            # forged delete from anyone else cannot match this author.
+            # from this author targeting it, or a purge record for
+            # it, means the parent is gone by design, not by partial
+            # sync, so this entry links up here instead of waiting for
+            # a parent that never comes.  The delete must be linked
+            # itself — an unlinked tombstone may have arrived before
+            # its own parent, and its chain position is not
+            # established yet, so the child waits until the tombstone
+            # links and the purge is applied.  The record is the proof
+            # for a dropped *edit* row: no delete targets the edit
+            # directly — the delete targets the post — but the edit's
+            # hash is recorded when it is dropped or purged, and the
+            # entry created after it must not stay orphaned behind
+            # that gap.  A forged delete from anyone else cannot match
+            # this author, and a forged delete creates no record —
+            # records are made only when a verified row is actually
+            # purged or dropped — so neither proof admits a forgery.
             row = conn.execute(
                 "SELECT 1 FROM posts d WHERE d.kind = 'delete' "
                 "AND d.linked = 1 AND d.target = ? AND d.author = ? LIMIT 1",
                 (prev, author),
             ).fetchone()
-            if row is not None:
+            if row is not None or _purged_post(conn, prev, author) is not None:
                 linked = True
                 seq = max_seq(conn, author) + 1
             else:

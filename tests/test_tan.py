@@ -3440,6 +3440,45 @@ def test_reoffered_edit_of_deleted_post_is_dropped(identities, tmp_path):
     assert get_post(conn, post["hash"]) is None
 
 
+def test_later_entry_links_after_dropped_edit(identities, tmp_path):
+    # Qodo Warning (later posts remain unlinked after a delete):
+    # dropping an edit of a deleted post also dropped the predecessor
+    # a later entry needs, so an entry created after that edit stayed
+    # unlinked.  The drop records the edit's hash, and the
+    # missing-parent branch links on that record — so the later entry
+    # still links up.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "gone", name="alice", now=1000)
+    edit = create_edit(
+        scratch, alice, post["hash"], "gone, fixed", name="alice", now=1001
+    )
+    later = create_post(
+        scratch, alice, "after the dropped edit", name="alice", now=1002
+    )
+    assert get_post(scratch, later["hash"])["prev"] == edit["hash"]
+    # The delete chains from the post itself, so it links as soon as
+    # the post is stored — the edit then arrives after the delete.
+    delete = create_delete(
+        scratch, alice, post["hash"], name="alice", now=1003,
+        previous=post["hash"],
+    )
+
+    store_post(conn, post)
+    store_post(conn, delete)
+    assert get_post(conn, post["hash"]) is None
+    # The edit arrives after the delete and is dropped — but its hash
+    # is recorded, so the entry created after it still links.
+    _, is_new = store_post(conn, edit)
+    assert is_new is False
+    assert get_post(conn, edit["hash"]) is None
+    store_post(conn, later)
+    assert get_post(conn, later["hash"])["linked"] == 1
+    assert timeline(conn, [post["author"]]) != []
+    assert verify_store(conn)["ok"] is True
+
+
 def test_purge_of_edited_post_keeps_later_entries_linked(
     identities, tmp_path
 ):
