@@ -94,6 +94,9 @@ export function Composer({
   // to report (peer offline) is swallowed, never a composer error.
   const lastTypingSentRef = useRef(0);
   const typingActiveRef = useRef(false);
+  // At most one `start` request in flight: a slow typing POST must not
+  // pile up behind the next keystroke's. `stop` is never held back.
+  const startInFlightRef = useRef(false);
   function reportTyping(state: "start" | "stop") {
     if (!onTyping) return;
     if (state === "start") {
@@ -104,14 +107,34 @@ export function Composer({
       ) {
         return;
       }
+      if (startInFlightRef.current) return;
       typingActiveRef.current = true;
       lastTypingSentRef.current = now;
+      startInFlightRef.current = true;
+      void onTyping(state)
+        .catch(() => undefined)
+        .finally(() => {
+          startInFlightRef.current = false;
+        });
+      return;
     } else {
       if (!typingActiveRef.current) return;
       typingActiveRef.current = false;
     }
     void onTyping(state).catch(() => undefined);
   }
+
+  // A conversation switch (target or mode) ends typing in the old one.
+  // The cleanup runs with the previous render's closure, so its stop
+  // reaches the old conversation's handler, and resetting the throttle
+  // lets the new conversation's first keystroke send `start` at once.
+  useEffect(() => {
+    return () => {
+      reportTyping("stop");
+      lastTypingSentRef.current = 0;
+    };
+    // reportTyping reads only refs and the onTyping of this render.
+  }, [target, mode]);
 
   const custom = mode === "custom" || (peers.length === 0 && mode !== "group");
   const groupMode = mode === "group";

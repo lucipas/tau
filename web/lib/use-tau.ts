@@ -177,10 +177,13 @@ export function fileToBase64(file: File): Promise<string> {
 // reconcile.
 const ALLOWLIST_WRITE_TIMEOUT_MS = 30000;
 
-// Typing entries expire after the server TTL (8s) plus 1s of slack:
-// a `start` older than this is dropped, whether it arrived live or
-// was replayed to a client that reconnected.
+// Typing entries expire after the server TTL (8s) plus 1s of slack,
+// measured from when this console received them.
 const TYPING_TTL_SECONDS = 9;
+
+// A typing POST is abandoned after this long; typing is re-sent every
+// few seconds anyway, so a late one is not worth holding a connection.
+const TYPING_REQUEST_TIMEOUT_MS = 3000;
 
 export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
@@ -682,16 +685,13 @@ export function useTau() {
 
     const onTyping = (payload: TypingEvent | null) => {
       if (!payload?.conversation || !payload?.peer) return;
-      // A replayed event (a client that reconnected and re-read the
-      // bus) can carry a `start` older than the TTL: it must not
-      // resurrect an indicator the sender already stopped.
-      if (Date.now() / 1000 - (payload.received_at ?? 0) > TYPING_TTL_SECONDS) {
-        return;
-      }
+      // Typing is live-only (never replayed), so this event is fresh on
+      // arrival. Expiry runs off the browser's own clock at arrival,
+      // not the node's `received_at`, which assumes the two clocks agree.
       const entry: TypingEntry = {
         peer: payload.peer,
         name: payload.name || payload.peer.slice(0, 8),
-        receivedAt: payload.received_at ?? Date.now() / 1000,
+        receivedAt: Date.now() / 1000,
       };
       setTyping((previous) => {
         const current = previous[payload.conversation] ?? [];
@@ -2556,8 +2556,14 @@ export function useTau() {
     ) => {
       // Best effort by design: a typing event that cannot be
       // delivered now (peer offline) is stale already, and the
-      // composer swallows the failure instead of showing an error.
-      return apiPost<{ ok: boolean }>("/api/typing", { ...target, state });
+      // composer swallows the failure instead of showing an error. The
+      // bound is short: a typing POST can wait on an offline peer, and
+      // a hung one must not hold a browser connection the send needs.
+      return apiPost<{ ok: boolean }>(
+        "/api/typing",
+        { ...target, state },
+        AbortSignal.timeout(TYPING_REQUEST_TIMEOUT_MS),
+      );
     },
     [],
   );
@@ -2872,6 +2878,10 @@ export function useTau() {
     refreshAllowlist,
     addAllowlistPeer,
     removeAllowlistPeer,
+    setAllowlistEnabled,
+  };
+}
+owlistPeer,
     setAllowlistEnabled,
   };
 }

@@ -493,6 +493,28 @@ class EventBus:
                 log.debug("Dropping event for a slow subscriber")
         return payload
 
+    def publish_live(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Fan out an ephemeral event to current subscribers, without replay.
+
+        The id is assigned as in :meth:`publish`, so ids stay monotonic,
+        but the event is not kept in the bounded replay history: frequent
+        ephemeral events (typing refreshes) must not evict durable events
+        a reconnecting client still needs.
+        """
+        with self._lock:
+            if self._closed:
+                return event
+            payload = dict(event)
+            payload["id"] = self._next_id
+            self._next_id += 1
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            try:
+                subscriber.put_nowait(payload)
+            except queue.Full:
+                log.debug("Dropping event for a slow subscriber")
+        return payload
+
     def replay(self, since: int = 0) -> List[Dict[str, Any]]:
         with self._lock:
             return [event for event in self._events if event["id"] > since]
@@ -1042,8 +1064,9 @@ class WebBridge:
 
         node.on_reaction = _on_reaction
 
-        # Typing events are ephemeral: nothing is recorded, the event
-        # just reaches the live console through the bus.
+        # Typing events are ephemeral: nothing is recorded, and they are
+        # not kept in the replay history either, so refreshes cannot push
+        # durable events out of it. They reach only the live console.
         previous_on_typing = getattr(node, "on_typing", None)
 
         def _on_typing(event: Dict[str, Any]) -> None:
@@ -1051,7 +1074,7 @@ class WebBridge:
                 if callable(previous_on_typing):
                     previous_on_typing(event)
             finally:
-                self.bus.publish({"type": "typing", **event})
+                self.bus.publish_live({"type": "typing", **event})
 
         node.on_typing = _on_typing
 
@@ -8574,6 +8597,11 @@ def _valid_schedule_in(value: Any) -> bool:
     return math.isfinite(seconds) and 0 < seconds <= MAX_SCHEDULED_POST_DELAY
 
 
+# Bound for one typing POST: the link setup inside it is the slow part, and
+# a typing event is stale once it is late, so it gets a short fixed budget.
+_TYPING_TIMEOUT_SECONDS = 5.0
+
+
 def _clamped_timeout(value: Any, default: float) -> float:
     """Clamp a request ``timeout`` to [1.0, 120.0] seconds.
 
@@ -10836,7 +10864,6 @@ class _WebHandler(BaseHTTPRequestHandler):
         peer = body.get("peer")
         group = body.get("group")
         state = body.get("state")
-        timeout = body.get("timeout", 20.0)
         if state not in ("start", "stop"):
             self._send_json(
                 {"error": {"message": "field 'state' must be 'start' or 'stop'"}},
@@ -10865,13 +10892,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
-        timeout = _clamped_timeout(timeout, 20.0)
         try:
+            # Typing is live-only and fired every few seconds: a short fixed
+            # bound, not the user-facing clamp, so a stalled link cannot tie
+            # up the browser's connection pool for tens of seconds.
             result = self.bridge.typing(
                 peer=peer.strip() if isinstance(peer, str) else None,
                 group=group.strip() if isinstance(group, str) else None,
                 state=state,
-                timeout=timeout,
+                timeout=_TYPING_TIMEOUT_SECONDS,
             )
         except ValueError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
