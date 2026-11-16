@@ -14,6 +14,8 @@ encrypted Reticulum ``Link``:
     /tau/peers    -> ask a peer which peers it has heard from; the answer
                     carries each peer's public key, so the receiver can verify
                     the key derives the reported destination hash (peer exchange)
+    /tau/typing   -> ephemeral typing indicator for a DM or a group;
+                    live-only, never queued or stored
 
 Payloads are JSON encoded as UTF-8 and deliberately size limited: a compromised
 or buggy peer must not be able to make us buffer large amounts of data.
@@ -104,6 +106,7 @@ REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
 REQUEST_GROUP_MESSAGE = "/tau/group"
+REQUEST_TYPING = "/tau/typing"
 REQUEST_PATHS = (
     REQUEST_PING,
     REQUEST_INFO,
@@ -117,6 +120,7 @@ REQUEST_PATHS = (
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
     REQUEST_GROUP_MESSAGE,
+    REQUEST_TYPING,
 )
 
 # Group DMs: a fixed roster, carried in every group message so a
@@ -739,6 +743,78 @@ def reaction_unsigned_bytes(raw: Any) -> bytes:
     payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
     unsigned = {key: value for key, value in payload.items() if key != "sig"}
     return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
+
+
+# Typing indicators: a live "peer is composing" hint, deliberately
+# unsigned and ephemeral.  Attribution comes from the link itself —
+# the request arrives over the sender's encrypted link, so the
+# receiver keys the indicator on the link identity and no signature
+# is needed.  A typing event is never queued, stored, or forwarded:
+# if no live link exists when it is sent, it is simply lost.
+TYPING_STATES = frozenset({"start", "stop"})
+# How long a peer counts as typing after their last "start" without a
+# "stop": the sender re-sends "start" while still typing, so a stale
+# indicator clears itself even when the "stop" is lost.
+TYPING_TTL_SECONDS = 8.0
+
+
+def typing_dict(
+    state: str,
+    *,
+    group: Optional[str] = None,
+    sent_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    """The ``/tau/typing`` payload as a dict.
+
+    ``group`` names the group being typed in (a group id hex hash);
+    without it the typing is in the DM with the sender, whose
+    identity the receiver already knows from the link.
+    """
+    if state not in TYPING_STATES:
+        raise ProtocolError("typing state must be 'start' or 'stop'")
+    payload: Dict[str, Any] = {
+        "type": "typing",
+        "v": PROTOCOL_VERSION,
+        "state": state,
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "client": f"tau/{__version__}",
+    }
+    if group is not None:
+        payload["group"] = _clean_hexhash(group, "group")
+    return payload
+
+
+def encode_typing(
+    state: str,
+    *,
+    group: Optional[str] = None,
+    sent_at: Optional[float] = None,
+) -> bytes:
+    """Encode a typing event for the ``/tau/typing`` request."""
+    return encode(
+        typing_dict(state, group=group, sent_at=sent_at),
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_typing(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/typing`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "typing":
+        raise ProtocolError("expected a typing payload")
+    state = payload.get("state")
+    if state not in TYPING_STATES:
+        raise ProtocolError("typing state must be 'start' or 'stop'")
+    group = payload.get("group")
+    if group is not None:
+        # Unlike a reaction's advisory group context, the group here
+        # is the address: a malformed one names no conversation, so
+        # the event is rejected instead of delivered to the wrong one.
+        group = _clean_hexhash(group, "group")
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+    return {"state": state, "group": group, "sent_at": sent_at}
 
 
 def retract_dict(

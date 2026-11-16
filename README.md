@@ -714,6 +714,20 @@ reaction whose target this node has never seen is still stored (the target
 may arrive later over a relay), but it is only rendered under a message the
 inbox actually holds.
 
+### Typing indicators
+
+A typing event (`/tau/typing`) is a live "peer is composing" hint, not a
+message: `tau typing start --to alice` tells Alice you are typing, `tau
+typing stop --to alice` tells her you stopped, and `--group NAME|ID` types
+in a group instead of a DM. The web console sends these from the composer
+automatically and shows "Alice is typing…" under the conversation. The
+event is deliberately unsigned — attribution comes from the link itself,
+since the request arrives over the sender's encrypted link — and
+ephemeral: it is never queued, stored, or forwarded, so if no live link
+exists when it is sent it is simply lost. A peer counts as typing for 8
+seconds after their last `start` without a `stop`; a `stop`, a timeout,
+or an incoming message from that peer clears the indicator.
+
 ### DM retracts
 
 `tau retract <message-id>` takes back a message you sent: it sends a

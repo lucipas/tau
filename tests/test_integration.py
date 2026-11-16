@@ -1681,6 +1681,111 @@ def test_two_nodes_exchange_dm_reactions(tmp_path: Path) -> None:
         stop_process(bob_server)
 
 
+def test_two_nodes_exchange_typing_indicators(tmp_path: Path) -> None:
+    # Typing is live-only: the event travels over the link and is
+    # answered by the peer's handler, so a 200 proves the round trip.
+    alice_port = free_port()
+    bob_port = free_port()
+    alice_http = free_port()
+    bob_http = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(alice_dir),
+                "--name",
+                "alice",
+                "--tcp-listen",
+                f"127.0.0.1:{alice_port}",
+                "--tcp-connect",
+                f"127.0.0.1:{bob_port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    alice_hash = alice_init["destination"]
+    bob_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(bob_dir),
+                "--name",
+                "bob",
+                "--tcp-listen",
+                f"127.0.0.1:{bob_port}",
+                "--tcp-connect",
+                f"127.0.0.1:{alice_port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    bob_hash = bob_init["destination"]
+
+    alice_out = tmp_path / "alice.out"
+    alice_err = tmp_path / "alice.err"
+    bob_out = tmp_path / "bob.out"
+    bob_err = tmp_path / "bob.err"
+    alice_server = start_serve(
+        alice_dir, alice_out, alice_err, "--http", f"127.0.0.1:{alice_http}"
+    )
+    bob_server = start_serve(
+        bob_dir, bob_out, bob_err, "--http", f"127.0.0.1:{bob_http}"
+    )
+    try:
+        assert wait_for_text(alice_out, '"ready"', timeout=60), alice_err.read_text()
+        assert wait_for_text(bob_out, '"ready"', timeout=60), bob_err.read_text()
+        # Let the two serving nodes exchange announces before sending.
+        time.sleep(5.0)
+
+        status, started = _console_request(
+            alice_http,
+            "/api/typing",
+            method="POST",
+            body={"peer": bob_hash, "state": "start"},
+        )
+        assert status == 200, started
+        assert started["ok"] is True
+        assert started["state"] == "start"
+
+        status, stopped = _console_request(
+            alice_http,
+            "/api/typing",
+            method="POST",
+            body={"peer": bob_hash, "state": "stop"},
+        )
+        assert status == 200, stopped
+        assert stopped["state"] == "stop"
+
+        # The other direction works too.
+        status, started = _console_request(
+            bob_http,
+            "/api/typing",
+            method="POST",
+            body={"peer": alice_hash, "state": "start"},
+        )
+        assert status == 200, started
+
+        # Live-only: an unknown peer has no link, so the event fails
+        # instead of queueing.
+        status, failed = _console_request(
+            alice_http,
+            "/api/typing",
+            method="POST",
+            body={"peer": "00" * 16, "state": "start"},
+        )
+        assert status == 502, failed
+    finally:
+        stop_process(alice_server)
+        stop_process(bob_server)
+
+
 def _wait_for_inbox_text(
     data_dir: Path, message_id: str, text: str, *, timeout: float = 60.0
 ):

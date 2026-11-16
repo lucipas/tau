@@ -47,6 +47,8 @@ function tauState(groups: TauGroup[], peers: Peer[] = []) {
     messages: [],
     unread: { per_peer: {}, per_group: {}, total: 0 },
     restoredUnread: null,
+    typing: {},
+    sendTyping: vi.fn(),
     outbox: [],
     heldForOthers: 0,
     bridge: null,
@@ -758,5 +760,48 @@ describe("Console tabs", () => {
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(isShown(screen.queryByText("hello queued"))).toBe(false);
+  });
+});
+
+describe("Console typing indicator", () => {
+  it("shows who is typing in the open group", async () => {
+    const crew = makeGroup("a".repeat(32), "crew");
+    mockedUseTau.mockReturnValue({
+      ...tauState([crew]),
+      typing: {
+        [`group:${crew.id}`]: [
+          {
+            peer: "ab".repeat(16),
+            name: "alice",
+            receivedAt: Date.now() / 1000,
+          },
+        ],
+      },
+    });
+    render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByText("alice is typing…")).toBeTruthy(),
+    );
+  });
+
+  it("hides the indicator for another conversation", async () => {
+    const crew = makeGroup("a".repeat(32), "crew");
+    mockedUseTau.mockReturnValue({
+      ...tauState([crew]),
+      typing: {
+        ["ab".repeat(16)]: [
+          {
+            peer: "ab".repeat(16),
+            name: "alice",
+            receivedAt: Date.now() / 1000,
+          },
+        ],
+      },
+    });
+    render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("crew · 2 members")).toBeTruthy(),
+    );
+    expect(screen.queryByText(/is typing/)).toBeNull();
   });
 });

@@ -433,6 +433,36 @@ def test_parse_reaction_rejects_wrong_shape():
         )
 
 
+def test_typing_roundtrip():
+    from tau.protocol import encode_typing, parse_typing
+
+    parsed = parse_typing(encode_typing("start", sent_at=123.0))
+    assert parsed == {"state": "start", "group": None, "sent_at": 123.0}
+
+
+def test_typing_group_roundtrip():
+    from tau.protocol import encode_typing, parse_typing
+
+    parsed = parse_typing(encode_typing("stop", group="ab" * 16))
+    assert parsed["state"] == "stop"
+    assert parsed["group"] == "ab" * 16
+
+
+def test_typing_rejects_bad_state_and_shape():
+    from tau.protocol import encode_typing, parse_typing
+
+    with pytest.raises(ProtocolError):
+        encode_typing("maybe")
+    with pytest.raises(ProtocolError):
+        parse_typing(encode({"type": "message", "text": "hi"}))
+    with pytest.raises(ProtocolError):
+        parse_typing(encode({"type": "typing", "state": "maybe"}))
+    with pytest.raises(ProtocolError):
+        parse_typing(
+            encode({"type": "typing", "state": "start", "group": "not-a-hash"})
+        )
+
+
 def test_reaction_signature_roundtrip():
     from tau.protocol import encode_reaction, parse_reaction
 

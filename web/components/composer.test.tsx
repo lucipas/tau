@@ -366,3 +366,43 @@ describe("Composer disappearing default", () => {
     expect(screen.getByText("never")).toBeTruthy();
   });
 });
+
+describe("Composer typing", () => {
+  function renderTypingComposer(
+    onTyping: (state: "start" | "stop") => Promise<void>,
+  ) {
+    render(
+      <Composer
+        peers={peers}
+        groups={groups}
+        target={PEER_HASH}
+        mode="peer"
+        onTargetChange={() => {}}
+        onModeChange={() => {}}
+        onSend={vi.fn()}
+        onSendGroup={vi.fn()}
+        onTyping={onTyping}
+      />,
+    );
+    return screen.getByPlaceholderText("Write something to the mesh…");
+  }
+
+  it("reports start on the first keystroke and stop when the text empties", () => {
+    const onTyping = vi.fn().mockResolvedValue(undefined);
+    const textarea = renderTypingComposer(onTyping);
+    fireEvent.change(textarea, { target: { value: "h" } });
+    expect(onTyping).toHaveBeenCalledWith("start");
+    expect(onTyping).toHaveBeenCalledTimes(1);
+    fireEvent.change(textarea, { target: { value: "" } });
+    expect(onTyping).toHaveBeenCalledWith("stop");
+  });
+
+  it("reports stop on blur", () => {
+    const onTyping = vi.fn().mockResolvedValue(undefined);
+    const textarea = renderTypingComposer(onTyping);
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    expect(onTyping).toHaveBeenCalledWith("start");
+    fireEvent.blur(textarea);
+    expect(onTyping).toHaveBeenCalledWith("stop");
+  });
+});

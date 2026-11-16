@@ -478,6 +478,23 @@ export interface ReactResponse {
   id: string | null;
 }
 
+// One typing event, as it arrives on the live stream.
+export interface TypingEvent {
+  conversation: string;
+  peer: string;
+  name: string;
+  state: "start" | "stop";
+  group: string | null;
+  received_at: number;
+}
+
+// One peer currently typing in a conversation, as the console holds it.
+export interface TypingEntry {
+  peer: string;
+  name: string;
+  receivedAt: number;
+}
+
 export interface SendGroupResponse {
   ok: boolean;
   messages: TauMessage[];

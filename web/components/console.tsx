@@ -44,6 +44,15 @@ function canonicalPeerTarget(target: string, peers: Peer[]): string {
   return match ? match.destination.toLowerCase() : lowered;
 }
 
+// "Alice is typing…" / "Alice and Bob are typing…" for the
+// indicator above the composer.
+function typingLabel(typists: { name: string }[]): string {
+  const names = typists.map((typist) => typist.name);
+  if (names.length === 1) return `${names[0]} is typing…`;
+  if (names.length === 2) return `${names[0]} and ${names[1]} are typing…`;
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]} are typing…`;
+}
+
 // Peers whose conversation is not archived: the only peers the console
 // offers as send targets. An archived thread stays hidden until restored.
 function activePeersOf(
@@ -325,6 +334,16 @@ export function Console() {
     }
   }
 
+  // Peers typing in the open conversation: the hook keys typing by
+  // peer hash for a DM and `group:<id>` for a group, so the open
+  // target resolves the same way the composer sends to it.
+  const typingKey =
+    mode === "group"
+      ? `group:${target.trim()}`
+      : canonicalPeerTarget(target, tau.peers);
+  const typists =
+    target.trim() === "" ? [] : (tau.typing[typingKey] ?? []);
+
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden">
       <div className="mesh-grid pointer-events-none fixed inset-0" aria-hidden="true" />
@@ -583,6 +602,14 @@ export function Console() {
                 }
               }}
             />
+            {typists.length > 0 ? (
+              <p
+                aria-live="polite"
+                className="mt-3 px-1 font-mono text-[11px] text-mist"
+              >
+                {typingLabel(typists)}
+              </p>
+            ) : null}
             <div className="mt-4 shrink-0">
             <Composer
               peers={activePeersOf(tau.peers, tau.archivedConversations)}
@@ -595,6 +622,17 @@ export function Console() {
               onSendGroup={tau.sendGroup}
               onSendFile={tau.sendFile}
               onSendGroupFile={tau.sendGroupFile}
+              onTyping={async (state) => {
+                if (target.trim() === "") return;
+                if (mode === "group") {
+                  await tau.sendTyping({ group: target.trim() }, state);
+                } else {
+                  await tau.sendTyping(
+                    { peer: canonicalPeerTarget(target, tau.peers) },
+                    state,
+                  );
+                }
+              }}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
               disappearingDefault={

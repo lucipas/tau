@@ -420,6 +420,195 @@ def test_send_group_reaction_rejects_unknown_and_solo_groups(tmp_path):
         node.send_group_reaction(solo, "m-1", "👍")
 
 
+def _typing_node(tmp_path):
+    """A node with a destination stand-in and a known alice identity."""
+    import types
+
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    node.identity = identity
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    # A bare destination stand-in: only the hexhash is consulted, and
+    # building a live RNS destination needs a running Reticulum.
+    node.destination = types.SimpleNamespace(hexhash=own_hash)
+    alice_identity = RNS.Identity()
+    alice_destination = RNS.Destination.hash(alice_identity, APP_NAME, ASPECT)
+    alice = Peer(
+        destination_hash=alice_destination,
+        name="alice",
+        public_key=alice_identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    node.registry.upsert(
+        alice.destination_hash, alice.public_key, name="alice", now=1.0
+    )
+    return node, identity, alice_identity, alice
+
+
+def test_handle_typing_records_start_stop_and_expiry(tmp_path):
+    from tau.protocol import decode, encode_typing
+
+    node, _, alice_identity, alice = _typing_node(tmp_path)
+    events = []
+    node.on_typing = events.append
+
+    response = node._handle_typing(
+        "/tau/typing", encode_typing("start"), b"req-1", alice_identity, 1000.0
+    )
+    assert decode(response)["ok"] is True
+    assert node.typing_peers(alice.hexhash) == [alice.hexhash]
+    assert len(events) == 1
+    assert events[0]["conversation"] == alice.hexhash
+    assert events[0]["peer"] == alice.hexhash
+    assert events[0]["name"] == "alice"
+    assert events[0]["state"] == "start"
+    assert events[0]["group"] is None
+
+    response = node._handle_typing(
+        "/tau/typing", encode_typing("stop"), b"req-2", alice_identity, 1001.0
+    )
+    assert decode(response)["ok"] is True
+    assert node.typing_peers(alice.hexhash) == []
+    assert events[-1]["state"] == "stop"
+
+    # Expiry is lazy: a start without a stop clears itself after the
+    # TTL, even when no further event arrives.
+    node._note_typing(alice.hexhash, alice.hexhash, "start", now=100.0)
+    assert node.typing_peers(alice.hexhash, now=107.0) == [alice.hexhash]
+    assert node.typing_peers(alice.hexhash, now=109.0) == []
+
+
+def test_handle_typing_rejects_anonymous_and_non_member(tmp_path):
+    from tau.protocol import decode, encode_typing
+
+    node, _, alice_identity, alice = _typing_node(tmp_path)
+    group = node.groups.create(
+        "crew",
+        [alice.hexhash, node.destination.hexhash],
+        created_by=alice.hexhash,
+    )
+
+    response = node._handle_typing(
+        "/tau/typing", encode_typing("start"), b"req-1", None, 1000.0
+    )
+    assert decode(response)["error"]["code"] == "unidentified"
+
+    stranger_identity = RNS.Identity()
+    response = node._handle_typing(
+        "/tau/typing",
+        encode_typing("start", group=group["id"]),
+        b"req-2",
+        stranger_identity,
+        1000.0,
+    )
+    assert decode(response)["error"]["code"] == "not_a_member"
+
+    # A member's group typing lands under the group conversation.
+    response = node._handle_typing(
+        "/tau/typing",
+        encode_typing("start", group=group["id"]),
+        b"req-3",
+        alice_identity,
+        1000.0,
+    )
+    assert decode(response)["ok"] is True
+    assert node.typing_peers(f"group:{group['id']}") == [alice.hexhash]
+
+
+def test_incoming_message_clears_typing(tmp_path):
+    from tau.protocol import decode, encode_message
+
+    node, _, alice_identity, alice = _typing_node(tmp_path)
+    events = []
+    node.on_typing = events.append
+    node._note_typing(alice.hexhash, alice.hexhash, "start", now=time.time())
+    assert node.typing_peers(alice.hexhash) == [alice.hexhash]
+
+    response = node._handle_message(
+        "/tau/message",
+        encode_message("hi", message_id="m-1"),
+        b"req-1",
+        alice_identity,
+        1000.0,
+    )
+    assert decode(response)["ok"] is True
+    assert node.typing_peers(alice.hexhash) == []
+    assert events[-1]["state"] == "stop"
+
+
+def test_send_typing_delivers_live_only(tmp_path, monkeypatch):
+    from tau.protocol import parse_typing, REQUEST_TYPING
+
+    node, _, _, alice = _typing_node(tmp_path)
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append((peer_arg, path, payload))
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_typing("alice", "start")
+
+    assert response["ok"] is True
+    assert response["state"] == "start"
+    assert response["to"] == alice.hexhash
+    assert len(calls) == 1
+    assert calls[0][0].hexhash == alice.hexhash
+    assert calls[0][1] == REQUEST_TYPING
+    assert parse_typing(calls[0][2])["state"] == "start"
+
+    with pytest.raises(NodeError, match="typing state must be"):
+        node.send_typing("alice", "maybe")
+
+
+def test_send_group_typing_fans_out(tmp_path, monkeypatch):
+    from tau.protocol import parse_typing, REQUEST_TYPING
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append((peer_arg, path, payload))
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_typing("crew", "start")
+
+    assert response["ok"] is True
+    assert response["group"] == group["id"]
+    assert response["state"] == "start"
+    # Both members got a leg; this node never types to itself.
+    assert {r["to"] for r in response["results"]} == {
+        alice.hexhash,
+        bob.hexhash,
+    }
+    assert all(r.get("delivered") for r in response["results"])
+    assert len(calls) == 2
+    assert all(path == REQUEST_TYPING for _, path, _ in calls)
+    # One payload for every leg.
+    assert calls[0][2] == calls[1][2]
+    payload = parse_typing(calls[0][2])
+    assert payload["state"] == "start"
+    assert payload["group"] == group["id"]
+
+
+def test_send_group_typing_rejects_unknown_and_solo_groups(tmp_path):
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    with pytest.raises(ValueError, match="unknown group"):
+        node.send_group_typing("nope", "start")
+    solo = {
+        "id": "00" * 16,
+        "name": "solo",
+        "members": [node.destination.hexhash],
+        "creator": node.destination.hexhash,
+    }
+    with pytest.raises(ValueError, match="no other members"):
+        node.send_group_typing(solo, "start")
+
+
 def test_send_group_message_uses_one_send_time_for_all_legs(
     tmp_path, monkeypatch
 ):

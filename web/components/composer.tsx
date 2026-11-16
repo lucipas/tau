@@ -38,6 +38,7 @@ export function Composer({
   onSendGroup,
   onSendFile,
   onSendGroupFile,
+  onTyping,
   replyTo,
   onCancelReply,
   disappearingDefault,
@@ -69,6 +70,7 @@ export function Composer({
     group: string,
     file: File,
   ) => Promise<TauMessage[]>;
+  onTyping?: (state: "start" | "stop") => Promise<void>;
   replyTo?: TauMessage | null;
   onCancelReply?: () => void;
   disappearingDefault?: number | null;
@@ -84,6 +86,55 @@ export function Composer({
   const [file, setFile] = useState<File | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Typing reports are throttled: a `start` at most every 3s while
+  // text keeps changing, a `stop` when the text empties, the field
+  // blurs, or the message sends. The receiver expires a `start`
+  // after 8s, so a lost `stop` still clears itself — and a failure
+  // to report (peer offline) is swallowed, never a composer error.
+  const lastTypingSentRef = useRef(0);
+  const typingActiveRef = useRef(false);
+  // At most one `start` request in flight: a slow typing POST must not
+  // pile up behind the next keystroke's. `stop` is never held back.
+  const startInFlightRef = useRef(false);
+  function reportTyping(state: "start" | "stop") {
+    if (!onTyping) return;
+    if (state === "start") {
+      const now = Date.now();
+      if (
+        typingActiveRef.current &&
+        now - lastTypingSentRef.current < 3000
+      ) {
+        return;
+      }
+      if (startInFlightRef.current) return;
+      typingActiveRef.current = true;
+      lastTypingSentRef.current = now;
+      startInFlightRef.current = true;
+      void onTyping(state)
+        .catch(() => undefined)
+        .finally(() => {
+          startInFlightRef.current = false;
+        });
+      return;
+    } else {
+      if (!typingActiveRef.current) return;
+      typingActiveRef.current = false;
+    }
+    void onTyping(state).catch(() => undefined);
+  }
+
+  // A conversation switch (target or mode) ends typing in the old one.
+  // The cleanup runs with the previous render's closure, so its stop
+  // reaches the old conversation's handler, and resetting the throttle
+  // lets the new conversation's first keystroke send `start` at once.
+  useEffect(() => {
+    return () => {
+      reportTyping("stop");
+      lastTypingSentRef.current = 0;
+    };
+    // reportTyping reads only refs and the onTyping of this render.
+  }, [target, mode]);
 
   const custom = mode === "custom" || (peers.length === 0 && mode !== "group");
   const groupMode = mode === "group";
@@ -150,6 +201,7 @@ export function Composer({
       try {
         await sendFileToTarget(trimmedTarget, file);
         setFile(null);
+        reportTyping("stop");
         if (fileInputRef.current) fileInputRef.current.value = "";
         onCancelReply?.();
         textareaRef.current?.focus();
@@ -186,6 +238,7 @@ export function Composer({
         );
       }
       setText("");
+      reportTyping("stop");
       // A delay applies to one send only: the next message goes now
       // unless the picker is set again.
       setSendSeconds(null);
@@ -350,9 +403,16 @@ export function Composer({
           id="message-text"
           value={text}
           onChange={(event) => {
-            setText(event.target.value.slice(0, MAX_MESSAGE_CHARS));
+            const next = event.target.value.slice(0, MAX_MESSAGE_CHARS);
+            setText(next);
             setError(null);
+            if (next.trim()) {
+              reportTyping("start");
+            } else {
+              reportTyping("stop");
+            }
           }}
+          onBlur={() => reportTyping("stop")}
           onKeyDown={onKeyDown}
           rows={2}
           maxLength={MAX_MESSAGE_CHARS}
