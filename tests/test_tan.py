@@ -2446,6 +2446,56 @@ def test_close_poll_freezes_tally(identities, tmp_path):
     }
 
 
+def test_vote_cast_after_close_via_sync_does_not_count(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    create_vote(conn, bob, poll["hash"], 0, name="bob", now=1001)
+    create_close_poll(conn, alice, poll["hash"], name="alice", now=1002)
+
+    # A vote created after the close — hand-built, since create_vote
+    # rejects it — arrives through the sync path anyway. It must
+    # neither count nor supersede the earlier live vote, and it must
+    # not overwrite the voter's name or vote time in results.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "robert",
+        "text": "1",
+        "created_at": 1003.0,
+        "prev": head(conn, author_of(bob)),
+        "kind": "vote",
+        "target": poll["hash"],
+    }
+    digest = hash(body, previous=body["prev"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    store_post(conn, mesg, now=1004)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [1, 0]
+    assert result["total"] == 1
+    assert result["voters"][0]["option"] == 0
+    assert result["voters"][0]["name"] == "bob"
+    assert result["voters"][0]["voted_at"] == 1001.0
+    assert vote_states(conn, [poll["hash"]]) == {
+        poll["hash"]: {author_of(bob): 0}
+    }
+
+    # The timeline tally keeps the pre-close vote too.
+    posts = timeline(conn, [author_of(alice)], viewer=author_of(bob))
+    assert len(posts) == 1
+    assert posts[0]["poll"] == {
+        "options": ["Thursday", "Friday"],
+        "counts": [1, 0],
+        "total": 1,
+        "closed": True,
+        "voted": 0,
+    }
+
+
 def test_poll_options_cannot_be_edited(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
