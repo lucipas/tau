@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 
 import RNS
@@ -78,6 +79,7 @@ from tau.tangents.tan import (
     quote_counts,
     quoters,
     reaction_states,
+    record_draft_publish,
     refresh_draft_claim,
     release_draft_claim,
     repost_counts,
@@ -8091,6 +8093,139 @@ def test_cli_tan_publish_draft_refreshes_claim_during_slow_publish(
         == 0
     )
     assert attempts == [None]
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert list_drafts(conn) == []
+    finally:
+        conn.close()
+
+
+def test_drafts_migration_tolerates_concurrent_open(tmp_path):
+    db_path = tmp_path / "tan.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE drafts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "text TEXT NOT NULL, "
+            "reply_to TEXT NOT NULL DEFAULT '', "
+            "expires_in REAL, "
+            "created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO drafts(text, reply_to, expires_in, created_at) "
+            "VALUES('old draft', '', NULL, 123.0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    errors = []
+    barrier = threading.Barrier(4)
+
+    def open_it():
+        try:
+            barrier.wait(timeout=10)
+            opened = init_db(db_path)
+            try:
+                assert get_draft(opened, 1)["claimed_at"] is None
+            finally:
+                opened.close()
+        except Exception as exc:  # noqa: BLE001 - collected, asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_it) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+
+def test_cli_tan_publish_draft_rereads_after_claim(tmp_path, capsys, monkeypatch):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    # A real stored post stands in for the one a previous attempt
+    # signed, recorded on the draft before this run's first read.
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "seed post",
+            ]
+        )
+        == 0
+    )
+    seed_hash = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "stale draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        record_draft_publish(conn, draft_id, post_hash=seed_hash)
+    finally:
+        conn.close()
+    # The first draft read predates the recorded post: without a
+    # re-read after winning the claim, this run would sign a fresh
+    # post for the same draft text.
+    real_get_draft = cli_module.get_draft
+    reads = []
+
+    def stale_first_get_draft(db_conn, ref):
+        draft = real_get_draft(db_conn, ref)
+        if not reads:
+            reads.append(True)
+            draft = dict(draft)
+            draft["post_hash"] = ""
+            draft["pending_peers"] = []
+        return draft
+
+    monkeypatch.setattr(cli_module, "get_draft", stale_first_get_draft)
+
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    seen = []
+
+    def fake_publish_local_post(node, **kwargs):
+        seen.append(kwargs)
+        return {
+            "post": {"hash": seed_hash, "text": "stale draft"},
+            "published": {"delivered": 1, "peers": 1, "errors": []},
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 0
+    )
+    # The re-read sent this run down the retry path: the fake was
+    # asked to re-deliver the recorded post, never to sign a new one.
+    assert len(seen) == 1
+    assert seen[0].get("post_hash") == seed_hash
+    assert "text" not in seen[0]
     conn = init_db(data_dir / "tan.sqlite3")
     try:
         assert list_drafts(conn) == []

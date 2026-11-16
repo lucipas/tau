@@ -3806,6 +3806,12 @@ def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
     try:
         draft = get_draft(conn, args.draft)
         token = claim_draft(conn, draft["id"], ttl=DRAFT_CLAIM_TTL)
+        if token is not None:
+            # Re-read after winning the claim: a publisher that
+            # finished between the first read and the claim may have
+            # recorded a signed post, which this run must retry
+            # instead of re-signing.
+            draft = get_draft(conn, draft["id"])
     finally:
         conn.close()
     if token is None:

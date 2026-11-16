@@ -619,6 +619,23 @@ CREATE TABLE IF NOT EXISTS drafts (
 """
 
 
+def _add_draft_column(
+    conn: sqlite3.Connection, column: str, column_type: str
+) -> None:
+    """Add a column to ``drafts``, tolerating a concurrent migration.
+
+    Two processes opening the same pre-migration database can both
+    see the column missing and both try the ALTER; the loser gets
+    "duplicate column name" from SQLite, which means the column is
+    there — success, not an error.
+    """
+    try:
+        conn.execute(f"ALTER TABLE drafts ADD COLUMN {column} {column_type}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc):
+            raise
+
+
 def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     """Initialises db storage using SQLite if needed. Returns the DB object."""
     if path is None:
@@ -665,17 +682,17 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     if draft_columns and "post_hash" not in draft_columns:
         # migrate a pre-retry database: drafts could not remember
         # the signed post a partial publish had already created
-        conn.execute("ALTER TABLE drafts ADD COLUMN post_hash TEXT")
+        _add_draft_column(conn, "post_hash", "TEXT")
     if draft_columns and "pending_peers" not in draft_columns:
-        conn.execute("ALTER TABLE drafts ADD COLUMN pending_peers TEXT")
+        _add_draft_column(conn, "pending_peers", "TEXT")
     if draft_columns and "claimed_at" not in draft_columns:
         # migrate a pre-claim database: drafts could not be claimed,
         # so two concurrent publish-draft runs could sign two posts
-        conn.execute("ALTER TABLE drafts ADD COLUMN claimed_at REAL")
+        _add_draft_column(conn, "claimed_at", "REAL")
     if draft_columns and "claim_token" not in draft_columns:
         # the claim's owner token, so only the publisher that won
         # the claim can refresh or release it
-        conn.execute("ALTER TABLE drafts ADD COLUMN claim_token TEXT")
+        _add_draft_column(conn, "claim_token", "TEXT")
     # Created after the migration above: the index references columns a
     # pre-reactions database does not have yet when _SCHEMA first runs.
     conn.execute("CREATE INDEX IF NOT EXISTS posts_target ON posts(target)")
