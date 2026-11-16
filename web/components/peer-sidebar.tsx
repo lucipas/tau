@@ -1322,7 +1322,7 @@ export function PeerSidebar({
                         ) : null}
                       </form>
                     ) : peer.note ? (
-                      <p className="mt-1 break-words pl-[42px] text-[11px] leading-relaxed text-mist">
+                      <p className="mt-1 whitespace-pre-wrap break-words pl-[42px] text-[11px] leading-relaxed text-mist">
                         <span className="text-zinc-400">note: </span>
                         {peer.note}
                       </p>
