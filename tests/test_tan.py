@@ -2186,6 +2186,39 @@ def test_poll_vote_tally_latest_vote_wins(identities, tmp_path):
     }
 
 
+def test_expired_vote_does_not_supersede_live_vote(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    create_vote(conn, bob, poll["hash"], 0, name="bob", now=1001)
+
+    # A later vote that has already expired — hand-built, since
+    # create_vote never sets an expiry — must neither count nor
+    # supersede the earlier live vote.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "1",
+        "created_at": 1002.0,
+        "prev": head(conn, author_of(bob)),
+        "kind": "vote",
+        "target": poll["hash"],
+        "expires_at": 1003.0,
+    }
+    digest = hash(body, previous=body["prev"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    store_post(conn, mesg, now=1004)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [1, 0]
+    assert result["total"] == 1
+    assert result["voters"][0]["option"] == 0
+
+
 def test_create_vote_rejects_bad_targets_and_options(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -2236,6 +2269,13 @@ def test_create_vote_rejects_bad_targets_and_options(identities, tmp_path):
         tan_module._normalize_post({**base, "text": "9"})
     with pytest.raises(PostError, match="must be an option index"):
         tan_module._normalize_post({**base, "text": "one"})
+    # Unicode digits pass str.isdigit but int() rejects them: a crafted
+    # vote carrying one must fail verification cleanly (PostError), not
+    # raise a bare ValueError past the sync handler's except clause.
+    with pytest.raises(PostError, match="must be an option index"):
+        tan_module._normalize_post({**base, "text": "²"})
+    with pytest.raises(PostError, match="must be an option index"):
+        tan_module._normalize_post({**base, "text": "٣"})
 
 
 def test_poll_options_cannot_be_edited(identities, tmp_path):

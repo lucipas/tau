@@ -501,7 +501,16 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         # decimal form.  The poll itself is not consulted here — it
         # may not have arrived yet — so the range check against the
         # poll's options happens where the tally is derived.
-        if not text.isdigit() or text != str(int(text)):
+        # ``str.isdigit`` is True for Unicode digits ("²") that
+        # ``int`` rejects, so require ASCII digits first: otherwise a
+        # crafted vote raises a bare ValueError out of verification —
+        # past the ``(ProtocolError, TanError)`` catch in the sync
+        # handler — instead of a clean PostError.
+        if (
+            not text.isascii()
+            or not text.isdigit()
+            or text != str(int(text))
+        ):
             raise PostError("vote text must be an option index")
         if not 0 <= int(text) < MAX_POLL_OPTIONS:
             raise PostError(
