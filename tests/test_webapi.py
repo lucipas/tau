@@ -7043,6 +7043,7 @@ def test_tan_rules_via_api(tmp_path):
         }
         assert payload["available_kinds"] == [
             "post",
+            "poll",
             "like",
             "unlike",
             "delete",
@@ -7050,6 +7051,7 @@ def test_tan_rules_via_api(tmp_path):
             "reply",
             "edit",
             "quote",
+            "vote",
         ]
 
         # Cache the live app's ruleset first: the update below must
