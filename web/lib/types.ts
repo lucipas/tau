@@ -797,6 +797,18 @@ export interface TanReplyParent {
   muted?: boolean;
 }
 
+export interface TanPoll {
+  // Option texts in poll order.
+  options: string[];
+  // Vote count per option, in option order.
+  counts: number[];
+  // Total number of standing votes.
+  total: number;
+  // Index of the viewer's own standing vote, or null when they have
+  // not voted.
+  voted: number | null;
+}
+
 export interface TanPost {
   v: number;
   author: string;
@@ -818,6 +830,9 @@ export interface TanPost {
   reposted?: boolean;
   quotes?: number;
   own?: boolean;
+  // Poll tally, attached to poll entries by the server; absent on
+  // non-poll posts and on views that do not annotate polls.
+  poll?: TanPoll;
   saved?: boolean;
   saved_at?: number;
   pinned?: boolean;

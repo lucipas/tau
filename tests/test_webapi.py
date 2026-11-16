@@ -6902,6 +6902,128 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def test_tan_vote_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_poll, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        poll = create_poll(
+            conn,
+            identity,
+            "which day?",
+            ["Thursday", "Friday"],
+            name="tester",
+            now=1000,
+        )
+        plain = create_post(conn, identity, "not a poll", name="tester", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Voting casts a signed vote entry for the chosen option.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"target": poll["hash"][:16], "option": 1},
+        )
+        assert status == 200
+        assert payload["vote"]["kind"] == "vote"
+        assert payload["vote"]["target"] == poll["hash"]
+        assert payload["vote"]["text"] == "1"
+
+        # The timeline carries the new tally and the viewer's vote.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["which day?"]["poll"] == {
+            "options": ["Thursday", "Friday"],
+            "counts": [0, 1],
+            "total": 1,
+            "voted": 1,
+        }
+
+        # Voting again moves the vote.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"target": poll["hash"], "option": 0},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["which day?"]["poll"]["counts"] == [1, 0]
+        assert by_text["which day?"]["poll"]["voted"] == 0
+
+        # A plain post is not a poll, and bad options are rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"target": plain["hash"], "option": 0},
+        )
+        assert status == 400
+        assert "only polls can be voted on" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"target": poll["hash"], "option": 2},
+        )
+        assert status == 400
+        assert "poll has 2 options" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"target": poll["hash"], "option": "1"},
+        )
+        assert status == 400
+        assert "field 'option' must be an option index" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"target": poll["hash"]},
+        )
+        assert status == 400
+        assert "field 'option' must be an option index" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"option": 0},
+        )
+        assert status == 400
+        assert "field 'target' is required" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"target": "cd" * 32, "option": 0},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_repost_via_api(tmp_path):
     import RNS
 

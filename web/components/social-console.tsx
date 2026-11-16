@@ -354,6 +354,15 @@ export function SocialConsole({
     }
   }
 
+  async function votePoll(post: TanPost, option: number) {
+    setError(null);
+    try {
+      await tan.voteOnPoll(post.hash, option);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not vote");
+    }
+  }
+
   async function submitRepost(post: TanPost) {
     // A ref, not state: two clicks before React re-renders must not both
     // send a repost, or the second one reports the store's duplicate error.
@@ -1512,6 +1521,7 @@ export function SocialConsole({
                     loading={tan.threadLoading}
                     error={tan.threadError ?? tan.error}
                     onToggleLike={toggleLike}
+                    onVotePoll={votePoll}
                     onRepost={submitRepost}
                     onReply={(target) => setReplyTarget(target)}
                     onDelete={submitDelete}
@@ -1536,6 +1546,7 @@ export function SocialConsole({
                           key={post.hash}
                           post={post}
                           onToggleLike={toggleLike}
+                          onVotePoll={votePoll}
                           onRepost={submitRepost}
                           onToggleLikers={toggleLikers}
                           likersOpen={likersOpen === post.hash}
@@ -1610,6 +1621,7 @@ export function SocialConsole({
                           key={post.hash}
                           post={post}
                           onToggleLike={toggleLike}
+                          onVotePoll={votePoll}
                           onRepost={submitRepost}
                           onToggleSave={toggleSave}
                           onTogglePin={togglePin}
@@ -1650,6 +1662,7 @@ export function SocialConsole({
                           key={post.hash}
                           post={post}
                           onToggleLike={toggleLike}
+                          onVotePoll={votePoll}
                           onRepost={submitRepost}
                           onToggleSave={toggleSave}
                           onTogglePin={togglePin}
@@ -1687,6 +1700,7 @@ export function SocialConsole({
                         key={post.hash}
                         post={post}
                         onToggleLike={toggleLike}
+                        onVotePoll={votePoll}
                         onRepost={submitRepost}
                         onToggleSave={toggleSave}
                         onTogglePin={togglePin}
@@ -1711,6 +1725,7 @@ export function SocialConsole({
                       key={post.hash}
                       post={post}
                       onToggleLike={toggleLike}
+                      onVotePoll={votePoll}
                       onRepost={submitRepost}
                       onToggleLikers={toggleLikers}
                       likersOpen={likersOpen === post.hash}
@@ -2100,6 +2115,7 @@ function ThreadView({
   error,
   onToggleLike,
   onRepost,
+  onVotePoll,
   onReply,
   onDelete,
   onHide,
@@ -2112,6 +2128,9 @@ function ThreadView({
   error: string | null;
   onToggleLike: (post: TanPost) => void;
   onRepost: (post: TanPost) => void;
+  // Optional like onToggleLikers: views that do not wire voting render
+  // the poll tally without vote buttons.
+  onVotePoll?: (post: TanPost, option: number) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   onHide: (post: TanPost) => void;
@@ -2137,6 +2156,7 @@ function ThreadView({
             post={post}
             onToggleLike={onToggleLike}
             onRepost={onRepost}
+            onVotePoll={onVotePoll}
             onReply={onReply}
             onDelete={onDelete}
             onHide={onHide}
@@ -2420,6 +2440,7 @@ export function PostCard({
   post,
   onToggleLike,
   onRepost,
+  onVotePoll,
   onToggleLikers,
   likersOpen,
   likers,
@@ -2449,6 +2470,9 @@ export function PostCard({
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
   onRepost: (post: TanPost) => void;
+  // Optional like onToggleLikers: views that do not wire voting render
+  // the poll tally without vote buttons.
+  onVotePoll?: (post: TanPost, option: number) => void;
   // Optional so existing callers (and tests) that only exercise the
   // like toggle keep working; when absent the count button is inert.
   onToggleLikers?: (post: TanPost) => void;
@@ -2522,6 +2546,9 @@ export function PostCard({
         ? post.repost_of.text
         : ""
       : post.text;
+  // Poll tallies ride on the post from the timeline/thread annotator;
+  // a poll without one (an older cached payload) renders as plain text.
+  const poll = post.kind === "poll" ? post.poll : undefined;
   return (
     <article
       className="rounded-xl border border-line/70 bg-void/40 p-3.5"
@@ -2665,6 +2692,58 @@ export function PostCard({
                 shortHash(post.target ?? "", 16)
               )}
             </p>
+          ) : null}
+          {poll ? (
+            <div className="mt-2 space-y-1.5">
+              {poll.options.map((option, index) => {
+                const count = poll.counts[index] ?? 0;
+                const share =
+                  poll.total > 0
+                    ? Math.round((count / poll.total) * 100)
+                    : 0;
+                const mine = poll.voted === index;
+                return (
+                  <button
+                    key={`${index}-${option}`}
+                    type="button"
+                    disabled={!onVotePoll}
+                    onClick={() => onVotePoll?.(post, index)}
+                    aria-pressed={mine}
+                    title={
+                      mine
+                        ? "Your vote — pick another option to change it"
+                        : `Vote for ${option}`
+                    }
+                    className={`relative block w-full overflow-hidden rounded-lg border px-2.5 py-1.5 text-left text-[12px] transition-colors ${
+                      mine
+                        ? "border-signal/50 bg-signal/10 text-zinc-100"
+                        : "border-line/70 bg-panel/60 text-zinc-200 hover:border-signal/40"
+                    }`}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className="absolute inset-y-0 left-0 bg-signal/15"
+                      style={{ width: `${share}%` }}
+                    />
+                    <span className="relative flex items-baseline justify-between gap-2">
+                      <span className="min-w-0 break-words">
+                        {mine ? "✓ " : ""}
+                        {option}
+                      </span>
+                      <span className="shrink-0 font-mono text-[10px] text-mist/80">
+                        {count} · {share}%
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+              <p className="font-mono text-[10px] text-mist/60">
+                {poll.total} vote{poll.total === 1 ? "" : "s"}
+                {poll.voted !== null && poll.voted !== undefined
+                  ? " · you voted"
+                  : ""}
+              </p>
+            </div>
           ) : null}
           <div className="mt-2 flex flex-wrap items-center gap-2 font-mono text-[10px] text-mist/60">
             <span className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5">

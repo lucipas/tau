@@ -470,6 +470,80 @@ describe("PostCard quote rendering", () => {
   });
 });
 
+describe("PostCard poll voting", () => {
+  const pollPost = makePost({
+    kind: "poll",
+    text: "which day?",
+    poll: {
+      options: ["Thursday", "Friday"],
+      counts: [1, 2],
+      total: 3,
+      voted: 1,
+    },
+  });
+
+  function renderPoll(post: TanPost, onVotePoll: (post: TanPost, option: number) => void) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onVotePoll={onVotePoll}
+        onReply={() => {}}
+        onQuote={() => {}}
+        onDelete={vi.fn()}
+        onEdit={async () => true}
+        deleting={false}
+      />,
+    );
+  }
+
+  it("renders the options with counts, shares and the viewer's vote", () => {
+    renderPoll(pollPost, vi.fn());
+
+    expect(screen.getByTitle("Vote for Thursday")).toBeTruthy();
+    expect(screen.getByTitle("Your vote — pick another option to change it")).toBeTruthy();
+    expect(screen.getByText("1 · 33%")).toBeTruthy();
+    expect(screen.getByText("2 · 67%")).toBeTruthy();
+    expect(screen.getByText("3 votes · you voted")).toBeTruthy();
+  });
+
+  it("votes for the clicked option", () => {
+    const onVotePoll = vi.fn();
+    renderPoll(pollPost, onVotePoll);
+
+    fireEvent.click(screen.getByTitle("Vote for Thursday"));
+    expect(onVotePoll).toHaveBeenCalledTimes(1);
+    expect(onVotePoll).toHaveBeenCalledWith(pollPost, 0);
+  });
+
+  it("renders the tally without vote buttons when voting is not wired", () => {
+    render(
+      <PostCard
+        post={pollPost}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onQuote={() => {}}
+        onDelete={vi.fn()}
+        onEdit={async () => true}
+        deleting={false}
+      />,
+    );
+
+    expect(
+      (screen.getByTitle("Vote for Thursday") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(screen.getByText("3 votes · you voted")).toBeTruthy();
+  });
+
+  it("renders no options on a poll without a tally", () => {
+    renderPoll(makePost({ kind: "poll", text: "which day?" }), vi.fn());
+
+    expect(screen.queryByTitle(/Vote for/)).toBeNull();
+  });
+});
+
 describe("TanBackupSection", () => {
   const doc: TanExportDocument = {
     format: "tau-tan-export",

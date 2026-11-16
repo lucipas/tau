@@ -532,6 +532,43 @@ describe("useTan repost", () => {
   });
 });
 
+describe("useTan voteOnPoll", () => {
+  it("posts the hash and option index to /api/tan/vote and reloads the feed", async () => {
+    const poll = makePost({
+      kind: "poll",
+      text: "which day?",
+      poll: {
+        options: ["Thursday", "Friday"],
+        counts: [0, 0],
+        total: 0,
+        voted: null,
+      },
+    });
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [poll], count: 1 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([poll]));
+    const loadsBefore = mockedGet.mock.calls.length;
+
+    await act(async () => {
+      await result.current.voteOnPoll(poll.hash, 1);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/vote", {
+      target: poll.hash,
+      option: 1,
+    });
+    // The feed is reloaded after the vote, so the card shows the new
+    // tally and the viewer's standing vote.
+    expect(mockedGet.mock.calls.length).toBeGreaterThan(loadsBefore);
+  });
+});
+
 describe("useTan deletePost", () => {
   it("posts the hash to /api/tan/delete and reloads the feed", async () => {
     const mine = makePost();
