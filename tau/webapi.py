@@ -8403,6 +8403,10 @@ class WebBridge:
                 "version": __version__,
                 "web": self.web_dir is not None,
                 "url": self.url,
+                # Private notes are readable and writable only from a
+                # loopback client; the console offers note editing only
+                # when this is true.
+                "notes_editable": include_notes,
             },
             "social": {
                 "enabled": self._tan_app() is not None,

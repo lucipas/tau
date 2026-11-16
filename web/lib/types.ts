@@ -372,6 +372,9 @@ export interface BridgeInfo {
   version: string;
   web: boolean;
   url: string;
+  // True when this console may read and write private peer notes
+  // (loopback clients only). Absent on snapshots from an older bridge.
+  notes_editable?: boolean;
 }
 
 export interface Snapshot {
