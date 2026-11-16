@@ -3400,6 +3400,11 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             finally:
                 node.stop()
 
+    # Publish-draft reads this back: a draft is only consumed once
+    # every requested peer accepted the post.  It is None for
+    # --no-publish, where there is no delivery to check.
+    args._tan_post_published = published
+
     if json_output:
         _emit({"post": post, "published": published}, True)
     else:

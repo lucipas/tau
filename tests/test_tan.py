@@ -7839,3 +7839,41 @@ def test_cli_tan_publish_draft_keeps_draft_when_reply_target_gone(
     assert main(["tan", "drafts", "--data-dir", str(data_dir), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [d["id"] for d in payload["drafts"]] == [draft_id]
+
+
+def test_cli_tan_publish_draft_keeps_draft_on_partial_delivery(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "doomed draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    # The post path reports success even when a peer refuses delivery,
+    # so publish-draft must read the delivery result back and keep
+    # the draft instead of deleting it.
+    def fake_post(args):
+        args._tan_post_published = {
+            "delivered": 0,
+            "peers": 1,
+            "errors": [{"peer": "aa" * 32, "error": "no route"}],
+        }
+        return 0
+
+    monkeypatch.setattr(cli_module, "cmd_tan_post", fake_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert [d["id"] for d in list_drafts(conn)] == [draft_id]
+    finally:
+        conn.close()
