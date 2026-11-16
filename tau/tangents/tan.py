@@ -3401,7 +3401,7 @@ def _delete_entry_exists(
     return row is not None
 
 
-def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> bool:
+def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> List[str]:
     """Drop a deleted post's row — and its content-carrying traces — from the store.
 
     Removes the target row itself when it is a timeline post by
@@ -3411,10 +3411,13 @@ def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> bool:
     to surface the post; with the post gone they surface nothing).
     The signed delete entry itself is untouched: it is the tombstone
     peers sync, and the chain stays linked through it.  A delete from
-    anyone but the post's author purges nothing.  Returns whether a
-    row was removed.  The caller owns the transaction: this runs inside
-    :func:`store_post`'s insert or :func:`_promote_children`, so it
-    commits with the entry that authorised the purge.
+    anyone but the post's author purges nothing.  Returns the hashes
+    of the rows removed — the target first, then its edit rows — so
+    the caller can re-link the entries created after each of them.
+    An empty list means nothing was purged.  The caller owns the
+    transaction: this runs inside :func:`store_post`'s insert or
+    :func:`_promote_children`, so it commits with the entry that
+    authorised the purge.
 
     Every removed row is recorded in ``purged_posts`` first (see
     :func:`_record_purged`): the row's hash is gone, but the chain
@@ -3429,9 +3432,9 @@ def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> bool:
         "SELECT author, kind, name, prev FROM posts WHERE hash = ?", (target,)
     ).fetchone()
     if row is None:
-        return False
+        return []
     if str(row["author"]) != author or str(row["kind"]) not in TIMELINE_KINDS:
-        return False
+        return []
     _record_purged(
         conn, target, author, str(row["name"] or ""), str(row["prev"] or "")
     )
@@ -3441,6 +3444,7 @@ def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> bool:
         "WHERE kind = 'edit' AND target = ? AND author = ?",
         (target, author),
     ).fetchall()
+    purged = [target]
     for edit in edits:
         _record_purged(
             conn,
@@ -3449,13 +3453,14 @@ def _purge_post(conn: sqlite3.Connection, author: str, target: str) -> bool:
             str(edit["name"] or ""),
             str(edit["prev"] or ""),
         )
+        purged.append(str(edit["hash"]))
     conn.execute(
         "DELETE FROM posts WHERE kind = 'edit' AND target = ? AND author = ?",
         (target, author),
     )
     for table in ("saved_posts", "pinned_posts", "hidden_posts"):
         conn.execute(f"DELETE FROM {table} WHERE hash = ?", (target,))
-    return True
+    return purged
 
 
 def _link_children_of_purged(
@@ -3518,12 +3523,20 @@ def _apply_delete(
     waiting children; the audit and the chain walk judge the gap on
     purge evidence instead (see :func:`verify_store` and
     :func:`_chain_hashes`), so an invented gap cannot leak into
-    displayed text.  Idempotent: a second application finds nothing
-    left to purge or link.
+    displayed text.  The purge also removes the author's edit rows on
+    the post, and entries created after one of those edits point at
+    the edit as their parent — so the re-link covers each purged
+    edit's children as well, or a later entry would stay orphaned
+    behind a gap the purge created.  Idempotent: a second application
+    finds nothing left to purge or link.
     """
+    purged: List[str] = []
     if linked:
-        _purge_post(conn, author, target)
+        purged = _purge_post(conn, author, target)
     _link_children_of_purged(conn, author, target)
+    for edit_hash in purged:
+        if edit_hash != target:
+            _link_children_of_purged(conn, author, edit_hash)
 
 
 def _target_post_or_raise(
@@ -6870,15 +6883,13 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
     unlinked entry whose parent is *linked* is an inconsistency and is
     reported, as is an unlinked entry with no parent or a nonzero sequence.
 
-    A linked entry whose parent is missing is also legitimate when a
-    linked delete entry from the same author targets the parent: the
-    parent was purged when its author deleted it (see
-    :func:`_purge_post`), and the tombstone explains the gap — the
-    chain is intact apart from the deliberately removed post.  (A
-    purge record is the stronger proof — see :func:`_purged_post` —
-    but a fresh peer importing after a purge has only the tombstone:
-    the post itself never arrives, so no record is ever created for
-    it, and the gap must still be excused for the import to verify.
+    A linked entry whose parent is missing is also legitimate when
+    the parent was purged: either a linked delete entry from the
+    same author targets the parent, or a purge record covers it (see
+    :func:`_purge_post`).  The tombstone is the only proof a fresh
+    peer importing after a purge ever has — the post itself never
+    arrives, so no record is created for it — and the record is the
+    proof for a purged edit row, which no delete targets directly.
     That is also why a forged delete can excuse an invented gap
     here; the chain walk and the no-author lookups use the purge
     record instead, so the forgery cannot leak into displayed text
@@ -6898,6 +6909,9 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
     try:
         rows = conn.execute("SELECT * FROM posts").fetchall()
         head_rows = conn.execute("SELECT author, hash, seq FROM heads").fetchall()
+        purged_rows = conn.execute(
+            "SELECT author, hash FROM purged_posts"
+        ).fetchall()
     finally:
         if started and conn.in_transaction:
             conn.rollback()
@@ -6944,11 +6958,27 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
         except (PostError, ProtocolError, ValueError, TypeError, KeyError) as exc:
             _report(row, str(exc))
 
+    # A missing parent is excused when either proof covers it: a
+    # linked delete entry from the same author targeting the parent,
+    # or a purge record for the parent.  The tombstone is the only
+    # proof a fresh peer importing after a purge ever has (the post
+    # itself never arrives, so no record is created for it).  The
+    # record is the proof for a purged *edit* row: no delete targets
+    # the edit directly — the delete targets the post — but the edit's
+    # hash is recorded when it is purged, and the entry created after
+    # it must not look like a broken chain.  Either proof alone
+    # excuses the gap; that is also why a forged delete can excuse
+    # an invented gap here, and why the chain walk and the no-author
+    # lookups judge gaps on the purge record instead (see
+    # :func:`_chain_hashes` and :func:`_delete_entry_exists`), so the
+    # forgery cannot leak into displayed text or previews.
     purged_parents = {
         (str(row["author"]), str(row["target"]))
         for row in rows
         if str(row["kind"]) == KIND_DELETE
         and _int_or_none(row["linked"]) == 1
+    } | {
+        (str(row["author"]), str(row["hash"])) for row in purged_rows
     }
     for author, entries in linked_by_author.items():
         entries.sort(key=lambda item: item[1])

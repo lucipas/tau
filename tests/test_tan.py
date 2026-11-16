@@ -3381,6 +3381,215 @@ def test_delete_arriving_before_its_post_applies_on_arrival(identities, tmp_path
     assert timeline(conn, [post["author"]]) == []
 
 
+def test_forked_edit_does_not_leak_across_purge_gap(identities, tmp_path):
+    # Qodo #7 (forked edits change displayed post text): the chain
+    # walk used to bridge a purge gap by sweeping in every linked
+    # entry with a smaller sequence, so a fork sibling's edit of
+    # another retained post could replace the displayed text.  The
+    # walk now follows ``prev`` links and crosses a gap only on a
+    # recorded purge, so the fork edit is never on the retained chain.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original", name="alice", now=1000)
+    create_edit(
+        conn, alice, post["hash"], "head branch", name="alice", now=1001
+    )
+    # A second edit branched from the same parent (written on another
+    # device before it saw the first edit) shares the sequence
+    # number; it is not on the retained head chain.
+    create_edit(
+        conn, alice, post["hash"], "forked branch", name="alice", now=1002,
+        previous=post["hash"],
+    )
+    later = create_post(conn, alice, "later", name="alice", now=1003)
+    after = create_post(conn, alice, "after", name="alice", now=1004)
+    # Deleting the middle post opens a purge gap after the fork edit.
+    create_delete(conn, alice, later["hash"], name="alice", now=1005)
+
+    items = {item["hash"]: item for item in timeline(conn, [post["author"]])}
+    assert items[post["hash"]]["text"] == "head branch"
+    assert items[after["hash"]]["text"] == "after"
+    assert verify_store(conn)["ok"] is True
+
+
+def test_reoffered_edit_of_deleted_post_is_dropped(identities, tmp_path):
+    # Qodo #2 (edits of a deleted post still land on re-sync): the
+    # drop guard used to check the edit's own hash for a delete, so
+    # a re-offered edit of a purged post was stored again.  The guard
+    # now checks the edit's target, so the edit is dropped with the
+    # post it belongs to.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "gone", name="alice", now=1000)
+    edit = create_edit(
+        scratch, alice, post["hash"], "gone, fixed", name="alice", now=1001
+    )
+    delete = create_delete(scratch, alice, post["hash"], name="alice", now=1002)
+    store_post(conn, post)
+    store_post(conn, edit)
+    store_post(conn, delete)
+    assert get_post(conn, post["hash"]) is None
+    assert get_post(conn, edit["hash"]) is None
+
+    _, is_new = store_post(conn, edit)
+    assert is_new is False
+    assert get_post(conn, edit["hash"]) is None
+    _, is_new = store_post(conn, post)
+    assert is_new is False
+    assert get_post(conn, post["hash"]) is None
+
+
+def test_purge_of_edited_post_keeps_later_entries_linked(
+    identities, tmp_path
+):
+    # Qodo #3 (purging edits breaks the author's chain): deleting a
+    # post also purges the author's edit rows on it, and the entry
+    # created after one of those edits points at the edit as its
+    # parent.  The purge records each edit hash and re-links the
+    # entries created after it, and the audit excuses the gap on the
+    # record — so the later entry stays linked and the store verifies.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "v1", name="alice", now=1000)
+    edit = create_edit(
+        conn, alice, post["hash"], "v2", name="alice", now=1001
+    )
+    later = create_post(conn, alice, "after the edit", name="alice", now=1002)
+    assert get_post(conn, later["hash"])["prev"] == edit["hash"]
+    create_delete(conn, alice, post["hash"], name="alice", now=1003)
+
+    assert get_post(conn, post["hash"]) is None
+    assert get_post(conn, edit["hash"]) is None
+    assert get_post(conn, later["hash"])["linked"] == 1
+    assert timeline(conn, [post["author"]]) != []
+    assert verify_store(conn)["ok"] is True
+
+
+def test_blocked_purged_parent_name_blanked_in_previews(
+    identities, tmp_path
+):
+    # Qodo #4 (blocked authors' names appear in previews): the reply
+    # branch blanked a blocked purged parent's author but not its
+    # name, so the name leaked through the snippet.  Both the reply
+    # and the quote branches now redact author and name together.
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "blocked words", name="bob", now=1000)
+    reply = create_reply(
+        conn, alice, post["hash"], "answering", name="alice", now=1001
+    )
+    quote = create_quote(
+        conn, alice, post["hash"], "sharing", name="alice", now=1002
+    )
+    create_delete(conn, bob, post["hash"], name="bob", now=1003)
+    assert get_post(conn, post["hash"]) is None
+
+    blocked = {author_of(bob)}
+    reply_dict = get_post(conn, reply["hash"])
+    assert reply_dict is not None
+    annotate_replies(conn, [reply_dict], blocked_authors=blocked)
+    assert reply_dict["reply_to"]["author"] == ""
+    assert reply_dict["reply_to"]["name"] == ""
+    assert reply_dict["reply_to"]["blocked"] is True
+    quote_dict = get_post(conn, quote["hash"])
+    assert quote_dict is not None
+    annotate_quotes(conn, [quote_dict], blocked_authors=blocked)
+    assert quote_dict["quoted"]["author"] == ""
+    assert quote_dict["quoted"]["name"] == ""
+    assert quote_dict["quoted"]["blocked"] is True
+
+
+def test_unlinked_delete_keeps_child_waiting(identities, tmp_path):
+    # Qodo #5 (unlinked deletes advance orphaned posts): a child
+    # offered while its parent's tombstone is still unlinked used to
+    # take a linked sequence on the tombstone alone, advancing the
+    # head before the delete's chain position was established.  The
+    # missing-parent branch now requires a linked delete, so the
+    # child waits until the tombstone links.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "target", name="alice", now=1000)
+    other = create_post(scratch, alice, "other", name="alice", now=1001)
+    child = create_post(
+        scratch, alice, "child", name="alice", now=1002,
+        previous=post["hash"],
+    )
+    delete = create_delete(
+        scratch, alice, post["hash"], name="alice", now=1003,
+        previous=other["hash"],
+    )
+
+    # The delete lands first, but its own parent has not arrived, so
+    # it is unlinked; the child must not link on its say-so.
+    store_post(conn, delete)
+    assert get_post(conn, delete["hash"])["linked"] == 0
+    store_post(conn, child)
+    assert get_post(conn, child["hash"])["linked"] == 0
+    assert timeline(conn, [post["author"]]) == []
+
+
+def test_unlinked_delete_does_not_purge_cached_target(identities, tmp_path):
+    # Qodo #8 (a deleted post reappears when re-offered): an unlinked
+    # delete used to purge a cached target immediately, and the
+    # re-offered post then came back before the delete linked.  The
+    # purge now waits until the delete is linked, so the cached post
+    # stays until the delete takes its chain position — and only then
+    # is it gone for good.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "stays for now", name="alice", now=1000)
+    other = create_post(scratch, alice, "other", name="alice", now=1001)
+    delete = create_delete(
+        scratch, alice, post["hash"], name="alice", now=1002,
+        previous=other["hash"],
+    )
+
+    store_post(conn, post)
+    store_post(conn, delete)
+    assert get_post(conn, delete["hash"])["linked"] == 0
+    assert get_post(conn, post["hash"]) is not None
+    _, is_new = store_post(conn, post)
+    assert is_new is False
+    assert get_post(conn, post["hash"]) is not None
+
+    # The delete's parent arrives, the delete links, and the purge
+    # applies; the post is gone and stays gone on re-offer.
+    store_post(conn, other)
+    assert get_post(conn, delete["hash"])["linked"] == 1
+    assert get_post(conn, post["hash"]) is None
+    _, is_new = store_post(conn, post)
+    assert is_new is False
+    assert get_post(conn, post["hash"]) is None
+
+
+def test_foreign_delete_for_uncached_post_is_inert(identities, tmp_path):
+    # Qodo #9 (anyone's delete can hide or relabel replies): a delete
+    # from a foreign author for a hash this node never held used to
+    # count as proof the post was deleted, so the post was dropped
+    # when it arrived and its previews carried the forger's name.
+    # Delete lookups without an author now consult the purge record
+    # — which only the post's own author can create — so the foreign
+    # tombstone is inert and the post stores normally.
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "mine", name="alice", now=1000)
+    foreign = init_db(tmp_path / "foreign.sqlite3")
+    delete = create_delete(foreign, bob, post["hash"], name="bob", now=1001)
+
+    store_post(conn, delete)
+    with pytest.raises(TanError, match="unknown post"):
+        resolve_post(conn, post["hash"])
+
+    _, is_new = store_post(conn, post)
+    assert is_new is True
+    assert get_post(conn, post["hash"]) is not None
+    assert timeline(conn, [post["author"]]) != []
+
+
 def test_delete_rejects_tampering(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
