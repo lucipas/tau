@@ -65,6 +65,7 @@ export function PeerSidebar({
   onDismissVerification,
   onSelectPeer,
   onSetAlias,
+  onSetPeerNote,
   onCreateGroup,
   onDeleteGroup,
   onLeaveGroup,
@@ -111,6 +112,7 @@ export function PeerSidebar({
   onDismissVerification: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
   onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
+  onSetPeerNote?: (destination: string, note: string | null) => Promise<Peer>;
   onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
   onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
   onLeaveGroup?: (group: string) => Promise<LeaveGroupResponse>;
@@ -359,6 +361,61 @@ export function PeerSidebar({
       );
     } finally {
       setAliasSaving(false);
+    }
+  };
+
+  // Private notes, same shape as aliases: one editor at a time, a
+  // blank save on a peer with no note is a no-op, and the server's
+  // 500-character cap is enforced in the field too.
+  const [editingNote, setEditingNote] = useState<string | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteError, setNoteError] = useState<string | null>(null);
+  const [noteSaving, setNoteSaving] = useState(false);
+
+  const startNoteEdit = (peer: Peer) => {
+    if (noteSaving) return;
+    setEditingNote(peer.destination);
+    setNoteDraft(peer.note ?? "");
+    setNoteError(null);
+  };
+
+  const saveNote = async (event: FormEvent, peer: Peer) => {
+    event.preventDefault();
+    if (!onSetPeerNote) return;
+    const note = noteDraft.trim();
+    // Saving a blank note for a peer with no note is a no-op, not a
+    // trip to the server (which would 400: nothing to clear).
+    if (note === "" && !peer.note) {
+      setEditingNote(null);
+      return;
+    }
+    setNoteSaving(true);
+    setNoteError(null);
+    try {
+      await onSetPeerNote(peer.destination, note === "" ? null : note);
+      setEditingNote(null);
+    } catch (error) {
+      setNoteError(
+        error instanceof Error ? error.message : "could not save note",
+      );
+    } finally {
+      setNoteSaving(false);
+    }
+  };
+
+  const clearNote = async (peer: Peer) => {
+    if (!onSetPeerNote) return;
+    setNoteSaving(true);
+    setNoteError(null);
+    try {
+      await onSetPeerNote(peer.destination, null);
+      setEditingNote(null);
+    } catch (error) {
+      setNoteError(
+        error instanceof Error ? error.message : "could not clear note",
+      );
+    } finally {
+      setNoteSaving(false);
     }
   };
 
@@ -852,6 +909,7 @@ export function PeerSidebar({
                 : (unread[peer.destination] ?? 0);
               const displayName = peer.alias || peer.name || "unknown";
               const isEditingAlias = editingAlias === peer.destination;
+              const isEditingNote = editingNote === peer.destination;
               const armingBlock = confirmBlock === peer.destination;
               return (
                 <li key={peer.destination}>
@@ -955,6 +1013,18 @@ export function PeerSidebar({
                           className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
                         >
                           ✎
+                        </button>
+                      ) : null}
+                      {onSetPeerNote ? (
+                        <button
+                          type="button"
+                          onClick={() => startNoteEdit(peer)}
+                          disabled={noteSaving}
+                          aria-label={`Set note for ${displayName}`}
+                          title="Set a private note for this peer — only visible on this console"
+                          className="shrink-0 rounded-md border border-line/70 px-1.5 py-1 font-mono text-[10px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                        >
+                          note
                         </button>
                       ) : null}
                       <div className="flex shrink-0 items-center gap-1">
@@ -1194,6 +1264,68 @@ export function PeerSidebar({
                           </p>
                         ) : null}
                       </form>
+                    ) : null}
+                    {isEditingNote ? (
+                      <form
+                        className="mt-2 pl-[42px]"
+                        onSubmit={(event) => void saveNote(event, peer)}
+                      >
+                        <label
+                          className="sr-only"
+                          htmlFor={`note-${peer.destination}`}
+                        >
+                          Private note for {displayName}
+                        </label>
+                        <textarea
+                          id={`note-${peer.destination}`}
+                          value={noteDraft}
+                          maxLength={500}
+                          rows={3}
+                          autoFocus
+                          placeholder="Private note — only visible on this console"
+                          onChange={(event) =>
+                            setNoteDraft(event.target.value)
+                          }
+                          className="w-full rounded-md border border-line bg-void/60 px-2 py-1 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
+                        />
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="submit"
+                            disabled={noteSaving}
+                            className="rounded-md border border-signal/50 bg-signal/10 px-2 py-0.5 text-[11px] font-medium text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                          >
+                            {noteSaving ? "saving…" : "save"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={noteSaving}
+                            onClick={() => setEditingNote(null)}
+                            className="rounded-md border border-line/70 px-2 py-0.5 text-[11px] text-mist transition hover:text-zinc-200 disabled:opacity-50"
+                          >
+                            cancel
+                          </button>
+                          {peer.note ? (
+                            <button
+                              type="button"
+                              disabled={noteSaving}
+                              onClick={() => void clearNote(peer)}
+                              className="rounded-md border border-line/70 px-2 py-0.5 text-[11px] text-mist transition hover:text-rose-300 disabled:opacity-50"
+                            >
+                              clear note
+                            </button>
+                          ) : null}
+                        </div>
+                        {noteError ? (
+                          <p className="mt-1.5 text-[11px] leading-relaxed text-rose-300">
+                            {noteError}
+                          </p>
+                        ) : null}
+                      </form>
+                    ) : peer.note ? (
+                      <p className="mt-1 break-words pl-[42px] text-[11px] leading-relaxed text-mist">
+                        <span className="text-zinc-400">note: </span>
+                        {peer.note}
+                      </p>
                     ) : null}
                     {ping ? (
                       <p

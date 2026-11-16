@@ -68,6 +68,10 @@ function makeGroup(overrides: Partial<TauGroup> = {}): TauGroup {
 type SidebarOptions = {
   peers?: Peer[];
   onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
+  onSetPeerNote?: (
+    destination: string,
+    note: string | null,
+  ) => Promise<Peer>;
   groups?: TauGroup[];
   leftGroups?: LeftGroup[];
   ignoredGroups?: IgnoredGroupEntry[];
@@ -145,6 +149,9 @@ function renderSidebar(
   const onSetAlias =
     options.onSetAlias ??
     (async (destination: string) => makePeer({ destination }));
+  const onSetPeerNote =
+    options.onSetPeerNote ??
+    (async (destination: string) => makePeer({ destination }));
   return render(
     <PeerSidebar
       node={options.node ?? null}
@@ -183,6 +190,7 @@ function renderSidebar(
       onDismissVerification={() => {}}
       onSelectPeer={onSelectPeer}
       onSetAlias={onSetAlias}
+      onSetPeerNote={onSetPeerNote}
       onCreateGroup={options.onCreateGroup}
       onDeleteGroup={options.onDeleteGroup}
       onLeaveGroup={options.onLeaveGroup}
@@ -469,6 +477,83 @@ describe("PeerSidebar aliases", () => {
       ),
     ).toBeTruthy();
     expect(onSetAlias).toHaveBeenCalledWith("ab".repeat(16), "laptop");
+  });
+});
+
+describe("PeerSidebar peer notes", () => {
+  it("shows a saved note under the peer", () => {
+    renderSidebar({}, vi.fn(), {
+      peers: [makePeer({ note: "met at the mesh meetup" })],
+    });
+
+    expect(screen.getByText(/met at the mesh meetup/)).toBeTruthy();
+  });
+
+  it("shows no note text for a peer without one, but still offers the editor", () => {
+    renderSidebar({});
+
+    expect(screen.queryByText(/note:/)).toBeNull();
+    expect(screen.getByLabelText("Set note for alice")).toBeTruthy();
+  });
+
+  it("saves a new note through onSetPeerNote", async () => {
+    const onSetPeerNote = vi.fn(async (destination: string) =>
+      makePeer({ destination, note: "runs the relay" }),
+    );
+    renderSidebar({}, vi.fn(), { onSetPeerNote });
+
+    fireEvent.click(screen.getByLabelText("Set note for alice"));
+    fireEvent.change(screen.getByLabelText("Private note for alice"), {
+      target: { value: "runs the relay" },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    await waitFor(() =>
+      expect(onSetPeerNote).toHaveBeenCalledWith(
+        "ab".repeat(16),
+        "runs the relay",
+      ),
+    );
+  });
+
+  it("clears a note through onSetPeerNote", async () => {
+    const onSetPeerNote = vi.fn(async (destination: string) =>
+      makePeer({ destination, note: null }),
+    );
+    renderSidebar({}, vi.fn(), {
+      peers: [makePeer({ note: "met at the mesh meetup" })],
+      onSetPeerNote,
+    });
+
+    fireEvent.click(screen.getByLabelText("Set note for alice"));
+    fireEvent.click(screen.getByText("clear note"));
+
+    await waitFor(() =>
+      expect(onSetPeerNote).toHaveBeenCalledWith("ab".repeat(16), null),
+    );
+  });
+
+  it("shows the server's message when saving fails", async () => {
+    const onSetPeerNote = vi.fn(async () => {
+      throw new Error("note must be at most 500 characters (501 given)");
+    });
+    renderSidebar({}, vi.fn(), { onSetPeerNote });
+
+    fireEvent.click(screen.getByLabelText("Set note for alice"));
+    fireEvent.change(screen.getByLabelText("Private note for alice"), {
+      target: { value: "x".repeat(501) },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    expect(
+      await screen.findByText(
+        "note must be at most 500 characters (501 given)",
+      ),
+    ).toBeTruthy();
+    expect(onSetPeerNote).toHaveBeenCalledWith(
+      "ab".repeat(16),
+      "x".repeat(501),
+    );
   });
 });
 

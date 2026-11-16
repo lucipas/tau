@@ -414,6 +414,9 @@ export function Console() {
             onSetAlias={(destination, alias) =>
               tau.setPeerAlias(destination, alias)
             }
+            onSetPeerNote={(destination, note) =>
+              tau.setPeerNote(destination, note)
+            }
             onVerify={(destination) => {
               void tau.verifyPeer(destination).catch(() => undefined);
             }}

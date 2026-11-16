@@ -828,23 +828,37 @@ def test_peers_alias_endpoint_sets_lists_and_clears(bridge, node, tmp_path):
     assert payload["peer"]["alias"] is None
 
 
-def test_peers_snapshot_and_alias_response_exclude_notes(bridge, node, tmp_path):
-    """Private peer notes never reach the web console: it can be exposed
-    remotely without owner authentication, and it has no note UI yet."""
+def test_peers_notes_reach_loopback_console_only(
+    bridge, node, tmp_path, monkeypatch
+):
+    """Private peer notes reach the local console only: the console can
+    be exposed remotely without owner authentication, so a remote
+    client gets no notes in the listing or the snapshot, cannot write
+    them — and peer events and mutation replies never carry them, so a
+    remote console cannot learn one from the live stream either."""
     from tau.peers import PeerRegistry
 
     registry = _seed_alias_registry(node, tmp_path)
     registry.set_note(PEER_HASH, "met at the mesh meetup")
 
+    # Loopback (this test's real HTTP client): notes included.
     _, _, listed = _json(bridge, "/api/peers")
     entry = next(
         item
         for item in listed["peers"]
         if item["destination"] == PEER_HASH
     )
-    assert "note" not in entry
-    assert entry["alias"] is None
+    assert entry["note"] == "met at the mesh meetup"
 
+    _, _, status = _json(bridge, "/api/status")
+    entry = next(
+        item
+        for item in status["peers"]
+        if item["destination"] == PEER_HASH
+    )
+    assert entry["note"] == "met at the mesh meetup"
+
+    # The alias reply is a mutation reply, like a peer event: no note.
     status, _, payload = _json(
         bridge,
         "/api/peers/alias",
@@ -854,6 +868,88 @@ def test_peers_snapshot_and_alias_response_exclude_notes(bridge, node, tmp_path)
     assert status == 200
     assert "note" not in payload["peer"]
     assert payload["peer"]["alias"] == "laptop"
+
+    # A remote client sees no notes anywhere, and cannot write them.
+    import tau.webapi as webapi
+
+    monkeypatch.setattr(webapi, "_is_loopback_client", lambda client: False)
+    _, _, listed = _json(bridge, "/api/peers")
+    entry = next(
+        item
+        for item in listed["peers"]
+        if item["destination"] == PEER_HASH
+    )
+    assert "note" not in entry
+    _, _, status = _json(bridge, "/api/status")
+    entry = next(
+        item
+        for item in status["peers"]
+        if item["destination"] == PEER_HASH
+    )
+    assert "note" not in entry
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/note",
+        method="POST",
+        body={"destination": PEER_HASH, "note": "from afar"},
+    )
+    assert status == 403
+
+
+def test_peers_note_endpoint_sets_lists_and_clears(bridge, node, tmp_path):
+    _seed_alias_registry(node, tmp_path)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/note",
+        method="POST",
+        body={"destination": PEER_HASH, "note": "met at the mesh meetup"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["peer"]["note"] == "met at the mesh meetup"
+    assert payload["peer"]["name"] == "alice"
+
+    # The note is visible in the peer list, so the console can show it.
+    _, _, listed = _json(bridge, "/api/peers")
+    entry = next(
+        item
+        for item in listed["peers"]
+        if item["destination"] == PEER_HASH
+    )
+    assert entry["note"] == "met at the mesh meetup"
+
+    # A blank note clears it.
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/note",
+        method="POST",
+        body={"destination": PEER_HASH, "note": ""},
+    )
+    assert status == 200
+    assert payload["peer"]["note"] is None
+
+    # Clearing again has nothing to clear.
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/note",
+        method="POST",
+        body={"destination": PEER_HASH, "note": ""},
+    )
+    assert status == 400
+
+    # Unknown peers, bad shapes, and overlong notes are all 400s.
+    for body in (
+        {"destination": "ff" * 32, "note": "x"},
+        {"note": "x"},
+        {"destination": PEER_HASH},
+        {"destination": PEER_HASH, "note": 42},
+        {"destination": PEER_HASH, "note": "x" * 501},
+    ):
+        status, _, payload = _json(
+            bridge, "/api/peers/note", method="POST", body=body
+        )
+        assert status == 400, body
 
 
 def test_console_alias_edit_keeps_cli_set_note(bridge, node, tmp_path):
