@@ -800,16 +800,12 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         for row in conn.execute("PRAGMA table_info(posts)").fetchall()
     }
     if columns and "v" not in columns:  # migrate an early scaffold database
-        conn.execute("ALTER TABLE posts ADD COLUMN v INTEGER NOT NULL DEFAULT 1")
+        _add_column(conn, "posts", "v", "INTEGER NOT NULL DEFAULT 1")
     if columns and "kind" not in columns:  # migrate a pre-reactions database
-        conn.execute(
-            "ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'post'"
-        )
-        conn.execute(
-            "ALTER TABLE posts ADD COLUMN target TEXT NOT NULL DEFAULT ''"
-        )
+        _add_column(conn, "posts", "kind", "TEXT NOT NULL DEFAULT 'post'")
+        _add_column(conn, "posts", "target", "TEXT NOT NULL DEFAULT ''")
     if columns and "expires_at" not in columns:  # migrate a pre-expiry database
-        conn.execute("ALTER TABLE posts ADD COLUMN expires_at REAL")
+        _add_column(conn, "posts", "expires_at", "REAL")
     if columns and "options" not in columns:  # migrate a pre-polls database
         # A poll's options live in one JSON column on its own entry, so
         # the migration is a single ALTER, not a new table.
