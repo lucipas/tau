@@ -3597,7 +3597,11 @@ def _retry_draft_post(
         else:
             print(f"stored locally (not published) {short_hash(post['hash'])}")
         return _EXIT_OK
-    targets = getattr(args, "to", None) or draft["pending_peers"] or None
+    # An explicit --to joins the peers already owed the post instead
+    # of replacing them: a retry that only reached its new peer
+    # would otherwise drop the original peers from the draft.
+    explicit = getattr(args, "to", None) or []
+    targets = list(dict.fromkeys([*(draft["pending_peers"] or []), *explicit])) or None
     result = _deliver_stored_post(
         config,
         post,
