@@ -178,6 +178,7 @@ import os
 import queue
 import shutil
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -11957,14 +11958,20 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # Text frames from the client are a no-op: a future
                 # client message must not mutate node state unasked.
         finally:
-            stopped.set()
-            self.bridge._unregister_ws_connection(stop)
             try:
-                subscriber.put_nowait(None)
-            except queue.Full:
-                pass
-            sender.join(timeout=2.0)
-            self.bridge.bus.unsubscribe(subscriber)
+                # Shut the socket down first: this fails a sender blocked
+                # in a write to a non-reading client, so the join below
+                # does not wait on it.
+                stop()
+                self.bridge._unregister_ws_connection(stop)
+                try:
+                    subscriber.put_nowait(None)
+                except queue.Full:
+                    pass
+                if sender_started:
+                    sender.join(timeout=2.0)
+            finally:
+                self.bridge.bus.unsubscribe(subscriber)
 
     def _serve_events(self, query: Dict[str, List[str]]) -> None:
         since = _int_param(query, "since", default=0, minimum=0, maximum=2**31 - 1)
@@ -12215,6 +12222,15 @@ def _int_param(
     default: int,
     minimum: int,
     maximum: int,
+) -> int:
+    values = query.get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
 ) -> int:
     values = query.get(name)
     if not values:
