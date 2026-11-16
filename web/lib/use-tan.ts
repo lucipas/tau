@@ -24,6 +24,7 @@ import type {
   TanMutedTag,
   TanMutedTagsResponse,
   TanPost,
+  TanPollResponse,
   TanPostResponse,
   TanQuotesResponse,
   TanRepostersResponse,
@@ -1377,6 +1378,36 @@ export function useTan() {
     ],
   );
 
+  const createPoll = useCallback(
+    async (question: string, options: string[], expiresIn?: number) => {
+      // A poll is a chain entry in the store, so it invalidates an
+      // audit exactly like a post does.
+      invalidateVerify();
+      setPosting(true);
+      try {
+        const result = await apiPost<TanPollResponse>("/api/tan/poll", {
+          question,
+          options,
+          ...(expiresIn ? { expires_in: expiresIn } : {}),
+        });
+        // The poll is stored once the POST succeeds: refresh the tag
+        // list at once, independently of the feed reload below, so a
+        // failed feed refresh cannot leave a new tag out of the list.
+        // A failed refresh keeps the old list.
+        void loadTags().catch(() => undefined);
+        // The creation response is a raw signed record without the poll
+        // tally, so the feed reload supplies the entry to display. A
+        // failed reload must not reject: the poll is already committed,
+        // and a rejection would invite a retry that publishes a duplicate.
+        await load().catch(() => undefined);
+        return result.poll;
+      } finally {
+        setPosting(false);
+      }
+    },
+    [load, invalidateVerify, loadTags],
+  );
+
   const repost = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/repost", { target });
@@ -1646,6 +1677,7 @@ export function useTan() {
     like,
     unlike,
     voteOnPoll,
+    createPoll,
     repost,
     fetchLikers,
     fetchReposters,

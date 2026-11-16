@@ -7024,6 +7024,115 @@ def test_tan_vote_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_poll_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Creating a poll stores a signed poll entry on the author's chain.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={"question": "which day?", "options": ["Thursday", "Friday"]},
+        )
+        assert status == 200
+        assert payload["poll"]["kind"] == "poll"
+        assert payload["poll"]["text"] == "which day?"
+        assert payload["poll"]["options"] == ["Thursday", "Friday"]
+        poll_hash = payload["poll"]["hash"]
+
+        # The timeline carries the new poll with a zero tally, and a
+        # vote cast through the API moves it.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["which day?"]["poll"] == {
+            "options": ["Thursday", "Friday"],
+            "counts": [0, 0],
+            "total": 0,
+            "voted": None,
+        }
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/vote",
+            method="POST",
+            body={"target": poll_hash, "option": 0},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["which day?"]["poll"]["counts"] == [1, 0]
+
+        # A missing question, a non-list of options, and an option
+        # count outside 2-8 are all rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={"options": ["Thursday", "Friday"]},
+        )
+        assert status == 400
+        assert "field 'question' is required" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={"question": "which day?", "options": "Thursday"},
+        )
+        assert status == 400
+        assert "field 'options' must be a list" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={"question": "which day?", "options": ["Thursday"]},
+        )
+        assert status == 400
+        assert "a poll needs 2-8 options" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={
+                "question": "which day?",
+                "options": ["Thursday", "Thursday"],
+            },
+        )
+        assert status == 400
+        assert "duplicate poll option" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/poll",
+            method="POST",
+            body={
+                "question": "which day?",
+                "options": ["Thursday", "Friday"],
+                "expires_in": 0,
+            },
+        )
+        assert status == 400
+        assert "field 'expires_in' must be a number" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_repost_via_api(tmp_path):
     import RNS
 
