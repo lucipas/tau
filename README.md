@@ -1036,6 +1036,11 @@ unlinked, and stall sync at the gap.
   quote leaves that author's later entries (including deletes) unlinked on the
   old peer until it upgrades and resyncs. Upgrade and resync older peers before
   exchanging quotes.
+- Polls and votes are new entry kinds too: a peer running a version that predates
+  them rejects those entries, and the same hash-chain effect applies — the rejected
+  poll or vote leaves that author's later entries (including posts and deletes)
+  unlinked on the old peer until it upgrades and resyncs. Upgrade and resync older
+  peers before exchanging polls or votes.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
   Back up your own chain with `tau tan export` and restore it with
