@@ -36,6 +36,7 @@ import type {
   TanScheduleResponse,
   TanScheduledPost,
   TanScheduledResponse,
+  TanShareResponse,
   TanSuggestResponse,
   TanSuggestion,
   TanSyncResponse,
@@ -1425,6 +1426,23 @@ export function useTan() {
       refreshPinnedIfLoaded,
     ],
   );
+  // Share one post with a peer or a group: the server sends the post
+  // as an attributed DM or group message, so the feed needs no reload
+  // — the sent copy appears in the chat tab through the live feed.
+  // Exactly one of `to` and `group` is required, matching the API.
+  const sharePost = useCallback(
+    async (
+      target: string,
+      options: { to?: string; group?: string },
+    ): Promise<TanShareResponse> => {
+      return apiPost<TanShareResponse>("/api/tan/share", {
+        target,
+        ...(options.to ? { to: options.to } : {}),
+        ...(options.group ? { group: options.group } : {}),
+      });
+    },
+    [],
+  );
   // Who liked one post, newest like first. Fetched on demand when the
   // liker list is opened, not with the timeline, so the feed payload
   // stays small. Returns the whole response so the caller can tell a
@@ -1679,6 +1697,7 @@ export function useTan() {
     voteOnPoll,
     createPoll,
     repost,
+    sharePost,
     fetchLikers,
     fetchReposters,
     fetchQuoters,

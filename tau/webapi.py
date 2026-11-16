@@ -126,6 +126,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/vote     vote on a Tan poll (signed vote entry on your chain)
     POST /api/tan/poll     ask a Tan poll question (signed poll entry on your chain)
     POST /api/tan/repost   repost a post (signed repost entry on your chain)
+    POST /api/tan/share    share a post with a peer or a group (sends it as a message)
     POST /api/tan/delete   delete one of your own posts
     POST /api/tan/edit     edit one of your own posts
     POST /api/tan/follow   follow an author
@@ -3250,6 +3251,118 @@ class WebBridge:
         finally:
             conn.close()
         return app.quote(post_hash, text, publish=True)
+
+    def tan_share(
+        self,
+        target: str,
+        *,
+        to: Optional[str] = None,
+        group: Optional[str] = None,
+        timeout: float = 20.0,
+    ) -> Dict[str, Any]:
+        """Share a Tan post with a peer or into a group, from the console.
+
+        Mirrors :meth:`forward_message`: the shared text is the post
+        rendered by :func:`tau.tangents.tan.share_text` — author, text,
+        and full hash, plus a poll's options — so the recipient reads it
+        inline on any transport with no protocol change.  Delivery
+        reuses :meth:`send_message` wholesale for a peer target — or
+        :meth:`send_group_message` for a group target, fanning out one
+        leg per member.  Either way the share is a new message, so it
+        carries no expiry, kind, or reply chain from the post, and the
+        new outbound entry appears in the feed like any other send.  A
+        repost shares its original; a post by a blocked author is
+        refused, matching the CLI.  Exactly one of ``to`` and ``group``
+        is required.
+        """
+        if to is not None and (not isinstance(to, str) or not to.strip()):
+            raise ValueError("target peer is required")
+        if group is not None and (
+            not isinstance(group, str) or not group.strip()
+        ):
+            raise ValueError("target group is required")
+        if (to is None) == (group is None):
+            raise ValueError("exactly one of 'to' and 'group' is required")
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError(
+                "the Tan social feed is not enabled; run serve --social"
+            )
+        conn = self._tan_conn()
+        try:
+            from .tangents.tan import resolve_share_post, share_text
+
+            post = resolve_share_post(conn, target)
+        finally:
+            conn.close()
+        from .tangents.rules import RulesError, load_ruleset
+        from .tangents.tan import apply_display_rules
+
+        # Use the running Tan app's ruleset, like the timeline and
+        # thread: the share guard must agree with what the console
+        # shows as hidden. A rules file changed by another process
+        # without reloading the app must not let a share send a post
+        # the console still hides. The file is still read once to
+        # prove it parses: a malformed rules file fails the share
+        # instead of silently becoming "display everything".
+        try:
+            load_ruleset(getattr(self.node.config, "tan_rules_path", None))
+        except RulesError as exc:
+            raise ValueError(
+                f"cannot share: the Tan rules could not be read: {exc}"
+            ) from exc
+        if not apply_display_rules([post], app.ruleset):
+            # Like the CLI: a post the owner's display rules hide is
+            # not amplified, even by hash.
+            raise ValueError("cannot share a post hidden by your Tan display rules")
+        author = str(post.get("author") or "")
+        viewer = self._tan_viewer()
+        if author and viewer is not None and author != viewer:
+            # A post by a blocked peer must not be amplified.  An
+            # unreadable block-list fails closed, matching the CLI.
+            blocklist = getattr(self.node, "blocklist", None)
+            if blocklist is None:
+                raise ValueError("cannot share: the block-list could not be read")
+            if blocklist.is_blocked(author):
+                raise ValueError("cannot share a post by a blocked peer")
+        if viewer is not None and author == viewer:
+            label = "you"
+        else:
+            # Re-resolve the author so a newer alias wins, falling back
+            # to the name recorded when the post arrived (or the short
+            # hash) — the same order `forward_message` uses.
+            label = None
+            if author:
+                registry = getattr(self.node, "registry", None)
+                if registry is not None:
+                    try:
+                        found = registry.get(author)
+                    except Exception:  # pragma: no cover - defensive
+                        found = None
+                    if found is not None:
+                        label = found.display_name
+            if not label:
+                label = str(post.get("name") or "") or None
+            if not label:
+                label = short_hash(author) if author else "unknown"
+        shared = share_text(post, label)
+        if group is not None:
+            messages, response = self.send_group_message(
+                group.strip(), shared, timeout=timeout
+            )
+            # The aggregate ok mirrors the group-send endpoint: a
+            # refused or unqueueable leg reports False so the console
+            # can name the members who missed the message instead of
+            # closing the picker on a success flag.
+            return {
+                "ok": bool(response.get("ok", True)),
+                "messages": messages,
+                "response": response,
+            }
+        message, response = self.send_message(
+            to.strip(), shared, timeout=timeout
+        )
+        return {"ok": True, "message": message, "response": response}
 
     def tan_delete(self, target: str) -> Dict[str, Any]:
         app = self._tan_app()
@@ -10356,6 +10469,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "repost": record}, head_only)
                 return
+            if path == "/api/tan/share":
+                self._handle_tan_share(body, head_only)
+                return
             if path == "/api/tan/delete":
                 target = body.get("target") or body.get("hash")
                 if not isinstance(target, str) or not target.strip():
@@ -11286,6 +11402,75 @@ class _WebHandler(BaseHTTPRequestHandler):
         except MailboxError as exc:
             # A full outbox (or a failed queue write) surfaces with its
             # message instead of a bare 500: the forward never went out,
+            # and the user can retry once the queue drains.
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_tan_share(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target") or body.get("hash")
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        to = body.get("to")
+        group = body.get("group")
+        if to is not None and (not isinstance(to, str) or not to.strip()):
+            self._send_json(
+                {"error": {"message": "field 'to' must be a peer name"}},
+                head_only,
+                400,
+            )
+            return
+        if group is not None and (
+            not isinstance(group, str) or not group.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'group' must be a group name"}},
+                head_only,
+                400,
+            )
+            return
+        if (to is None) == (group is None):
+            self._send_json(
+                {
+                    "error": {
+                        "message": "exactly one of 'to' and 'group' is required"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        try:
+            result = self.bridge.tan_share(
+                target.strip(),
+                to=to.strip() if isinstance(to, str) else None,
+                timeout=timeout,
+                group=group.strip() if isinstance(group, str) else None,
+            )
+        except WebBridgeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except MailboxError as exc:
+            # A full outbox (or a failed queue write) surfaces with its
+            # message instead of a bare 500: the share never went out,
             # and the user can retry once the queue drains.
             self._send_json({"error": {"message": str(exc)}}, head_only, 503)
             return

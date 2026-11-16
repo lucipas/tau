@@ -12,6 +12,7 @@ import pytest
 
 from tau import cli
 from tau.config import TauConfig
+from tau.groups import GroupStore
 from tau.inbox import Inbox
 from tau.local_send import SendServer, send_server_available
 from tau.mailbox import Mailbox
@@ -24,6 +25,7 @@ class _FakeRunningNode:
     def __init__(self, config, behaviour=None, deliver_on_flush=False):
         self.config = config
         self.mailbox = Mailbox(config.mailbox_path)
+        self.groups = GroupStore(config.groups_path)
         self.behaviour = behaviour or {}
         self.deliver_on_flush = deliver_on_flush
         self.calls: list = []
@@ -52,6 +54,49 @@ class _FakeRunningNode:
             self.mailbox.record_sent(entry.id, to=b"\xbb" * 16, text=text)
             return {"ok": True, "queued": True, "id": entry.id, "to": entry.to_hex}
         return {"ok": True, "echo": text, "_rtt": 0.05}
+
+    def send_group_message(self, group, text, **kwargs):
+        group_id = group.get("id") if isinstance(group, dict) else group
+        self.calls.append(("group_send", group_id, text))
+        mode = self.behaviour.get("group_send", "delivered")
+        if mode == "queued":
+            entry = self.mailbox.enqueue(
+                to=b"\xbb" * 16,
+                text=text,
+                message_id=f"{len(self.calls):032x}",
+            )
+            self.mailbox.record_sent(entry.id, to=b"\xbb" * 16, text=text)
+            return {
+                "group": group_id,
+                "name": "weekend",
+                "results": [
+                    {
+                        "to": "bb" * 16,
+                        "to_name": "alice",
+                        "queued": True,
+                        "id": entry.id,
+                    }
+                ],
+            }
+        return {
+            "group": group_id,
+            "name": "weekend",
+            "results": [
+                {
+                    "to": "ab" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "id": "g-1",
+                }
+            ],
+        }
+
+    def wait_for_delivery(self, message_id, timeout=0.0):
+        if self.behaviour.get("wait_delivers"):
+            self.mailbox.record_delivered(message_id)
+            self.mailbox.remove_outbox(message_id)
+            return True
+        return False
 
     def send_retraction(self, target, message_id, **kwargs):
         self.calls.append(("retract", target, message_id))
@@ -548,6 +593,75 @@ def test_dispatch_group_ops_accept_leg_timeout(tmp_path):
         leg_timeout=5.0,
     )
     assert result["ok"] is True
+
+
+def test_dispatch_group_send_runs_on_the_serving_node(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    group = GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    result = cli._dispatch_local_send(
+        node,
+        op="group_send",
+        group="weekend",
+        text="shared post",
+        leg_timeout=5.0,
+    )
+    assert result["results"][0]["delivered"] is True
+    assert node.calls == [("group_send", group["id"], "shared post")]
+
+
+def test_dispatch_group_send_reconciles_queued_legs_on_flush(tmp_path):
+    # A queued leg the flush delivers reports delivered, via the sent
+    # record — the serving node runs without a delivery callback.
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(
+        config, behaviour={"group_send": "queued"}, deliver_on_flush=True
+    )
+    result = cli._dispatch_local_send(
+        node, op="group_send", group="weekend", text="shared post"
+    )
+    assert result["results"][0]["delivered"] is True
+    assert result["results"][0].get("queued") is False
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_group_send_uses_running_node(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    server = SendServer(
+        data_dir, lambda **request: cli._dispatch_local_send(node, **request)
+    )
+    try:
+        assert send_server_available(data_dir)
+        _FakeLocalNode.instances.clear()
+        monkeypatch.setattr(cli, "TauNode", _FakeLocalNode)
+        assert (
+            cli.main(
+                ["group", "send", "--data-dir", str(data_dir), "weekend", "hello"]
+            )
+            == 0
+        )
+        # No one-shot node started: the serving node carried the send.
+        assert _FakeLocalNode.instances == []
+        assert node.calls == [
+            ("group_send", node.groups.find("weekend")["id"], "hello")
+        ]
+        assert "delivered to alice" in capsys.readouterr().out
+    finally:
+        server.stop()
+    assert not server.path.exists()
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")

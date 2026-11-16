@@ -92,6 +92,7 @@ from tau.tangents.tan import (
     resolve_author,
     resolve_post,
     resolve_muted_name,
+    resolve_share_post,
     max_seq,
     mentions,
     mute,
@@ -105,6 +106,7 @@ from tau.tangents.tan import (
     save_draft,
     saved_posts,
     search_posts,
+    share_text,
     store,
     store_post,
     DRAFT_CLAIM_TTL,
@@ -7985,6 +7987,79 @@ def test_resolve_post_rejects_expired_post(identities, tmp_path):
         resolve_post(conn, post["hash"])
     with pytest.raises(TanError, match="has expired"):
         resolve_post(conn, post["hash"][:12])
+
+
+def test_share_text_carries_author_text_and_hash(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "hello mesh", name="alice", now=1000)
+    shared = share_text(post, "alice")
+    assert shared == (
+        f"Shared Tan post by alice:\nhello mesh\n(tan {post['hash']})"
+    )
+
+
+def test_share_text_poll_carries_question_and_options(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "best colour?", ["red", "blue"], name="alice", now=1000
+    )
+    shared = share_text(poll, "you")
+    assert shared == (
+        "Shared Tan poll by you:\nbest colour?\n1. red\n2. blue\n"
+        f"(tan {poll['hash']})"
+    )
+
+
+def test_share_text_truncates_body_to_the_message_limit(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "x" * MAX_MESSAGE_CHARS, name="alice", now=1000)
+    shared = share_text(post, "alice")
+    assert len(shared) <= MAX_MESSAGE_CHARS
+    assert shared.endswith(f"(tan {post['hash']})")
+    assert "…" in shared
+
+
+def test_resolve_share_post_shares_the_original_not_the_repost(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    original = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+    repost = create_repost(conn, bob, original["hash"], name="bob", now=1001)
+    assert resolve_share_post(conn, repost["hash"])["hash"] == original["hash"]
+    assert resolve_share_post(conn, original["hash"][:12])["hash"] == original["hash"]
+    with pytest.raises(TanError, match="unknown post"):
+        resolve_share_post(conn, "cd" * 32)
+
+
+def test_resolve_share_post_shares_the_latest_edit(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    original = create_post(conn, alice, "original wording", name="alice", now=1000)
+    create_edit(conn, alice, original["hash"], "revised wording", name="alice", now=1001)
+    # Direct share and share of a repost both carry the revision Tan
+    # views display — never the pre-edit wording.
+    shared = resolve_share_post(conn, original["hash"])
+    assert shared["text"] == "revised wording"
+    assert share_text(shared, "alice") == (
+        f"Shared Tan post by alice:\nrevised wording\n(tan {original['hash']})"
+    )
+    repost = create_repost(conn, bob, original["hash"], name="bob", now=1002)
+    assert resolve_share_post(conn, repost["hash"])["text"] == "revised wording"
+
+
+def test_resolve_share_post_refuses_an_unlinked_post(identities, tmp_path):
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+    conn = init_db(tmp_path / "tan.sqlite3")
+    store_post(conn, second)
+    with pytest.raises(TanError, match="not linked yet"):
+        resolve_share_post(conn, second["hash"])
 
 
 def test_thread_hides_expired_reply_and_rejects_expired_root(identities, tmp_path):

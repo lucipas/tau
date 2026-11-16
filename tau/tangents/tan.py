@@ -3186,6 +3186,66 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     raise TanError(f"unknown post: {ref!r}")
 
 
+def resolve_share_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
+    """Resolve a post reference to the post a share sends.
+
+    A repost carries no text of its own, so sharing one shares its
+    original instead — the share attributes the original's author, not
+    the reposter.  Follows the repost chain defensively (creation
+    refuses a repost of a repost, but an old chain is followed rather
+    than trusted).
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked", True):
+        raise TanError(f"post is not linked yet: {ref!r}")
+    hops = 0
+    while post.get("kind") == KIND_REPOST:
+        target = post.get("target") or ""
+        if not target:
+            raise TanError(f"repost has no original: {ref!r}")
+        hops += 1
+        if hops > 8:
+            raise TanError(f"repost chain too deep: {ref!r}")
+        post = resolve_post(conn, target)
+        if not post.get("linked", True):
+            raise TanError(f"post is not linked yet: {ref!r}")
+    # Share the author's latest edit, matching what Tan views display.
+    return annotate_edits(conn, [post])[0]
+
+
+def share_text(post: Dict[str, Any], label: str) -> str:
+    """Render a stored post as the text of a DM or group message sharing it.
+
+    The shared copy is an ordinary message — no protocol change — so the
+    recipient reads the post inline even when their node never saw it,
+    and the full hash lets them open the thread (``tau tan thread``) or
+    vote (``tau tan vote``) once they have it.  A poll carries its
+    options with the question.
+
+    The body is truncated to fit ``MAX_MESSAGE_CHARS``: a post may use
+    the whole budget itself, so the attribution header and hash footer
+    would otherwise push the share over the DM limit.  The hash stays
+    intact, so nothing is lost — the recipient can fetch the full text.
+    """
+    kind = post.get("kind") or KIND_POST
+    header = (
+        f"Shared Tan poll by {label}:"
+        if kind == KIND_POLL
+        else f"Shared Tan post by {label}:"
+    )
+    options = ""
+    if kind == KIND_POLL:
+        choices = _decode_options(post.get("options"))
+        options = "".join(f"\n{i + 1}. {choice}" for i, choice in enumerate(choices))
+    footer = f"\n(tan {post['hash']})"
+    fixed = len(header) + 1 + len(options) + len(footer)
+    body = str(post.get("text") or "")
+    budget = MAX_MESSAGE_CHARS - fixed
+    if len(body) > budget:
+        body = body[: max(0, budget - 1)] + "…"
+    return f"{header}\n{body}{options}{footer}"
+
+
 def resolve_delete_target(conn: sqlite3.Connection, ref: str) -> str:
     """Resolve a delete target to a post hash.
 
