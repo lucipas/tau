@@ -38,6 +38,19 @@ liked, and can be deleted by their own author.  A reply whose parent has
 not arrived yet is stored anyway; the timeline shows it without a parent
 snippet until the parent is cached.
 
+A poll is a top-level entry like a post, but it carries a question and a
+fixed list of options: it is written by the *asker* onto their own chain
+with ``kind`` ``"poll"`` and the options signed alongside the question,
+so a relay cannot swap them.  A vote is a targeted entry like a
+reaction, written by the *voter* onto their own chain with ``kind``
+``"vote"``, ``target`` set to the poll's hash, and the chosen option's
+index as its text.  One standing vote per voter per poll decides the
+tally — voting again changes your vote, the same way the latest
+like/unlike entry decides a like.  Polls appear in the timeline, can be
+replied to, liked and deleted like posts, and their tallies are derived
+from stored votes, never stored; their options cannot be edited, since
+changing them would rewrite tallies already cast.
+
 An edit is a targeted entry of the same shape, written by the *author*
 onto their own chain with ``kind`` ``"edit"``, ``target`` set to the
 post (or reply) being corrected, and the replacement text carried like a
@@ -139,6 +152,14 @@ MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
 MAX_DRAFTS = 100
 
+# A poll asks one question with a fixed list of options: at least two,
+# so there is something to choose between, and at most eight, so the
+# signed entry still fits the request budget with room for the
+# question.  An option is short — a choice, not a paragraph.
+MIN_POLL_OPTIONS = 2
+MAX_POLL_OPTIONS = 8
+MAX_POLL_OPTION_CHARS = 100
+
 # A draft publish claim goes stale after this long, so a publisher
 # that crashed mid-publish cannot wedge its draft forever.  A normal
 # publish finishes in seconds, far inside this window.
@@ -169,20 +190,23 @@ KIND_REPLY = "reply"
 KIND_REPOST = "repost"
 KIND_EDIT = "edit"
 KIND_QUOTE = "quote"
+KIND_POLL = "poll"
+KIND_VOTE = "vote"
 REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
-# Reactions, deletes and reposts carry no text; replies, edits and quotes
-# carry text but are still targeted entries, so their parent link is
-# signed like a reaction's.
+# Reactions, deletes and reposts carry no text; replies, edits, quotes
+# and votes carry text but are still targeted entries, so their parent
+# link is signed like a reaction's.  A vote's text is the chosen
+# option's index — the choice is signed with the vote.
 TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE, KIND_REPOST)
-# Targeted entries (reactions, deletes, replies, edits, quotes and
-# reposts) point at another post.
-TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY, KIND_EDIT, KIND_QUOTE)
-ENTRY_KINDS = (KIND_POST,) + TARGETED_KINDS
-# Kinds that appear as timeline items: top-level posts, replies, reposts
-# and quotes.  A repost shows the original post's text with attribution;
+# Targeted entries (reactions, deletes, replies, edits, quotes,
+# reposts and votes) point at another post.
+TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY, KIND_EDIT, KIND_QUOTE, KIND_VOTE)
+ENTRY_KINDS = (KIND_POST, KIND_POLL) + TARGETED_KINDS
+# Kinds that appear as timeline items: top-level posts, replies, reposts,
+# quotes and polls.  A repost shows the original post's text with attribution;
 # a quote is a post-like entry: it carries its own text, can be replied
 # to and can be deleted.
-TIMELINE_KINDS = (KIND_POST, KIND_REPLY, KIND_REPOST, KIND_QUOTE)
+TIMELINE_KINDS = (KIND_POST, KIND_REPLY, KIND_REPOST, KIND_QUOTE, KIND_POLL)
 # Kinds a reply or a repost may target: a post or a reply.  A repost is
 # not replyable — it carries no text of its own, so a reply to it would
 # have no parent snippet to show — and neither kind targets reactions
@@ -203,6 +227,11 @@ QUOTABLE_KINDS_SQL = ", ".join(f"'{kind}'" for kind in QUOTABLE_KINDS)
 # its signature.
 TARGETED_HASH_FIELDS = HASH_FIELDS + ("kind", "target")
 REACTION_HASH_FIELDS = TARGETED_HASH_FIELDS
+# A poll signs its options alongside the question, so a relay cannot
+# swap them without breaking the hash.  A vote signs its target like
+# any targeted entry; the chosen option rides in the text, which the
+# post hash fields already cover.
+POLL_HASH_FIELDS = HASH_FIELDS + ("kind", "options")
 
 # Column order used by every SELECT so rows can be converted consistently.
 _POST_COLUMNS = (
@@ -221,6 +250,7 @@ _POST_COLUMNS = (
     "linked",
     "kind",
     "target",
+    "options",
 )
 
 
@@ -267,6 +297,8 @@ def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
     """
     if mesg.get("kind") in TARGETED_KINDS:
         fields = TARGETED_HASH_FIELDS
+    elif mesg.get("kind") == KIND_POLL:
+        fields = POLL_HASH_FIELDS
     else:
         fields = HASH_FIELDS
     if mesg.get("expires_at") is not None:
@@ -285,9 +317,70 @@ def _canonical_body(post: Dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _encode_options(options: Optional[Sequence[str]]) -> Optional[str]:
+    """Encode a poll's options for the posts table, or None."""
+    if options is None:
+        return None
+    return json.dumps(list(options), ensure_ascii=False)
+
+
+def _decode_options(value: Any) -> Optional[List[str]]:
+    """Decode stored poll options: a list, a JSON string, or None.
+
+    Rows read from the posts table carry the JSON string; normalised
+    entries carry the list itself.  Anything else decodes to None, so
+    a damaged row never crashes a display surface.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(option) for option in value]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, list) and all(
+            isinstance(option, str) for option in parsed
+        ):
+            return list(parsed)
+    return None
+
+
+def _clean_poll_options(value: Any) -> List[str]:
+    """Validate a poll's options: 2-8 distinct, short, normalised choices."""
+    if not isinstance(value, list):
+        raise PostError("poll options must be a list")
+    if not MIN_POLL_OPTIONS <= len(value) <= MAX_POLL_OPTIONS:
+        raise PostError(
+            f"a poll needs {MIN_POLL_OPTIONS}-{MAX_POLL_OPTIONS} options"
+        )
+    options: List[str] = []
+    seen: Set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise PostError("poll options must be strings")
+        try:
+            option = normalize_message(raw)
+        except ProtocolError as exc:
+            raise PostError(f"invalid poll option: {exc}") from exc
+        if option != raw:
+            raise PostError("poll option is not normalised")
+        if len(option) > MAX_POLL_OPTION_CHARS:
+            raise PostError(
+                f"poll option is longer than {MAX_POLL_OPTION_CHARS} characters"
+            )
+        folded = option.casefold()
+        if folded in seen:
+            raise PostError(f"duplicate poll option: {option!r}")
+        seen.add(folded)
+        options.append(option)
+    return options
+
+
 def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
     """Return the public, canonical representation of a chain entry."""
-    return {
+    canonical = {
         "v": post["v"],
         "author": post["author"],
         "key": post["key"],
@@ -301,6 +394,11 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         "target": post.get("target") or "",
         "expires_at": post.get("expires_at"),
     }
+    if post.get("kind") == KIND_POLL:
+        # Options ride with the poll entry itself, so an exported or
+        # synced poll carries its choices with it.
+        canonical["options"] = _decode_options(post.get("options"))
+    return canonical
 
 
 def hash(mesg: Dict[str, Any], previous: Optional[str] = None) -> str:
@@ -398,6 +496,24 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
             raise PostError("posts cannot carry a reaction target")
         target = ""
 
+    if kind == KIND_VOTE:
+        # A vote's text is the chosen option's index, in canonical
+        # decimal form.  The poll itself is not consulted here — it
+        # may not have arrived yet — so the range check against the
+        # poll's options happens where the tally is derived.
+        if not text.isdigit() or text != str(int(text)):
+            raise PostError("vote text must be an option index")
+        if not 0 <= int(text) < MAX_POLL_OPTIONS:
+            raise PostError(
+                f"vote option index must be 0-{MAX_POLL_OPTIONS - 1}"
+            )
+    if kind == KIND_POLL:
+        options = _clean_poll_options(mesg.get("options"))
+    else:
+        if mesg.get("options") is not None:
+            raise PostError("only polls can carry options")
+        options = None
+
     post = {
         "v": TAN_VERSION,
         "author": author,
@@ -409,6 +525,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "kind": kind,
         "target": target,
         "expires_at": expires_at,
+        "options": options,
     }
     _check_wire_size(post)
     return post
@@ -546,7 +663,8 @@ CREATE TABLE IF NOT EXISTS posts (
     seq INTEGER NOT NULL DEFAULT 0,
     linked INTEGER NOT NULL DEFAULT 0,
     kind TEXT NOT NULL DEFAULT 'post',
-    target TEXT NOT NULL DEFAULT ''
+    target TEXT NOT NULL DEFAULT '',
+    options TEXT
 );
 
 CREATE INDEX IF NOT EXISTS posts_author_seq ON posts(author, seq);
@@ -619,10 +737,10 @@ CREATE TABLE IF NOT EXISTS drafts (
 """
 
 
-def _add_draft_column(
-    conn: sqlite3.Connection, column: str, column_type: str
+def _add_column(
+    conn: sqlite3.Connection, table: str, column: str, column_type: str
 ) -> None:
-    """Add a column to ``drafts``, tolerating a concurrent migration.
+    """Add a column to *table*, tolerating a concurrent migration.
 
     Two processes opening the same pre-migration database can both
     see the column missing and both try the ALTER; the loser gets
@@ -630,10 +748,17 @@ def _add_draft_column(
     there — success, not an error.
     """
     try:
-        conn.execute(f"ALTER TABLE drafts ADD COLUMN {column} {column_type}")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
     except sqlite3.OperationalError as exc:
         if "duplicate column" not in str(exc):
             raise
+
+
+def _add_draft_column(
+    conn: sqlite3.Connection, column: str, column_type: str
+) -> None:
+    """Add a column to ``drafts`` (see :func:`_add_column`)."""
+    _add_column(conn, "drafts", column, column_type)
 
 
 def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
@@ -675,6 +800,10 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         )
     if columns and "expires_at" not in columns:  # migrate a pre-expiry database
         conn.execute("ALTER TABLE posts ADD COLUMN expires_at REAL")
+    if columns and "options" not in columns:  # migrate a pre-polls database
+        # A poll's options live in one JSON column on its own entry, so
+        # the migration is a single ALTER, not a new table.
+        _add_column(conn, "posts", "options", "TEXT")
     draft_columns = {
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
@@ -738,6 +867,7 @@ def open_readonly_db(path: Union[str, Path]) -> sqlite3.Connection:
         "target",
         "linked",
         "expires_at",
+        "options",
     }
     if not required <= columns or "follows" not in tables:
         conn.close()
@@ -912,8 +1042,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, expires_at, sig, seq, linked, kind, target) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, expires_at, sig, seq, linked, kind, target, options) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -930,6 +1060,7 @@ def store_post(
                     1 if linked else 0,
                     post.get("kind") or KIND_POST,
                     post.get("target") or "",
+                    _encode_options(post.get("options")),
                 ),
             )
             if linked:
@@ -1097,8 +1228,8 @@ def create_reply(
     existing = get_post(conn, target)
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
-    if existing.get("kind", KIND_POST) not in REPLYABLE_KINDS + (KIND_QUOTE,):
-        raise TanError("only posts, replies and quotes can be replied to")
+    if existing.get("kind", KIND_POST) not in REPLYABLE_KINDS + (KIND_QUOTE, KIND_POLL):
+        raise TanError("only posts, replies, quotes and polls can be replied to")
     if not existing.get("linked"):
         raise TanError(
             "post has not linked yet; sync its chain before replying"
@@ -1422,6 +1553,142 @@ def create_edit(
     return record
 
 
+def create_poll(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    question: str,
+    options: Sequence[str],
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+    expires_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a poll: a question with fixed options.
+
+    A poll is a top-level entry like a post: ``kind`` is ``"poll"``,
+    ``text`` carries the question and the options ride alongside it,
+    signed, so a relay cannot swap them.  Options are fixed at
+    creation — changing them would rewrite tallies already cast — so
+    there is no edit path for polls.  A poll may carry an *expires_at*
+    like a post; votes on an expired poll are rejected, the same as
+    replies to one.
+    """
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    clean_options = _clean_poll_options(list(options))
+    if expires_at is not None:
+        expires_at = _require_timestamp(expires_at, "expires_at")
+        if expires_at <= timestamp:
+            raise PostError("expires_at must be after created_at")
+    clean_text = normalize_message(question)
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": clean_text,
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_POLL,
+            "options": clean_options,
+        }
+        if expires_at is not None:
+            body["expires_at"] = expires_at
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
+def create_vote(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    option: int,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a vote for one option of the poll *target*.
+
+    A vote is a targeted entry like a reaction: ``kind`` is ``"vote"``,
+    ``target`` is the poll's hash and the chosen option's index rides
+    in the text, so the choice is signed like a reaction's target.
+    The vote is appended to the voter's own chain, exactly like a
+    post, and is gossipped and synced through the same paths.  Only
+    a cached, linked poll that has not expired or been deleted can be
+    voted on — a vote is cast on a poll the voter has seen in full —
+    and *option* must name one of its options.  One standing vote per
+    voter per poll decides the tally: voting again changes your vote,
+    the same way the latest like/unlike entry decides a like.  Votes
+    received from peers for polls that have not arrived yet are still
+    stored through the sync path (:func:`store_post`) and start
+    counting once the poll is cached.
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    existing = get_post(conn, target)
+    if existing is None:
+        raise TanError(f"unknown post: {target!r}")
+    if existing.get("kind", KIND_POST) != KIND_POLL:
+        raise TanError("only polls can be voted on")
+    if not existing.get("linked"):
+        raise TanError(
+            "poll has not linked yet; sync its chain before voting"
+        )
+    if _is_deleted(conn, existing):
+        raise TanError("poll has been deleted")
+    if is_expired(existing, now=timestamp):
+        raise TanError("poll has expired")
+    options = _decode_options(existing.get("options")) or []
+    if not isinstance(option, int) or isinstance(option, bool):
+        raise TanError("vote option must be an option index")
+    if not 0 <= option < len(options):
+        raise TanError(f"poll has {len(options)} options")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": str(option),
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_VOTE,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
 def reaction_states(
     conn: sqlite3.Connection, targets: Sequence[str]
 ) -> Dict[str, Dict[str, str]]:
@@ -1468,6 +1735,45 @@ def like_counts(
             "liked": viewer is not None and viewer in likers,
         }
     return result
+
+
+def vote_states(
+    conn: sqlite3.Connection, targets: Sequence[str]
+) -> Dict[str, Dict[str, int]]:
+    """Map each poll hash to ``{voter: option index}`` from linked votes.
+
+    Only linked votes count; an orphaned vote starts counting as soon
+    as its chain links up.  The latest vote per voter wins, so voting
+    again changes your vote.  A vote whose text is not a plain option
+    index never reaches the store (see :func:`_normalize_post`), so
+    every index here is in range for the poll's option count — except
+    a vote stored before its poll arrived, whose option count is
+    unknown until then: callers check the index against the poll's
+    options and ignore the ones that do not name a real option.
+    """
+    clean = []
+    for target in targets:
+        try:
+            clean.append(_require_hex(target, HASH_HEX_LENGTH, "target"))
+        except PostError:
+            continue
+    states: Dict[str, Dict[str, int]] = {target: {} for target in clean}
+    if not clean:
+        return states
+    placeholders = ", ".join("?" for _ in clean)
+    rows = conn.execute(
+        "SELECT target, author, text FROM posts "
+        f"WHERE kind = 'vote' AND linked = 1 AND target IN ({placeholders}) "
+        "ORDER BY target, author, seq ASC",
+        clean,
+    ).fetchall()
+    for row in rows:
+        text = str(row["text"])
+        if not text.isdigit():
+            continue
+        # Rows arrive in chain order per voter, so the last write wins.
+        states[str(row["target"])][str(row["author"])] = int(text)
+    return states
 
 
 def post_likers(
@@ -1578,6 +1884,93 @@ def post_quoters(
             }
         )
     return annotate_edits(conn, quoters)
+
+
+def poll_results(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> Dict[str, Any]:
+    """Return the poll *ref* names plus its current tally.
+
+    Mirrors :func:`likers`: *ref* is resolved exactly as
+    :func:`resolve_post` does — an unknown, ambiguous, deleted or
+    expired reference raises :class:`TanError` — and a reference to
+    anything but a poll raises too.  The result carries the resolved
+    poll under ``"poll"``, its options under ``"options"``, the vote
+    count per option under ``"counts"``, the total number of voters
+    under ``"total"``, and the voters under ``"voters"``: one
+    ``{"author": ..., "name": ..., "option": <index>}`` record per
+    voter whose standing vote names a real option, newest vote first.
+    The name is the one on the voter's latest vote entry for the poll.
+    Like :func:`likers`, a poll from a blocked author is refused, and
+    an unusable block list hides everything.
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        # Like likers(): an unlinked entry is not shown, so its tally is not either.
+        raise TanError(f"poll has not linked yet: {ref!r}")
+    excluded = set(_clean_excluded(exclude_authors))
+    if exclude_all:
+        raise TanError("cannot show poll results: the block-list is unusable")
+    if post.get("author") in excluded:
+        raise TanError(f"poll is from a blocked author: {ref!r}")
+    if post.get("kind") != KIND_POLL:
+        raise TanError(f"not a poll: {ref!r}")
+    options = _decode_options(post.get("options")) or []
+    target = str(post["hash"])
+    states = vote_states(conn, [target]).get(target, {})
+    voters = [
+        (author, index)
+        for author, index in states.items()
+        if 0 <= index < len(options)
+    ]
+    records: List[Dict[str, Any]] = []
+    if voters:
+        # One target-scoped query, no voter list expanded into
+        # placeholders: the name lookup cannot hit SQLite's host
+        # parameter limit no matter how many voters a poll has.
+        rows = conn.execute(
+            "SELECT author, name, created_at FROM posts "
+            "WHERE kind = 'vote' AND linked = 1 AND target = ? "
+            "ORDER BY author, seq ASC",
+            (target,),
+        ).fetchall()
+        names: Dict[str, str] = {}
+        voted_at: Dict[str, float] = {}
+        for row in rows:
+            # Rows arrive in chain order per voter, so the last write
+            # wins — the name and time on the voter's latest vote.
+            names[str(row["author"])] = str(row["name"])
+            voted_at[str(row["author"])] = float(row["created_at"])
+        records = [
+            {
+                "author": author,
+                "name": names.get(author, ""),
+                "option": index,
+                "voted_at": voted_at.get(author, 0.0),
+            }
+            for author, index in voters
+        ]
+    records.sort(
+        key=lambda record: (
+            -record["voted_at"],
+            record["name"].lower(),
+            record["author"],
+        )
+    )
+    counts = [0] * len(options)
+    for record in records:
+        counts[int(record["option"])] += 1
+    return {
+        "poll": _canonical_post(post),
+        "options": options,
+        "counts": counts,
+        "total": len(records),
+        "voters": records,
+    }
 
 
 def without_hidden_quotes(
@@ -1932,6 +2325,9 @@ def annotate_reactions(
     ``own`` is true when *viewer* is given and the post's author is the
     viewer, so a display surface can offer author-only actions (like
     deleting the post) without learning the viewer's identity itself.
+    Poll tallies ride this same step — every surface that shows likes
+    also shows polls — so :func:`annotate_polls` runs here rather
+    than in each caller.
     """
     counts = like_counts(conn, [post["hash"] for post in posts], viewer=viewer)
     for post in posts:
@@ -1939,6 +2335,46 @@ def annotate_reactions(
         post["likes"] = info["likes"]
         post["liked"] = info["liked"]
         post["own"] = viewer is not None and post["author"] == viewer
+    return annotate_polls(conn, posts, viewer=viewer)
+
+
+def annotate_polls(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+    *,
+    viewer: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Attach a ``poll`` tally to poll entries, in place.
+
+    ``poll`` carries the options, the vote count per option in option
+    order, the total number of voters, and — when *viewer* is given —
+    the index of the viewer's own standing vote (or ``None``).  Votes
+    naming an option the poll does not have are ignored: a poll's
+    options never change once published, so a mismatch means a bad
+    entry.  Non-poll entries are untouched.
+    """
+    polls = [post for post in posts if post.get("kind") == KIND_POLL]
+    if not polls:
+        return posts
+    states = vote_states(conn, [str(post["hash"]) for post in polls])
+    for post in polls:
+        options = _decode_options(post.get("options")) or []
+        voters = states.get(str(post["hash"]), {})
+        counts = [0] * len(options)
+        total = 0
+        voted = None
+        for author, index in voters.items():
+            if 0 <= index < len(counts):
+                counts[index] += 1
+                total += 1
+                if viewer is not None and author == viewer:
+                    voted = index
+        post["poll"] = {
+            "options": options,
+            "counts": counts,
+            "total": total,
+            "voted": voted,
+        }
     return posts
 
 
@@ -2575,6 +3011,9 @@ def apply_display_rules(
         for post in shown:
             post.pop("likes", None)
             post.pop("liked", None)
+    if not ruleset.displays(KIND_VOTE):
+        for post in shown:
+            post.pop("poll", None)
     if not ruleset.displays(KIND_REPOST):
         for post in shown:
             post.pop("reposts", None)
@@ -3736,7 +4175,7 @@ def search_posts(
 ) -> List[Dict[str, Any]]:
     """Search stored posts by keyword, newest first.
 
-    Only linked ``post`` and ``quote`` entries match: reaction entries
+    Only linked ``post``, ``quote`` and ``poll`` entries match: reaction entries
     never appear as results, and posts their author deleted are
     excluded the same way the timeline excludes them.  The match is a
     case-insensitive substring search over the post's current text — an
@@ -3767,7 +4206,7 @@ def search_posts(
     count = max(1, min(int(limit), MAX_SEARCH_POSTS))
     needle = query.strip().casefold()
     params: List[Any] = []
-    where = f"linked = 1 AND kind IN ('post', 'quote') AND {_NOT_DELETED}"
+    where = f"linked = 1 AND kind IN ('post', 'quote', 'poll') AND {_NOT_DELETED}"
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         if author in excluded:
@@ -6191,6 +6630,54 @@ class TanApp:
 
     def unlike(self, target: str, **kwargs: Any) -> Dict[str, Any]:
         return self.react(target, liked=False, **kwargs)
+
+    def create_poll(
+        self,
+        question: str,
+        options: Sequence[str],
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+        expires_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Create a poll (see :func:`create_poll`), optionally publishing it."""
+        conn = self.connect()
+        try:
+            record = create_poll(
+                conn,
+                self.identity,
+                question,
+                options,
+                name=self.name,
+                expires_at=expires_at,
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
+
+    def vote(
+        self,
+        target: str,
+        option: int,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Cast a vote for one option of a poll (see :func:`create_vote`)."""
+        conn = self.connect()
+        try:
+            record = create_vote(
+                conn, self.identity, target, option, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
 
     def repost(
         self,

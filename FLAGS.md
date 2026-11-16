@@ -68,6 +68,9 @@ Global options may appear before or after the command:
 | `tau tan quote POST TEXT` | Quote a post with your own comment (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
+| `tau tan poll TEXT --option A --option B` | Ask a question with options (signed poll entry on your chain) |
+| `tau tan vote POLL OPTION` | Vote for one option of a poll (option number or exact text) |
+| `tau tan results POLL` | Show a poll's question, options and current tally |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |

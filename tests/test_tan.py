@@ -27,6 +27,7 @@ from tau.tangents.tan import (
     _shelf_pageable_total,
     annotate_edits,
     annotate_pinned,
+    annotate_polls,
     annotate_quote_counts,
     annotate_quotes,
     annotate_reactions,
@@ -38,11 +39,13 @@ from tau.tangents.tan import (
     claim_draft,
     create_delete,
     create_edit,
+    create_poll,
     create_post,
     create_quote,
     create_reaction,
     create_reply,
     create_repost,
+    create_vote,
     clean_tag,
     deleted_targets,
     delete_draft,
@@ -95,6 +98,7 @@ from tau.tangents.tan import (
     open_readonly_db,
     pin_post,
     pinned_posts,
+    poll_results,
     save_post,
     save_draft,
     saved_posts,
@@ -121,6 +125,7 @@ from tau.tangents.tan import (
     unsave_post,
     verify_post,
     verify_store,
+    vote_states,
     without_muted_keywords,
     without_muted_tags,
 )
@@ -2080,6 +2085,339 @@ def test_tan_reposts_and_quotes_via_cli(identities, tmp_path, capsys):
     assert "hard agree" in out
 
 
+def test_create_poll_validates_options(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+
+    with pytest.raises(PostError, match="needs 2-8 options"):
+        create_poll(conn, alice, "too few?", ["only one"], name="alice", now=1000)
+    with pytest.raises(PostError, match="needs 2-8 options"):
+        create_poll(
+            conn, alice, "too many?", [f"opt {n}" for n in range(9)],
+            name="alice", now=1000,
+        )
+    with pytest.raises(PostError, match="duplicate poll option"):
+        create_poll(conn, alice, "dup?", ["Yes", "yes"], name="alice", now=1000)
+    with pytest.raises(PostError, match="must not be empty"):
+        create_poll(conn, alice, "blank?", ["", "no"], name="alice", now=1000)
+    with pytest.raises(PostError, match="longer than 100 characters"):
+        create_poll(conn, alice, "long?", ["x" * 101, "no"], name="alice", now=1000)
+
+    poll = create_poll(
+        conn, alice, "meet thursday or friday?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    assert poll["kind"] == "poll"
+    assert poll["text"] == "meet thursday or friday?"
+    assert poll["options"] == ["Thursday", "Friday"]
+    assert poll["target"] == ""
+    assert verify_post(poll)["hash"] == poll["hash"]
+    assert head(conn, author_of(alice)) == poll["hash"]
+
+    # A post carrying options is malformed: only polls carry them.
+    base = {
+        "v": 1,
+        "author": author_of(alice),
+        "key": "cd" * 64,
+        "name": "alice",
+        "text": "sneaky",
+        "created_at": 1001.0,
+        "prev": poll["hash"],
+        "options": ["a", "b"],
+    }
+    with pytest.raises(PostError, match="only polls can carry options"):
+        tan_module._normalize_post(base)
+    # And a poll without options is missing a signed field.
+    with pytest.raises(PostError, match="must be a list"):
+        tan_module._normalize_post({**base, "kind": "poll", "options": None})
+
+
+def test_poll_vote_tally_latest_vote_wins(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+
+    # No votes yet: zeros, not an error.
+    assert vote_states(conn, [poll["hash"]]) == {poll["hash"]: {}}
+    result = poll_results(conn, poll["hash"])
+    assert result["options"] == ["Thursday", "Friday"]
+    assert result["counts"] == [0, 0]
+    assert result["total"] == 0
+    assert result["voters"] == []
+
+    create_vote(conn, bob, poll["hash"], 0, name="bob", now=1001)
+    create_vote(conn, carol, poll["hash"], 1, name="carol", now=1002)
+    result = poll_results(conn, poll["hash"][:16])
+    assert result["poll"]["hash"] == poll["hash"]
+    assert result["counts"] == [1, 1]
+    assert result["total"] == 2
+    assert [voter["author"] for voter in result["voters"]] == [
+        author_of(carol),
+        author_of(bob),
+    ]
+    assert [voter["option"] for voter in result["voters"]] == [1, 0]
+    assert [voter["name"] for voter in result["voters"]] == ["carol", "bob"]
+
+    # Voting again changes your vote (latest chain entry wins).
+    create_vote(conn, bob, poll["hash"], 1, name="bob", now=1003)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [0, 2]
+    assert result["total"] == 2
+    assert [voter["author"] for voter in result["voters"]] == [
+        author_of(bob),
+        author_of(carol),
+    ]
+
+    # The timeline annotates the poll with its tally, and the viewer's
+    # own standing vote.
+    posts = timeline(
+        conn, [author_of(alice)], viewer=author_of(bob)
+    )
+    assert len(posts) == 1
+    assert posts[0]["poll"] == {
+        "options": ["Thursday", "Friday"],
+        "counts": [0, 2],
+        "total": 2,
+        "voted": 1,
+    }
+
+
+def test_create_vote_rejects_bad_targets_and_options(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "not a poll", name="alice", now=1000)
+    poll = create_poll(
+        conn, alice, "pick one", ["a", "b"], name="alice", now=1001,
+    )
+
+    with pytest.raises(TanError, match="only polls can be voted on"):
+        create_vote(conn, bob, post["hash"], 0, name="bob", now=1002)
+    with pytest.raises(TanError, match="unknown post"):
+        create_vote(conn, bob, "cd" * 32, 0, name="bob", now=1002)
+    with pytest.raises(TanError, match="has 2 options"):
+        create_vote(conn, bob, poll["hash"], 2, name="bob", now=1002)
+    with pytest.raises(TanError, match="has 2 options"):
+        create_vote(conn, bob, poll["hash"], -1, name="bob", now=1002)
+
+    # A vote on a deleted poll is rejected, like a reply to one.
+    create_delete(conn, alice, poll["hash"], name="alice", now=1003)
+    with pytest.raises(TanError, match="has been deleted"):
+        create_vote(conn, bob, poll["hash"], 0, name="bob", now=1004)
+    with pytest.raises(TanError, match="has been deleted"):
+        poll_results(conn, poll["hash"])
+
+    # A vote on an expired poll is rejected too.
+    short = create_poll(
+        conn, alice, "quick?", ["yes", "no"], name="alice", now=1005,
+        expires_at=1006.0,
+    )
+    with pytest.raises(TanError, match="has expired"):
+        create_vote(conn, bob, short["hash"], 0, name="bob", now=1007)
+
+    # A vote whose text is not a canonical option index never verifies.
+    base = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": "cd" * 64,
+        "name": "bob",
+        "text": "007",
+        "created_at": 1008.0,
+        "prev": "",
+        "kind": "vote",
+        "target": poll["hash"],
+    }
+    with pytest.raises(PostError, match="must be an option index"):
+        tan_module._normalize_post(base)
+    with pytest.raises(PostError, match="vote option index must be 0-7"):
+        tan_module._normalize_post({**base, "text": "9"})
+    with pytest.raises(PostError, match="must be an option index"):
+        tan_module._normalize_post({**base, "text": "one"})
+
+
+def test_poll_options_cannot_be_edited(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "pick one", ["a", "b"], name="alice", now=1000,
+    )
+    # Editing a poll would rewrite tallies already cast.
+    with pytest.raises(TanError, match="only posts and replies can be edited"):
+        create_edit(conn, alice, poll["hash"], "changed", name="alice", now=1001)
+    # Deleting a poll works like deleting a post: it leaves the timeline.
+    create_delete(conn, alice, poll["hash"], name="alice", now=1002)
+    assert timeline(conn, [author_of(alice)]) == []
+
+
+def test_poll_thread_and_search(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "which relay should we try next?", ["north", "south"],
+        name="alice", now=1000,
+    )
+    create_vote(conn, bob, poll["hash"], 1, name="bob", now=1001)
+    reply = create_reply(conn, bob, poll["hash"], "south is closer", name="bob", now=1002)
+
+    # The thread is rooted at the poll, with its tally and the reply.
+    entries = thread(conn, poll["hash"])
+    assert [entry["hash"] for entry in entries] == [poll["hash"], reply["hash"]]
+    assert entries[0]["poll"]["counts"] == [0, 1]
+    assert entries[1]["depth"] == 1
+
+    # The poll's question is searchable like a post's text.
+    assert [post["hash"] for post in search_posts(conn, "relay")] == [
+        poll["hash"]
+    ]
+
+
+def test_poll_export_import_round_trip(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    poll = create_poll(
+        source, alice, "export me?", ["yes", "no"], name="alice", now=1000,
+    )
+    create_vote(source, bob, poll["hash"], 0, name="bob", now=1001)
+    # The vote lives on bob's chain, so the export needs all authors.
+    document = export_entries(source, all_authors=True)
+
+    target = init_db(tmp_path / "target.sqlite3")
+    outcome = import_entries(target, document)
+    assert outcome["imported"] == 2
+    assert outcome["skipped"] == 0
+    result = poll_results(target, poll["hash"])
+    assert result["options"] == ["yes", "no"]
+    assert result["counts"] == [1, 0]
+    assert result["total"] == 1
+    assert result["voters"][0]["author"] == author_of(bob)
+
+
+def test_cli_tan_poll_vote_results(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--option",
+                "Thursday",
+                "--option",
+                "Friday",
+                "meet thursday or friday?",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    poll = payload["poll"]
+    assert poll["kind"] == "poll"
+    assert poll["options"] == ["Thursday", "Friday"]
+
+    # Vote by number, then change it by exact option text.
+    assert (
+        main(
+            [
+                "tan",
+                "vote",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                poll["hash"][:16],
+                "1",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["vote"]["kind"] == "vote"
+    assert payload["vote"]["text"] == "0"
+    assert (
+        main(
+            [
+                "tan",
+                "vote",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                poll["hash"],
+                "Friday",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["vote"]["text"] == "1"
+
+    assert (
+        main(
+            ["tan", "results", "--data-dir", str(data_dir), "--json", poll["hash"]]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["counts"] == [0, 1]
+    assert payload["total"] == 1
+    assert payload["voters"][0]["option"] == 1
+
+    # Text output shows the question, the options with counts, and the voter.
+    assert main(["tan", "results", "--data-dir", str(data_dir), poll["hash"]]) == 0
+    out = capsys.readouterr().out
+    assert "meet thursday or friday?" in out
+    assert "1. Thursday — 0 votes" in out
+    assert "2. Friday — 1 vote" in out
+    assert "alice" in out
+
+    # The timeline prints the poll with its options and tally.
+    assert main(["tan", "timeline", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "meet thursday or friday?" in out
+    assert "2. Friday — 1 vote (your vote)" in out
+
+    # A bad option fails before anything is stored.
+    assert (
+        main(
+            [
+                "tan",
+                "vote",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                poll["hash"],
+                "Saturday",
+            ]
+        )
+        == 2
+    )
+    assert "no such option" in capsys.readouterr().err
+    assert (
+        main(
+            [
+                "tan",
+                "poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--option",
+                "only one",
+                "needs two options",
+            ]
+        )
+        == 2
+    )
+    assert "at least 2 --option values" in capsys.readouterr().err
+
+
 def test_likers_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -3540,7 +3878,7 @@ def test_reply_to_deleted_post_or_reaction_is_rejected(identities, tmp_path):
     post = create_post(conn, alice, "doomed", name="alice", now=1000)
     like = create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
 
-    with pytest.raises(TanError, match="only posts, replies and quotes"):
+    with pytest.raises(TanError, match="only posts, replies, quotes and polls"):
         create_reply(conn, bob, like["hash"], "reply to a like", name="bob", now=1002)
 
     create_delete(conn, alice, post["hash"], name="alice", now=1003)
@@ -7468,6 +7806,35 @@ def test_init_db_migrates_pre_expiry_store(identities, tmp_path):
         assert stored is not None
         assert stored["expires_at"] is None
         assert verify_post(stored)["hash"] == post["hash"]
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_pre_polls_store(identities, tmp_path):
+    alice, bob = identities
+    db_path = tmp_path / "tan.sqlite3"
+    conn = init_db(db_path)
+    post = create_post(conn, alice, "legacy row", name="alice", now=1000)
+    conn.execute("ALTER TABLE posts DROP COLUMN options")
+    conn.commit()
+    conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        assert "options" in columns
+        stored = get_post(conn, post["hash"])
+        assert stored is not None
+        assert "options" not in stored
+        assert verify_post(stored)["hash"] == post["hash"]
+        # And a poll works on the migrated store.
+        poll = create_poll(
+            conn, alice, "migrated?", ["yes", "no"], name="alice", now=1001,
+        )
+        create_vote(conn, bob, poll["hash"], 0, name="bob", now=1002)
+        assert poll_results(conn, poll["hash"])["counts"] == [1, 0]
     finally:
         conn.close()
 

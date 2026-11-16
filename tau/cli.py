@@ -142,12 +142,16 @@ from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     DEFAULT_SUGGEST_LIMIT,
     DRAFT_CLAIM_TTL,
+    KIND_POLL,
     KIND_QUOTE,
     MAX_GOSSIP_TTL,
     MAX_TAN_POST_EXPIRY,
+    MIN_POLL_OPTIONS,
     TanApp,
     TanError,
     _author_from_identity,
+    _clean_poll_options,
+    _decode_options,
     annotate_pinned,
     annotate_quote_counts,
     annotate_quotes,
@@ -186,6 +190,7 @@ from .tangents.tan import (
     open_db_readonly,
     open_readonly_db,
     pin_post,
+    poll_results,
     quoters,
     record_draft_publish,
     refresh_draft_claim,
@@ -1989,6 +1994,88 @@ def build_parser() -> argparse.ArgumentParser:
     tan_edit.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_edit.set_defaults(func=cmd_tan_edit)
 
+    tan_poll = tan_sub.add_parser(
+        "poll",
+        parents=[common],
+        help="ask a question with options (writes a signed poll entry to your chain)",
+    )
+    tan_poll.add_argument(
+        "text", nargs="?", help="poll question (reads stdin when omitted)"
+    )
+    tan_poll.add_argument(
+        "--file", type=Path, help="read the question from a file"
+    )
+    tan_poll.add_argument(
+        "--option",
+        action="append",
+        default=None,
+        dest="options",
+        metavar="TEXT",
+        help="one answer option (repeatable: give 2-8 options)",
+    )
+    tan_poll.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_poll.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_poll.add_argument(
+        "--expire",
+        default=None,
+        metavar="DURATION",
+        help="disappearing poll: hide it from timelines and searches "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — the "
+        "expiry is signed with the poll",
+    )
+    tan_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_poll.set_defaults(func=cmd_tan_poll)
+
+    tan_vote = tan_sub.add_parser(
+        "vote",
+        parents=[common],
+        help="vote for one option of a poll (writes a signed vote entry to your chain)",
+    )
+    tan_vote.add_argument(
+        "target", metavar="POLL", help="poll hash or unique hash prefix"
+    )
+    tan_vote.add_argument(
+        "option",
+        metavar="OPTION",
+        help="option number (1-based) or exact option text",
+    )
+    tan_vote.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_vote.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_vote.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_vote.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_vote.set_defaults(func=cmd_tan_vote)
+
+    tan_results = tan_sub.add_parser(
+        "results",
+        parents=[common],
+        help="show a poll's question, options and current tally",
+    )
+    tan_results.add_argument(
+        "ref", metavar="HASH|PREFIX", help="poll hash or unique hash prefix"
+    )
+    tan_results.set_defaults(func=cmd_tan_results)
+
     tan_timeline = tan_sub.add_parser(
         "timeline",
         parents=[common],
@@ -2978,6 +3065,8 @@ def _print_tan_posts(
                         print(f"    {line}")
             else:
                 print(f"  quoting {short_hash(str(post.get('target', '')))}")
+        if post.get("kind") == "poll":
+            _print_poll_options(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -3033,6 +3122,8 @@ def _print_tan_thread(
                     f"{indent}  quoting "
                     f"{short_hash(str(post.get('target', '')))}"
                 )
+        if post.get("kind") == "poll":
+            _print_poll_options(post, indent=f"{indent}  ")
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -3074,6 +3165,8 @@ def _print_saved_posts(
             continue
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        if post.get("kind") == "poll":
+            _print_poll_options(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -3108,6 +3201,8 @@ def _print_hidden_posts(
             continue
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        if post.get("kind") == "poll":
+            _print_poll_options(post)
 
 
 def _print_pinned_posts(
@@ -3169,10 +3264,79 @@ def _print_pinned_posts(
                         print(f"    {line}")
             else:
                 print(f"  quoting {short_hash(str(post.get('target', '')))}")
+        if post.get("kind") == "poll":
+            _print_poll_options(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"  ♥ {likes}{suffix}")
+
+
+def _print_poll_options(
+    post: Dict[str, Any], *, indent: str = "  "
+) -> None:
+    """Print a poll's options with their tallies, when known.
+
+    Options come from the poll entry itself, so they print even where
+    no tally was attached; counts print only when the ``poll``
+    annotation is present.
+    """
+    options = _decode_options(post.get("options")) or []
+    tally = post.get("poll") if isinstance(post.get("poll"), dict) else None
+    counts = tally.get("counts") if tally else None
+    voted = tally.get("voted") if tally else None
+    for index, option in enumerate(options):
+        line = f"{indent}{index + 1}. {option}"
+        if counts is not None and 0 <= index < len(counts):
+            votes = int(counts[index])
+            line += f" — {votes} vote{'s' if votes != 1 else ''}"
+            if voted is not None and voted == index:
+                line += " (your vote)"
+        print(line)
+    if tally is not None:
+        total = int(tally.get("total") or 0)
+        print(f"{indent}{total} vote{'s' if total != 1 else ''} total")
+
+
+def _print_tan_poll_results(result: Dict[str, Any], *, json_output: bool) -> None:
+    """Print a poll plus its current tally, as returned by tan.poll_results."""
+    poll = result["poll"]
+    options = result["options"]
+    counts = result["counts"]
+    voters = result["voters"]
+    if json_output:
+        _emit(
+            {
+                "poll": poll,
+                "options": options,
+                "counts": counts,
+                "total": result["total"],
+                "voters": voters,
+            },
+            True,
+        )
+        return
+    name = poll.get("name") or "anonymous"
+    author = short_hash(str(poll.get("author", "")))
+    when = datetime.fromtimestamp(float(poll.get("created_at", 0))).strftime(
+        "%Y-%m-%d %H:%M"
+    )
+    print(f"[{when}] {name} ({author}) {short_hash(str(poll.get('hash', '')))}")
+    for line in str(poll.get("text", "")).splitlines() or [""]:
+        print(f"  {line}")
+    by_option: Dict[int, List[Dict[str, Any]]] = {}
+    for voter in voters:
+        by_option.setdefault(int(voter["option"]), []).append(voter)
+    for index, option in enumerate(options):
+        votes = int(counts[index]) if index < len(counts) else 0
+        print(f"  {index + 1}. {option} — {votes} vote{'s' if votes != 1 else ''}")
+        for voter in by_option.get(index, []):
+            voter_name = voter.get("name") or "anonymous"
+            print(
+                f"      {voter_name} ({short_hash(str(voter.get('author', '')))})"
+            )
+    if not voters:
+        print("No votes yet.")
 
 
 def _print_tan_likes(result: Dict[str, Any], *, json_output: bool) -> None:
@@ -4212,6 +4376,185 @@ def cmd_tan_edit(args: argparse.Namespace) -> int:
             )
             for error in published["errors"]:
                 print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def _resolve_poll_option(value: str, options: Sequence[str]) -> int:
+    """Resolve a vote's option (1-based number or exact text) to an index.
+
+    Raises ValueError with a message the caller prints: a number out of
+    range, or text that matches no option.  Options are distinct, so
+    text can match at most once.
+    """
+    text = str(value).strip()
+    if text.isdigit():
+        index = int(text) - 1
+        if 0 <= index < len(options):
+            return index
+        raise ValueError(
+            f"option {text} is out of range: this poll has {len(options)} options"
+        )
+    for index, option in enumerate(options):
+        if option == text:
+            return index
+    raise ValueError(f"no such option: {text!r}")
+
+
+def cmd_tan_poll(args: argparse.Namespace) -> int:
+    question = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    options = list(getattr(args, "options", None) or [])
+    if len(options) < MIN_POLL_OPTIONS:
+        print(
+            f"error: a poll needs at least {MIN_POLL_OPTIONS} --option values",
+            file=sys.stderr,
+        )
+        return 2
+    # Validate before the node starts, so a bad option fails fast.
+    try:
+        options = _clean_poll_options(options)
+    except TanError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    expire_seconds = 0.0
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        try:
+            expire_seconds = _parse_duration(
+                expire_text,
+                flag="--expire",
+                max_seconds=MAX_TAN_POST_EXPIRY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    expires_at = time.time() + expire_seconds if expire_text is not None else None
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        record = app.create_poll(question, options, expires_at=expires_at)
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            app = TanApp(
+                config,
+                node.identity,
+                name=config.name,
+                request_timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            node.attach_app(app)
+            targets = None
+            if getattr(args, "to", None):
+                targets = [node.resolve_peer(target) for target in args.to]
+            record = app.create_poll(question, options, expires_at=expires_at)
+            published = app.publish(
+                record,
+                targets=targets,
+                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+            )
+        finally:
+            node.stop()
+
+    if json_output:
+        _emit({"poll": record, "published": published}, True)
+    else:
+        print(f"polled {short_hash(record['hash'])}")
+        for index, option in enumerate(record.get("options") or [], start=1):
+            print(f"  {index}. {option}")
+        if expires_at is not None:
+            print(f"  expires in {_ago(expire_seconds)}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_vote(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    conn = init_db(config.social_db_path)
+    try:
+        poll = resolve_post(conn, args.target)
+        if poll.get("kind") != KIND_POLL:
+            print(f"error: {args.target!r} is not a poll", file=sys.stderr)
+            return 2
+        options = _decode_options(poll.get("options")) or []
+        try:
+            option = _resolve_poll_option(args.option, options)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    finally:
+        conn.close()
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        record = app.vote(poll["hash"], option)
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            app = TanApp(
+                config,
+                node.identity,
+                name=config.name,
+                request_timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            node.attach_app(app)
+            targets = None
+            if getattr(args, "to", None):
+                targets = [node.resolve_peer(target) for target in args.to]
+            record = app.vote(poll["hash"], option)
+            published = app.publish(
+                record,
+                targets=targets,
+                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+            )
+        finally:
+            node.stop()
+
+    if json_output:
+        _emit({"vote": record, "published": published}, True)
+    else:
+        print(f"voted for {options[option]!r} on {short_hash(poll['hash'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_results(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
+    conn = init_db(config.social_db_path)
+    try:
+        result = poll_results(
+            conn,
+            args.ref,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
+        )
+    finally:
+        conn.close()
+    _print_tan_poll_results(result, json_output=json_output)
     return _EXIT_OK
 
 
