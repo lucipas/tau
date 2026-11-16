@@ -141,6 +141,7 @@ from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     DEFAULT_SUGGEST_LIMIT,
+    DRAFT_CLAIM_TTL,
     KIND_QUOTE,
     MAX_GOSSIP_TTL,
     MAX_TAN_POST_EXPIRY,
@@ -157,6 +158,7 @@ from .tangents.tan import (
     apply_display_rules,
     author_stats,
     author_timeline,
+    claim_draft,
     clean_tag,
     delete_draft,
     export_entries,
@@ -185,6 +187,7 @@ from .tangents.tan import (
     pin_post,
     quoters,
     record_draft_publish,
+    release_draft_claim,
     reposters,
     resolve_author,
     resolve_cached_author,
@@ -3509,6 +3512,13 @@ def cmd_tan_drafts(args: argparse.Namespace) -> int:
         return _EXIT_OK
     for draft in drafts:
         print(f"{draft['id']}  {_stamp(draft['created_at'])}")
+        if draft["claimed_at"] is not None and draft["claimed_at"] > (
+            time.time() - DRAFT_CLAIM_TTL
+        ):
+            # A live claim means another publish-draft is working on
+            # this draft right now; a stale one is just a crashed
+            # publisher's leftover and is not shown as in progress.
+            print("  publishing…")
         if draft["reply_to"]:
             print(f"  in reply to {short_hash(draft['reply_to'])}")
         if draft["expires_in"] is not None:
@@ -3643,13 +3653,9 @@ def _retry_draft_post(
     return _EXIT_OK
 
 
-def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
-    config = _make_config(args)
-    conn = init_db(config.social_db_path)
-    try:
-        draft = get_draft(conn, args.draft)
-    finally:
-        conn.close()
+def _publish_draft_claimed(
+    args: argparse.Namespace, config: TauConfig, draft: Dict[str, Any]
+) -> int:
     if draft["post_hash"]:
         # A previous attempt already signed this post: re-send that
         # post to the peers that missed it, never a second copy.
@@ -3703,6 +3709,42 @@ def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     return _EXIT_OK
+
+
+def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
+    """Publish a draft, holding its claim for the whole attempt.
+
+    The claim is taken before anything is signed or sent, so a
+    second concurrent ``publish-draft`` for the same draft loses the
+    claim and publishes nothing.  It is released whenever the draft
+    survives the attempt — a failed publish, a partial delivery —
+    so a retry is never blocked by this run's own claim; a
+    successful publish deletes the draft, making the release a
+    no-op.  A claim a crashed publisher left behind goes stale
+    after ``DRAFT_CLAIM_TTL`` and can be taken over.
+    """
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        draft = get_draft(conn, args.draft)
+        claimed = claim_draft(conn, draft["id"])
+    finally:
+        conn.close()
+    if not claimed:
+        print(
+            f"error: draft {draft['id']} is already being published — "
+            "try again when it finishes",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    try:
+        return _publish_draft_claimed(args, config, draft)
+    finally:
+        conn = init_db(config.social_db_path)
+        try:
+            release_draft_claim(conn, draft["id"])
+        finally:
+            conn.close()
 
 
 def cmd_tan_discard_draft(args: argparse.Namespace) -> int:

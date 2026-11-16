@@ -137,6 +137,11 @@ MAX_MUTED_TAGS = 256
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
 MAX_DRAFTS = 100
+
+# A draft publish claim goes stale after this long, so a publisher
+# that crashed mid-publish cannot wedge its draft forever.  A normal
+# publish finishes in seconds, far inside this window.
+DRAFT_CLAIM_TTL = 600.0
 MAX_HIDDEN_POSTS = 512
 MAX_PINNED_POSTS = 10
 MAX_GOSSIP_TTL = 3
@@ -606,6 +611,7 @@ CREATE TABLE IF NOT EXISTS drafts (
     expires_in REAL,
     post_hash TEXT,
     pending_peers TEXT,
+    claimed_at REAL,
     created_at REAL NOT NULL
 );
 """
@@ -660,6 +666,10 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         conn.execute("ALTER TABLE drafts ADD COLUMN post_hash TEXT")
     if draft_columns and "pending_peers" not in draft_columns:
         conn.execute("ALTER TABLE drafts ADD COLUMN pending_peers TEXT")
+    if draft_columns and "claimed_at" not in draft_columns:
+        # migrate a pre-claim database: drafts could not be claimed,
+        # so two concurrent publish-draft runs could sign two posts
+        conn.execute("ALTER TABLE drafts ADD COLUMN claimed_at REAL")
     # Created after the migration above: the index references columns a
     # pre-reactions database does not have yet when _SCHEMA first runs.
     conn.execute("CREATE INDEX IF NOT EXISTS posts_target ON posts(target)")
@@ -4672,6 +4682,9 @@ def _draft_dict(row: sqlite3.Row) -> Dict[str, Any]:
         ),
         "post_hash": str(row["post_hash"] or ""),
         "pending_peers": _parse_pending_peers(row["pending_peers"]),
+        "claimed_at": (
+            float(row["claimed_at"]) if row["claimed_at"] is not None else None
+        ),
         "created_at": float(row["created_at"]),
     }
 
@@ -4807,6 +4820,48 @@ def record_draft_publish(
             (digest, json.dumps(pending), draft["id"]),
         )
     return get_draft(conn, draft["id"])
+
+
+def claim_draft(
+    conn: sqlite3.Connection,
+    ref: Any,
+    *,
+    now: Optional[float] = None,
+    ttl: float = DRAFT_CLAIM_TTL,
+) -> bool:
+    """Atomically claim a draft for publishing, or report it is taken.
+
+    The claim is one ``UPDATE`` that only wins when the draft is
+    unclaimed or its claim is older than *ttl*, so two concurrent
+    ``publish-draft`` runs can never both sign a post for the same
+    draft: the loser's update touches zero rows.  Returns ``True``
+    when this caller won the claim.  Raises ``TanError`` for an
+    unknown draft.
+    """
+    draft = get_draft(conn, ref)
+    stamp = float(now if now is not None else time.time())
+    with conn:
+        cursor = conn.execute(
+            "UPDATE drafts SET claimed_at = ? WHERE id = ? "
+            "AND (claimed_at IS NULL OR claimed_at <= ?)",
+            (stamp, draft["id"], stamp - float(ttl)),
+        )
+    return cursor.rowcount == 1
+
+
+def release_draft_claim(conn: sqlite3.Connection, ref: Any) -> None:
+    """Drop a draft's publish claim, if it has one.
+
+    Called whenever a publish attempt leaves the draft behind — a
+    failed publish, a partial delivery — so an immediate retry is not
+    blocked by this run's own claim.  A no-op when the draft was
+    already deleted by a successful publish, or was never claimed.
+    """
+    draft_id = _parse_draft_id(ref)
+    with conn:
+        conn.execute(
+            "UPDATE drafts SET claimed_at = NULL WHERE id = ?", (draft_id,)
+        )
 
 
 # Shelf tables whose rows are pageable posts, for the shared

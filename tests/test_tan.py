@@ -34,6 +34,7 @@ from tau.tangents.tan import (
     annotated_pinned_posts,
     annotated_saved_posts,
     author_stats,    author_timeline,
+    claim_draft,
     create_delete,
     create_edit,
     create_post,
@@ -76,6 +77,7 @@ from tau.tangents.tan import (
     quote_counts,
     quoters,
     reaction_states,
+    release_draft_claim,
     repost_counts,
     reposters,
     resolve_author,
@@ -95,6 +97,7 @@ from tau.tangents.tan import (
     search_posts,
     store,
     store_post,
+    DRAFT_CLAIM_TTL,
     MAX_DRAFTS,
     MAX_MUTED_TAGS,
     MAX_TAN_POST_EXPIRY,
@@ -7897,6 +7900,139 @@ def test_cli_tan_publish_draft_keeps_draft_on_partial_delivery(
         conn.close()
 
 
+def test_cli_tan_publish_draft_refuses_claimed_draft(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            ["tan", "draft", "--data-dir", str(data_dir), "--json", "claimed draft"]
+        )
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+    # Another process is already publishing this draft.
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert claim_draft(conn, draft_id) is True
+    finally:
+        conn.close()
+    assert (
+        main(
+            ["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)]
+        )
+        == 1
+    )
+    assert "already being published" in capsys.readouterr().err
+    # Nothing was signed or stored, and the draft survives.
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert [d["id"] for d in list_drafts(conn)] == [draft_id]
+        assert feed(conn, all_authors=True) == []
+    finally:
+        conn.close()
+
+
+def test_cli_tan_publish_draft_releases_claim_on_partial_delivery(
+    tmp_path, capsys, monkeypatch
+):
+    import tau.cli as cli_module
+
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    # A real stored post stands in for the one the first attempt
+    # signs: the retry must resolve it back from the local database.
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "seed post",
+            ]
+        )
+        == 0
+    )
+    seed_hash = json.loads(capsys.readouterr().out)["post"]["hash"]
+    assert (
+        main(["tan", "draft", "--data-dir", str(data_dir), "--json", "doomed draft"])
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+
+    class _FakePublishNode:
+        def __init__(self, config, name=None):
+            self.config = config
+            self.name = name or "alice"
+            self.identity = RNS.Identity()
+
+        def start(self, exclusive=False):
+            pass
+
+        def attach_app(self, app):
+            pass
+
+        def stop(self):
+            pass
+
+    def fake_publish_local_post(node, **kwargs):
+        return {
+            "post": {"hash": seed_hash, "text": "doomed draft"},
+            "published": {
+                "delivered": 0,
+                "peers": 1,
+                "errors": [{"peer": "aa" * 32, "error": "no route"}],
+            },
+        }
+
+    monkeypatch.setattr(cli_module, "TauNode", _FakePublishNode)
+    monkeypatch.setattr(cli_module, "_publish_local_post", fake_publish_local_post)
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        # The failed attempt released its claim, so the draft can be
+        # retried right away instead of waiting out the TTL.
+        assert get_draft(conn, draft_id)["claimed_at"] is None
+    finally:
+        conn.close()
+    # The retry resolves the same stored post and re-attempts
+    # delivery instead of being refused by the first attempt's claim.
+    assert (
+        main(["tan", "publish-draft", "--data-dir", str(data_dir), str(draft_id)])
+        == 1
+    )
+    assert "kept" in capsys.readouterr().err
+    assert "already being published" not in capsys.readouterr().err
+
+
+def test_cli_tan_drafts_shows_claimed_draft_as_publishing(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            ["tan", "draft", "--data-dir", str(data_dir), "--json", "busy draft"]
+        )
+        == 0
+    )
+    draft_id = json.loads(capsys.readouterr().out)["draft"]["id"]
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert claim_draft(conn, draft_id) is True
+    finally:
+        conn.close()
+    assert main(["tan", "drafts", "--data-dir", str(data_dir)]) == 0
+    assert "publishing…" in capsys.readouterr().out
+
+
 def test_cli_tan_publish_draft_retry_resends_same_post(
     tmp_path, capsys, monkeypatch
 ):
@@ -8113,11 +8249,54 @@ def test_drafts_table_migrates_post_hash_columns(tmp_path):
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
         }
-        assert {"post_hash", "pending_peers"} <= columns
+        assert {"post_hash", "pending_peers", "claimed_at"} <= columns
         draft = get_draft(conn, 1)
         assert draft["text"] == "old draft"
         assert draft["post_hash"] == ""
         assert draft["pending_peers"] == []
+        assert draft["claimed_at"] is None
+    finally:
+        conn.close()
+
+
+def test_draft_claim_atomicity_across_connections(tmp_path):
+    db_path = tmp_path / "tan.sqlite3"
+    first = init_db(db_path)
+    second = init_db(db_path)
+    try:
+        draft = save_draft(first, "claim me", now=1000)
+        assert get_draft(first, draft["id"])["claimed_at"] is None
+        # The first connection wins the claim; a second connection
+        # for the same draft loses it — the two publishers cannot
+        # both sign a post for this draft.
+        assert claim_draft(first, draft["id"], now=1000) is True
+        assert claim_draft(second, draft["id"], now=1001) is False
+        assert get_draft(second, draft["id"])["claimed_at"] == 1000
+        # Releasing the claim lets the other connection take it.
+        release_draft_claim(first, draft["id"])
+        assert get_draft(second, draft["id"])["claimed_at"] is None
+        assert claim_draft(second, draft["id"], now=1002) is True
+    finally:
+        first.close()
+        second.close()
+
+
+def test_draft_claim_goes_stale(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    try:
+        draft = save_draft(conn, "stale claim", now=1000)
+        assert claim_draft(conn, draft["id"], now=1000) is True
+        # Inside the TTL the claim still holds, even for the same
+        # connection: a second publish attempt must wait.
+        assert claim_draft(conn, draft["id"], now=1000 + 10) is False
+        # Past the TTL a crashed publisher's claim can be taken over.
+        assert (
+            claim_draft(conn, draft["id"], now=1000 + DRAFT_CLAIM_TTL + 1)
+            is True
+        )
+        release_draft_claim(conn, draft["id"])
+        with pytest.raises(TanError):
+            claim_draft(conn, 999, now=1000)
     finally:
         conn.close()
 
