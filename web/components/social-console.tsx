@@ -2693,7 +2693,7 @@ export function PostCard({
               )}
             </p>
           ) : null}
-          {poll ? (
+          {poll && !post.deleted ? (
             <div className="mt-2 space-y-1.5">
               {poll.options.map((option, index) => {
                 const count = poll.counts[index] ?? 0;
