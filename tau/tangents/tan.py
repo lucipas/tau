@@ -1117,11 +1117,11 @@ def store_post(
             if linked:
                 _advance_head(conn, author, digest, seq, post["created_at"])
                 _promote_children(conn, author, digest, seq)
-            if post.get("kind") == KIND_DELETE and linked:
-                # A delete takes effect once it is linked on the chain:
-                # the target leaves the store and the entries created
-                # after it link up again.  An unlinked delete purges
-                # nothing yet; _promote_children applies it on linking.
+            if post.get("kind") == KIND_DELETE:
+                # A stored delete is authoritative, linked or not: the
+                # target post leaves the store now, here and on every
+                # peer that syncs the tombstone, and the entries created
+                # after it link up again.
                 _apply_delete(conn, author, str(post.get("target") or ""))
     except sqlite3.IntegrityError:
         # Another thread or process inserted the same post first.
