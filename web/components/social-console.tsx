@@ -24,6 +24,7 @@ import { TAN_POLL_INTERVAL_MS, useTan } from "@/lib/use-tan";
 
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
 import { RulesSection } from "./rules-section";
+import { TargetPicker } from "./target-picker";
 
 export function SocialConsole({
   embedded = false,
@@ -3325,45 +3326,15 @@ export function PostCard({
             )}
           </div>
           {shareOpen ? (
-            <div
-              className="mt-2 flex flex-wrap gap-1"
-              role="group"
-              aria-label="Share to a peer or group"
-            >
-              {(sharePeers ?? []).length === 0 &&
-              (shareGroups ?? []).length === 0 ? (
-                <span className="font-mono text-[10px] text-mist/60">
-                  no known peers or groups yet
-                </span>
-              ) : (
-                <>
-                  {(sharePeers ?? []).map((peer) => (
-                    <button
-                      key={peer.destination}
-                      type="button"
-                      title={`Share with ${peer.alias ?? peer.name}`}
-                      disabled={sharePending}
-                      onClick={() => void handleShare(peer.destination)}
-                      className="rounded-lg border border-line/80 bg-void/60 px-2 py-1 font-mono text-[11px] text-zinc-200 transition hover:border-signal/35 hover:bg-void"
-                    >
-                      {peer.alias ?? peer.name}
-                    </button>
-                  ))}
-                  {(shareGroups ?? []).map((group) => (
-                    <button
-                      key={group.id}
-                      type="button"
-                      title={`Share with group ${group.name}`}
-                      disabled={sharePending}
-                      onClick={() => void handleShareGroup(group.id)}
-                      className="rounded-lg border border-signal/30 bg-signal/10 px-2 py-1 font-mono text-[11px] text-signal transition hover:border-signal/50 hover:bg-signal/15"
-                    >
-                      #{group.name}
-                    </button>
-                  ))}
-                </>
-              )}
-            </div>
+            <TargetPicker
+              peers={sharePeers}
+              groups={shareGroups}
+              pending={sharePending}
+              onSelectPeer={(to) => void handleShare(to)}
+              onSelectGroup={(group) => void handleShareGroup(group)}
+              verb="Share with"
+              className="mt-2"
+            />
           ) : null}
           {shareError ? (
             <p
