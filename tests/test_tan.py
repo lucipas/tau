@@ -3010,6 +3010,44 @@ def test_import_after_purge_keeps_later_entries_linked(identities, tmp_path):
         target.close()
 
 
+def test_import_after_purge_keeps_earlier_edit_visible(identities, tmp_path):
+    # Qodo Critical (fresh peers show outdated edits after a purge):
+    # the export used to carry only retained posts, so a fresh peer
+    # importing after a purge had no record for the deleted post and
+    # the chain walk stopped at the gap — an edit made before the
+    # purge never counted and the original text showed.  The export
+    # now carries the purge records, restored before the entries, so
+    # the walk crosses the gap and the edit renders.
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        post = create_post(source, alice, "original", name="alice", now=1000)
+        create_edit(source, alice, post["hash"], "edited", name="alice", now=1001)
+        doomed = create_post(source, alice, "doomed", name="alice", now=1002)
+        later = create_post(source, alice, "later", name="alice", now=1003)
+        create_delete(source, alice, doomed["hash"], name="alice", now=1004)
+        document = export_entries(source, author=author_of(alice))
+        assert [record["hash"] for record in document["purged"]] == [
+            doomed["hash"]
+        ]
+        assert document["purged"][0]["linked"] == 1
+    finally:
+        source.close()
+
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        result = import_entries(target, document)
+        assert result["errors"] == []
+        assert get_post(target, doomed["hash"]) is None
+        assert get_post(target, later["hash"])["linked"] is True
+        shown = {item["hash"]: item for item in timeline(target, [post["author"]])}
+        assert shown[post["hash"]]["text"] == "edited"
+        assert shown[post["hash"]]["edited"] is True
+        assert verify_store(target)["ok"] is True
+    finally:
+        target.close()
+
+
 def test_search_matches_substring_case_insensitively(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -3337,6 +3375,67 @@ def test_sync_hides_deleted_posts(identities, tmp_path):
         conn.close()
 
 
+class _FeedNode:
+    """A fake node that answers feed requests through a real TanApp."""
+
+    def __init__(self, peer, source_app):
+        self.registry = _FakeRegistry(peer)
+        self.source_app = source_app
+        self.requests = []
+
+    def request(self, peer, path, payload, *, timeout=20.0):
+        request = decode(payload)
+        self.requests.append((path, request))
+        assert path == TAN_FEED_PATH
+        return decode(
+            self.source_app._handle_feed(path, payload, b"id", None, time.time())
+        )
+
+
+def test_sync_after_purge_keeps_earlier_edit_visible(identities, tmp_path):
+    # Same gap as the export round trip, reached over sync: the feed
+    # page carries the purge records its posts need, restored before
+    # the page's entries are stored, so the fresh peer renders the
+    # edit made before the purge instead of the original text.
+    alice, bob = identities
+    source_config = TauConfig.resolve(data_dir=tmp_path / "source-app", name="bob")
+    source_app = TanApp(source_config, bob, name="bob", gossip=False)
+    source = source_app.connect()
+    post = create_post(source, bob, "original", name="bob", now=1000)
+    create_edit(source, bob, post["hash"], "edited", name="bob", now=1001)
+    doomed = create_post(source, bob, "doomed", name="bob", now=1002)
+    later = create_post(source, bob, "later", name="bob", now=1003)
+    create_delete(source, bob, doomed["hash"], name="bob", now=1004)
+    source.close()
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = TanApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(post["author"]),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _FeedNode(peer, source_app)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, authors=[post["author"]], limit=20)
+    assert summary["stored"] == 4
+    assert summary["errors"] == []
+
+    conn = app.connect()
+    try:
+        assert get_post(conn, doomed["hash"]) is None
+        assert get_post(conn, later["hash"])["linked"] is True
+        shown = {item["hash"]: item for item in timeline(conn, [post["author"]])}
+        assert shown[post["hash"]]["text"] == "edited"
+        assert shown[post["hash"]]["edited"] is True
+        assert verify_store(conn)["ok"] is True
+    finally:
+        conn.close()
+
+
 def test_delete_by_non_author_is_inert(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -3567,6 +3666,69 @@ def test_unlinked_delete_keeps_child_waiting(identities, tmp_path):
     store_post(conn, child)
     assert get_post(conn, child["hash"])["linked"] == 0
     assert timeline(conn, [post["author"]]) == []
+
+
+def test_unlinked_edit_purge_keeps_later_child_waiting(identities, tmp_path):
+    # Qodo Warning (unlinked entries gain a false chain position):
+    # an edit stored while its own parent was missing never acquired
+    # a chain position, so when it is purged with its post, a later
+    # child of that edit must keep waiting instead of linking
+    # through the purge record.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "gone", name="alice", now=1000)
+    # The edit's parent never arrives: it is stored unlinked.
+    edit = create_edit(
+        scratch, alice, post["hash"], "gone, fixed", name="alice", now=1001,
+        previous="0" * 64,
+    )
+    later = create_post(
+        scratch, alice, "after the unlinked edit", name="alice", now=1002,
+        previous=edit["hash"],
+    )
+    delete = create_delete(scratch, alice, post["hash"], name="alice", now=1003)
+
+    store_post(conn, post)
+    store_post(conn, edit)
+    assert get_post(conn, edit["hash"])["linked"] == 0
+    store_post(conn, delete)
+    assert get_post(conn, post["hash"]) is None
+    assert get_post(conn, edit["hash"]) is None
+    # The child arrives after the purge: the record for its unlinked
+    # parent must not link it.
+    store_post(conn, later)
+    assert get_post(conn, later["hash"])["linked"] == 0
+    assert verify_store(conn)["ok"] is True
+
+
+def test_purge_of_unlinked_edit_keeps_waiting_child_waiting(identities, tmp_path):
+    # Same hole, the other way round: the child is already waiting
+    # when the delete applies, and the purge-time re-link must not
+    # promote it through a parent that never had a chain position.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "gone", name="alice", now=1000)
+    edit = create_edit(
+        scratch, alice, post["hash"], "gone, fixed", name="alice", now=1001,
+        previous="0" * 64,
+    )
+    later = create_post(
+        scratch, alice, "after the unlinked edit", name="alice", now=1002,
+        previous=edit["hash"],
+    )
+    delete = create_delete(scratch, alice, post["hash"], name="alice", now=1003)
+
+    store_post(conn, post)
+    store_post(conn, edit)
+    store_post(conn, later)
+    assert get_post(conn, later["hash"])["linked"] == 0
+    store_post(conn, delete)
+    assert get_post(conn, post["hash"]) is None
+    assert get_post(conn, edit["hash"]) is None
+    assert get_post(conn, later["hash"])["linked"] == 0
+    assert verify_store(conn)["ok"] is True
 
 
 def test_unlinked_delete_does_not_purge_cached_target(identities, tmp_path):
