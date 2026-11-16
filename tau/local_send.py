@@ -22,7 +22,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .local_ipc import LocalServer, call_local, local_server_available
+from .local_ipc import (
+    LocalIPCConnectFailed,
+    LocalServer,
+    call_local,
+    local_server_available,
+    local_server_listening,
+)
 
 _SEND_SOCKET_NAME = "send.sock"
 _FANOUT_SOCKET_NAME = "send-fanout.sock"
@@ -66,17 +72,30 @@ def send_running(data_dir: Path, *, reply_timeout: Optional[float] = None, **req
     in *request* is the operation timeout and is forwarded to the server.
 
     A fan-out op (see :data:`FANOUT_OPS`) goes to the fan-out socket
-    when a fan-out worker is answering there, so it cannot block the
-    main socket; when no fan-out worker answers — an older serving
-    node, or a fan-out server that could not bind — it falls back to
-    the main socket instead of failing.  The probe only connects, so
-    a fallback decision is made before anything is sent: a request
-    is never sent twice.
+    when a fan-out worker owns it, so it cannot block the main
+    socket; when no fan-out worker owns it — an older serving node,
+    or a fan-out server that could not bind — it falls back to the
+    main socket instead of failing.  The probe distinguishes an
+    absent listener from a busy one: a connect that times out means
+    the worker exists but its backlog is full, so the request queues
+    behind it rather than spilling onto the main socket.  And when
+    the worker stops between the probe and the connect, the failed
+    connect — before any request bytes are sent — falls back to the
+    main socket as well.  A request is never sent twice.
     """
-    if request.get("op") in FANOUT_OPS and send_fanout_server_available(data_dir):
-        return call_local(
-            data_dir / _FANOUT_SOCKET_NAME, reply_timeout=reply_timeout, **request
-        )
+    if request.get("op") in FANOUT_OPS and local_server_listening(
+        data_dir / _FANOUT_SOCKET_NAME
+    ):
+        try:
+            return call_local(
+                data_dir / _FANOUT_SOCKET_NAME,
+                reply_timeout=reply_timeout,
+                **request,
+            )
+        except LocalIPCConnectFailed:
+            # The fan-out worker went away between the probe and the
+            # connect; nothing was sent, so the main socket may serve it.
+            pass
     return call_local(data_dir / _SEND_SOCKET_NAME, reply_timeout=reply_timeout, **request)
 
 

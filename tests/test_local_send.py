@@ -555,6 +555,100 @@ def test_fanout_ops_fall_back_to_main_socket(tmp_path):
         server.stop()
 
 
+def test_call_local_connect_failures_are_retryable(tmp_path):
+    # A connect that fails before any request bytes are sent may be
+    # retried elsewhere; the error type says so (Qodo Warning on
+    # PR #456: a group request must not fail when the fan-out worker
+    # stops between the probe and the connect).
+    from tau.local_ipc import (
+        LocalIPCConnectFailed,
+        LocalIPCUnavailable,
+        call_local,
+    )
+
+    # No socket file at all.
+    with pytest.raises(LocalIPCConnectFailed):
+        call_local(tmp_path / "missing.sock", op="send")
+    # A stale socket file: the path exists but nobody listens.
+    stale = tmp_path / "stale.sock"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(str(stale))
+    finally:
+        sock.close()
+    assert stale.exists()
+    with pytest.raises(LocalIPCConnectFailed):
+        call_local(stale, op="send")
+    # A connect failure is still an unavailable-server error for
+    # callers that do not distinguish.
+    with pytest.raises(LocalIPCUnavailable):
+        call_local(stale, op="send")
+
+
+def test_call_local_slow_reply_is_not_retryable(tmp_path):
+    # A reply wait that fails after the request was sent must never
+    # be retried elsewhere: the first server may already have handled
+    # it, so a retry could send it twice.
+    from tau.local_ipc import (
+        LocalIPCConnectFailed,
+        LocalIPCUnavailable,
+        call_local,
+    )
+
+    def _slow(**request):
+        time.sleep(3)
+        return {"ok": True}
+
+    server = SendServer(tmp_path, _slow)
+    try:
+        with pytest.raises(LocalIPCUnavailable) as excinfo:
+            call_local(tmp_path / "send.sock", reply_timeout=0.2, op="send")
+        assert type(excinfo.value) is LocalIPCUnavailable
+        assert not isinstance(excinfo.value, LocalIPCConnectFailed)
+    finally:
+        server.stop()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_fanout_op_falls_back_when_fanout_socket_vanishes(
+    tmp_path, monkeypatch
+):
+    # The fan-out worker can stop between the probe and the connect
+    # (serve shutdown stops it first): the request was never sent, so
+    # it falls back to the main socket instead of failing (Qodo
+    # Warning on PR #456).
+    import tau.local_send
+
+    from tau.local_send import send_fanout_server_available, send_running
+
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    server = SendServer(
+        tmp_path, lambda **request: cli._dispatch_local_send(node, **request)
+    )
+    try:
+        assert send_server_available(tmp_path)
+        assert not send_fanout_server_available(tmp_path)
+        # Pretend the probe saw a fan-out worker that is gone by the
+        # time the request connects.
+        monkeypatch.setattr(
+            tau.local_send, "local_server_listening", lambda *args, **kwargs: True
+        )
+        result = send_running(
+            tmp_path, op="group_send", group="weekend", text="hi", leg_timeout=5.0
+        )
+        assert result["results"][0]["delivered"] is True
+        assert node.calls == [
+            ("group_send", node.groups.find("weekend")["id"], "hi")
+        ]
+    finally:
+        server.stop()
+
+
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
 def test_slow_group_send_does_not_block_main_socket(tmp_path):
     # The regression test for issue #455: a group send stalled on
@@ -606,6 +700,99 @@ def test_slow_group_send_does_not_block_main_socket(tmp_path):
         assert results["group"]["results"][0]["delivered"] is True
     finally:
         release.set()
+        fanout_server.stop()
+        main_server.stop()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_saturated_fanout_backlog_does_not_fall_back_to_main_socket(tmp_path):
+    # Qodo Warning on PR #456: when concurrent group requests fill
+    # the fan-out worker's listen backlog, the availability probe
+    # fails even though the worker is running — that must not read as
+    # "no fan-out worker" and spill a group send onto the main socket.
+    from tau.local_send import FanoutServer, send_running
+
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    release = threading.Event()
+    handler_started = threading.Event()
+    main_calls: list = []
+    fanout_calls: list = []
+    results: dict = {}
+    held: list = []
+
+    def dispatch(calls):
+        def _dispatch(**request):
+            calls.append(request.get("op", "send"))
+            if request.get("op") == "group_send":
+                handler_started.set()
+                assert release.wait(timeout=15)
+            return cli._dispatch_local_send(node, **request)
+
+        return _dispatch
+
+    main_server = SendServer(tmp_path, dispatch(main_calls))
+    fanout_server = FanoutServer(tmp_path, dispatch(fanout_calls))
+    try:
+        assert send_server_available(tmp_path)
+        first = threading.Thread(
+            target=lambda: results.__setitem__(
+                "first",
+                send_running(
+                    tmp_path,
+                    op="group_send",
+                    group="weekend",
+                    text="one",
+                    leg_timeout=5.0,
+                ),
+            ),
+            daemon=True,
+        )
+        first.start()
+        assert handler_started.wait(timeout=5)
+        # Fill the fan-out listen backlog while its worker is busy.
+        for _ in range(32):
+            held_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            held_sock.settimeout(5)
+            held_sock.connect(str(tmp_path / "send-fanout.sock"))
+            held.append(held_sock)
+        second = threading.Thread(
+            target=lambda: results.__setitem__(
+                "second",
+                send_running(
+                    tmp_path,
+                    op="group_send",
+                    group="weekend",
+                    text="two",
+                    leg_timeout=5.0,
+                ),
+            ),
+            daemon=True,
+        )
+        second.start()
+        # The second group send's probe times out on the full backlog;
+        # it must still not spill onto the main socket.
+        time.sleep(3)
+        assert main_calls == []
+        for held_sock in held:
+            held_sock.close()
+        held.clear()
+        release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        assert not first.is_alive() and not second.is_alive()
+        assert results["first"]["results"][0]["delivered"] is True
+        assert results["second"]["results"][0]["delivered"] is True
+        assert main_calls == []
+        assert fanout_calls.count("group_send") == 2
+    finally:
+        release.set()
+        for held_sock in held:
+            held_sock.close()
         fanout_server.stop()
         main_server.stop()
 
