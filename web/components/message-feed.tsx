@@ -15,6 +15,7 @@ import {
 } from "@/lib/format";
 
 import { RadarIcon, SectionLabel } from "./ui";
+import { TargetPicker } from "./target-picker";
 
 // One emoji or short text token per the protocol limit (32 chars);
 // a fixed picker keeps every reaction inside it by construction.
@@ -1008,46 +1009,15 @@ function MessageBubble({
           </div>
         ) : null}
         {forwardOpen ? (
-          <div
-            className={`flex flex-wrap gap-1 px-1 pt-1 ${
-              outbound ? "justify-end" : ""
-            }`}
-            role="group"
-            aria-label="Forward to a peer or group"
-          >
-            {(peers ?? []).length === 0 && (groups ?? []).length === 0 ? (
-              <span className="font-mono text-[10px] text-mist/60">
-                no known peers or groups yet
-              </span>
-            ) : (
-              <>
-                {(peers ?? []).map((peer) => (
-                  <button
-                    key={peer.destination}
-                    type="button"
-                    title={`Forward to ${peer.alias ?? peer.name}`}
-                    disabled={forwardPending}
-                    onClick={() => void handleForward(peer.destination)}
-                    className="rounded-lg border border-line/80 bg-void/60 px-2 py-1 font-mono text-[11px] text-zinc-200 transition hover:border-signal/35 hover:bg-void"
-                  >
-                    {peer.alias ?? peer.name}
-                  </button>
-                ))}
-                {(groups ?? []).map((group) => (
-                  <button
-                    key={group.id}
-                    type="button"
-                    title={`Forward to group ${group.name}`}
-                    disabled={forwardPending}
-                    onClick={() => void handleForwardGroup(group.id)}
-                    className="rounded-lg border border-signal/30 bg-signal/10 px-2 py-1 font-mono text-[11px] text-signal transition hover:border-signal/50 hover:bg-signal/15"
-                  >
-                    #{group.name}
-                  </button>
-                ))}
-              </>
-            )}
-          </div>
+          <TargetPicker
+            peers={peers}
+            groups={groups}
+            pending={forwardPending}
+            onSelectPeer={(to) => void handleForward(to)}
+            onSelectGroup={(group) => void handleForwardGroup(group)}
+            verb="Forward to"
+            className={`px-1 pt-1 ${outbound ? "justify-end" : ""}`}
+          />
         ) : null}
         {forwardError ? (
           <p

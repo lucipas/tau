@@ -148,6 +148,248 @@ describe("PostCard delete control", () => {
   });
 });
 
+describe("PostCard share control", () => {
+  const peers = [
+    {
+      destination: "a".repeat(64),
+      name: "alice",
+      last_seen: 1000,
+      age: 0,
+      hops: 1,
+      protocol: 1,
+    },
+  ];
+  const groups = [
+    { id: "g".repeat(32), name: "crew", members: [], created_at: 1000 },
+  ];
+
+  function renderCard(props: Record<string, unknown> = {}) {
+    const post = makePost();
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+        {...props}
+      />,
+    );
+    return post;
+  }
+
+  it("offers peers and groups, and shares with the picked peer", async () => {
+    const onShare = vi.fn().mockResolvedValue(undefined);
+    const post = renderCard({
+      onShare,
+      onShareGroup: vi.fn(),
+      sharePeers: peers,
+      shareGroups: groups,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    expect(screen.getByRole("button", { name: "alice" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "#crew" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "alice" }));
+    await waitFor(() => expect(onShare).toHaveBeenCalledWith(post, peers[0].destination));
+  });
+
+  it("shares with the picked group", async () => {
+    const onShareGroup = vi.fn().mockResolvedValue(undefined);
+    renderCard({
+      onShare: vi.fn(),
+      onShareGroup,
+      sharePeers: peers,
+      shareGroups: groups,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    fireEvent.click(screen.getByRole("button", { name: "#crew" }));
+    await waitFor(() =>
+      expect(onShareGroup).toHaveBeenCalledWith(
+        expect.objectContaining({ hash: "c".repeat(64) }),
+        groups[0].id,
+      ),
+    );
+  });
+
+  it("says so when there are no known peers or groups", () => {
+    renderCard({ onShare: vi.fn(), sharePeers: [], shareGroups: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    expect(screen.getByText("no known peers or groups yet")).toBeTruthy();
+  });
+
+  it("shows no share button when sharing is not wired", () => {
+    renderCard();
+    expect(
+      screen.queryByRole("button", { name: "Share this post" }),
+    ).toBeNull();
+  });
+
+  it("reports a failed share and keeps the picker open", async () => {
+    const onShare = vi.fn().mockRejectedValue(new Error("peer is offline"));
+    renderCard({ onShare, sharePeers: peers, shareGroups: groups });
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    fireEvent.click(screen.getByRole("button", { name: "alice" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("share failed: peer is offline"),
+      ).toBeTruthy(),
+    );
+    expect(screen.getByRole("button", { name: "alice" })).toBeTruthy();
+  });
+});
+
+describe("SocialConsole share", () => {
+  const mockSharePost = vi.fn();
+  const peers = [
+    {
+      destination: "a".repeat(64),
+      name: "alice",
+      last_seen: 1000,
+      age: 0,
+      hops: 1,
+      protocol: 1,
+    },
+  ];
+  const groups = [
+    { id: "g".repeat(32), name: "crew", members: [], created_at: 1000 },
+  ];
+
+  function makeTan(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
+      tags: [],
+      tagFilter: null,
+      setTagFilter: vi.fn(),
+      mutedAuthors: [],
+      mutedKeywords: [],
+      followedTags: [],
+      mutedTags: [],
+      all: false,
+      setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      followTag: vi.fn(),
+      unfollowTag: vi.fn(),
+      muteTag: vi.fn(),
+      unmuteTag: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      repost: vi.fn(),
+      sharePost: mockSharePost,
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      hidden: [],
+      hiddenLoading: false,
+      hiddenHasMore: false,
+      loadHidden: vi.fn(),
+      loadMoreHidden: vi.fn(),
+      hide: vi.fn(),
+      unhide: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it("keeps the picker open and shows the card error on a rejected share", async () => {
+    const post = makePost();
+    mockSharePost.mockRejectedValue(new Error("peer is offline"));
+    mockUseTan.mockReturnValue(makeTan({ posts: [post] }));
+    render(<SocialConsole peers={peers} groups={groups} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    fireEvent.click(screen.getByRole("button", { name: "alice" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("share failed: peer is offline"),
+      ).toBeTruthy(),
+    );
+    expect(screen.getByRole("button", { name: "alice" })).toBeTruthy();
+    expect(mockSharePost).toHaveBeenCalledWith(post.hash, { to: peers[0].destination });
+  });
+
+  it("names the members a failed group share missed", async () => {
+    const post = makePost();
+    mockSharePost.mockResolvedValue({
+      ok: false,
+      messages: [],
+      response: {
+        results: [
+          { to: "b".repeat(64), to_name: "bob", delivered: false },
+          { to: "a".repeat(64), to_name: "alice", delivered: true },
+        ],
+      },
+    });
+    mockUseTan.mockReturnValue(makeTan({ posts: [post] }));
+    render(<SocialConsole peers={peers} groups={groups} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    fireEvent.click(screen.getByRole("button", { name: "#crew" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("share failed: could not reach bob"),
+      ).toBeTruthy(),
+    );
+    expect(screen.getByRole("button", { name: "#crew" })).toBeTruthy();
+  });
+
+  it("confirms a successful share and closes the picker", async () => {
+    const post = makePost();
+    mockSharePost.mockResolvedValue({ ok: true, message: null, response: {} });
+    mockUseTan.mockReturnValue(makeTan({ posts: [post] }));
+    render(<SocialConsole peers={peers} groups={groups} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Share this post" }));
+    fireEvent.click(screen.getByRole("button", { name: "alice" }));
+    await waitFor(() =>
+      expect(screen.getByText("shared with alice")).toBeTruthy(),
+    );
+    expect(
+      screen.queryByRole("button", { name: "alice" }),
+    ).toBeNull();
+  });
+});
+
 describe("VerifyResult", () => {
   function makeReport(overrides: Partial<TanVerifyReport> = {}): TanVerifyReport {
     return {
