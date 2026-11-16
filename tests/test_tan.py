@@ -4150,6 +4150,79 @@ def test_pending_record_upgrades_when_predecessor_arrives_later(identities, tmp_
         target.close()
 
 
+def test_pending_record_upgrades_when_purged_predecessor_arrives_later(identities, tmp_path):
+    # Qodo Critical (later imports strand deleted chains): the
+    # restore relink linked ordinary children of a newly restored
+    # purge record but never reconsidered pending purge records
+    # naming it as their predecessor — so a record kept pending
+    # because its predecessor had not arrived stayed pending when
+    # that predecessor arrived as a purge record in a later import,
+    # and the entries behind it stayed unlinked.  A newly linked
+    # restored record now resolves its dependent pending records
+    # in the same committed relink.
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        first = create_post(source, alice, "first", name="alice", now=1000)
+        doomed_b = create_post(source, alice, "doomed-b", name="alice", now=1001)
+        doomed_c = create_post(
+            source, alice, "doomed-c", name="alice", now=1002,
+            previous=doomed_b["hash"],
+        )
+        later = create_post(
+            source, alice, "later", name="alice", now=1003,
+            previous=doomed_c["hash"],
+        )
+        later2 = create_post(
+            source, alice, "later still", name="alice", now=1004,
+            previous=doomed_c["hash"],
+        )
+        create_delete(source, alice, doomed_b["hash"], name="alice", now=1005)
+        create_delete(source, alice, doomed_c["hash"], name="alice", now=1006)
+        document = export_entries(source, author=author_of(alice))
+        purged = {record["hash"]: record for record in document["purged"]}
+        assert set(purged) == {doomed_b["hash"], doomed_c["hash"]}
+    finally:
+        source.close()
+
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        # First import: everything but the predecessor's record and
+        # the second later entry — the later record is backed and
+        # referenced, but its predecessor has not arrived, so it is
+        # kept pending.  (The first later entry still links on its
+        # delete's arrival — with no record at all, the delete is
+        # the only proof — but the record itself stays pending.)
+        first_doc = dict(document)
+        first_doc["entries"] = [
+            entry
+            for entry in document["entries"]
+            if entry["hash"] != later2["hash"]
+        ]
+        first_doc["purged"] = [purged[doomed_c["hash"]]]
+        result = import_entries(target, first_doc)
+        assert result["errors"] == []
+        assert _purge_record(target, doomed_c["hash"]) == 0
+        assert get_post(target, later["hash"])["linked"] == 1
+        # Second import: the second later entry plus only the
+        # predecessor's record — the pending record is NOT
+        # re-offered.  The entry arrives while its parent's record
+        # is still pending, so it waits unlinked; when the
+        # predecessor's record links, the pending record must
+        # upgrade and the waiting entry link with it.
+        second_doc = dict(document)
+        second_doc["entries"] = [later2]
+        second_doc["purged"] = [purged[doomed_b["hash"]]]
+        result = import_entries(target, second_doc)
+        assert result["errors"] == []
+        assert _purge_record(target, doomed_b["hash"]) == 1
+        assert _purge_record(target, doomed_c["hash"]) == 1
+        assert get_post(target, later2["hash"])["linked"] == 1
+        assert verify_store(target)["ok"] is True
+    finally:
+        target.close()
+
+
 def test_restored_record_cannot_claim_another_authors_post(identities, tmp_path):
     # Qodo Critical (any author can claim another user's post as
     # purged): the restore used to accept a record's author on the

@@ -4378,17 +4378,22 @@ def _relink_purged_children(
     Runs after a restore (import or sync page): a child stored
     unlinked while its parent's record was missing links up once the
     record is there, and the promotion carries through its own
-    descendants, including a delete that follows it.  The relink
-    commits here, in its own transaction: the callers close the
-    connection right after (the CLI and web imports, the last sync
-    page), and an uncommitted relink would be rolled back on close
-    — the entries would stay unlinked on disk while the process
-    that just linked them still sees them linked.
+    descendants, including a delete that follows it.  A newly linked
+    record can also resolve an older pending record naming it as
+    predecessor — the pending record upgrades here, in the same
+    committed transaction, so entries behind that gap link up too
+    even when the pending record itself was not re-offered.  The
+    relink commits here, in its own transaction: the callers close
+    the connection right after (the CLI and web imports, the last
+    sync page), and an uncommitted relink would be rolled back on
+    close — the entries would stay unlinked on disk while the
+    process that just linked them still sees them linked.
     """
     if not restored:
         return
     with conn:
         for author, digest in restored:
+            _resolve_pending_purged(conn, author, digest)
             _link_children_of_purged(conn, author, digest)
 
 
