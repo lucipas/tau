@@ -8933,6 +8933,62 @@ def test_drafts_migration_tolerates_concurrent_open(tmp_path):
     assert errors == []
 
 
+def test_posts_migration_tolerates_concurrent_open(tmp_path):
+    # Regression test for #419: two processes opening the same
+    # pre-expiry / pre-reactions store both saw the posts columns
+    # missing and both ran the ALTER; the loser crashed with
+    # "duplicate column name: expires_at" (and likewise for v,
+    # kind, target). The migrations now tolerate that race.
+    db_path = tmp_path / "tan.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE posts ("
+            "hash TEXT PRIMARY KEY, "
+            "author TEXT NOT NULL, prev TEXT NOT NULL DEFAULT '', "
+            "key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', "
+            "text TEXT NOT NULL, created_at REAL NOT NULL, "
+            "received_at REAL NOT NULL, sig TEXT NOT NULL, "
+            "seq INTEGER NOT NULL DEFAULT 0, linked INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO posts(hash, author, key, text, created_at, "
+            "received_at, sig) VALUES(?, 'bb', 'cc', 'legacy row', "
+            "1000, 1000, 'dd')",
+            ("aa" * 32,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    errors = []
+    barrier = threading.Barrier(4)
+
+    def open_it():
+        try:
+            barrier.wait(timeout=10)
+            opened = init_db(db_path)
+            try:
+                columns = {
+                    str(row["name"])
+                    for row in opened.execute(
+                        "PRAGMA table_info(posts)"
+                    ).fetchall()
+                }
+                assert {"v", "kind", "target", "expires_at", "options"} <= columns
+                assert get_post(opened, "aa" * 32)["text"] == "legacy row"
+            finally:
+                opened.close()
+        except Exception as exc:  # noqa: BLE001 - collected, asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_it) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+
 def test_cli_tan_publish_draft_rereads_after_claim(tmp_path, capsys, monkeypatch):
     import tau.cli as cli_module
 
