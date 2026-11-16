@@ -1352,6 +1352,31 @@ export function useTan() {
     ],
   );
 
+  const voteOnPoll = useCallback(
+    async (target: string, option: number) => {
+      // Votes are chain entries in the store, so they invalidate an
+      // audit exactly like a post does.
+      invalidateVerify();
+      await apiPost("/api/tan/vote", { target, option });
+      // The vote is already committed; a refresh failure must not be
+      // reported as the vote failing (a retry would add another entry).
+      await runRefreshes([
+        load(),
+        refreshSavedIfLoaded(),
+        refreshPinnedIfLoaded(),
+        refreshHiddenIfLoaded(),
+      ]);
+    },
+    [
+      load,
+      invalidateVerify,
+      refreshHiddenIfLoaded,
+      refreshSavedIfLoaded,
+      refreshPinnedIfLoaded,
+      runRefreshes,
+    ],
+  );
+
   const repost = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/repost", { target });
@@ -1620,6 +1645,7 @@ export function useTan() {
     unmuteTag,
     like,
     unlike,
+    voteOnPoll,
     repost,
     fetchLikers,
     fetchReposters,
