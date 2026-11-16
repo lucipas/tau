@@ -2731,7 +2731,9 @@ function TanPostImage({ post }: { post: TanPost }) {
       // Poll the bytes endpoint until the transfer lands (or 60s pass).
       for (let i = 0; i < 30; i++) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
-        const response = await fetch(src, { method: "HEAD" });
+        // GET: the media route serves only GET, so a HEAD poll never sees
+        // the image once it lands.
+        const response = await fetch(src);
         if (response.ok) {
           setMissing(false);
           setAttempt((count) => count + 1);
