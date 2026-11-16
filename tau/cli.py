@@ -2149,6 +2149,34 @@ def build_parser() -> argparse.ArgumentParser:
     tan_vote.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_vote.set_defaults(func=cmd_tan_vote)
 
+    tan_close_poll = tan_sub.add_parser(
+        "close-poll",
+        parents=[common],
+        help="close one of your own polls early (writes a signed close entry to your chain)",
+    )
+    tan_close_poll.add_argument(
+        "target", metavar="POLL", help="poll hash or unique hash prefix"
+    )
+    tan_close_poll.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_close_poll.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_close_poll.add_argument(
+        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
+    )
+    tan_close_poll.add_argument(
+        "--timeout", type=float, default=15.0, metavar="SECONDS"
+    )
+    tan_close_poll.set_defaults(func=cmd_tan_close_poll)
+
     tan_results = tan_sub.add_parser(
         "results",
         parents=[common],
@@ -3379,6 +3407,8 @@ def _print_poll_options(
     if tally is not None:
         total = int(tally.get("total") or 0)
         print(f"{indent}{total} vote{'s' if total != 1 else ''} total")
+        if tally.get("closed"):
+            print(f"{indent}closed — no more votes")
 
 
 def _print_tan_poll_results(result: Dict[str, Any], *, json_output: bool) -> None:
@@ -3394,6 +3424,7 @@ def _print_tan_poll_results(result: Dict[str, Any], *, json_output: bool) -> Non
                 "options": options,
                 "counts": counts,
                 "total": result["total"],
+                "closed": result["closed"],
                 "voters": voters,
             },
             True,
@@ -3407,6 +3438,8 @@ def _print_tan_poll_results(result: Dict[str, Any], *, json_output: bool) -> Non
     print(f"[{when}] {name} ({author}) {short_hash(str(poll.get('hash', '')))}")
     for line in str(poll.get("text", "")).splitlines() or [""]:
         print(f"  {line}")
+    if result.get("closed"):
+        print("  closed — no more votes")
     by_option: Dict[int, List[Dict[str, Any]]] = {}
     for voter in voters:
         by_option.setdefault(int(voter["option"]), []).append(voter)
@@ -4720,6 +4753,79 @@ def cmd_tan_vote(args: argparse.Namespace) -> int:
         _emit({"vote": record, "published": published}, True)
     else:
         print(f"voted for {options[option]!r} on {short_hash(poll['hash'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_close_poll(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    conn = init_db(config.social_db_path)
+    try:
+        poll = resolve_post(conn, args.target)
+        if poll.get("kind") != KIND_POLL:
+            print(f"error: {args.target!r} is not a poll", file=sys.stderr)
+            return 2
+    finally:
+        conn.close()
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        record = app.close_poll(poll["hash"])
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            # The serving node owns the data directory: close the poll
+            # locally, then ask the running node to publish it, the
+            # same way publish-draft re-delivers a stored post.
+            from .local_publish import publish_running
+
+            app = TanApp(config, _tan_identity(config), name=config.name)
+            record = app.close_poll(poll["hash"])
+            result = publish_running(
+                config.data_dir,
+                post_hash=record["hash"],
+                to=getattr(args, "to", None),
+                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            published = result["published"]
+        else:
+            try:
+                app = TanApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                node.attach_app(app)
+                targets = None
+                if getattr(args, "to", None):
+                    targets = [node.resolve_peer(target) for target in args.to]
+                record = app.close_poll(poll["hash"])
+                published = app.publish(
+                    record,
+                    targets=targets,
+                    ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                )
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"close": record, "published": published}, True)
+    else:
+        print(f"closed poll {short_hash(poll['hash'])}")
         if published is None:
             print("  stored locally (not published)")
         else:

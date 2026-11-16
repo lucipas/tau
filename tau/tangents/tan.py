@@ -192,12 +192,13 @@ KIND_EDIT = "edit"
 KIND_QUOTE = "quote"
 KIND_POLL = "poll"
 KIND_VOTE = "vote"
+KIND_CLOSE = "close"
 REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
 # Reactions, deletes and reposts carry no text; replies, edits, quotes
 # and votes carry text but are still targeted entries, so their parent
 # link is signed like a reaction's.  A vote's text is the chosen
 # option's index — the choice is signed with the vote.
-TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE, KIND_REPOST)
+TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE, KIND_REPOST, KIND_CLOSE)
 # Targeted entries (reactions, deletes, replies, edits, quotes,
 # reposts and votes) point at another post.
 TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY, KIND_EDIT, KIND_QUOTE, KIND_VOTE)
@@ -1664,6 +1665,8 @@ def create_vote(
         raise TanError("poll has been deleted")
     if is_expired(existing, now=timestamp):
         raise TanError("poll has expired")
+    if is_poll_closed(conn, existing):
+        raise TanError("poll is closed")
     options = _decode_options(existing.get("options")) or []
     if not isinstance(option, int) or isinstance(option, bool):
         raise TanError("vote option must be an option index")
@@ -1688,6 +1691,81 @@ def create_vote(
             "created_at": timestamp,
             "prev": prev,
             "kind": KIND_VOTE,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
+def create_close_poll(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a close entry for the poll *target*.
+
+    The close is appended to the closer's own chain, exactly like a
+    delete: ``kind`` is ``close`` and ``target`` is the poll hash, so
+    it gossips and syncs through the same paths and every node that
+    holds the poll learns it is closed.  Only the poll's author can
+    close it — a close from anyone else stays inert, the same
+    author-match rule :func:`is_poll_closed` applies — and only when
+    the poll is cached locally, linked, and not deleted or expired:
+    a close is written to a poll the author has seen in full.  Closing
+    freezes the tally: votes cast before the close keep counting, and
+    votes after it are rejected (see :func:`create_vote`).  A close is
+    final — there is no reopen — and closing an already-closed poll
+    raises, like deleting an already-deleted post.
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    existing = get_post(conn, target)
+    if existing is None:
+        raise TanError(f"unknown post: {target!r}")
+    if existing.get("kind", KIND_POST) != KIND_POLL:
+        raise TanError("only polls can be closed")
+    if not existing.get("linked"):
+        raise TanError(
+            "poll has not linked yet; sync its chain before closing"
+        )
+    if _is_deleted(conn, existing):
+        raise TanError("poll has been deleted")
+    if is_expired(existing, now=timestamp):
+        raise TanError("poll has expired")
+    if existing["author"] != author:
+        raise TanError("cannot close a poll you did not author")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        # Checked under the write lock so a concurrent close that
+        # committed first is seen here rather than appended twice.
+        if is_poll_closed(conn, existing):
+            raise TanError("poll is already closed")
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": "",
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_CLOSE,
             "target": target,
         }
         digest = hash(body, previous=prev)
@@ -1746,6 +1824,28 @@ def like_counts(
     return result
 
 
+def _poll_close_cutoffs(
+    conn: sqlite3.Connection, targets: Sequence[str]
+) -> Dict[str, float]:
+    """Map each closed poll hash to the ``created_at`` of its earliest close.
+
+    Only linked close entries written by the poll's own author count,
+    the same rule :func:`is_poll_closed` applies. Votes created after
+    the cutoff are not part of the frozen tally.
+    """
+    if not targets:
+        return {}
+    placeholders = ", ".join("?" for _ in targets)
+    rows = conn.execute(
+        "SELECT c.target AS target, MIN(c.created_at) AS closed_at "
+        "FROM posts c JOIN posts p ON p.hash = c.target AND p.author = c.author "
+        "WHERE c.kind = 'close' AND c.linked = 1 AND p.kind = 'poll' "
+        f"AND c.target IN ({placeholders}) GROUP BY c.target",
+        list(targets),
+    ).fetchall()
+    return {str(row["target"]): float(row["closed_at"]) for row in rows}
+
+
 def vote_states(
     conn: sqlite3.Connection, targets: Sequence[str]
 ) -> Dict[str, Dict[str, int]]:
@@ -1782,8 +1882,9 @@ def vote_states(
         options = _decode_options(row["options"])
         if options is not None:
             option_counts[str(row["hash"])] = len(options)
+    closed_at = _poll_close_cutoffs(conn, clean)
     rows = conn.execute(
-        "SELECT target, author, text, expires_at FROM posts "
+        "SELECT target, author, text, created_at, expires_at FROM posts "
         f"WHERE kind = 'vote' AND linked = 1 AND target IN ({placeholders}) "
         "ORDER BY target, author, seq ASC",
         clean,
@@ -1795,6 +1896,11 @@ def vote_states(
         if is_expired({"expires_at": row["expires_at"]}):
             # An expired vote no longer stands, and it does not
             # supersede an earlier live vote by the same voter.
+            continue
+        cutoff = closed_at.get(str(row["target"]))
+        if cutoff is not None and float(row["created_at"]) > cutoff:
+            # Cast after the poll's author closed it: never counts,
+            # and does not supersede the voter's pre-close vote.
             continue
         index = int(text)
         option_count = option_counts.get(str(row["target"]))
@@ -1932,7 +2038,8 @@ def poll_results(
     anything but a poll raises too.  The result carries the resolved
     poll under ``"poll"``, its options under ``"options"``, the vote
     count per option under ``"counts"``, the total number of voters
-    under ``"total"``, and the voters under ``"voters"``: one
+    under ``"total"``, whether the poll is closed under ``"closed"``,
+    and the voters under ``"voters"``: one
     ``{"author": ..., "name": ..., "option": <index>}`` record per
     voter whose standing vote names a real option, newest vote first.
     The name is the one on the voter's latest vote entry for the poll.
@@ -1969,9 +2076,13 @@ def poll_results(
             "ORDER BY author, seq ASC",
             (target,),
         ).fetchall()
+        cutoff = _poll_close_cutoffs(conn, [target]).get(target)
         names: Dict[str, str] = {}
         voted_at: Dict[str, float] = {}
         for row in rows:
+            if cutoff is not None and float(row["created_at"]) > cutoff:
+                # A vote cast after the close is not part of the tally.
+                continue
             # Rows arrive in chain order per voter, so the last write
             # wins — the name and time on the voter's latest vote.
             names[str(row["author"])] = str(row["name"])
@@ -2000,6 +2111,7 @@ def poll_results(
         "options": options,
         "counts": counts,
         "total": len(records),
+        "closed": is_poll_closed(conn, post),
         "voters": records,
     }
 
@@ -2378,11 +2490,11 @@ def annotate_polls(
     """Attach a ``poll`` tally to poll entries, in place.
 
     ``poll`` carries the options, the vote count per option in option
-    order, the total number of voters, and — when *viewer* is given —
-    the index of the viewer's own standing vote (or ``None``).  Votes
-    naming an option the poll does not have are ignored: a poll's
-    options never change once published, so a mismatch means a bad
-    entry.  Non-poll entries are untouched.
+    order, the total number of voters, whether the poll is closed, and
+    — when *viewer* is given — the index of the viewer's own standing
+    vote (or ``None``).  Votes naming an option the poll does not have
+    are ignored: a poll's options never change once published, so a
+    mismatch means a bad entry.  Non-poll entries are untouched.
     """
     polls = [post for post in posts if post.get("kind") == KIND_POLL]
     if not polls:
@@ -2404,6 +2516,7 @@ def annotate_polls(
             "options": options,
             "counts": counts,
             "total": total,
+            "closed": is_poll_closed(conn, post),
             "voted": voted,
         }
     return posts
@@ -2991,6 +3104,16 @@ def _is_deleted(conn: sqlite3.Connection, post: Dict[str, Any]) -> bool:
     row = conn.execute(
         "SELECT 1 FROM posts d WHERE d.kind = 'delete' AND d.linked = 1 "
         "AND d.target = ? AND d.author = ? LIMIT 1",
+        (post["hash"], post["author"]),
+    ).fetchone()
+    return row is not None
+
+
+def is_poll_closed(conn: sqlite3.Connection, post: Dict[str, Any]) -> bool:
+    """Whether *post* is closed by a close entry from its own author."""
+    row = conn.execute(
+        "SELECT 1 FROM posts c WHERE c.kind = 'close' AND c.linked = 1 "
+        "AND c.target = ? AND c.author = ? LIMIT 1",
         (post["hash"], post["author"]),
     ).fetchone()
     return row is not None
@@ -6763,6 +6886,26 @@ class TanApp:
         try:
             record = create_vote(
                 conn, self.identity, target, option, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
+
+    def close_poll(
+        self,
+        target: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Close one of your own polls early (see :func:`create_close_poll`)."""
+        conn = self.connect()
+        try:
+            record = create_close_poll(
+                conn, self.identity, target, name=self.name
             )
         finally:
             conn.close()

@@ -7045,6 +7045,7 @@ def test_tan_vote_via_api(tmp_path):
             "options": ["Thursday", "Friday"],
             "counts": [0, 1],
             "total": 1,
+            "closed": False,
             "voted": 1,
         }
 
@@ -7158,6 +7159,7 @@ def test_tan_poll_via_api(tmp_path):
             "options": ["Thursday", "Friday"],
             "counts": [0, 0],
             "total": 0,
+            "closed": False,
             "voted": None,
         }
         status, _, payload = _json(
@@ -7682,6 +7684,7 @@ def test_tan_rules_via_api(tmp_path):
             "unlike",
             "delete",
             "repost",
+            "close",
             "reply",
             "edit",
             "quote",
