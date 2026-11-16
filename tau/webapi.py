@@ -9003,7 +9003,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._serve_events(query)
             return
 
-        if self.command == "GET":
+        if self.command in ("GET", "HEAD"):
             if path == "/api/status":
                 self._send_json(
                     self.bridge.snapshot(

@@ -2490,6 +2490,12 @@ class TauNode:
             log.warning("Stored media %s failed its hash check; refusing", sha256[:8])
             return response_error("not_found", "stored image failed its hash check")
         requester = RNS.Destination.hash(remote_identity, APP_NAME, ASPECT).hex()
+        if self.blocklist.is_blocked(requester):
+            log.info(
+                "Media request from %s denied by the block-list",
+                requester[:8],
+            )
+            return response_error("not_allowed", "requester is blocked")
         name = f"tan-{sha256[:12]}.img"
         try:
             conn = init_tan_db(self.config.social_db_path)
@@ -6639,14 +6645,28 @@ class TauNode:
             raise NodeError("sha256 must be a 64 character hex digest") from exc
         cached = media_path(self.config.data_dir, digest)
         if cached is not None:
-            return {
-                "ok": True,
-                "v": PROTOCOL_VERSION,
-                "sha256": digest,
-                "path": str(cached),
-                "size": cached.stat().st_size,
-                "cached": True,
-            }
+            try:
+                cached_bytes = cached.read_bytes()
+            except OSError:
+                cached_bytes = None
+            if (
+                cached_bytes is not None
+                and hashlib.sha256(cached_bytes).hexdigest() == digest
+            ):
+                return {
+                    "ok": True,
+                    "v": PROTOCOL_VERSION,
+                    "sha256": digest,
+                    "path": str(cached),
+                    "size": cached.stat().st_size,
+                    "cached": True,
+                }
+            # A damaged cache entry is dropped so the fetch below
+            # repairs it instead of reporting corrupt bytes as cached.
+            try:
+                cached.unlink()
+            except OSError:
+                pass
         peer = self.resolve_peer(
             author,
             timeout=min(timeout, 10.0) if discover_timeout is None else discover_timeout,
@@ -8153,11 +8173,20 @@ class TauNode:
             peer = self.registry.get(offer["from"])
             if peer is not None:
                 offer["from_name"] = peer.display_name
+            if self._is_pending_media_fetch(offer["from"], offer):
+                # A media fetch answers a request this node made: the
+                # bytes go straight to the media store from memory.
+                # They never enter the file inbox — no inbound file
+                # record, no copy under files/<author>/, no on_file
+                # callback — so viewing a feed image cannot flood the
+                # inbox, and an inbox write failure cannot lose bytes
+                # that already verified against their hash.
+                self._complete_media_fetch(offer, data)
+                return
             record = self._save_received_file(offer, data)
             if record is None:
                 return
             self._record_received(record)
-            self._complete_media_fetch(offer, record)
             if self.on_file is not None:
                 try:
                     self.on_file(record)
@@ -8167,14 +8196,15 @@ class TauNode:
             log.warning("Could not handle concluded Resource", exc_info=True)
 
     def _complete_media_fetch(
-        self, offer: Dict[str, Any], record: Dict[str, Any]
+        self, offer: Dict[str, Any], data: bytes
     ) -> None:
         """File a concluded transfer that answers a media fetch.
 
-        Copies the verified bytes into the media store under their
-        digest — the inbox copy stays where it is — and wakes the
-        ``fetch_tan_media`` waiter with the store path.  A transfer
-        that was never a media fetch is left alone.
+        Stores the verified bytes in the media store under their
+        digest and wakes the ``fetch_tan_media`` waiter with the
+        store path.  A transfer that was never a media fetch is left
+        alone; a media-store failure signals an error instead of
+        leaving the waiter blocked.
         """
         digest = str(offer.get("sha256") or "").lower()
         with self._media_fetches_lock:
@@ -8182,7 +8212,6 @@ class TauNode:
             if pending is None or pending.get("author") != offer.get("from"):
                 return
         try:
-            data = Path(record["path"]).read_bytes()
             stored = store_media(self.config.data_dir, digest, data)
         except (OSError, TanError) as exc:
             with self._media_fetches_lock:

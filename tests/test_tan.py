@@ -278,6 +278,9 @@ def test_media_store_round_trip_and_prune(tmp_path):
     assert media_path(tmp_path, digest) == stored
     # A second store of the same bytes is a no-op that returns the path.
     assert store_media(tmp_path, digest, data) == stored
+    # A damaged cache entry is repaired by storing the good bytes again.
+    stored.write_bytes(b"corrupt")
+    assert store_media(tmp_path, digest, data).read_bytes() == data
     # Bytes that do not match their digest are refused.
     with pytest.raises(TanError):
         store_media(tmp_path, "0" * 64, data)

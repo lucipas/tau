@@ -7869,3 +7869,45 @@ def test_tan_media_rejects_unknown_image(tmp_path, capsys):
         cli.main(["tan", "media", "--data-dir", str(data_dir), "ab" * 32]) == 2
     )
     assert cli.main(["tan", "media", "--data-dir", str(data_dir), "nope"]) == 2
+
+
+def test_print_tan_posts_counts_appear_once(capsys):
+    from tau.cli import _print_tan_posts
+
+    post = {
+        "name": "alice",
+        "author": "ab" * 16,
+        "hash": "cd" * 32,
+        "created_at": 1000.0,
+        "text": "hi",
+        "kind": "post",
+        "likes": 3,
+        "liked": False,
+        "reposts": 1,
+        "reposted": False,
+        "quotes": 2,
+    }
+    _print_tan_posts([post], json_output=False)
+    out = capsys.readouterr().out
+    assert out.count("♥ 3") == 1
+    assert out.count("↻ 1") == 1
+    assert out.count("❝ 2") == 1
+
+
+def test_fetch_running_bounds_reply_wait(tmp_path, monkeypatch):
+    from tau import local_media
+
+    seen = {}
+
+    def fake_call_local(path, *, reply_timeout=None, **request):
+        seen["reply_timeout"] = reply_timeout
+        seen["path"] = path
+        return {"ok": True}
+
+    monkeypatch.setattr(local_media, "call_local", fake_call_local)
+    result = local_media.fetch_running(
+        tmp_path, author="ab" * 16, sha256="cd" * 32, timeout=45.0
+    )
+    assert result == {"ok": True}
+    assert seen["reply_timeout"] == 75.0
+    assert str(seen["path"]).endswith("media.sock")

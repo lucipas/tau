@@ -16247,6 +16247,15 @@ def test_tan_media_serves_cached_image(bridge, node, tmp_path):
     assert headers["Content-Type"] == "image/png"
     assert headers["Content-Disposition"].startswith('inline; filename="photo.png"')
     assert headers["Content-Length"] == str(len(data))
+    # HEAD answers the same headers without the bytes, so the
+    # console's fetch poll can tell the image arrived.
+    status, headers, body = _request(
+        bridge, f"/api/tan/media/{digest}", method="HEAD"
+    )
+    assert status == 200
+    assert body == b""
+    assert headers["Content-Type"] == "image/png"
+    assert headers["Content-Length"] == str(len(data))
     status, _, payload = _json(bridge, f"/api/tan/media/{'00' * 32}")
     assert status == 404
     assert "no such cached image" in payload["error"]["message"]

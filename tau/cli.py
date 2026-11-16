@@ -3294,16 +3294,6 @@ def _print_tan_posts(
         quotes = int(post.get("quotes") or 0)
         if quotes:
             print(f"  ❝ {quotes}")
-        if likes or post.get("liked"):
-            suffix = " (you liked this)" if post.get("liked") else ""
-            print(f"  ♥ {likes}{suffix}")
-        reposts = int(post.get("reposts") or 0)
-        if reposts or post.get("reposted"):
-            suffix = " (you reposted this)" if post.get("reposted") else ""
-            print(f"  ↻ {reposts}{suffix}")
-        quotes = int(post.get("quotes") or 0)
-        if quotes:
-            print(f"  ❝ {quotes}")
 
 
 def _print_tan_thread(

@@ -23,9 +23,20 @@ class MediaServer(LocalServer):
 
 
 def fetch_running(data_dir: Path, **request: Any) -> Dict[str, Any]:
-    """Ask the serving node to fetch one Tan image; returns its result."""
+    """Ask the serving node to fetch one Tan image; returns its result.
+
+    The client-side reply wait is bounded by the fetch timeout the
+    caller asked for, plus slack for the node's own stages — without
+    it a serving node that stops responding leaves the caller hung
+    on the socket long after its own timeout passed.
+    """
+    timeout = float(request.get("timeout") or 60.0)
     try:
-        return call_local(data_dir / _MEDIA_SOCKET_NAME, **request)
+        return call_local(
+            data_dir / _MEDIA_SOCKET_NAME,
+            reply_timeout=timeout + 30.0,
+            **request,
+        )
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "could not fetch through the running node; ensure it is running "

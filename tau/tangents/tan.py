@@ -1148,10 +1148,17 @@ def store_media(
     ensure_dir(directory)
     target = directory / digest
     if target.is_file():
-        # Already stored: refresh its recency for the prune order.
-        now = time.time()
-        os.utime(target, (now, now))
-        return target
+        try:
+            existing = target.read_bytes()
+        except OSError:
+            existing = None
+        if existing is not None and hashlib.sha256(existing).hexdigest() == digest:
+            # Already stored: refresh its recency for the prune order.
+            now = time.time()
+            os.utime(target, (now, now))
+            return target
+        # A damaged cache entry is replaced by the verified bytes below,
+        # so a truncated file can never wedge the digest as "cached".
     tmp = directory / f".{digest}.tmp-{uuid.uuid4().hex}"
     try:
         tmp.write_bytes(data)
