@@ -378,6 +378,165 @@ describe("useTau setPeerNote", () => {
   });
 });
 
+describe("useTau lookalike warnings", () => {
+  it("keeps a note-based warning when a peer event arrives without one", async () => {
+    // The anchor is a saved contact only by private note; the lookalike
+    // announces the anchor's name. The snapshot (loopback, notes
+    // included) flags the lookalike, so the note-blind live event must
+    // not erase the warning.
+    const anchor = makePeer({
+      destination: "cd".repeat(16),
+      name: "alice",
+      note: "met at the mesh meetup",
+    });
+    const lookalike = makePeer({
+      destination: "ef".repeat(16),
+      name: "Alice",
+      lookalike_of: "alice",
+    });
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [anchor, lookalike]);
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.lookalike_of,
+      ).toBe("alice"),
+    );
+
+    act(() => {
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "ef".repeat(16),
+          name: "Alice",
+          last_seen: 300,
+          lookalike_of: null,
+        }),
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.last_seen,
+      ).toBe(300),
+    );
+
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === lookalike.destination,
+      )?.lookalike_of,
+    ).toBe("alice");
+  });
+
+  it("clears a warning when the anchor no longer matches", async () => {
+    const anchor = makePeer({ destination: "cd".repeat(16), verified: true });
+    const lookalike = makePeer({
+      destination: "ef".repeat(16),
+      name: "Alice",
+      lookalike_of: "alice",
+    });
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [anchor, lookalike]);
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.lookalike_of,
+      ).toBe("alice"),
+    );
+
+    // The verified peer renames away from the claimed name, then the
+    // lookalike re-announces: the recompute must not resurrect the
+    // warning from the stale snapshot value.
+    act(() => {
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "cd".repeat(16),
+          name: "alicia",
+          verified: true,
+          last_seen: 300,
+        }),
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === anchor.destination,
+        )?.name,
+      ).toBe("alicia"),
+    );
+    act(() => {
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "ef".repeat(16),
+          name: "Alice",
+          last_seen: 301,
+          lookalike_of: null,
+        }),
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.last_seen,
+      ).toBe(301),
+    );
+
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === lookalike.destination,
+      )?.lookalike_of,
+    ).toBeNull();
+  });
+
+  it("keeps a note-based warning when an alias reply arrives without one", async () => {
+    const anchor = makePeer({
+      destination: "cd".repeat(16),
+      name: "alice",
+      note: "met at the mesh meetup",
+    });
+    const lookalike = makePeer({
+      destination: "ef".repeat(16),
+      name: "Alice",
+      lookalike_of: "alice",
+    });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      peer: makePeer({
+        destination: "ef".repeat(16),
+        name: "Alice",
+        alias: "laptop",
+        lookalike_of: null,
+      }),
+    });
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [anchor, lookalike]);
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.lookalike_of,
+      ).toBe("alice"),
+    );
+
+    await act(async () => {
+      await result.current.setPeerAlias(lookalike.destination, "laptop");
+    });
+
+    const updated = result.current.peers.find(
+      (entry) => entry.destination === lookalike.destination,
+    );
+    expect(updated?.alias).toBe("laptop");
+    expect(updated?.lookalike_of).toBe("alice");
+  });
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });

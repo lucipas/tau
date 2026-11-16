@@ -6969,18 +6969,32 @@ class WebBridge:
         # Mirrors peers_verify; a node-like without the lock (e.g. in
         # tests) simply edits.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        # The alias the console last saw, before any edit lands: a
+        # neighbour announcing it loses its warning when this edit
+        # lands, so it must be refreshed even if the alias on disk
+        # (and therefore the one read under the lock) differs by now.
         before = self.node.registry.get(destination)
         previous_alias = before.alias if before is not None else None
         with lock:
             # Pick up notes a one-shot command saved since the last
             # periodic refresh, so this save does not write back stale ones.
             self.node.registry.refresh_aliases()
+            # Capture the alias being replaced only now, under the
+            # lock: a concurrent edit may have changed it between the
+            # read above and lock acquisition, and the refresh may
+            # have just restored a different alias from disk — either
+            # stale value would leave the neighbours announcing the
+            # intervening alias with a stale lookalike badge.
+            current = self.node.registry.get(destination)
+            replaced_alias = current.alias if current is not None else None
             if alias is not None and alias.strip():
                 peer = self.node.registry.set_alias(destination, alias)
             else:
                 peer = self.node.registry.clear_alias(destination)
         self.record_peer(peer)
-        self._refresh_lookalike_neighbours(peer, previous_alias)
+        self._refresh_lookalike_neighbours(
+            peer, previous_alias, replaced_alias
+        )
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.
@@ -7011,6 +7025,10 @@ class WebBridge:
             else:
                 peer = self.node.registry.clear_note(destination)
         self.record_peer(peer)
+        # A note makes this peer a saved contact — or stops it being
+        # one — which anchors or releases the lookalike warning on
+        # peers announcing its name, so refresh those rows too.
+        self._refresh_lookalike_neighbours(peer)
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.
