@@ -147,10 +147,14 @@ def _connect(path: Path, timeout: float = _CONNECT_TIMEOUT_SECONDS) -> socket.so
     A listener whose backlog is full is still a running worker, so a
     connect that fails with ``EAGAIN`` is retried — on a fresh socket
     each time, since a failed connect leaves the socket unusable —
-    until *timeout* seconds have passed.  A failure that proves the
-    listener absent, or any other error, is raised at once.
+    until *timeout* seconds have passed.  The wait between attempts
+    backs off exponentially (0.05 s doubling to a 0.5 s cap, clamped
+    to the deadline) so a saturated listener is not polled at a fixed
+    rate.  A failure that proves the listener absent, or any other
+    error, is raised at once.
     """
     deadline = time.monotonic() + timeout
+    delay = 0.05
     while True:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -160,7 +164,8 @@ def _connect(path: Path, timeout: float = _CONNECT_TIMEOUT_SECONDS) -> socket.so
         except OSError as exc:
             client.close()
             if _is_full_backlog(exc) and time.monotonic() < deadline:
-                time.sleep(0.05)
+                time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+                delay = min(delay * 2, 0.5)
                 continue
             raise
 
