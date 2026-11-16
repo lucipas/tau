@@ -267,6 +267,11 @@ from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
 
+# (author, sha256) background media fetches already running, so repeated
+# POSTs for the same image do not each start another waiting thread.
+_MEDIA_FETCHES_INFLIGHT: Set[Tuple[str, str]] = set()
+_MEDIA_FETCHES_INFLIGHT_LOCK = threading.Lock()
+
 DEFAULT_WEB_PORT = 8787
 DEFAULT_WEB_HOST = "127.0.0.1"
 
@@ -8138,7 +8143,12 @@ class WebBridge:
         generic name and ``application/octet-stream``.  The bytes are
         re-checked against the digest before serving.
         """
-        from .tangents.tan import find_post_by_image, init_db, media_path
+        from .tangents.tan import (
+            find_post_by_image,
+            init_db,
+            media_path,
+            media_requires_publication,
+        )
 
         digest = str(sha256).strip().lower()
         if len(digest) != 64:
@@ -8170,6 +8180,9 @@ class WebBridge:
                 conn.close()
         except Exception:  # pragma: no cover - a broken Tan DB must not block serving
             post = None
+        if post is None and media_requires_publication(stored):
+            # A local upload whose post was never published stays private.
+            return None
         if post is not None:
             image = post.get("image") or {}
             if isinstance(image.get("mime"), str) and image["mime"]:
@@ -8187,22 +8200,39 @@ class WebBridge:
         """
         digest = str(sha256).strip().lower()
         node = self.node
-        threading.Thread(
-            target=self._fetch_media_in_background,
-            args=(node, digest, author),
-            name="tau-media-fetch",
-            daemon=True,
-        ).start()
+        key = (str(author), digest)
+        with _MEDIA_FETCHES_INFLIGHT_LOCK:
+            if key in _MEDIA_FETCHES_INFLIGHT:
+                # The same image from the same author is already being fetched;
+                # the console's polling picks it up when it lands.
+                return {"accepted": True, "sha256": digest}
+            _MEDIA_FETCHES_INFLIGHT.add(key)
+        try:
+            threading.Thread(
+                target=self._fetch_media_in_background,
+                args=(node, digest, author, key),
+                name="tau-media-fetch",
+                daemon=True,
+            ).start()
+        except Exception:
+            with _MEDIA_FETCHES_INFLIGHT_LOCK:
+                _MEDIA_FETCHES_INFLIGHT.discard(key)
+            raise
         return {"accepted": True, "sha256": digest}
 
     @staticmethod
-    def _fetch_media_in_background(node: Any, sha256: str, author: str) -> None:
+    def _fetch_media_in_background(
+        node: Any, sha256: str, author: str, key: Tuple[str, str]
+    ) -> None:
         try:
             node.fetch_tan_media(author, sha256, timeout=120.0)
         except Exception as exc:  # pragma: no cover - network dependent
             log.warning(
                 "Background Tan media fetch for %s failed: %s", sha256[:8], exc
             )
+        finally:
+            with _MEDIA_FETCHES_INFLIGHT_LOCK:
+                _MEDIA_FETCHES_INFLIGHT.discard(key)
 
     def messages_search(
         self,

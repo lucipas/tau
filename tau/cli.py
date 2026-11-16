@@ -3083,7 +3083,7 @@ def _read_image(path: Path, data_dir: Path) -> Dict[str, Any]:
         raise NodeError(f"image file name {source.name!r} is not usable")
     digest = hashlib.sha256(data).hexdigest()
     try:
-        store_media(data_dir, digest, data)
+        store_media(data_dir, digest, data, pinned=True)
     except TanError as exc:
         raise NodeError(str(exc)) from exc
     return {"sha256": digest, "size": len(data), "mime": mime, "name": name}
@@ -3284,16 +3284,6 @@ def _print_tan_posts(
             _print_poll_options(post)
         _print_tan_image(post)
         likes = int(post.get("likes") or 0)
-        if likes or post.get("liked"):
-            suffix = " (you liked this)" if post.get("liked") else ""
-            print(f"  ♥ {likes}{suffix}")
-        reposts = int(post.get("reposts") or 0)
-        if reposts or post.get("reposted"):
-            suffix = " (you reposted this)" if post.get("reposted") else ""
-            print(f"  ↻ {reposts}{suffix}")
-        quotes = int(post.get("quotes") or 0)
-        if quotes:
-            print(f"  ❝ {quotes}")
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"  ♥ {likes}{suffix}")

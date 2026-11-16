@@ -1102,8 +1102,34 @@ def media_dir(data_dir: Union[str, Path]) -> Path:
     return Path(data_dir).expanduser() / "media"
 
 
+_PINNED_MEDIA_SUBDIR = "own"
+
+
+def _media_file_matches(path: Path, digest: str) -> bool:
+    """Return True when *path*'s bytes hash to *digest*."""
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 16), b""):
+                hasher.update(chunk)
+    except OSError:
+        return False
+    return hasher.hexdigest() == digest
+
+
+def media_requires_publication(stored: Path) -> bool:
+    """Return True when *stored* is a local upload that must not be served
+    until a post carrying it is published (see :func:`store_media`)."""
+    return stored.parent.name == _PINNED_MEDIA_SUBDIR
+
+
 def media_path(data_dir: Union[str, Path], sha256: str) -> Optional[Path]:
-    """Return the stored bytes for *sha256*, or ``None`` when absent."""
+    """Return the stored bytes for *sha256*, or ``None`` when absent.
+
+    A file whose bytes no longer hash to *sha256* counts as absent so
+    a later fetch or store can replace it.  A hit refreshes the file's
+    recency for the LRU prune order.
+    """
     digest = str(sha256).strip().lower()
     if len(digest) != HASH_HEX_LENGTH:
         return None
@@ -1111,9 +1137,15 @@ def media_path(data_dir: Union[str, Path], sha256: str) -> Optional[Path]:
         bytes.fromhex(digest)
     except ValueError:
         return None
-    target = media_dir(data_dir) / digest
-    if target.is_file():
-        return target
+    directory = media_dir(data_dir)
+    for candidate in (directory / _PINNED_MEDIA_SUBDIR / digest, directory / digest):
+        if candidate.is_file() and _media_file_matches(candidate, digest):
+            now = time.time()
+            try:
+                os.utime(candidate, (now, now))
+            except OSError:  # pragma: no cover - best effort
+                pass
+            return candidate
     return None
 
 
@@ -1123,13 +1155,17 @@ def store_media(
     data: bytes,
     *,
     max_total_bytes: int = MAX_MEDIA_STORE_BYTES,
+    pinned: bool = False,
 ) -> Path:
     """Store *data* in the media store under its SHA-256, verifying it.
 
     Writes atomically (temp file + rename) and prunes the least
-    recently used files when the store would exceed *max_total_bytes*,
-    so one prolific author cannot fill the disk.  Returns the path
-    of the stored file.
+    recently used cached files when the store would exceed
+    *max_total_bytes*, so one prolific author cannot fill the disk.
+    ``pinned`` files (the local user's own uploads) live in a separate
+    subdirectory that pruning never touches.  An existing copy is kept
+    only if its bytes still verify; otherwise it is replaced.  Returns
+    the path of the stored file.
     """
     digest = str(sha256).strip().lower()
     if len(digest) != HASH_HEX_LENGTH:
@@ -1145,14 +1181,15 @@ def store_media(
             f"media of {len(data)} bytes exceeds the {MAX_IMAGE_BYTES} byte limit"
         )
     directory = media_dir(data_dir)
-    ensure_dir(directory)
-    target = directory / digest
-    if target.is_file():
-        # Already stored: refresh its recency for the prune order.
+    target_dir = directory / _PINNED_MEDIA_SUBDIR if pinned else directory
+    ensure_dir(target_dir)
+    target = target_dir / digest
+    if target.is_file() and _media_file_matches(target, digest):
+        # Already stored and intact: refresh its recency for the prune order.
         now = time.time()
         os.utime(target, (now, now))
         return target
-    tmp = directory / f".{digest}.tmp-{uuid.uuid4().hex}"
+    tmp = target_dir / f".{digest}.tmp-{uuid.uuid4().hex}"
     try:
         tmp.write_bytes(data)
         os.replace(tmp, target)
@@ -1163,7 +1200,8 @@ def store_media(
             pass
         except OSError:  # pragma: no cover - best effort
             pass
-    _prune_media_store(directory, max_total_bytes=max_total_bytes)
+    if not pinned:
+        _prune_media_store(directory, max_total_bytes=max_total_bytes)
     return target
 
 
