@@ -22,10 +22,25 @@ class MediaServer(LocalServer):
         )
 
 
+# Slack beyond the requested fetch timeout for the serving node to finish
+# its own resolution and transfer bookkeeping before replying.
+_REPLY_SLACK_SECONDS = 30.0
+
+
 def fetch_running(data_dir: Path, **request: Any) -> Dict[str, Any]:
     """Ask the serving node to fetch one Tan image; returns its result."""
+    timeout = request.get("timeout")
+    reply_timeout = (
+        float(timeout) + _REPLY_SLACK_SECONDS
+        if isinstance(timeout, (int, float))
+        else None
+    )
     try:
-        return call_local(data_dir / _MEDIA_SOCKET_NAME, **request)
+        return call_local(
+            data_dir / _MEDIA_SOCKET_NAME,
+            reply_timeout=reply_timeout,
+            **request,
+        )
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "could not fetch through the running node; ensure it is running "
