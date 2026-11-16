@@ -29,6 +29,7 @@ INBOX_FILE_NAME = "inbox.json"
 GROUPS_FILE_NAME = "groups.json"
 MESSAGES_FILE_NAME = "messages.json"
 SOCIAL_DB_FILE_NAME = "tan.sqlite3"
+CHANNELS_DB_FILE_NAME = "channels.sqlite3"
 TAN_RULES_FILE_NAME = "tan-rules.json"
 ALLOWLIST_FILE_NAME = "allowlist.json"
 FILES_DIR_NAME = "files"
@@ -67,6 +68,7 @@ class TauConfig:
     groups_path: Path
     node_file: Path
     social_db_path: Path
+    channels_db_path: Path
     tan_rules_path: Path
     allowlist_path: Path
     blocklist_path: Path
@@ -110,6 +112,7 @@ class TauConfig:
             groups_path=base / GROUPS_FILE_NAME,
             node_file=base / NODE_FILE_NAME,
             social_db_path=base / SOCIAL_DB_FILE_NAME,
+            channels_db_path=base / CHANNELS_DB_FILE_NAME,
             tan_rules_path=base / TAN_RULES_FILE_NAME,
             allowlist_path=base / ALLOWLIST_FILE_NAME,
             blocklist_path=base / BLOCKLIST_FILE_NAME,
