@@ -7371,6 +7371,75 @@ def _send_local_message(
     return result
 
 
+def _send_group_local_message(
+    node: TauNode,
+    *,
+    group: str,
+    text: str,
+    timeout: float = 20.0,
+    leg_timeout: Optional[float] = None,
+    discover_timeout: Optional[float] = None,
+    queue: bool = True,
+    in_reply_to: Optional[Dict[str, Any]] = None,
+    expires_at: Optional[float] = None,
+    wait: float = 0.0,
+    send_after: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fan one group message out on the running node, for the local send server.
+
+    Mirrors the one-shot path in :func:`cmd_group_send` (same
+    ``--wait`` handling, same queued-to-delivered flush
+    reconciliation) so a group send routed through the serving node
+    reports the same result.  The flush reconciliation reads the
+    sent record instead of the delivery callback the one-shot path
+    installs at construction: the serving node is already running
+    without one, and the flush records a confirmed delivery on the
+    sent record before the entry leaves the outbox.  ``leg_timeout``
+    is the per-leg bound forwarded by the client; see
+    :func:`_retract_group_local_message` for why it is not the reply
+    wait.
+    """
+    node.groups.list_groups()  # reload: a group made by another process
+    record = node.groups.find(group)
+    if record is None:
+        raise ValueError(f"unknown group: {group!r}")
+    response = node.send_group_message(
+        record,
+        text,
+        timeout=float(leg_timeout if leg_timeout is not None else timeout),
+        discover_timeout=discover_timeout,
+        queue=bool(queue),
+        in_reply_to=in_reply_to,
+        expires_at=expires_at,
+        send_after=send_after,
+    )
+    if wait > 0:
+        _wait_for_queued_sends(
+            node,
+            [result for result in response["results"] if result.get("queued")],
+            wait,
+        )
+    elif any(result.get("queued") for result in response["results"]):
+        # One-shot send: give reachable members a brief chance to take
+        # a queued leg before this process exits.
+        node.flush_outbox(timeout=3.0, max_peers=5)
+        for result in response["results"]:
+            if not result.get("queued"):
+                continue
+            # Only a recorded delivery counts as delivered; an entry
+            # that merely vanished was cancelled, expired, or taken by
+            # another process.
+            sent = node.mailbox.sent_record(result["id"])
+            if sent is not None and sent.get("delivered_at") is not None:
+                result["queued"] = False
+                result["delivered"] = True
+            elif node.mailbox.get_outbox(result["id"]) is None:
+                result["queued"] = False
+                result["ok"] = False
+                result["error"] = "left the outbox without a delivery confirmation"
+    return response
+
+
 def _retract_local_message(
     node: TauNode,
     *,
@@ -7513,12 +7582,14 @@ def _typing_group_local_message(
 def _dispatch_local_send(
     node: TauNode, *, bridge: Any = None, **request: Any
 ) -> Dict[str, Any]:
-    """Serve one local send-socket request: a DM send, a retraction, a
-    group retraction, an edit, a group edit, or a console-copy drop.
+    """Serve one local send-socket request: a DM send, a group send, a
+    retraction, a group retraction, an edit, a group edit, or a
+    console-copy drop.
 
     The socket carries them all, distinguished by ``op``: ``"send"``
     (the default, so older one-shot clients keep working) runs
-    :func:`_send_local_message`, while ``"retract"``,
+    :func:`_send_local_message`, ``"group_send"`` runs
+    :func:`_send_group_local_message`, while ``"retract"``,
     ``"retract_group"``, ``"edit"`` and ``"edit_group"`` run the
     retraction, the group retraction, the edit and the group edit on
     the serving node, so ``tau retract`` and ``tau edit`` work while
@@ -7561,6 +7632,8 @@ def _dispatch_local_send(
         return _typing_group_local_message(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
+    if op == "group_send":
+        return _send_group_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
 
 
@@ -10751,6 +10824,100 @@ def cmd_group_rename(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _send_group_via_running_node(
+    args: argparse.Namespace,
+    config: TauConfig,
+    text: str,
+    *,
+    expires_at: Optional[float],
+    send_after: Optional[float],
+    wait: float,
+    in_reply_to: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Send a group message through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        # The per-leg timeout travels in the request; the reply wait stays
+        # unbounded because a fan-out can outlast any single leg's bound.
+        return send_running(
+            config.data_dir,
+            op="group_send",
+            group=args.group,
+            text=text,
+            leg_timeout=float(getattr(args, "timeout", 20.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            queue=not getattr(args, "no_queue", False),
+            in_reply_to=in_reply_to,
+            expires_at=expires_at,
+            wait=wait,
+            send_after=send_after,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-send; retry the send"
+        ) from exc
+
+
+def _send_group_via_local_node(
+    args: argparse.Namespace,
+    config: TauConfig,
+    text: str,
+    *,
+    expires_at: Optional[float],
+    send_after: Optional[float],
+    wait: float,
+    in_reply_to: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """One-shot group send on a node this process starts and stops itself."""
+    delivered_ids: Set[str] = set()
+    node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
+    node.start()
+    try:
+        group = node.groups.find(args.group)
+        response = node.send_group_message(
+            group,
+            text,
+            timeout=float(getattr(args, "timeout", 20.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            queue=not getattr(args, "no_queue", False),
+            in_reply_to=in_reply_to,
+            expires_at=expires_at,
+            send_after=send_after,
+        )
+        # --wait replaces the one-shot flush: wait for each queued leg
+        # for the requested duration, recording delivered or still
+        # queued outcomes. Only queued legs go to the helper, since it
+        # treats any other leg without an "ok" key as delivered.
+        if wait > 0:
+            _wait_for_queued_sends(
+                node,
+                [result for result in response["results"] if result.get("queued")],
+                wait,
+            )
+        # One-shot send: give reachable members a brief chance to take
+        # a queued leg before this process exits.
+        elif any(result.get("queued") for result in response["results"]):
+            node.flush_outbox(timeout=3.0, max_peers=5)
+            for result in response["results"]:
+                if not result.get("queued"):
+                    continue
+                # Only a delivery acknowledgement counts as delivered; an
+                # entry that merely vanished was cancelled, expired, or
+                # taken by another process.
+                if result["id"] in delivered_ids:
+                    result["queued"] = False
+                    result["delivered"] = True
+                elif node.mailbox.get_outbox(result["id"]) is None:
+                    result["queued"] = False
+                    result["ok"] = False
+                    result["error"] = "left the outbox without a delivery confirmation"
+    finally:
+        node.stop()
+    return response
+
+
 def cmd_group_send(args: argparse.Namespace) -> int:
     delay_text = getattr(args, "delay", None)
     if delay_text is not None and getattr(args, "no_queue", False):
@@ -10796,7 +10963,6 @@ def cmd_group_send(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-    delivered_ids: Set[str] = set()
     in_reply_to = None
     if getattr(args, "reply_to", None) is not None:
         group_id = GroupStore(config.groups_path).find(args.group)["id"]
@@ -10806,50 +10972,28 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             str(args.reply_to),
             group_id,
         )
-    node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
-    node.start()
-    try:
-        group = node.groups.find(args.group)
-        response = node.send_group_message(
-            group,
+    # A serving node owns the data directory: send through it instead of
+    # starting a second Reticulum instance on the same identity.
+    if _send_routes_via_running_node(config):
+        response = _send_group_via_running_node(
+            args,
+            config,
             text,
-            timeout=float(getattr(args, "timeout", 20.0)),
-            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
-            queue=not getattr(args, "no_queue", False),
-            in_reply_to=in_reply_to,
             expires_at=expires_at,
             send_after=send_after,
+            wait=wait,
+            in_reply_to=in_reply_to,
         )
-        # --wait replaces the one-shot flush: wait for each queued leg
-        # for the requested duration, recording delivered or still
-        # queued outcomes. Only queued legs go to the helper, since it
-        # treats any other leg without an "ok" key as delivered.
-        if wait > 0:
-            _wait_for_queued_sends(
-                node,
-                [result for result in response["results"] if result.get("queued")],
-                wait,
-            )
-        # One-shot send: give reachable members a brief chance to take
-        # a queued leg before this process exits.
-        elif any(result.get("queued") for result in response["results"]):
-            node.flush_outbox(timeout=3.0, max_peers=5)
-            for result in response["results"]:
-                if not result.get("queued"):
-                    continue
-                # Only a delivery acknowledgement counts as delivered; an
-                # entry that merely vanished was cancelled, expired, or
-                # taken by another process.
-                if result["id"] in delivered_ids:
-                    result["queued"] = False
-                    result["delivered"] = True
-                elif node.mailbox.get_outbox(result["id"]) is None:
-                    result["queued"] = False
-                    result["ok"] = False
-                    result["error"] = "left the outbox without a delivery confirmation"
-    finally:
-        node.stop()
-
+    else:
+        response = _send_group_via_local_node(
+            args,
+            config,
+            text,
+            expires_at=expires_at,
+            send_after=send_after,
+            wait=wait,
+            in_reply_to=in_reply_to,
+        )
     failed_legs = [
         r for r in response["results"] if not r.get("delivered") and not r.get("queued")
     ]
