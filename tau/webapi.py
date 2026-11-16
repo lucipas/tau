@@ -6878,10 +6878,17 @@ class WebBridge:
             # Notes are stricter still — a remote console must never see
             # them — so they are included only when the caller asked,
             # which the HTTP layer does only for loopback clients.
-            items = [
-                peer.local_dict(now, include_note=include_notes)
-                for peer in self.node.registry.all()
-            ]
+            # lookalike_of is the same kind of local-only trust state:
+            # the display name of the verified peer or saved contact
+            # this unverified peer may be impersonating, or None.
+            items = []
+            for peer in self.node.registry.all():
+                item = peer.local_dict(now, include_note=include_notes)
+                collided = self.node.registry.lookalike_for(peer)
+                item["lookalike_of"] = (
+                    collided.display_name if collided is not None else None
+                )
+                items.append(item)
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []

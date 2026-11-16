@@ -1379,6 +1379,58 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     assert "No peers known" in capsys.readouterr().out
 
 
+def test_peers_table_flags_lookalike_and_rename(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    registry = PeerRegistry(config.peers_path)
+    verified = RNS.Identity()
+    registry.upsert(
+        destination_hash(verified),
+        verified.get_public_key(),
+        name="alice",
+        now=1000.0,
+    )
+    registry.mark_verified(destination_hash(verified), "00001", now=1100.0)
+    lookalike = RNS.Identity()
+    registry.upsert(
+        destination_hash(lookalike),
+        lookalike.get_public_key(),
+        name="Alice",
+        now=1200.0,
+    )
+    renamed = RNS.Identity()
+    registry.upsert(
+        destination_hash(renamed),
+        renamed.get_public_key(),
+        name="carol",
+        now=1000.0,
+    )
+    registry.mark_verified(destination_hash(renamed), "00002", now=1100.0)
+    registry.upsert(
+        destination_hash(renamed),
+        renamed.get_public_key(),
+        name="caroline",
+        now=1200.0,
+    )
+    registry.save()
+
+    code = cli.main(["peers", "--data-dir", str(data_dir)])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "lookalike of alice" in captured.out
+    assert "announces with the same name as alice" in captured.err
+    assert "changed its announced name from 'carol'" in captured.err
+
+    code = cli.main(["peers", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    by_name = {entry["name"]: entry for entry in payload["peers"]}
+    assert by_name["Alice"]["lookalike_of"] == "alice"
+    assert by_name["alice"]["lookalike_of"] is None
+    assert by_name["caroline"]["previous_name"] == "carol"
+    assert by_name["caroline"]["name_change_at"] == 1200.0
+
+
 # -- heard --------------------------------------------------------------------
 
 _HEARD_RECORD = {

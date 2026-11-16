@@ -142,6 +142,12 @@ class FakeRegistry:
     def refresh_aliases(self):
         return 0
 
+    def lookalike_for(self, peer):
+        # The fixture holds a single peer, so nothing can collide with
+        # it; the real registry (PeerRegistry.lookalike_for) is covered
+        # by tests that swap one in (see _seed_alias_registry).
+        return None
+
     def restore(self, peer):
         if self.get(peer.destination_hash) is None:
             self._peers.append(peer)
@@ -749,6 +755,32 @@ def test_peers_endpoint_includes_verification_state(bridge, node):
     assert entry["key_change_at"] is None
     # Verification state is local-only: the public description stays clean.
     assert "verified" not in peer.public_dict()
+
+
+def test_peers_endpoint_flags_lookalike_and_rename(bridge, node, tmp_path):
+    registry = _seed_alias_registry(node, tmp_path)
+    alice = registry.get(bytes.fromhex(PEER_HASH))
+    registry.mark_verified(alice.destination_hash, "00001", now=1500.0)
+    registry.upsert(
+        bytes.fromhex("ef" * 16), b"\x03" * 64, name="Alice", hops=1
+    )
+    carol = registry.upsert(
+        bytes.fromhex("12" * 16), b"\x04" * 64, name="carol", hops=1
+    )
+    registry.mark_verified(carol.destination_hash, "00002", now=1500.0)
+    registry.upsert(
+        bytes.fromhex("12" * 16), b"\x04" * 64, name="caroline", hops=1
+    )
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    by_name = {item["name"]: item for item in payload["peers"]}
+    assert by_name["Alice"]["lookalike_of"] == "alice"
+    assert by_name["Alice"]["verified"] is False
+    assert by_name["alice"]["lookalike_of"] is None
+    assert by_name["caroline"]["name_change_at"] is not None
+    assert by_name["caroline"]["previous_name"] == "carol"
+    assert by_name["caroline"]["lookalike_of"] is None
 
 
 def test_heard_endpoint_lists_foreign_announces(bridge, node):
