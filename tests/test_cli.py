@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import os
 import stat
@@ -322,6 +323,81 @@ def test_send_mixed_delivered_and_queued(tmp_path, capsys, monkeypatch):
     assert len(node.flush_calls) == 1
     assert node.flush_calls[0]["timeout"] == 3.0
     assert node.flush_calls[0]["max_peers"] == 5
+
+
+def test_app_log_level_mapping():
+    from types import SimpleNamespace
+
+    from tau.cli import _app_log_level, _rns_log_level
+
+    assert _app_log_level(SimpleNamespace()) == logging.WARNING
+    assert _app_log_level(SimpleNamespace(verbose=1)) == logging.INFO
+    assert _app_log_level(SimpleNamespace(verbose=2)) == logging.DEBUG
+    assert _app_log_level(SimpleNamespace(verbose=3)) == logging.DEBUG
+    assert (
+        _app_log_level(SimpleNamespace(quiet=True, verbose=2)) == logging.ERROR
+    )
+    assert _rns_log_level(SimpleNamespace()) == 2
+    assert _rns_log_level(SimpleNamespace(verbose=1)) == 4
+    assert _rns_log_level(SimpleNamespace(verbose=2)) == 5
+    assert _rns_log_level(SimpleNamespace(quiet=True)) == 1
+    assert _rns_log_level(SimpleNamespace(rns_log_level=7)) == 7
+    assert _rns_log_level(SimpleNamespace(rns_log_level=99)) == 8
+    assert _rns_log_level(SimpleNamespace(rns_log_level=-1)) == 0
+
+
+def test_send_verbose_narrates_route_and_progress(
+    tmp_path, capsys, caplog, monkeypatch
+):
+    # The logger level is forced here so the test proves the log calls
+    # exist and say the right things; the flag-to-level mapping itself
+    # is covered by test_app_log_level_mapping.
+    caplog.set_level(logging.DEBUG, logger="tau.cli")
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["-vv", "--to", "alice", "--to", "bob", "hi"],
+        behaviour={"alice": "delivered", "bob": "queued"},
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    # Verbosity goes to stderr (logs); stdout keeps its historical shape.
+    assert "delivered to alice" in out
+    assert "queued for bob" in out
+    assert "local one-shot node" not in out
+    assert "sending to alice" not in out
+    records = [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == "tau.cli"
+    ]
+    assert any(
+        level == logging.DEBUG
+        and "no serving node holds the data directory" in message
+        for level, message in records
+    )
+    assert any(
+        level == logging.INFO
+        and "sending via a local one-shot node" in message
+        for level, message in records
+    )
+    assert any(
+        level == logging.DEBUG
+        and "sending to alice via the local node" in message
+        for level, message in records
+    )
+    assert any(
+        level == logging.DEBUG
+        and "send to alice finished" in message
+        and "delivered" in message
+        for level, message in records
+    )
+    assert any(
+        level == logging.DEBUG
+        and "send to bob finished" in message
+        and "queued" in message
+        for level, message in records
+    )
 
 
 def test_send_queued_entry_flips_when_flush_delivers(tmp_path, capsys, monkeypatch):

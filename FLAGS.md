@@ -8,7 +8,7 @@ Global options may appear before or after the command:
 | `--rns-config DIR` | Reticulum config directory (default: `<data-dir>/reticulum`) |
 | `--name NAME` | Node name announced to peers |
 | `--json` | Machine-readable output |
-| `-v`, `-vv` | Info / debug logging |
+| `-v`, `-vv` | Info / debug logging (sends narrate the route and per-target progress on stderr) |
 | `-q` | Errors only |
 | `--rns-log-level 0-8` | Explicit Reticulum log level |
 
