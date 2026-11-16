@@ -37,6 +37,7 @@ from tau.tangents.tan import (
     annotated_saved_posts,
     author_stats,    author_timeline,
     claim_draft,
+    create_close_poll,
     create_delete,
     create_edit,
     create_poll,
@@ -68,6 +69,7 @@ from tau.tangents.tan import (
     import_entries,
     init_db,
     is_expired,
+    is_poll_closed,
     like_counts,
     likers,
     list_authors,
@@ -2182,6 +2184,7 @@ def test_poll_vote_tally_latest_vote_wins(identities, tmp_path):
         "options": ["Thursday", "Friday"],
         "counts": [0, 2],
         "total": 2,
+        "closed": False,
         "voted": 1,
     }
 
@@ -2260,6 +2263,7 @@ def test_out_of_range_vote_does_not_supersede_live_vote(identities, tmp_path):
         "options": ["Thursday", "Friday"],
         "counts": [1, 0],
         "total": 1,
+        "closed": False,
         "voted": 0,
     }
 
@@ -2321,6 +2325,123 @@ def test_create_vote_rejects_bad_targets_and_options(identities, tmp_path):
         tan_module._normalize_post({**base, "text": "²"})
     with pytest.raises(PostError, match="must be an option index"):
         tan_module._normalize_post({**base, "text": "٣"})
+
+
+def test_create_close_poll_rejects_bad_targets(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "not a poll", name="alice", now=1000)
+    poll = create_poll(
+        conn, alice, "pick one", ["a", "b"], name="alice", now=1001,
+    )
+
+    with pytest.raises(TanError, match="only polls can be closed"):
+        create_close_poll(conn, alice, post["hash"], name="alice", now=1002)
+    with pytest.raises(TanError, match="unknown post"):
+        create_close_poll(conn, alice, "cd" * 32, name="alice", now=1002)
+
+    # Only the poll's author can close it.
+    with pytest.raises(TanError, match="did not author"):
+        create_close_poll(conn, bob, poll["hash"], name="bob", now=1002)
+
+    # A close entry from someone else is inert: it stores through the
+    # sync path but never closes the poll, the same author-match rule
+    # deletes rely on.  Hand-built, since create_close_poll rejects it.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "",
+        "created_at": 1002.0,
+        "prev": head(conn, author_of(bob)),
+        "kind": "close",
+        "target": poll["hash"],
+    }
+    digest = hash(body, previous=body["prev"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    store_post(conn, mesg, now=1003)
+    assert not is_poll_closed(conn, poll)
+
+    # Closing a deleted poll is rejected, like voting on one.
+    create_delete(conn, alice, poll["hash"], name="alice", now=1004)
+    with pytest.raises(TanError, match="has been deleted"):
+        create_close_poll(conn, alice, poll["hash"], name="alice", now=1005)
+
+    # Closing an expired poll is rejected too.
+    short = create_poll(
+        conn, alice, "quick?", ["yes", "no"], name="alice", now=1006,
+        expires_at=1007.0,
+    )
+    with pytest.raises(TanError, match="has expired"):
+        create_close_poll(conn, alice, short["hash"], name="alice", now=1008)
+
+    # A close entry carrying text never verifies.
+    base = {
+        "v": 1,
+        "author": author_of(alice),
+        "key": "cd" * 64,
+        "name": "alice",
+        "text": "nope",
+        "created_at": 1009.0,
+        "prev": "",
+        "kind": "close",
+        "target": poll["hash"],
+    }
+    with pytest.raises(PostError, match="cannot carry text"):
+        tan_module._normalize_post(base)
+
+
+def test_close_poll_freezes_tally(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    poll = create_poll(
+        conn, alice, "which day?", ["Thursday", "Friday"],
+        name="alice", now=1000,
+    )
+    create_vote(conn, bob, poll["hash"], 0, name="bob", now=1001)
+    create_vote(conn, carol, poll["hash"], 1, name="carol", now=1002)
+
+    assert not is_poll_closed(conn, poll)
+    result = poll_results(conn, poll["hash"])
+    assert result["closed"] is False
+    assert result["counts"] == [1, 1]
+
+    record = create_close_poll(conn, alice, poll["hash"], name="alice", now=1003)
+    assert record["kind"] == "close"
+    assert record["target"] == poll["hash"]
+    assert record["text"] == ""
+    assert is_poll_closed(conn, poll)
+
+    # Closing twice raises.
+    with pytest.raises(TanError, match="already closed"):
+        create_close_poll(conn, alice, poll["hash"], name="alice", now=1004)
+
+    # Votes cast before the close keep counting; votes after it are
+    # rejected, exactly like votes on an expired poll.
+    result = poll_results(conn, poll["hash"])
+    assert result["closed"] is True
+    assert result["counts"] == [1, 1]
+    assert result["total"] == 2
+    with pytest.raises(TanError, match="poll is closed"):
+        create_vote(conn, bob, poll["hash"], 1, name="bob", now=1005)
+    with pytest.raises(TanError, match="poll is closed"):
+        create_vote(conn, carol, poll["hash"], 0, name="carol", now=1005)
+    result = poll_results(conn, poll["hash"])
+    assert result["counts"] == [1, 1]
+    assert result["total"] == 2
+
+    # The timeline annotation carries the closed flag too.
+    posts = timeline(conn, [author_of(alice)], viewer=author_of(bob))
+    assert len(posts) == 1
+    assert posts[0]["poll"] == {
+        "options": ["Thursday", "Friday"],
+        "counts": [1, 1],
+        "total": 2,
+        "closed": True,
+        "voted": 0,
+    }
 
 
 def test_poll_options_cannot_be_edited(identities, tmp_path):
@@ -2501,6 +2622,100 @@ def test_cli_tan_poll_vote_results(tmp_path, capsys):
         == 2
     )
     assert "at least 2 --option values" in capsys.readouterr().err
+
+
+def test_cli_tan_close_poll(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--option",
+                "Thursday",
+                "--option",
+                "Friday",
+                "meet thursday or friday?",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    poll = payload["poll"]
+
+    # Close the poll: the close entry is signed, textless and targeted.
+    assert (
+        main(
+            [
+                "tan",
+                "close-poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                poll["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["close"]["kind"] == "close"
+    assert payload["close"]["target"] == poll["hash"]
+    assert payload["close"]["text"] == ""
+
+    # Results report the poll as closed, and a vote after the close fails.
+    assert (
+        main(
+            ["tan", "results", "--data-dir", str(data_dir), "--json", poll["hash"]]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["closed"] is True
+    assert payload["counts"] == [0, 0]
+    assert (
+        main(
+            [
+                "tan",
+                "vote",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                poll["hash"],
+                "1",
+            ]
+        )
+        == 1
+    )
+    assert "poll is closed" in capsys.readouterr().err
+
+    # Text output marks the poll closed in results and on the timeline.
+    assert main(["tan", "results", "--data-dir", str(data_dir), poll["hash"]]) == 0
+    assert "closed — no more votes" in capsys.readouterr().out
+    assert main(["tan", "timeline", "--data-dir", str(data_dir)]) == 0
+    assert "closed — no more votes" in capsys.readouterr().out
+
+    # Closing twice fails, and closing a non-poll fails too.
+    assert (
+        main(
+            [
+                "tan",
+                "close-poll",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                poll["hash"],
+            ]
+        )
+        == 1
+    )
+    assert "already closed" in capsys.readouterr().err
 
 
 def test_likers_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):
