@@ -2881,7 +2881,3 @@ export function useTau() {
     setAllowlistEnabled,
   };
 }
-owlistPeer,
-    setAllowlistEnabled,
-  };
-}

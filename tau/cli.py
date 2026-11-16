@@ -12167,7 +12167,3 @@ def _cmd_messages_sent(
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
-     print(f"[{when}] to {name} — {state}")
-        for line in str(entry.get("text", "")).splitlines() or [""]:
-            print(f"  {line}")
-    return _EXIT_OK
