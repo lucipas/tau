@@ -7720,4 +7720,3 @@ class TanApp:
                 self._gossip_slots.release()
 
         threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
-eading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
