@@ -1395,13 +1395,11 @@ export function useTan() {
         // failed feed refresh cannot leave a new tag out of the list.
         // A failed refresh keeps the old list.
         void loadTags().catch(() => undefined);
-        setPosts((previous) => {
-          if (previous.some((post) => post.hash === result.poll.hash)) {
-            return previous;
-          }
-          return [result.poll, ...previous];
-        });
-        await load();
+        // The creation response is a raw signed record without the poll
+        // tally, so the feed reload supplies the entry to display. A
+        // failed reload must not reject: the poll is already committed,
+        // and a rejection would invite a retry that publishes a duplicate.
+        await load().catch(() => undefined);
         return result.poll;
       } finally {
         setPosting(false);
