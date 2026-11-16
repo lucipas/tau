@@ -621,6 +621,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     react.set_defaults(func=cmd_react)
 
+    # `tau typing` sends a live "composing" hint: a start when the
+    # user begins typing, a stop when they send, blur, or go idle.
+    # The console drives it from the composer; the CLI is the same
+    # event for scripting and tests.
+    typing = subparsers.add_parser(
+        "typing",
+        parents=[common],
+        help="send a typing event to a peer or a group",
+    )
+    typing.add_argument(
+        "state",
+        choices=["start", "stop"],
+        help="'start' when composing begins, 'stop' when it ends",
+    )
+    typing_target = typing.add_mutually_exclusive_group(required=True)
+    typing_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    typing_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: type in the group instead of to a peer",
+    )
+    typing.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    typing.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    typing.set_defaults(func=cmd_typing)
+
     pin = subparsers.add_parser(
         "pin",
         parents=[common],
@@ -10506,6 +10541,94 @@ def cmd_react(args: argparse.Namespace) -> int:
         print(f"retracted your reaction to {name}'s message {_safe_id_prefix(str(target['id']))}")
     else:
         print(f"reacted {token} to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    return _EXIT_OK
+
+
+def _report_group_typing(
+    args: argparse.Namespace,
+    response: Dict[str, Any],
+    state: str,
+) -> int:
+    """Report a group-typing fan-out: per-member results in both modes."""
+    results = response.get("results") or []
+    failed_legs = [r for r in results if not r.get("delivered")]
+    if _json_mode(args):
+        _emit(response, True)
+        return _EXIT_ERROR if failed_legs else _EXIT_OK
+    verb = "typing in" if state == "start" else "stopped typing in"
+    print(f"{verb} group {response.get('name') or response.get('group')}")
+    for result in results:
+        name = result.get("to_name") or (result.get("to") or "")[:8]
+        if result.get("delivered"):
+            print(f"delivered to {name}")
+        else:
+            print(
+                f"failed for {name}: "
+                f"{_safe_text(str(result.get('error') or 'unknown error'))}"
+            )
+    return _EXIT_ERROR if failed_legs else _EXIT_OK
+
+
+def cmd_typing(args: argparse.Namespace) -> int:
+    """Send a typing event to a peer or a group, from the CLI.
+
+    Typing is live-only: an offline peer is a plain failure, not a
+    queued send — a typing event that cannot be delivered now is
+    stale by the time the peer returns.
+    """
+    state = str(args.state)
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        timeout = float(getattr(args, "timeout", 20.0))
+        discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+        if getattr(args, "group", None):
+            group = node.groups.find(args.group)
+            try:
+                response = node.send_group_typing(
+                    group,
+                    state,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                # Typing rides the live link only in v1 — there is no
+                # outbox queue for it — so an unreachable member is a
+                # plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver group typing event: {exc} "
+                    "(typing needs the members online in v1)"
+                ) from exc
+            return _report_group_typing(args, response, state)
+        target = getattr(args, "to", None)
+        if not target:
+            raise NodeError("give a peer with --to, or a group with --group")
+        try:
+            response = node.send_typing(
+                target,
+                state,
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except NodeError as exc:
+            # Typing rides the live link only in v1 — there is no
+            # outbox queue for it — so an unreachable peer is a plain
+            # failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver typing event: {exc} "
+                "(typing needs the peer online in v1)"
+            ) from exc
+    finally:
+        node.stop()
+
+    peer = node.registry.get(str(response.get("to") or ""))
+    name = peer.display_name if peer is not None else str(target)
+    if _json_mode(args):
+        _emit(response, True)
+        return _EXIT_OK
+    verb = "typing to" if state == "start" else "stopped typing to"
+    print(f"{verb} {name}")
     return _EXIT_OK
 
 

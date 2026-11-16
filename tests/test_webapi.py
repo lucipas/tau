@@ -191,6 +191,8 @@ class FakeNode:
         self.sent = []
         self.group_sent = []
         self.group_reactions = []
+        self.typing = []
+        self.group_typing = []
         self.group_retractions = []
         self.group_retract_failures = {}
         self.group_retract_cancelled = []
@@ -453,6 +455,31 @@ class FakeNode:
             "cleared": not reaction,
             "id": "react-1",
             "results": results,
+        }
+
+    def send_typing(self, peer, state, *, timeout=20.0, discover_timeout=None):
+        self.typing.append((peer, state))
+        return {"ok": True, "state": state, "to": peer}
+
+    def send_group_typing(self, group, state, *, timeout=20.0, discover_timeout=None):
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        self.group_typing.append((group["id"], state))
+        return {
+            "ok": True,
+            "v": 1,
+            "group": group["id"],
+            "name": group["name"],
+            "state": state,
+            "results": [
+                {
+                    "to": member,
+                    "to_name": "alice" if member == PEER_HASH else "bob",
+                    "delivered": True,
+                    "state": state,
+                }
+                for member in group["members"]
+            ],
         }
 
     def send_group_retraction(
@@ -11094,6 +11121,86 @@ def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
     )
     assert status == 400
     assert "unknown message" in payload["error"]["message"]
+
+
+def test_typing_endpoint_sends_to_a_peer(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/typing",
+        method="POST",
+        body={"peer": PEER_HASH, "state": "start"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["state"] == "start"
+    assert node.typing == [(PEER_HASH, "start")]
+
+
+def test_typing_endpoint_fans_out_to_a_group(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/typing",
+        method="POST",
+        body={"group": group_id, "state": "start"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["group"] == group_id
+    assert node.group_typing == [(group_id, "start")]
+
+
+def test_typing_endpoint_rejects_bad_state_and_both_targets(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/typing",
+        method="POST",
+        body={"peer": PEER_HASH, "state": "maybe"},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/typing",
+        method="POST",
+        body={"peer": PEER_HASH, "group": "ab" * 16, "state": "start"},
+    )
+    assert status == 400
+    assert node.typing == []
+    assert node.group_typing == []
+
+
+def test_typing_endpoint_rejects_unknown_group(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/typing",
+        method="POST",
+        body={"group": "00" * 16, "state": "start"},
+    )
+    assert status == 400
+    assert "unknown group" in payload["error"]["message"]
+
+
+def test_typing_event_reaches_the_bus(bridge, node):
+    # The bridge chains the node's on_typing callback and publishes
+    # the event on the bus, so the live console learns about it.
+    subscriber = bridge.bus.subscribe()
+    try:
+        node.on_typing(
+            {
+                "conversation": PEER_HASH,
+                "peer": PEER_HASH,
+                "name": "alice",
+                "state": "start",
+                "group": None,
+                "received_at": 1000.0,
+            }
+        )
+        event = subscriber.get(timeout=5)
+    finally:
+        bridge.bus.unsubscribe(subscriber)
+    assert event["type"] == "typing"
+    assert event["peer"] == PEER_HASH
+    assert event["state"] == "start"
 
 
 def test_react_endpoint_fans_out_to_group_members(bridge, node):

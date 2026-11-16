@@ -52,6 +52,8 @@ script) can read what arrives from the mesh and send messages back:
                            seconds, default 300; one outbound entry per member)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
+    POST /api/typing       typing ``{"peer": "<hash>", "state": "start"|"stop"}``
+                           or ``{"group": "<id>", "state": "start"|"stop"}``
     POST /api/messages/delete delete ``{"id": <console message id>}`` from
                            the console history (and the node inbox, when the
                            message carries a wire id)
@@ -1039,6 +1041,19 @@ class WebBridge:
                 self.record_reaction(record)
 
         node.on_reaction = _on_reaction
+
+        # Typing events are ephemeral: nothing is recorded, the event
+        # just reaches the live console through the bus.
+        previous_on_typing = getattr(node, "on_typing", None)
+
+        def _on_typing(event: Dict[str, Any]) -> None:
+            try:
+                if callable(previous_on_typing):
+                    previous_on_typing(event)
+            finally:
+                self.bus.publish({"type": "typing", **event})
+
+        node.on_typing = _on_typing
 
         # Edits arrive on the same node callback pattern: chain any edit
         # callback the node already has, then update the console history
@@ -4706,6 +4721,39 @@ class WebBridge:
             "cleared": clear,
             "id": response.get("id"),
         }
+
+    def typing(
+        self,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+        state: str = "start",
+        timeout: float = 20.0,
+    ) -> Dict[str, Any]:
+        """Send a typing event from the console to a peer or a group.
+
+        Exactly one of *peer* (a destination hash) or *group* (an id)
+        names the conversation.  The event is live-only: an offline
+        peer raises NodeError and the console surfaces it as a 502,
+        exactly like a failed reaction.
+        """
+        if state not in ("start", "stop"):
+            raise ValueError("typing state must be 'start' or 'stop'")
+        if peer is not None and group is not None:
+            raise ValueError("pass 'peer' or 'group', not both")
+        if group is not None:
+            # Reload the persisted store first: a group created by
+            # another process (``tau group``) must be seen by this
+            # typing event.  Resolve the stored id exactly: the
+            # fan-out takes a record, never a name lookup.
+            self.node.groups.list_groups()
+            record = self.node.groups.get(group)
+            if record is None:
+                raise ValueError(f"unknown group: {group!r}")
+            return self.node.send_group_typing(record, state, timeout=timeout)
+        if not peer:
+            raise ValueError("a peer or a group is required")
+        return self.node.send_typing(peer, state, timeout=timeout)
 
     def delete_message(self, target: int) -> Dict[str, Any]:
         """Delete one stored DM from the console history, by console id.
@@ -9218,6 +9266,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/react":
                 self._handle_react(body, head_only)
                 return
+            if path == "/api/typing":
+                self._handle_typing(body, head_only)
+                return
             if path == "/api/messages/delete":
                 self._handle_delete_message(body, head_only)
                 return
@@ -10771,6 +10822,58 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, status)
             return
         except ProtocolError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_typing(self, body: Dict[str, Any], head_only: bool) -> None:
+        peer = body.get("peer")
+        group = body.get("group")
+        state = body.get("state")
+        timeout = body.get("timeout", 20.0)
+        if state not in ("start", "stop"):
+            self._send_json(
+                {"error": {"message": "field 'state' must be 'start' or 'stop'"}},
+                head_only,
+                400,
+            )
+            return
+        if peer is not None and group is not None:
+            self._send_json(
+                {"error": {"message": "pass 'peer' or 'group', not both"}},
+                head_only,
+                400,
+            )
+            return
+        if peer is not None and (not isinstance(peer, str) or not peer.strip()):
+            self._send_json(
+                {"error": {"message": "field 'peer' must be a peer hash"}},
+                head_only,
+                400,
+            )
+            return
+        if group is not None and (not isinstance(group, str) or not group.strip()):
+            self._send_json(
+                {"error": {"message": "field 'group' must be a group id"}},
+                head_only,
+                400,
+            )
+            return
+        timeout = _clamped_timeout(timeout, 20.0)
+        try:
+            result = self.bridge.typing(
+                peer=peer.strip() if isinstance(peer, str) else None,
+                group=group.strip() if isinstance(group, str) else None,
+                state=state,
+                timeout=timeout,
+            )
+        except ValueError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         except PeerError as exc:

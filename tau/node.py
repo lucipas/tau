@@ -101,7 +101,9 @@ from .protocol import (
     REQUEST_REACT,
     REQUEST_RETRACT,
     REQUEST_DM_EDIT,
+    REQUEST_TYPING,
     ProtocolError,
+    TYPING_TTL_SECONDS,
     build_announce,
     build_file_offer,
     build_mail_fetch,
@@ -116,6 +118,7 @@ from .protocol import (
     encode_group_message,
     encode,
     encode_message,
+    encode_typing,
     generate_message_id,
     normalize_message,
     normalize_message_kind,
@@ -129,6 +132,7 @@ from .protocol import (
     parse_read_receipt,
     parse_reaction,
     parse_retract,
+    parse_typing,
     reaction_dict,
     reaction_unsigned_bytes,
     retract_dict,
@@ -514,6 +518,7 @@ class TauNode:
         on_reaction: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_retract: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_edit: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_typing: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -542,6 +547,13 @@ class TauNode:
         self.on_reaction = on_reaction
         self.on_retract = on_retract
         self.on_edit = on_edit
+        self.on_typing = on_typing
+        # Typing indicators, keyed by conversation — a peer hash for a
+        # DM, ``"group:<id>"`` for a group — to ``{peer_hash: expires_at}``.
+        # Ephemeral by design: nothing here is persisted, and an entry
+        # only lives until its TTL runs out (see _note_typing).
+        self._typing: Dict[str, Dict[str, float]] = {}
+        self._typing_lock = threading.Lock()
         # Ids whose delivery this node confirmed by a successful send,
         # newest last, capped so a long-lived node does not grow the
         # record without bound.  An outbox entry that disappears without
@@ -825,6 +837,7 @@ class TauNode:
             REQUEST_REACT: self._handle_reaction,
             REQUEST_RETRACT: self._handle_retract,
             REQUEST_DM_EDIT: self._handle_dm_edit,
+            REQUEST_TYPING: self._handle_typing,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -1694,6 +1707,92 @@ class TauNode:
             return False
         return True
 
+    def _publish_typing(self, record: Dict[str, Any]) -> None:
+        """Fan one typing event out to the console, best effort."""
+        if self.on_typing is None:
+            return
+        try:
+            self.on_typing(record)
+        except Exception:  # pragma: no cover - user callback
+            log.warning("on_typing callback failed", exc_info=True)
+
+    def _note_typing(
+        self,
+        conversation: str,
+        peer_hash: str,
+        state: str,
+        *,
+        group: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record a typing event and fan it out.
+
+        ``conversation`` is the peer hash for a DM or ``"group:<id>"``
+        for a group.  A ``"start"`` refreshes the peer's expiry to
+        ``now + TYPING_TTL_SECONDS``; a ``"stop"`` drops the entry.
+        Expiry is enforced lazily (see :meth:`typing_peers`) and by
+        the console's own timer — there is no sweeper thread for an
+        event this ephemeral.
+        """
+        moment = now if now is not None else time.time()
+        peer = self.registry.get(peer_hash)
+        name = peer.display_name if peer is not None else peer_hash[:8]
+        changed = False
+        with self._typing_lock:
+            entries = self._typing.setdefault(conversation, {})
+            # Drop expired entries for this conversation while here,
+            # so a long-dead indicator cannot outlive its TTL.
+            for other in [
+                key for key, expires in entries.items() if expires <= moment
+            ]:
+                del entries[other]
+            if state == "start":
+                entries[peer_hash] = moment + TYPING_TTL_SECONDS
+                changed = True
+            elif peer_hash in entries:
+                del entries[peer_hash]
+                changed = True
+            if not entries:
+                del self._typing[conversation]
+        if changed:
+            self._publish_typing(
+                {
+                    "conversation": conversation,
+                    "peer": peer_hash,
+                    "name": name,
+                    "state": state,
+                    "group": group,
+                    "received_at": moment,
+                }
+            )
+
+    def _clear_typing(self, conversation: str, peer_hash: str) -> None:
+        """Drop a peer's typing entry, fanning out a ``stop`` if set.
+
+        A message from a peer ends their typing: they sent what they
+        were composing.
+        """
+        self._note_typing(conversation, peer_hash, "stop")
+
+    def typing_peers(
+        self, conversation: str, *, now: Optional[float] = None
+    ) -> List[str]:
+        """Peer hashes currently typing in *conversation*, expiry-pruned."""
+        moment = now if now is not None else time.time()
+        with self._typing_lock:
+            entries = self._typing.get(conversation, {})
+            live = {
+                peer: expires
+                for peer, expires in entries.items()
+                if expires > moment
+            }
+            if len(live) != len(entries):
+                if live:
+                    self._typing[conversation] = live
+                else:
+                    del self._typing[conversation]
+            return sorted(live)
+
     def _notify_message(self, record: Dict[str, Any], *, publish_ok: bool) -> None:
         """Deliver a recorded message to the console callbacks.
 
@@ -1890,6 +1989,10 @@ class TauNode:
                 self.on_message(stored_record)
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_message callback failed", exc_info=True)
+        if stored_record is not None and caller_hash:
+            # A message from a peer ends their typing: they sent what
+            # they were composing.
+            self._clear_typing(caller_hash, caller_hash)
 
         return response_ok(
             echo=message["text"],
@@ -2209,6 +2312,10 @@ class TauNode:
                     self._record_received(record)
             if not duplicate:
                 self._notify_message(record, publish_ok=publish_ok)
+                # A message from a member ends their typing in the
+                # group: they sent what they were composing.
+                if caller_hash:
+                    self._clear_typing(f"group:{group['id']}", caller_hash)
 
         return response_ok(
             echo=message["text"],
@@ -2733,6 +2840,81 @@ class TauNode:
             target=reaction["target"],
             received_at=received_at,
             duplicate=duplicate,
+        )
+
+    def _handle_typing(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            typing = parse_typing(data)
+        except ProtocolError as exc:
+            return response_error("invalid_typing", str(exc))
+
+        received_at = time.time()
+        if remote_identity is None:
+            # A typing indicator is keyed by its sender: without an
+            # authenticated link identity there is no sender to key
+            # on, and an anonymous event could impersonate anyone.
+            return response_error(
+                "unidentified", "identify on the link to send typing state"
+            )
+        caller_hash = tau_destination_hash(remote_identity).hex()
+        if self.blocklist.is_blocked(caller_hash):
+            # The block check runs before the allow-list, as for
+            # messages: blocking wins, and the drop is silent — the
+            # sender gets a generic delivery failure, never a signal
+            # that they are blocked.
+            log.info(
+                "Typing event from %s denied by the block-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "unavailable", "typing event could not be delivered"
+            )
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Typing event from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        group_id = typing.get("group")
+        if group_id is not None:
+            group = self.groups.get(group_id)
+            if group is None:
+                # A group created by another process (``tau group``)
+                # is not in this node's cache yet: reload once before
+                # refusing, the same reason _handle_reaction reloads
+                # its inbox before resolving.
+                self.groups.list_groups()
+                group = self.groups.get(group_id)
+            members = (group or {}).get("members") or []
+            if (
+                group is None
+                or caller_hash not in members
+                or self.destination_hexhash not in members
+            ):
+                return response_error(
+                    "not_a_member", "sender is not a group member"
+                )
+        conversation = f"group:{group_id}" if group_id is not None else caller_hash
+        self._note_typing(
+            conversation,
+            caller_hash,
+            typing["state"],
+            group=group_id,
+            now=received_at,
+        )
+        return response_ok(
+            state=typing["state"],
+            group=group_id,
+            received_at=received_at,
         )
 
     def _handle_retract(
@@ -6590,6 +6772,155 @@ class TauNode:
             "reaction": token,
             "cleared": not token,
             "id": reaction_id,
+            "results": results,
+        }
+
+    def send_typing(
+        self,
+        target: Union[str, bytes, Peer],
+        state: str,
+        *,
+        group: Optional[Union[str, Dict[str, Any]]] = None,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Send a typing event to a peer, or fan it out to a group.
+
+        ``state`` is ``"start"`` or ``"stop"``; ``group`` (an id, id
+        prefix, name, or group record) types in that group instead of
+        a DM.  Typing is live-only in v1: unlike ``send_message``
+        there is no outbox queue — a typing event that cannot be
+        delivered now is stale by the time the peer returns, so an
+        unreachable peer raises :class:`NodeError` instead of
+        queueing, exactly like reactions.
+        """
+        if state not in ("start", "stop"):
+            raise NodeError("typing state must be 'start' or 'stop'")
+        if group is not None:
+            return self.send_group_typing(
+                group,
+                state,
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        payload_bytes = encode_typing(state)
+        response = self._request(peer, REQUEST_TYPING, payload_bytes, timeout)
+        return dict(response, state=state, to=peer.hexhash)
+
+    def send_group_typing(
+        self,
+        group: Union[str, Dict[str, Any]],
+        state: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan a typing event out to every member of a group.
+
+        *group* is a group id, id prefix, name, or group record.  The
+        same payload bytes go to every member except this node, one
+        leg per member with the same per-leg timeout a group send
+        uses, so one slow member cannot starve the rest.  A failed leg
+        reports an ``error`` instead of queueing: typing is live-only.
+        Returns a per-member result list; ``ok`` is true only when
+        every member received the event.
+        """
+        if state not in ("start", "stop"):
+            raise NodeError("typing state must be 'start' or 'stop'")
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        if not members:
+            # A usage error, not a delivery failure: the console maps
+            # it to a 400 and the CLI prints it plain, instead of a
+            # 502 / a misleading "peer offline" suffix.
+            raise ValueError("group has no other members to type to")
+        payload_bytes = encode_typing(state, group=group["id"])
+        results: List[Dict[str, Any]] = []
+        for member in members:
+            # One deadline bounds each leg, exactly as in
+            # send_group_message: the stages of a single delivery
+            # share the leg's budget, but one member's leg must not
+            # consume another's.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "ok": False,
+                        "error": "not attempted: group typing time limit reached",
+                        "state": state,
+                    }
+                )
+                continue
+            peer: Optional[Peer] = None
+            try:
+                peer = self.resolve_peer(
+                    member,
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
+                )
+                response = self._request(
+                    peer,
+                    REQUEST_TYPING,
+                    payload_bytes,
+                    _remaining(deadline) or 0.0,
+                    deadline=deadline,
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name,
+                        "delivered": True,
+                        "state": state,
+                        "rtt": response.get("_rtt"),
+                    }
+                )
+            except (NotAllowedError, NotAMemberError) as exc:
+                # The member is online and explicitly refused; typing
+                # has no outbox to queue into, so the leg is simply
+                # reported as failed.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": "not_allowed"
+                        if isinstance(exc, NotAllowedError)
+                        else "not_a_member",
+                        "state": state,
+                    }
+                )
+            except NodeError as exc:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": str(exc),
+                        "state": state,
+                    }
+                )
+        all_ok = all(result.get("delivered") for result in results)
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "group": group["id"],
+            "name": group["name"],
+            "state": state,
             "results": results,
         }
 

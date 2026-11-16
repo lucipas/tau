@@ -75,6 +75,8 @@ import type {
   SocialInfo,
   TauGroup,
   TauMessage,
+  TypingEntry,
+  TypingEvent,
   UnignoreGroupResponse,
   UnpinMessageResponse,
   UnreadCounts,
@@ -175,6 +177,11 @@ export function fileToBase64(file: File): Promise<string> {
 // reconcile.
 const ALLOWLIST_WRITE_TIMEOUT_MS = 30000;
 
+// Typing entries expire after the server TTL (8s) plus 1s of slack:
+// a `start` older than this is dropped, whether it arrived live or
+// was replayed to a client that reconnected.
+const TYPING_TTL_SECONDS = 9;
+
 export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
@@ -234,6 +241,12 @@ export function useTau() {
   const [mutedConversations, setMutedConversations] =
     useState<MutedConversations>({ peers: [], groups: [] });
   const [mutedError, setMutedError] = useState<string | null>(null);
+  // Peers typing right now, keyed by conversation — a peer hash for a
+  // DM, `group:<id>` for a group — to the peers typing there with the
+  // time their last `start` arrived. A `stop`, a timeout, or an
+  // incoming message clears an entry; a 2s sweep drops entries the
+  // sender never stopped.
+  const [typing, setTyping] = useState<Record<string, TypingEntry[]>>({});
   // Destinations with an archived conversation, for the live feed: a
   // message that arrives for one (archived from another tab or the CLI)
   // is dropped on arrival, the same way a blocked sender's is.
@@ -385,6 +398,31 @@ export function useTau() {
   useEffect(() => {
     searchQueryRef.current = searchQuery;
   }, [searchQuery]);
+
+  // Typing entries expire on their own: a `stop` lost on the wire
+  // must not leave a stale indicator up. Entries older than the TTL
+  // are dropped; a 2s sweep keeps the display honest without
+  // re-rendering every second.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const cutoff = Date.now() / 1000 - TYPING_TTL_SECONDS;
+      setTyping((previous) => {
+        let changed = false;
+        const next: Record<string, TypingEntry[]> = {};
+        for (const [conversation, entries] of Object.entries(previous)) {
+          const live = entries.filter((item) => item.receivedAt > cutoff);
+          if (live.length === entries.length) {
+            next[conversation] = entries;
+          } else {
+            changed = true;
+            if (live.length > 0) next[conversation] = live;
+          }
+        }
+        return changed ? next : previous;
+      });
+    }, 2000);
+    return () => clearInterval(timer);
+  }, []);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -642,6 +680,35 @@ export function useTau() {
       void refreshNode().catch(() => undefined);
     };
 
+    const onTyping = (payload: TypingEvent | null) => {
+      if (!payload?.conversation || !payload?.peer) return;
+      // A replayed event (a client that reconnected and re-read the
+      // bus) can carry a `start` older than the TTL: it must not
+      // resurrect an indicator the sender already stopped.
+      if (Date.now() / 1000 - (payload.received_at ?? 0) > TYPING_TTL_SECONDS) {
+        return;
+      }
+      const entry: TypingEntry = {
+        peer: payload.peer,
+        name: payload.name || payload.peer.slice(0, 8),
+        receivedAt: payload.received_at ?? Date.now() / 1000,
+      };
+      setTyping((previous) => {
+        const current = previous[payload.conversation] ?? [];
+        if (payload.state === "stop") {
+          const next = current.filter((item) => item.peer !== payload.peer);
+          if (next.length === current.length) return previous;
+          if (next.length === 0) {
+            const { [payload.conversation]: _dropped, ...rest } = previous;
+            return rest;
+          }
+          return { ...previous, [payload.conversation]: next };
+        }
+        const others = current.filter((item) => item.peer !== payload.peer);
+        return { ...previous, [payload.conversation]: [...others, entry] };
+      });
+    };
+
     const onError = () => {
       if (!disposed) setConnection("reconnecting");
     };
@@ -672,6 +739,9 @@ export function useTau() {
         case "status":
           onStatus();
           break;
+        case "typing":
+          onTyping(payload as TypingEvent | null);
+          break;
         default:
           break;
       }
@@ -691,6 +761,7 @@ export function useTau() {
         ["peer", onSseEvent("peer")],
         ["unread", onSseEvent("unread")],
         ["status", onSseEvent("status")],
+        ["typing", onSseEvent("typing")],
       ];
       source.addEventListener("open", onOpen);
       for (const [type, listener] of listeners) {
@@ -2478,6 +2549,19 @@ export function useTau() {
     return apiPost<ReactResponse>("/api/react", { target, clear: true });
   }, []);
 
+  const sendTyping = useCallback(
+    async (
+      target: { peer: string } | { group: string },
+      state: "start" | "stop",
+    ) => {
+      // Best effort by design: a typing event that cannot be
+      // delivered now (peer offline) is stale already, and the
+      // composer swallows the failure instead of showing an error.
+      return apiPost<{ ok: boolean }>("/api/typing", { ...target, state });
+    },
+    [],
+  );
+
   // A search is a view switch, like the Tan search: setting the query
   // fetches the search endpoint instead of showing the live feed.
   // Clearing it returns to the live traffic the same way.
@@ -2696,6 +2780,7 @@ export function useTau() {
     unpinMessage,
     unread,
     restoredUnread,
+    typing,
     outbox,
     heldForOthers,
     dmRequests,
@@ -2756,6 +2841,7 @@ export function useTau() {
     setPeerAlias,
     reactToMessage,
     clearReaction,
+    sendTyping,
     createGroup,
     deleteGroup,
     leaveGroup,

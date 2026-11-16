@@ -21,6 +21,7 @@ Global options may appear before or after the command:
 | `tau send --to PEER [--to PEER ...] TEXT` | Send a message over an encrypted link (queued if the peer is offline; `--to` is repeatable) |
 | `tau send --to PEER --reply-to ID TEXT` | Reply to an earlier message in the conversation, quoting it |
 | `tau react MESSAGE-ID EMOJI` | React to a received message (one emoji or short token; `--clear` retracts) |
+| `tau typing start\|stop --to PEER` | Send a live typing event to a peer (`--group NAME\|ID` types in a group instead; live-only, never queued) |
 | `tau send-file --to PEER PATH` | Send a small file (at most 10 MiB) over an RNS Resource on a direct link |
 | `tau config accept-files on\|off` | Opt in or out of receiving files (off by default) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
