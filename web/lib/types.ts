@@ -816,6 +816,13 @@ export interface TanPoll {
   voted: number | null;
 }
 
+export interface TanImage {
+  sha256: string;
+  size: number;
+  mime: string;
+  name: string;
+}
+
 export interface TanPost {
   v: number;
   author: string;
@@ -828,6 +835,9 @@ export interface TanPost {
   sig: string;
   kind?: string;
   target?: string;
+  // Image attachment, signed with the post: hash, size, mime and
+  // name only — the bytes are fetched on demand, never gossiped.
+  image?: TanImage;
   reply_to?: TanReplyParent | null;
   repost_of?: TanReplyParent | null;
   quoted?: TanReplyParent | null;

@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { casefoldTag, formatDateTime, shortHash } from "@/lib/format";
+import { API_BASE, apiPost } from "@/lib/api";
 import type {
   Peer,
   TanAuthor,
@@ -2700,6 +2701,85 @@ export function VerifyResult({ report }: { report: TanVerifyReport }) {
   );
 }
 
+// A post's image attachment: the bytes are served from the local
+// media store when this node already holds them; otherwise the
+// console asks the author for them and retries the image once they
+// arrive.  A failed load shows a download button instead of a
+// broken image — the bytes may simply not have arrived yet.
+function TanPostImage({ post }: { post: TanPost }) {
+  const image = post.image;
+  const [missing, setMissing] = useState(false);
+  const [fetching, setFetching] = useState(false);
+  const [fetchFailed, setFetchFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  if (!image || post.deleted) return null;
+  // Captured after the guard: narrowing of `image` does not survive
+  // into the fetch closure, so hold the digest in a plain const.
+  const imageSha = image.sha256;
+  const src = `${API_BASE}/api/tan/media/${imageSha}`;
+  const sizeText =
+    image.size >= 1024
+      ? `${(image.size / 1024).toFixed(1)} KiB`
+      : `${image.size} B`;
+  async function fetchImage() {
+    setFetching(true);
+    setFetchFailed(false);
+    try {
+      await apiPost(`/api/tan/media/${imageSha}/fetch`, {
+        author: post.author,
+      });
+      // Poll the bytes endpoint until the transfer lands (or 60s pass).
+      for (let i = 0; i < 30; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const response = await fetch(src, { method: "HEAD" });
+        if (response.ok) {
+          setMissing(false);
+          setAttempt((count) => count + 1);
+          return;
+        }
+      }
+      setFetchFailed(true);
+    } catch {
+      setFetchFailed(true);
+    } finally {
+      setFetching(false);
+    }
+  }
+  if (missing) {
+    return (
+      <div className="mt-2 rounded-lg border border-line/70 bg-panel/60 px-2.5 py-2 text-[12px] text-mist/80">
+        <p>
+          🖼 {image.name} ({sizeText}, {image.mime}) — not downloaded yet
+        </p>
+        <button
+          type="button"
+          disabled={fetching}
+          onClick={fetchImage}
+          className="mt-1.5 rounded border border-line/70 bg-void/60 px-2 py-1 font-mono text-[11px] text-sky-300 transition-colors hover:text-sky-200 disabled:opacity-50"
+        >
+          {fetching ? "fetching image…" : "download image"}
+        </button>
+        {fetchFailed ? (
+          <p className="mt-1 text-[11px] text-rose-300">
+            Could not fetch the image — the author may be offline. Try again
+            later.
+          </p>
+        ) : null}
+      </div>
+    );
+  }
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      key={attempt}
+      src={src}
+      alt={image.name}
+      onError={() => setMissing(true)}
+      className="mt-2 max-h-96 w-auto max-w-full rounded-lg border border-line/70"
+    />
+  );
+}
+
 export function PostCard({
   post,
   onToggleLike,
@@ -3062,6 +3142,7 @@ export function PostCard({
               </p>
             </div>
           ) : null}
+          <TanPostImage post={post} />
           <div className="mt-2 flex flex-wrap items-center gap-2 font-mono text-[10px] text-mist/60">
             <span className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5">
               {post.prev ? "chained" : "genesis"}

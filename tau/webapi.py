@@ -148,6 +148,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/unmute-tag unmute a tag
     POST /api/tan/sync     pull missing posts from peers
     GET  /api/tan/export   export stored posts (``?scope=mine|all``)
+    GET  /api/tan/media/<sha256> bytes of a cached Tan image
+    POST /api/tan/media/<sha256>/fetch fetch a Tan image from its author
     POST /api/tan/import   import an export document (every entry verified)
     GET  /api/tan/saved    saved posts, newest save first
     POST /api/tan/save     save a post to read later
@@ -8127,6 +8129,81 @@ class WebBridge:
             return None
         return data, name
 
+    def tan_media(self, sha256: str) -> Optional[Tuple[bytes, str, str]]:
+        """Return ``(bytes, mime, name)`` for a cached Tan image, or ``None``.
+
+        The mime and name come from the signed post carrying the
+        digest, so a stored file is always served with the type its
+        author declared; a digest with no local post falls back to a
+        generic name and ``application/octet-stream``.  The bytes are
+        re-checked against the digest before serving.
+        """
+        from .tangents.tan import find_post_by_image, init_db, media_path
+
+        digest = str(sha256).strip().lower()
+        if len(digest) != 64:
+            return None
+        try:
+            bytes.fromhex(digest)
+        except ValueError:
+            return None
+        # The media store lives next to the Tan database, so the
+        # bridge resolves it from the DB path rather than the node's
+        # data directory — the two are the same directory, but the DB
+        # path is what the bridge already knows.
+        stored = media_path(Path(self._tan_db_path()).parent, digest)
+        if stored is None:
+            return None
+        try:
+            data = stored.read_bytes()
+        except OSError:
+            return None
+        if hashlib.sha256(data).hexdigest() != digest:
+            return None
+        mime = "application/octet-stream"
+        name = f"tan-{digest[:12]}.img"
+        try:
+            conn = init_db(self._tan_db_path())
+            try:
+                post = find_post_by_image(conn, digest)
+            finally:
+                conn.close()
+        except Exception:  # pragma: no cover - a broken Tan DB must not block serving
+            post = None
+        if post is not None:
+            image = post.get("image") or {}
+            if isinstance(image.get("mime"), str) and image["mime"]:
+                mime = image["mime"]
+            if isinstance(image.get("name"), str) and image["name"]:
+                name = image["name"]
+        return data, mime, name
+
+    def tan_fetch_media(self, sha256: str, author: str) -> Dict[str, Any]:
+        """Ask the node to fetch a Tan image in the background.
+
+        Returns at once with ``{"accepted": True}`` — the transfer
+        takes seconds to minutes on a mesh, so the console polls
+        ``GET /api/tan/media/<sha256>`` until the bytes arrive.
+        """
+        digest = str(sha256).strip().lower()
+        node = self.node
+        threading.Thread(
+            target=self._fetch_media_in_background,
+            args=(node, digest, author),
+            name="tau-media-fetch",
+            daemon=True,
+        ).start()
+        return {"accepted": True, "sha256": digest}
+
+    @staticmethod
+    def _fetch_media_in_background(node: Any, sha256: str, author: str) -> None:
+        try:
+            node.fetch_tan_media(author, sha256, timeout=120.0)
+        except Exception as exc:  # pragma: no cover - network dependent
+            log.warning(
+                "Background Tan media fetch for %s failed: %s", sha256[:8], exc
+            )
+
     def messages_search(
         self,
         *,
@@ -9066,6 +9143,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._handle_download_file(parts[0], parts[1], head_only)
+                return
+            if path.startswith("/api/tan/media/"):
+                sha256 = unquote(path[len("/api/tan/media/") :])
+                if not sha256 or "/" in sha256:
+                    self._send_json(
+                        {"error": {"message": "not found"}}, head_only, 404
+                    )
+                    return
+                self._handle_tan_media(sha256, head_only)
                 return
             if path == "/api/messages/search":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=200)
@@ -10190,6 +10276,41 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "peer": peer}, head_only)
                 return
+            if path.startswith("/api/tan/media/") and path.endswith("/fetch"):
+                sha256 = unquote(
+                    path[len("/api/tan/media/") : -len("/fetch")]
+                ).strip("/")
+                author = body.get("author")
+                if (
+                    not isinstance(sha256, str)
+                    or len(sha256) != 64
+                    or not isinstance(author, str)
+                    or len(author.strip()) != 32
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "a 64 character image sha256 and a "
+                                "32 character author hash are required"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    bytes.fromhex(sha256)
+                    bytes.fromhex(author.strip())
+                except ValueError:
+                    self._send_json(
+                        {"error": {"message": "sha256 and author must be hex"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                result = self.bridge.tan_fetch_media(sha256, author.strip())
+                self._send_json(result, head_only, HTTPStatus.ACCEPTED)
+                return
             if path == "/api/tan/posts":
                 text = body.get("text")
                 if not isinstance(text, str) or not text.strip():
@@ -10809,6 +10930,39 @@ class _WebHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Disposition",
             f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(file_name)}",
+        )
+        self._cors_headers()
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(data)
+
+    def _handle_tan_media(self, sha256: str, head_only: bool) -> None:
+        """Serve one cached Tan image's bytes inline.
+
+        The digest is the address: only a file this node actually
+        holds under that digest is ever served, with the mime its
+        signed post declared; anything else is a 404.
+        """
+        found = self.bridge.tan_media(sha256)
+        if found is None:
+            self._send_json(
+                {"error": {"message": "no such cached image"}}, head_only, 404
+            )
+            return
+        data, mime, file_name = found
+        ascii_name = "".join(
+            char if 32 <= ord(char) < 127 and char not in '"\\' else "_"
+            for char in file_name
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Disposition",
+            f'inline; filename="{ascii_name}"; '
             f"filename*=UTF-8''{quote(file_name)}",
         )
         self._cors_headers()

@@ -95,6 +95,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import random
 import re
 import sqlite3
@@ -120,6 +121,7 @@ from ..protocol import (
     normalize_message,
     response_error,
     response_ok,
+    sanitize_file_name,
     sanitize_name,
 )
 from ..util import ensure_dir
@@ -176,6 +178,15 @@ MAX_SYNC_PAGES = 32
 # cap as a scheduled post's delay — a post cannot be scheduled
 # further out than it is allowed to live.
 MAX_TAN_POST_EXPIRY = 7 * 24 * 60 * 60
+
+# One image per Tan post, at most 2 MiB: the signed post carries only
+# the hash, size, mime and name, and the bytes move separately over
+# an RNS Resource when a peer asks for them, so the 8 KiB publish
+# envelope stays small.  The local media store keeps at most 64 MiB
+# of published and fetched images, pruning the least recently used.
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_MEDIA_STORE_BYTES = 64 * 1024 * 1024
+IMAGE_MIME_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
 
 # Fields covered by the post hash.  ``prev`` is deliberately not in this tuple:
 # it is prefixed to the canonical body, exactly as the original scaffold
@@ -252,6 +263,7 @@ _POST_COLUMNS = (
     "kind",
     "target",
     "options",
+    "image",
 )
 
 
@@ -304,6 +316,11 @@ def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
         fields = HASH_FIELDS
     if mesg.get("expires_at") is not None:
         fields = fields + ("expires_at",)
+    if mesg.get("image") is not None:
+        # An image is signed like an expiry: a relay cannot swap the
+        # attachment for another file's hash without breaking the
+        # hash, and a post without one hashes exactly as before.
+        fields = fields + ("image",)
     return fields
 
 
@@ -323,6 +340,83 @@ def _encode_options(options: Optional[Sequence[str]]) -> Optional[str]:
     if options is None:
         return None
     return json.dumps(list(options), ensure_ascii=False)
+
+
+def _clean_image(value: Any) -> Dict[str, Any]:
+    """Validate a Tan post image attachment: ``{sha256, size, mime, name}``.
+
+    The bytes are never in the post — only the digest, size, mime and
+    a bare file name — so a peer that wants the image fetches it by
+    digest and re-checks the hash before trusting it.
+    """
+    if not isinstance(value, dict):
+        raise PostError("post image must be an object")
+    sha256 = value.get("sha256")
+    if not isinstance(sha256, str) or len(sha256) != HASH_HEX_LENGTH:
+        raise PostError("post image sha256 must be a 64 character hex digest")
+    try:
+        bytes.fromhex(sha256)
+    except ValueError as exc:
+        raise PostError("post image sha256 must be a 64 character hex digest") from exc
+    size = value.get("size")
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise PostError("post image size must be an integer")
+    if size < 1 or size > MAX_IMAGE_BYTES:
+        raise PostError(
+            f"post image of {size} bytes exceeds the {MAX_IMAGE_BYTES} byte limit"
+        )
+    mime = value.get("mime")
+    if mime not in IMAGE_MIME_TYPES:
+        raise PostError(
+            "post image mime must be one of: " + ", ".join(IMAGE_MIME_TYPES)
+        )
+    name = value.get("name")
+    if (
+        not isinstance(name, str)
+        or not sanitize_file_name(name)
+        or sanitize_file_name(name) != name
+    ):
+        raise PostError("post image name must be a safe bare file name")
+    return {
+        "sha256": sha256.lower(),
+        "size": size,
+        "mime": mime,
+        "name": name,
+    }
+
+
+def _encode_image(image: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Encode a post's image attachment for the posts table, or None."""
+    if image is None:
+        return None
+    return json.dumps(_clean_image(image), ensure_ascii=False)
+
+
+def _decode_image(value: Any) -> Optional[Dict[str, Any]]:
+    """Decode a stored image attachment: a dict, a JSON string, or None.
+
+    Rows read from the posts table carry the JSON string; normalised
+    entries carry the dict itself.  Anything else decodes to None, so
+    a damaged row never crashes a display surface.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        try:
+            return _clean_image(value)
+        except PostError:
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict):
+            try:
+                return _clean_image(parsed)
+            except PostError:
+                return None
+    return None
 
 
 def _decode_options(value: Any) -> Optional[List[str]]:
@@ -399,6 +493,10 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         # Options ride with the poll entry itself, so an exported or
         # synced poll carries its choices with it.
         canonical["options"] = _decode_options(post.get("options"))
+    if post.get("image") is not None:
+        # The attachment rides with the post entry itself, so an
+        # exported or synced post carries its image reference with it.
+        canonical["image"] = _decode_image(post.get("image"))
     return canonical
 
 
@@ -524,6 +622,15 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
             raise PostError("only polls can carry options")
         options = None
 
+    if kind == KIND_POST:
+        image = (
+            _clean_image(mesg["image"]) if mesg.get("image") is not None else None
+        )
+    else:
+        if mesg.get("image") is not None:
+            raise PostError("only posts can carry an image")
+        image = None
+
     post = {
         "v": TAN_VERSION,
         "author": author,
@@ -536,6 +643,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "target": target,
         "expires_at": expires_at,
         "options": options,
+        "image": image,
     }
     _check_wire_size(post)
     return post
@@ -674,7 +782,8 @@ CREATE TABLE IF NOT EXISTS posts (
     linked INTEGER NOT NULL DEFAULT 0,
     kind TEXT NOT NULL DEFAULT 'post',
     target TEXT NOT NULL DEFAULT '',
-    options TEXT
+    options TEXT,
+    image TEXT
 );
 
 CREATE INDEX IF NOT EXISTS posts_author_seq ON posts(author, seq);
@@ -820,6 +929,10 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         # A poll's options live in one JSON column on its own entry, so
         # the migration is a single ALTER, not a new table.
         _add_column(conn, "posts", "options", "TEXT")
+    if columns and "image" not in columns:  # migrate a pre-media database
+        # A post's image attachment lives in one JSON column on its
+        # own entry, like a poll's options.
+        _add_column(conn, "posts", "image", "TEXT")
     draft_columns = {
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
@@ -949,6 +1062,132 @@ def get_post(conn: sqlite3.Connection, digest: str) -> Optional[Dict[str, Any]]:
     _require_hex(digest, HASH_HEX_LENGTH, "hash")
     row = _fetch_post(conn, digest)
     return _row_to_post_with_meta(row) if row is not None else None
+
+
+def find_post_by_image(
+    conn: sqlite3.Connection, sha256: str
+) -> Optional[Dict[str, Any]]:
+    """Return the newest stored post carrying image *sha256*, or ``None``.
+
+    Used when serving a media fetch: the responder needs the post's
+    recorded name for the file offer, and the requester needs the
+    post's author to know who to ask.  A node that fetched the bytes
+    without the post serves them under a fallback name instead.
+    """
+    digest = sha256.strip().lower()
+    if len(digest) != HASH_HEX_LENGTH:
+        return None
+    try:
+        bytes.fromhex(digest)
+    except ValueError:
+        return None
+    row = conn.execute(
+        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+        "WHERE image LIKE ? ORDER BY created_at DESC LIMIT 1",
+        (f'%"sha256": "{digest}"%',),
+    ).fetchone()
+    return _row_to_post_with_meta(row) if row is not None else None
+
+
+# -- media store -----------------------------------------------------------
+#
+# Image bytes live outside the Tan database, in ``<data_dir>/media``,
+# one file per SHA-256 digest.  The signed post carries only the
+# digest, so any peer holding the bytes can serve them — the author,
+# or a peer that already fetched them.
+
+
+def media_dir(data_dir: Union[str, Path]) -> Path:
+    """Return the media store directory under *data_dir*."""
+    return Path(data_dir).expanduser() / "media"
+
+
+def media_path(data_dir: Union[str, Path], sha256: str) -> Optional[Path]:
+    """Return the stored bytes for *sha256*, or ``None`` when absent."""
+    digest = str(sha256).strip().lower()
+    if len(digest) != HASH_HEX_LENGTH:
+        return None
+    try:
+        bytes.fromhex(digest)
+    except ValueError:
+        return None
+    target = media_dir(data_dir) / digest
+    if target.is_file():
+        return target
+    return None
+
+
+def store_media(
+    data_dir: Union[str, Path],
+    sha256: str,
+    data: bytes,
+    *,
+    max_total_bytes: int = MAX_MEDIA_STORE_BYTES,
+) -> Path:
+    """Store *data* in the media store under its SHA-256, verifying it.
+
+    Writes atomically (temp file + rename) and prunes the least
+    recently used files when the store would exceed *max_total_bytes*,
+    so one prolific author cannot fill the disk.  Returns the path
+    of the stored file.
+    """
+    digest = str(sha256).strip().lower()
+    if len(digest) != HASH_HEX_LENGTH:
+        raise TanError("media sha256 must be a 64 character hex digest")
+    try:
+        bytes.fromhex(digest)
+    except ValueError as exc:
+        raise TanError("media sha256 must be a 64 character hex digest") from exc
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise TanError("media bytes do not match their sha256")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise TanError(
+            f"media of {len(data)} bytes exceeds the {MAX_IMAGE_BYTES} byte limit"
+        )
+    directory = media_dir(data_dir)
+    ensure_dir(directory)
+    target = directory / digest
+    if target.is_file():
+        # Already stored: refresh its recency for the prune order.
+        now = time.time()
+        os.utime(target, (now, now))
+        return target
+    tmp = directory / f".{digest}.tmp-{uuid.uuid4().hex}"
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:  # pragma: no cover - best effort
+            pass
+    _prune_media_store(directory, max_total_bytes=max_total_bytes)
+    return target
+
+
+def _prune_media_store(directory: Path, *, max_total_bytes: int) -> None:
+    """Drop least-recently-used media files until under *max_total_bytes*."""
+    try:
+        files = [
+            (path.stat().st_mtime, path.stat().st_size, path)
+            for path in directory.iterdir()
+            if path.is_file() and not path.name.startswith(".")
+        ]
+    except OSError:  # pragma: no cover - defensive
+        return
+    remaining = sum(size for _, size, _ in files)
+    if remaining <= max_total_bytes:
+        return
+    for _, size, path in sorted(files):
+        if remaining <= max_total_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:  # pragma: no cover - defensive
+            continue
+        remaining -= size
 
 
 def head(conn: sqlite3.Connection, author: str) -> Optional[str]:
@@ -1250,8 +1489,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, expires_at, sig, seq, linked, kind, target, options) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, expires_at, sig, seq, linked, kind, target, options, image) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -1269,6 +1508,7 @@ def store_post(
                     post.get("kind") or KIND_POST,
                     post.get("target") or "",
                     _encode_options(post.get("options")),
+                    _encode_image(post.get("image")),
                 ),
             )
             if linked:
@@ -1319,18 +1559,23 @@ def create_post(
     now: Optional[float] = None,
     previous: Optional[str] = None,
     expires_at: Optional[float] = None,
+    image: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a post owned by *identity*.
 
     When *expires_at* is given the post disappears from display
     surfaces once that time passes; the expiry is signed with the
     post, so it cannot be stripped or extended without breaking the
-    hash.  It must be after the post's creation time.
+    hash.  It must be after the post's creation time.  When *image*
+    is given — ``{sha256, size, mime, name}`` — the attachment is
+    signed with the post the same way; the bytes themselves live in
+    the local media store, never in the post.
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
     clean_name = sanitize_name(name)
     clean_text = normalize_message(text)
+    clean_image = _clean_image(image) if image is not None else None
     if expires_at is not None:
         expires_at = _require_timestamp(expires_at, "expires_at")
         if expires_at <= timestamp:
@@ -1356,6 +1601,8 @@ def create_post(
         }
         if expires_at is not None:
             body["expires_at"] = expires_at
+        if clean_image is not None:
+            body["image"] = clean_image
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -7918,11 +8165,13 @@ class TanApp:
         targets: Optional[Sequence[Any]] = None,
         ttl: int = MAX_GOSSIP_TTL,
         expires_at: Optional[float] = None,
+        image: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a post, or a reply when *reply_to* names a parent post.
 
         When *expires_at* is given the post disappears from display
         surfaces once that time passes; see :func:`create_post`.
+        A reply cannot carry an image — only a top-level post can.
         """
         conn = self.connect()
         try:
@@ -7937,7 +8186,12 @@ class TanApp:
                 )
             else:
                 post = create_post(
-                    conn, self.identity, text, name=self.name, expires_at=expires_at
+                    conn,
+                    self.identity,
+                    text,
+                    name=self.name,
+                    expires_at=expires_at,
+                    image=image,
                 )
         finally:
             conn.close()

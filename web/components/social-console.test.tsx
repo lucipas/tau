@@ -2527,3 +2527,57 @@ describe("SocialConsole embedded", () => {
     expect(screen.getByText("social feed")).toBeTruthy();
   });
 });
+
+describe("PostCard image attachment", () => {
+  const imagePost = () =>
+    makePost({
+      image: {
+        sha256: "ab".repeat(32),
+        size: 123456,
+        mime: "image/png",
+        name: "photo.png",
+      },
+    });
+
+  function renderCard(post: TanPost) {
+    return render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onQuote={() => {}}
+        onDelete={vi.fn()}
+        onEdit={async () => true}
+        deleting={false}
+      />,
+    );
+  }
+
+  it("renders the image inline from the media endpoint", () => {
+    renderCard(imagePost());
+
+    const img = screen.getByAltText("photo.png");
+    expect(img.tagName).toBe("IMG");
+    expect(img.getAttribute("src")).toContain(
+      `/api/tan/media/${"ab".repeat(32)}`,
+    );
+  });
+
+  it("shows a download button when the image is not cached yet", () => {
+    renderCard(imagePost());
+
+    const img = screen.getByAltText("photo.png");
+    fireEvent.error(img);
+
+    expect(screen.queryByAltText("photo.png")).toBeNull();
+    expect(screen.getByText("download image")).toBeTruthy();
+    expect(screen.getByText(/photo\.png/)).toBeTruthy();
+  });
+
+  it("renders no image element for a text-only post", () => {
+    renderCard(makePost());
+
+    expect(screen.queryByRole("img")).toBeNull();
+  });
+});
