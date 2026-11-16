@@ -4828,15 +4828,16 @@ def claim_draft(
     *,
     now: Optional[float] = None,
     ttl: float = DRAFT_CLAIM_TTL,
-) -> bool:
+) -> Optional[float]:
     """Atomically claim a draft for publishing, or report it is taken.
 
     The claim is one ``UPDATE`` that only wins when the draft is
     unclaimed or its claim is older than *ttl*, so two concurrent
     ``publish-draft`` runs can never both sign a post for the same
-    draft: the loser's update touches zero rows.  Returns ``True``
-    when this caller won the claim.  Raises ``TanError`` for an
-    unknown draft.
+    draft: the loser's update touches zero rows.  Returns the claim's
+    ``claimed_at`` stamp, which identifies this claim to
+    ``release_draft_claim``, when this caller won; ``None`` when the
+    draft is taken.  Raises ``TanError`` for an unknown draft.
     """
     draft = get_draft(conn, ref)
     stamp = float(now if now is not None else time.time())
@@ -4846,21 +4847,26 @@ def claim_draft(
             "AND (claimed_at IS NULL OR claimed_at <= ?)",
             (stamp, draft["id"], stamp - float(ttl)),
         )
-    return cursor.rowcount == 1
+    return stamp if cursor.rowcount == 1 else None
 
 
-def release_draft_claim(conn: sqlite3.Connection, ref: Any) -> None:
-    """Drop a draft's publish claim, if it has one.
+def release_draft_claim(
+    conn: sqlite3.Connection, ref: Any, claimed_at: float
+) -> None:
+    """Drop a draft's publish claim, if this claim still holds it.
 
     Called whenever a publish attempt leaves the draft behind — a
     failed publish, a partial delivery — so an immediate retry is not
-    blocked by this run's own claim.  A no-op when the draft was
-    already deleted by a successful publish, or was never claimed.
+    blocked by this run's own claim.  Only the claim identified by
+    *claimed_at* is cleared: if it went stale and another publisher
+    took the draft over, that newer claim is left intact.  A no-op
+    when the draft was already deleted by a successful publish.
     """
     draft_id = _parse_draft_id(ref)
     with conn:
         conn.execute(
-            "UPDATE drafts SET claimed_at = NULL WHERE id = ?", (draft_id,)
+            "UPDATE drafts SET claimed_at = NULL WHERE id = ? AND claimed_at = ?",
+            (draft_id, float(claimed_at)),
         )
 
 

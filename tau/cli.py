@@ -3727,10 +3727,15 @@ def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
     conn = init_db(config.social_db_path)
     try:
         draft = get_draft(conn, args.draft)
-        claimed = claim_draft(conn, draft["id"])
+        claimed_at = claim_draft(conn, draft["id"])
+        if claimed_at is not None:
+            # Re-read after winning the claim: a publisher that finished
+            # between the first read and the claim may have recorded a
+            # signed post, which this run must retry instead of re-signing.
+            draft = get_draft(conn, draft["id"])
     finally:
         conn.close()
-    if not claimed:
+    if claimed_at is None:
         print(
             f"error: draft {draft['id']} is already being published — "
             "try again when it finishes",
@@ -3742,7 +3747,7 @@ def cmd_tan_publish_draft(args: argparse.Namespace) -> int:
     finally:
         conn = init_db(config.social_db_path)
         try:
-            release_draft_claim(conn, draft["id"])
+            release_draft_claim(conn, draft["id"], claimed_at)
         finally:
             conn.close()
 
