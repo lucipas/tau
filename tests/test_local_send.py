@@ -32,6 +32,7 @@ class _FakeRunningNode:
         self.sent: list = []
         self.flush_calls: list = []
         self.peer = SimpleNamespace(hexhash="ab" * 16, display_name="alice")
+        self.registry = SimpleNamespace(get=lambda _hexhash: self.peer)
 
     def resolve_peer(self, target, timeout=10.0):
         return self.peer
@@ -183,6 +184,15 @@ class _FakeRunningNode:
     def send_edit(self, target, message_id, text, **kwargs):
         self.calls.append(("edit", target, message_id, text))
         return {"ok": True, "target": message_id, "edited": True, "id": "e-1"}
+
+    def send_typing(self, target, state, **kwargs):
+        self.calls.append(("typing", target, state))
+        return {"ok": True, "to": "ab" * 16, "state": state}
+
+    def send_group_typing(self, group, state, **kwargs):
+        group_id = group.get("id") if isinstance(group, dict) else group
+        self.calls.append(("typing_group", group_id, state))
+        return {"ok": True, "group": group_id, "state": state, "results": []}
 
     def flush_outbox(self, **kwargs):
         self.flush_calls.append(kwargs)
@@ -455,6 +465,149 @@ def test_send_running_timeout_bounds_slow_reply(tmp_path):
         assert time.monotonic() - start < 2.0
     finally:
         server.stop()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_fanout_ops_route_to_fanout_socket(tmp_path):
+    # The fan-out ops travel on the fan-out socket, and a DM send
+    # never does: with only a fan-out worker running, the group ops
+    # reach the node while a DM send finds no main socket (issue #455).
+    from tau.local_ipc import LocalIPCUnavailable
+    from tau.local_send import (
+        FanoutServer,
+        send_fanout_server_available,
+        send_running,
+    )
+
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    server = FanoutServer(
+        tmp_path, lambda **request: cli._dispatch_local_send(node, **request)
+    )
+    try:
+        assert send_fanout_server_available(tmp_path)
+        assert not send_server_available(tmp_path)
+        group_id = node.groups.find("weekend")["id"]
+        send_running(
+            tmp_path, op="group_send", group="weekend", text="hi", leg_timeout=5.0
+        )
+        send_running(
+            tmp_path,
+            op="retract_group",
+            group="weekend",
+            message_id="m-1",
+            target_sent_at=100.0,
+            leg_timeout=5.0,
+        )
+        send_running(
+            tmp_path,
+            op="edit_group",
+            group="weekend",
+            message_id="m-1",
+            text="edited",
+            target_sent_at=100.0,
+            leg_timeout=5.0,
+        )
+        send_running(
+            tmp_path, op="typing_group", group="weekend", state="start", leg_timeout=5.0
+        )
+        assert node.calls == [
+            ("group_send", group_id, "hi"),
+            ("retract_group", "weekend", "m-1", 100.0),
+            ("edit_group", "weekend", "m-1", "edited", 100.0),
+            ("typing_group", group_id, "start"),
+        ]
+        with pytest.raises(LocalIPCUnavailable):
+            send_running(tmp_path, target="alice", text="hi")
+    finally:
+        server.stop()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_fanout_ops_fall_back_to_main_socket(tmp_path):
+    # An older serving node has no fan-out worker: the fan-out ops
+    # fall back to the main socket instead of failing (issue #455).
+    from tau.local_send import send_fanout_server_available, send_running
+
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    server = SendServer(
+        tmp_path, lambda **request: cli._dispatch_local_send(node, **request)
+    )
+    try:
+        assert send_server_available(tmp_path)
+        assert not send_fanout_server_available(tmp_path)
+        send_running(
+            tmp_path, op="group_send", group="weekend", text="hi", leg_timeout=5.0
+        )
+        assert node.calls == [
+            ("group_send", node.groups.find("weekend")["id"], "hi")
+        ]
+    finally:
+        server.stop()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_slow_group_send_does_not_block_main_socket(tmp_path):
+    # The regression test for issue #455: a group send stalled on
+    # the fan-out worker must not delay a DM send on the main socket.
+    from tau.local_send import FanoutServer, send_running
+
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    GroupStore(config.groups_path).create(
+        "weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16
+    )
+    node = _FakeRunningNode(config)
+    release = threading.Event()
+    results: dict = {}
+
+    def dispatch(**request):
+        if request.get("op") == "group_send":
+            # A slow fan-out: unreachable members, or --wait.
+            assert release.wait(timeout=10)
+        return cli._dispatch_local_send(node, **request)
+
+    main_server = SendServer(tmp_path, dispatch)
+    fanout_server = FanoutServer(tmp_path, dispatch)
+    try:
+        assert send_server_available(tmp_path)
+        thread = threading.Thread(
+            target=lambda: results.__setitem__(
+                "group",
+                send_running(
+                    tmp_path,
+                    op="group_send",
+                    group="weekend",
+                    text="hi",
+                    leg_timeout=5.0,
+                ),
+            ),
+            daemon=True,
+        )
+        thread.start()
+        # The group send is stuck on the fan-out worker; the DM send
+        # on the main socket must still answer promptly.
+        start = time.monotonic()
+        result = send_running(tmp_path, target="alice", text="quick")
+        assert time.monotonic() - start < 2.0
+        assert result["echo"] == "quick"
+        release.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert results["group"]["results"][0]["delivered"] is True
+    finally:
+        release.set()
+        fanout_server.stop()
+        main_server.stop()
 
 
 def test_drop_console_copy_via_running_node_without_server_is_best_effort(
@@ -1259,6 +1412,113 @@ def test_serve_continues_when_send_server_cannot_bind(tmp_path, caplog, capsys, 
     ready = json.loads(capsys.readouterr().out.strip().splitlines()[0])
     assert ready["event"] == "ready"
     assert ready["send_socket"] is False
+
+
+def test_serve_starts_and_stops_fanout_server(tmp_path, monkeypatch):
+    """`tau serve` starts a fan-out worker next to the send server, and stops both (issue #455)."""
+    import tau.local_send
+
+    started = []
+
+    class RecordingFanoutServer(tau.local_send.FanoutServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            started.append(("bound", self.path.exists()))
+
+        def stop(self):
+            started.append(("stopped", self.path.exists()))
+            super().stop()
+
+    class RecordingNode:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.identity = None
+
+        def start(
+            self,
+            *,
+            announce=True,
+            exclusive=False,
+            mail_loop=True,
+            lxmf=False,
+            lxmf_propagation=False,
+        ):
+            pass
+
+        def stop(self):
+            pass
+
+        def info(self):
+            return {
+                "name": "test",
+                "destination": "ab" * 16,
+                "rns_version": "test",
+                "mailbox": {},
+                "lxmf": {},
+            }
+
+    (tmp_path / "node").mkdir()
+    monkeypatch.setattr(cli, "TauNode", RecordingNode)
+    monkeypatch.setattr(tau.local_send, "FanoutServer", RecordingFanoutServer)
+
+    args = cli.build_parser().parse_args(
+        ["serve", "--data-dir", str(tmp_path / "node"), "--duration", "0"]
+    )
+    assert cli.cmd_serve(args) == 0
+    # The fan-out socket existed while serving, and both sockets are
+    # gone once the node stops.
+    assert started == [("bound", True), ("stopped", True)]
+    assert not (tmp_path / "node" / "send.sock").exists()
+    assert not (tmp_path / "node" / "send-fanout.sock").exists()
+
+
+def test_serve_continues_when_fanout_server_cannot_bind(
+    tmp_path, caplog, monkeypatch
+):
+    """A fan-out socket that cannot bind must not stop `tau serve` (issue #455)."""
+    import tau.local_send
+
+    class RecordingNode:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.identity = None
+
+        def start(
+            self,
+            *,
+            announce=True,
+            exclusive=False,
+            mail_loop=True,
+            lxmf=False,
+            lxmf_propagation=False,
+        ):
+            pass
+
+        def stop(self):
+            pass
+
+        def info(self):
+            return {
+                "name": "test",
+                "destination": "ab" * 16,
+                "rns_version": "test",
+                "mailbox": {},
+                "lxmf": {},
+            }
+
+    class FailingFanoutServer:
+        def __init__(self, *args, **kwargs):
+            raise OSError("no socket support here")
+
+    (tmp_path / "node").mkdir()
+    monkeypatch.setattr(cli, "TauNode", RecordingNode)
+    monkeypatch.setattr(tau.local_send, "FanoutServer", FailingFanoutServer)
+
+    args = cli.build_parser().parse_args(
+        ["serve", "--data-dir", str(tmp_path / "node"), "--duration", "0"]
+    )
+    assert cli.cmd_serve(args) == 0
+    assert "Could not start the local fan-out server" in caplog.text
 
 
 def test_instance_lock_free_reads_holder_pid(tmp_path):

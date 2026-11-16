@@ -6490,8 +6490,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
             raise
 
     send_server = None
+    fanout_server = None
     if hasattr(socket, "AF_UNIX"):
-        from .local_send import SendServer
+        from .local_send import FanoutServer, SendServer
 
         try:
             send_server = SendServer(
@@ -6508,6 +6509,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
             # start a second instance on this identity — so no send is
             # lost silently.
             log.warning("Could not start the local send server", exc_info=True)
+        if send_server is not None:
+            try:
+                # The fan-out worker: group sends, retractions, edits
+                # and typing run on their own socket so a slow fan-out
+                # cannot block the main send socket (issue #455). It
+                # shares the dispatch — and the node — with the main
+                # server. Best-effort like the main server: when it
+                # cannot bind, fan-out ops fall back to the main socket.
+                fanout_server = FanoutServer(
+                    config.data_dir,
+                    lambda **request: _dispatch_local_send(
+                        node, bridge=bridge, **request
+                    ),
+                )
+            except Exception:
+                log.warning(
+                    "Could not start the local fan-out server", exc_info=True
+                )
 
     info = node.info()
     send_socket = send_server is not None
@@ -6566,6 +6585,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             while not stop.wait(0.5):
                 pass
     finally:
+        if fanout_server is not None:
+            fanout_server.stop()
         if send_server is not None:
             send_server.stop()
         if publish_server is not None:
