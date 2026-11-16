@@ -4387,7 +4387,7 @@ def _resolve_poll_option(value: str, options: Sequence[str]) -> int:
     text can match at most once.
     """
     text = str(value).strip()
-    if text.isdigit():
+    if text.isascii() and text.isdigit():
         index = int(text) - 1
         if 0 <= index < len(options):
             return index

@@ -1762,14 +1762,18 @@ def vote_states(
         return states
     placeholders = ", ".join("?" for _ in clean)
     rows = conn.execute(
-        "SELECT target, author, text FROM posts "
+        "SELECT target, author, text, expires_at FROM posts "
         f"WHERE kind = 'vote' AND linked = 1 AND target IN ({placeholders}) "
         "ORDER BY target, author, seq ASC",
         clean,
     ).fetchall()
     for row in rows:
         text = str(row["text"])
-        if not text.isdigit():
+        if not (text.isascii() and text.isdigit()):
+            continue
+        if is_expired({"expires_at": row["expires_at"]}):
+            # An expired vote no longer stands, and it does not
+            # supersede an earlier live vote by the same voter.
             continue
         # Rows arrive in chain order per voter, so the last write wins.
         states[str(row["target"])][str(row["author"])] = int(text)
