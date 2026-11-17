@@ -75,6 +75,16 @@ describe("lookalikeOf", () => {
     expect(lookalikeOf([anchor, peer], peer)).toBe("Straße");
   });
 
+  it("folds ligatures the way the server does, for note-only contacts", () => {
+    const anchor = makePeer({
+      destination: "cd".repeat(16),
+      note: "met at the mesh meetup",
+      name: "ﬀoo",
+    });
+    const peer = makePeer({ destination: "ef".repeat(16), name: "ffoo" });
+    expect(lookalikeOf([anchor, peer], peer)).toBe("ﬀoo");
+  });
+
   it("never compares the peer's own alias", () => {
     const anchor = makePeer({ destination: "cd".repeat(16), verified: true });
     const peer = makePeer({

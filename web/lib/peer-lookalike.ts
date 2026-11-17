@@ -1,11 +1,29 @@
 import type { Peer } from "./types";
 
+/** Case folds `toLowerCase` leaves alone, mirroring Python
+ * `str.casefold()` for the characters that can appear in display
+ * names: sharp s, final sigma, and the Latin ligatures (U+FB00–FB06).
+ * A fuller table would cover all of Unicode's CaseFolding.txt; these
+ * are the folds a peer name can realistically carry. */
+const CASE_FOLDS: Record<string, string> = {
+  "ß": "ss",
+  "ς": "σ",
+  "ﬀ": "ff",
+  "ﬁ": "fi",
+  "ﬂ": "fl",
+  "ﬃ": "ffi",
+  "ﬄ": "ffl",
+  "ﬅ": "st",
+  "ﬆ": "st",
+};
+
 /** Lowercase a peer name the way the server does: Python `str.casefold`
  * maps ß to ss and final sigma ς to σ, which JavaScript `toLowerCase`
- * leaves alone — same two replacements as `casefoldTag` in format.ts,
- * kept here so this module stays self-contained. */
+ * leaves alone — as do the ligatures above. */
 function casefold(name: string): string {
-  return name.toLowerCase().replace(/ß/g, "ss").replace(/ς/g, "σ");
+  return name
+    .toLowerCase()
+    .replace(/[ßςﬀﬁﬂﬃﬄﬅﬆ]/g, (ch) => CASE_FOLDS[ch] ?? ch);
 }
 
 /** Display name of a peer the way the server reports it: the local
@@ -43,12 +61,42 @@ export function lookalikeOf(peers: Peer[], peer: Peer): string | null {
     if (other.destination === peer.destination) continue;
     const contact = other.alias || other.note;
     if (!other.verified && !contact) continue;
-    const names = [other.name, other.alias]
-      .map((name) => casefold(name ?? ""))
-      .filter((name) => name && name !== "unknown");
-    if (names.includes(claimed)) {
+    if (lookalikeNames(other).includes(claimed)) {
       return displayName(other);
     }
   }
   return null;
+}
+
+/** Casefolded names *peer* can be known by for lookalike matching:
+ * its announced name and its local alias, excluding the "unknown"
+ * fallback for peers that never announced a name. */
+export function lookalikeNames(peer: Peer): string[] {
+  return [peer.name, peer.alias]
+    .map((name) => casefold(name ?? ""))
+    .filter((name) => name && name !== "unknown");
+}
+
+/**
+ * Recompute `lookalike_of` for every peer announcing *contact*'s name
+ * or alias, against *peers* — which must already carry the contact's
+ * new state. Used after a note edit reconciles the contact's note:
+ * the anchor's note just changed, so a warning kept from the stale
+ * note (or missing for the new one) must be re-derived, not trusted.
+ * The contact itself is left alone: its warning comes from the reply.
+ */
+export function recomputeLookalikeWarnings(
+  peers: Peer[],
+  contact: Peer,
+): Peer[] {
+  const names = lookalikeNames(contact);
+  if (names.length === 0) return peers;
+  return peers.map((entry) => {
+    if (entry.destination === contact.destination) return entry;
+    if (!names.includes(casefold(entry.name ?? ""))) return entry;
+    const recomputed = lookalikeOf(peers, entry);
+    return recomputed === entry.lookalike_of
+      ? entry
+      : { ...entry, lookalike_of: recomputed };
+  });
 }

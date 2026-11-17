@@ -1160,6 +1160,37 @@ def test_peers_note_refreshes_lookalike_neighbours(bridge, node, tmp_path):
     assert len(mine) >= 2, "neighbour was not re-published after a note was cleared"
 
 
+def test_peers_note_refresh_covers_pre_refresh_alias(bridge, node, tmp_path):
+    """A one-shot command may have changed the alias on disk since
+    the last refresh: a note edit refreshes aliases from disk, so the
+    neighbour announcing the alias the console last saw must still be
+    re-published when the note edit lands."""
+    registry = _seed_alias_registry(node, tmp_path)
+    registry.set_alias(PEER_HASH, "disk")
+    # M announces "disk" and carries a warning for alice-as-"disk".
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="disk", hops=1)
+    listed = {item["destination"]: item for item in bridge.peers()}
+    assert listed[BOB_HASH]["lookalike_of"] == "disk"
+
+    # A one-shot command changed the alias on disk to "old"; the
+    # bridge's in-memory alias is still "disk" until its next refresh.
+    peers_file = tmp_path / "peers.json"
+    raw = json.loads(peers_file.read_text(encoding="utf-8"))
+    for entry in raw["peers"]:
+        if entry["destination"] == PEER_HASH:
+            entry["alias"] = "old"
+    peers_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    # The note edit refreshes aliases (alice becomes "old"), so M
+    # announcing "disk" must be re-published with no warning.
+    bridge.set_peer_note(PEER_HASH, "met at the meetup")
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour announcing the pre-refresh alias was not re-published"
+    assert mine[-1]["lookalike_of"] is None
+
+
 def test_peers_alias_endpoint_rejects_bad_requests(bridge, node, tmp_path):
     registry = _seed_alias_registry(node, tmp_path)
     registry.set_alias(bytes.fromhex(OTHER_HASH), "laptop")

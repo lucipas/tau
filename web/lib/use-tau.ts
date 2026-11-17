@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiDownload, apiGet, apiPost, apiPostText, eventsUrl, websocketUrl } from "./api";
-import { lookalikeOf } from "./peer-lookalike";
+import { lookalikeOf, recomputeLookalikeWarnings } from "./peer-lookalike";
 import type {
   AcceptDmRequestResponse,
   AllowlistResponse,
@@ -2387,6 +2387,38 @@ export function useTau() {
             result.peer,
           ]),
         );
+      } else if (snapshotGeneration.current === snapshotBefore) {
+        // A peer event arrived first — usually this edit's own
+        // note-blind event, published by the server before the reply.
+        // Skipping the reply outright would leave the note stale and
+        // warnings recomputed from it wrong. The reply's note is
+        // still authoritative: events never carry a note, so no event
+        // can supersede it, and a snapshot (which could carry a newer
+        // note from another tab) has not arrived. Apply just the note
+        // — and the reply's warning, computed with it — without
+        // overwriting newer peer fields the event delivered, then
+        // recompute warnings for peers matching this contact, so a
+        // set note flags them and a cleared note unflags them.
+        setPeers((previous) => {
+          const known = previous.find(
+            (entry) => entry.destination === destination,
+          );
+          if (!known) return previous;
+          const merged = {
+            ...known,
+            note: result.peer.note,
+            lookalike_of: result.peer.lookalike_of,
+          };
+          // A verified peer is never a lookalike, even if the reply
+          // predates a verify that arrived as an event meanwhile.
+          const contact = merged.verified
+            ? { ...merged, lookalike_of: null }
+            : merged;
+          const next = previous.map((entry) =>
+            entry.destination === destination ? contact : entry,
+          );
+          return sortPeers(recomputeLookalikeWarnings(next, contact));
+        });
       }
       return result.peer;
     },

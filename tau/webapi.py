@@ -7018,6 +7018,13 @@ class WebBridge:
         # note or alias a one-shot command saved since the last
         # periodic refresh, so this save does not write back stale ones.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        # The alias the console last saw, before any edit lands: the
+        # refresh below may restore a different alias from disk, and
+        # neighbours announcing the former value must still be
+        # refreshed when the note edit lands — same gap as the alias
+        # edit's pre-lock value.
+        before = self.node.registry.get(destination)
+        previous_alias = before.alias if before is not None else None
         with lock:
             self.node.registry.refresh_aliases()
             if note is not None and note.strip():
@@ -7028,7 +7035,7 @@ class WebBridge:
         # A note makes this peer a saved contact — or stops it being
         # one — which anchors or releases the lookalike warning on
         # peers announcing its name, so refresh those rows too.
-        self._refresh_lookalike_neighbours(peer)
+        self._refresh_lookalike_neighbours(peer, previous_alias)
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.

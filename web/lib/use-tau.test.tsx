@@ -535,6 +535,290 @@ describe("useTau lookalike warnings", () => {
     expect(updated?.alias).toBe("laptop");
     expect(updated?.lookalike_of).toBe("alice");
   });
+
+  it("reconciles a note set when its event arrives before the reply", async () => {
+    // The anchor carries no note yet; the lookalike announces its name
+    // with no warning. The server publishes this edit's note-blind
+    // events before the reply, so the reply would be skipped outright —
+    // the note must still land, and the lookalike must gain its warning.
+    const anchor = makePeer({ destination: "cd".repeat(16), name: "alice" });
+    const lookalike = makePeer({ destination: "ef".repeat(16), name: "Alice" });
+    const pending = deferred<{ ok: boolean; peer: Peer }>();
+    mockedPost.mockReturnValue(pending.promise);
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [anchor, lookalike]);
+    await waitFor(() => expect(result.current.peers).toHaveLength(2));
+
+    let settled: Promise<Peer>;
+    act(() => {
+      settled = result.current.setPeerNote(
+        anchor.destination,
+        "met at the mesh meetup",
+      );
+    });
+    // This edit's own events arrive first, carrying no note: the
+    // anchor's record, then the lookalike's (note-blind, no warning).
+    act(() => {
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "cd".repeat(16),
+          name: "alice",
+          last_seen: 300,
+        }),
+      });
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "ef".repeat(16),
+          name: "Alice",
+          last_seen: 301,
+          lookalike_of: null,
+        }),
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.last_seen,
+      ).toBe(301),
+    );
+
+    await act(async () => {
+      pending.resolve({
+        ok: true,
+        peer: makePeer({
+          destination: "cd".repeat(16),
+          name: "alice",
+          note: "met at the mesh meetup",
+          lookalike_of: null,
+        }),
+      });
+      await settled;
+    });
+
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === anchor.destination,
+      )?.note,
+    ).toBe("met at the mesh meetup");
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === lookalike.destination,
+      )?.lookalike_of,
+    ).toBe("alice");
+  });
+
+  it("reconciles a note cleared when its event arrives before the reply", async () => {
+    // The anchor is a note-only contact; the lookalike carries its
+    // warning. The note-blind events arrive first and recompute from
+    // the stale note, keeping the warning — the reply must clear both
+    // the note and the warning.
+    const anchor = makePeer({
+      destination: "cd".repeat(16),
+      name: "alice",
+      note: "met at the mesh meetup",
+    });
+    const lookalike = makePeer({
+      destination: "ef".repeat(16),
+      name: "Alice",
+      lookalike_of: "alice",
+    });
+    const pending = deferred<{ ok: boolean; peer: Peer }>();
+    mockedPost.mockReturnValue(pending.promise);
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [anchor, lookalike]);
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.lookalike_of,
+      ).toBe("alice"),
+    );
+
+    let settled: Promise<Peer>;
+    act(() => {
+      settled = result.current.setPeerNote(anchor.destination, null);
+    });
+    act(() => {
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "cd".repeat(16),
+          name: "alice",
+          last_seen: 300,
+        }),
+      });
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "ef".repeat(16),
+          name: "Alice",
+          last_seen: 301,
+          lookalike_of: null,
+        }),
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.last_seen,
+      ).toBe(301),
+    );
+    // The stale note kept the warning through the events.
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === lookalike.destination,
+      )?.lookalike_of,
+    ).toBe("alice");
+
+    await act(async () => {
+      pending.resolve({
+        ok: true,
+        peer: makePeer({
+          destination: "cd".repeat(16),
+          name: "alice",
+          note: null,
+          lookalike_of: null,
+        }),
+      });
+      await settled;
+    });
+
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === anchor.destination,
+      )?.note,
+    ).toBeNull();
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === lookalike.destination,
+      )?.lookalike_of,
+    ).toBeNull();
+  });
+
+  it("flags the lookalike when the note reply lands before its event", async () => {
+    const anchor = makePeer({ destination: "cd".repeat(16), name: "alice" });
+    const lookalike = makePeer({ destination: "ef".repeat(16), name: "Alice" });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      peer: makePeer({
+        destination: "cd".repeat(16),
+        name: "alice",
+        note: "met at the mesh meetup",
+        lookalike_of: null,
+      }),
+    });
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [anchor, lookalike]);
+    await waitFor(() => expect(result.current.peers).toHaveLength(2));
+
+    await act(async () => {
+      await result.current.setPeerNote(
+        anchor.destination,
+        "met at the mesh meetup",
+      );
+    });
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === anchor.destination,
+      )?.note,
+    ).toBe("met at the mesh meetup");
+
+    act(() => {
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "ef".repeat(16),
+          name: "Alice",
+          last_seen: 300,
+          lookalike_of: null,
+        }),
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.last_seen,
+      ).toBe(300),
+    );
+
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === lookalike.destination,
+      )?.lookalike_of,
+    ).toBe("alice");
+  });
+
+  it("unflags the lookalike when the note reply lands before its event", async () => {
+    const anchor = makePeer({
+      destination: "cd".repeat(16),
+      name: "alice",
+      note: "met at the mesh meetup",
+    });
+    const lookalike = makePeer({
+      destination: "ef".repeat(16),
+      name: "Alice",
+      lookalike_of: "alice",
+    });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      peer: makePeer({
+        destination: "cd".repeat(16),
+        name: "alice",
+        note: null,
+        lookalike_of: null,
+      }),
+    });
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [anchor, lookalike]);
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.lookalike_of,
+      ).toBe("alice"),
+    );
+
+    await act(async () => {
+      await result.current.setPeerNote(anchor.destination, null);
+    });
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === anchor.destination,
+      )?.note,
+    ).toBeNull();
+
+    act(() => {
+      source.emit("peer", {
+        peer: makePeer({
+          destination: "ef".repeat(16),
+          name: "Alice",
+          last_seen: 300,
+          lookalike_of: null,
+        }),
+      });
+    });
+    await waitFor(() =>
+      expect(
+        result.current.peers.find(
+          (entry) => entry.destination === lookalike.destination,
+        )?.last_seen,
+      ).toBe(300),
+    );
+
+    expect(
+      result.current.peers.find(
+        (entry) => entry.destination === lookalike.destination,
+      )?.lookalike_of,
+    ).toBeNull();
+  });
 });
 
 afterEach(() => {
