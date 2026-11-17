@@ -84,6 +84,7 @@ from .tangents.tan import (
     find_post_by_image,
     init_db as init_tan_db,
     media_path,
+    media_requires_publication,
     store_media,
 )
 from .protocol import (
@@ -245,6 +246,11 @@ _MAX_PENDING_FILE_OFFERS = 64
 _MAX_PENDING_FILE_OFFERS_PER_SENDER = 4
 # Default budget for one file transfer (offer + Resource bytes).
 _FILE_TRANSFER_TIMEOUT = 300.0
+# Concurrent media pushes a node serves: a global cap, and a per-requester
+# cap, so one identified peer cannot tie up the node's push threads or
+# saturate a low-bandwidth interface.
+_MAX_MEDIA_PUSHES = 4
+_MAX_MEDIA_PUSHES_PER_REQUESTER = 2
 # A Resource advertisement's data size is the file size plus the
 # metadata carried with it (the transfer id: a 3-byte length prefix
 # around a msgpack'd 32-character string, 37 bytes in total).  The
@@ -610,11 +616,13 @@ class TauNode:
         self._active_links: Set[RNS.Link] = set()
         self._pending_file_offers: Dict[str, Dict[str, Any]] = {}
         self._file_offers_lock = threading.Lock()
-        # Media fetches this node asked for: sha256 -> {author, event,
-        # path, error}.  The event is set when the Resource carrying
-        # the bytes concludes (or the fetch fails), so fetch_tan_media
-        # can wait on it instead of polling.
-        self._pending_media_fetches: Dict[str, Dict[str, Any]] = {}
+        # Media fetches this node asked for: (author, sha256) ->
+        # {author, requested_at, event, path, error}.  The event is set
+        # when the Resource carrying the bytes concludes (or the fetch
+        # fails), so fetch_tan_media can wait on it instead of polling.
+        # Concurrent fetches of the same image from the same author
+        # share one record and wake together.
+        self._pending_media_fetches: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._media_fetches_lock = threading.Lock()
         self._save_lock = threading.Lock()
         self._last_peer_save = 0.0
@@ -624,6 +632,9 @@ class TauNode:
         self._allowlist: Optional[AllowList] = None
         self._allowlist_lock = threading.RLock()
         self._blocklist: Optional[BlockList] = None
+        # (requester, sha256) keys of media pushes still in flight.
+        self._media_pushes_lock = threading.Lock()
+        self._media_pushes_inflight: set = set()
 
     @property
     def allowlist(self) -> AllowList:
@@ -2477,59 +2488,107 @@ class TauNode:
             request = parse_media_request(data)
         except ProtocolError as exc:
             return response_error("invalid_request", str(exc))
-        sha256 = request["sha256"]
-        stored = media_path(self.config.data_dir, sha256)
-        if stored is None:
+        caller_hash = tau_destination_hash(remote_identity).hex()
+        if self.blocklist.is_blocked(caller_hash):
+            # Blocking is silent, as for messages: no signal that the
+            # requester is blocked.
+            log.info("Media request from %s denied by the block-list", caller_hash)
             return response_error("not_found", "this node does not hold that image")
-        try:
-            payload = stored.read_bytes()
-        except OSError as exc:
-            log.warning("Could not read stored media %s: %s", sha256[:8], exc)
-            return response_error("not_found", "stored image could not be read")
-        if hashlib.sha256(payload).hexdigest() != sha256:
-            log.warning("Stored media %s failed its hash check; refusing", sha256[:8])
-            return response_error("not_found", "stored image failed its hash check")
-        requester = RNS.Destination.hash(remote_identity, APP_NAME, ASPECT).hex()
-        if self.blocklist.is_blocked(requester):
-            log.info(
-                "Media request from %s denied by the block-list",
-                requester[:8],
+        sha256 = request["sha256"]
+        reservation = self._reserve_media_push(caller_hash, sha256)
+        if reservation is None:
+            return response_error(
+                "busy", "too many media transfers in progress; retry shortly"
             )
-            return response_error("not_allowed", "requester is blocked")
-        name = f"tan-{sha256[:12]}.img"
+        handed_off = False
         try:
-            conn = init_tan_db(self.config.social_db_path)
+            stored = media_path(self.config.data_dir, sha256)
+            if stored is None:
+                return response_error("not_found", "this node does not hold that image")
+            if media_requires_publication(stored):
+                # A local upload is served only once a post carries it;
+                # until then its bytes stay private to this node.
+                conn = init_tan_db(self.config.social_db_path)
+                try:
+                    published = find_post_by_image(conn, sha256) is not None
+                finally:
+                    conn.close()
+                if not published:
+                    return response_error(
+                        "not_found", "this node does not hold that image"
+                    )
             try:
-                post = find_post_by_image(conn, sha256)
-            finally:
-                conn.close()
-        except Exception:  # pragma: no cover - a broken Tan DB must not block serving
-            log.debug("Could not look up the post for media %s", sha256[:8], exc_info=True)
-            post = None
-        if post is not None:
-            image = post.get("image") or {}
-            if isinstance(image.get("name"), str) and image["name"]:
-                name = image["name"]
-
-        def _push() -> None:
+                payload = stored.read_bytes()
+            except OSError as exc:
+                log.warning("Could not read stored media %s: %s", sha256[:8], exc)
+                return response_error("not_found", "stored image could not be read")
+            if hashlib.sha256(payload).hexdigest() != sha256:
+                log.warning("Stored media %s failed its hash check; refusing", sha256[:8])
+                return response_error("not_found", "stored image failed its hash check")
+            requester = RNS.Destination.hash(remote_identity, APP_NAME, ASPECT).hex()
+            name = f"tan-{sha256[:12]}.img"
             try:
-                self._send_file_bytes(
-                    requester,
-                    payload,
-                    name,
-                    sha256,
-                    timeout=_FILE_TRANSFER_TIMEOUT,
-                )
-            except NodeError as exc:
-                log.info(
-                    "Media push for %s to %s failed: %s",
-                    sha256[:8],
-                    requester[:8],
-                    exc,
-                )
+                conn = init_tan_db(self.config.social_db_path)
+                try:
+                    post = find_post_by_image(conn, sha256)
+                finally:
+                    conn.close()
+            except Exception:  # pragma: no cover - a broken Tan DB must not block serving
+                log.debug("Could not look up the post for media %s", sha256[:8], exc_info=True)
+                post = None
+            if post is not None:
+                image = post.get("image") or {}
+                if isinstance(image.get("name"), str) and image["name"]:
+                    name = image["name"]
 
-        threading.Thread(target=_push, name="tau-media-push", daemon=True).start()
-        return response_ok(sending=True, sha256=sha256, size=len(payload), name=name)
+            def _push() -> None:
+                try:
+                    self._send_file_bytes(
+                        requester,
+                        payload,
+                        name,
+                        sha256,
+                        timeout=_FILE_TRANSFER_TIMEOUT,
+                    )
+                except NodeError as exc:
+                    log.info(
+                        "Media push for %s to %s failed: %s",
+                        sha256[:8],
+                        requester[:8],
+                        exc,
+                    )
+                finally:
+                    self._release_media_push(reservation)
+
+            handed_off = True
+            threading.Thread(target=_push, name="tau-media-push", daemon=True).start()
+            return response_ok(sending=True, sha256=sha256, size=len(payload), name=name)
+        finally:
+            if not handed_off:
+                self._release_media_push(reservation)
+
+    def _reserve_media_push(
+        self, requester: str, sha256: str
+    ) -> Optional[Tuple[str, str]]:
+        """Claim a push slot for (*requester*, *sha256*), or ``None`` when
+        the duplicate, per-requester, or global cap is already reached."""
+        key = (requester, sha256)
+        with self._media_pushes_lock:
+            if key in self._media_pushes_inflight:
+                return None
+            if len(self._media_pushes_inflight) >= _MAX_MEDIA_PUSHES:
+                return None
+            per_requester = sum(
+                1 for held, _ in self._media_pushes_inflight if held == requester
+            )
+            if per_requester >= _MAX_MEDIA_PUSHES_PER_REQUESTER:
+                return None
+            self._media_pushes_inflight.add(key)
+        return key
+
+    def _release_media_push(self, key: Tuple[str, str]) -> None:
+        with self._media_pushes_lock:
+            self._media_pushes_inflight.discard(key)
 
     def _handle_reaction(
         self,
@@ -6645,60 +6704,55 @@ class TauNode:
             raise NodeError("sha256 must be a 64 character hex digest") from exc
         cached = media_path(self.config.data_dir, digest)
         if cached is not None:
-            try:
-                cached_bytes = cached.read_bytes()
-            except OSError:
-                cached_bytes = None
-            if (
-                cached_bytes is not None
-                and hashlib.sha256(cached_bytes).hexdigest() == digest
-            ):
-                return {
-                    "ok": True,
-                    "v": PROTOCOL_VERSION,
-                    "sha256": digest,
-                    "path": str(cached),
-                    "size": cached.stat().st_size,
-                    "cached": True,
-                }
-            # A damaged cache entry is dropped so the fetch below
-            # repairs it instead of reporting corrupt bytes as cached.
-            try:
-                cached.unlink()
-            except OSError:
-                pass
+            return {
+                "ok": True,
+                "v": PROTOCOL_VERSION,
+                "sha256": digest,
+                "path": str(cached),
+                "size": cached.stat().st_size,
+                "cached": True,
+            }
         peer = self.resolve_peer(
             author,
             timeout=min(timeout, 10.0) if discover_timeout is None else discover_timeout,
         )
         author_hash = peer.hexhash
-        event = threading.Event()
+        key = (author_hash, digest)
         record: Dict[str, Any] = {
             "author": author_hash,
-            "event": event,
+            "event": threading.Event(),
             "requested_at": time.time(),
         }
         with self._media_fetches_lock:
             self._prune_media_fetches_locked()
-            self._pending_media_fetches[digest] = record
+            existing = self._pending_media_fetches.get(key)
+            # The first caller owns the request; a concurrent caller for the
+            # same image from the same author waits on that same transfer.
+            owner = existing is None
+            if existing is None:
+                self._pending_media_fetches[key] = record
+            else:
+                record = existing
+        event = record["event"]
         try:
-            link = self._open_link(peer, min(timeout, 30.0))
-            try:
-                response = self._request_on_link(
-                    link,
-                    REQUEST_MEDIA,
-                    build_media_request(digest),
-                    20.0,
-                )
-            finally:
+            if owner:
+                link = self._open_link(peer, min(timeout, 30.0))
                 try:
-                    link.teardown()
-                except Exception:  # pragma: no cover - defensive
-                    pass
-            if not response.get("ok"):
-                raise NodeError(
-                    f"media fetch refused: {response.get('error', 'unknown error')}"
-                )
+                    response = self._request_on_link(
+                        link,
+                        REQUEST_MEDIA,
+                        build_media_request(digest),
+                        20.0,
+                    )
+                finally:
+                    try:
+                        link.teardown()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                if not response.get("ok"):
+                    raise NodeError(
+                        f"media fetch refused: {response.get('error', 'unknown error')}"
+                    )
             if not event.wait(timeout):
                 raise NodeError(
                     f"media transfer {digest[:8]} did not finish within {timeout:.0f}s"
@@ -6717,20 +6771,25 @@ class TauNode:
                 "cached": False,
             }
         finally:
-            with self._media_fetches_lock:
-                if self._pending_media_fetches.get(digest) is record:
-                    del self._pending_media_fetches[digest]
+            if owner:
+                with self._media_fetches_lock:
+                    if record.get("path") is None and record.get("error") is None:
+                        # Wake any waiters sharing this transfer: it will not arrive.
+                        record["error"] = "media fetch ended before the image arrived"
+                    event.set()
+                    if self._pending_media_fetches.get(key) is record:
+                        del self._pending_media_fetches[key]
 
     def _prune_media_fetches_locked(self) -> None:
         """Drop expired pending media fetches; caller holds the lock."""
         now = time.time()
         expired = [
-            digest
-            for digest, record in self._pending_media_fetches.items()
+            key
+            for key, record in self._pending_media_fetches.items()
             if now - float(record.get("requested_at", now)) > 300.0
         ]
-        for digest in expired:
-            del self._pending_media_fetches[digest]
+        for key in expired:
+            del self._pending_media_fetches[key]
 
     def send_reaction(
         self,
@@ -8065,8 +8124,7 @@ class TauNode:
             return False
         with self._media_fetches_lock:
             self._prune_media_fetches_locked()
-            record = self._pending_media_fetches.get(digest)
-            return record is not None and record.get("author") == sender_hash
+            return (sender_hash, digest) in self._pending_media_fetches
 
     def _prune_file_offers(self) -> None:
         now = time.time()
@@ -8170,19 +8228,14 @@ class TauNode:
                     transfer_id[:8],
                 )
                 return
+            if self._is_pending_media_fetch(offer["from"], offer):
+                # Media fetch bytes go straight to the media store: they are
+                # not inbox files, and a failed inbox write must not block them.
+                self._complete_media_fetch(offer, data)
+                return
             peer = self.registry.get(offer["from"])
             if peer is not None:
                 offer["from_name"] = peer.display_name
-            if self._is_pending_media_fetch(offer["from"], offer):
-                # A media fetch answers a request this node made: the
-                # bytes go straight to the media store from memory.
-                # They never enter the file inbox — no inbound file
-                # record, no copy under files/<author>/, no on_file
-                # callback — so viewing a feed image cannot flood the
-                # inbox, and an inbox write failure cannot lose bytes
-                # that already verified against their hash.
-                self._complete_media_fetch(offer, data)
-                return
             record = self._save_received_file(offer, data)
             if record is None:
                 return
@@ -8195,22 +8248,19 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not handle concluded Resource", exc_info=True)
 
-    def _complete_media_fetch(
-        self, offer: Dict[str, Any], data: bytes
-    ) -> None:
-        """File a concluded transfer that answers a media fetch.
+    def _complete_media_fetch(self, offer: Dict[str, Any], data: bytes) -> None:
+        """File the verified bytes of a transfer that answers a media fetch.
 
-        Stores the verified bytes in the media store under their
-        digest and wakes the ``fetch_tan_media`` waiter with the
-        store path.  A transfer that was never a media fetch is left
-        alone; a media-store failure signals an error instead of
-        leaving the waiter blocked.
+        Stores them in the media store under their digest and wakes the
+        ``fetch_tan_media`` waiters with the store path (or the error).
+        The caller has already matched the offer to a pending fetch.
         """
         digest = str(offer.get("sha256") or "").lower()
+        key = (str(offer.get("from")), digest)
         with self._media_fetches_lock:
-            pending = self._pending_media_fetches.get(digest)
-            if pending is None or pending.get("author") != offer.get("from"):
-                return
+            pending = self._pending_media_fetches.get(key)
+        if pending is None:
+            return
         try:
             stored = store_media(self.config.data_dir, digest, data)
         except (OSError, TanError) as exc:

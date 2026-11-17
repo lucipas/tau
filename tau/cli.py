@@ -3083,7 +3083,7 @@ def _read_image(path: Path, data_dir: Path) -> Dict[str, Any]:
         raise NodeError(f"image file name {source.name!r} is not usable")
     digest = hashlib.sha256(data).hexdigest()
     try:
-        store_media(data_dir, digest, data)
+        store_media(data_dir, digest, data, pinned=True)
     except TanError as exc:
         raise NodeError(str(exc)) from exc
     return {"sha256": digest, "size": len(data), "mime": mime, "name": name}
