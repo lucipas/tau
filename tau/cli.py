@@ -115,7 +115,7 @@ from .group_invites import (
     parse_invite_link,
     revoke_invites,
 )
-from .groups import GroupStore, pinned_rosters, visible_reactions
+from .groups import GroupStore, pinned_group, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
     attach_group_poll_tallies,
@@ -812,7 +812,8 @@ def build_parser() -> argparse.ArgumentParser:
     retract = subparsers.add_parser(
         "retract",
         parents=[common],
-        help="retract a sent message from the recipient's inbox",
+        help="retract a sent message from the recipient's inbox "
+        "(a group creator may also retract a member's message)",
     )
     retract.add_argument(
         "message",
@@ -9911,6 +9912,7 @@ def _retract_group_local_message(
     timeout: float = 20.0,
     leg_timeout: Optional[float] = None,
     discover_timeout: Optional[float] = None,
+    target_author: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retract a group message on the running node, for the local send server.
 
@@ -9919,7 +9921,9 @@ def _retract_group_local_message(
     wait on the socket is unbounded for a fan-out, so the operation
     timeout cannot travel as ``timeout`` — send_running swallows that
     keyword as the reply wait.  An older client sends no leg timeout
-    and the default bound applies.
+    and the default bound applies.  ``target_author`` names the
+    message's author for a moderator retract; an author retract (and
+    an older client) omits it and the fan-out stamps this node.
     """
     return node.send_group_retraction(
         group,
@@ -9927,6 +9931,7 @@ def _retract_group_local_message(
         timeout=float(leg_timeout if leg_timeout is not None else timeout),
         discover_timeout=discover_timeout,
         target_sent_at=target_sent_at,
+        target_author=target_author,
     )
 
 
@@ -10345,6 +10350,7 @@ def _retract_group_via_running_node(
     *,
     timeout: float,
     discover_timeout: Optional[float],
+    target_author: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retract a group message through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -10359,6 +10365,7 @@ def _retract_group_via_running_node(
             group=group_id,
             message_id=message_id,
             target_sent_at=target_sent_at,
+            target_author=target_author,
             leg_timeout=timeout,
             discover_timeout=discover_timeout,
         )
@@ -11483,6 +11490,24 @@ def _own_destination_hash(config: TauConfig) -> Optional[str]:
     """This node's destination hash, or ``None`` without an identity."""
     identity = load_identity(config.identity_path)
     return destination_hash(identity).hex() if identity is not None else None
+
+
+def _is_group_creator(config: TauConfig, target: Dict[str, Any]) -> bool:
+    """True when this node created the group *target* belongs to.
+
+    The creator is read from the pinned roster for the message's
+    group — the same record the receive path verifies a moderator
+    retract against — so a stale local copy cannot grant moderation
+    this node does not have.
+    """
+    group_id = target.get("group") or ""
+    if not group_id:
+        return False
+    own_hash = _own_destination_hash(config)
+    if own_hash is None:
+        return False
+    pinned = pinned_group(GroupStore(config.groups_path), str(group_id))
+    return pinned is not None and (pinned.get("creator") or "") == own_hash
 
 
 def _quote_line(
@@ -14863,11 +14888,15 @@ def _retract_group_message(
     registry: PeerRegistry,
     target: Dict[str, Any],
 ) -> int:
-    """Retract a sent group message, fanning out to every member.
+    """Retract a group message, fanning out to every member.
 
-    Queued legs are cancelled by the fan-out (see
+    An author retracts their own sent message; a group creator may
+    also retract a member's message (moderation — see
+    :func:`cmd_retract`), in which case the fan-out carries that
+    member as the target author and reaches the author too.  Queued
+    legs are cancelled by the fan-out (see
     :meth:`tau.node.TauNode.send_group_retraction`), so a member whose
-    leg never left never receives the message.  The local sent copy is
+    leg never left never receives the message.  The local copy is
     dropped only when every member received the retract: a partial
     fan-out keeps it, so the user can retry the members still holding
     the message — re-sending is idempotent, and a member who already
@@ -14876,12 +14905,23 @@ def _retract_group_message(
     group_id = target.get("group") or ""
     if not group_id:
         raise NodeError("that group message has no group to retract from")
+    moderating = target.get("direction") == "in"
     leg_sent_at = target.get("leg_sent_at")
+    if leg_sent_at is None and moderating:
+        # A received copy carries the legs' shared send time as its
+        # sent_at (the author's send time); a sent record carries it
+        # as leg_sent_at instead.
+        leg_sent_at = target.get("sent_at")
     if leg_sent_at is None:
         raise NodeError(
             "that group message was sent before group retracts landed; "
             "it carries no leg send time, so it cannot be retracted"
         )
+    # The author of the message being retracted: this node for an
+    # author retract, the sender of the received copy for a moderator
+    # retract.  Receivers resolve their copy — and key the durable
+    # marker — by this hash (see TauNode._handle_retract).
+    target_author = target.get("destination") or None
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
     via_running_node = _send_routes_via_running_node(config)
@@ -14898,6 +14938,7 @@ def _retract_group_message(
                 float(leg_sent_at),
                 timeout=timeout,
                 discover_timeout=discover_timeout,
+                target_author=target_author,
             )
         except NodeError as exc:
             # Retracts ride the live link only in v1 — there is no
@@ -14918,6 +14959,7 @@ def _retract_group_message(
                     timeout=timeout,
                     discover_timeout=discover_timeout,
                     target_sent_at=float(leg_sent_at),
+                    target_author=target_author,
                 )
             except NodeError as exc:
                 # Retracts ride the live link only in v1 — there is no
@@ -14932,6 +14974,16 @@ def _retract_group_message(
 
     results = response.get("results") or []
     failed = [r for r in results if not r.get("delivered")]
+    if moderating:
+        author_peer = registry.get(target_author or "")
+        author_name = (
+            author_peer.display_name
+            if author_peer is not None
+            else short_hash(target_author or "")
+        )
+        message_label = f"{author_name}'s group message"
+    else:
+        message_label = "your group message"
     if _json_mode(args):
         _emit(
             {
@@ -14952,7 +15004,7 @@ def _retract_group_message(
             if result.get("delivered"):
                 if result.get("deleted"):
                     print(
-                        f"retracted your group message "
+                        f"retracted {message_label} "
                         f"{_safe_id_prefix(str(target['id']))} from {name}'s inbox"
                     )
                 else:
@@ -15218,10 +15270,16 @@ def cmd_retract(args: argparse.Namespace) -> int:
     if not target.get("id"):
         raise NodeError("that message has no id to retract")
     if target.get("direction") != "out":
-        raise NodeError(
-            "that message was not sent by this node;"
-            " only your own sent messages can be retracted"
-        )
+        # A group creator may retract a member's message (moderation):
+        # a received group message is retractable when this node
+        # created the group.  Anything else still needs a sent copy.
+        if target.get("kind") != "group" or not _is_group_creator(
+            config, target
+        ):
+            raise NodeError(
+                "that message was not sent by this node;"
+                " only your own sent messages can be retracted"
+            )
     if target.get("kind") == "group":
         return _retract_group_message(args, config, inbox, registry, target)
     recipient = target.get("destination") or ""

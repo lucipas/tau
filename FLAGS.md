@@ -26,6 +26,7 @@ Global options may appear before or after the command:
 | `tau beacon update PEER --location "LAT,LON [PLACE]"` | Refresh a running beacon's position or position file (`--location-file PATH` to attach a file instead) |
 | `tau beacon list` | List running and recently ended beacons |
 | `tau react MESSAGE-ID EMOJI` | React to a received message (one emoji or short token; `--clear` retracts) |
+| `tau retract MESSAGE-ID` | Take back a sent message (group messages fan out to every member; a group creator may also retract a member's message) |
 | `tau typing start\|stop --to PEER` | Send a live typing event to a peer (`--group NAME\|ID` types in a group instead; live-only, never queued) |
 | `tau send-file --to PEER PATH` | Send a small file (at most 10 MiB) over an RNS Resource on a direct link |
 | `tau config accept-files on\|off` | Opt in or out of receiving files (off by default) |
