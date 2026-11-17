@@ -779,6 +779,35 @@ export interface DeclineDmRequestResponse {
   blocked: boolean;
 }
 
+// A pending group join request, as `GET /api/groups/join-requests`
+// returns it: the group by name (the stable handle across roster
+// changes), the requester's hash and display name, and the time the
+// request arrived.
+export interface JoinRequestEntry {
+  group: string;
+  group_id: string;
+  peer: string;
+  peer_name: string;
+  requested_at: number;
+  expires_at: number;
+}
+
+export interface JoinRequestsResponse {
+  requests: JoinRequestEntry[];
+  count: number;
+}
+
+export interface DecideJoinRequestResponse {
+  ok: boolean;
+  status: string;
+  group: {
+    id: string;
+    name: string;
+    members: string[];
+    creator: string;
+  };
+}
+
 export interface AllowlistEntry {
   destination: string;
   name: string;

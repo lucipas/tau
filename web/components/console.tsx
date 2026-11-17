@@ -10,6 +10,7 @@ import { ChannelsConsole } from "./channels-console";
 import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
 import { DmRequestsSection } from "./dm-requests-section";
+import { JoinRequestsSection } from "./join-requests-section";
 import { DoctorSection } from "./doctor-section";
 import { CONSOLE_TABS, Header, type ConsoleTab } from "./header";
 import { MessageFeed } from "./message-feed";
@@ -696,6 +697,13 @@ export function Console() {
                 onAccept={tau.acceptDmRequest}
                 onDecline={tau.declineDmRequest}
               />
+              <div className="mt-4">
+                <JoinRequestsSection
+                  requests={tau.joinRequests}
+                  onApprove={tau.approveJoinRequest}
+                  onDeny={tau.denyJoinRequest}
+                />
+              </div>
             </div>
             <div className="mt-4 shrink-0 rounded-2xl border border-line/80 bg-panel/40">
               <button
