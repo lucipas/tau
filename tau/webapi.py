@@ -282,6 +282,7 @@ from .protocol import (
     _clean_group_poll_target_or_none,
     _clean_group_poll_vote_or_none,
     clean_in_reply_to,
+    clean_beacon,
     clean_location,
     clean_reaction,
     excerpt_hash,
@@ -902,6 +903,12 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     location = clean_location(entry.get("location"))
     if location is not None:
         message["location"] = location
+    # A live-beacon marker rides the same way, so the console can
+    # tell a live update from a one-off pin; a malformed marker
+    # drops instead of the entry.
+    beacon = clean_beacon(entry.get("beacon"))
+    if beacon is not None:
+        message["beacon"] = beacon
     # Group-poll fields ride on the console entry so a restarted
     # console still renders its polls; a malformed field drops
     # instead of the entry, and a hand-edited entry carrying several

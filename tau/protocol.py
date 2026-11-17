@@ -467,6 +467,7 @@ def encode_group_message(
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    beacon: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -509,6 +510,10 @@ def encode_group_message(
     ``location`` optionally pins a place on the message (see
     :func:`clean_location`): a pin without coordinates is rejected,
     so a caller cannot send a location message that renders nowhere.
+    ``beacon`` optionally marks the message as one update of a live
+    beacon (see :func:`clean_beacon`), exactly like a direct message:
+    it rides with the pin on every leg, so each member can tell a
+    live update from a one-off pin.
     """
     if sum(
         field is not None for field in (poll_options, poll_vote, poll_close)
@@ -577,6 +582,13 @@ def encode_group_message(
         raise ProtocolError("location must have a latitude -90..90 and a longitude -180..180")
     if cleaned_location is not None:
         payload["location"] = cleaned_location
+    cleaned_beacon = clean_beacon(beacon)
+    if beacon is not None and cleaned_beacon is None:
+        raise ProtocolError("beacon must have an id, an expiry and a sequence number")
+    if cleaned_beacon is not None:
+        if cleaned_location is None:
+            raise ProtocolError("a beacon update must carry a location pin")
+        payload["beacon"] = cleaned_beacon
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -670,6 +682,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "poll_vote": parsed_vote,
         "poll_close": parsed_close,
         "location": clean_location(payload.get("location")),
+        "beacon": clean_beacon(payload.get("beacon")),
     }
 
 
@@ -1540,8 +1553,10 @@ def clean_in_reply_to(value: Any) -> Optional[Dict[str, Any]]:
 # pin rides as a structured field on a message — a ``location``-kind
 # DM or a group message — so the receiver can render it with an
 # open-in-maps link instead of parsing coordinates out of the text.
-# A live beacon (periodic updates, expiry) is a later step; v1 is
-# the static pin only.
+# A live beacon (``tau beacon``) is a series of such pins carrying a
+# ``beacon`` marker (see :func:`clean_beacon`): the same pin shape,
+# plus the beacon id, the update sequence and the beacon's expiry, so
+# the receiver can tell a live update from a one-off pin.
 MAX_LOCATION_NAME_LENGTH = 200
 _LOCATION_ARG_RE = re.compile(
     r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)(?:\s+(.*?))?\s*$"
@@ -1590,6 +1605,49 @@ def clean_location(value: Any) -> Optional[Dict[str, Any]]:
     if name:
         cleaned["name"] = name
     return cleaned
+
+
+def clean_beacon(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate a live-beacon marker, or ``None`` when absent or malformed.
+
+    A beacon update is a location message carrying ``beacon``:
+    ``{\"id\": <beacon id>, \"expires_at\": <epoch>, \"seq\": <update
+    number>}``.  A malformed marker drops instead of breaking the
+    message — the pin still reads — exactly like a malformed
+    ``location`` drops.  Callers that must reject a bad marker
+    (``encode_message``) check the input was not ``None`` and raise
+    when cleaning returns ``None``.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    beacon_id = value.get("id")
+    if (
+        not isinstance(beacon_id, str)
+        or not beacon_id
+        or len(beacon_id) > 64
+    ):
+        return None
+    expires_at = value.get("expires_at")
+    if (
+        isinstance(expires_at, bool)
+        or not isinstance(expires_at, (int, float))
+        or not math.isfinite(float(expires_at))
+    ):
+        return None
+    seq = value.get("seq")
+    if (
+        isinstance(seq, bool)
+        or not isinstance(seq, int)
+        or seq < 1
+    ):
+        return None
+    return {
+        "id": beacon_id,
+        "expires_at": float(expires_at),
+        "seq": seq,
+    }
 
 
 def parse_location_arg(text: Any) -> Dict[str, Any]:
@@ -1654,6 +1712,7 @@ def encode_message(
     in_reply_to: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
+    beacon: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a chat message for the ``/tau/message`` request.
 
@@ -1666,7 +1725,11 @@ def encode_message(
     quotes.  ``location`` optionally pins a place on the message
     (see :func:`clean_location`): a pin without coordinates is
     rejected, so a caller cannot send a location message that
-    renders nowhere.
+    renders nowhere.  ``beacon`` optionally marks the message as one
+    update of a live beacon (see :func:`clean_beacon`): it rides
+    with the pin, so the receiver can tell a live update from a
+    one-off pin and show the beacon's expiry; a beacon without a
+    pin is rejected, since an update that renders nowhere is noise.
     """
     payload = {
         "type": "message",
@@ -1689,6 +1752,13 @@ def encode_message(
         raise ProtocolError("location must have a latitude -90..90 and a longitude -180..180")
     if cleaned_location is not None:
         payload["location"] = cleaned_location
+    cleaned_beacon = clean_beacon(beacon)
+    if beacon is not None and cleaned_beacon is None:
+        raise ProtocolError("beacon must have an id, an expiry and a sequence number")
+    if cleaned_beacon is not None:
+        if cleaned_location is None:
+            raise ProtocolError("a beacon update must carry a location pin")
+        payload["beacon"] = cleaned_beacon
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -1712,6 +1782,7 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         "expires_at": _clean_expires_at(payload.get("expires_at")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "location": clean_location(payload.get("location")),
+        "beacon": clean_beacon(payload.get("beacon")),
     }
 
 

@@ -46,6 +46,7 @@ from .protocol import (
     _clean_group_poll_target_or_none,
     _clean_group_poll_vote_or_none,
     clean_in_reply_to,
+    clean_beacon,
     clean_location,
     excerpt_hash,
     generate_message_id,
@@ -173,6 +174,10 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     # pin drops instead of the record — the message is still
     # readable, just without its map link.
     location = clean_location(raw.get("location"))
+    # A live-beacon marker rides the same way: a malformed marker
+    # drops instead of the record — the update is still readable as
+    # a plain pin.
+    beacon = clean_beacon(raw.get("beacon"))
     seq = raw.get("seq")
     if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
         seq = None
@@ -198,6 +203,8 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["in_reply_to"] = in_reply_to
     if location is not None:
         record["location"] = location
+    if beacon is not None:
+        record["beacon"] = beacon
     leg_ids = raw.get("leg_ids")
     if isinstance(leg_ids, list):
         # One record per group send keeps every leg id, so any leg can

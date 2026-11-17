@@ -11,6 +11,7 @@ from tau.protocol import (
     MAX_REQUEST_BYTES,
     ProtocolError,
     build_announce,
+    clean_beacon,
     clean_location,
     decode,
     derive_group_id,
@@ -228,6 +229,48 @@ def test_message_roundtrip_with_location():
     parsed = parse_message(data)
     assert parsed["text"] == "meet here"
     assert parsed["location"] == pin
+
+
+def test_clean_beacon_accepts_valid_marker():
+    assert clean_beacon({"id": "aabbccdd", "expires_at": 1800003600, "seq": 2}) == {
+        "id": "aabbccdd",
+        "expires_at": 1800003600.0,
+        "seq": 2,
+    }
+    assert clean_beacon(None) is None
+
+
+def test_clean_beacon_rejects_malformed_markers():
+    assert clean_beacon({"expires_at": 1800003600, "seq": 1}) is None
+    assert clean_beacon({"id": "", "expires_at": 1800003600, "seq": 1}) is None
+    assert clean_beacon({"id": "a", "expires_at": "soon", "seq": 1}) is None
+    assert clean_beacon({"id": "a", "expires_at": 1800003600, "seq": 0}) is None
+    assert clean_beacon({"id": "a", "expires_at": 1800003600, "seq": 1.5}) is None
+    assert clean_beacon("beacon") is None
+
+
+def test_message_roundtrip_with_beacon():
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    marker = {"id": "aabbccdd", "expires_at": 1800003600, "seq": 2}
+    data = encode_message(
+        "on my way",
+        message_id="b" * 32,
+        location=pin,
+        beacon=marker,
+        kind="location",
+    )
+    parsed = parse_message(data)
+    assert parsed["location"] == pin
+    assert parsed["beacon"] == marker
+    # A beacon without a pin is rejected, and so is a bad marker.
+    with pytest.raises(ProtocolError):
+        encode_message("on my way", beacon=marker)
+    with pytest.raises(ProtocolError):
+        encode_message("on my way", location=pin, beacon={"id": "a", "seq": 0})
+    # A message without a beacon carries none.
+    assert parse_message(
+        encode_message("hi", message_id="c" * 32)
+    )["beacon"] is None
     # A pin without coordinates is rejected at encode time, and a
     # malformed pin on the wire drops instead of the message.
     with pytest.raises(ProtocolError):
