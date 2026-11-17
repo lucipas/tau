@@ -43,6 +43,16 @@ from .dm_requests import (
     record_dm_request,
 )
 from .disappearing import group_default_for, peer_default_for
+from .group_invites import (
+    JOIN_REQUEST_KIND,
+    InviteError,
+    invite_status,
+    list_join_requests,
+    load_invites,
+    record_join_request,
+    resolve_join_request,
+    verify_invite_link,
+)
 from .groups import GroupStore, pinned_group
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -162,6 +172,16 @@ def _budget(timeout: float, deadline: Optional[float]) -> float:
     if deadline is None:
         return timeout
     return max(0.0, min(timeout, deadline - time.monotonic()))
+
+
+def _invite_group_summary(group: Dict[str, Any]) -> Dict[str, Any]:
+    """The group record a join-request reply carries to the requester."""
+    return {
+        "id": group["id"],
+        "name": group["name"],
+        "members": list(group["members"]),
+        "creator": group.get("creator", ""),
+    }
 
 
 def _past(deadline: Optional[float]) -> bool:
@@ -1939,6 +1959,14 @@ class TauNode:
             return response_error(
                 "unavailable", "message could not be delivered"
             )
+        if message.get("kind") == JOIN_REQUEST_KIND:
+            # A join request carries a signed invite token: it is a
+            # capability the creator issued, so it is decided here,
+            # before the DM allow-list — a stranger holding a valid
+            # token is not a stranger any more.  An invalid one is
+            # rejected outright (never stored as chat, never a DM
+            # request): the kind is never a chat message.
+            return self._handle_join_request(message, caller_hash, received_at)
         if not self.allowlist.is_allowed(caller_hash):
             log.info(
                 "Message from %s denied by the DM allow-list",
@@ -2033,6 +2061,197 @@ class TauNode:
             expired=expired,
             retracted=retracted,
         )
+
+    def _handle_join_request(
+        self,
+        message: Dict[str, Any],
+        caller_hash: str,
+        received_at: float,
+    ) -> bytes:
+        """Answer a ``group-join-request`` message (``/tau/message``).
+
+        The message text is the invite link.  A valid token is
+        decided here — open groups add the requester at once, closed
+        groups record a pending request — and the reply carries the
+        outcome plus the group record, so the requester learns the
+        roster from the reply itself.  An invalid token gets the same
+        generic error whatever failed (unknown group, wrong mode or
+        generation, bad signature), so the reply never leaks whether
+        a group id is real.
+        """
+        try:
+            result = self._process_join_request(
+                message.get("text", ""), caller_hash, received_at
+            )
+        except InviteError as exc:
+            log.info(
+                "Join request from %s rejected: %s",
+                caller_hash or "anonymous",
+                exc,
+            )
+            return response_error("invalid_invite", "invite link is not valid")
+        return response_ok(
+            received_at=received_at,
+            server=self.name,
+            node=self.destination_hexhash,
+            **result,
+        )
+
+    def _process_join_request(
+        self,
+        link_text: Any,
+        caller_hash: str,
+        received_at: float,
+    ) -> Dict[str, Any]:
+        """Decide a join request; shared by the live and relayed paths.
+
+        Returns ``{"status": ..., "group": ...}`` where status is
+        ``added`` (open group), ``pending`` (closed group, request
+        recorded), or ``already_member``.  Raises
+        :class:`InviteError` for any token or group problem.  The
+        decision is idempotent: a retried or relayed duplicate of a
+        request that already landed answers ``already_member`` (open)
+        or re-records the pending request (closed).
+        """
+        if not caller_hash:
+            raise InviteError("join request needs a sender identity")
+        if self.identity is None:
+            raise InviteError("node has no identity")
+        invites = load_invites(self.config.invites_path)
+        invite = verify_invite_link(
+            link_text, identity=self.identity, invites=invites
+        )
+        own_hash = self.destination_hexhash
+        # The token names the group: the id derives from the roster,
+        # so the first join already retires the id it was minted for.
+        # Resolve the name to the current roster on every join.
+        try:
+            group = self.groups.find(invite["group"])
+        except ValueError as exc:
+            raise InviteError("invite is not valid for this group") from exc
+        if (
+            group is None
+            or not group.get("local")
+            or group.get("creator") != own_hash
+        ):
+            raise InviteError("invite is not valid for this group")
+        if caller_hash in group["members"]:
+            return {
+                "status": "already_member",
+                "group": _invite_group_summary(group),
+            }
+        if invite["mode"] == "open":
+            members = list(group["members"]) + [caller_hash]
+            try:
+                new_group = self.groups.update_members(
+                    group["id"], members, created_by=own_hash
+                )
+            except ValueError as exc:
+                raise InviteError(str(exc)) from exc
+            self._welcome_joiner(new_group, caller_hash)
+            return {"status": "added", "group": _invite_group_summary(new_group)}
+        record_join_request(
+            self.config.join_requests_path,
+            group["name"],
+            caller_hash,
+            now=received_at,
+        )
+        return {"status": "pending", "group": _invite_group_summary(group)}
+
+    def _welcome_joiner(self, group: Dict[str, Any], peer_hash: str) -> None:
+        """Announce a new member to the group, off the request thread.
+
+        The welcome is a group message to the new roster: it pins
+        the roster for the joiner (who has never seen the group) and
+        tells the existing members someone joined.  It runs on a
+        daemon thread because the fan-out can take a while and the
+        join request is answered from a link-request handler; a
+        queued leg (joiner offline) still delivers on retry.
+        """
+        peer = self.registry.get(peer_hash)
+        name = peer.display_name if peer is not None else peer_hash[:8]
+
+        def _send() -> None:
+            try:
+                self.send_group_message(
+                    group,
+                    f"{name} joined {group['name']} via an invite link.",
+                    timeout=20.0,
+                )
+            except Exception:  # pragma: no cover - delivery is best-effort
+                log.warning(
+                    "Could not send join welcome to %s", group["id"][:8],
+                    exc_info=True,
+                )
+
+        thread = threading.Thread(
+            target=_send, daemon=True, name="tau-join-welcome"
+        )
+        thread.start()
+
+    def list_join_requests(
+        self, group_name: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Pending join requests, optionally for one group (by name)."""
+        return [
+            entry.to_dict()
+            for entry in list_join_requests(
+                self.config.join_requests_path, group_name=group_name
+            )
+        ]
+
+    def approve_join_request(
+        self, group_name: str, peer_hash: str
+    ) -> Dict[str, Any]:
+        """Admit a pending join request: roster change + welcome.
+
+        The successor group (new id, same name) is created and a
+        welcome group message pins the roster for the new member.
+        Raises :class:`ValueError` when there is no pending request,
+        the group is unknown, or this node did not create it.
+        """
+        group = self.groups.find(group_name)
+        if group is None:
+            raise ValueError(f"unknown group: {group_name!r}")
+        own_hash = self.destination_hexhash
+        if not group.get("local") or group.get("creator") != own_hash:
+            raise ValueError("only the creator can approve join requests")
+        if not resolve_join_request(
+            self.config.join_requests_path, group["name"], peer_hash
+        ):
+            raise ValueError("no pending join request from that peer")
+        if peer_hash in group["members"]:
+            return {"status": "already_member", "group": _invite_group_summary(group)}
+        members = list(group["members"]) + [peer_hash]
+        new_group = self.groups.update_members(
+            group["id"], members, created_by=own_hash
+        )
+        peer = self.registry.get(peer_hash)
+        name = peer.display_name if peer is not None else peer_hash[:8]
+        self.send_group_message(
+            new_group,
+            f"{name} joined {group['name']} via an invite link.",
+            timeout=20.0,
+        )
+        return {"status": "added", "group": _invite_group_summary(new_group)}
+
+    def deny_join_request(self, group_name: str, peer_hash: str) -> Dict[str, Any]:
+        """Refuse a pending join request without changing the roster.
+
+        Raises :class:`ValueError` when there is no pending request
+        or this node did not create the group.
+        """
+        group = self.groups.find(group_name)
+        if group is None:
+            raise ValueError(f"unknown group: {group_name!r}")
+        own_hash = self.destination_hexhash
+        if not group.get("local") or group.get("creator") != own_hash:
+            raise ValueError("only the creator can deny join requests")
+        if not resolve_join_request(
+            self.config.join_requests_path, group["name"], peer_hash
+        ):
+            raise ValueError("no pending join request from that peer")
+        return {"status": "denied", "group": _invite_group_summary(group)}
 
     def _accept_group_message(
         self,
@@ -5049,6 +5268,25 @@ class TauNode:
                 sender or "unknown",
             )
             return False
+        if message.get("kind") == JOIN_REQUEST_KIND:
+            # Same interception as the live path: a relayed join
+            # request is decided, never stored as chat and never a
+            # DM request.  Processing is idempotent, so a duplicate
+            # relayed copy re-answers instead of double-adding, and
+            # the delivery counts as resolved either way.
+            try:
+                self._process_join_request(
+                    message.get("text", ""),
+                    sender if isinstance(sender, str) else "",
+                    time.time(),
+                )
+            except InviteError as exc:
+                log.info(
+                    "Relayed join request from %s rejected: %s",
+                    sender or "unknown",
+                    exc,
+                )
+            return True
         if not self.allowlist.is_allowed(
             sender if isinstance(sender, str) else None
         ):

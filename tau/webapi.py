@@ -27,6 +27,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/rename rename ``{"group": "<id | prefix | name>", "name": "<new name>"}``
     POST /api/groups/topic set or clear the topic ``{"group": "...", "topic": "..."}`` / ``{"group": "...", "clear": true}``
+    GET  /api/groups/join-requests pending join requests for groups this node created
+    POST /api/groups/approve-join approve ``{"group": "<name>", "peer": "<hash>"}``
+    POST /api/groups/deny-join deny ``{"group": "<name>", "peer": "<hash>"}``
     POST /api/groups/leave leave ``{"group": "..."}`` — members only;
                            a group this node created uses delete instead
     POST /api/groups/rejoin rejoin a left group ``{"group": "<32-char id>"}``
@@ -244,6 +247,7 @@ from .config import (
     set_node_setting,
     write_node_metadata,
 )
+from .group_invites import list_join_requests
 from .groups import GroupStore, pinned_rosters, visible_reactions
 from .ignored_groups import (
     IgnoredGroupsError,
@@ -4180,6 +4184,64 @@ class WebBridge:
             )
             requests.append({**request.to_dict(), "sender_name": sender_name})
         return requests
+
+    def join_requests(self) -> List[Dict[str, Any]]:
+        """Pending group join requests, oldest first, with display names.
+
+        The same list ``tau group requests`` prints, so the console
+        reviews exactly what the CLI reviews.  Requests from blocked
+        senders are hidden, like the rest of the console hides
+        blocked senders' content: the owner declines those from the
+        CLI.  An unreadable block-list hides everything (fail
+        closed), matching the node.
+        """
+        config = self.node.config
+        registry = getattr(self.node, "registry", None)
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            return []
+        requests = []
+        for request in list_join_requests(config.join_requests_path):
+            if request.peer in blocked:
+                continue
+            peer = registry.get(request.peer) if registry is not None else None
+            peer_name = (
+                peer.display_name
+                if peer is not None
+                else short_hash(request.peer)
+            )
+            try:
+                group = self.node.groups.find(request.group)
+            except ValueError:
+                group = None
+            requests.append(
+                {
+                    **request.to_dict(),
+                    "peer_name": peer_name,
+                    "group_id": group["id"] if group is not None else "",
+                }
+            )
+        return requests
+
+    def approve_join_request(self, group: str, peer: str) -> Dict[str, Any]:
+        """Admit a pending join request from the console.
+
+        Mirrors ``tau group approve``: only the group's creator can
+        admit, the roster change is a successor group, and a welcome
+        group message pins the roster for the new member.  Raises
+        ``ValueError`` for an unknown group, a non-creator caller, or
+        a peer with no pending request.
+        """
+        return self.node.approve_join_request(group, peer)
+
+    def deny_join_request(self, group: str, peer: str) -> Dict[str, Any]:
+        """Refuse a pending join request from the console.
+
+        Mirrors ``tau group deny``.  Raises ``ValueError`` for an
+        unknown group, a non-creator caller, or a peer with no
+        pending request.
+        """
+        return self.node.deny_join_request(group, peer)
 
     def accept_dm_request(self, ref: str) -> Dict[str, Any]:
         """Accept one held DM request: allow-list the sender, deliver the message.
@@ -9278,6 +9340,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/groups/left":
                 self._send_json(self.bridge.left_groups(), head_only)
                 return
+            if path == "/api/groups/join-requests":
+                requests = self.bridge.join_requests()
+                self._send_json(
+                    {"requests": requests, "count": len(requests)}, head_only
+                )
+                return
             if path == "/api/messages":
                 pinned_only = query.get("pinned") == ["1"]
                 # A pinned view spans the whole console log, not just
@@ -10259,6 +10327,43 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **changed}, head_only)
+                return
+            if path in (
+                "/api/groups/approve-join",
+                "/api/groups/deny-join",
+            ):
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                peer = body.get("peer")
+                if not isinstance(peer, str) or not peer.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'peer' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/groups/approve-join":
+                        decided = self.bridge.approve_join_request(
+                            target.strip(), peer.strip()
+                        )
+                    else:
+                        decided = self.bridge.deny_join_request(
+                            target.strip(), peer.strip()
+                        )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **decided}, head_only)
                 return
             if path == "/api/groups/rename":
                 target = body.get("group")
