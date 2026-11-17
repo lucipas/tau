@@ -293,13 +293,17 @@ export function Console() {
   // feed is visible again: the panel stays mounted, so without this
   // guard the effect would mark it read behind the user's back.
   useEffect(() => {
-    if (!target || tab !== "chat") return;
+    if (!target) return;
     if (openUnread === 0) {
       // Read elsewhere (another tab, the CLI): the reminder is gone,
       // so the hold goes with it — new mail must auto-read again.
+      // This cleanup runs on every tab: a hold left behind while
+      // another tab is shown would otherwise survive the zero count
+      // and then swallow the next mail at or below the held level.
       manualUnread.current.delete(target);
       return;
     }
+    if (tab !== "chat") return;
     const held = manualUnread.current.get(target);
     if (held !== undefined && openUnread <= held) return;
     if (held !== undefined) manualUnread.current.delete(target);

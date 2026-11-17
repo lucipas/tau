@@ -363,6 +363,80 @@ describe("Console mark unread", () => {
     );
   });
 
+  it("clears the hold when the count hits zero while another tab is shown", async () => {
+    const alice = makePeer("ab".repeat(16), "alice");
+    const bob = makePeer("cd".repeat(16), "bob");
+    const markRead = vi.fn().mockResolvedValue({ per_peer: {}, per_group: {}, total: 0 });
+    const markUnread = vi.fn().mockResolvedValue({
+      per_peer: { [alice.destination]: 1 },
+      per_group: {},
+      total: 1,
+    });
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      markRead,
+      markUnread,
+    });
+
+    const { rerender } = render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("alice · abababab")).toBeTruthy(),
+    );
+    expect(markRead).not.toHaveBeenCalled();
+
+    // Mark the open conversation unread: the badge rises and the
+    // auto-read effect holds it at that level.
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Mark conversation with alice unread",
+      }),
+    );
+    await waitFor(() =>
+      expect(markUnread).toHaveBeenCalledWith(alice.destination, false),
+    );
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      markRead,
+      markUnread,
+      unread: { per_peer: { [alice.destination]: 1 }, per_group: {}, total: 1 },
+    });
+    rerender(<Console />);
+    await waitFor(() =>
+      expect(screen.getByTitle("1 unread message")).toBeTruthy(),
+    );
+    expect(markRead).not.toHaveBeenCalled();
+
+    // Show another tab while another client reads the conversation:
+    // the count drops to zero, and the hold must go with it even
+    // though the chat feed is hidden.
+    fireEvent.click(screen.getByRole("tab", { name: "social" }));
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      markRead,
+      markUnread,
+      unread: { per_peer: {}, per_group: {}, total: 0 },
+    });
+    rerender(<Console />);
+
+    // New mail arrives while still hidden: it stays unread until the
+    // chat feed is visible again.
+    mockedUseTau.mockReturnValue({
+      ...tauState([], [alice, bob]),
+      markRead,
+      markUnread,
+      unread: { per_peer: { [alice.destination]: 1 }, per_group: {}, total: 1 },
+    });
+    rerender(<Console />);
+    expect(markRead).not.toHaveBeenCalled();
+
+    // Returning to Chat reads it: the stale hold is gone, so the count
+    // at the held level no longer skips markRead.
+    fireEvent.click(screen.getByRole("tab", { name: "chat" }));
+    await waitFor(() =>
+      expect(markRead).toHaveBeenCalledWith(alice.destination),
+    );
+  });
+
   it("does not reinstall a hold after the conversation was reopened", async () => {
     const alice = makePeer("ab".repeat(16), "alice");
     const bob = makePeer("cd".repeat(16), "bob");
