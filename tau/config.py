@@ -46,6 +46,9 @@ PROFILE_FILE_NAME = "profile.json"
 PROFILES_FILE_NAME = "profiles.json"
 FOLLOW_LIST_FILE_NAME = "follow-list.json"
 FOLLOW_LISTS_FILE_NAME = "follow-lists.json"
+PAGE_FILE_NAME = "page.json"
+PAGES_FILE_NAME = "pages.json"
+PAGE_ALLOWLIST_FILE_NAME = "page-allowed.json"
 NODE_LOCK_FILE_NAME = "node.lock"
 RNS_DIR_NAME = "reticulum"
 RNS_CONFIG_FILE_NAME = "config"
@@ -90,6 +93,9 @@ class TauConfig:
     profiles_path: Path
     follow_list_path: Path
     follow_lists_path: Path
+    page_path: Path
+    pages_path: Path
+    page_allowlist_path: Path
     name: str
     rns_loglevel: int = 2
     announce_interval: float = 300.0
@@ -140,6 +146,9 @@ class TauConfig:
             profiles_path=base / PROFILES_FILE_NAME,
             follow_list_path=base / FOLLOW_LIST_FILE_NAME,
             follow_lists_path=base / FOLLOW_LISTS_FILE_NAME,
+            page_path=base / PAGE_FILE_NAME,
+            pages_path=base / PAGES_FILE_NAME,
+            page_allowlist_path=base / PAGE_ALLOWLIST_FILE_NAME,
             name=node_name,
             rns_loglevel=rns_loglevel,
             announce_interval=announce_interval,

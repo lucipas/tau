@@ -2480,6 +2480,264 @@ def test_request_follows_rejects_bad_response(tmp_path):
         node.request_follows(peer)
 
 
+def _page_peer():
+    """A peer identity plus its signed personal page document."""
+    from tau.pages import build_page
+
+    identity = RNS.Identity()
+    destination = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    peer = Peer(
+        destination_hash=destination,
+        name="alice",
+        public_key=identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    doc = build_page(
+        identity,
+        title="Mesh meetup",
+        markdown="# Mesh meetup\n\nSaturday, 2pm, Rock Springs Park.\n",
+        version=2,
+        updated_at=1000.0,
+    )
+    return peer, doc
+
+
+def test_handle_page_serves_local_page_when_newer(tmp_path):
+    from tau.pages import save_local_page
+    from tau.protocol import decode, encode_page_request
+
+    node = make_node(tmp_path)
+    _, doc = _page_peer()
+    save_local_page(node.config.page_path, doc)
+    raw = node._handle_page(
+        "/tau/page",
+        encode_page_request(1),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is True
+    assert response["page"]["version"] == 2
+    assert response["page"]["title"] == "Mesh meetup"
+
+
+def test_handle_page_withholds_page_when_not_newer(tmp_path):
+    from tau.pages import save_local_page
+    from tau.protocol import decode, encode_page_request
+
+    node = make_node(tmp_path)
+    _, doc = _page_peer()
+    save_local_page(node.config.page_path, doc)
+    raw = node._handle_page(
+        "/tau/page",
+        encode_page_request(2),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    assert decode(raw)["page"] is None
+
+
+def test_handle_page_without_local_page_answers_none(tmp_path):
+    from tau.protocol import decode, encode_page_request
+
+    node = make_node(tmp_path)
+    assert node.local_page is None
+    raw = node._handle_page(
+        "/tau/page",
+        encode_page_request(0),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    assert decode(raw)["page"] is None
+
+
+def test_handle_page_rejects_bad_request(tmp_path):
+    from tau.protocol import decode
+
+    node = make_node(tmp_path)
+    raw = node._handle_page(
+        "/tau/page", b'{"type": "ping"}', b"request-id", None, time.time()
+    )
+    response = decode(raw)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "bad_request"
+
+
+def test_handle_page_denies_unlisted_caller_when_enforced(tmp_path):
+    import json
+
+    from tau.pages import save_local_page
+    from tau.protocol import decode, encode_page_request
+
+    node = make_node(tmp_path)
+    _, doc = _page_peer()
+    save_local_page(node.config.page_path, doc)
+    # Allow only a different peer; the caller below is a stranger.
+    other = RNS.Identity()
+    other_hash = RNS.Destination.hash(other, APP_NAME, ASPECT).hex()
+    node.config.page_allowlist_path.write_text(
+        json.dumps({"enabled": True, "allow": [other_hash]}),
+        encoding="utf-8",
+    )
+    stranger = RNS.Identity()
+    raw = node._handle_page(
+        "/tau/page",
+        encode_page_request(0),
+        b"request-id",
+        stranger,
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+
+
+def test_handle_page_serves_listed_caller_when_enforced(tmp_path):
+    import json
+
+    from tau.pages import save_local_page
+    from tau.protocol import decode, encode_page_request
+
+    node = make_node(tmp_path)
+    _, doc = _page_peer()
+    save_local_page(node.config.page_path, doc)
+    caller = RNS.Identity()
+    caller_hash = RNS.Destination.hash(caller, APP_NAME, ASPECT).hex()
+    node.config.page_allowlist_path.write_text(
+        json.dumps({"enabled": True, "allow": [caller_hash]}),
+        encoding="utf-8",
+    )
+    raw = node._handle_page(
+        "/tau/page",
+        encode_page_request(0),
+        b"request-id",
+        caller,
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is True
+    assert response["page"]["version"] == 2
+
+
+def test_handle_page_fails_closed_on_corrupt_allowlist(tmp_path):
+    from tau.pages import save_local_page
+    from tau.protocol import decode, encode_page_request
+
+    node = make_node(tmp_path)
+    _, doc = _page_peer()
+    save_local_page(node.config.page_path, doc)
+    node.config.page_allowlist_path.write_text(
+        "{not json", encoding="utf-8"
+    )
+    raw = node._handle_page(
+        "/tau/page",
+        encode_page_request(0),
+        b"request-id",
+        RNS.Identity(),
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+
+
+def test_request_page_stores_verified_page(tmp_path):
+    from tau.protocol import REQUEST_PAGE, decode, encode_page_request
+
+    node = make_node(tmp_path)
+    peer, doc = _page_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    seen = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        seen["path"] = path
+        seen["payload"] = payload
+        return {"ok": True, "v": 1, "page": doc}
+
+    node._request = fake_request
+    result = node.request_page(peer)
+    assert seen["path"] == REQUEST_PAGE
+    assert result is not None and result["version"] == 2
+    stored = node.page_store.get(peer.hexhash)
+    assert stored is not None and stored["title"] == "Mesh meetup"
+    # The request names the version already held (0 here), so a peer
+    # with nothing newer can answer with nothing.
+    assert decode(seen["payload"])["known_version"] == 0
+
+
+def test_request_page_returns_none_when_peer_has_nothing_new(tmp_path):
+    from tau.protocol import decode
+
+    node = make_node(tmp_path)
+    peer, doc = _page_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node.page_store.store(doc)
+    seen = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        seen["payload"] = payload
+        return {"ok": True, "v": 1, "page": None}
+
+    node._request = fake_request
+    assert node.request_page(peer) is None
+    # The request named the stored version, so the peer knew not to send.
+    assert decode(seen["payload"])["known_version"] == 2
+
+
+def test_request_page_rejects_page_for_another_peer(tmp_path):
+    node = make_node(tmp_path)
+    peer, _doc = _page_peer()
+    other_peer, other_doc = _page_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "v": 1,
+        "page": other_doc,
+    }
+    with pytest.raises(NodeError, match="does not match the peer"):
+        node.request_page(peer)
+    assert node.page_store.get(peer.hexhash) is None
+
+
+def test_request_page_rejects_tampered_page(tmp_path):
+    node = make_node(tmp_path)
+    peer, doc = _page_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    tampered = dict(doc)
+    tampered["markdown"] = "forged"
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "v": 1,
+        "page": tampered,
+    }
+    with pytest.raises(NodeError, match="invalid page"):
+        node.request_page(peer)
+    assert node.page_store.get(peer.hexhash) is None
+
+
+def test_request_page_rejects_bad_response(tmp_path):
+    node = make_node(tmp_path)
+    peer, _doc = _page_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node._request = lambda p, path, payload, timeout: {"ok": False}
+    with pytest.raises(NodeError, match="invalid page response"):
+        node.request_page(peer)
+
+
 def test_on_announce_fetches_newer_profile(tmp_path, monkeypatch):
     node = _heard_node(tmp_path, monkeypatch, hops=1)
     fetches = []

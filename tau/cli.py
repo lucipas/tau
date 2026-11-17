@@ -141,6 +141,15 @@ from .follows import (
     public_follow_list,
     save_local_follow_list,
 )
+from .pages import (
+    PageError,
+    PageStore,
+    build_page,
+    load_local_page,
+    public_page,
+    save_local_page,
+    title_from_markdown,
+)
 from .profile import (
     MAX_BIO_CHARS,
     MAX_LINKS,
@@ -1062,6 +1071,109 @@ def build_parser() -> argparse.ArgumentParser:
         help="show your published public profile",
     )
     profile_show.set_defaults(func=cmd_profile_show)
+
+    page = subparsers.add_parser(
+        "page",
+        parents=[common],
+        help="publish and fetch signed personal mesh pages",
+    )
+    page_sub = page.add_subparsers(dest="page_command", metavar="PAGE_COMMAND")
+    page_sub.required = True
+
+    page_publish = page_sub.add_parser(
+        "publish",
+        parents=[common],
+        help="publish a Markdown file as this node's signed personal page",
+    )
+    page_publish.add_argument(
+        "file",
+        metavar="FILE.md",
+        help="Markdown file to publish (at most 8 KiB)",
+    )
+    page_publish.add_argument(
+        "--title",
+        default=None,
+        metavar="TEXT",
+        help="page title (default: the file's first '# ' heading)",
+    )
+    page_publish.set_defaults(func=cmd_page_publish)
+
+    page_show = page_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show your published personal page",
+    )
+    page_show.set_defaults(func=cmd_page_show)
+
+    page_fetch = page_sub.add_parser(
+        "fetch",
+        parents=[common],
+        help="show a peer's signed personal page, fetching it live "
+        "when this node does not hold a copy",
+    )
+    page_fetch.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer name, destination hash or hash prefix",
+    )
+    page_fetch.add_argument(
+        "--cached",
+        action="store_true",
+        help="show the stored copy without fetching from the peer",
+    )
+    page_fetch.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="how long to wait for the peer to answer (default: %(default)s)",
+    )
+    page_fetch.set_defaults(func=cmd_page_fetch)
+
+    page_allow = page_sub.add_parser(
+        "allow",
+        parents=[common],
+        help="control who may fetch this node's page (public unless enforced)",
+    )
+    page_allow_sub = page_allow.add_subparsers(
+        dest="page_allow_command", metavar="PAGE_ALLOW_COMMAND"
+    )
+    page_allow_sub.required = True
+
+    page_allow_list = page_allow_sub.add_parser(
+        "list", parents=[common], help="show the page allow-list"
+    )
+    page_allow_list.set_defaults(func=cmd_page_allow)
+
+    page_allow_add = page_allow_sub.add_parser(
+        "add",
+        parents=[common],
+        help="allow fetching this node's page from a peer (name, hash or prefix)",
+    )
+    page_allow_add.add_argument(
+        "peer", help="peer name, destination hash or hash prefix"
+    )
+    page_allow_add.set_defaults(func=cmd_page_allow)
+
+    page_allow_remove = page_allow_sub.add_parser(
+        "remove",
+        parents=[common],
+        help="stop allowing a peer to fetch this node's page",
+    )
+    page_allow_remove.add_argument(
+        "peer", help="peer name, destination hash or hash prefix"
+    )
+    page_allow_remove.set_defaults(func=cmd_page_allow)
+
+    page_allow_on = page_allow_sub.add_parser(
+        "on", parents=[common], help="enforce the page allow-list"
+    )
+    page_allow_on.set_defaults(func=cmd_page_allow)
+
+    page_allow_off = page_allow_sub.add_parser(
+        "off", parents=[common], help="stop enforcing the page allow-list"
+    )
+    page_allow_off.set_defaults(func=cmd_page_allow)
 
     status = subparsers.add_parser(
         "status",
@@ -8361,6 +8473,241 @@ def cmd_profile_show(args: argparse.Namespace) -> int:
         _emit(public_profile(doc), True)
     else:
         _print_profile(doc)
+    return _EXIT_OK
+
+
+def _print_page(doc: Dict[str, Any], *, indent: str = "") -> None:
+    """Print one page document in text form (header + raw Markdown)."""
+    print(f"{indent}title:   {doc['title'] or '—'}")
+    print(
+        f"{indent}version: {doc['version']} "
+        f"({_format_message_time(doc['updated_at'])})"
+    )
+    print(f"{indent}author:  {doc['author']}")
+    print()
+    print(doc["markdown"])
+
+
+def cmd_page_publish(args: argparse.Namespace) -> int:
+    """Publish a new version of this node's signed personal page.
+
+    The Markdown file is signed and written to the data directory; a
+    serving node picks it up at its next fetch, and peers fetch the
+    document over a link.  The title defaults to the file's first
+    ``# `` heading.  Linked files are not published yet — this slice
+    covers the page itself; file links stay for a follow-up.
+    """
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    try:
+        markdown = Path(args.file).expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise NodeError(f"could not read page file: {exc}") from exc
+    existing = load_local_page(config.page_path)
+    title = (
+        args.title
+        if args.title is not None
+        else title_from_markdown(markdown)
+    )
+    version = existing["version"] + 1 if existing is not None else 1
+    try:
+        doc = build_page(
+            identity,
+            title=title,
+            markdown=markdown,
+            version=version,
+        )
+    except PageError as exc:
+        raise NodeError(str(exc)) from exc
+    save_local_page(config.page_path, doc)
+    if _json_mode(args):
+        _emit(public_page(doc), True)
+    else:
+        print(
+            f"Published page version {version}"
+            + (f" — {doc['title']}" if doc["title"] else "")
+            + "."
+        )
+        print("  Peers can fetch it with `tau page <your name>`.")
+    return _EXIT_OK
+
+
+def cmd_page_show(args: argparse.Namespace) -> int:
+    """Show this node's published personal page, if one is set."""
+    config = _make_config(args)
+    doc = load_local_page(config.page_path)
+    if doc is None:
+        if _json_mode(args):
+            _emit({"page": None}, True)
+        else:
+            print(
+                "No page published yet. Publish one with "
+                "`tau page publish <file.md>`."
+            )
+        return _EXIT_OK
+    if _json_mode(args):
+        _emit(public_page(doc), True)
+    else:
+        _print_page(doc)
+    return _EXIT_OK
+
+
+def cmd_page_fetch(args: argparse.Namespace) -> int:
+    """Show a peer's signed personal page, fetching it when needed.
+
+    A live fetch is attempted first (unless ``--cached``): the peer
+    answers with its page only when it holds a newer version than
+    this node.  When the fetch fails, the stored copy is shown
+    instead and the failure is named; when nothing is stored at all,
+    the fetch failure is the error.
+    """
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    store = PageStore(config.pages_path)
+    fetch_error: Optional[str] = None
+    fetched = False
+    if not getattr(args, "cached", False):
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            node.request_page(peer, timeout=args.timeout)
+            fetched = True
+        except NodeError as exc:
+            fetch_error = str(exc)
+        finally:
+            node.stop()
+        # The node saved any newer page it fetched; re-read the
+        # store rather than trusting the in-memory copy above.
+        store = PageStore(config.pages_path)
+    page = store.get(peer.hexhash)
+    if page is None:
+        if fetch_error is not None:
+            raise NodeError(
+                f"could not fetch a page from {peer.display_name}: "
+                f"{fetch_error}"
+            )
+        if _json_mode(args):
+            _emit(
+                {
+                    "peer": peer.hexhash,
+                    "name": peer.display_name,
+                    "page": None,
+                },
+                True,
+            )
+        else:
+            print(f"{peer.display_name} has no personal page yet.")
+        return _EXIT_OK
+    if _json_mode(args):
+        _emit(
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "page": public_page(page),
+                "fetched": fetched,
+                "fetch_error": fetch_error,
+            },
+            True,
+        )
+    else:
+        _print_page(page)
+        if fetch_error is not None:
+            print(f"  (showing the stored copy — fetch failed: {fetch_error})")
+    return _EXIT_OK
+
+
+def cmd_page_allow(args: argparse.Namespace) -> int:
+    """Manage the page allow-list (who may fetch this node's page).
+
+    NomadNet-style ``.allowed``: with no list file the page is public;
+    ``tau page allow on`` enforces the list, so only listed peers may
+    fetch.  A running serve applies saved changes when it restarts.
+    """
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    command = getattr(args, "page_allow_command", None)
+    registry = PeerRegistry(config.peers_path)
+    changed = False
+
+    if command in ("add", "remove", "on", "off"):
+        # Reload inside the lock: two allow commands racing must not
+        # discard each other's change to a different peer.
+        with allowlist_lock(config.page_allowlist_path):
+            try:
+                allowlist = load_allowlist(config.page_allowlist_path)
+            except AllowListError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return _EXIT_ERROR
+            if command == "add":
+                destination = _resolve_allowlist_peer(registry, args.peer)
+                if destination not in allowlist.allow:
+                    allowlist = allowlist.with_added(destination)
+                    changed = True
+            elif command == "remove":
+                destination = _resolve_allowlist_peer(registry, args.peer)
+                if destination in allowlist.allow:
+                    allowlist = allowlist.with_removed(destination)
+                    changed = True
+            elif command == "on":
+                if not allowlist.enabled:
+                    allowlist = allowlist.with_enabled(True)
+                    changed = True
+            elif command == "off":
+                if allowlist.enabled:
+                    allowlist = allowlist.with_enabled(False)
+                    changed = True
+            if changed:
+                save_allowlist(config.page_allowlist_path, allowlist)
+    else:
+        try:
+            allowlist = load_allowlist(config.page_allowlist_path)
+        except AllowListError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+
+    def describe(destination: str) -> Dict[str, Any]:
+        peer = registry.get(destination)
+        return {
+            "destination": destination,
+            # The asserted name, not the local alias: the operator must
+            # see who was actually allowed, and an alias could mask that.
+            "name": (
+                (peer.name or short_hash(peer.hexhash))
+                if peer is not None
+                else ""
+            ),
+        }
+
+    if json_output:
+        payload = allowlist.to_dict()
+        payload["entries"] = [describe(value) for value in sorted(allowlist.allow)]
+        payload["path"] = str(config.page_allowlist_path)
+        _emit(payload, True)
+    else:
+        state = "enforced" if allowlist.enabled else "off"
+        print(f"Page allow-list ({config.page_allowlist_path}): {state}")
+        if not allowlist.allow:
+            print("  no peers listed — when enforced, nobody may fetch this page")
+        for entry in sorted(allowlist.allow):
+            peer = registry.get(entry)
+            name = (
+                f" ({peer.name or short_hash(peer.hexhash)})"
+                if peer is not None
+                else ""
+            )
+            print(f"  {entry}{name}")
+        if changed:
+            print("  (a running serve applies saved changes when it restarts)")
     return _EXIT_OK
 
 
