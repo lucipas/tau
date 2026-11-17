@@ -215,6 +215,7 @@ class FakeNode:
         )
         self.sent_files = []
         self.group_sent_files = []
+        self.media_fetches = []
         self.announced = 0
         self.flush_calls = []
         self.flush_lock_busy = False
@@ -669,6 +670,10 @@ class FakeNode:
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
         return {"ok": True, "pong": True, "server": self.name, "_rtt": 0.004}
+
+    def fetch_tan_media(self, author, sha256, *, timeout=60.0, discover_timeout=None):
+        self.media_fetches.append((author, sha256))
+        return {"ok": True, "sha256": sha256, "path": "", "size": 0, "cached": False}
 
     def request_info(self, peer, *, timeout=15.0, discover_timeout=None):
         return {
@@ -16557,6 +16562,82 @@ def test_download_received_file_unknown_is_404(bridge, node, tmp_path):
     assert status == 404
     status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/a/b.txt")
     assert status == 404
+
+
+def test_tan_media_serves_cached_image(bridge, node, tmp_path):
+    import hashlib
+
+    from tau.tangents.tan import create_post, init_db, store_media
+
+    _with_config(node, tmp_path)
+    data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    digest = hashlib.sha256(data).hexdigest()
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(
+            conn,
+            identity,
+            "pic",
+            name="alice",
+            now=1000,
+            image={
+                "sha256": digest,
+                "size": len(data),
+                "mime": "image/png",
+                "name": "photo.png",
+            },
+        )
+    finally:
+        conn.close()
+    store_media(tmp_path, digest, data)
+    status, headers, body = _request(bridge, f"/api/tan/media/{digest}")
+    assert status == 200
+    assert body == data
+    assert headers["Content-Type"] == "image/png"
+    assert headers["Content-Disposition"].startswith('inline; filename="photo.png"')
+    assert headers["Content-Length"] == str(len(data))
+    # HEAD answers the same headers without the bytes, so the
+    # console's fetch poll can tell the image arrived.
+    status, headers, body = _request(
+        bridge, f"/api/tan/media/{digest}", method="HEAD"
+    )
+    assert status == 200
+    assert body == b""
+    assert headers["Content-Type"] == "image/png"
+    assert headers["Content-Length"] == str(len(data))
+    status, _, payload = _json(bridge, f"/api/tan/media/{'00' * 32}")
+    assert status == 404
+    assert "no such cached image" in payload["error"]["message"]
+
+
+def test_tan_media_fetch_accepts_and_validates(bridge, node, tmp_path):
+    _with_config(node, tmp_path)
+    digest = "ab" * 32
+    status, _, payload = _json(
+        bridge,
+        f"/api/tan/media/{digest}/fetch",
+        method="POST",
+        body={"author": "cd" * 16},
+    )
+    assert status == 202
+    assert payload["accepted"] is True
+    assert payload["sha256"] == digest
+    # A bad author hash is a 400, not a background fetch.
+    status, _, payload = _json(
+        bridge,
+        f"/api/tan/media/{digest}/fetch",
+        method="POST",
+        body={"author": "short"},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        f"/api/tan/media/{digest}/fetch",
+        method="POST",
+        body={},
+    )
+    assert status == 400
 
 
 def test_download_received_file_rejects_bad_sender_and_name(bridge, node, tmp_path):

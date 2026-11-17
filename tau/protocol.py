@@ -98,6 +98,7 @@ REQUEST_PING = "/tau/ping"
 REQUEST_INFO = "/tau/info"
 REQUEST_MESSAGE = "/tau/message"
 REQUEST_FILE = "/tau/file"
+REQUEST_MEDIA = "/tau/media"
 REQUEST_READ = "/tau/read"
 REQUEST_REACT = "/tau/react"
 REQUEST_RETRACT = "/tau/dm/retract"
@@ -112,6 +113,7 @@ REQUEST_PATHS = (
     REQUEST_INFO,
     REQUEST_MESSAGE,
     REQUEST_FILE,
+    REQUEST_MEDIA,
     REQUEST_READ,
     REQUEST_REACT,
     REQUEST_RETRACT,
@@ -1596,6 +1598,41 @@ def _clean_hexhash(value: Any, field: str) -> str:
     except ValueError as exc:
         raise ProtocolError(f"{field} must be a 32 character hex hash") from exc
     return value.lower()
+
+
+def _clean_sha256(value: Any, field: str = "sha256") -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ProtocolError(f"{field} must be a 64 character hex digest")
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise ProtocolError(f"{field} must be a 64 character hex digest") from exc
+    return value.lower()
+
+
+def build_media_request(sha256: str) -> bytes:
+    """Encode a ``/tau/media`` request for one Tan image, by SHA-256.
+
+    The request names only the digest: the sender already carries the
+    size, mime and name on the signed post, and the responder answers
+    with a file offer plus a Resource, so no other field is needed
+    here — and none is trusted from the requester.
+    """
+    return encode(
+        {
+            "type": "media_request",
+            "v": PROTOCOL_VERSION,
+            "sha256": _clean_sha256(sha256),
+        }
+    )
+
+
+def parse_media_request(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/media`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "media_request":
+        raise ProtocolError("expected a media_request payload")
+    return {"sha256": _clean_sha256(payload.get("sha256"))}
 
 
 def _clean_message_id(value: Any) -> str:

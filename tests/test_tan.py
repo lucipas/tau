@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -22,6 +24,8 @@ from tau.tangents.tan import (
     TAN_FEED_PATH,
     TAN_POST_PATH,
     TAN_VERSION,
+    MAX_GOSSIP_TTL,
+    MAX_IMAGE_BYTES,
     PostError,
     TanApp,
     TanError,
@@ -56,6 +60,7 @@ from tau.tangents.tan import (
     export_entries,
     extract_tags,
     feed,
+    find_post_by_image,
     follow,
     follow_tag,
     followed_tags,
@@ -78,6 +83,8 @@ from tau.tangents.tan import (
     mute_keyword,
     mute_tag,
     muted_keywords,
+    media_path,
+    store_media,
     muted_tags,
     post_likers,
     post_quoters,
@@ -176,6 +183,120 @@ def test_create_post_chains_and_verifies(identities, tmp_path):
         "hello mesh",
         "second post",
     ]
+
+
+def _png_bytes(size: int = 100) -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + b"\x00" * size
+
+
+def _image_for(data: bytes, name: str = "photo.png") -> dict:
+    return {
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "mime": "image/png",
+        "name": name,
+    }
+
+
+def test_create_post_with_image_round_trips(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    data = _png_bytes()
+    image = _image_for(data)
+    post = create_post(conn, alice, "look at this", name="alice", now=1000, image=image)
+
+    assert post["image"] == image
+    assert verify_post(post)["image"] == image
+    stored = get_post(conn, post["hash"])
+    assert stored is not None and stored["image"] == image
+    assert [entry["image"] for entry in feed(conn, author=post["author"])] == [image]
+
+
+def test_image_is_signed_with_the_post(identities, tmp_path):
+    alice, _ = identities
+    first = init_db(tmp_path / "a.sqlite3")
+    second = init_db(tmp_path / "b.sqlite3")
+    data = _png_bytes()
+    plain = create_post(first, alice, "same text", name="alice", now=1000)
+    with_image = create_post(
+        second, alice, "same text", name="alice", now=1000, image=_image_for(data)
+    )
+    assert plain["hash"] != with_image["hash"]
+
+    tampered = dict(with_image, image={**with_image["image"], "size": 999})
+    with pytest.raises(PostError):
+        verify_post(tampered)
+
+
+def test_image_rejected_when_invalid(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    good = _image_for(_png_bytes())
+    bad_images = [
+        {**good, "size": 0},
+        {**good, "size": MAX_IMAGE_BYTES + 1},
+        {**good, "mime": "image/svg+xml"},
+        {**good, "mime": "text/plain"},
+        {**good, "sha256": "zz" * 32},
+        {**good, "sha256": "ab" * 16},
+        {**good, "name": "../evil.png"},
+        {**good, "name": ""},
+        {**good, "name": "a/b.png"},
+    ]
+    for bad in bad_images:
+        with pytest.raises(PostError):
+            create_post(conn, alice, "x", name="alice", now=1000, image=bad)
+
+
+def test_only_posts_carry_images(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "parent", name="alice", now=1000)
+    reply = create_reply(conn, alice, post["hash"], "a reply", name="alice", now=1001)
+    crafted = dict(reply, image=_image_for(_png_bytes()))
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
+
+
+def test_find_post_by_image(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    image = _image_for(_png_bytes())
+    post = create_post(conn, alice, "pic", name="alice", now=1000, image=image)
+    found = find_post_by_image(conn, image["sha256"])
+    assert found is not None and found["hash"] == post["hash"]
+    assert find_post_by_image(conn, "f" * 64) is None
+    assert find_post_by_image(conn, "not-a-digest") is None
+
+
+def test_media_store_round_trip_and_prune(tmp_path):
+    data = _png_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    assert media_path(tmp_path, digest) is None
+    stored = store_media(tmp_path, digest, data)
+    assert stored.read_bytes() == data
+    assert media_path(tmp_path, digest) == stored
+    # A second store of the same bytes is a no-op that returns the path.
+    assert store_media(tmp_path, digest, data) == stored
+    # A damaged cache entry is repaired by storing the good bytes again.
+    stored.write_bytes(b"corrupt")
+    assert store_media(tmp_path, digest, data).read_bytes() == data
+    # Bytes that do not match their digest are refused.
+    with pytest.raises(TanError):
+        store_media(tmp_path, "0" * 64, data)
+    # Oversize bytes are refused.
+    big = b"x" * (MAX_IMAGE_BYTES + 1)
+    with pytest.raises(TanError):
+        store_media(tmp_path, hashlib.sha256(big).hexdigest(), big)
+    # Pruning drops the oldest file when the store would exceed the cap.
+    os.utime(stored, (1000, 1000))
+    second = b"\xff\xd8\xff" + b"\x00" * 50
+    second_digest = hashlib.sha256(second).hexdigest()
+    store_media(
+        tmp_path, second_digest, second, max_total_bytes=len(data) + len(second) - 1
+    )
+    assert media_path(tmp_path, digest) is None
+    assert media_path(tmp_path, second_digest) is not None
 
 
 def test_concurrent_create_post_does_not_fork_the_chain(identities, tmp_path):
