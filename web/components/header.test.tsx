@@ -134,10 +134,10 @@ describe("Header tabs", () => {
     expect(onTabChange).toHaveBeenCalledWith("settings");
   });
 
-  it("offers all four tabs", () => {
+  it("offers all five tabs", () => {
     renderHeader();
 
-    for (const label of ["chat", "social", "tools", "settings"]) {
+    for (const label of ["chat", "social", "channels", "tools", "settings"]) {
       expect(screen.getByRole("tab", { name: label })).toBeTruthy();
     }
   });

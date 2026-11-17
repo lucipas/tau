@@ -15,6 +15,13 @@ vi.mock("./social-console", () => ({
   SocialConsole: () => <div data-testid="social-tab-feed">social feed</div>,
 }));
 
+// Same for the channels tab: channels-console.test.tsx covers the view.
+vi.mock("./channels-console", () => ({
+  ChannelsConsole: () => (
+    <div data-testid="channels-tab-feed">channels feed</div>
+  ),
+}));
+
 // jsdom does not implement scrollIntoView, which the feed calls to
 // stick to the newest message.
 if (!Element.prototype.scrollIntoView) {
@@ -619,6 +626,16 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("traffic"))).toBe(false);
   });
 
+  it("switches to the channels tab on click", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "channels" }));
+
+    expect(isShown(screen.getByTestId("channels-tab-feed"))).toBe(true);
+    expect(isShown(screen.queryByText("traffic"))).toBe(false);
+  });
+
   it("switches to the settings tab on click", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
@@ -638,12 +655,15 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("traffic"))).toBe(false);
   });
 
-  it("jumps between tabs with Alt+1 through Alt+4", () => {
+  it("jumps between tabs with Alt+1 through Alt+5", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
 
-    fireEvent.keyDown(document.body, { key: "3", code: "Digit3", altKey: true });
+    fireEvent.keyDown(document.body, { key: "4", code: "Digit4", altKey: true });
     expect(isShown(screen.getByText("sneakernet"))).toBe(true);
+
+    fireEvent.keyDown(document.body, { key: "3", code: "Digit3", altKey: true });
+    expect(isShown(screen.getByTestId("channels-tab-feed"))).toBe(true);
 
     fireEvent.keyDown(document.body, { key: "2", code: "Digit2", altKey: true });
     expect(isShown(screen.getByTestId("social-tab-feed"))).toBe(true);

@@ -15,6 +15,7 @@ import type {
   BundleImportResponse,
   CancelOutboxResponse,
   ChangeGroupMembersResponse,
+  ChannelMessage,
   CreateGroupResponse,
   DeclineDmRequestResponse,
   DeleteGroupResponse,
@@ -250,6 +251,11 @@ export function useTau() {
   // incoming message clears an entry; a 2s sweep drops entries the
   // sender never stopped.
   const [typing, setTyping] = useState<Record<string, TypingEntry[]>>({});
+  // The latest live channel message, for the Channels view: it
+  // appends to the open channel when it belongs there, and the
+  // history poll is the backstop for a dropped event.
+  const [channelMessage, setChannelMessage] =
+    useState<ChannelMessage | null>(null);
   // Destinations with an archived conversation, for the live feed: a
   // message that arrives for one (archived from another tab or the CLI)
   // is dropped on arrival, the same way a blocked sender's is.
@@ -728,6 +734,15 @@ export function useTau() {
       });
     };
 
+    // A channel message arriving live: the Channels view appends it
+    // to the open channel when it belongs there. A replayed event
+    // after a reconnect carries a message the history poll already
+    // holds, so the view dedupes by hash.
+    const onChannelMessage = (payload: { message?: ChannelMessage } | null) => {
+      if (!payload?.message) return;
+      setChannelMessage(payload.message);
+    };
+
     const onError = () => {
       if (!disposed) setConnection("reconnecting");
     };
@@ -761,6 +776,9 @@ export function useTau() {
         case "typing":
           onTyping(payload as TypingEvent | null);
           break;
+        case "channel-message":
+          onChannelMessage(payload as { message?: ChannelMessage } | null);
+          break;
         default:
           break;
       }
@@ -781,6 +799,7 @@ export function useTau() {
         ["unread", onSseEvent("unread")],
         ["status", onSseEvent("status")],
         ["typing", onSseEvent("typing")],
+        ["channel-message", onSseEvent("channel-message")],
       ];
       source.addEventListener("open", onOpen);
       for (const [type, listener] of listeners) {
@@ -2835,6 +2854,7 @@ export function useTau() {
     unread,
     restoredUnread,
     typing,
+    channelMessage,
     outbox,
     heldForOthers,
     dmRequests,

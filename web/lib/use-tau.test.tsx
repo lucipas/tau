@@ -4,6 +4,7 @@ import type { Mock } from "vitest";
 
 import type {
   BlockPeerResponse,
+  ChannelMessage,
   EditMessageResponse,
   NodeInfo,
   Peer,
@@ -3203,5 +3204,39 @@ describe("useTau websocket transport", () => {
     snapshotInto(source, [makePeer()]);
     await waitFor(() => expect(result.current.peers).toHaveLength(1));
     unmount();
+  });
+});
+
+describe("useTau channel-message events", () => {
+  it("exposes the latest live channel message for the Channels view", async () => {
+    const message: ChannelMessage = {
+      v: 1,
+      hash: "c".repeat(64),
+      channel: "general",
+      author: "a".repeat(64),
+      key: "b".repeat(128),
+      name: "alice",
+      text: "hello channel",
+      created_at: 1000,
+      received_at: 1001,
+      sig: "d".repeat(128),
+    };
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    expect(result.current.channelMessage).toBeNull();
+
+    act(() => {
+      source.emit("channel-message", { message });
+    });
+    await waitFor(() =>
+      expect(result.current.channelMessage).toEqual(message),
+    );
+
+    // An event with no message leaves the last one in place.
+    act(() => {
+      source.emit("channel-message", {});
+    });
+    expect(result.current.channelMessage).toEqual(message);
   });
 });

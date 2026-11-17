@@ -1180,3 +1180,67 @@ export interface TanImportResponse {
   ok: boolean;
   import: TanImportResult;
 }
+
+// Public channels: open topic rooms anyone can join (see
+// `tau/channels.py`). The API returns messages newest first; the
+// console reverses them for display.
+
+export interface Channel {
+  channel: string;
+  joined_at: number;
+}
+
+export interface ChannelMessage {
+  v: number;
+  hash: string;
+  channel: string;
+  author: string;
+  key: string;
+  name: string;
+  text: string;
+  created_at: number;
+  received_at: number;
+  sig: string;
+}
+
+export interface ChannelsResponse {
+  channels: Channel[];
+  count: number;
+}
+
+export interface ChannelMessagesResponse {
+  channel: string;
+  messages: ChannelMessage[];
+  count: number;
+}
+
+export interface ChannelJoinResponse {
+  ok: boolean;
+  channel: string;
+  joined_at: number;
+}
+
+export interface ChannelLeaveResponse {
+  ok: boolean;
+  channel: string;
+  left: boolean;
+}
+
+export interface ChannelSendResponse {
+  ok: boolean;
+  message: ChannelMessage;
+}
+
+export interface ChannelSyncSummary {
+  channel: string;
+  peers: number;
+  stored: number;
+  duplicates: number;
+  skipped: number;
+  errors: { peer: string; error: string }[];
+}
+
+export interface ChannelSyncResponse {
+  ok: boolean;
+  sync: ChannelSyncSummary;
+}
