@@ -125,6 +125,17 @@ from .node import (
     instance_lock_holder,
 )
 from .peers import Peer, PeerError, PeerRegistry, safety_number
+from .profile import (
+    MAX_BIO_CHARS,
+    MAX_LINKS,
+    ProfileError,
+    ProfileStore,
+    build_profile,
+    load_local_profile,
+    public_profile,
+    resolve_avatar,
+    save_local_profile,
+)
 from .scheduled_posts import (
     MAX_SCHEDULED_POST_DELAY,
     ScheduledPostsError,
@@ -928,6 +939,83 @@ def build_parser() -> argparse.ArgumentParser:
         "(they will not be attempted until the peer is rediscovered)",
     )
     peers_forget.set_defaults(func=cmd_peers_forget)
+
+    peers_profile = peers_sub.add_parser(
+        "profile",
+        parents=[common],
+        help="show a peer's signed public profile, fetching it live "
+        "when this node does not hold a copy",
+    )
+    peers_profile.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer name, destination hash or hash prefix",
+    )
+    peers_profile.add_argument(
+        "--cached",
+        action="store_true",
+        help="show the stored copy without fetching from the peer",
+    )
+    peers_profile.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="how long to wait for the peer to answer (default: %(default)s)",
+    )
+    peers_profile.set_defaults(func=cmd_peers_profile)
+
+    profile = subparsers.add_parser(
+        "profile",
+        parents=[common],
+        help="publish and show this node's signed public profile",
+    )
+    profile_sub = profile.add_subparsers(
+        dest="profile_command", metavar="PROFILE_COMMAND"
+    )
+    profile_sub.required = True
+
+    profile_set = profile_sub.add_parser(
+        "set",
+        parents=[common],
+        help="publish a new version of your public profile "
+        "(display name, bio, avatar, links)",
+    )
+    profile_set.add_argument(
+        "--display-name",
+        default=None,
+        metavar="NAME",
+        help="display name (default: the current profile name, or the "
+        "node name when no profile is published yet)",
+    )
+    profile_set.add_argument(
+        "--bio",
+        default=None,
+        metavar="TEXT",
+        help=f"short bio, at most {MAX_BIO_CHARS} characters",
+    )
+    profile_set.add_argument(
+        "--avatar",
+        default=None,
+        metavar="FILE|HASH",
+        help="avatar image file to hash, or a 32/64-character hex hash",
+    )
+    profile_set.add_argument(
+        "--link",
+        dest="links",
+        action="append",
+        default=None,
+        metavar="URL",
+        help=f"profile link (repeatable, at most {MAX_LINKS})",
+    )
+    profile_set.set_defaults(func=cmd_profile_set)
+
+    profile_show = profile_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show your published public profile",
+    )
+    profile_show.set_defaults(func=cmd_profile_show)
 
     status = subparsers.add_parser(
         "status",
@@ -7766,6 +7854,7 @@ def cmd_peers_show(args: argparse.Namespace) -> int:
     held = mailbox.held_for(peer.destination_hash)
     received = inbox.list_messages(peer=peer.hexhash, limit=None)
     now = time.time()
+    stored_profile = ProfileStore(config.profiles_path).get(peer.hexhash)
     payload = {
         "name": peer.name,
         "destination": peer.hexhash,
@@ -7782,6 +7871,7 @@ def cmd_peers_show(args: argparse.Namespace) -> int:
         "queued": len(queued),
         "held": len(held),
         "received": len(received),
+        "profile": public_profile(stored_profile),
     }
     if _json_mode(args):
         _emit(payload, True)
@@ -7809,6 +7899,177 @@ def cmd_peers_show(args: argparse.Namespace) -> int:
     print(f"queued mail:  {len(queued)} message(s) waiting for this peer")
     print(f"held mail:    {len(held)} sealed message(s) held for this peer")
     print(f"received:     {len(received)} message(s) from this peer in the inbox")
+    if stored_profile is not None:
+        print("profile:")
+        _print_profile(stored_profile, indent="  ")
+    return _EXIT_OK
+
+
+def _print_profile(doc: Dict[str, Any], *, indent: str = "") -> None:
+    """Print one profile document in text form."""
+    print(f"{indent}name:    {doc['name']}")
+    print(f"{indent}bio:     {doc['bio'] or '—'}")
+    print(f"{indent}avatar:  {doc['avatar'] or '—'}")
+    if doc["links"]:
+        for link in doc["links"]:
+            print(f"{indent}link:    {link}")
+    else:
+        print(f"{indent}link:    —")
+    print(
+        f"{indent}version: {doc['version']} "
+        f"({_format_message_time(doc['created_at'])})"
+    )
+
+
+def cmd_profile_set(args: argparse.Namespace) -> int:
+    """Publish a new version of this node's signed public profile.
+
+    A flag left out keeps the value the current profile carries (or
+    the node name for the display name when no profile is published
+    yet), so a small change does not wipe the rest of the card.  The
+    new version is written to the data directory; a serving node
+    picks it up at its next announce, and peers that see the newer
+    version fetch the document over a link.
+    """
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    existing = load_local_profile(config.profile_path)
+    name = (
+        args.display_name
+        if args.display_name is not None
+        else (existing["name"] if existing is not None else config.name)
+    )
+    bio = (
+        args.bio
+        if args.bio is not None
+        else (existing["bio"] if existing is not None else "")
+    )
+    avatar = (
+        resolve_avatar(args.avatar)
+        if args.avatar is not None
+        else (existing["avatar"] if existing is not None else None)
+    )
+    links = (
+        list(args.links)
+        if args.links is not None
+        else (list(existing["links"]) if existing is not None else [])
+    )
+    version = existing["version"] + 1 if existing is not None else 1
+    try:
+        doc = build_profile(
+            identity,
+            name=name,
+            bio=bio,
+            avatar=avatar,
+            links=links,
+            version=version,
+        )
+    except ProfileError as exc:
+        raise NodeError(str(exc)) from exc
+    save_local_profile(config.profile_path, doc)
+    if _json_mode(args):
+        _emit(public_profile(doc), True)
+    else:
+        print(f"Published profile version {version} for {doc['name']}.")
+        _print_profile(doc, indent="  ")
+        print(
+            "  Peers will see it at the next announce "
+            "(within ~5 minutes), or fetch it on demand."
+        )
+    return _EXIT_OK
+
+
+def cmd_profile_show(args: argparse.Namespace) -> int:
+    """Show this node's published public profile, if one is set."""
+    config = _make_config(args)
+    doc = load_local_profile(config.profile_path)
+    if doc is None:
+        if _json_mode(args):
+            _emit({"profile": None}, True)
+        else:
+            print(
+                "No profile published yet. Publish one with "
+                "`tau profile set --bio ... --link ...`."
+            )
+        return _EXIT_OK
+    if _json_mode(args):
+        _emit(public_profile(doc), True)
+    else:
+        _print_profile(doc)
+    return _EXIT_OK
+
+
+def cmd_peers_profile(args: argparse.Namespace) -> int:
+    """Show a peer's signed public profile, fetching it when needed.
+
+    A live fetch is attempted first (unless ``--cached``): the peer
+    answers with its profile only when it holds a newer version than
+    this node.  When the fetch fails, the stored copy is shown
+    instead and the failure is named; when nothing is stored at all,
+    the fetch failure is the error.
+    """
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    store = ProfileStore(config.profiles_path)
+    fetch_error: Optional[str] = None
+    fetched = False
+    if not getattr(args, "cached", False):
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            node.request_profile(peer, timeout=args.timeout)
+            fetched = True
+        except NodeError as exc:
+            fetch_error = str(exc)
+        finally:
+            node.stop()
+        # The node saved any newer profile it fetched; re-read the
+        # store rather than trusting the in-memory copy above.
+        store = ProfileStore(config.profiles_path)
+    profile = store.get(peer.hexhash)
+    if profile is None:
+        if fetch_error is not None:
+            raise NodeError(
+                f"could not fetch a profile from {peer.display_name}: "
+                f"{fetch_error}"
+            )
+        if _json_mode(args):
+            _emit(
+                {
+                    "peer": peer.hexhash,
+                    "name": peer.display_name,
+                    "profile": None,
+                },
+                True,
+            )
+        else:
+            print(f"{peer.display_name} has no public profile yet.")
+        return _EXIT_OK
+    if _json_mode(args):
+        _emit(
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "profile": public_profile(profile),
+                "fetched": fetched,
+                "fetch_error": fetch_error,
+            },
+            True,
+        )
+    else:
+        _print_profile(profile)
+        if fetch_error is not None:
+            print(f"  (showing the stored copy — fetch failed: {fetch_error})")
     return _EXIT_OK
 
 

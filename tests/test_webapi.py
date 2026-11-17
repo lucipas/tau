@@ -821,6 +821,57 @@ def test_heard_endpoint_empty_without_accessor(bridge, node):
     assert payload == {"heard": [], "count": 0}
 
 
+def test_peers_endpoint_includes_profile(bridge, node, tmp_path):
+    from tau.profile import ProfileStore, build_profile
+
+    registry = _seed_alias_registry(node, tmp_path)
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    registry.upsert(
+        peer_hash, identity.get_public_key(), name="carol", hops=1
+    )
+    registry.save()
+    store = ProfileStore(tmp_path / "profiles.json")
+    doc = build_profile(
+        identity,
+        name="carol",
+        bio="mesh tinkerer",
+        avatar="ab" * 16,
+        links=["https://example.com"],
+        version=2,
+        created_at=1000.0,
+    )
+    assert store.store(doc) is True
+    assert store.save() is True
+    node.profile_store = store
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    by_name = {item["name"]: item for item in payload["peers"]}
+    carol = by_name["carol"]["profile"]
+    assert carol["bio"] == "mesh tinkerer"
+    assert carol["avatar"] == "ab" * 16
+    assert carol["links"] == ["https://example.com"]
+    assert carol["version"] == 2
+    assert carol["author"] == peer_hash.hex()
+    # The display view carries no key or signature.
+    assert "sig" not in carol and "key" not in carol
+    # A peer with no profile reads as null, not as a missing key.
+    assert by_name["alice"]["profile"] is None
+
+
+def test_peers_endpoint_without_profile_store_has_null_profiles(
+    bridge, node
+):
+    # A node-like without a profile store (like this fixture's
+    # FakeNode) simply has no profiles — the endpoint still answers.
+    assert not hasattr(node, "profile_store")
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    assert payload["peers"][0]["profile"] is None
+
+
 def _seed_alias_registry(node, tmp_path):
     """Swap the fake registry for a real one the alias endpoint can use."""
     from tau.peers import PeerRegistry

@@ -79,6 +79,12 @@ from .mailbox import (
     seal_receipt,
 )
 from .peers import DESTINATION_HASH_BYTES, Peer, PeerError, PeerRegistry
+from .profile import (
+    ProfileError,
+    ProfileStore,
+    load_local_profile,
+    verify_profile,
+)
 from .tangents.tan import (
     MAX_IMAGE_BYTES,
     TanError,
@@ -108,6 +114,7 @@ from .protocol import (
     REQUEST_MESSAGE,
     REQUEST_PEERS,
     REQUEST_PING,
+    REQUEST_PROFILE,
     REQUEST_READ,
     REQUEST_REACT,
     REQUEST_RETRACT,
@@ -132,6 +139,7 @@ from .protocol import (
     encode_group_message,
     encode,
     encode_message,
+    encode_profile_request,
     encode_typing,
     generate_message_id,
     normalize_message,
@@ -144,6 +152,7 @@ from .protocol import (
     parse_mail_store,
     parse_media_request,
     parse_message,
+    parse_profile_request,
     parse_read_receipt,
     parse_reaction,
     parse_retract,
@@ -548,6 +557,16 @@ class TauNode:
         self.mailbox = Mailbox(config.mailbox_path)
         self.inbox = Inbox(config.inbox_path)
         self.groups = GroupStore(getattr(config, "groups_path", None))
+        # Public profiles: the local one this node publishes (reloaded
+        # from disk on every announce, so a one-shot `tau profile set`
+        # reaches peers without a restart) and the received ones, keyed
+        # by author, newest signed version only.
+        self.profile_store = ProfileStore(
+            getattr(config, "profiles_path", None)
+        )
+        self.local_profile = load_local_profile(
+            getattr(config, "profile_path", None)
+        )
         self.on_message = on_message
         # Record-only twin of on_message: the console history write
         # without the live event.  A delivery whose live publication
@@ -746,6 +765,26 @@ class TauNode:
         return self.destination.hexhash
 
     @property
+    def local_profile_version(self) -> Optional[int]:
+        """The local profile's version, or None when none is published."""
+        if self.local_profile is None:
+            return None
+        return self.local_profile["version"]
+
+    def refresh_local_profile(self) -> bool:
+        """Reload the local profile from disk; True when it changed.
+
+        A one-shot ``tau profile set`` writes the file while this node
+        serves; the announce path calls this first, so the new version
+        rides the next announce without a restart.
+        """
+        fresh = load_local_profile(getattr(self.config, "profile_path", None))
+        if fresh == self.local_profile:
+            return False
+        self.local_profile = fresh
+        return True
+
+    @property
     def started(self) -> bool:
         return self.reticulum is not None
 
@@ -855,7 +894,11 @@ class TauNode:
         self.destination.set_max_request_size(
             max(_REQUEST_WIRE_LIMIT, _MAIL_WIRE_LIMIT)
         )
-        self.destination.set_default_app_data(lambda: build_announce(self.name))
+        self.destination.set_default_app_data(
+            lambda: build_announce(
+                self.name, profile_version=self.local_profile_version
+            )
+        )
         self.destination.set_link_established_callback(self._on_incoming_link)
 
         handlers = {
@@ -871,6 +914,7 @@ class TauNode:
             REQUEST_DM_EDIT: self._handle_dm_edit,
             REQUEST_TYPING: self._handle_typing,
             REQUEST_PEERS: self._handle_peers,
+            REQUEST_PROFILE: self._handle_profile,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
         }
@@ -1240,7 +1284,14 @@ class TauNode:
         """Send a signed announce for this node's destination."""
         if self.destination is None:
             raise NodeError("node has not been started")
-        self.destination.announce(app_data=build_announce(self.name))
+        # Pick up a profile a one-shot command published since the
+        # last announce, so its version rides this one.
+        self.refresh_local_profile()
+        self.destination.announce(
+            app_data=build_announce(
+                self.name, profile_version=self.local_profile_version
+            )
+        )
 
     def _announce_loop(self) -> None:
         interval = max(1.0, float(self.config.announce_interval))
@@ -1296,6 +1347,19 @@ class TauNode:
             peer.hops,
         )
         self._save_peers()
+        # The announce carries the peer's profile version, not the
+        # profile itself: when it is newer than the version held, fetch
+        # the document over a link in the background, best-effort.
+        announced_profile = info.get("profile_version")
+        if (
+            isinstance(announced_profile, int)
+            and announced_profile > 0
+            and self.reticulum is not None
+        ):
+            stored = self.profile_store.get(peer.hexhash)
+            stored_version = stored["version"] if stored is not None else 0
+            if announced_profile > stored_version:
+                self._spawn_profile_fetch(peer)
         if self.on_peer is not None:
             try:
                 self.on_peer(peer)
@@ -1404,6 +1468,28 @@ class TauNode:
         with self._mail_rounds_lock:
             self._mail_round_threads.add(thread)
         thread.start()
+
+    def _spawn_profile_fetch(self, peer: Peer) -> None:
+        """Fetch an announcing peer's newer profile on its own thread.
+
+        Best-effort gossip: a peer that never answers, or answers with
+        a profile that fails verification, simply leaves the stored
+        copy (or nothing) in place — the next announce with a still
+        newer version tries again.  Untracked, unlike mail rounds: no
+        caller waits on a profile fetch before reading state.
+        """
+
+        def _run() -> None:
+            try:
+                self.request_profile(peer)
+            except Exception:  # pragma: no cover - network dependent
+                log.debug(
+                    "Could not fetch profile from %s", peer.hexhash, exc_info=True
+                )
+
+        threading.Thread(
+            target=_run, name="tau-profile-fetch", daemon=True
+        ).start()
 
     def wait_for_mail_rounds(self, timeout: float = 30.0) -> bool:
         """Wait for announce-triggered mail rounds to finish.
@@ -1585,6 +1671,33 @@ class TauNode:
     ) -> bytes:
         peers = self.registry.public_peers(include_keys=True)
         return response_ok(peers=peers[:100], count=len(peers))
+
+    def _handle_profile(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Answer a ``/tau/profile`` request with the local profile.
+
+        The profile is public by design, so any peer may ask — but
+        only a version newer than the one the requester already holds
+        is sent, so a re-announce of an unchanged profile costs one
+        small round trip instead of the whole document.
+        """
+        try:
+            request = parse_profile_request(data)
+        except ProtocolError as exc:
+            return response_error("bad_request", str(exc))
+        # Pick up a profile published since this node started, the
+        # same way announce() does.
+        self.refresh_local_profile()
+        profile = self.local_profile
+        if profile is not None and profile["version"] <= request["known_version"]:
+            profile = None
+        return response_ok(profile=profile)
 
     def _record_received(self, record: Dict[str, Any]) -> None:
         """Persist a delivered DM to the inbox; never break delivery."""
@@ -8064,6 +8177,58 @@ class TauNode:
             else min(timeout, 10.0),
         )
         return self._request(peer, REQUEST_PEERS, b"{}", timeout)
+
+    def request_profile(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = 15.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a peer's signed public profile over a link.
+
+        The request names the newest version already held, so the peer
+        answers with its profile only when it has a newer one.  A
+        returned profile is verified before it is trusted: the
+        signature must cover the document, the key must derive the
+        author's destination hash, and that key must be the one the
+        registry holds for this peer — a profile for anyone else is
+        refused.  A newer verified profile is stored (and the store
+        saved); anything else returns the stored copy's fate — ``None``
+        when the peer has nothing newer for us.  Raises
+        :class:`NodeError` when the peer cannot be reached or answers
+        with a malformed or forged profile.
+        """
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        stored = self.profile_store.get(peer.hexhash)
+        known_version = stored["version"] if stored is not None else 0
+        response = self._request(
+            peer,
+            REQUEST_PROFILE,
+            encode_profile_request(known_version),
+            timeout,
+        )
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise NodeError("peer gave an invalid profile response")
+        profile = response.get("profile")
+        if profile is None:
+            return None
+        try:
+            verified = verify_profile(profile)
+        except ProfileError as exc:
+            raise NodeError(f"peer gave an invalid profile: {exc}") from exc
+        if verified["author"] != peer.hexhash:
+            raise NodeError("profile author does not match the peer")
+        if verified["key"] != peer.public_key.hex():
+            raise NodeError("profile key does not match the peer")
+        if self.profile_store.store(verified):
+            self.profile_store.save()
+        return verified
 
     def exchange_peers(
         self,

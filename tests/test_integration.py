@@ -782,6 +782,60 @@ def test_two_nodes_exchange_tan_posts(tmp_path: Path) -> None:
             server.wait(timeout=5)
 
 
+def test_two_nodes_exchange_public_profiles(tmp_path: Path) -> None:
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = init_node(
+        tmp_path, "alice", "--tcp-listen", f"127.0.0.1:{port}"
+    )
+    alice_hash = alice_init["destination"]
+    init_node(tmp_path, "bob", "--tcp-connect", f"127.0.0.1:{port}")
+
+    require_ok(
+        run_tau(
+            "profile",
+            "set",
+            "--bio",
+            "mesh tinkerer",
+            "--link",
+            "https://example.com",
+            "--data-dir",
+            str(alice_dir),
+        )
+    )
+
+    alice = start_serve(
+        alice_dir, tmp_path / "alice.out", tmp_path / "alice.err"
+    )
+    bob = start_serve(bob_dir, tmp_path / "bob.out", tmp_path / "bob.err")
+    try:
+        # Bob learns alice's profile from her announces alone: the
+        # announce carries the version, and bob fetches the document
+        # over a link and stores it.
+        assert wait_for_text(
+            bob_dir / "profiles.json", "mesh tinkerer", timeout=60.0
+        )
+        # The stored copy answers the CLI without a live fetch.
+        output = require_ok(
+            run_tau(
+                "peers",
+                "profile",
+                alice_hash,
+                "--cached",
+                "--data-dir",
+                str(bob_dir),
+            )
+        )
+        assert "mesh tinkerer" in output
+        assert "https://example.com" in output
+        assert "version: 1" in output
+    finally:
+        stop_process(alice)
+        stop_process(bob)
+
+
 def test_second_serve_on_same_data_dir_fails_fast(tmp_path: Path) -> None:
     port = free_port()
     alice_dir = tmp_path / "alice"

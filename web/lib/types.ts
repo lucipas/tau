@@ -214,6 +214,16 @@ export interface UnignoreGroupResponse {
   changed: boolean;
 }
 
+export interface PeerProfile {
+  author: string;
+  name: string;
+  bio: string;
+  avatar: string | null;
+  links: string[];
+  version: number;
+  created_at: number;
+}
+
 export interface Peer {
   destination: string;
   name: string;
@@ -221,6 +231,9 @@ export interface Peer {
   age: number;
   hops: number;
   protocol: number;
+  // The peer's signed public profile (display name, bio, avatar
+  // hash, links), when one has been fetched — null otherwise.
+  profile?: PeerProfile | null;
   // Local-only label for this peer, set with `tau peers alias` or from
   // the console. Never sent to peers.
   alias?: string | null;
