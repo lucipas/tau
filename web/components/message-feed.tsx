@@ -154,7 +154,10 @@ export function MessageFeed({
                 : `${counts.inbound} in / ${counts.outbound} out`}
           </span>
         </div>
-        <div className="flex items-center gap-2">
+        {/* ml-auto: when the header wraps (narrow phones, long counts,
+            search state), the actions land right-aligned on their own
+            line instead of stranded at the left edge under the label. */}
+        <div className="ml-auto flex items-center gap-2">
           {showingPinned && onClearPinned ? (
             <button
               type="button"

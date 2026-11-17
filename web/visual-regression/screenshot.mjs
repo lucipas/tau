@@ -122,6 +122,7 @@ async function waitForDevTools() {
 }
 
 const VIEWPORTS = [
+  { name: "mobile-360", width: 360, height: 800, dpr: 2 },
   { name: "mobile-390", width: 390, height: 844, dpr: 2 },
   { name: "desktop-1280", width: 1280, height: 900, dpr: 1 },
 ];
@@ -143,6 +144,10 @@ const GEOMETRY_EXPRESSION = `(() => {
     const row = replyBtn ? replyBtn.parentElement : null;
     return { actionRow: r(row) };
   });
+  // Traffic header: the first row of the feed section (label + counts on
+  // the left, pinned/streaming actions on the right).
+  const headerEl = feed ? feed.querySelector(':scope > div') : null;
+  const headerClusters = headerEl ? [...headerEl.children].map((c) => r(c)) : [];
   return {
     url: location.href,
     viewport: { w: window.innerWidth, h: window.innerHeight },
@@ -153,6 +158,7 @@ const GEOMETRY_EXPRESSION = `(() => {
     composer: r(composer),
     outbox: r(outbox),
     aside: r(aside),
+    trafficHeader: { header: r(headerEl), clusters: headerClusters },
     composerOverlapsFeed: overlap(r(composer), r(scroll)),
     outboxOverlappedByActionRow: actions.some((a) => overlap(a.actionRow, r(outbox))),
     messages: articles.length,
@@ -171,6 +177,23 @@ function checkGeometry(name, g, width) {
   }
   if (g.docScrollWidth > width) {
     failures.push(`horizontal overflow (docScrollWidth=${g.docScrollWidth} > ${width})`);
+  }
+  const th = g.trafficHeader;
+  if (th && th.clusters.length >= 2) {
+    // The traffic header is a wrapping justify-between row. When the
+    // actions cluster drops to its own line (narrow phones, long counts,
+    // search state), it must land right-aligned — never stranded at the
+    // left edge under the label, which is how it rendered at 360px.
+    const [left, right] = th.clusters;
+    const wrapped = right.y > left.y + 4;
+    if (wrapped) {
+      const headerRight = th.header.right - 16; // px-4 padding
+      if (Math.abs(right.right - headerRight) > 4) {
+        failures.push(
+          `traffic header wraps ragged (actions right=${right.right}, header content right=${headerRight})`,
+        );
+      }
+    }
   }
   if (name.startsWith("desktop") && g.aside && g.main) {
     // The aside must fit its 340px column: its right edge must not pass

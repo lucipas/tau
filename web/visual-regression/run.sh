@@ -30,6 +30,11 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
   make web-build
 fi
 
+# Serve the export this checkout just built. Without this, `tau serve`
+# resolves web/out through the editable install (whatever worktree the
+# venv points at) and the check screenshots a stale build.
+export TAU_WEB_DIR="$ROOT/web/out"
+
 TMP="$(mktemp -d /tmp/tau-visual-regression.XXXXXX)"
 ALICE_PID=""
 BOB_PID=""

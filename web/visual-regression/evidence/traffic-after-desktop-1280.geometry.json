@@ -1,0 +1,87 @@
+{
+  "url": "http://127.0.0.1:8787/",
+  "viewport": {
+    "w": 1280,
+    "h": 900
+  },
+  "docScrollWidth": 1280,
+  "main": {
+    "x": 0,
+    "y": 69,
+    "w": 1280,
+    "h": 792,
+    "bottom": 861,
+    "right": 1280
+  },
+  "feedSection": {
+    "x": 392,
+    "y": 93,
+    "w": 856,
+    "h": 458,
+    "bottom": 550,
+    "right": 1248
+  },
+  "feedScroll": {
+    "x": 393,
+    "y": 206,
+    "w": 854,
+    "h": 343,
+    "bottom": 549,
+    "right": 1247
+  },
+  "composer": {
+    "x": 392,
+    "y": 578,
+    "w": 856,
+    "h": 168,
+    "bottom": 747,
+    "right": 1248
+  },
+  "outbox": {
+    "x": 392,
+    "y": 795,
+    "w": 856,
+    "h": 43,
+    "bottom": 837,
+    "right": 1248
+  },
+  "aside": {
+    "x": 32,
+    "y": 93,
+    "w": 326,
+    "h": 1050,
+    "bottom": 1143,
+    "right": 358
+  },
+  "trafficHeader": {
+    "header": {
+      "x": 393,
+      "y": 94,
+      "w": 854,
+      "h": 52,
+      "bottom": 145,
+      "right": 1247
+    },
+    "clusters": [
+      {
+        "x": 409,
+        "y": 112,
+        "w": 141,
+        "h": 15,
+        "bottom": 127,
+        "right": 550
+      },
+      {
+        "x": 1079,
+        "y": 106,
+        "w": 152,
+        "h": 27,
+        "bottom": 132,
+        "right": 1231
+      }
+    ]
+  },
+  "composerOverlapsFeed": false,
+  "outboxOverlappedByActionRow": false,
+  "messages": 2
+}

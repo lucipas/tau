@@ -1,8 +1,9 @@
 # Visual regression check for the tau web console
 
 Screenshots the built static export as served by a running
-`tau serve --http` bridge, at a mobile (390px) and a desktop (1280px)
-viewport, and asserts the layout invariants that broke in Nov 2026:
+`tau serve --http` bridge, at mobile (360px and 390px) and desktop
+(1280px) viewports, and asserts the layout invariants that broke in
+Nov 2026:
 
 - the message feed does not collapse to ~0px tall on mobile
 - the composer does not overlap the message list
@@ -10,6 +11,9 @@ viewport, and asserts the layout invariants that broke in Nov 2026:
 - the sidebar does not overflow its desktop column (peer action
   buttons used to be clipped off the right edge)
 - no horizontal overflow at either width
+- the traffic header never wraps ragged: when its actions cluster
+  drops to its own line (360px, long counts, search state), it must
+  land right-aligned, not stranded at the left edge under the label
 
 ## Run it
 

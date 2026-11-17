@@ -1447,4 +1447,22 @@ describe("MessageFeed mobile layout", () => {
     expect(row).not.toBeNull();
     expect(row!.classList.contains("flex-wrap")).toBe(true);
   });
+
+  it("right-aligns the traffic header actions when the header wraps", () => {
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onShowPinned={async () => {}}
+      />,
+    );
+    // The header is a wrapping justify-between row: at 360px (and in
+    // the search state at 390px) the pinned/streaming cluster drops to
+    // its own line, where it used to sit stranded at the left edge.
+    const pinned = screen.getByText("📌 pinned");
+    const actions = pinned.closest("div");
+    expect(actions).not.toBeNull();
+    expect(actions!.classList.contains("ml-auto")).toBe(true);
+  });
 });
