@@ -148,6 +148,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/unmute-tag unmute a tag
     POST /api/tan/sync     pull missing posts from peers
     GET  /api/tan/export   export stored posts (``?scope=mine|all``)
+    GET  /api/tan/media/<sha256> bytes of a cached Tan image
+    POST /api/tan/media/<sha256>/fetch fetch a Tan image from its author
     POST /api/tan/import   import an export document (every entry verified)
     GET  /api/channels     joined channels, most recently joined first
     GET  /api/channels/messages  stored messages for a channel (``?channel=<name>&limit=20``)
@@ -270,6 +272,11 @@ from .protocol import (
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
+
+# (author, sha256) background media fetches already running, so repeated
+# POSTs for the same image do not each start another waiting thread.
+_MEDIA_FETCHES_INFLIGHT: Set[Tuple[str, str]] = set()
+_MEDIA_FETCHES_INFLIGHT_LOCK = threading.Lock()
 
 DEFAULT_WEB_PORT = 8787
 DEFAULT_WEB_HOST = "127.0.0.1"
@@ -1533,7 +1540,13 @@ class WebBridge:
         # a loopback-gated listing does.
         payload = peer.local_dict(include_note=include_note)
         # Annotate like the snapshot does, so a live update or alias
-        # response does not erase the frontend's blocked badge.
+        # response does not erase the frontend's blocked badge or the
+        # lookalike warning.  The collision uses the same note boundary
+        # as the snapshot, so a live event never reveals a note-only contact.
+        collided = self.node.registry.lookalike_for(peer, include_notes=include_note)
+        payload["lookalike_of"] = (
+            collided.display_name if collided is not None else None
+        )
         blocklist = getattr(self.node, "blocklist", None)
         payload["blocked"] = bool(
             blocklist is not None and blocklist.is_blocked(payload.get("destination"))
@@ -1542,6 +1555,29 @@ class WebBridge:
 
     def record_peer(self, peer: Peer) -> None:
         self.bus.publish({"type": "peer", "peer": self._local_peer_payload(peer)})
+
+    def _refresh_lookalike_neighbours(
+        self, changed: Peer, *previous_names: Optional[str]
+    ) -> None:
+        """Re-publish peers whose lookalike state *changed* may have affected.
+
+        A lookalike warning depends on other peers' aliases and
+        verification, so editing one contact changes the rows of peers
+        announcing the same name.  Those rows are republished here, using
+        the names *changed* carries now or carried before (*previous_names*).
+        """
+        names = {
+            name.casefold()
+            for name in (changed.name, changed.alias, *previous_names)
+            if name and name.casefold() != "unknown"
+        }
+        if not names:
+            return
+        for other in self.node.registry.all():
+            if other.destination_hash == changed.destination_hash:
+                continue
+            if other.name.casefold() in names:
+                self.record_peer(other)
 
     def _remember_removed_wire_id(self, wire_id: str) -> None:
         """Remember a wire id whose console entry is gone (caller holds the lock).
@@ -7021,10 +7057,21 @@ class WebBridge:
             # Notes are stricter still — a remote console must never see
             # them — so they are included only when the caller asked,
             # which the HTTP layer does only for loopback clients.
-            items = [
-                peer.local_dict(now, include_note=include_notes)
-                for peer in self.node.registry.all()
-            ]
+            # lookalike_of is the same kind of local-only trust state:
+            # the display name of the verified peer or saved contact
+            # this unverified peer may be impersonating, or None.  A
+            # note-only contact counts only when notes are included, so a
+            # remote listing cannot reveal which peers carry a note.
+            items = []
+            for peer in self.node.registry.all():
+                item = peer.local_dict(now, include_note=include_notes)
+                collided = self.node.registry.lookalike_for(
+                    peer, include_notes=include_notes
+                )
+                item["lookalike_of"] = (
+                    collided.display_name if collided is not None else None
+                )
+                items.append(item)
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
@@ -7072,15 +7119,32 @@ class WebBridge:
         # Mirrors peers_verify; a node-like without the lock (e.g. in
         # tests) simply edits.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        # The alias the console last saw, before any edit lands: a
+        # neighbour announcing it loses its warning when this edit
+        # lands, so it must be refreshed even if the alias on disk
+        # (and therefore the one read under the lock) differs by now.
+        before = self.node.registry.get(destination)
+        previous_alias = before.alias if before is not None else None
         with lock:
             # Pick up notes a one-shot command saved since the last
             # periodic refresh, so this save does not write back stale ones.
             self.node.registry.refresh_aliases()
+            # Capture the alias being replaced only now, under the
+            # lock: a concurrent edit may have changed it between the
+            # read above and lock acquisition, and the refresh may
+            # have just restored a different alias from disk — either
+            # stale value would leave the neighbours announcing the
+            # intervening alias with a stale lookalike badge.
+            current = self.node.registry.get(destination)
+            replaced_alias = current.alias if current is not None else None
             if alias is not None and alias.strip():
                 peer = self.node.registry.set_alias(destination, alias)
             else:
                 peer = self.node.registry.clear_alias(destination)
         self.record_peer(peer)
+        self._refresh_lookalike_neighbours(
+            peer, previous_alias, replaced_alias
+        )
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.
@@ -7104,6 +7168,13 @@ class WebBridge:
         # note or alias a one-shot command saved since the last
         # periodic refresh, so this save does not write back stale ones.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        # The alias the console last saw, before any edit lands: the
+        # refresh below may restore a different alias from disk, and
+        # neighbours announcing the former value must still be
+        # refreshed when the note edit lands — same gap as the alias
+        # edit's pre-lock value.
+        before = self.node.registry.get(destination)
+        previous_alias = before.alias if before is not None else None
         with lock:
             self.node.registry.refresh_aliases()
             if note is not None and note.strip():
@@ -7111,6 +7182,10 @@ class WebBridge:
             else:
                 peer = self.node.registry.clear_note(destination)
         self.record_peer(peer)
+        # A note makes this peer a saved contact — or stops it being
+        # one — which anchors or releases the lookalike warning on
+        # peers announcing its name, so refresh those rows too.
+        self._refresh_lookalike_neighbours(peer, previous_alias)
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.
@@ -7172,6 +7247,10 @@ class WebBridge:
             self.node.registry.refresh_aliases()
             self.node.registry.mark_verified(peer.destination_hash, number)
             self.node.registry.save()
+        # Rows of unverified peers announcing this name lose or gain their
+        # warning with this verification; the verified row itself is
+        # updated by the console from the response.
+        self._refresh_lookalike_neighbours(peer)
         return {
             "peer": peer.hexhash,
             "name": peer.display_name,
@@ -8270,6 +8349,106 @@ class WebBridge:
             return None
         return data, name
 
+    def tan_media(self, sha256: str) -> Optional[Tuple[bytes, str, str]]:
+        """Return ``(bytes, mime, name)`` for a cached Tan image, or ``None``.
+
+        The mime and name come from the signed post carrying the
+        digest, so a stored file is always served with the type its
+        author declared; a digest with no local post falls back to a
+        generic name and ``application/octet-stream``.  The bytes are
+        re-checked against the digest before serving.
+        """
+        from .tangents.tan import (
+            find_post_by_image,
+            init_db,
+            media_path,
+            media_requires_publication,
+        )
+
+        digest = str(sha256).strip().lower()
+        if len(digest) != 64:
+            return None
+        try:
+            bytes.fromhex(digest)
+        except ValueError:
+            return None
+        # The media store lives next to the Tan database, so the
+        # bridge resolves it from the DB path rather than the node's
+        # data directory — the two are the same directory, but the DB
+        # path is what the bridge already knows.
+        stored = media_path(Path(self._tan_db_path()).parent, digest)
+        if stored is None:
+            return None
+        try:
+            data = stored.read_bytes()
+        except OSError:
+            return None
+        if hashlib.sha256(data).hexdigest() != digest:
+            return None
+        mime = "application/octet-stream"
+        name = f"tan-{digest[:12]}.img"
+        try:
+            conn = init_db(self._tan_db_path())
+            try:
+                post = find_post_by_image(conn, digest)
+            finally:
+                conn.close()
+        except Exception:  # pragma: no cover - a broken Tan DB must not block serving
+            post = None
+        if post is None and media_requires_publication(stored):
+            # A local upload whose post was never published stays private.
+            return None
+        if post is not None:
+            image = post.get("image") or {}
+            if isinstance(image.get("mime"), str) and image["mime"]:
+                mime = image["mime"]
+            if isinstance(image.get("name"), str) and image["name"]:
+                name = image["name"]
+        return data, mime, name
+
+    def tan_fetch_media(self, sha256: str, author: str) -> Dict[str, Any]:
+        """Ask the node to fetch a Tan image in the background.
+
+        Returns at once with ``{"accepted": True}`` — the transfer
+        takes seconds to minutes on a mesh, so the console polls
+        ``GET /api/tan/media/<sha256>`` until the bytes arrive.
+        """
+        digest = str(sha256).strip().lower()
+        node = self.node
+        key = (str(author), digest)
+        with _MEDIA_FETCHES_INFLIGHT_LOCK:
+            if key in _MEDIA_FETCHES_INFLIGHT:
+                # The same image from the same author is already being fetched;
+                # the console's polling picks it up when it lands.
+                return {"accepted": True, "sha256": digest}
+            _MEDIA_FETCHES_INFLIGHT.add(key)
+        try:
+            threading.Thread(
+                target=self._fetch_media_in_background,
+                args=(node, digest, author, key),
+                name="tau-media-fetch",
+                daemon=True,
+            ).start()
+        except Exception:
+            with _MEDIA_FETCHES_INFLIGHT_LOCK:
+                _MEDIA_FETCHES_INFLIGHT.discard(key)
+            raise
+        return {"accepted": True, "sha256": digest}
+
+    @staticmethod
+    def _fetch_media_in_background(
+        node: Any, sha256: str, author: str, key: Tuple[str, str]
+    ) -> None:
+        try:
+            node.fetch_tan_media(author, sha256, timeout=120.0)
+        except Exception as exc:  # pragma: no cover - network dependent
+            log.warning(
+                "Background Tan media fetch for %s failed: %s", sha256[:8], exc
+            )
+        finally:
+            with _MEDIA_FETCHES_INFLIGHT_LOCK:
+                _MEDIA_FETCHES_INFLIGHT.discard(key)
+
     def messages_search(
         self,
         *,
@@ -9069,7 +9248,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._serve_events(query)
             return
 
-        if self.command == "GET":
+        if self.command in ("GET", "HEAD"):
             if path == "/api/status":
                 self._send_json(
                     self.bridge.snapshot(
@@ -9209,6 +9388,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._handle_download_file(parts[0], parts[1], head_only)
+                return
+            if path.startswith("/api/tan/media/"):
+                sha256 = unquote(path[len("/api/tan/media/") :])
+                if not sha256 or "/" in sha256:
+                    self._send_json(
+                        {"error": {"message": "not found"}}, head_only, 404
+                    )
+                    return
+                self._handle_tan_media(sha256, head_only)
                 return
             if path == "/api/messages/search":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=200)
@@ -10359,6 +10547,41 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "peer": peer}, head_only)
                 return
+            if path.startswith("/api/tan/media/") and path.endswith("/fetch"):
+                sha256 = unquote(
+                    path[len("/api/tan/media/") : -len("/fetch")]
+                ).strip("/")
+                author = body.get("author")
+                if (
+                    not isinstance(sha256, str)
+                    or len(sha256) != 64
+                    or not isinstance(author, str)
+                    or len(author.strip()) != 32
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "a 64 character image sha256 and a "
+                                "32 character author hash are required"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    bytes.fromhex(sha256)
+                    bytes.fromhex(author.strip())
+                except ValueError:
+                    self._send_json(
+                        {"error": {"message": "sha256 and author must be hex"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                result = self.bridge.tan_fetch_media(sha256, author.strip())
+                self._send_json(result, head_only, HTTPStatus.ACCEPTED)
+                return
             if path == "/api/tan/posts":
                 text = body.get("text")
                 if not isinstance(text, str) or not text.strip():
@@ -11063,6 +11286,39 @@ class _WebHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Disposition",
             f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(file_name)}",
+        )
+        self._cors_headers()
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(data)
+
+    def _handle_tan_media(self, sha256: str, head_only: bool) -> None:
+        """Serve one cached Tan image's bytes inline.
+
+        The digest is the address: only a file this node actually
+        holds under that digest is ever served, with the mime its
+        signed post declared; anything else is a 404.
+        """
+        found = self.bridge.tan_media(sha256)
+        if found is None:
+            self._send_json(
+                {"error": {"message": "no such cached image"}}, head_only, 404
+            )
+            return
+        data, mime, file_name = found
+        ascii_name = "".join(
+            char if 32 <= ord(char) < 127 and char not in '"\\' else "_"
+            for char in file_name
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Disposition",
+            f'inline; filename="{ascii_name}"; '
             f"filename*=UTF-8''{quote(file_name)}",
         )
         self._cors_headers()

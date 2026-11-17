@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import sqlite3
@@ -142,9 +144,11 @@ from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     DEFAULT_SUGGEST_LIMIT,
     DRAFT_CLAIM_TTL,
+    IMAGE_MIME_TYPES,
     KIND_POLL,
     KIND_QUOTE,
     MAX_GOSSIP_TTL,
+    MAX_IMAGE_BYTES,
     MAX_TAN_POST_EXPIRY,
     MIN_POLL_OPTIONS,
     TanApp,
@@ -171,6 +175,7 @@ from .tangents.tan import (
     follow_tag,
     followed_tags,
     following,
+    find_post_by_image,
     get_draft,
     hidden_posts,
     hide_post,
@@ -206,7 +211,9 @@ from .tangents.tan import (
     save_post,
     search_posts,
     share_text,
+    store_media,
     suggest_authors,
+    media_path,
     tags,
     thread,
     timeline,
@@ -1784,6 +1791,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_post.add_argument("--file", type=Path, help="read the post text from a file")
     tan_post.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        metavar="IMAGE",
+        help="attach one image to the post (JPEG, PNG, GIF or WebP, at most "
+        "2 MiB) — the signed post carries its hash, size, mime and name, "
+        "and the bytes are fetched on demand with `tau tan media`",
+    )
+    tan_post.add_argument(
         "--reply-to",
         default=None,
         metavar="POST",
@@ -1823,6 +1839,32 @@ def build_parser() -> argparse.ArgumentParser:
     tan_post.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_post.set_defaults(func=cmd_tan_post)
+
+    tan_media = tan_sub.add_parser(
+        "media",
+        parents=[common],
+        help="fetch the image attached to a Tan post, by its SHA-256",
+    )
+    tan_media.add_argument(
+        "sha256", metavar="SHA256", help="image digest, as shown on the post"
+    )
+    tan_media.add_argument(
+        "--author",
+        default=None,
+        metavar="HASH",
+        help="author to fetch from (defaults to the author of the local "
+        "post carrying this image)",
+    )
+    tan_media.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="copy the fetched image to this path (default: print the "
+        "media store path)",
+    )
+    tan_media.add_argument("--timeout", type=float, default=60.0, metavar="SECONDS")
+    tan_media.set_defaults(func=cmd_tan_media)
 
     tan_draft = tan_sub.add_parser(
         "draft",
@@ -3039,7 +3081,15 @@ def _print_peer_table(
     *,
     now: Optional[float] = None,
     safety_numbers: Optional[Dict[str, str]] = None,
+    lookalikes: Optional[Dict[str, Peer]] = None,
 ) -> None:
+    """Print the peers table, flagging possible lookalikes.
+
+    *lookalikes* maps a peer's destination hex hash to the verified
+    peer or saved contact it may be impersonating (see
+    :meth:`PeerRegistry.lookalike_for`); a flagged peer is rendered
+    with the collision in its name cell and a warning below the table.
+    """
     rows = list(peers)
     if not rows:
         print("No peers known. Run `tau discover` or `tau serve` first.")
@@ -3051,6 +3101,9 @@ def _print_peer_table(
         name = peer.display_name
         if peer.alias and peer.alias != peer.name:
             name = f"{peer.alias} ({peer.name})"
+        collided = lookalikes.get(peer.hexhash) if lookalikes else None
+        if collided is not None:
+            name = f"{name} ⚠ lookalike of {collided.display_name}"
         table.append(
             (
                 peer.hexhash,
@@ -3073,6 +3126,33 @@ def _print_peer_table(
             "band before trusting it.",
             file=sys.stderr,
         )
+    if lookalikes:
+        for peer in rows:
+            collided = lookalikes.get(peer.hexhash)
+            if collided is None:
+                continue
+            print(
+                f"WARNING: {peer.display_name} ({short_hash(peer.hexhash)}) "
+                "is unverified and announces with the same name as "
+                f"{collided.display_name} "
+                f"({short_hash(collided.hexhash)}); treat it as a stranger "
+                "until its safety number is compared out of band.",
+                file=sys.stderr,
+            )
+    renamed = [
+        p for p in rows if p.is_verified and p.name_change_at is not None
+    ]
+    for peer in renamed:
+        previous = (
+            f" from {peer.previous_name!r}" if peer.previous_name else ""
+        )
+        print(
+            f"WARNING: verified peer {peer.display_name} "
+            f"({short_hash(peer.hexhash)}) changed its announced name"
+            f"{previous}; re-verify out of band before trusting the "
+            "new name.",
+            file=sys.stderr,
+        )
     if safety_numbers:
         print("\nSafety numbers — compare each with the peer over another "
               "channel; a match confirms the key is theirs:")
@@ -3080,6 +3160,23 @@ def _print_peer_table(
             number = safety_numbers.get(peer.hexhash)
             if number:
                 print(f"  {peer.display_name} ({short_hash(peer.hexhash)}): {number}")
+
+
+def _lookalike_map(
+    registry: PeerRegistry, peers: Iterable[Peer]
+) -> Dict[str, Peer]:
+    """Map destination hex hashes to the peer each lookalike resembles.
+
+    Only peers :meth:`PeerRegistry.lookalike_for` flags appear, so the
+    caller can pass the result straight to :func:`_print_peer_table`
+    or annotate JSON output.
+    """
+    found: Dict[str, Peer] = {}
+    for peer in peers:
+        collided = registry.lookalike_for(peer)
+        if collided is not None:
+            found[peer.hexhash] = collided
+    return found
 
 
 def _make_config(
@@ -3108,6 +3205,55 @@ def _read_message(args: argparse.Namespace) -> str:
     if not sys.stdin.isatty():
         return sys.stdin.read()
     raise NodeError("provide a message, --file, or pipe text on stdin")
+
+
+def _detect_image_mime(data: bytes) -> Optional[str]:
+    """Identify an image by its magic bytes, or ``None`` when unknown."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _read_image(path: Path, data_dir: Path) -> Dict[str, Any]:
+    """Read, validate and store an image for a Tan post.
+
+    Returns the attachment dict the signed post carries — hash, size,
+    mime and name.  The bytes go into the local media store first, so
+    the author can serve them when a peer asks.
+    """
+    from .protocol import sanitize_file_name
+
+    source = Path(path).expanduser()
+    try:
+        data = source.read_bytes()
+    except OSError as exc:
+        raise NodeError(f"could not read {source}: {exc}") from exc
+    if len(data) < 1 or len(data) > MAX_IMAGE_BYTES:
+        raise NodeError(
+            f"image of {len(data)} bytes is outside the 1..{MAX_IMAGE_BYTES} "
+            "byte limit"
+        )
+    mime = _detect_image_mime(data)
+    if mime is None:
+        raise NodeError(
+            "image must be a JPEG, PNG, GIF or WebP file "
+            f"(unsupported format: {source.name})"
+        )
+    name = sanitize_file_name(source.name)
+    if not name:
+        raise NodeError(f"image file name {source.name!r} is not usable")
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        store_media(data_dir, digest, data, pinned=True)
+    except TanError as exc:
+        raise NodeError(str(exc)) from exc
+    return {"sha256": digest, "size": len(data), "mime": mime, "name": name}
 
 
 # -- commands --------------------------------------------------------------
@@ -3216,6 +3362,19 @@ def _default_web_dir() -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
+def _print_tan_image(post: Dict[str, Any]) -> None:
+    """Print a post's image attachment line, when it has one."""
+    image = post.get("image")
+    if not isinstance(image, dict):
+        return
+    size = int(image.get("size") or 0)
+    size_text = f"{size / 1024:.1f} KiB" if size >= 1024 else f"{size} B"
+    print(
+        f"  🖼 {image.get('name')} ({size_text}, {image.get('mime')}) — "
+        f"download with `tau tan media {image.get('sha256')}`"
+    )
+
+
 def _print_tan_posts(
     posts: Sequence[Dict[str, Any]],
     *,
@@ -3290,6 +3449,7 @@ def _print_tan_posts(
                 print(f"  quoting {short_hash(str(post.get('target', '')))}")
         if post.get("kind") == "poll":
             _print_poll_options(post)
+        _print_tan_image(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -3390,6 +3550,7 @@ def _print_saved_posts(
             print(f"  {line}")
         if post.get("kind") == "poll":
             _print_poll_options(post)
+        _print_tan_image(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -3489,6 +3650,7 @@ def _print_pinned_posts(
                 print(f"  quoting {short_hash(str(post.get('target', '')))}")
         if post.get("kind") == "poll":
             _print_poll_options(post)
+        _print_tan_image(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -3699,6 +3861,7 @@ def _publish_local_post(
     ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
     expires_at: Optional[float] = None,
+    image: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
 ) -> Dict[str, Any]:
     if channel is not None:
@@ -3737,7 +3900,9 @@ def _publish_local_post(
     else:
         if text is None:
             raise TanError("nothing to publish")
-        post = publisher.create_post(text, reply_to=reply_to, expires_at=expires_at)
+        post = publisher.create_post(
+            text, reply_to=reply_to, expires_at=expires_at, image=image
+        )
     published = publisher.publish(
         post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
     )
@@ -3770,6 +3935,24 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     expires_at = time.time() + expire_seconds if expire_text is not None else None
+
+    image = None
+    if getattr(args, "image", None) is not None:
+        if reply_to is not None:
+            print(
+                "error: --image can only be attached to a top-level post, "
+                "not a reply",
+                file=sys.stderr,
+            )
+            return 2
+        if getattr(args, "delay", None) is not None:
+            print(
+                "error: --image cannot be combined with --delay — "
+                "scheduled posts cannot carry an attachment yet",
+                file=sys.stderr,
+            )
+            return 2
+        image = _read_image(args.image, config.data_dir)
 
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
@@ -3819,7 +4002,9 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
-        post = app.create_post(text, reply_to=reply_to, expires_at=expires_at)
+        post = app.create_post(
+            text, reply_to=reply_to, expires_at=expires_at, image=image
+        )
         published = None
     else:
         node = TauNode(config, name=config.name)
@@ -3828,8 +4013,10 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         except InstanceAlreadyRunning:
             from .local_publish import publish_running
 
-            result = publish_running(
-                config.data_dir,
+            # The image rides the IPC request only when there is one:
+            # a plain post must still publish through a running node
+            # from before this flag existed.
+            request = dict(
                 text=text,
                 reply_to=reply_to,
                 to=getattr(args, "to", None),
@@ -3837,6 +4024,9 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 timeout=float(getattr(args, "timeout", 15.0)),
                 expires_at=expires_at,
             )
+            if image is not None:
+                request["image"] = image
+            result = publish_running(config.data_dir, **request)
             post, published = result["post"], result["published"]
         else:
             try:
@@ -3855,6 +4045,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
                     expires_at=expires_at,
+                    image=image,
                 )
                 post, published = result["post"], result["published"]
             finally:
@@ -3877,6 +4068,11 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             print(f"  in reply to {short_hash(reply_to)}")
         if expires_at is not None:
             print(f"  expires in {_ago(expire_seconds)}")
+        image = post.get("image")
+        if isinstance(image, dict):
+            size = int(image.get("size") or 0)
+            size_text = f"{size / 1024:.1f} KiB" if size >= 1024 else f"{size} B"
+            print(f"  image {image.get('name')} ({size_text}, {image.get('mime')})")
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -3885,6 +4081,81 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             )
             for error in published["errors"]:
                 print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_media(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    digest = str(args.sha256).strip().lower()
+    if len(digest) != 64:
+        print("error: sha256 must be a 64 character hex digest", file=sys.stderr)
+        return 2
+    try:
+        bytes.fromhex(digest)
+    except ValueError:
+        print("error: sha256 must be a 64 character hex digest", file=sys.stderr)
+        return 2
+    timeout = float(getattr(args, "timeout", 60.0))
+    cached = media_path(config.data_dir, digest)
+    if cached is not None:
+        result = {
+            "ok": True,
+            "sha256": digest,
+            "path": str(cached),
+            "size": cached.stat().st_size,
+            "cached": True,
+        }
+    else:
+        author = getattr(args, "author", None)
+        if author is None:
+            # Learn the author from the local post carrying this image.
+            conn = init_db(config.social_db_path)
+            try:
+                post = find_post_by_image(conn, digest)
+            finally:
+                conn.close()
+            if post is None:
+                print(
+                    "error: no local post carries that image — "
+                    "pass --author <hash>",
+                    file=sys.stderr,
+                )
+                return 2
+            author = post["author"]
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_media import fetch_running
+
+            result = fetch_running(
+                config.data_dir, author=author, sha256=digest, timeout=timeout
+            )
+        else:
+            try:
+                result = node.fetch_tan_media(
+                    author, digest, timeout=timeout
+                )
+            finally:
+                node.stop()
+    out_path = getattr(args, "out", None)
+    if out_path is not None:
+        target = Path(out_path).expanduser()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(result["path"], target)
+        except OSError as exc:
+            print(f"error: could not copy to {target}: {exc}", file=sys.stderr)
+            return 2
+        result = dict(result, path=str(target))
+    if json_output:
+        _emit(result, True)
+    else:
+        size = int(result.get("size") or 0)
+        size_text = f"{size / 1024:.1f} KiB" if size >= 1024 else f"{size} B"
+        cached_text = " (already cached)" if result.get("cached") else ""
+        print(f"image {digest[:12]} ({size_text}) saved to {result['path']}{cached_text}")
     return _EXIT_OK
 
 
@@ -6919,6 +7190,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
             _restore_stop_handlers(previous_handlers)
             raise
 
+    media_server = None
+    if social_app is not None and hasattr(socket, "AF_UNIX"):
+        from .local_media import MediaServer
+
+        try:
+            media_server = MediaServer(
+                config.data_dir,
+                lambda **request: node.fetch_tan_media(**request),
+            )
+        except BaseException:
+            if publish_server is not None:
+                publish_server.stop()
+            if bridge is not None:
+                bridge.stop()
+            node.stop()
+            _restore_stop_handlers(previous_handlers)
+            raise
+
     send_server = None
     fanout_server = None
     if hasattr(socket, "AF_UNIX"):
@@ -7029,6 +7318,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             send_server.stop()
         if publish_server is not None:
             publish_server.stop()
+        if media_server is not None:
+            media_server.stop()
         if bridge is not None:
             bridge.stop()
         node.stop()
@@ -7060,10 +7351,17 @@ def cmd_discover(args: argparse.Namespace) -> int:
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
     peers = node.registry.all(max_age=max_age)
+    lookalikes = _lookalike_map(node.registry, peers)
     if _json_mode(args):
+        payload = [peer.to_dict() for peer in peers]
+        for entry in payload:
+            collided = lookalikes.get(entry["destination"])
+            entry["lookalike_of"] = (
+                collided.display_name if collided is not None else None
+            )
         _emit(
             {
-                "peers": [peer.to_dict() for peer in peers],
+                "peers": payload,
                 "count": len(peers),
                 "duration": duration,
             },
@@ -7071,7 +7369,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
         )
     else:
         print()
-        _print_peer_table(peers)
+        _print_peer_table(peers, lookalikes=lookalikes)
         print(f"\n{len(peers)} peer(s) in {duration:.1f}s")
     return _EXIT_OK
 
@@ -7162,12 +7460,22 @@ def cmd_peers(args: argparse.Namespace) -> int:
         }
     if _json_mode(args):
         payload = [peer.to_dict() for peer in peers]
+        lookalikes = _lookalike_map(registry, peers)
+        for entry in payload:
+            collided = lookalikes.get(entry["destination"])
+            entry["lookalike_of"] = (
+                collided.display_name if collided is not None else None
+            )
         if safety_numbers is not None:
             for entry in payload:
                 entry["safety_number"] = safety_numbers[entry["destination"]]
         _emit({"peers": payload, "count": len(peers)}, True)
     else:
-        _print_peer_table(peers, safety_numbers=safety_numbers)
+        _print_peer_table(
+            peers,
+            safety_numbers=safety_numbers,
+            lookalikes=_lookalike_map(registry, peers),
+        )
     return _EXIT_OK
 
 

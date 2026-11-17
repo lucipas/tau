@@ -1455,6 +1455,58 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     assert "No peers known" in capsys.readouterr().out
 
 
+def test_peers_table_flags_lookalike_and_rename(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    registry = PeerRegistry(config.peers_path)
+    verified = RNS.Identity()
+    registry.upsert(
+        destination_hash(verified),
+        verified.get_public_key(),
+        name="alice",
+        now=1000.0,
+    )
+    registry.mark_verified(destination_hash(verified), "00001", now=1100.0)
+    lookalike = RNS.Identity()
+    registry.upsert(
+        destination_hash(lookalike),
+        lookalike.get_public_key(),
+        name="Alice",
+        now=1200.0,
+    )
+    renamed = RNS.Identity()
+    registry.upsert(
+        destination_hash(renamed),
+        renamed.get_public_key(),
+        name="carol",
+        now=1000.0,
+    )
+    registry.mark_verified(destination_hash(renamed), "00002", now=1100.0)
+    registry.upsert(
+        destination_hash(renamed),
+        renamed.get_public_key(),
+        name="caroline",
+        now=1200.0,
+    )
+    registry.save()
+
+    code = cli.main(["peers", "--data-dir", str(data_dir)])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "lookalike of alice" in captured.out
+    assert "announces with the same name as alice" in captured.err
+    assert "changed its announced name from 'carol'" in captured.err
+
+    code = cli.main(["peers", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    by_name = {entry["name"]: entry for entry in payload["peers"]}
+    assert by_name["Alice"]["lookalike_of"] == "alice"
+    assert by_name["alice"]["lookalike_of"] is None
+    assert by_name["caroline"]["previous_name"] == "carol"
+    assert by_name["caroline"]["name_change_at"] == 1200.0
+
+
 # -- heard --------------------------------------------------------------------
 
 _HEARD_RECORD = {
@@ -7848,3 +7900,142 @@ class _FakeReactNode:
     ):
         self.edited.append((target, message_id, text))
         return {"ok": True, "edited": True, "target": message_id, "id": "e-1"}
+
+
+def _post_image_fixture(tmp_path, capsys):
+    import hashlib
+
+    from tau.tangents.tan import init_db, media_path
+
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    png = tmp_path / "photo.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    digest = hashlib.sha256(png.read_bytes()).hexdigest()
+    code = cli.main(
+        [
+            "tan",
+            "post",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "look at this",
+            "--image",
+            str(png),
+        ]
+    )
+    assert code == 0
+    capsys.readouterr()
+    return data_dir, png, digest
+
+
+def test_tan_post_with_image_stores_attachment(tmp_path, capsys):
+    import hashlib
+
+    from tau.tangents.tan import feed, init_db, media_path
+
+    data_dir, png, digest = _post_image_fixture(tmp_path, capsys)
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        posts = feed(conn)
+    finally:
+        conn.close()
+    assert len(posts) == 1
+    assert posts[0]["image"] == {
+        "sha256": digest,
+        "size": len(png.read_bytes()),
+        "mime": "image/png",
+        "name": "photo.png",
+    }
+    assert media_path(data_dir, digest) is not None
+    assert cli.main(["tan", "timeline", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "photo.png" in out
+    assert f"tau tan media {digest}" in out
+    # The cached image downloads without touching the mesh.
+    assert cli.main(["tan", "media", "--data-dir", str(data_dir), digest]) == 0
+    out = capsys.readouterr().out
+    assert "already cached" in out
+    assert digest[:12] in out
+
+
+def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    text_file = tmp_path / "notes.txt"
+    text_file.write_text("not an image")
+    base = ["tan", "post", "--data-dir", str(data_dir), "--no-publish", "hi"]
+    assert cli.main([*base, "--image", str(text_file)]) == 1
+    big = tmp_path / "big.png"
+    big.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (2 * 1024 * 1024))
+    assert cli.main([*base, "--image", str(big)]) == 1
+    png = tmp_path / "photo.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
+    assert cli.main([*base, "--image", str(png), "--delay", "5m"]) == 2
+    # A reply cannot carry an image: post first, then reply to it.
+    assert cli.main([*base, "--image", str(png)]) == 0
+    capsys.readouterr()
+    from tau.tangents.tan import feed, init_db
+
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post_hash = feed(conn)[0]["hash"]
+    finally:
+        conn.close()
+    assert (
+        cli.main([*base, "--image", str(png), "--reply-to", post_hash]) == 2
+    )
+
+
+def test_tan_media_rejects_unknown_image(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    assert (
+        cli.main(["tan", "media", "--data-dir", str(data_dir), "ab" * 32]) == 2
+    )
+    assert cli.main(["tan", "media", "--data-dir", str(data_dir), "nope"]) == 2
+
+
+def test_print_tan_posts_counts_appear_once(capsys):
+    from tau.cli import _print_tan_posts
+
+    post = {
+        "name": "alice",
+        "author": "ab" * 16,
+        "hash": "cd" * 32,
+        "created_at": 1000.0,
+        "text": "hi",
+        "kind": "post",
+        "likes": 3,
+        "liked": False,
+        "reposts": 1,
+        "reposted": False,
+        "quotes": 2,
+    }
+    _print_tan_posts([post], json_output=False)
+    out = capsys.readouterr().out
+    assert out.count("♥ 3") == 1
+    assert out.count("↻ 1") == 1
+    assert out.count("❝ 2") == 1
+
+
+def test_fetch_running_bounds_reply_wait(tmp_path, monkeypatch):
+    from tau import local_media
+
+    seen = {}
+
+    def fake_call_local(path, *, reply_timeout=None, **request):
+        seen["reply_timeout"] = reply_timeout
+        seen["path"] = path
+        return {"ok": True}
+
+    monkeypatch.setattr(local_media, "call_local", fake_call_local)
+    result = local_media.fetch_running(
+        tmp_path, author="ab" * 16, sha256="cd" * 32, timeout=45.0
+    )
+    assert result == {"ok": True}
+    assert seen["reply_timeout"] == 75.0
+    assert str(seen["path"]).endswith("media.sock")

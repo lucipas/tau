@@ -196,6 +196,13 @@ export interface Peer {
   verified?: boolean;
   verified_at?: number | null;
   key_change_at?: number | null;
+  // Display name of the verified peer or saved contact this unverified
+  // peer may be impersonating (same announced name), or null.
+  lookalike_of?: string | null;
+  // When a verified peer last changed its announced name, with the name
+  // it carried before the change — a rename warning until re-verified.
+  name_change_at?: number | null;
+  previous_name?: string | null;
   // True when the peer is on this node's block-list: their DMs are
   // dropped and their Tan posts hidden.
   blocked?: boolean;
@@ -816,6 +823,13 @@ export interface TanPoll {
   voted: number | null;
 }
 
+export interface TanImage {
+  sha256: string;
+  size: number;
+  mime: string;
+  name: string;
+}
+
 export interface TanPost {
   v: number;
   author: string;
@@ -828,6 +842,9 @@ export interface TanPost {
   sig: string;
   kind?: string;
   target?: string;
+  // Image attachment, signed with the post: hash, size, mime and
+  // name only — the bytes are fetched on demand, never gossiped.
+  image?: TanImage;
   reply_to?: TanReplyParent | null;
   repost_of?: TanReplyParent | null;
   quoted?: TanReplyParent | null;

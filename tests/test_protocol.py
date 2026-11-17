@@ -718,3 +718,42 @@ def test_message_roundtrip_with_expiry():
     parsed = parse_message(data)
     assert parsed["text"] == "vanish soon"
     assert parsed["expires_at"] == 1893456000.0
+
+
+def test_media_request_round_trip():
+    from tau.protocol import build_media_request, parse_media_request
+
+    digest = "ab" * 32
+    assert parse_media_request(build_media_request(digest)) == {"sha256": digest}
+    assert parse_media_request(build_media_request(digest.upper())) == {
+        "sha256": digest
+    }
+
+
+def test_media_request_rejects_bad_digest():
+    from tau.protocol import build_media_request, parse_media_request
+
+    with pytest.raises(ProtocolError):
+        build_media_request("not-a-digest")
+    with pytest.raises(ProtocolError):
+        build_media_request("zz" * 32)
+    with pytest.raises(ProtocolError):
+        parse_media_request(
+            encode(
+                {
+                    "type": "media_request",
+                    "v": protocol.PROTOCOL_VERSION,
+                    "sha256": "zz" * 32,
+                }
+            )
+        )
+    with pytest.raises(ProtocolError):
+        parse_media_request(
+            encode(
+                {
+                    "type": "file_offer",
+                    "v": protocol.PROTOCOL_VERSION,
+                    "sha256": "ab" * 32,
+                }
+            )
+        )

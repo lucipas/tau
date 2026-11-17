@@ -951,6 +951,22 @@ export function PeerSidebar({
                                 ✓ verified
                               </span>
                             ) : null}
+                            {peer.lookalike_of ? (
+                              <span
+                                className="ml-1.5 rounded-full border border-rose-400/40 bg-rose-400/10 px-1.5 py-px text-[10px] text-rose-300"
+                                title={`Unverified peer announcing with the same name as ${peer.lookalike_of} — possible lookalike; compare safety numbers before trusting it`}
+                              >
+                                ⚠ lookalike of {peer.lookalike_of}
+                              </span>
+                            ) : null}
+                            {peer.name_change_at ? (
+                              <span
+                                className="ml-1.5 rounded-full border border-amber-400/40 bg-amber-400/10 px-1.5 py-px text-[10px] text-amber-300"
+                                title={`This verified peer changed its announced name${peer.previous_name ? ` from ${peer.previous_name}` : ""} — re-verify before trusting the new name`}
+                              >
+                                ⚠ renamed
+                              </span>
+                            ) : null}
                             {peer.blocked ? (
                               <span
                                 className="ml-1.5 rounded-full border border-rose-400/40 bg-rose-400/10 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-rose-300"
