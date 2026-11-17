@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --color-mesh: #22d3ee;
+  --color-mesh-dim: #0e7490;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #09090b;
+  color: #f4f4f5;
+}
+
+::selection {
+  background: #164e63;
+}

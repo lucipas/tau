@@ -1,0 +1,186 @@
+// api.test.ts — URL / param / body building for the api.ts client, with
+// fetch mocked. No live node is needed: every test drives a deferred
+// promise so the request can be inspected before it resolves.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  ApiError,
+  clearReaction,
+  eventsUrl,
+  fetchTanMedia,
+  fileUrl,
+  getChannelMessages,
+  getMessages,
+  getTanThread,
+  getTanTimeline,
+  markRead,
+  pageFileUrl,
+  reactToMessage,
+  sendMessage,
+  tanMediaUrl,
+  voteTanPoll,
+  wsUrl,
+} from "./api";
+
+interface Captured {
+  url: string;
+  init?: RequestInit;
+}
+
+let captured: Captured[] = [];
+let nextJson: unknown = {};
+let nextOk = true;
+let nextStatus = 200;
+
+function jsonResponse(body: unknown, ok = true, status = 200): Response {
+  return {
+    ok,
+    status,
+    text: async () => JSON.stringify(body),
+  } as Response;
+}
+
+beforeEach(() => {
+  captured = [];
+  nextJson = {};
+  nextOk = true;
+  nextStatus = 200;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      captured.push({ url, init });
+      return jsonResponse(nextJson, nextOk, nextStatus);
+    }),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+function bodyOf(call: number): Record<string, unknown> {
+  return JSON.parse(String(captured[call]?.init?.body ?? "{}")) as Record<string, unknown>;
+}
+
+describe("GET endpoints", () => {
+  it("fetches messages with a limit", async () => {
+    nextJson = { messages: [] };
+    await getMessages(50);
+    expect(captured[0].url).toBe("/api/messages?limit=50");
+    expect(captured[0].init?.headers).toEqual({ "Content-Type": "application/json" });
+    expect(captured[0].init?.method).toBeUndefined();
+  });
+
+  it("builds the Tan timeline query (all / author / tag)", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanTimeline({ limit: 10, all: true, author: "alice", tag: "mesh" });
+    expect(captured[0].url).toBe("/api/tan/timeline?limit=10&all=1&author=alice&tag=mesh");
+  });
+
+  it("omits empty timeline params", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanTimeline();
+    expect(captured[0].url).toBe("/api/tan/timeline?limit=30");
+  });
+
+  it("encodes the thread ref", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanThread("ab12 cd");
+    expect(captured[0].url).toBe("/api/tan/thread?ref=ab12%20cd");
+  });
+
+  it("encodes the channel name", async () => {
+    nextJson = { channel: "general", messages: [], count: 0 };
+    await getChannelMessages("my channel", 5);
+    expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
+  });
+});
+
+describe("POST endpoints", () => {
+  it("sends a DM with reply / expiry / delay / poll options", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage(
+      { to: "alice" },
+      "hello",
+      { replyTo: "wire1", expiresIn: 3600, sendIn: 60, pollOptions: ["a", "b"] },
+    );
+    expect(captured[0].url).toBe("/api/messages");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      to: "alice",
+      text: "hello",
+      reply_to: "wire1",
+      expires_in: 3600,
+      send_in: 60,
+      poll_options: ["a", "b"],
+    });
+  });
+
+  it("sends a group message with the group key, not `to`", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage({ group: "g123" }, "hi");
+    expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
+  });
+
+  it("reacts and clears a reaction on the same route", async () => {
+    nextJson = { ok: true };
+    await reactToMessage("wire9", "👍");
+    expect(bodyOf(0)).toEqual({ target: "wire9", reaction: "👍" });
+    await clearReaction("wire9");
+    expect(bodyOf(1)).toEqual({ target: "wire9", clear: true });
+  });
+
+  it("votes a Tan poll with a 0-based option index", async () => {
+    nextJson = { ok: true };
+    await voteTanPoll("posthash", 2);
+    expect(captured[0].url).toBe("/api/tan/vote");
+    expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
+  });
+
+  it("marks read with an empty body when no conversation is given", async () => {
+    nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, total: 0, revision: 1 } };
+    await markRead();
+    expect(bodyOf(0)).toEqual({});
+  });
+
+  it("fetches Tan media with the author in the body", async () => {
+    nextJson = { ok: true };
+    await fetchTanMedia("a".repeat(64), "b".repeat(32));
+    expect(captured[0].url).toBe(`/api/tan/media/${"a".repeat(64)}/fetch`);
+    expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
+  });
+});
+
+describe("ApiError", () => {
+  it("surfaces the bridge's error message and status", async () => {
+    nextOk = false;
+    nextStatus = 404;
+    nextJson = { error: { message: "no peer matches 'alice'" } };
+    await expect(getMessages()).rejects.toMatchObject({
+      message: "no peer matches 'alice'",
+      status: 404,
+    });
+    await expect(getMessages()).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it("falls back to a generic message on a non-JSON error body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 500, text: async () => "boom" }) as Response),
+    );
+    await expect(getMessages()).rejects.toMatchObject({ status: 500 });
+  });
+});
+
+describe("URL helpers", () => {
+  it("builds file / media / page / event / ws URLs", () => {
+    expect(fileUrl("sender1", "my file.txt")).toBe("/api/files/sender1/my%20file.txt");
+    expect(tanMediaUrl("a".repeat(64))).toBe(`/api/tan/media/${"a".repeat(64)}`);
+    expect(pageFileUrl("b".repeat(32), "c".repeat(64))).toBe(
+      `/api/pages/${"b".repeat(32)}/files/${"c".repeat(64)}`,
+    );
+    expect(eventsUrl()).toBe("/api/events");
+    expect(eventsUrl(42)).toBe("/api/events?since=42");
+    expect(wsUrl()).toBe("ws://example.com/ws");
+  });
+});
