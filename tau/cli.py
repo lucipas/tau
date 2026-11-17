@@ -56,6 +56,7 @@ from .config import (
     TauConfig,
     accept_files_enabled,
     load_node_name,
+    parse_host_port,
     send_read_receipts_enabled,
     set_node_setting,
     write_node_metadata,
@@ -418,6 +419,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--init",
         action="store_true",
         help="write default Reticulum config (overwrites)",
+    )
+    init.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the interactive setup dialogue, use the defaults",
     )
     init.set_defaults(func=cmd_init)
 
@@ -3945,8 +3951,120 @@ def _read_image(path: Path, data_dir: Path) -> Dict[str, Any]:
 # -- commands --------------------------------------------------------------
 
 
+def _prompt_setup_value(prompt, default, *, input_fn=input, validate=None):
+    """Ask one setup question, re-prompting while ``validate`` rejects it.
+
+    Enter accepts ``default``.  EOF cancels the whole setup: callers run
+    before any file is written, so nothing is left behind.
+    """
+    while True:
+        try:
+            raw = input_fn(f"{prompt} [{default}]: ")
+        except EOFError:
+            raise NodeError("setup cancelled — nothing was written") from None
+        answer = raw.strip() or default
+        if validate is None:
+            return answer
+        try:
+            return validate(answer)
+        except ValueError as exc:
+            print(f"  {exc} — try again.")
+
+
+def _prompt_setup_yes_no(prompt, default, *, input_fn=input) -> bool:
+    """Ask one yes/no setup question; Enter accepts ``default``."""
+    hint = "Y/n" if default else "y/N"
+    while True:
+        try:
+            raw = input_fn(f"{prompt} [{hint}]: ")
+        except EOFError:
+            raise NodeError("setup cancelled — nothing was written") from None
+        answer = raw.strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("  Please answer y or n.")
+
+
+def _validate_setup_host_port(value, *, default_host):
+    """Parse a setup address answer, returning it normalized as host:port."""
+    host, port = parse_host_port(value, default_host=default_host)
+    return f"{host}:{port}"
+
+
+def run_setup_dialogue(args, config, *, input_fn=input) -> None:
+    """Interactive first-run setup for `tau init`.
+
+    Asks for the node name, LAN discovery, and optional TCP interfaces,
+    writing the answers back onto ``args`` so ``cmd_init`` proceeds with
+    them.  Runs before any file is written, so cancelling (Ctrl-C /
+    Ctrl-D) leaves nothing behind.  ``input_fn`` is injectable for tests.
+    """
+    print("First-time setup — press Enter to accept the [default].")
+    if getattr(args, "name", None) is None:
+        args.name = sanitize_name(
+            _prompt_setup_value("Node name", config.name, input_fn=input_fn),
+            fallback=config.name,
+        )
+    auto_interface = _prompt_setup_yes_no(
+        "Discover peers on the local network (AutoInterface)",
+        True,
+        input_fn=input_fn,
+    )
+    args.no_auto_interface = not auto_interface
+    if _prompt_setup_yes_no(
+        "Listen for TCP connections from other nodes", False, input_fn=input_fn
+    ):
+        args.tcp_listen = _prompt_setup_value(
+            "Listen address",
+            f"0.0.0.0:{PROTOCOL_TCP_PORT}",
+            input_fn=input_fn,
+            validate=lambda value: _validate_setup_host_port(
+                value, default_host="0.0.0.0"
+            ),
+        )
+    if _prompt_setup_yes_no(
+        "Connect to another node over TCP", False, input_fn=input_fn
+    ):
+        args.tcp_connect = _prompt_setup_value(
+            "Connect to (HOST:PORT)",
+            f"127.0.0.1:{PROTOCOL_TCP_PORT}",
+            input_fn=input_fn,
+            validate=lambda value: _validate_setup_host_port(
+                value, default_host="127.0.0.1"
+            ),
+        )
+
+
+def _setup_dialogue_wanted(args, config) -> bool:
+    """Whether `tau init` should run the interactive setup dialogue.
+
+    Only for a first run on a terminal: scripts (piped stdin, ``--json``),
+    explicit interface flags, and ``--yes`` all keep the silent defaults,
+    and re-running init on an existing node never re-prompts.
+    """
+    if getattr(args, "yes", False):
+        return False
+    if _json_mode(args):
+        return False
+    if config.rns_config_file.exists():
+        return False
+    if (
+        getattr(args, "tcp_listen", None) is not None
+        or getattr(args, "tcp_connect", None) is not None
+        or getattr(args, "no_auto_interface", False)
+    ):
+        return False
+    return sys.stdin.isatty()
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    if _setup_dialogue_wanted(args, config):
+        run_setup_dialogue(args, config)
     config.prepare()
 
     auto_interface = not getattr(args, "no_auto_interface", False)
