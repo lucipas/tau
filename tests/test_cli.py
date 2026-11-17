@@ -8733,3 +8733,207 @@ def test_fetch_running_bounds_reply_wait(tmp_path, monkeypatch):
     assert result == {"ok": True}
     assert seen["reply_timeout"] == 75.0
     assert str(seen["path"]).endswith("media.sock")
+
+
+# -- live location beacons (issue #468) -------------------------------------
+
+BEACON_PEER = "ab" * 16
+BEACON_PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def _seed_beacon(tmp_path, **kwargs):
+    from tau.beacons import Beacons, save_beacons
+    from tau.config import TauConfig
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    beacons = Beacons()
+    beacon = beacons.start(
+        target=kwargs.pop("target", BEACON_PEER),
+        target_kind=kwargs.pop("target_kind", "dm"),
+        location=kwargs.pop("location", BEACON_PIN),
+        now=kwargs.pop("now", time.time()),
+        **kwargs,
+    )
+    save_beacons(config.beacons_path, beacons)
+    return config, beacon
+
+
+def test_parser_beacon_arguments():
+    parser = cli.build_parser()
+    start = parser.parse_args(
+        [
+            "beacon", "start", "alice",
+            "--location", "34.05,-83.88 Rock Springs Park",
+            "--coarse", "--duration-mins", "30", "--interval-mins", "10",
+        ]
+    )
+    assert start.beacon_command == "start"
+    assert start.peer == "alice"
+    assert start.func is cli.cmd_beacon_start
+    assert start.coarse is True
+    assert start.duration_mins == 30.0
+    assert start.interval_mins == 10.0
+    stop = parser.parse_args(["beacon", "stop", "--group", "crew"])
+    assert stop.beacon_command == "stop"
+    assert stop.group == "crew"
+    assert stop.func is cli.cmd_beacon_stop
+    update = parser.parse_args(
+        ["beacon", "update", BEACON_PEER, "--location", "35,-84"]
+    )
+    assert update.beacon_command == "update"
+    assert update.func is cli.cmd_beacon_update
+    listed = parser.parse_args(["beacon", "list"])
+    assert listed.beacon_command == "list"
+    assert listed.func is cli.cmd_beacon_list
+
+
+def test_beacon_list_shows_running_and_ended(tmp_path, capsys):
+    _seed_beacon(tmp_path)
+    code = cli.main(["beacon", "list", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Rock Springs Park" in out
+    assert "update(s) sent" in out
+
+
+def test_beacon_list_json(tmp_path, capsys):
+    _, beacon = _seed_beacon(tmp_path)
+    code = cli.main(
+        ["beacon", "list", "--json", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert len(data["beacons"]) == 1
+    assert data["beacons"][0]["id"] == beacon.id
+    assert data["beacons"][0]["active"] is True
+
+
+def test_beacon_stop_stops_running_beacon(tmp_path, capsys):
+    _seed_beacon(tmp_path)
+    code = cli.main(
+        ["beacon", "stop", BEACON_PEER, "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "Stopped the live beacon" in capsys.readouterr().out
+    # A second stop reports that nothing is running.
+    code = cli.main(
+        ["beacon", "stop", BEACON_PEER, "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "No beacon is running" in capsys.readouterr().out
+
+
+def test_beacon_update_refreshes_position(tmp_path, capsys):
+    _seed_beacon(tmp_path)
+    code = cli.main(
+        [
+            "beacon", "update", BEACON_PEER,
+            "--location", "35.0,-84.0 New Park",
+            "--data-dir", str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    assert "New Park" in capsys.readouterr().out
+    from tau.beacons import load_beacons
+    from tau.config import TauConfig
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    stored = load_beacons(config.beacons_path)
+    assert stored.beacons
+    beacon = next(iter(stored.beacons.values()))
+    assert beacon.location == {"lat": 35.0, "lon": -84.0, "name": "New Park"}
+
+
+def test_beacon_update_requires_a_position(tmp_path, capsys):
+    _seed_beacon(tmp_path)
+    code = cli.main(
+        ["beacon", "update", BEACON_PEER, "--data-dir", str(tmp_path / "node")]
+    )
+    assert code != 0
+
+
+class _FakeBeaconNode:
+    """One-shot node stub for `tau beacon start` (no Reticulum)."""
+
+    instances = []
+
+    def __init__(self, config, name=None):
+        from tau.mailbox import Mailbox
+
+        self.config = config
+        self.mailbox = Mailbox(config.mailbox_path)
+        self.started = False
+        self.start_calls = []
+        self.update_calls = []
+        _FakeBeaconNode.instances.append(self)
+
+    def start(self, **kwargs):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def start_beacon(self, target, location, **kwargs):
+        from tau.beacons import Beacons, load_beacons, save_beacons
+
+        self.start_calls.append((target, location, kwargs))
+        beacons = load_beacons(self.config.beacons_path)
+        beacon = beacons.start(
+            target=target,
+            target_kind="group" if kwargs.get("group") else "dm",
+            target_name="alice",
+            location=location,
+            coarse=kwargs.get("coarse", False),
+            duration=kwargs.get("duration", 3600.0),
+            interval=kwargs.get("interval", 300.0),
+            location_file=kwargs.get("location_file"),
+        )
+        save_beacons(self.config.beacons_path, beacons)
+        return beacon
+
+    def send_beacon_update(self, beacon, **kwargs):
+        self.update_calls.append(beacon.id)
+        beacon.updates_sent += 1
+        beacon.next_update_at = time.time() + beacon.interval
+        return {"ok": True, "queued": True, "id": "f" * 32}
+
+
+def test_beacon_start_sends_first_update_via_one_shot_node(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(cli, "TauNode", _FakeBeaconNode)
+    _FakeBeaconNode.instances.clear()
+    code = cli.main(
+        [
+            "beacon", "start", BEACON_PEER,
+            "--location", "34.05,-83.88 Rock Springs Park",
+            "--data-dir", str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Started a live beacon" in out
+    assert "first update queued" in out
+    node = _FakeBeaconNode.instances[0]
+    assert len(node.start_calls) == 1
+    assert len(node.update_calls) == 1
+    assert node.started is False
+
+
+def test_beacon_start_local_op_starts_and_sends(tmp_path):
+    node = _FakeBeaconNode(
+        TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    )
+    result = cli._beacon_start_local(
+        node,
+        target=BEACON_PEER,
+        location=BEACON_PIN,
+        duration=1800.0,
+        interval=300.0,
+    )
+    assert result["ok"] is True
+    assert result["beacon"]["target"] == BEACON_PEER
+    # The summary is taken after the first update went out.
+    assert result["beacon"]["updates_sent"] == 1
+    assert result["update"]["queued"] is True
+    assert node.update_calls == [result["beacon"]["id"]]

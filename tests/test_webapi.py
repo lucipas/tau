@@ -10629,6 +10629,24 @@ def test_stored_location_pin_survives_load_and_bad_shapes_drop():
     assert "location" not in _clean_stored_message(entry)
 
 
+def test_stored_beacon_marker_survives_load_and_bad_shapes_drop():
+    from tau.webapi import _clean_stored_message
+
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    marker = {"id": "aabbccdd", "expires_at": 1800003600, "seq": 2}
+    entry = _stored_message(1, "on my way", direction="out")
+    entry["location"] = pin
+    entry["beacon"] = marker
+    cleaned = _clean_stored_message(entry)
+    assert cleaned is not None
+    assert cleaned["beacon"] == marker
+
+    entry["beacon"] = {"id": "a", "seq": 0}
+    assert "beacon" not in _clean_stored_message(entry)
+    entry["beacon"] = "live"
+    assert "beacon" not in _clean_stored_message(entry)
+
+
 def test_corrupt_message_history_starts_empty(node, tmp_path):
     (tmp_path / "messages.json").write_text("{not json", encoding="utf-8")
     bridge = _bridge_with_data_dir(node, tmp_path)
