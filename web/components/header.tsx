@@ -11,6 +11,7 @@ import { BoltIcon, CopyButton, SignalIcon, StatusDot } from "./ui";
 export const CONSOLE_TABS = [
   { id: "chat", label: "chat" },
   { id: "social", label: "social" },
+  { id: "channels", label: "channels" },
   { id: "tools", label: "tools" },
   { id: "settings", label: "settings" },
 ] as const;

@@ -842,3 +842,41 @@ def test_parse_group_message_drops_malformed_poll_fields():
         poll_vote={"target": {"author": "ab" * 16, "sent_at": 1.0}},
     )
     assert parse_group_message(encode(bad_vote))["poll_vote"] is None
+
+def test_media_request_round_trip():
+    from tau.protocol import build_media_request, parse_media_request
+
+    digest = "ab" * 32
+    assert parse_media_request(build_media_request(digest)) == {"sha256": digest}
+    assert parse_media_request(build_media_request(digest.upper())) == {
+        "sha256": digest
+    }
+
+
+def test_media_request_rejects_bad_digest():
+    from tau.protocol import build_media_request, parse_media_request
+
+    with pytest.raises(ProtocolError):
+        build_media_request("not-a-digest")
+    with pytest.raises(ProtocolError):
+        build_media_request("zz" * 32)
+    with pytest.raises(ProtocolError):
+        parse_media_request(
+            encode(
+                {
+                    "type": "media_request",
+                    "v": protocol.PROTOCOL_VERSION,
+                    "sha256": "zz" * 32,
+                }
+            )
+        )
+    with pytest.raises(ProtocolError):
+        parse_media_request(
+            encode(
+                {
+                    "type": "file_offer",
+                    "v": protocol.PROTOCOL_VERSION,
+                    "sha256": "ab" * 32,
+                }
+            )
+        )

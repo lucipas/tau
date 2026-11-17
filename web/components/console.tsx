@@ -6,6 +6,7 @@ import { useTau } from "@/lib/use-tau";
 import type { Peer, TauMessage } from "@/lib/types";
 
 import { BundleSection } from "./bundle-section";
+import { ChannelsConsole } from "./channels-console";
 import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
 import { DmRequestsSection } from "./dm-requests-section";
@@ -97,7 +98,7 @@ export function Console() {
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
-  // Alt+1 through Alt+4 jump between tabs, like the header pills.
+  // Alt+1 through Alt+5 jump between tabs, like the header pills.
   // Ignored while typing in a field, so Alt+digit never hijacks
   // text entry.
   useEffect(() => {
@@ -109,7 +110,7 @@ export function Console() {
       const key = (event.code ?? "").startsWith("Digit")
         ? event.code.slice("Digit".length)
         : event.key;
-      const index = ["1", "2", "3", "4"].indexOf(key);
+      const index = ["1", "2", "3", "4", "5"].indexOf(key);
       if (index === -1) return;
       const target = event.target as HTMLElement | null;
       if (
@@ -742,6 +743,22 @@ export function Console() {
                 embedded
                 peers={tau.peers}
                 groups={tau.groups}
+              />
+            </div>
+            {/* Stays mounted like the social tab, so the channel
+                composer's draft and the selected channel survive a
+                tab switch, and live channel messages keep arriving
+                while another tab is shown. */}
+            <div
+              className={
+                tab === "channels"
+                  ? "thin-scroll min-h-0 flex-1 overflow-y-auto"
+                  : "hidden"
+              }
+            >
+              <ChannelsConsole
+                embedded
+                channelMessage={tau.channelMessage ?? null}
               />
             </div>
             {tab === "tools" ? (
