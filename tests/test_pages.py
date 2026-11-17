@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -10,21 +11,31 @@ import RNS
 
 from tau.pages import (
     MAX_PAGE_BYTES,
+    MAX_PAGE_FILE_BYTES,
+    MAX_PAGE_FILES,
     PageError,
     PageStore,
     build_page,
     clean_markdown,
+    clean_page_file,
+    clean_page_files,
     clean_title,
+    hash_page_file,
     load_local_page,
+    load_page_file,
+    make_page_file_entry,
     normalize_page,
     public_page,
     save_local_page,
+    store_page_file,
     title_from_markdown,
     verify_page,
 )
 from tau.protocol import (
     ProtocolError,
+    encode_page_file_request,
     encode_page_request,
+    parse_page_file_request,
     parse_page_request,
 )
 
@@ -281,3 +292,193 @@ def test_encode_page_request_rejects_negative_version():
 def test_encode_page_request_rejects_non_integer():
     with pytest.raises(ProtocolError, match="must be an integer"):
         encode_page_request("1")
+
+
+# -- linked files ----------------------------------------------------------
+
+
+def _file_entry(name="notes.txt", data=b"meetup notes"):
+    return make_page_file_entry(name, data)
+
+
+def test_make_page_file_entry_fields():
+    data = b"meetup notes"
+    entry = _file_entry(data=data)
+    assert entry["name"] == "notes.txt"
+    assert entry["sha256"] == hash_page_file(data)
+    assert entry["size"] == len(data)
+
+
+def test_make_page_file_entry_rejects_oversize():
+    with pytest.raises(PageError, match="larger than 32768 bytes"):
+        make_page_file_entry("big.bin", b"x" * (MAX_PAGE_FILE_BYTES + 1))
+
+
+def test_make_page_file_entry_rejects_empty():
+    with pytest.raises(PageError, match="must not be empty"):
+        make_page_file_entry("empty.txt", b"")
+
+
+def test_make_page_file_entry_rejects_path_name():
+    with pytest.raises(PageError, match="plain filename"):
+        make_page_file_entry("../escape.txt", b"x")
+
+
+def test_clean_page_files_accepts_up_to_five():
+    entries = [_file_entry(name=f"file{i}.txt") for i in range(MAX_PAGE_FILES)]
+    assert len(clean_page_files(entries)) == MAX_PAGE_FILES
+    assert clean_page_files(None) == []
+    assert clean_page_files([]) == []
+
+
+def test_clean_page_files_rejects_too_many():
+    entries = [_file_entry(name=f"file{i}.txt") for i in range(MAX_PAGE_FILES + 1)]
+    with pytest.raises(PageError, match="at most 5 files"):
+        clean_page_files(entries)
+
+
+def test_clean_page_files_rejects_duplicate_names():
+    with pytest.raises(PageError, match="names must be unique"):
+        clean_page_files([_file_entry(), _file_entry(data=b"other bytes")])
+
+
+def test_clean_page_files_rejects_bad_hash_and_size():
+    entry = _file_entry()
+    entry["sha256"] = "not hex"
+    with pytest.raises(PageError, match="sha256 must be 64 hex characters"):
+        clean_page_file(entry)
+    entry = _file_entry()
+    entry["size"] = MAX_PAGE_FILE_BYTES + 1
+    with pytest.raises(PageError, match="between 1 and 32768"):
+        clean_page_file(entry)
+
+
+def test_build_page_with_files_round_trip():
+    identity = make_identity()
+    entry = _file_entry()
+    doc = make_page(identity, files=[entry])
+    verified = verify_page(doc)
+    assert verified["files"] == [entry]
+    assert verified["v"] == 2
+    view = public_page(doc)
+    assert view["files"] == [entry]
+
+
+def test_verify_rejects_tampered_file_list():
+    identity = make_identity()
+    entry = _file_entry()
+    doc = make_page(identity, files=[entry])
+    doc["files"] = [_file_entry(name="swapped.txt", data=b"other bytes")]
+    with pytest.raises(PageError, match="signature is invalid"):
+        verify_page(doc)
+
+
+def test_verify_accepts_v1_page_without_files():
+    """A page signed before files existed still verifies.
+
+    Its signature covers the v1 field set (no ``files``), so the
+    digest is recomputed the v1 way; the verified document reports
+    an empty file list.
+    """
+    identity = make_identity()
+    unsigned = {
+        "v": 1,
+        "author": RNS.Destination.hash(identity, "tau", "node").hex(),
+        "key": identity.get_public_key().hex(),
+        "title": "Mesh meetup",
+        "markdown": "# Mesh meetup\n\nSaturday, 2pm.\n",
+        "version": 1,
+        "updated_at": 1000.0,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    doc = dict(unsigned)
+    doc["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    verified = verify_page(doc)
+    assert verified["v"] == 1
+    assert verified["files"] == []
+
+
+def test_verify_rejects_unsupported_page_version():
+    doc = make_page()
+    doc["v"] = 3
+    with pytest.raises(PageError, match="unsupported page version"):
+        verify_page(doc)
+
+
+def test_verify_rejects_v2_page_relabeled_as_v1():
+    """Flipping a v2 page's version to 1 must not verify.
+
+    The signature was computed over the v2 body (with the file
+    list); checked against the v1 field set it no longer matches,
+    so a downgrade cannot smuggle a file list past verification.
+    """
+    doc = make_page(files=[_file_entry()])
+    doc["v"] = 1
+    with pytest.raises(PageError, match="signature is invalid"):
+        verify_page(doc)
+
+
+# -- page file blob store ---------------------------------------------------
+
+
+def test_store_and_load_page_file(tmp_path):
+    data = b"meetup notes"
+    sha = hash_page_file(data)
+    path = store_page_file(tmp_path / "page-files", sha, data)
+    assert path is not None and path.is_file()
+    assert load_page_file(tmp_path / "page-files", sha) == data
+
+
+def test_store_page_file_rejects_wrong_hash(tmp_path):
+    with pytest.raises(PageError, match="do not match their SHA-256"):
+        store_page_file(tmp_path, hash_page_file(b"other"), b"bytes")
+
+
+def test_load_page_file_missing_is_none(tmp_path):
+    assert load_page_file(tmp_path, hash_page_file(b"nothing")) is None
+    assert load_page_file(None, hash_page_file(b"nothing")) is None
+
+
+def test_load_page_file_rejects_tampered_blob(tmp_path):
+    data = b"meetup notes"
+    sha = hash_page_file(data)
+    store_page_file(tmp_path, sha, data)
+    (tmp_path / sha).write_bytes(b"tampered")
+    assert load_page_file(tmp_path, sha) is None
+
+
+# -- page file request wire format -----------------------------------------
+
+
+def test_encode_decode_page_file_request_round_trip():
+    sha = hash_page_file(b"meetup notes")
+    raw = encode_page_file_request(sha)
+    assert parse_page_file_request(raw) == {"sha256": sha}
+    # Uppercase hex is accepted and normalised to lowercase.
+    assert parse_page_file_request(encode_page_file_request(sha.upper())) == {
+        "sha256": sha
+    }
+
+
+def test_parse_page_file_request_rejects_wrong_type():
+    with pytest.raises(
+        ProtocolError, match="expected a page_file_request payload"
+    ):
+        parse_page_file_request(b'{"type": "page_request", "sha256": "x"}')
+
+
+def test_encode_page_file_request_rejects_bad_hash():
+    with pytest.raises(ProtocolError, match="64 hex characters"):
+        encode_page_file_request("abc")
+    with pytest.raises(ProtocolError, match="not valid hex"):
+        encode_page_file_request("z" * 64)
+    with pytest.raises(ProtocolError, match="must be a hex string"):
+        encode_page_file_request(42)

@@ -145,9 +145,13 @@ from .pages import (
     PageError,
     PageStore,
     build_page,
+    clean_page_files,
     load_local_page,
+    load_page_file,
+    make_page_file_entry,
     public_page,
     save_local_page,
+    store_page_file,
     title_from_markdown,
 )
 from .profile import (
@@ -1096,6 +1100,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         help="page title (default: the file's first '# ' heading)",
     )
+    page_publish.add_argument(
+        "--file",
+        dest="attach",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="attach a small file to the page (at most 5, 32 KiB each; "
+        "repeatable; the new version's file list is exactly these files)",
+    )
     page_publish.set_defaults(func=cmd_page_publish)
 
     page_show = page_sub.add_parser(
@@ -1129,6 +1142,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for the peer to answer (default: %(default)s)",
     )
     page_fetch.set_defaults(func=cmd_page_fetch)
+
+    page_file = page_sub.add_parser(
+        "file",
+        parents=[common],
+        help="save one of a peer's linked page files to disk",
+    )
+    page_file.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer name, destination hash or hash prefix",
+    )
+    page_file.add_argument(
+        "selector",
+        metavar="NAME|SHA256",
+        help="linked file name, or a unique SHA-256 prefix",
+    )
+    page_file.add_argument(
+        "--to",
+        default=None,
+        metavar="PATH",
+        help="where to write the file (default: the file's name here)",
+    )
+    page_file.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite the destination file when it already exists",
+    )
+    page_file.add_argument(
+        "--cached",
+        action="store_true",
+        help="use the stored page and files without fetching from the peer",
+    )
+    page_file.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="how long to wait for the peer to answer (default: %(default)s)",
+    )
+    page_file.set_defaults(func=cmd_page_file)
 
     page_allow = page_sub.add_parser(
         "allow",
@@ -8476,8 +8529,18 @@ def cmd_profile_show(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _print_page(doc: Dict[str, Any], *, indent: str = "") -> None:
-    """Print one page document in text form (header + raw Markdown)."""
+def _print_page(
+    doc: Dict[str, Any],
+    *,
+    indent: str = "",
+    page_files_dir: Optional[Path] = None,
+) -> None:
+    """Print one page document in text form (header + raw Markdown).
+
+    Linked files are listed after the text, with whether this node
+    already holds their bytes — a fetched page lists its files even
+    before any of them is downloaded.
+    """
     print(f"{indent}title:   {doc['title'] or '—'}")
     print(
         f"{indent}version: {doc['version']} "
@@ -8486,6 +8549,21 @@ def _print_page(doc: Dict[str, Any], *, indent: str = "") -> None:
     print(f"{indent}author:  {doc['author']}")
     print()
     print(doc["markdown"])
+    files = doc.get("files", [])
+    if files:
+        print()
+        print(f"{indent}files:")
+        for entry in files:
+            held = (
+                load_page_file(page_files_dir, entry["sha256"]) is not None
+                if page_files_dir is not None
+                else False
+            )
+            state = "downloaded" if held else "not fetched"
+            print(
+                f"{indent}  - {entry['name']} "
+                f"({entry['size']} bytes, {state})"
+            )
 
 
 def cmd_page_publish(args: argparse.Namespace) -> int:
@@ -8494,8 +8572,12 @@ def cmd_page_publish(args: argparse.Namespace) -> int:
     The Markdown file is signed and written to the data directory; a
     serving node picks it up at its next fetch, and peers fetch the
     document over a link.  The title defaults to the file's first
-    ``# `` heading.  Linked files are not published yet — this slice
-    covers the page itself; file links stay for a follow-up.
+    ``# `` heading.  Each ``--file`` attaches one small file to the
+    page (at most five, 32 KiB each): its bytes are stored under
+    their SHA-256 and its name, hash and size are signed into the
+    page, so peers fetch exactly the bytes the author listed.  The
+    file list is the new version's list in full — republishing
+    without ``--file`` publishes a page with no linked files.
     """
     config = _make_config(args)
     identity = load_identity(config.identity_path)
@@ -8507,6 +8589,26 @@ def cmd_page_publish(args: argparse.Namespace) -> int:
         markdown = Path(args.file).expanduser().read_text(encoding="utf-8")
     except OSError as exc:
         raise NodeError(f"could not read page file: {exc}") from exc
+    attached_files: List[tuple] = []
+    for attached in getattr(args, "attach", None) or []:
+        try:
+            data = Path(attached).expanduser().read_bytes()
+        except OSError as exc:
+            raise NodeError(f"could not read page file: {exc}") from exc
+        try:
+            entry = make_page_file_entry(Path(attached).name, data)
+        except PageError as exc:
+            raise NodeError(str(exc)) from exc
+        attached_files.append((entry, data))
+    try:
+        entries = clean_page_files([entry for entry, _ in attached_files])
+    except PageError as exc:
+        raise NodeError(str(exc)) from exc
+    for entry, data in attached_files:
+        try:
+            store_page_file(config.page_files_dir, entry["sha256"], data)
+        except PageError as exc:
+            raise NodeError(str(exc)) from exc
     existing = load_local_page(config.page_path)
     title = (
         args.title
@@ -8519,6 +8621,7 @@ def cmd_page_publish(args: argparse.Namespace) -> int:
             identity,
             title=title,
             markdown=markdown,
+            files=entries,
             version=version,
         )
     except PageError as exc:
@@ -8532,6 +8635,8 @@ def cmd_page_publish(args: argparse.Namespace) -> int:
             + (f" — {doc['title']}" if doc["title"] else "")
             + "."
         )
+        for entry in entries:
+            print(f"  linked {entry['name']} ({entry['size']} bytes)")
         print("  Peers can fetch it with `tau page <your name>`.")
     return _EXIT_OK
 
@@ -8552,7 +8657,7 @@ def cmd_page_show(args: argparse.Namespace) -> int:
     if _json_mode(args):
         _emit(public_page(doc), True)
     else:
-        _print_page(doc)
+        _print_page(doc, page_files_dir=config.page_files_dir)
     return _EXIT_OK
 
 
@@ -8620,9 +8725,128 @@ def cmd_page_fetch(args: argparse.Namespace) -> int:
             True,
         )
     else:
-        _print_page(page)
+        _print_page(page, page_files_dir=config.page_files_dir)
         if fetch_error is not None:
             print(f"  (showing the stored copy — fetch failed: {fetch_error})")
+    return _EXIT_OK
+
+
+def _resolve_page_file_entry(
+    page: Dict[str, Any], selector: str
+) -> Dict[str, Any]:
+    """The linked-file entry named by *selector*: exact name, or a
+    unique SHA-256 prefix.  Raises :class:`NodeError` when nothing
+    matches, or when a prefix matches more than one file.
+    """
+    entries = page.get("files", [])
+    for entry in entries:
+        if entry["name"] == selector:
+            return entry
+    matches = [
+        entry for entry in entries if entry["sha256"].startswith(selector)
+    ]
+    if not matches:
+        raise NodeError(f"no linked file named {selector!r} on this page")
+    if len(matches) > 1:
+        names = ", ".join(entry["name"] for entry in matches)
+        raise NodeError(
+            f"{selector!r} matches more than one linked file: {names}"
+        )
+    return matches[0]
+
+
+def cmd_page_file(args: argparse.Namespace) -> int:
+    """Save one of a peer's linked page files to disk.
+
+    The peer's page is fetched live first (unless ``--cached``), which
+    also fetches its linked files; a file whose bytes are already
+    stored is used as-is.  The file is written to ``--to`` (default:
+    the file's name in the current directory) and never overwrites
+    an existing file unless ``--force`` is given.
+    """
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    store = PageStore(config.pages_path)
+    fetch_error: Optional[str] = None
+    if not getattr(args, "cached", False):
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            node.request_page(peer, timeout=args.timeout)
+        except NodeError as exc:
+            fetch_error = str(exc)
+        finally:
+            node.stop()
+        # The node saved any newer page it fetched; re-read the
+        # store rather than trusting the in-memory copy above.
+        store = PageStore(config.pages_path)
+    page = store.get(peer.hexhash)
+    if page is None:
+        if fetch_error is not None:
+            raise NodeError(
+                f"could not fetch a page from {peer.display_name}: "
+                f"{fetch_error}"
+            )
+        raise NodeError(f"{peer.display_name} has no personal page yet.")
+    entry = _resolve_page_file_entry(page, args.selector)
+    data = load_page_file(config.page_files_dir, entry["sha256"])
+    if data is None and not getattr(args, "cached", False):
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            data = node.request_page_file(
+                peer, entry, timeout=args.timeout
+            )
+        except NodeError as exc:
+            fetch_error = str(exc)
+        finally:
+            node.stop()
+    if data is None:
+        if fetch_error is not None:
+            raise NodeError(
+                f"could not fetch {entry['name']} from "
+                f"{peer.display_name}: {fetch_error}"
+            )
+        raise NodeError(
+            f"{entry['name']} is listed on {peer.display_name}'s page "
+            "but its bytes are not stored here; fetch the page live "
+            "to download it."
+        )
+    destination = (
+        Path(args.to).expanduser()
+        if getattr(args, "to", None) is not None
+        else Path.cwd() / entry["name"]
+    )
+    if destination.exists() and not getattr(args, "force", False):
+        raise NodeError(
+            f"{destination} already exists; pass --force to overwrite it"
+        )
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+    except OSError as exc:
+        raise NodeError(f"could not write {destination}: {exc}") from exc
+    if _json_mode(args):
+        _emit(
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "file": entry,
+                "path": str(destination),
+            },
+            True,
+        )
+    else:
+        print(
+            f"Saved {entry['name']} ({entry['size']} bytes) "
+            f"from {peer.display_name} to {destination}."
+        )
     return _EXIT_OK
 
 

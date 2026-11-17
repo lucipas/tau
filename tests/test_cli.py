@@ -2031,6 +2031,285 @@ def test_page_publish_rejects_oversize_file(tmp_path, capsys):
     assert load_local_page(data_dir / "page.json") is None
 
 
+def test_parser_page_file_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["page", "file", "alice", "notes.txt", "--to", "out.txt", "--force"]
+    )
+    assert args.page_command == "file"
+    assert args.target == "alice"
+    assert args.selector == "notes.txt"
+    assert args.to == "out.txt"
+    assert args.force is True
+    assert args.cached is False
+    assert args.timeout == 15.0
+    assert args.func is cli.cmd_page_file
+
+    publish = parser.parse_args(
+        ["page", "publish", "meetup.md", "--file", "a.txt", "--file", "b.txt"]
+    )
+    assert publish.attach == ["a.txt", "b.txt"]
+    assert publish.file == "meetup.md"
+    assert publish.func is cli.cmd_page_publish
+
+
+def test_page_publish_with_files_end_to_end(tmp_path, capsys):
+    import json
+
+    from tau.pages import hash_page_file, load_local_page, load_page_file
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    page_file = tmp_path / "meetup.md"
+    page_file.write_text(
+        "# Mesh meetup\n\nSaturday, 2pm, Rock Springs Park.\n",
+        encoding="utf-8",
+    )
+    notes = tmp_path / "notes.txt"
+    notes.write_bytes(b"meetup notes")
+    flyer = tmp_path / "flyer.txt"
+    flyer.write_bytes(b"bring a chair")
+
+    code = cli.main(
+        [
+            "page",
+            "publish",
+            str(page_file),
+            "--file",
+            str(notes),
+            "--file",
+            str(flyer),
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Published page version 1 — Mesh meetup." in out
+    assert "linked notes.txt (12 bytes)" in out
+    assert "linked flyer.txt (13 bytes)" in out
+
+    stored = load_local_page(data_dir / "page.json")
+    assert stored is not None
+    assert len(stored["files"]) == 2
+    assert stored["files"][0]["name"] == "notes.txt"
+    assert stored["files"][0]["sha256"] == hash_page_file(b"meetup notes")
+    assert stored["files"][0]["size"] == 12
+    assert (
+        load_page_file(data_dir / "page-files", stored["files"][0]["sha256"])
+        == b"meetup notes"
+    )
+
+    code = cli.main(["page", "show", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "notes.txt (12 bytes, downloaded)" in out
+    assert "flyer.txt (13 bytes, downloaded)" in out
+
+    code = cli.main(["page", "show", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in payload["files"]] == [
+        "notes.txt",
+        "flyer.txt",
+    ]
+
+
+def test_page_publish_rejects_too_many_and_duplicate_files(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    page_file = tmp_path / "meetup.md"
+    page_file.write_text("# Mesh meetup\n\nSaturday.\n", encoding="utf-8")
+    attached = []
+    for index in range(6):
+        path = tmp_path / f"file{index}.txt"
+        path.write_bytes(b"x")
+        attached.append(str(path))
+    code = cli.main(
+        ["page", "publish", str(page_file), "--data-dir", str(data_dir)]
+        + [item for path in attached for item in ("--file", path)]
+    )
+    assert code != 0
+
+    first = tmp_path / "a" / "notes.txt"
+    first.parent.mkdir()
+    first.write_bytes(b"one")
+    second = tmp_path / "b" / "notes.txt"
+    second.parent.mkdir()
+    second.write_bytes(b"two")
+    code = cli.main(
+        [
+            "page",
+            "publish",
+            str(page_file),
+            "--file",
+            str(first),
+            "--file",
+            str(second),
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code != 0
+
+
+def test_page_publish_rejects_oversize_attached_file(tmp_path, capsys):
+    from tau.pages import load_local_page
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    page_file = tmp_path / "meetup.md"
+    page_file.write_text("# Mesh meetup\n\nSaturday.\n", encoding="utf-8")
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * (32 * 1024 + 1))
+    code = cli.main(
+        [
+            "page",
+            "publish",
+            str(page_file),
+            "--file",
+            str(big),
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code != 0
+    assert load_local_page(data_dir / "page.json") is None
+
+
+def _seed_peer_page(tmp_path, data_dir, *, with_blob=True):
+    """A peer 'alice' with a stored signed page linking one file."""
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.pages import (
+        PageStore,
+        build_page,
+        make_page_file_entry,
+        store_page_file,
+    )
+    from tau.peers import PeerRegistry
+    from tau.protocol import APP_NAME, ASPECT
+
+    config = TauConfig.resolve(data_dir=data_dir)
+    identity = RNS.Identity()
+    destination = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    data = b"meetup notes and map"
+    entry = make_page_file_entry("notes.txt", data)
+    doc = build_page(
+        identity,
+        title="Mesh meetup",
+        markdown="# Mesh meetup\n\nSaturday, 2pm.\n",
+        files=[entry],
+        version=1,
+        updated_at=1000.0,
+    )
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(destination, identity.get_public_key(), name="alice", now=1.0)
+    registry.save()
+    store = PageStore(config.pages_path)
+    store.store(doc)
+    store.save()
+    if with_blob:
+        store_page_file(config.page_files_dir, entry["sha256"], data)
+    return entry, data
+
+
+def test_page_file_cached_end_to_end(tmp_path, capsys):
+    import json
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    entry, data = _seed_peer_page(tmp_path, data_dir)
+    out = tmp_path / "out.txt"
+
+    code = cli.main(
+        [
+            "page",
+            "file",
+            "alice",
+            "notes.txt",
+            "--cached",
+            "--to",
+            str(out),
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert out.read_bytes() == data
+    assert "Saved notes.txt (20 bytes)" in capsys.readouterr().out
+
+    # The same file by SHA-256 prefix, in JSON mode.
+    out2 = tmp_path / "out2.txt"
+    code = cli.main(
+        [
+            "page",
+            "file",
+            "alice",
+            entry["sha256"][:12],
+            "--cached",
+            "--to",
+            str(out2),
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["file"]["name"] == "notes.txt"
+    assert out2.read_bytes() == data
+
+    # Refuses to overwrite without --force.
+    code = cli.main(
+        [
+            "page",
+            "file",
+            "alice",
+            "notes.txt",
+            "--cached",
+            "--to",
+            str(out),
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code != 0
+
+
+def test_page_file_cached_without_blob_fails(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    _seed_peer_page(tmp_path, data_dir, with_blob=False)
+    out = tmp_path / "out.txt"
+    code = cli.main(
+        [
+            "page",
+            "file",
+            "alice",
+            "notes.txt",
+            "--cached",
+            "--to",
+            str(out),
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code != 0
+    assert not out.exists()
+
+    code = cli.main(
+        [
+            "page",
+            "file",
+            "alice",
+            "missing.txt",
+            "--cached",
+            "--to",
+            str(out),
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code != 0
+
+
 def test_profile_set_and_show_end_to_end(tmp_path, capsys):
     from tau.profile import load_local_profile
 
