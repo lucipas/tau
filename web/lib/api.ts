@@ -25,7 +25,6 @@ import type {
   DisappearingDefaults,
   Group,
   GroupChangeResult,
-  GroupPollTally,
   HeldEnvelope,
   JoinRequest,
   LeftGroups,
@@ -342,15 +341,22 @@ export async function setGroupTopic(group: string, topic?: string, clear = false
   return post("/api/groups/topic", clear ? { group, clear: true } : { group, topic });
 }
 
+/** Voting/closing a group poll returns the sent vote/close legs + node response. */
+export interface GroupPollActionResult {
+  ok: boolean;
+  messages: ChatMessage[];
+  response: Record<string, unknown>;
+}
+
 export async function voteGroupPoll(
   group: string,
   poll: string,
   option: number | string,
-): Promise<GroupPollTally> {
+): Promise<GroupPollActionResult> {
   return post("/api/groups/vote", { group, poll, option });
 }
 
-export async function closeGroupPoll(group: string, poll: string): Promise<GroupPollTally> {
+export async function closeGroupPoll(group: string, poll: string): Promise<GroupPollActionResult> {
   return post("/api/groups/close-poll", { group, poll });
 }
 

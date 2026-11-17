@@ -145,12 +145,20 @@ export interface PeerInfo {
 }
 
 export interface PingResult {
-  /** Shape returned by WebBridge.ping: reachability + round-trip. */
-  ok?: boolean;
-  reachable?: boolean;
-  rtt_ms?: number;
-  rtt?: number;
-  [key: string]: unknown;
+  /** Shape returned by WebBridge.ping. */
+  ok: boolean;
+  /** Peer's public_dict (destination, name, last_seen, age, hops...). */
+  peer: {
+    destination: string;
+    name: string;
+    last_seen: number;
+    age: number;
+    hops: number | null;
+    protocol: number | null;
+    lxmf: string | null;
+  };
+  server?: unknown;
+  rtt_ms: number | null;
 }
 
 export interface SafetyNumberResult {
