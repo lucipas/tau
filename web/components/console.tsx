@@ -131,6 +131,10 @@ export function Console() {
   }, []);
 
   const customPicked = useRef(false);
+  // A peer click from another tab asks for the composer only once
+  // the chat tab has rendered: the composer is hidden until then,
+  // so focusing inside selectPeer is silently skipped.
+  const focusComposerRef = useRef(false);
   // The selection as it is now, for async completions that must not act
   // on a conversation the user has since switched to.
   const targetRef = useRef(target);
@@ -309,6 +313,26 @@ export function Console() {
     ).catch(() => undefined);
   }, [target, mode, openUnread, markRead, tab]);
 
+  function focusComposer() {
+    const textarea = document.getElementById(
+      "message-text",
+    ) as HTMLTextAreaElement | null;
+    textarea?.focus();
+    if (window.innerWidth < 1024) {
+      textarea?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }
+
+  // The tab switch in selectPeer renders after the click handler
+  // returns: when it lands on chat, focus the composer the click
+  // asked for. Already on chat the click focuses directly, so no
+  // flag is set and a later return to chat does not steal focus.
+  useEffect(() => {
+    if (tab !== "chat" || !focusComposerRef.current) return;
+    focusComposerRef.current = false;
+    focusComposer();
+  }, [tab]);
+
   function selectPeer(destination: string) {
     customPicked.current = false;
     setMode("peer");
@@ -327,12 +351,13 @@ export function Console() {
     // Opening the conversation advances its read cursor on the node,
     // so the badge clears. A failed call leaves the badge in place.
     void tau.markRead(destination).catch(() => undefined);
-    const textarea = document.getElementById(
-      "message-text",
-    ) as HTMLTextAreaElement | null;
-    textarea?.focus();
-    if (window.innerWidth < 1024) {
-      textarea?.scrollIntoView({ behavior: "smooth", block: "center" });
+    // Focus after the tab switch renders: from another tab the
+    // composer is still hidden here, so the immediate focus is
+    // skipped and the effect above focuses once chat is shown.
+    if (tab === "chat") {
+      focusComposer();
+    } else {
+      focusComposerRef.current = true;
     }
   }
 
