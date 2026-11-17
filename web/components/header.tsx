@@ -12,6 +12,7 @@ export const CONSOLE_TABS = [
   { id: "chat", label: "chat" },
   { id: "social", label: "social" },
   { id: "channels", label: "channels" },
+  { id: "pages", label: "pages" },
   { id: "tools", label: "tools" },
   { id: "settings", label: "settings" },
 ] as const;

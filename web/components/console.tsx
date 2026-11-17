@@ -16,6 +16,7 @@ import { CONSOLE_TABS, Header, type ConsoleTab } from "./header";
 import { MessageFeed } from "./message-feed";
 import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
+import { PagesConsole } from "./pages-console";
 import { PeerSidebar } from "./peer-sidebar";
 import { SettingsSection } from "./settings-section";
 import { SocialConsole } from "./social-console";
@@ -99,7 +100,7 @@ export function Console() {
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
-  // Alt+1 through Alt+5 jump between tabs, like the header pills.
+  // Alt+1 through Alt+6 jump between tabs, like the header pills.
   // Ignored while typing in a field, so Alt+digit never hijacks
   // text entry.
   useEffect(() => {
@@ -111,7 +112,7 @@ export function Console() {
       const key = (event.code ?? "").startsWith("Digit")
         ? event.code.slice("Digit".length)
         : event.key;
-      const index = ["1", "2", "3", "4", "5"].indexOf(key);
+      const index = ["1", "2", "3", "4", "5", "6"].indexOf(key);
       if (index === -1) return;
       const target = event.target as HTMLElement | null;
       if (
@@ -777,6 +778,17 @@ export function Console() {
                 embedded
                 channelMessage={tau.channelMessage ?? null}
               />
+            </div>
+            {/* Stays mounted like the channels tab, so the selected
+                page and the fetch draft survive a tab switch. */}
+            <div
+              className={
+                tab === "pages"
+                  ? "thin-scroll min-h-0 flex-1 overflow-y-auto"
+                  : "hidden"
+              }
+            >
+              <PagesConsole embedded peers={tau.peers} />
             </div>
             {tab === "tools" ? (
               <div className="thin-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto lg:pr-1">
