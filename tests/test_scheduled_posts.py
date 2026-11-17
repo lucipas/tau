@@ -791,7 +791,7 @@ def test_cancel_removes_stored_post_after_failed_publish(tmp_path, capsys):
     # must remove that stored post too, not just the queue entry.
     from tau.config import TauConfig
     from tau.identity import load_identity
-    from tau.tangents.tan import TanApp, deleted_targets, init_db
+    from tau.tangents.tan import TanApp, deleted_targets, get_post, init_db
 
     data_dir = tmp_path / "node"
     assert _run_cli(data_dir, ["init", "--json"]) == 0
@@ -824,19 +824,23 @@ def test_cancel_removes_stored_post_after_failed_publish(tmp_path, capsys):
     assert len(load_scheduled_posts(queue_path)) == 0
     conn = init_db(config.social_db_path)
     try:
-        assert stored_hash in deleted_targets(conn)
+        # Cancelling deletes the stored post, and deleting purges its
+        # row — the text is gone, not just hidden — while the signed
+        # delete entry stays as the tombstone.
+        assert get_post(conn, stored_hash) is None
+        assert deleted_targets(conn) == set()
     finally:
         conn.close()
 
 
 def test_cancelled_post_syncs_only_as_deleted(tmp_path, capsys):
     # Cancellation after a publish attempt writes a Tan delete, not a
-    # removal: the post stays stored so the chain stays verifiable,
-    # but the sync feed carries the delete entry with it, so a peer
-    # that syncs learns the deletion — and the display feed hides it.
+    # removal: deleting purges the post row from the store, but the
+    # sync feed carries the delete entry, so a peer that syncs learns
+    # the deletion — and the display feed hides it.
     from tau.config import TauConfig
     from tau.identity import load_identity
-    from tau.tangents.tan import TanApp, deleted_targets, feed, init_db
+    from tau.tangents.tan import TanApp, deleted_targets, feed, get_post, init_db
 
     data_dir = tmp_path / "node"
     assert _run_cli(data_dir, ["init", "--json"]) == 0
@@ -865,11 +869,12 @@ def test_cancelled_post_syncs_only_as_deleted(tmp_path, capsys):
     assert _run_cli(data_dir, ["tan", "cancel-scheduled", post.id]) == 0
     conn = init_db(config.social_db_path)
     try:
-        assert stored_hash in deleted_targets(conn)
-        # What /tan/feed serves to a syncing peer: the post is still
-        # there (chain verifiable), but so is its delete entry.
+        # The post row is purged, so the sync feed carries only the
+        # tombstone — the post itself never lands on a peer.
+        assert get_post(conn, stored_hash) is None
+        assert deleted_targets(conn) == set()
         synced = feed(conn)
-        assert any(p["hash"] == stored_hash for p in synced)
+        assert all(p["hash"] != stored_hash for p in synced)
         assert any(
             p.get("kind") == "delete" and p.get("target") == stored_hash
             for p in synced

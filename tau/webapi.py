@@ -194,7 +194,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
@@ -1179,6 +1179,12 @@ class WebBridge:
         self._server: Optional[_WebServer] = None
         self._thread: Optional[threading.Thread] = None
         self._closing = threading.Event()
+        # Live /ws connections, guarded by _ws_lock: each handler
+        # registers its per-connection stop callable here so bridge
+        # shutdown can close a connection whose sender is blocked in
+        # wfile.flush() for a client that stopped reading (see #425).
+        self._ws_lock = threading.Lock()
+        self._ws_stops: Set[Callable[[], None]] = set()
         # Backup bookkeeping, guarded by _backup_lock: archives being built,
         # archives awaiting download, and the temp paths to clean up on stop.
         self._backup_lock = threading.Lock()
@@ -1218,10 +1224,37 @@ class WebBridge:
         log.info("tau web console listening on %s", self.url)
         return self.url
 
+    def _register_ws_connection(self, stop: Callable[[], None]) -> None:
+        """Track one live /ws connection so :meth:`stop` can close it."""
+        with self._ws_lock:
+            self._ws_stops.add(stop)
+
+    def _unregister_ws_connection(self, stop: Callable[[], None]) -> None:
+        with self._ws_lock:
+            self._ws_stops.discard(stop)
+
+    def _close_ws_connections(self) -> None:
+        """Shut down every live /ws connection.
+
+        A sender blocked in ``wfile.flush()`` for a client that stopped
+        reading reaches neither the pump's own stop path nor the
+        ``closing`` flag; shutting the socket down fails the blocked
+        write (and wakes the reader parked in ``read_message``) so the
+        handler unwinds instead of outliving bridge shutdown.
+        """
+        with self._ws_lock:
+            stops = list(self._ws_stops)
+        for stop in stops:
+            try:
+                stop()
+            except OSError:
+                pass
+
     def stop(self) -> None:
         with self._backup_lock:
             self._closing.set()
         self.bus.close()
+        self._close_ws_connections()
         server = self._server
         self._server = None
         if server is not None:
@@ -2544,11 +2577,11 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             _NOT_DELETED,
+            _delete_entry_exists,
             KIND_LIKE,
             KIND_UNLIKE,
             TIMELINE_KINDS_SQL,
             TanError,
-            deleted_targets,
             muted_author_set,
             post_likers,
         )
@@ -2564,8 +2597,6 @@ class WebBridge:
         exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
-            if clean in deleted_targets(conn):
-                raise TanError(f"post has been deleted: {clean!r}")
             # A target is visible only when the timeline would show it:
             # linked, a timeline kind, not deleted by its author, and by
             # an author who is neither muted nor blocked.
@@ -2575,7 +2606,18 @@ class WebBridge:
                 (clean,),
             ).fetchone()
             hidden = muted_author_set(conn) | blocked
-            if row is None or exclude_all or str(row["author"]) in hidden:
+            if row is None:
+                # The row is gone when its author deleted it: deleting
+                # purges the post, so the tombstone is the only trace
+                # left.  The row query already excludes a retained post
+                # its author deleted, and a delete from anyone else
+                # leaves the row visible — so a missing row with a
+                # linked delete entry still reports deleted, not
+                # unknown, matching the like endpoint.
+                if _delete_entry_exists(conn, clean):
+                    raise TanError(f"post has been deleted: {clean!r}")
+                raise TanError(f"unknown post: {clean!r}")
+            if exclude_all or str(row["author"]) in hidden:
                 raise TanError(f"unknown post: {clean!r}")
             app = self._tan_app()
             if app is not None:
@@ -2645,10 +2687,10 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             _NOT_DELETED,
+            _delete_entry_exists,
             KIND_REPOST,
             TIMELINE_KINDS_SQL,
             TanError,
-            deleted_targets,
             muted_author_set,
             post_reposters,
         )
@@ -2664,8 +2706,6 @@ class WebBridge:
         exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
-            if clean in deleted_targets(conn):
-                raise TanError(f"post has been deleted: {clean!r}")
             # A target is visible only when the timeline would show it:
             # linked, a timeline kind, not deleted by its author, and by
             # an author who is neither muted nor blocked.
@@ -2675,7 +2715,18 @@ class WebBridge:
                 (clean,),
             ).fetchone()
             hidden = muted_author_set(conn) | blocked
-            if row is None or exclude_all or str(row["author"]) in hidden:
+            if row is None:
+                # The row is gone when its author deleted it: deleting
+                # purges the post, so the tombstone is the only trace
+                # left.  The row query already excludes a retained post
+                # its author deleted, and a delete from anyone else
+                # leaves the row visible — so a missing row with a
+                # linked delete entry still reports deleted, not
+                # unknown, matching the like endpoint.
+                if _delete_entry_exists(conn, clean):
+                    raise TanError(f"post has been deleted: {clean!r}")
+                raise TanError(f"unknown post: {clean!r}")
+            if exclude_all or str(row["author"]) in hidden:
                 raise TanError(f"unknown post: {clean!r}")
             app = self._tan_app()
             if app is not None:
@@ -2747,11 +2798,11 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             _NOT_DELETED,
+            _delete_entry_exists,
             KIND_QUOTE,
             TIMELINE_KINDS_SQL,
             TanError,
             ancestry_hidden,
-            deleted_targets,
             get_post,
             muted_author_set,
             post_quoters,
@@ -2769,8 +2820,6 @@ class WebBridge:
         exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
-            if clean in deleted_targets(conn):
-                raise TanError(f"post has been deleted: {clean!r}")
             # A target is visible only when the timeline would show it:
             # linked, a timeline kind, not deleted by its author, and by
             # an author who is neither muted nor blocked.
@@ -2780,7 +2829,18 @@ class WebBridge:
                 (clean,),
             ).fetchone()
             hidden = muted_author_set(conn) | blocked
-            if row is None or exclude_all or str(row["author"]) in hidden:
+            if row is None:
+                # The row is gone when its author deleted it: deleting
+                # purges the post, so the tombstone is the only trace
+                # left.  The row query already excludes a retained post
+                # its author deleted, and a delete from anyone else
+                # leaves the row visible — so a missing row with a
+                # linked delete entry still reports deleted, not
+                # unknown, matching the like endpoint.
+                if _delete_entry_exists(conn, clean):
+                    raise TanError(f"post has been deleted: {clean!r}")
+                raise TanError(f"unknown post: {clean!r}")
+            if exclude_all or str(row["author"]) in hidden:
                 raise TanError(f"unknown post: {clean!r}")
             app = self._tan_app()
             if app is not None:
@@ -12106,6 +12166,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             target=pump, name="tau-ws-pump", daemon=True
         )
         try:
+            self.bridge._register_ws_connection(stop)
+            # A shutdown that started between the handshake and this
+            # registration is not in the bridge's snapshot; bail out
+            # instead of serving a connection stop() will never close.
+            if self.bridge.closing:
+                return
             if not send_json(
                 {
                     "type": "snapshot",
@@ -12139,7 +12205,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # Text frames from the client are a no-op: a future
                 # client message must not mutate node state unasked.
         finally:
+            # Shut the socket down before unregistering: a sender
+            # blocked in a write to a non-reading client must be failed
+            # here, or bridge shutdown can miss it — the handler may
+            # unregister between the bridge's snapshot of live
+            # connections and its shutdown of them. The join below
+            # then returns promptly instead of waiting on the sender.
+            stop()
             stopped.set()
+            self.bridge._unregister_ws_connection(stop)
             try:
                 subscriber.put_nowait(None)
             except queue.Full:

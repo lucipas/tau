@@ -8263,6 +8263,9 @@ def _send_via_local_node(
     send_after: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    log.info("starting a local one-shot node (data dir %s)", config.data_dir)
     node = TauNode(config, name=config.name)
     node.start()
     results: List[Dict[str, Any]] = []
@@ -8275,6 +8278,7 @@ def _send_via_local_node(
             # pre-existing id (e.g. one it holds a sealed copy of) is
             # treated as delivered — the link request succeeded.
             queued_before = {entry.id for entry in node.mailbox.outbox_list()}
+            started = time.monotonic()
             try:
                 reply_to = None
                 if getattr(args, "reply_to", None):
@@ -8282,14 +8286,21 @@ def _send_via_local_node(
                         node,
                         target,
                         args.reply_to,
-                        float(getattr(args, "discover_timeout", 10.0)),
+                        discover_timeout,
                     )
                     reply_ids[target] = reply_to["id"]
+                log.debug(
+                    "sending to %s via the local node "
+                    "(timeout %.0fs, discover %.0fs)",
+                    target,
+                    timeout,
+                    discover_timeout,
+                )
                 response = node.send_message(
                     target,
                     text,
-                    timeout=float(getattr(args, "timeout", 20.0)),
-                    discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
                     queue=not getattr(args, "no_queue", False),
                     in_reply_to=reply_to,
                     expires_at=expires_at,
@@ -8297,6 +8308,12 @@ def _send_via_local_node(
                     send_after=send_after,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
+                log.debug(
+                    "send to %s failed after %.2fs: %s",
+                    target,
+                    time.monotonic() - started,
+                    exc,
+                )
                 if len(targets) == 1:
                     # Single recipient keeps the historical behaviour:
                     # the error reaches main() and exits non-zero.
@@ -8308,15 +8325,28 @@ def _send_via_local_node(
                 # remaining recipients.
                 results.append({"target": target, "ok": False, "error": str(exc)})
                 continue
-            results.append(
-                _finalize_send_result(
-                    response,
-                    target=target,
-                    expires_at=expires_at,
-                    queued_before=queued_before,
-                )
+            result = _finalize_send_result(
+                response,
+                target=target,
+                expires_at=expires_at,
+                queued_before=queued_before,
             )
+            if result.get("queued"):
+                outcome = f"queued (id {short_hash(str(result.get('id', '')))})"
+            else:
+                outcome = "delivered"
+            log.debug(
+                "send to %s finished in %.2fs: %s",
+                target,
+                time.monotonic() - started,
+                outcome,
+            )
+            results.append(result)
         if wait > 0:
+            queued = sum(1 for result in results if result.get("queued"))
+            log.debug(
+                "waiting up to %.1fs for %d queued send(s)", wait, queued
+            )
             _wait_for_queued_sends(node, results, wait)
         else:
             _reconcile_queued_sends(node, results, expires_at)
@@ -8340,15 +8370,25 @@ def _send_via_running_node(
     from .local_ipc import LocalIPCUnavailable
     from .local_send import send_running
 
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
     results: List[Dict[str, Any]] = []
     for target in targets:
+        started = time.monotonic()
         try:
+            log.debug(
+                "sending to %s via the running node's send socket "
+                "(timeout %.0fs, discover %.0fs)",
+                target,
+                timeout,
+                discover_timeout,
+            )
             result = send_running(
                 config.data_dir,
                 target=target,
                 text=text,
-                timeout=float(getattr(args, "timeout", 20.0)),
-                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
                 queue=not getattr(args, "no_queue", False),
                 expires_at=expires_at,
                 reply_to=getattr(args, "reply_to", None),
@@ -8361,6 +8401,12 @@ def _send_via_running_node(
                 "the running node stopped answering mid-send; retry the send"
             ) from exc
         except (NodeError, PeerError, MailboxError) as exc:
+            log.debug(
+                "send to %s failed after %.2fs: %s",
+                target,
+                time.monotonic() - started,
+                exc,
+            )
             if len(targets) == 1:
                 raise
             results.append({"target": target, "ok": False, "error": str(exc)})
@@ -8368,6 +8414,18 @@ def _send_via_running_node(
         reply_id = result.pop("_reply_id", None)
         if reply_id is not None:
             reply_ids[target] = reply_id
+        if result.get("queued"):
+            outcome = f"queued (id {short_hash(str(result.get('id', '')))})"
+        elif result.get("delivered") is False:
+            outcome = "sent (no delivery confirmation)"
+        else:
+            outcome = "delivered"
+        log.debug(
+            "send to %s finished in %.2fs: %s",
+            target,
+            time.monotonic() - started,
+            outcome,
+        )
         results.append(result)
     return results
 
@@ -8643,15 +8701,28 @@ def _send_routes_via_running_node(config: TauConfig) -> bool:
 
     has_socket = hasattr(socket, "AF_UNIX")
     if has_socket and send_server_available(config.data_dir):
+        log.debug("send socket answers; routing via the running node")
         return True
     config.prepare()
     if _instance_lock_free(config):
+        log.debug(
+            "no serving node holds the data directory; "
+            "starting a local one-shot node"
+        )
         return False
+    log.debug(
+        "data directory is locked; waiting for the serving node's send socket"
+    )
     deadline = time.monotonic() + _SEND_ROUTE_WAIT_SECONDS
     while True:
         if has_socket and send_server_available(config.data_dir):
+            log.debug("send socket answered while waiting; routing via the running node")
             return True
         if _instance_lock_free(config):
+            log.debug(
+                "data-directory lock freed while waiting; "
+                "starting a local one-shot node"
+            )
             return False
         if time.monotonic() >= deadline:
             break
@@ -8803,14 +8874,24 @@ def cmd_send(args: argparse.Namespace) -> int:
             return 2
     targets = args.to if isinstance(args.to, list) else [args.to]
     reply_ids: Dict[str, str] = {}
+    log.debug(
+        "send: %d target(s), kind=%s, wait=%.1fs, expires_at=%s, send_after=%s",
+        len(targets),
+        kind,
+        wait,
+        expires_at,
+        send_after,
+    )
     # A serving node owns the data directory: send through it instead of
     # starting a second Reticulum instance on the same identity.
     if _send_routes_via_running_node(config):
+        log.info("sending via the running node")
         results = _send_via_running_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after,
         )
     else:
+        log.info("sending via a local one-shot node")
         results = _send_via_local_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after,

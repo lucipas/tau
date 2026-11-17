@@ -31,6 +31,7 @@ from tau.mailbox import Mailbox
 from tau.node import NodeError
 from tau.peers import AmbiguousPeer, Peer, PeerError
 from tau.webapi import (
+    SUBSCRIBER_QUEUE_SIZE,
     PeerForgetBlocked,
     WebBridge,
     WebBridgeError,
@@ -4299,6 +4300,110 @@ def test_websocket_survives_idle_client(bridge):
         sock.close()
 
 
+def test_websocket_slow_client_does_not_outlive_bridge_stop(bridge):
+    # A client that stops reading must not keep the bridge alive: once
+    # its TCP buffers fill, the sender blocks in wfile.flush(), and
+    # bridge.stop() must still return promptly with the connection
+    # closed (see #425).
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # A small receive buffer caps the bytes in flight, so the sender
+    # blocks after a modest flood instead of megabytes of buffering.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.settimeout(5)
+    sock.connect(("127.0.0.1", bridge.port))
+    sock.sendall(
+        (
+            "GET /ws HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("latin-1")
+    )
+    buffer = _WSBuffer(sock)
+    try:
+        headers = buffer.read_until(b"\r\n\r\n")
+        assert headers.startswith(b"HTTP/1.1 101")
+        opcode, payload = _ws_read_frame(buffer)
+        assert opcode == 1
+        assert json.loads(payload)["type"] == "snapshot"
+        # Flood the stream and never read again: the sender drains the
+        # subscriber queue into the socket until the kernel send buffer
+        # fills, then blocks in wfile.flush(). The flood must attempt
+        # far more than the send buffer can absorb (several MiB) plus
+        # the subscriber queue, so the sender is parked in a write
+        # rather than merely behind.
+        flooding = threading.Event()
+        published = [0]
+
+        def flood() -> None:
+            while not flooding.is_set():
+                bridge.bus.publish(
+                    {"type": "status", "node": {"name": "x" * 1024}}
+                )
+                published[0] += 1
+
+        flooder = threading.Thread(target=flood, daemon=True)
+        flooder.start()
+        try:
+            deadline = time.monotonic() + 30
+            while published[0] < 65536 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert published[0] >= 65536, "flooder did not publish enough"
+            # Keep flooding a moment so the sender is parked in a
+            # write, then stop: a sender keeping up would drain the
+            # queue to empty within milliseconds.
+            time.sleep(1.0)
+            flooding.set()
+            flooder.join(timeout=5)
+            subscribers = list(bridge.bus._subscribers)
+            assert len(subscribers) == 1
+            assert (
+                subscribers[0].qsize() >= SUBSCRIBER_QUEUE_SIZE - 1
+            ), "sender was not blocked on the slow client"
+        finally:
+            flooding.set()
+            flooder.join(timeout=5)
+        stopped = []
+        stopper = threading.Thread(
+            target=lambda: (bridge.stop(), stopped.append(True)),
+            daemon=True,
+        )
+        stopper.start()
+        stopper.join(timeout=10)
+        assert not stopper.is_alive(), "bridge.stop() hung on a slow client"
+        assert stopped == [True]
+        # The sender was parked in wfile.flush(): on the fixed code the
+        # shutdown fails that write and the pump thread exits. Draining
+        # the client socket cannot be the check — reading frees window
+        # and unblocks the sender on its own, so the pump would drain
+        # its queue, notice bridge.closing, and exit even unfixed.
+        deadline = time.monotonic() + 5
+        while any(
+            thread.name == "tau-ws-pump" and thread.is_alive()
+            for thread in threading.enumerate()
+        ):
+            assert time.monotonic() < deadline, (
+                "ws pump thread outlived bridge.stop()"
+            )
+            time.sleep(0.05)
+        # With the pump gone the connection is closed: drain whatever
+        # the client already buffered, then expect EOF.
+        sock.settimeout(5)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                pytest.fail("server left the slow client's connection open")
+            if not chunk:
+                break
+            assert time.monotonic() < deadline
+    finally:
+        sock.close()
+
+
 def test_websocket_streams_snapshot_events_and_ping(bridge):
     sock = socket.create_connection(("127.0.0.1", bridge.port), timeout=5)
     try:
@@ -6548,8 +6653,8 @@ def test_tan_saved_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/saved")
         assert [item["text"] for item in payload["posts"]] == ["save me"]
 
-        # A post deleted after being saved stays in the list with its
-        # text blanked, so the save is not silently lost.
+        # A post deleted after being saved leaves the list with the
+        # post: deleting purges the save ref along with the post row.
         node.app = TanApp(node.config, identity, name="tester", gossip=False)
         status, _, payload = _json(
             bridge,
@@ -6560,10 +6665,7 @@ def test_tan_saved_via_api(tmp_path):
         assert status == 200
         status, _, payload = _json(bridge, "/api/tan/saved")
         assert status == 200
-        assert len(payload["posts"]) == 1
-        assert payload["posts"][0]["text"] == ""
-        assert payload["posts"][0]["deleted"] is True
-        assert payload["posts"][0]["saved"] is True
+        assert payload["posts"] == []
     finally:
         bridge.stop()
 
@@ -6733,8 +6835,10 @@ def test_tan_pinned_via_api(tmp_path):
         assert by_hash[mine["hash"]]["pinned"] is True
         assert by_hash[theirs["hash"]]["pinned"] is False
 
-        # A post deleted after being pinned stays in the list with its
-        # text blanked, so the pin is not silently lost.
+        # A post deleted after being pinned leaves the list with the
+        # post: deleting purges the pin ref along with the post row,
+        # while the eight other pins stay (extra[0] was unpinned
+        # earlier in this test, extra[9] never fit on the shelf).
         status, _, payload = _json(
             bridge,
             "/api/tan/delete",
@@ -6745,9 +6849,8 @@ def test_tan_pinned_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/pinned")
         assert status == 200
         pinned = {item["hash"]: item for item in payload["posts"]}
-        assert pinned[mine["hash"]]["text"] == ""
-        assert pinned[mine["hash"]]["deleted"] is True
-        assert pinned[mine["hash"]]["pinned"] is True
+        assert mine["hash"] not in pinned
+        assert len(payload["posts"]) == 8
     finally:
         bridge.stop()
 
@@ -7079,8 +7182,10 @@ def test_tan_delete_via_api(tmp_path):
         entries = feed(conn, author=post["author"])
     finally:
         conn.close()
+    # The deleted post is purged from the store, so the feed carries
+    # the keeper post and the two deletes — the purged post itself is
+    # gone from it.
     assert [entry["kind"] for entry in entries] == [
-        "post",
         "post",
         "delete",
         "delete",
@@ -7947,8 +8052,10 @@ def test_tan_edit_via_api(tmp_path):
         entries = feed(conn, author=post["author"])
     finally:
         conn.close()
+    # The deleted post is purged from the store, so the feed carries
+    # the two surviving posts, both edits, and the delete — the purged
+    # post itself is gone from it.
     assert [entry["kind"] for entry in entries] == [
-        "post",
         "post",
         "post",
         "edit",
@@ -8575,6 +8682,100 @@ def test_tan_likers_rejects_deleted_post(tmp_path):
         status, _, payload = _json(bridge, f"/api/tan/likes?target={own['hash']}")
         assert status == 400
         assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_reposters_rejects_deleted_post(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_delete, create_post, create_repost, init_db
+
+    node, _, _ = _likers_setup(tmp_path)
+    # A post deleted by its own author: build one with an identity held
+    # in this test, have another identity repost it, then delete it.
+    # (Reposting your own post is refused, so the reposter differs.)
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        own = create_post(conn, identity, "delete me", name="me", now=2000)
+        create_repost(conn, other, own["hash"], name="other", now=2001)
+        create_delete(conn, identity, own["hash"], name="me", now=2002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/reposts?target={own['hash']}")
+        assert status == 400
+        assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_quoters_rejects_deleted_post(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_delete, create_post, create_quote, init_db
+
+    node, _, _ = _likers_setup(tmp_path)
+    # A post deleted by its own author: build one with an identity held
+    # in this test, quote it, then delete it.
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        own = create_post(conn, identity, "delete me", name="me", now=2000)
+        create_quote(conn, identity, own["hash"], "quoting this", name="me", now=2001)
+        create_delete(conn, identity, own["hash"], name="me", now=2002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/quotes?target={own['hash']}")
+        assert status == 400
+        assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_likers_ignores_forged_delete(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_delete, init_db, store_post
+
+    node, post, authors = _likers_setup(tmp_path)
+    # A delete from anyone but the post's author is inert: the post
+    # stays visible, so its likers stay disclosed.  The handler checks
+    # the row before the tombstone, so a forged delete smuggled in
+    # through the store path must not hide a stored post.
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    forger = RNS.Identity()
+    forged = create_delete(scratch, forger, post["hash"], name="forger", now=2000)
+    conn = init_db(node.config.social_db_path)
+    try:
+        record, is_new = store_post(conn, forged)
+        assert is_new is True
+        assert record["kind"] == "delete"
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 200
+        assert [entry["author"] for entry in payload["likers"]] == [
+            authors["dave"],
+            authors["alice"],
+        ]
+        assert payload["total"] == 2
     finally:
         bridge.stop()
 
@@ -10618,7 +10819,13 @@ def test_tan_cancel_scheduled_post_removes_stored_post(tmp_path):
         new_scheduled_post_id,
         save_scheduled_posts,
     )
-    from tau.tangents.tan import TanApp, create_post, deleted_targets, init_db
+    from tau.tangents.tan import (
+        TanApp,
+        _delete_entry_exists,
+        create_post,
+        get_post,
+        init_db,
+    )
 
     node = FakeNode()
     node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
@@ -10657,11 +10864,12 @@ def test_tan_cancel_scheduled_post_removes_stored_post(tmp_path):
         assert payload["deleted_local"] is True
         status, _, payload = _json(bridge, "/api/tan/scheduled")
         assert payload == {"scheduled": [], "count": 0}
-        # The stored post is hidden by a delete entry, like the CLI's
-        # cancel, and the post itself is still in the store.
+        # The stored post is purged by the delete entry, like the CLI's
+        # cancel: the row is gone, and the tombstone is the only trace.
         conn = init_db(node.config.social_db_path)
         try:
-            assert post["hash"] in deleted_targets(conn)
+            assert get_post(conn, post["hash"]) is None
+            assert _delete_entry_exists(conn, post["hash"])
         finally:
             conn.close()
     finally:
