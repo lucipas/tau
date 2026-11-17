@@ -35,6 +35,21 @@ def test_parser_accepts_global_options_before_and_after_command():
     assert str(after.data_dir) == "/tmp/b"
 
 
+def test_parser_trace_and_mesh_arguments():
+    parser = cli.build_parser()
+
+    traced = parser.parse_args(["trace", "alice"])
+    assert traced.command == "trace"
+    assert traced.peer == "alice"
+    assert traced.timeout == 15.0
+    assert traced.discover_timeout == 10.0
+    assert traced.func is cli.cmd_trace
+
+    meshed = parser.parse_args(["mesh"])
+    assert meshed.command == "mesh"
+    assert meshed.func is cli.cmd_mesh
+
+
 def test_parser_send_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["send", "--to", "alice", "hello world"])

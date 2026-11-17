@@ -5,6 +5,7 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    GET  /api/mesh         peers with live path-table reachability
     GET  /api/heard        non-tau announces heard since this node started
     POST /api/peers/forget  forget a peer ``{"target": "<name or hash>"}``
                            (optional ``"force": true`` strands queued mail)
@@ -27,6 +28,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/rename rename ``{"group": "<id | prefix | name>", "name": "<new name>"}``
     POST /api/groups/topic set or clear the topic ``{"group": "...", "topic": "..."}`` / ``{"group": "...", "clear": true}``
+    GET  /api/groups/join-requests pending join requests for groups this node created
+    POST /api/groups/approve-join approve ``{"group": "<name>", "peer": "<hash>"}``
+    POST /api/groups/deny-join deny ``{"group": "<name>", "peer": "<hash>"}``
     POST /api/groups/vote vote on a group poll ``{"group": "...", "poll": "<wire id>", "option": <1-based number or exact text>}``
     POST /api/groups/close-poll close a group poll you created ``{"group": "...", "poll": "<wire id>"}``
     POST /api/groups/leave leave ``{"group": "..."}`` — members only;
@@ -247,6 +251,7 @@ from .config import (
     set_node_setting,
     write_node_metadata,
 )
+from .group_invites import list_join_requests
 from .groups import GroupStore, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
@@ -4255,6 +4260,64 @@ class WebBridge:
             requests.append({**request.to_dict(), "sender_name": sender_name})
         return requests
 
+    def join_requests(self) -> List[Dict[str, Any]]:
+        """Pending group join requests, oldest first, with display names.
+
+        The same list ``tau group requests`` prints, so the console
+        reviews exactly what the CLI reviews.  Requests from blocked
+        senders are hidden, like the rest of the console hides
+        blocked senders' content: the owner declines those from the
+        CLI.  An unreadable block-list hides everything (fail
+        closed), matching the node.
+        """
+        config = self.node.config
+        registry = getattr(self.node, "registry", None)
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            return []
+        requests = []
+        for request in list_join_requests(config.join_requests_path):
+            if request.peer in blocked:
+                continue
+            peer = registry.get(request.peer) if registry is not None else None
+            peer_name = (
+                peer.display_name
+                if peer is not None
+                else short_hash(request.peer)
+            )
+            try:
+                group = self.node.groups.find(request.group)
+            except ValueError:
+                group = None
+            requests.append(
+                {
+                    **request.to_dict(),
+                    "peer_name": peer_name,
+                    "group_id": group["id"] if group is not None else "",
+                }
+            )
+        return requests
+
+    def approve_join_request(self, group: str, peer: str) -> Dict[str, Any]:
+        """Admit a pending join request from the console.
+
+        Mirrors ``tau group approve``: only the group's creator can
+        admit, the roster change is a successor group, and a welcome
+        group message pins the roster for the new member.  Raises
+        ``ValueError`` for an unknown group, a non-creator caller, or
+        a peer with no pending request.
+        """
+        return self.node.approve_join_request(group, peer)
+
+    def deny_join_request(self, group: str, peer: str) -> Dict[str, Any]:
+        """Refuse a pending join request from the console.
+
+        Mirrors ``tau group deny``.  Raises ``ValueError`` for an
+        unknown group, a non-creator caller, or a peer with no
+        pending request.
+        """
+        return self.node.deny_join_request(group, peer)
+
     def accept_dm_request(self, ref: str) -> Dict[str, Any]:
         """Accept one held DM request: allow-list the sender, deliver the message.
 
@@ -7323,7 +7386,39 @@ class WebBridge:
                 blocklist is not None
                 and blocklist.is_blocked(item.get("destination"))
             )
+        # Live reachability from the serving node's path table, so the
+        # console peers table can tell a peer with a path now from one
+        # merely heard once: the registry's stored hop count is the
+        # announce-time value and goes stale as the mesh shifts.  A
+        # failed snapshot leaves the rows without the live keys rather
+        # than failing the whole peers poll.
+        try:
+            live = {
+                row["destination"]: row for row in self.mesh()
+            }
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read mesh snapshot", exc_info=True)
+            live = {}
+        for item in items:
+            row = live.get(item.get("destination"))
+            if row is not None:
+                item["reachable"] = row["reachable"]
+                item["live_hops"] = row["hops"]
         return items
+
+    def mesh(self) -> List[Dict[str, Any]]:
+        """Live reachability snapshot for every known peer.
+
+        Delegates to the serving node's path-table check; a node that
+        is not up yet has no live paths, so the snapshot is empty
+        rather than a stale registry read.  A node without the method
+        (older doubles) reads as no live paths instead of failing.
+        """
+        node = getattr(self, "node", None)
+        snapshot = getattr(node, "mesh_snapshot", None) if node else None
+        if not callable(snapshot):
+            return []
+        return snapshot()
 
     def heard(self) -> List[Dict[str, Any]]:
         """Non-tau announces heard since this node started, newest first.
@@ -9589,6 +9684,10 @@ class _WebHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
                 return
+            if path == "/api/mesh":
+                rows = self.bridge.mesh()
+                self._send_json({"peers": rows, "count": len(rows)}, head_only)
+                return
             if path == "/api/heard":
                 heard = self.bridge.heard()
                 self._send_json({"heard": heard, "count": len(heard)}, head_only)
@@ -9599,6 +9698,12 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/groups/left":
                 self._send_json(self.bridge.left_groups(), head_only)
+                return
+            if path == "/api/groups/join-requests":
+                requests = self.bridge.join_requests()
+                self._send_json(
+                    {"requests": requests, "count": len(requests)}, head_only
+                )
                 return
             if path == "/api/messages":
                 pinned_only = query.get("pinned") == ["1"]
@@ -10581,6 +10686,43 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **changed}, head_only)
+                return
+            if path in (
+                "/api/groups/approve-join",
+                "/api/groups/deny-join",
+            ):
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                peer = body.get("peer")
+                if not isinstance(peer, str) or not peer.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'peer' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/groups/approve-join":
+                        decided = self.bridge.approve_join_request(
+                            target.strip(), peer.strip()
+                        )
+                    else:
+                        decided = self.bridge.deny_join_request(
+                            target.strip(), peer.strip()
+                        )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **decided}, head_only)
                 return
             if path == "/api/groups/rename":
                 target = body.get("group")

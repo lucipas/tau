@@ -43,6 +43,16 @@ from .dm_requests import (
     record_dm_request,
 )
 from .disappearing import group_default_for, peer_default_for
+from .group_invites import (
+    JOIN_REQUEST_KIND,
+    InviteError,
+    invite_status,
+    list_join_requests,
+    load_invites,
+    record_join_request,
+    resolve_join_request,
+    verify_invite_link,
+)
 from .groups import GroupStore, pinned_group
 from .group_polls import PostError, clean_poll_options
 from .identity import (
@@ -175,6 +185,16 @@ def _budget(timeout: float, deadline: Optional[float]) -> float:
     if deadline is None:
         return timeout
     return max(0.0, min(timeout, deadline - time.monotonic()))
+
+
+def _invite_group_summary(group: Dict[str, Any]) -> Dict[str, Any]:
+    """The group record a join-request reply carries to the requester."""
+    return {
+        "id": group["id"],
+        "name": group["name"],
+        "members": list(group["members"]),
+        "creator": group.get("creator", ""),
+    }
 
 
 def _past(deadline: Optional[float]) -> bool:
@@ -2057,6 +2077,14 @@ class TauNode:
             return response_error(
                 "unavailable", "message could not be delivered"
             )
+        if message.get("kind") == JOIN_REQUEST_KIND:
+            # A join request carries a signed invite token: it is a
+            # capability the creator issued, so it is decided here,
+            # before the DM allow-list — a stranger holding a valid
+            # token is not a stranger any more.  An invalid one is
+            # rejected outright (never stored as chat, never a DM
+            # request): the kind is never a chat message.
+            return self._handle_join_request(message, caller_hash, received_at)
         if not self.allowlist.is_allowed(caller_hash):
             log.info(
                 "Message from %s denied by the DM allow-list",
@@ -2153,6 +2181,197 @@ class TauNode:
             expired=expired,
             retracted=retracted,
         )
+
+    def _handle_join_request(
+        self,
+        message: Dict[str, Any],
+        caller_hash: str,
+        received_at: float,
+    ) -> bytes:
+        """Answer a ``group-join-request`` message (``/tau/message``).
+
+        The message text is the invite link.  A valid token is
+        decided here — open groups add the requester at once, closed
+        groups record a pending request — and the reply carries the
+        outcome plus the group record, so the requester learns the
+        roster from the reply itself.  An invalid token gets the same
+        generic error whatever failed (unknown group, wrong mode or
+        generation, bad signature), so the reply never leaks whether
+        a group id is real.
+        """
+        try:
+            result = self._process_join_request(
+                message.get("text", ""), caller_hash, received_at
+            )
+        except InviteError as exc:
+            log.info(
+                "Join request from %s rejected: %s",
+                caller_hash or "anonymous",
+                exc,
+            )
+            return response_error("invalid_invite", "invite link is not valid")
+        return response_ok(
+            received_at=received_at,
+            server=self.name,
+            node=self.destination_hexhash,
+            **result,
+        )
+
+    def _process_join_request(
+        self,
+        link_text: Any,
+        caller_hash: str,
+        received_at: float,
+    ) -> Dict[str, Any]:
+        """Decide a join request; shared by the live and relayed paths.
+
+        Returns ``{"status": ..., "group": ...}`` where status is
+        ``added`` (open group), ``pending`` (closed group, request
+        recorded), or ``already_member``.  Raises
+        :class:`InviteError` for any token or group problem.  The
+        decision is idempotent: a retried or relayed duplicate of a
+        request that already landed answers ``already_member`` (open)
+        or re-records the pending request (closed).
+        """
+        if not caller_hash:
+            raise InviteError("join request needs a sender identity")
+        if self.identity is None:
+            raise InviteError("node has no identity")
+        invites = load_invites(self.config.invites_path)
+        invite = verify_invite_link(
+            link_text, identity=self.identity, invites=invites
+        )
+        own_hash = self.destination_hexhash
+        # The token names the group: the id derives from the roster,
+        # so the first join already retires the id it was minted for.
+        # Resolve the name to the current roster on every join.
+        try:
+            group = self.groups.find(invite["group"])
+        except ValueError as exc:
+            raise InviteError("invite is not valid for this group") from exc
+        if (
+            group is None
+            or not group.get("local")
+            or group.get("creator") != own_hash
+        ):
+            raise InviteError("invite is not valid for this group")
+        if caller_hash in group["members"]:
+            return {
+                "status": "already_member",
+                "group": _invite_group_summary(group),
+            }
+        if invite["mode"] == "open":
+            members = list(group["members"]) + [caller_hash]
+            try:
+                new_group = self.groups.update_members(
+                    group["id"], members, created_by=own_hash
+                )
+            except ValueError as exc:
+                raise InviteError(str(exc)) from exc
+            self._welcome_joiner(new_group, caller_hash)
+            return {"status": "added", "group": _invite_group_summary(new_group)}
+        record_join_request(
+            self.config.join_requests_path,
+            group["name"],
+            caller_hash,
+            now=received_at,
+        )
+        return {"status": "pending", "group": _invite_group_summary(group)}
+
+    def _welcome_joiner(self, group: Dict[str, Any], peer_hash: str) -> None:
+        """Announce a new member to the group, off the request thread.
+
+        The welcome is a group message to the new roster: it pins
+        the roster for the joiner (who has never seen the group) and
+        tells the existing members someone joined.  It runs on a
+        daemon thread because the fan-out can take a while and the
+        join request is answered from a link-request handler; a
+        queued leg (joiner offline) still delivers on retry.
+        """
+        peer = self.registry.get(peer_hash)
+        name = peer.display_name if peer is not None else peer_hash[:8]
+
+        def _send() -> None:
+            try:
+                self.send_group_message(
+                    group,
+                    f"{name} joined {group['name']} via an invite link.",
+                    timeout=20.0,
+                )
+            except Exception:  # pragma: no cover - delivery is best-effort
+                log.warning(
+                    "Could not send join welcome to %s", group["id"][:8],
+                    exc_info=True,
+                )
+
+        thread = threading.Thread(
+            target=_send, daemon=True, name="tau-join-welcome"
+        )
+        thread.start()
+
+    def list_join_requests(
+        self, group_name: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Pending join requests, optionally for one group (by name)."""
+        return [
+            entry.to_dict()
+            for entry in list_join_requests(
+                self.config.join_requests_path, group_name=group_name
+            )
+        ]
+
+    def approve_join_request(
+        self, group_name: str, peer_hash: str
+    ) -> Dict[str, Any]:
+        """Admit a pending join request: roster change + welcome.
+
+        The successor group (new id, same name) is created and a
+        welcome group message pins the roster for the new member.
+        Raises :class:`ValueError` when there is no pending request,
+        the group is unknown, or this node did not create it.
+        """
+        group = self.groups.find(group_name)
+        if group is None:
+            raise ValueError(f"unknown group: {group_name!r}")
+        own_hash = self.destination_hexhash
+        if not group.get("local") or group.get("creator") != own_hash:
+            raise ValueError("only the creator can approve join requests")
+        if not resolve_join_request(
+            self.config.join_requests_path, group["name"], peer_hash
+        ):
+            raise ValueError("no pending join request from that peer")
+        if peer_hash in group["members"]:
+            return {"status": "already_member", "group": _invite_group_summary(group)}
+        members = list(group["members"]) + [peer_hash]
+        new_group = self.groups.update_members(
+            group["id"], members, created_by=own_hash
+        )
+        peer = self.registry.get(peer_hash)
+        name = peer.display_name if peer is not None else peer_hash[:8]
+        self.send_group_message(
+            new_group,
+            f"{name} joined {group['name']} via an invite link.",
+            timeout=20.0,
+        )
+        return {"status": "added", "group": _invite_group_summary(new_group)}
+
+    def deny_join_request(self, group_name: str, peer_hash: str) -> Dict[str, Any]:
+        """Refuse a pending join request without changing the roster.
+
+        Raises :class:`ValueError` when there is no pending request
+        or this node did not create the group.
+        """
+        group = self.groups.find(group_name)
+        if group is None:
+            raise ValueError(f"unknown group: {group_name!r}")
+        own_hash = self.destination_hexhash
+        if not group.get("local") or group.get("creator") != own_hash:
+            raise ValueError("only the creator can deny join requests")
+        if not resolve_join_request(
+            self.config.join_requests_path, group["name"], peer_hash
+        ):
+            raise ValueError("no pending join request from that peer")
+        return {"status": "denied", "group": _invite_group_summary(group)}
 
     def _accept_group_message(
         self,
@@ -5183,6 +5402,25 @@ class TauNode:
                 sender or "unknown",
             )
             return False
+        if message.get("kind") == JOIN_REQUEST_KIND:
+            # Same interception as the live path: a relayed join
+            # request is decided, never stored as chat and never a
+            # DM request.  Processing is idempotent, so a duplicate
+            # relayed copy re-answers instead of double-adding, and
+            # the delivery counts as resolved either way.
+            try:
+                self._process_join_request(
+                    message.get("text", ""),
+                    sender if isinstance(sender, str) else "",
+                    time.time(),
+                )
+            except InviteError as exc:
+                log.info(
+                    "Relayed join request from %s rejected: %s",
+                    sender or "unknown",
+                    exc,
+                )
+            return True
         if not self.allowlist.is_allowed(
             sender if isinstance(sender, str) else None
         ):
@@ -8212,6 +8450,122 @@ class TauNode:
             else min(timeout, 10.0),
         )
         return self._request(peer, REQUEST_PING, b"{}", timeout)
+
+    def _path_state(self, dest_hash: bytes) -> Tuple[bool, Optional[int]]:
+        """Live path state for *dest_hash*: (known, hops).
+
+        Hops come from Reticulum's path table, not the peer registry:
+        the registry only records the hop count heard at announce time,
+        which goes stale as the mesh shifts.  ``hops`` is ``None`` when
+        no path is known — ``hops_to`` returns the ``PATHFINDER_M``
+        sentinel (128) for unknown destinations, which is not a hop
+        count.  A transport that is not up yet reads as "no path".
+        """
+        try:
+            if not RNS.Transport.has_path(dest_hash):
+                return False, None
+            hops = RNS.Transport.hops_to(dest_hash)
+        except Exception:  # pragma: no cover - transport not up yet
+            log.debug("Path lookup failed", exc_info=True)
+            return False, None
+        if hops >= _PATHFINDER_MAX_HOPS:
+            return False, None
+        return True, hops
+
+    def trace(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = 15.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Trace the mesh path to *target* and probe it live.
+
+        Returns the peer, whether Reticulum currently knows a path, the
+        hop count from the live path table, and the round-trip of a ping
+        probe over that path.  Reticulum exposes no per-leg timing, so
+        the probe is one end-to-end round-trip, not a hop-by-hop
+        breakdown — the hop count is the path shape, the RTT is the
+        proof the whole path works.  A known path whose probe fails
+        still reports the path: the peer may be up but not answering
+        requests.  The result is a snapshot, not a promise — paths
+        change as the mesh shifts.
+        """
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        has_path, hops = self._path_state(peer.destination_hash)
+        if not has_path:
+            # One explicit path request before giving up: the peer may
+            # have announced since the registry was last read, and a
+            # fresh request can surface a path the table has not got.
+            try:
+                RNS.Transport.request_path(peer.destination_hash)
+            except Exception:  # pragma: no cover - transport not up yet
+                log.debug("Path request failed", exc_info=True)
+            deadline = time.time() + min(3.0, max(0.0, timeout))
+            while time.time() < deadline:
+                has_path, hops = self._path_state(peer.destination_hash)
+                if has_path:
+                    break
+                time.sleep(0.1)
+        rtt_ms: Optional[float] = None
+        probe_error: Optional[str] = None
+        if has_path:
+            try:
+                response = self.ping(peer, timeout=timeout, discover_timeout=0.0)
+                rtt = response.get("_rtt")
+                if isinstance(rtt, (int, float)):
+                    rtt_ms = round(float(rtt) * 1000.0, 1)
+            except (NodeError, PeerRefusedError) as exc:
+                probe_error = str(exc)
+        return {
+            "peer": peer.display_name,
+            "destination": peer.hexhash,
+            "has_path": has_path,
+            "hops": hops,
+            "rtt_ms": rtt_ms,
+            "reachable": rtt_ms is not None,
+            "last_seen": peer.last_seen,
+            "probe_error": probe_error,
+            "note": (
+                "Reticulum reports no per-leg timing; rtt_ms is one "
+                "end-to-end probe over the whole path."
+                if has_path
+                else "No path known; the peer may be offline or out of range."
+            ),
+        }
+
+    def mesh_snapshot(self) -> List[Dict[str, Any]]:
+        """One live reachability row per known peer.
+
+        Unlike ``tau peers``, which reads the registry offline, this
+        re-checks every peer against Reticulum's current path table,
+        so ``hops`` is the path as it stands now and ``reachable``
+        means a path is known — not merely that the peer announced
+        once.  Rows are sorted by display name; a peer whose path
+        vanished keeps its last-seen time so the owner can tell a
+        peer that went quiet from one never heard.
+        """
+        rows = []
+        for peer in self.registry.all():
+            has_path, hops = self._path_state(peer.destination_hash)
+            rows.append(
+                {
+                    "destination": peer.hexhash,
+                    "name": peer.display_name,
+                    "hops": hops,
+                    "has_path": has_path,
+                    "reachable": has_path,
+                    "last_seen": peer.last_seen,
+                    "verified": peer.is_verified,
+                }
+            )
+        rows.sort(key=lambda row: row["name"].lower())
+        return rows
 
     def request_info(
         self,

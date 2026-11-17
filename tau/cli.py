@@ -94,6 +94,14 @@ from .identity import (
     load_or_create_identity,
     save_identity,
 )
+from .group_invites import (
+    JOIN_REQUEST_KIND,
+    InviteError,
+    invite_status,
+    mint_invite,
+    parse_invite_link,
+    revoke_invites,
+)
 from .groups import GroupStore, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
@@ -812,6 +820,23 @@ def build_parser() -> argparse.ArgumentParser:
     ping.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     ping.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
     ping.set_defaults(func=cmd_ping)
+
+    trace = subparsers.add_parser(
+        "trace",
+        parents=[common],
+        help="trace the mesh path to a peer (hops + live probe)",
+    )
+    trace.add_argument("peer", metavar="NAME|HASH")
+    trace.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    trace.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
+    trace.set_defaults(func=cmd_trace)
+
+    mesh = subparsers.add_parser(
+        "mesh",
+        parents=[common],
+        help="list known peers with live reachability and hop counts",
+    )
+    mesh.set_defaults(func=cmd_mesh)
 
     info = subparsers.add_parser(
         "info", parents=[common], help="show a remote peer's information"
@@ -1722,6 +1747,108 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     group_remove_member.set_defaults(func=cmd_group_remove_member)
+
+    group_invite = group_sub.add_parser(
+        "invite",
+        parents=[common],
+        help="mint an invite link for a group you created",
+    )
+    group_invite.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_invite.add_argument(
+        "--closed",
+        action="store_true",
+        help="invitees ask to join and you approve them (default: open)",
+    )
+    group_invite.add_argument(
+        "--open",
+        action="store_true",
+        help="invitees join at once (default unless the group already has invites)",
+    )
+    group_invite.add_argument(
+        "--revoke",
+        action="store_true",
+        help="invalidate every invite minted for this group so far",
+    )
+    group_invite.set_defaults(func=cmd_group_invite)
+
+    group_join = group_sub.add_parser(
+        "join",
+        parents=[common],
+        help="join a group with an invite link",
+    )
+    group_join.add_argument(
+        "link", metavar="LINK", help="invite link from `tau group invite`"
+    )
+    group_join.add_argument(
+        "--timeout", type=float, default=20.0, metavar="SECONDS"
+    )
+    group_join.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for the creator to announce",
+    )
+    group_join.set_defaults(func=cmd_group_join)
+
+    group_requests = group_sub.add_parser(
+        "requests",
+        parents=[common],
+        help="list pending join requests for groups you created",
+    )
+    group_requests.add_argument(
+        "group",
+        metavar="GROUP",
+        nargs="?",
+        help="group id, id prefix or name (omit for all groups)",
+    )
+    group_requests.set_defaults(func=cmd_group_requests)
+
+    group_approve = group_sub.add_parser(
+        "approve",
+        parents=[common],
+        help="admit a pending join request to a group you created",
+    )
+    group_approve.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_approve.add_argument(
+        "peer",
+        metavar="PEER",
+        help="requesting peer (name, destination hash, or hash prefix)",
+    )
+    group_approve.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_approve.set_defaults(func=cmd_group_approve)
+
+    group_deny = group_sub.add_parser(
+        "deny",
+        parents=[common],
+        help="refuse a pending join request to a group you created",
+    )
+    group_deny.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_deny.add_argument(
+        "peer",
+        metavar="PEER",
+        help="requesting peer (name, destination hash, or hash prefix)",
+    )
+    group_deny.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_deny.set_defaults(func=cmd_group_deny)
 
     group_topic = group_sub.add_parser(
         "topic",
@@ -12216,6 +12343,319 @@ def cmd_group_remove_member(args: argparse.Namespace) -> int:
     return _change_group_members(args, adding=False)
 
 
+def cmd_group_invite(args: argparse.Namespace) -> int:
+    """Mint (or revoke) an invite link for a group this node created.
+
+    Minting needs no running node: the token is signed with the
+    local identity and the mode/generation are local state until a
+    join request arrives.
+    """
+    if getattr(args, "closed", False) and getattr(args, "open", False):
+        raise NodeError("pass --closed or --open, not both")
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    own_hash = destination_hash(identity).hex()
+    if not group["local"] or group["creator"] != own_hash:
+        raise NodeError("only the creator can mint invites for a group")
+    if getattr(args, "revoke", False):
+        generation = revoke_invites(config.invites_path, group_name=group["name"])
+        if _json_mode(args):
+            _emit(
+                {"group": _describe_group(group, PeerRegistry(config.peers_path)),
+                 "revoked_generation": generation - 1,
+                 "generation": generation},
+                True,
+            )
+            return _EXIT_OK
+        print(
+            f"revoked every invite for {group['name']} ({group['id'][:8]});"
+            " mint a new one to share the group again"
+        )
+        return _EXIT_OK
+    stored = invite_status(config.invites_path, group_name=group["name"])
+    if getattr(args, "closed", False):
+        mode = "closed"
+    elif getattr(args, "open", False):
+        mode = "open"
+    elif stored is not None:
+        mode = stored["mode"]
+    else:
+        mode = "open"
+    link = mint_invite(
+        config.invites_path,
+        identity,
+        group_name=group["name"],
+        creator_hash=own_hash,
+        mode=mode,
+    )
+    stored = invite_status(config.invites_path, group_name=group["name"])
+    if _json_mode(args):
+        _emit(
+            {
+                "group": _describe_group(group, PeerRegistry(config.peers_path)),
+                "link": link,
+                "mode": mode,
+                "generation": stored["generation"] if stored else 0,
+            },
+            True,
+        )
+        return _EXIT_OK
+    print(f"invite link for {group['name']} ({group['id'][:8]}), {mode} group:")
+    print(link)
+    if mode == "closed":
+        print("Invitees ask to join; review them with `tau group requests`.")
+    else:
+        print("Anyone with this link joins at once.")
+    print("Revoke it any time with `tau group invite --revoke`.")
+    return _EXIT_OK
+
+
+def cmd_group_join(args: argparse.Namespace) -> int:
+    """Join a group with an invite link.
+
+    Sends the link as a ``group-join-request`` DM to the creator.
+    The creator's reply carries the outcome and the roster: an
+    open group adds this node at once (the roster is pinned
+    locally from the authenticated reply), a closed group leaves
+    the request pending, and a queued request is decided when it
+    reaches the creator — the welcome group message then pins the
+    roster for this node.
+    """
+    try:
+        token = parse_invite_link(args.link)
+    except InviteError as exc:
+        raise NodeError(str(exc)) from exc
+    config = _make_config(args)
+    reply_ids: Dict[str, str] = {}
+    if _send_routes_via_running_node(config):
+        results = _send_via_running_node(
+            args,
+            config,
+            args.link.strip(),
+            [token["creator"]],
+            None,
+            reply_ids,
+            kind=JOIN_REQUEST_KIND,
+            wait=0.0,
+            send_after=None,
+        )
+    else:
+        results = _send_via_local_node(
+            args,
+            config,
+            args.link.strip(),
+            [token["creator"]],
+            None,
+            reply_ids,
+            kind=JOIN_REQUEST_KIND,
+            wait=0.0,
+            send_after=None,
+        )
+    result = results[0]
+    if result.get("queued"):
+        if _json_mode(args):
+            _emit({"status": "queued", "group": token["group"]}, True)
+            return _EXIT_OK
+        print(
+            "Join request queued — the creator was unreachable."
+            " It is decided when it arrives; the welcome message"
+            " then adds the group here."
+        )
+        return _EXIT_OK
+    if not result.get("ok"):
+        error = result.get("error") or {}
+        message = (
+            error.get("message")
+            if isinstance(error, dict)
+            else str(error) or "join request failed"
+        )
+        raise NodeError(f"join request failed: {message}")
+    status = result.get("status")
+    group = result.get("group") if isinstance(result.get("group"), dict) else {}
+    if status in ("added", "already_member") and group.get("id"):
+        store = GroupStore(config.groups_path)
+        store.record(
+            group["id"],
+            group.get("name", ""),
+            list(group.get("members", [])),
+            creator=group.get("creator", ""),
+            sender=group.get("creator", ""),
+            sent_at=time.time(),
+        )
+        if _json_mode(args):
+            pinned = store.get(group["id"])
+            _emit(
+                {
+                    "status": status,
+                    "group": _describe_group(pinned, PeerRegistry(config.peers_path))
+                    if pinned is not None
+                    else group,
+                },
+                True,
+            )
+            return _EXIT_OK
+        if status == "already_member":
+            print(f"already a member of {group.get('name')} ({group['id'][:8]})")
+        else:
+            print(f"joined group {group.get('name')} ({group['id'][:8]})")
+        return _EXIT_OK
+    if status == "pending" and group.get("id"):
+        if _json_mode(args):
+            _emit({"status": "pending", "group": group}, True)
+            return _EXIT_OK
+        print(
+            f"Join request pending: the creator of {group.get('name')}"
+            f" ({group['id'][:8]}) has to approve it first."
+        )
+        return _EXIT_OK
+    raise NodeError(f"unexpected join reply: {result}")
+
+
+def _resolve_join_peer(
+    node: TauNode, group_name: str, target: str, *, timeout: float
+) -> str:
+    """Resolve a join-request peer without waiting on discovery.
+
+    The peer hash is already in the pending request, so a name,
+    hash, or hash prefix that names a pending requester resolves
+    locally; only an unknown name falls back to peer discovery.
+    """
+    requests = node.list_join_requests(group_name)
+    wanted = target.strip().lower()
+    for entry in requests:
+        peer_hash = entry["peer"]
+        if peer_hash == wanted or peer_hash.startswith(wanted):
+            return peer_hash
+        peer = node.registry.get(peer_hash)
+        if peer is not None and peer.display_name.lower() == wanted:
+            return peer_hash
+    try:
+        known = node.registry.resolve(target)
+    except PeerError:
+        known = None
+    if known is not None:
+        return known.hexhash
+    return node.resolve_peer(target, timeout=timeout).hexhash
+
+
+def cmd_group_requests(args: argparse.Namespace) -> int:
+    """List pending join requests for groups this node created."""
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        group_name = None
+        group = None
+        if getattr(args, "group", None):
+            group = node.groups.find(args.group)
+            group_name = group["name"]
+        requests = node.list_join_requests(group_name)
+        registry = node.registry
+        store = node.groups
+    finally:
+        node.stop()
+    described = []
+    for entry in requests:
+        peer = registry.get(entry["peer"])
+        try:
+            group_record = store.find(entry["group"])
+        except ValueError:
+            group_record = None
+        described.append(
+            {
+                "group": entry["group"],
+                "group_id": group_record["id"] if group_record else "",
+                "peer": entry["peer"],
+                "peer_name": peer.display_name if peer is not None else entry["peer"][:8],
+                "requested_at": entry["requested_at"],
+            }
+        )
+    if _json_mode(args):
+        _emit({"requests": described}, True)
+        return _EXIT_OK
+    if not described:
+        print("No pending join requests.")
+        return _EXIT_OK
+    for entry in described:
+        when = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(entry["requested_at"])
+        )
+        print(
+            f"  {entry['peer_name']} ({entry['peer'][:8]})"
+            f" -> {entry['group']} ({entry['group_id'][:8]}) at {when}"
+        )
+    print("Admit one with `tau group approve <group> <peer>`.")
+    return _EXIT_OK
+
+
+def _change_join_request(args: argparse.Namespace, *, approve: bool) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        group = node.groups.find(args.group)
+        if not group["local"] or group["creator"] != own_hash:
+            raise NodeError("only the creator can decide join requests")
+        peer_hash = _resolve_join_peer(
+            node,
+            group["name"],
+            args.peer,
+            timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+        try:
+            if approve:
+                outcome = node.approve_join_request(group["name"], peer_hash)
+            else:
+                outcome = node.deny_join_request(group["name"], peer_hash)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+        described_group = node.groups.get(outcome["group"]["id"])
+        if described_group is not None:
+            described_group = _describe_group(described_group, node.registry)
+        else:  # pragma: no cover - the group was just updated
+            described_group = dict(outcome["group"])
+    finally:
+        node.stop()
+    peer = node.registry.get(peer_hash)
+    name = peer.display_name if peer is not None else peer_hash[:8]
+    if _json_mode(args):
+        _emit(
+            {
+                "status": outcome["status"],
+                "peer": peer_hash,
+                "group": described_group,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if outcome["status"] == "added":
+        print(
+            f"approved {name} into {described_group['name']}"
+            f" ({described_group['id'][:8]} -> {outcome['group']['id'][:8]})"
+        )
+    elif outcome["status"] == "already_member":
+        print(f"{name} is already a member of {described_group['name']}")
+    else:
+        print(f"denied {name} for {described_group['name']}")
+    return _EXIT_OK
+
+
+def cmd_group_approve(args: argparse.Namespace) -> int:
+    return _change_join_request(args, approve=True)
+
+
+def cmd_group_deny(args: argparse.Namespace) -> int:
+    return _change_join_request(args, approve=False)
+
+
 def cmd_group_topic(args: argparse.Namespace) -> int:
     """Set or show the topic of a group this node created.
 
@@ -14386,6 +14826,74 @@ def cmd_ping(args: argparse.Namespace) -> int:
         rtt = response.get("_rtt")
         latency = f" ({rtt * 1000:.0f} ms)" if isinstance(rtt, (int, float)) else ""
         print(f"pong from {response.get('server', args.to)}{latency}")
+    return _EXIT_OK
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        result = node.trace(
+            args.peer,
+            timeout=float(getattr(args, "timeout", 15.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        print(f"trace to {result['peer']} ({result['destination']})")
+        if result["has_path"]:
+            print(f"  path: known, {result['hops']} hop(s)")
+        else:
+            print("  path: none known")
+        if result["rtt_ms"] is not None:
+            print(f"  probe: pong in {result['rtt_ms']:.0f} ms")
+        elif result["probe_error"]:
+            print(f"  probe: no reply ({result['probe_error']})")
+        print(f"  last seen: {_ago(time.time() - result['last_seen'])} ago")
+        print(f"  note: {result['note']}")
+    return _EXIT_OK if result["reachable"] else _EXIT_ERROR
+
+
+def cmd_mesh(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        rows = node.mesh_snapshot()
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit({"peers": rows, "count": len(rows)}, True)
+        return _EXIT_OK
+    if not rows:
+        print("No peers known. Run `tau discover` or `tau serve` first.")
+        return _EXIT_OK
+    now = time.time()
+    header = ("NAME", "DESTINATION", "HOPS", "REACHABLE", "LAST SEEN")
+    table: List[tuple] = [header]
+    for row in rows:
+        table.append(
+            (
+                row["name"],
+                row["destination"],
+                str(row["hops"]) if row["hops"] is not None else "—",
+                "yes" if row["reachable"] else "no",
+                _ago(now - row["last_seen"]),
+            )
+        )
+    widths = [max(len(row[i]) for row in table) for i in range(len(header))]
+    for row in table:
+        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+    print(
+        "\nReachability is a snapshot from Reticulum's path table, not a "
+        "promise — paths change as the mesh shifts."
+    )
     return _EXIT_OK
 
 

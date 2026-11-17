@@ -261,6 +261,13 @@ export interface Peer {
   // True when the peer is on this node's block-list: their DMs are
   // dropped and their Tan posts hidden.
   blocked?: boolean;
+  // Live reachability from the serving node's Reticulum path table
+  // (see GET /api/mesh): true when a path is known right now, with
+  // the current hop count. Absent when the console predates the
+  // mesh endpoint or the snapshot failed — then the row falls back
+  // to the registry's announce-time hop count with no dot.
+  reachable?: boolean;
+  live_hops?: number | null;
 }
 
 export interface BlockPeerResult {
@@ -784,6 +791,35 @@ export interface AcceptDmRequestResponse {
 export interface DeclineDmRequestResponse {
   declined: DmRequestEntry;
   blocked: boolean;
+}
+
+// A pending group join request, as `GET /api/groups/join-requests`
+// returns it: the group by name (the stable handle across roster
+// changes), the requester's hash and display name, and the time the
+// request arrived.
+export interface JoinRequestEntry {
+  group: string;
+  group_id: string;
+  peer: string;
+  peer_name: string;
+  requested_at: number;
+  expires_at: number;
+}
+
+export interface JoinRequestsResponse {
+  requests: JoinRequestEntry[];
+  count: number;
+}
+
+export interface DecideJoinRequestResponse {
+  ok: boolean;
+  status: string;
+  group: {
+    id: string;
+    name: string;
+    members: string[];
+    creator: string;
+  };
 }
 
 export interface AllowlistEntry {
