@@ -29,6 +29,15 @@ from .allowlist import (
     load_allowlist_or_deny_all,
     save_allowlist,
 )
+from .beacons import (
+    BEACON_DEFAULT_DURATION,
+    BEACON_UPDATE_INTERVAL,
+    Beacon,
+    BeaconsError,
+    beacons_lock,
+    load_beacons,
+    save_beacons,
+)
 from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import (
     TauConfig,
@@ -159,6 +168,7 @@ from .protocol import (
     build_mail_store,
     build_media_request,
     build_read_receipt,
+    clean_beacon,
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_in_reply_to,
@@ -177,6 +187,7 @@ from .protocol import (
     encode_profile_request,
     encode_typing,
     generate_message_id,
+    location_default_text,
     normalize_message,
     normalize_message_kind,
     parse_announce,
@@ -1999,6 +2010,7 @@ class TauNode:
                     expires_at=message.get("expires_at"),
                     in_reply_to=message.get("in_reply_to"),
                     location=message.get("location"),
+                    beacon=message.get("beacon"),
                 ),
                 now=received_at,
             )
@@ -2377,6 +2389,8 @@ class TauNode:
                     record["in_reply_to"] = message["in_reply_to"]
                 if message.get("location") is not None:
                     record["location"] = message["location"]
+                if message.get("beacon") is not None:
+                    record["beacon"] = message["beacon"]
                 log.info(
                     "Message from %s (%s): %s",
                     caller_name,
@@ -2780,6 +2794,8 @@ class TauNode:
                 record["in_reply_to"] = message["in_reply_to"]
             if message.get("location") is not None:
                 record["location"] = message["location"]
+            if message.get("beacon") is not None:
+                record["beacon"] = message["beacon"]
             if message.get("poll_options") is not None:
                 record["poll_options"] = message["poll_options"]
             if message.get("poll_vote") is not None:
@@ -4443,6 +4459,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled-post publish failed", exc_info=True)
             try:
+                self._send_due_beacon_updates()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Beacon update round failed", exc_info=True)
+            try:
                 self._exchange_sweep(max_peers=_EXCHANGE_SWEEP_PEERS)
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Peer exchange sweep failed", exc_info=True)
@@ -4891,6 +4911,7 @@ class TauNode:
                 in_reply_to=fresh.in_reply_to,
                 expires_at=fresh.message_expires_at,
                 location=fresh.location,
+                beacon=fresh.beacon,
                 poll_options=fresh.poll_options,
                 poll_vote=fresh.poll_vote,
                 poll_close=fresh.poll_close,
@@ -4937,6 +4958,7 @@ class TauNode:
                 expires_at=fresh.message_expires_at,
                 in_reply_to=fresh.in_reply_to,
                 location=fresh.location,
+                beacon=fresh.beacon,
                 kind=getattr(fresh, "kind", None),
             )
         # A replacement can still land after the fresh read: abort the
@@ -5222,6 +5244,7 @@ class TauNode:
                 expires_at=fresh.message_expires_at,
                 in_reply_to=fresh.in_reply_to,
                 location=fresh.location,
+                beacon=fresh.beacon,
                 kind=getattr(fresh, "kind", None),
                 edited_at=fresh.edited_at,
             )
@@ -5702,6 +5725,8 @@ class TauNode:
             record["in_reply_to"] = message["in_reply_to"]
         if message.get("location") is not None:
             record["location"] = message["location"]
+        if message.get("beacon") is not None:
+            record["beacon"] = message["beacon"]
         if message.get("edited_at") is not None:
             # A relayed copy of an edited leg carries the edit's send
             # time inside its signed envelope: the record starts life
@@ -6121,6 +6146,7 @@ class TauNode:
         in_reply_to: Optional[Dict[str, Any]] = None,
         kind: Optional[str] = None,
         location: Optional[Dict[str, Any]] = None,
+        beacon: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
@@ -6135,6 +6161,11 @@ class TauNode:
         pins a place on the message (see :func:`clean_location`): it
         travels the same way, and a pin without an explicit kind is
         tagged ``location`` so the receiver can filter on it.
+        ``beacon`` marks the message as one update of a live beacon
+        (see :func:`clean_beacon`): it rides with the pin, through
+        queueing and sealed relay copies alike, so the receiver can
+        tell a live update from a one-off pin; a beacon without a pin
+        is rejected, since an update that renders nowhere is noise.
 
         ``expires_at`` is an optional sender-set expiry (epoch seconds):
         it travels in the message payload and inside sealed relay
@@ -6165,6 +6196,13 @@ class TauNode:
             raise NodeError(
                 "location must have a latitude -90..90 and a longitude -180..180"
             )
+        cleaned_beacon = clean_beacon(beacon)
+        if beacon is not None and cleaned_beacon is None:
+            raise NodeError(
+                "beacon must have an id, an expiry and a sequence number"
+            )
+        if cleaned_beacon is not None and cleaned_location is None:
+            raise NodeError("a beacon update must carry a location pin")
         if cleaned_location is not None and kind is None:
             # A pin without an explicit kind is a location message, so
             # the receiver can filter on it; an explicit kind wins.
@@ -6221,6 +6259,7 @@ class TauNode:
             expires_at=expires_at,
             in_reply_to=reply_to,
             location=cleaned_location,
+            beacon=cleaned_beacon,
         )
         peer: Optional[Peer] = None
         try:
@@ -6252,6 +6291,7 @@ class TauNode:
                         expires_at=expires_at,
                         in_reply_to=reply_to,
                         location=cleaned_location,
+                        beacon=cleaned_beacon,
                         kind=clean_kind,
                         send_after=send_after,
                     )
@@ -6285,6 +6325,11 @@ class TauNode:
                         **(
                             {"location": cleaned_location}
                             if cleaned_location is not None
+                            else {}
+                        ),
+                        **(
+                            {"beacon": cleaned_beacon}
+                            if cleaned_beacon is not None
                             else {}
                         ),
                     }
@@ -6350,6 +6395,11 @@ class TauNode:
                         if cleaned_location is not None
                         else {}
                     ),
+                    **(
+                        {"beacon": cleaned_beacon}
+                        if cleaned_beacon is not None
+                        else {}
+                    ),
                 }
             )
             if self.registry.get(peer.destination_hash) is None:
@@ -6391,6 +6441,7 @@ class TauNode:
                 expires_at=expires_at,
                 in_reply_to=reply_to,
                 location=cleaned_location,
+                beacon=cleaned_beacon,
                 kind=clean_kind,
                 # A scheduled send to an undiscovered peer queues here:
                 # the not-before time must survive the fallback, or the
@@ -6412,6 +6463,11 @@ class TauNode:
                     **(
                         {"location": cleaned_location}
                         if cleaned_location is not None
+                        else {}
+                    ),
+                    **(
+                        {"beacon": cleaned_beacon}
+                        if cleaned_beacon is not None
                         else {}
                     ),
                 }
@@ -6535,6 +6591,7 @@ class TauNode:
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
         location: Optional[Dict[str, Any]] = None,
+        beacon: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -6594,7 +6651,9 @@ class TauNode:
         ``location`` pins a place on the message (see
         :func:`clean_location`): it rides on every leg, through
         queued legs and sealed relay copies, exactly like a direct
-        message pin.
+        message pin.  ``beacon`` marks the message as one update of
+        a live beacon (see :func:`clean_beacon`), exactly like a
+        direct message: it rides with the pin on every leg.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -6672,6 +6731,13 @@ class TauNode:
             raise NodeError(
                 "location must have a latitude -90..90 and a longitude -180..180"
             )
+        cleaned_beacon = clean_beacon(beacon)
+        if beacon is not None and cleaned_beacon is None:
+            raise NodeError(
+                "beacon must have an id, an expiry and a sequence number"
+            )
+        if cleaned_beacon is not None and cleaned_location is None:
+            raise NodeError("a beacon update must carry a location pin")
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         context = {
@@ -6711,6 +6777,7 @@ class TauNode:
                 poll_vote=cleaned_vote,
                 poll_close=cleaned_close,
                 location=cleaned_location,
+                beacon=cleaned_beacon,
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -6772,6 +6839,7 @@ class TauNode:
                         send_after=send_after,
                         in_reply_to=reply_to,
                         location=cleaned_location,
+                        beacon=cleaned_beacon,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -6827,6 +6895,7 @@ class TauNode:
                 poll_vote=cleaned_vote,
                 poll_close=cleaned_close,
                 location=cleaned_location,
+                beacon=cleaned_beacon,
             )
             peer: Optional[Peer] = None
             if budget <= 0.0:
@@ -6874,6 +6943,7 @@ class TauNode:
                         sent_at=sent_at,
                         in_reply_to=reply_to,
                         location=cleaned_location,
+                        beacon=cleaned_beacon,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -7022,6 +7092,7 @@ class TauNode:
                         sent_at=sent_at,
                         in_reply_to=reply_to,
                         location=cleaned_location,
+                        beacon=cleaned_beacon,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -7103,6 +7174,11 @@ class TauNode:
                         else {}
                     ),
                     **(
+                        {"beacon": cleaned_beacon}
+                        if cleaned_beacon is not None
+                        else {}
+                    ),
+                    **(
                         {"poll_options": cleaned_options}
                         if cleaned_options is not None
                         else {}
@@ -7143,6 +7219,158 @@ class TauNode:
             **({"expires_at": expires_at} if expires_at is not None else {}),
             "results": results,
         }
+
+    # -- live location beacons ---------------------------------------------
+
+    def start_beacon(
+        self,
+        target: str,
+        location: Dict[str, Any],
+        *,
+        group: bool = False,
+        coarse: bool = False,
+        duration: float = BEACON_DEFAULT_DURATION,
+        interval: float = BEACON_UPDATE_INTERVAL,
+        location_file: Optional[str] = None,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> Beacon:
+        """Start a live beacon for a DM peer or a group and return it.
+
+        Resolves the conversation first — a peer by name or hash, a
+        group by id, prefix or name — so a beacon can never start for
+        a target this node cannot name.  The first update is the
+        caller's job (:meth:`send_beacon_update`): the beacon is
+        stored with its next update one interval out, so the mail
+        loop cannot double-send it in the same round.
+        """
+        now = time.time() if now is None else now
+        if group:
+            self.groups.list_groups()  # reload: a group made by another process
+            record = self.groups.find(target)
+            if record is None:
+                raise NodeError(f"unknown group: {target!r}")
+            target_hash = record["id"]
+            target_kind = "group"
+            target_name = record["name"]
+        else:
+            peer = self.resolve_peer(
+                target,
+                timeout=discover_timeout
+                if discover_timeout is not None
+                else min(timeout, 10.0),
+            )
+            target_hash = peer.hexhash
+            target_kind = "dm"
+            target_name = peer.display_name
+        try:
+            with beacons_lock(self.config.beacons_path):
+                beacons = load_beacons(self.config.beacons_path)
+                beacon = beacons.start(
+                    target=target_hash,
+                    target_kind=target_kind,
+                    target_name=target_name,
+                    location=location,
+                    coarse=coarse,
+                    duration=duration,
+                    interval=interval,
+                    location_file=location_file,
+                    now=now,
+                )
+                save_beacons(self.config.beacons_path, beacons)
+        except BeaconsError as exc:
+            raise NodeError(str(exc)) from exc
+        return beacon
+
+    def send_beacon_update(
+        self, beacon: Beacon, *, now: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Send one update for *beacon* and advance its schedule.
+
+        The position is resolved at send time — a position file is
+        re-read, a coarse beacon is rounded — so the update carries
+        where the sender is now, not where they were at start.  The
+        update is a location message with the beacon marker, sent
+        through the normal paths, so an unreachable peer queues it
+        in the outbox like any other message.  Only the counters move
+        on disk: a stop racing this send keeps its effect, since the
+        persist step writes back just the sequence and the next
+        update time.
+        """
+        now = time.time() if now is None else now
+        try:
+            location = beacon.current_location()
+        except BeaconsError as exc:
+            raise NodeError(str(exc)) from exc
+        seq = beacon.updates_sent + 1
+        marker = beacon.wire_marker(seq)
+        text = location_default_text(location)
+        if beacon.target_kind == "group":
+            self.groups.list_groups()  # reload: a group made by another process
+            record = self.groups.find(beacon.target)
+            if record is None:
+                raise NodeError(f"unknown group: {beacon.target!r}")
+            result = self.send_group_message(
+                record,
+                text,
+                location=location,
+                beacon=marker,
+                kind="location",
+            )
+        else:
+            result = self.send_message(
+                bytes.fromhex(beacon.target),
+                text,
+                location=location,
+                beacon=marker,
+                kind="location",
+            )
+        beacon.updates_sent = seq
+        beacon.next_update_at = now + beacon.interval
+        try:
+            with beacons_lock(self.config.beacons_path):
+                stored = load_beacons(self.config.beacons_path)
+                current = stored.get(beacon.id)
+                if current is not None:
+                    current.updates_sent = seq
+                    current.next_update_at = beacon.next_update_at
+                    save_beacons(self.config.beacons_path, stored)
+        except BeaconsError as exc:  # pragma: no cover - disk failure
+            log.warning("Could not persist beacon update: %s", exc)
+        return result
+
+    def _send_due_beacon_updates(self) -> None:
+        """Send the beacon updates whose time has come.
+
+        Runs in the mail loop, next to the scheduled-post publish:
+        the store is re-read from disk each round, so a ``tau
+        beacon`` command in another process is picked up without a
+        restart.  A failed update logs and stays due — the next
+        round retries it — and a failure here never raises into the
+        mail loop.
+        """
+        try:
+            with beacons_lock(self.config.beacons_path):
+                beacons = load_beacons(self.config.beacons_path)
+                now = time.time()
+                due = [
+                    beacon
+                    for beacon in beacons.active(now)
+                    if beacon.is_due(now)
+                ]
+        except BeaconsError as exc:
+            log.warning("Could not load beacons: %s", exc)
+            return
+        for beacon in sorted(due, key=lambda b: b.next_update_at):
+            try:
+                self.send_beacon_update(beacon)
+            except (NodeError, BeaconsError, MailboxError) as exc:
+                log.warning(
+                    "Beacon update for %s failed: %s",
+                    beacon.target_name or beacon.target,
+                    exc,
+                )
 
     def send_group_file(
         self,
@@ -8337,6 +8565,7 @@ class TauNode:
                             send_after=entry.send_after,
                             in_reply_to=entry.in_reply_to,
                             location=entry.location,
+                            beacon=entry.beacon,
                             edited_at=float(payload["sent_at"]),
                         )
                         requeued.append(entry.id)
@@ -8367,6 +8596,7 @@ class TauNode:
                                     send_after=entry.send_after,
                                     in_reply_to=entry.in_reply_to,
                                     location=entry.location,
+                                    beacon=entry.beacon,
                                     edited_at=entry.edited_at,
                                 )
                             except MailboxError:

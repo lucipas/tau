@@ -67,6 +67,7 @@ from .protocol import (
     MAX_MAIL_TTL,
     ProtocolError,
     _clean_group_poll_options_or_none,
+    clean_beacon,
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_group_topic,
@@ -349,6 +350,13 @@ class OutboxEntry:
     # a retry or a sealed relay copy re-sends the same pin, exactly
     # like the quote above.  ``None`` means no pin — the common case.
     location: Optional[Dict[str, Any]] = None
+    # Live-beacon marker this entry carries (``tau beacon``): the
+    # beacon id, its expiry and the update sequence (see
+    # ``tau.protocol.clean_beacon``).  A retry or a sealed relay copy
+    # re-sends the same marker with the same pin, so the receiver
+    # still recognises the update as live.  ``None`` means the
+    # message is not a beacon update — the common case.
+    beacon: Optional[Dict[str, Any]] = None
     # Logical send time every copy of this message carries on the wire.
     # A group fan-out records its shared send time here (see
     # ``TauNode.send_group_message``), so a reaction can name the
@@ -451,6 +459,8 @@ class OutboxEntry:
             payload["in_reply_to"] = dict(self.in_reply_to)
         if self.location is not None:
             payload["location"] = dict(self.location)
+        if self.beacon is not None:
+            payload["beacon"] = dict(self.beacon)
         if self.poll_options is not None:
             payload["poll_options"] = list(self.poll_options)
         if self.poll_vote is not None:
@@ -600,6 +610,9 @@ class OutboxEntry:
         # A corrupt pin on an already-queued entry must not make the
         # outbox unreadable; the message still delivers, just without it.
         location = clean_location(raw.get("location"))
+        # Same for a corrupt beacon marker: the update still delivers
+        # as a plain pin instead of breaking the outbox read.
+        beacon = clean_beacon(raw.get("beacon"))
         return cls(
             id=message_id,
             to=destination,
@@ -632,6 +645,7 @@ class OutboxEntry:
             edited_at=edited_at,
             in_reply_to=in_reply_to,
             location=location,
+            beacon=beacon,
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
@@ -1357,6 +1371,7 @@ class Mailbox:
         group: Optional[Dict[str, Any]] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         location: Optional[Dict[str, Any]] = None,
+        beacon: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
         sent_at: Optional[float] = None,
         edited_at: Optional[float] = None,
@@ -1473,6 +1488,11 @@ class Mailbox:
             raise MailboxError(
                 "location must have a latitude -90..90 and a longitude -180..180"
             )
+        cleaned_beacon = clean_beacon(beacon)
+        if beacon is not None and cleaned_beacon is None:
+            raise MailboxError(
+                "beacon must have an id, an expiry and a sequence number"
+            )
         send_after_value: Optional[float] = None
         if send_after is not None:
             if isinstance(send_after, bool) or not isinstance(
@@ -1558,6 +1578,7 @@ class Mailbox:
                 edited_at=edited_at_value,
                 in_reply_to=reply_to,
                 location=cleaned_location,
+                beacon=cleaned_beacon,
                 poll_options=clean_options,
                 poll_vote=clean_vote,
                 poll_close=clean_close,
@@ -2743,6 +2764,7 @@ def seal_message(
     expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
+    beacon: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
     edited_at: Optional[float] = None,
 ) -> bytes:
@@ -2760,7 +2782,11 @@ def seal_message(
     ``edited_at`` (when given) is the signed send time of the edit
     that rewrote this text; it travels inside the same signed
     envelope, so a relayed copy initializes the recipient's edit
-    ordering state exactly like a direct one.
+    ordering state exactly like a direct one.  ``beacon`` (when
+    given) marks the message as one update of a live beacon; it
+    travels inside the same signed envelope, so a relayed copy still
+    recognises the update as live — and a beacon without a pin is
+    rejected, like a direct one.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -2874,6 +2900,15 @@ def seal_message(
         )
     if cleaned_location is not None:
         inner["location"] = cleaned_location
+    cleaned_beacon = clean_beacon(beacon)
+    if beacon is not None and cleaned_beacon is None:
+        raise MailboxError(
+            "beacon must have an id, an expiry and a sequence number"
+        )
+    if cleaned_beacon is not None:
+        if cleaned_location is None:
+            raise MailboxError("a beacon update must carry a location pin")
+        inner["beacon"] = cleaned_beacon
     canonical = encode(inner)
     signature = sender_identity.sign(canonical)
     if signature is None:  # pragma: no cover - identity without private keys
@@ -3107,6 +3142,7 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "edited_at": edited_at,
         "in_reply_to": in_reply_to,
         "location": clean_location(payload.get("location")),
+        "beacon": clean_beacon(payload.get("beacon")),
     }
     group_raw = payload.get("group")
     if group_raw is not None:

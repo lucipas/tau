@@ -61,6 +61,18 @@ from .config import (
     write_node_metadata,
     write_rns_config,
 )
+from .beacons import (
+    BEACON_DEFAULT_DURATION,
+    BEACON_MAX_DURATION,
+    BEACON_MAX_INTERVAL,
+    BEACON_MIN_INTERVAL,
+    BEACON_UPDATE_INTERVAL,
+    BeaconsError,
+    beacons_lock,
+    load_beacons,
+    read_location_file,
+    save_beacons,
+)
 from .disappearing import (
     MAX_DISAPPEARING_SECONDS,
     DisappearingError,
@@ -180,6 +192,7 @@ from .protocol import (
     MAX_MESSAGE_CHARS,
     PROTOCOL_VERSION,
     ProtocolError,
+    clean_beacon,
     clean_in_reply_to,
     clean_location,
     clean_reaction,
@@ -1560,6 +1573,119 @@ def build_parser() -> argparse.ArgumentParser:
         help="unmute this conversation instead",
     )
     mute.set_defaults(func=cmd_mute)
+
+    beacon = subparsers.add_parser(
+        "beacon",
+        parents=[common],
+        help="share live location with a conversation until it expires",
+    )
+    beacon_sub = beacon.add_subparsers(dest="beacon_command", metavar="BEACON_COMMAND")
+    beacon_sub.required = True
+
+    beacon_start = beacon_sub.add_parser(
+        "start",
+        parents=[common],
+        help="start sharing live location with a peer or group",
+    )
+    beacon_start_target = beacon_start.add_mutually_exclusive_group(required=True)
+    beacon_start_target.add_argument(
+        "peer",
+        nargs="?",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    beacon_start_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    beacon_start.add_argument(
+        "--location",
+        required=True,
+        metavar="LAT,LON [PLACE]",
+        help='starting position (e.g. --location "34.05,-83.88 Rock Springs Park")',
+    )
+    beacon_start.add_argument(
+        "--location-file",
+        metavar="PATH",
+        help="JSON position file re-read on every update, so an external "
+        "GPS writer moves the beacon (e.g. a termux-location loop)",
+    )
+    beacon_start.add_argument(
+        "--coarse",
+        action="store_true",
+        help="round every update to ~1 km and drop the place name",
+    )
+    beacon_start.add_argument(
+        "--duration-mins",
+        type=float,
+        default=60.0,
+        metavar="MINUTES",
+        help="how long the beacon runs (default 60, at most 480)",
+    )
+    beacon_start.add_argument(
+        "--interval-mins",
+        type=float,
+        default=5.0,
+        metavar="MINUTES",
+        help="minutes between updates (default 5, 1 to 60)",
+    )
+    beacon_start.set_defaults(func=cmd_beacon_start)
+
+    beacon_stop = beacon_sub.add_parser(
+        "stop",
+        parents=[common],
+        help="stop sharing live location with a peer or group",
+    )
+    beacon_stop_target = beacon_stop.add_mutually_exclusive_group(required=True)
+    beacon_stop_target.add_argument(
+        "peer",
+        nargs="?",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    beacon_stop_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    beacon_stop.set_defaults(func=cmd_beacon_stop)
+
+    beacon_update = beacon_sub.add_parser(
+        "update",
+        parents=[common],
+        help="refresh a running beacon's position or position file",
+    )
+    beacon_update_target = beacon_update.add_mutually_exclusive_group(required=True)
+    beacon_update_target.add_argument(
+        "peer",
+        nargs="?",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    beacon_update_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    beacon_update.add_argument(
+        "--location",
+        metavar="LAT,LON [PLACE]",
+        help="new position (e.g. --location \"34.05,-83.88 Rock Springs Park\")",
+    )
+    beacon_update.add_argument(
+        "--location-file",
+        metavar="PATH",
+        help="JSON position file re-read on every update from now on",
+    )
+    beacon_update.set_defaults(func=cmd_beacon_update)
+
+    beacon_list = beacon_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list running and recently ended beacons",
+    )
+    beacon_list.set_defaults(func=cmd_beacon_list)
 
     archived = subparsers.add_parser(
         "archived",
@@ -9478,6 +9604,37 @@ def _wait_for_queued_sends(
             result["waited"] = round(waited, 1)
 
 
+def _beacon_start_local(
+    node: TauNode,
+    *,
+    target: str,
+    group: bool = False,
+    location: Dict[str, Any],
+    location_file: Optional[str] = None,
+    coarse: bool = False,
+    duration: float = BEACON_DEFAULT_DURATION,
+    interval: float = BEACON_UPDATE_INTERVAL,
+) -> Dict[str, Any]:
+    """Start a beacon on the running node, for the local send server.
+
+    Starts the beacon and sends its first update at once, so the
+    peer or group hears from the sender immediately instead of at
+    the next mail-loop round.  Later updates go out from the mail
+    loop, which re-reads the beacons file each round.
+    """
+    beacon = node.start_beacon(
+        target,
+        location,
+        group=bool(group),
+        coarse=bool(coarse),
+        duration=float(duration),
+        interval=float(interval),
+        location_file=location_file,
+    )
+    update = node.send_beacon_update(beacon)
+    return {"ok": True, "beacon": _beacon_summary(beacon), "update": update}
+
+
 def _send_local_message(
     node: TauNode,
     *,
@@ -9800,6 +9957,8 @@ def _dispatch_local_send(
         return _typing_local_message(node, **request)
     if op == "typing_group":
         return _typing_group_local_message(node, **request)
+    if op == "beacon_start":
+        return _beacon_start_local(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
     if op == "group_send":
@@ -11377,6 +11536,20 @@ def _print_message_entry(
         label = name if isinstance(name, str) and name else "Location"
         print(f"  📍 {label} — {location['lat']}, {location['lon']}")
         print(f"  {location_maps_url(location)}")
+        beacon = clean_beacon(entry.get("beacon"))
+        if beacon is not None:
+            # A live update names its sequence and expiry, so the
+            # reader can tell it from a one-off pin and see how long
+            # the beacon has left; an expired beacon still reads as
+            # the pin it was.
+            remaining = beacon["expires_at"] - time.time()
+            if remaining > 0:
+                print(
+                    f"  live beacon · update {beacon['seq']} · "
+                    f"expires in {_ago(remaining)}"
+                )
+            else:
+                print(f"  live beacon · update {beacon['seq']} · expired")
     poll = entry.get("poll")
     if isinstance(poll, dict) and poll.get("options"):
         # A group poll renders its tally under the question, like a
@@ -12458,6 +12631,253 @@ def cmd_mute(args: argparse.Namespace) -> int:
             f"Muted {label}: its messages still arrive, but never light "
             "the unread badge."
         )
+    return _EXIT_OK
+
+
+def _beacon_target(config: TauConfig, args: argparse.Namespace) -> Tuple[str, bool, str]:
+    """Resolve a beacon stop/update target locally: hash, group?, label.
+
+    Local-only, like the mute command: a peer resolves from the
+    inbox and registry, a group from the group store.  Starting a
+    beacon resolves on the node instead, with discovery, so a peer
+    never seen before can still get one.
+    """
+    if getattr(args, "group", None) is not None:
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
+        return (
+            group["id"],
+            True,
+            f"group {group['name']} ({short_hash(group['id'])})",
+        )
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    key = _resolve_inbox_peer(inbox, registry, args.peer, direction=None)
+    peer = registry.get(key)
+    name = peer.display_name if peer is not None else "unknown"
+    return key, False, f"conversation with {name} ({short_hash(key)})"
+
+
+def _beacon_summary(beacon: Any, now: Optional[float] = None) -> Dict[str, Any]:
+    """A beacon as JSON: its schedule, position and live state."""
+    now = time.time() if now is None else now
+    return {
+        "id": beacon.id,
+        "target": beacon.target,
+        "target_kind": beacon.target_kind,
+        "target_name": beacon.target_name,
+        "started_at": beacon.started_at,
+        "expires_at": beacon.expires_at,
+        "interval_seconds": beacon.interval,
+        "coarse": beacon.coarse,
+        "location": dict(beacon.location),
+        "location_file": beacon.location_file,
+        "next_update_at": beacon.next_update_at,
+        "updates_sent": beacon.updates_sent,
+        "stopped": beacon.stopped,
+        "active": beacon.is_active(now),
+        "expires_in_seconds": max(0.0, beacon.expires_at - now),
+    }
+
+
+def _beacon_line(beacon: Any, now: Optional[float] = None) -> str:
+    """One human-readable line for a beacon."""
+    now = time.time() if now is None else now
+    target = beacon.target_name or short_hash(beacon.target)
+    kind = "group" if beacon.target_kind == "group" else "peer"
+    place = location_default_text(beacon.location)
+    coarse = " (coarse)" if beacon.coarse else ""
+    if beacon.is_active(now):
+        state = (
+            f"expires in {_ago(beacon.expires_at - now)}, "
+            f"next update in {_ago(beacon.next_update_at - now)}"
+        )
+    elif beacon.stopped:
+        state = "stopped"
+    else:
+        state = "expired"
+    return (
+        f"{target} ({kind}) — {place}{coarse}: "
+        f"{beacon.updates_sent} update(s) sent, {state}"
+    )
+
+
+def cmd_beacon_start(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    location = _location_from_args(args)
+    if location is None:  # --location is required by the parser
+        raise NodeError("--location is required to start a beacon")
+    location_file = getattr(args, "location_file", None)
+    if location_file is not None and read_location_file(location_file) is None:
+        raise NodeError(
+            f"location file {location_file} has no valid position"
+        )
+    duration = float(getattr(args, "duration_mins", 60.0)) * 60.0
+    interval = float(getattr(args, "interval_mins", 5.0)) * 60.0
+    if not 0 < duration <= BEACON_MAX_DURATION:
+        raise NodeError(
+            "beacon duration must be between 1 and "
+            f"{int(BEACON_MAX_DURATION // 60)} minutes"
+        )
+    if not BEACON_MIN_INTERVAL <= interval <= BEACON_MAX_INTERVAL:
+        raise NodeError(
+            "beacon interval must be between "
+            f"{int(BEACON_MIN_INTERVAL // 60)} and "
+            f"{int(BEACON_MAX_INTERVAL // 60)} minutes"
+        )
+    is_group = getattr(args, "group", None) is not None
+    target = args.group if is_group else args.peer
+    coarse = bool(getattr(args, "coarse", False))
+    # A serving node owns the data directory: start through it instead
+    # of starting a second Reticulum instance on the same identity.
+    if _send_routes_via_running_node(config):
+        from .local_send import send_running
+
+        result = send_running(
+            config.data_dir,
+            op="beacon_start",
+            target=target,
+            group=is_group,
+            location=location,
+            location_file=location_file,
+            coarse=coarse,
+            duration=duration,
+            interval=interval,
+        )
+        summary = result.get("beacon") or {}
+        update = result.get("update") or {}
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            beacon = node.start_beacon(
+                target,
+                location,
+                group=is_group,
+                coarse=coarse,
+                duration=duration,
+                interval=interval,
+                location_file=location_file,
+            )
+            update = node.send_beacon_update(beacon)
+            summary = _beacon_summary(beacon)
+        finally:
+            node.stop()
+    if _json_mode(args):
+        _emit({"beacon": summary, "update": update}, True)
+        return _EXIT_OK
+    label = summary.get("target_name") or short_hash(
+        str(summary.get("target") or "")
+    )
+    kind = "group" if summary.get("target_kind") == "group" else "peer"
+    outcome = (
+        "queued" if update.get("queued") else "sent"
+    )
+    print(
+        f"Started a live beacon for {label} ({kind}): updates every "
+        f"{_ago(float(summary.get('interval_seconds') or BEACON_UPDATE_INTERVAL))} "
+        f"until it expires in "
+        f"{_ago(float(summary.get('expires_in_seconds') or 0))} — "
+        f"first update {outcome}."
+    )
+    if not _send_routes_via_running_node(config):
+        print(
+            "Keep `tau serve` running: later updates go out from the "
+            "serving node."
+        )
+    return _EXIT_OK
+
+
+def cmd_beacon_stop(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    key, is_group, label = _beacon_target(config, args)
+    kind = "group" if is_group else "dm"
+    with beacons_lock(config.beacons_path):
+        beacons = load_beacons(config.beacons_path)
+        stopped = beacons.stop(key, kind)
+        if stopped is None:
+            if _json_mode(args):
+                _emit({"target": key, "group": is_group, "stopped": False}, True)
+                return _EXIT_OK
+            print(f"No beacon is running for {label}.")
+            return _EXIT_OK
+        save_beacons(config.beacons_path, beacons)
+        summary = _beacon_summary(stopped)
+    if _json_mode(args):
+        _emit({"target": key, "group": is_group, "stopped": True, "beacon": summary}, True)
+        return _EXIT_OK
+    print(
+        f"Stopped the live beacon for {label} after "
+        f"{stopped.updates_sent} update(s)."
+    )
+    return _EXIT_OK
+
+
+def cmd_beacon_update(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    location = _location_from_args(args)
+    location_file = getattr(args, "location_file", None)
+    if location is None and location_file is None:
+        print(
+            "error: --location or --location-file is required",
+            file=sys.stderr,
+        )
+        return _EXIT_ERROR
+    if location_file is not None and read_location_file(location_file) is None:
+        raise NodeError(
+            f"location file {location_file} has no valid position"
+        )
+    key, is_group, label = _beacon_target(config, args)
+    kind = "group" if is_group else "dm"
+    with beacons_lock(config.beacons_path):
+        beacons = load_beacons(config.beacons_path)
+        beacon = beacons.update_location(
+            key, kind, location=location, location_file=location_file
+        )
+        save_beacons(config.beacons_path, beacons)
+        summary = _beacon_summary(beacon)
+    if _json_mode(args):
+        _emit({"target": key, "group": is_group, "beacon": summary}, True)
+        return _EXIT_OK
+    place = location_default_text(beacon.location)
+    source = (
+        f"position file {location_file}"
+        if location_file is not None
+        else place
+    )
+    print(
+        f"Beacon for {label} now uses {source}; "
+        f"next update in {_ago(beacon.next_update_at - time.time())}."
+    )
+    return _EXIT_OK
+
+
+def cmd_beacon_list(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    beacons = load_beacons(config.beacons_path)
+    now = time.time()
+    active = beacons.active(now)
+    ended = sorted(
+        (b for b in beacons.beacons.values() if not b.is_active(now)),
+        key=lambda b: b.started_at,
+        reverse=True,
+    )[:5]
+    if _json_mode(args):
+        _emit(
+            {
+                "beacons": [_beacon_summary(b, now) for b in active],
+                "ended": [_beacon_summary(b, now) for b in ended],
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not active and not ended:
+        print("No beacons.")
+        return _EXIT_OK
+    for beacon in active:
+        print(_beacon_line(beacon, now))
+    for beacon in ended:
+        print(f"{_beacon_line(beacon, now)} (ended)")
     return _EXIT_OK
 
 
