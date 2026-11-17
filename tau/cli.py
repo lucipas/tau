@@ -37,6 +37,13 @@ from .archive import (
     load_archived_set,
     save_archive,
 )
+from .away import (
+    AwayError,
+    AwayState,
+    away_lock,
+    load_away,
+    save_away,
+)
 from .backup import create_backup, restore_backup
 from .blocklist import (
     BlockListError,
@@ -1579,6 +1586,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="unmute this conversation instead",
     )
     mute.set_defaults(func=cmd_mute)
+
+    away = subparsers.add_parser(
+        "away",
+        parents=[common],
+        help="set an away message that auto-replies to DMs while you are away",
+    )
+    away_sub = away.add_subparsers(dest="away_command", metavar="AWAY_COMMAND")
+    away_sub.required = True
+
+    away_on = away_sub.add_parser(
+        "on",
+        parents=[common],
+        help="turn the away reply on, optionally with a custom message",
+    )
+    away_on.add_argument(
+        "--message",
+        metavar="TEXT",
+        help="custom away message (default: \"I'm away right now. "
+        "I'll reply when I'm back.\")",
+    )
+    away_on.set_defaults(func=cmd_away_on)
+
+    away_off = away_sub.add_parser(
+        "off",
+        parents=[common],
+        help="turn the away reply off",
+    )
+    away_off.set_defaults(func=cmd_away_off)
+
+    away_status = away_sub.add_parser(
+        "status",
+        parents=[common],
+        help="show whether the away reply is on and what it says",
+    )
+    away_status.set_defaults(func=cmd_away_status)
 
     beacon = subparsers.add_parser(
         "beacon",
@@ -12749,6 +12791,92 @@ def cmd_mute(args: argparse.Namespace) -> int:
             f"Muted {label}: its messages still arrive, but never light "
             "the unread badge."
         )
+    return _EXIT_OK
+
+
+def cmd_away_on(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    # Reload inside the lock: two away commands racing must not
+    # discard each other's change.
+    with away_lock(config.away_path):
+        try:
+            load_away(config.away_path)
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        try:
+            state = AwayState.on(getattr(args, "message", None))
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        save_away(config.away_path, state)
+    if _json_mode(args):
+        _emit(
+            {
+                "enabled": True,
+                "message": state.message,
+                "since": state.since,
+            },
+            True,
+        )
+        return _EXIT_OK
+    print(
+        "Away reply on: the first DM from each peer gets one reply:\n"
+        f"{state.message}"
+    )
+    return _EXIT_OK
+
+
+def cmd_away_off(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    with away_lock(config.away_path):
+        try:
+            current = load_away(config.away_path)
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        was_on = current.enabled
+        if was_on:
+            save_away(config.away_path, current.off())
+    if _json_mode(args):
+        _emit(
+            {"enabled": False, "message": current.message},
+            True,
+        )
+        return _EXIT_OK
+    if was_on:
+        print("Away reply off.")
+    else:
+        print("Away reply is already off.")
+    return _EXIT_OK
+
+
+def cmd_away_status(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        state = load_away(config.away_path)
+    except AwayError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    if _json_mode(args):
+        _emit(
+            {
+                "enabled": state.enabled,
+                "message": state.message,
+                "since": state.since,
+                "replied_to": sorted(state.replied_to),
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not state.enabled:
+        print("Away reply is off.")
+    else:
+        print(f"Away reply is on:\n{state.message}")
+        if state.replied_to:
+            print(
+                f"{len(state.replied_to)} peer(s) answered in this away period."
+            )
     return _EXIT_OK
 
 
