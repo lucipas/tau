@@ -1473,3 +1473,36 @@ describe("PeerSidebar archived conversations", () => {
     expect(screen.getByText("could not load archived")).toBeTruthy();
   });
 });
+
+describe("PeerSidebar profiles", () => {
+  it("shows a peer's profile bio, avatar hash and links on its row", () => {
+    renderSidebar({}, vi.fn(), {
+      peers: [
+        makePeer({
+          profile: {
+            author: "ab".repeat(16),
+            name: "alice",
+            bio: "mesh tinkerer",
+            avatar: "ab".repeat(32),
+            links: ["https://example.com"],
+            version: 2,
+            created_at: 1000,
+          },
+        }),
+      ],
+    });
+
+    expect(screen.getByText("mesh tinkerer")).toBeTruthy();
+    expect(screen.getByText("example.com")).toBeTruthy();
+    expect(
+      screen.getByTitle(`Avatar SHA-256 ${"ab".repeat(32)}`),
+    ).toBeTruthy();
+  });
+
+  it("shows nothing extra for a peer without a profile", () => {
+    renderSidebar({}, vi.fn(), { peers: [makePeer()] });
+
+    expect(screen.queryByText("mesh tinkerer")).toBeNull();
+    expect(screen.queryByText("example.com")).toBeNull();
+  });
+});

@@ -1145,3 +1145,61 @@ describe("MessageFeed pins", () => {
     expect(screen.getByText("No pinned messages")).toBeTruthy();
   });
 });
+
+describe("MessageFeed peer profile", () => {
+  it("shows the open peer's profile bio and links in the header", () => {
+    const message = makeMessage();
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        peer={{
+          destination: "ab".repeat(16),
+          name: "alice",
+          last_seen: 1000,
+          age: 5,
+          hops: 1,
+          protocol: 1,
+          profile: {
+            author: "ab".repeat(16),
+            name: "alice",
+            bio: "mesh tinkerer",
+            avatar: "ab".repeat(32),
+            links: ["https://example.com"],
+            version: 2,
+            created_at: 1000,
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("alice — mesh tinkerer")).toBeTruthy();
+    expect(screen.getByText("example.com")).toBeTruthy();
+    expect(
+      screen.getByTitle(`Avatar SHA-256 ${"ab".repeat(32)}`),
+    ).toBeTruthy();
+  });
+
+  it("shows no profile strip without a peer profile", () => {
+    const message = makeMessage();
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        peer={{
+          destination: "ab".repeat(16),
+          name: "alice",
+          last_seen: 1000,
+          age: 5,
+          hops: 1,
+          protocol: 1,
+          profile: null,
+        }}
+      />,
+    );
+
+    expect(screen.queryByText(/mesh tinkerer/)).toBeNull();
+  });
+});

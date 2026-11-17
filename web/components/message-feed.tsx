@@ -26,6 +26,7 @@ export function MessageFeed({
   node,
   peers,
   groups,
+  peer,
   live,
   onReply,
   onDelete,
@@ -53,6 +54,10 @@ export function MessageFeed({
   peers?: Peer[];
   // Known groups to offer as forward targets, alongside peers.
   groups?: TauGroup[];
+  // The peer this DM conversation is with, when one is open: its
+  // signed public profile (bio, avatar hash, links) renders in the
+  // header strip below.
+  peer?: Peer | null;
   live: boolean;
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
@@ -181,6 +186,33 @@ export function MessageFeed({
           </span>
         </div>
       </div>
+
+      {peer?.profile ? (
+        <div className="border-b border-line/60 px-4 py-2">
+          <p className="truncate text-xs text-zinc-200" title={peer.profile.bio}>
+            {peer.profile.name}
+            {peer.profile.bio ? ` — ${peer.profile.bio}` : ""}
+          </p>
+          <p className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[10px] text-mist">
+            {peer.profile.avatar ? (
+              <span title={`Avatar SHA-256 ${peer.profile.avatar}`}>
+                avatar {shortHash(peer.profile.avatar, 10)}
+              </span>
+            ) : null}
+            {peer.profile.links.map((link) => (
+              <a
+                key={link}
+                href={link}
+                target="_blank"
+                rel="noreferrer"
+                className="max-w-full truncate text-signal hover:underline"
+              >
+                {link.replace(/^https?:\/\//, "")}
+              </a>
+            ))}
+          </p>
+        </div>
+      ) : null}
 
       {onSearch ? (
         <form

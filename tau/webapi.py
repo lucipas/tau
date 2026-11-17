@@ -256,6 +256,7 @@ from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError, safety_number
+from .profile import public_profile
 from .protocol import (
     MAX_FILE_BYTES,
     MAX_MAIL_TTL,
@@ -1551,7 +1552,25 @@ class WebBridge:
         payload["blocked"] = bool(
             blocklist is not None and blocklist.is_blocked(payload.get("destination"))
         )
+        payload["profile"] = self._peer_profile(peer)
         return payload
+
+    def _peer_profile(self, peer: Peer) -> Optional[Dict[str, Any]]:
+        """The stored public profile for *peer*, display-ready or None.
+
+        A node-like without a profile store (e.g. in tests) simply has
+        no profiles, mirroring :meth:`peers` returning [] when the
+        registry cannot be read.
+        """
+        store = getattr(self.node, "profile_store", None)
+        if store is None:
+            return None
+        try:
+            doc = store.get(peer.hexhash)
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read profile for %s", peer.hexhash, exc_info=True)
+            return None
+        return public_profile(doc)
 
     def record_peer(self, peer: Peer) -> None:
         self.bus.publish({"type": "peer", "peer": self._local_peer_payload(peer)})
@@ -7071,6 +7090,7 @@ class WebBridge:
                 item["lookalike_of"] = (
                     collided.display_name if collided is not None else None
                 )
+                item["profile"] = self._peer_profile(peer)
                 items.append(item)
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)

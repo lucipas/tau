@@ -344,6 +344,14 @@ export function Console() {
       : canonicalPeerTarget(target, tau.peers);
   const typists =
     target.trim() === "" ? [] : (tau.typing[typingKey] ?? []);
+  // The peer this DM conversation is with, for the profile strip in
+  // the message header: groups have no peer profile.
+  const selectedPeer =
+    mode === "peer"
+      ? (tau.peers.find(
+          (candidate) => candidate.destination === typingKey,
+        ) ?? null)
+      : null;
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden">
@@ -549,6 +557,7 @@ export function Console() {
               node={tau.node}
               peers={tau.peers}
               groups={tau.groups}
+              peer={selectedPeer}
               live={tau.connection === "live"}
               searching={tau.searchQuery !== null}
               searchQuery={tau.searchQuery}
