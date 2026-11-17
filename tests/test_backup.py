@@ -15,6 +15,11 @@ import pytest
 
 from tau import cli
 from tau.backup import BACKUP_FILES, MANIFEST_NAME, create_backup, restore_backup
+from tau.channels import (
+    create_message,
+    init_db as init_channel_db,
+    join_channel,
+)
 from tau.config import TauConfig
 from tau.dm_requests import DM_REQUEST_TTL, DmRequest, record_dm_request
 from tau.identity import destination_hash, load_identity
@@ -61,6 +66,20 @@ def _seed_state(data_dir):
     (data_dir / "blocklist.json").write_text('{"blocked": []}\n', encoding="utf-8")
     conn = init_db(data_dir / "tan.sqlite3")
     conn.close()
+    # A joined channel with a message, so the round-trip proves channel
+    # membership and history survive backup and restore.
+    config = TauConfig.resolve(data_dir=data_dir)
+    identity = load_identity(data_dir / "identity")
+    assert identity is not None
+    channel_conn = init_channel_db(data_dir / "channels.sqlite3")
+    try:
+        join_channel(channel_conn, "general")
+        create_message(
+            channel_conn, identity, "general", "hello channels",
+            name="alice", now=1000,
+        )
+    finally:
+        channel_conn.close()
     # Runtime state that must never be archived.
     (data_dir / "node.lock").write_text("1234", encoding="utf-8")
     # Received files, one per sender, as the node stores them.
@@ -154,13 +173,27 @@ def test_backup_restore_round_trip(tmp_path, capsys):
     assert _id_destination(node_b, capsys) == destination_a
     assert stat.S_IMODE(os.stat(node_b / "identity").st_mode) == 0o600
     for name, data in contents_before.items():
-        # The Tan database is snapshotted with SQLite's backup API, so
+        # SQLite databases are snapshotted with SQLite's backup API, so
         # the restored file is content-identical but not byte-identical
         # (header counters may differ); compare it by logical dump.
-        if name == "tan.sqlite3":
+        if name in ("tan.sqlite3", "channels.sqlite3"):
             assert _sqlite_dump(node_b / name) == _sqlite_dump(node_a / name)
         else:
             assert (node_b / name).read_bytes() == data
+
+    # The restored channel store keeps its membership and history.
+    channel_conn = init_channel_db(node_b / "channels.sqlite3")
+    try:
+        from tau.channels import channel_history, list_memberships
+
+        assert [item["channel"] for item in list_memberships(channel_conn)] == [
+            "general"
+        ]
+        assert [
+            item["text"] for item in channel_history(channel_conn, "general")
+        ] == ["hello channels"]
+    finally:
+        channel_conn.close()
 
 
 def test_backup_refuses_existing_archive_without_force(tmp_path, capsys):

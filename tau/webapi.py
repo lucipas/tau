@@ -149,6 +149,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/sync     pull missing posts from peers
     GET  /api/tan/export   export stored posts (``?scope=mine|all``)
     POST /api/tan/import   import an export document (every entry verified)
+    GET  /api/channels     joined channels, most recently joined first
+    GET  /api/channels/messages  stored messages for a channel (``?channel=<name>&limit=20``)
+    POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
+    POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
+    POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/tan/saved    saved posts, newest save first
     POST /api/tan/save     save a post to read later
     POST /api/tan/unsave   remove a post from the saved list
@@ -2096,6 +2102,11 @@ class WebBridge:
         self.bus.publish({"type": "post", "post": dict(record)})
         return record
 
+    def record_channel_message(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Fan a channel message out to SSE subscribers."""
+        self.bus.publish({"type": "channel-message", "message": dict(record)})
+        return record
+
     # -- Tan social feed ---------------------------------------------------
 
     def _tan_app(self) -> Optional[Any]:
@@ -3679,6 +3690,105 @@ class WebBridge:
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
+
+    # -- Public channels ---------------------------------------------------
+
+    def _channel_app(self) -> Optional[Any]:
+        app = getattr(self.node, "channel_app", None)
+        return app if getattr(app, "db_path", None) is not None else None
+
+    def _channel_db_path(self) -> Path:
+        app = self._channel_app()
+        if app is not None:
+            return Path(app.db_path)
+        return Path(self.node.config.channels_db_path)
+
+    def _channel_conn(self) -> Any:
+        from .channels import init_db
+
+        return init_db(self._channel_db_path())
+
+    def _local_channel_app(self) -> Any:
+        """A ChannelApp for local-only ops (join/leave/list/read).
+
+        The attached app when channels are enabled, so the console
+        sees exactly what the running node serves; otherwise a fresh
+        app over the same store, which never touches the network.
+        """
+        from .channels import ChannelApp
+        from .identity import load_identity
+
+        app = self._channel_app()
+        if app is not None:
+            return app
+        identity = load_identity(self.node.config.identity_path)
+        if identity is None:
+            raise WebBridgeError("no identity; run `tau init` first")
+        return ChannelApp(
+            self.node.config, identity, name=getattr(self.node, "name", None)
+        )
+
+    def channel_list(self) -> List[Dict[str, Any]]:
+        """Joined channels, most recently joined first."""
+        return self._local_channel_app().memberships()
+
+    def channel_messages(
+        self, channel: str, *, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Stored messages for *channel*, newest first, minus blocked authors."""
+        from .channels import channel_history, clean_channel_name
+
+        name = clean_channel_name(channel)
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._channel_conn()
+        try:
+            messages = channel_history(conn, name, limit=limit)
+        finally:
+            conn.close()
+        if exclude_all:
+            return []
+        return [
+            message
+            for message in messages
+            if str(message.get("author", "")) not in blocked
+        ]
+
+    def channel_join(self, channel: str) -> Dict[str, Any]:
+        """Join *channel*, recording membership locally."""
+        return self._local_channel_app().join(channel)
+
+    def channel_leave(self, channel: str) -> Dict[str, Any]:
+        """Leave *channel*; cached messages are kept."""
+        from .channels import clean_channel_name
+
+        left = self._local_channel_app().leave(channel)
+        return {"channel": clean_channel_name(channel), "left": left}
+
+    def channel_send(self, channel: str, text: str) -> Dict[str, Any]:
+        """Send *text* to a joined channel, gossiping it to peers."""
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        return app.send(channel, text, publish=True)
+
+    def channel_sync(
+        self, channel: Optional[str] = None, *, limit: int = 20
+    ) -> Dict[str, Any]:
+        """Pull missing history for *channel*, or every joined channel."""
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        if channel:
+            return app.sync(self.node, channel, limit=limit)
+        return app.sync_all(self.node, limit=limit)
 
     def tan_rules(self) -> Dict[str, Any]:
         """This node's Tan admission ruleset, as ``tau tan rules`` reports it.
@@ -9496,6 +9606,32 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(report, head_only)
                 return
+            if path == "/api/channels":
+                channels = self.bridge.channel_list()
+                self._send_json(
+                    {"channels": channels, "count": len(channels)}, head_only
+                )
+                return
+            if path == "/api/channels/messages":
+                channel = query.get("channel", [None])[0]
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "query 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                limit = _int_param(query, "limit", default=20, minimum=1, maximum=50)
+                try:
+                    messages = self.bridge.channel_messages(channel, limit=limit)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(
+                    {"channel": channel, "messages": messages, "count": len(messages)},
+                    head_only,
+                )
+                return
             self._send_json({"error": {"message": "not found"}}, head_only, 404)
             return
 
@@ -10773,6 +10909,91 @@ class _WebHandler(BaseHTTPRequestHandler):
                     result = self.bridge.tan_sync(
                         explore=bool(body.get("explore", True))
                     )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                self._send_json({"ok": True, "sync": result}, head_only)
+                return
+            if path in ("/api/channels/join", "/api/channels/leave"):
+                channel = body.get("channel")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/channels/join":
+                        result = self.bridge.channel_join(channel)
+                    else:
+                        result = self.bridge.channel_leave(channel)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/channels/send":
+                channel = body.get("channel")
+                text = body.get("text")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    message = self.bridge.channel_send(channel, text)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/sync":
+                channel = body.get("channel")
+                if channel is not None and (
+                    not isinstance(channel, str) or not channel.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'channel' must be a channel name"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                limit = body.get("limit", 20)
+                if (
+                    not isinstance(limit, int)
+                    or isinstance(limit, bool)
+                    or not 1 <= limit <= 50
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'limit' must be 1-50"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.channel_sync(channel, limit=limit)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return

@@ -46,6 +46,7 @@ from typing import Dict, List, Tuple
 from . import __version__
 from .config import (
     ARCHIVED_FILE_NAME,
+    CHANNELS_DB_FILE_NAME,
     DISAPPEARING_FILE_NAME,
     DM_REQUESTS_FILE_NAME,
     FILES_DIR_NAME,
@@ -59,6 +60,7 @@ from .util import atomic_write_json, ensure_dir, read_json
 BACKUP_FORMAT_VERSION = 1
 MANIFEST_NAME = "manifest.json"
 SOCIAL_DB_NAME = "tan.sqlite3"
+CHANNELS_DB_NAME = CHANNELS_DB_FILE_NAME
 RNS_CONFIG_MEMBER = "reticulum/config"
 
 # Archive member -> path relative to the data directory.  Only these
@@ -75,6 +77,7 @@ BACKUP_FILES = (
     "inbox.json",
     "messages.json",
     SOCIAL_DB_NAME,
+    CHANNELS_DB_NAME,
     "tan-rules.json",
     "allowlist.json",
     "ignored-groups.json",
@@ -88,9 +91,13 @@ BACKUP_FILES = (
     RNS_CONFIG_MEMBER,
 )
 
-# Files SQLite keeps beside the Tan database.  A restored database must
+# Files SQLite keeps beside a database.  A restored database must
 # never be paired with a stale journal or WAL from the previous state.
 _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+
+# Databases snapshotted through SQLite's backup API instead of copied
+# raw, so committed WAL pages are part of the copy.
+_SQLITE_DBS = (SOCIAL_DB_NAME, CHANNELS_DB_NAME)
 
 # Bounds on untrusted archives, enforced while streaming.
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -184,9 +191,10 @@ def _destinations(
 def _state_paths(destinations: Dict[str, Path]) -> Dict[str, Path]:
     """Every live node-state path, labelled, including SQLite sidecars."""
     state = dict(destinations)
-    db = destinations[SOCIAL_DB_NAME]
-    for suffix in _SQLITE_SIDECARS:
-        state[f"{SOCIAL_DB_NAME}{suffix}"] = Path(f"{db}{suffix}")
+    for db_name in _SQLITE_DBS:
+        db = destinations[db_name]
+        for suffix in _SQLITE_SIDECARS:
+            state[f"{db_name}{suffix}"] = Path(f"{db}{suffix}")
     return state
 
 
@@ -281,11 +289,11 @@ def create_backup(
             # A symlinked state file would be archived as a symlink member,
             # which restore rejects as not a regular file — so a backup of
             # a node with linked state would succeed and then never
-            # restore.  Refuse loudly instead.  (The Tan database is the
-            # exception: it is snapshotted to a fresh regular file, so a
-            # link there is harmless.)
+            # restore.  Refuse loudly instead.  (The SQLite databases are
+            # the exception: they are snapshotted to fresh regular files,
+            # so a link there is harmless.)
             for name in files:
-                if name != SOCIAL_DB_NAME and destinations[name].is_symlink():
+                if name not in _SQLITE_DBS and destinations[name].is_symlink():
                     raise BackupError(
                         f"cannot back up {destinations[name]}: it is a symlink"
                     )
@@ -318,9 +326,9 @@ def create_backup(
                             expanded = 0
                             for name in files:
                                 source = destinations[name]
-                                if name == SOCIAL_DB_NAME:
+                                if name in _SQLITE_DBS:
                                     source = _snapshot_sqlite(
-                                        source, Path(scratch) / SOCIAL_DB_NAME
+                                        source, Path(scratch) / name
                                     )
                                 # Size and bytes come from one open descriptor:
                                 # a live node may atomically replace the file

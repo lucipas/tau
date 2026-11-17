@@ -4536,6 +4536,95 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_channels_via_api(tmp_path):
+    from types import SimpleNamespace
+
+    import RNS
+
+    from tau import cli
+    from tau.channels import (
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    tester = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        bob_message = create_message(
+            conn, bob, "general", "hello channels", name="bob", now=1000
+        )
+        create_message(
+            conn, tester, "general", "from tester", name="tester", now=1001
+        )
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/channels")
+        assert status == 200
+        assert [item["channel"] for item in payload["channels"]] == ["general"]
+        assert payload["channels"][0]["messages"] == 2
+
+        status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == [
+            "from tester",
+            "hello channels",
+        ]
+
+        status, _, payload = _json(bridge, "/api/channels/messages")
+        assert status == 400
+
+        # A blocked author is hidden, like the timeline hides their posts.
+        node.blocklist = SimpleNamespace(
+            blocked=frozenset({bob_message["author"]}), block_all=False
+        )
+        status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == ["from tester"]
+        node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert payload["messages"] == []
+        node.blocklist = None
+
+        status, _, payload = _json(
+            bridge, "/api/channels/join", method="POST", body={"channel": "other"}
+        )
+        assert status == 200
+        assert payload["channel"] == "other"
+        status, _, payload = _json(
+            bridge, "/api/channels/leave", method="POST", body={"channel": "other"}
+        )
+        assert status == 200
+        assert payload["left"] is True
+
+        # Sending and syncing need channels enabled on the serving node.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "nope"},
+        )
+        assert status == 503
+        assert "not enabled" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge, "/api/channels/sync", method="POST", body={}
+        )
+        assert status == 503
+    finally:
+        bridge.stop()
+
+
 def test_tan_authors_via_api(tmp_path):
     import RNS
     from types import SimpleNamespace
