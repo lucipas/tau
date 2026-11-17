@@ -1,104 +1,186 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+// api.test.ts — URL / param / body building for the api.ts client, with
+// fetch mocked. No live node is needed: every test drives a deferred
+// promise so the request can be inspected before it resolves.
 
-import { ApiError, apiDownload, websocketUrl } from "./api";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  ApiError,
+  clearReaction,
+  eventsUrl,
+  fetchTanMedia,
+  fileUrl,
+  getChannelMessages,
+  getMessages,
+  getTanThread,
+  getTanTimeline,
+  markRead,
+  pageFileUrl,
+  reactToMessage,
+  sendMessage,
+  tanMediaUrl,
+  voteTanPoll,
+  wsUrl,
+} from "./api";
 
-function mockFetch(response: Response) {
-  const fetchMock = vi.fn().mockResolvedValue(response);
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
+interface Captured {
+  url: string;
+  init?: RequestInit;
 }
+
+let captured: Captured[] = [];
+let nextJson: unknown = {};
+let nextOk = true;
+let nextStatus = 200;
+
+function jsonResponse(body: unknown, ok = true, status = 200): Response {
+  return {
+    ok,
+    status,
+    text: async () => JSON.stringify(body),
+  } as Response;
+}
+
+beforeEach(() => {
+  captured = [];
+  nextJson = {};
+  nextOk = true;
+  nextStatus = 200;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      captured.push({ url, init });
+      return jsonResponse(nextJson, nextOk, nextStatus);
+    }),
+  );
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  vi.unstubAllEnvs();
 });
 
-describe("websocketUrl", () => {
-  it("targets the bridge port under next dev", () => {
-    // jsdom runs at http://localhost:3000/ with no API base set.
-    expect(websocketUrl()).toBe("ws://localhost:8787/ws");
+function bodyOf(call: number): Record<string, unknown> {
+  return JSON.parse(String(captured[call]?.init?.body ?? "{}")) as Record<string, unknown>;
+}
+
+describe("GET endpoints", () => {
+  it("fetches messages with a limit", async () => {
+    nextJson = { messages: [] };
+    await getMessages(50);
+    expect(captured[0].url).toBe("/api/messages?limit=50");
+    expect(captured[0].init?.headers).toEqual({ "Content-Type": "application/json" });
+    expect(captured[0].init?.method).toBeUndefined();
   });
 
-  it("swaps an http API base to ws", async () => {
-    vi.stubEnv("NEXT_PUBLIC_API_BASE", "http://127.0.0.1:8787");
-    vi.resetModules();
-    const fresh = await import("./api");
-    expect(fresh.websocketUrl()).toBe("ws://127.0.0.1:8787/ws");
+  it("builds the Tan timeline query (all / author / tag)", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanTimeline({ limit: 10, all: true, author: "alice", tag: "mesh" });
+    expect(captured[0].url).toBe("/api/tan/timeline?limit=10&all=1&author=alice&tag=mesh");
   });
 
-  it("resolves a relative API base against the page", async () => {
-    vi.stubEnv("NEXT_PUBLIC_API_BASE", "/tau");
-    vi.resetModules();
-    const fresh = await import("./api");
-    expect(fresh.websocketUrl()).toBe("ws://localhost:3000/tau/ws");
+  it("omits empty timeline params", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanTimeline();
+    expect(captured[0].url).toBe("/api/tan/timeline?limit=30");
+  });
+
+  it("encodes the thread ref", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanThread("ab12 cd");
+    expect(captured[0].url).toBe("/api/tan/thread?ref=ab12%20cd");
+  });
+
+  it("encodes the channel name", async () => {
+    nextJson = { channel: "general", messages: [], count: 0 };
+    await getChannelMessages("my channel", 5);
+    expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
   });
 });
 
-describe("apiDownload", () => {
-  it("returns the blob and the filename from Content-Disposition", async () => {
-    const fetchMock = mockFetch(
-      new Response("archive-bytes", {
-        status: 200,
-        headers: {
-          "Content-Type": "application/gzip",
-          "Content-Disposition":
-            'attachment; filename="tau-backup-alice-20261110-120000.tar.gz"',
-        },
-      }),
+describe("POST endpoints", () => {
+  it("sends a DM with reply / expiry / delay / poll options", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage(
+      { to: "alice" },
+      "hello",
+      { replyTo: "wire1", expiresIn: 3600, sendIn: 60, pollOptions: ["a", "b"] },
     );
-
-    const result = await apiDownload("/api/backup");
-
-    expect(await result.blob.text()).toBe("archive-bytes");
-    expect(result.filename).toBe("tau-backup-alice-20261110-120000.tar.gz");
-    expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("/api/backup"),
-      expect.objectContaining({ cache: "no-store" }),
-    );
+    expect(captured[0].url).toBe("/api/messages");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      to: "alice",
+      text: "hello",
+      reply_to: "wire1",
+      expires_in: 3600,
+      send_in: 60,
+      poll_options: ["a", "b"],
+    });
   });
 
-  it("falls back to a default filename without Content-Disposition", async () => {
-    mockFetch(new Response("x", { status: 200 }));
-
-    const result = await apiDownload("/api/backup");
-
-    expect(result.filename).toBe("tau-backup.tar.gz");
+  it("sends a group message with the group key, not `to`", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage({ group: "g123" }, "hi");
+    expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
   });
 
-  it("throws an ApiError carrying the server's JSON message", async () => {
-    mockFetch(
-      new Response(
-        JSON.stringify({ error: { message: "no data directory" } }),
-        {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        },
-      ),
+  it("reacts and clears a reaction on the same route", async () => {
+    nextJson = { ok: true };
+    await reactToMessage("wire9", "👍");
+    expect(bodyOf(0)).toEqual({ target: "wire9", reaction: "👍" });
+    await clearReaction("wire9");
+    expect(bodyOf(1)).toEqual({ target: "wire9", clear: true });
+  });
+
+  it("votes a Tan poll with a 0-based option index", async () => {
+    nextJson = { ok: true };
+    await voteTanPoll("posthash", 2);
+    expect(captured[0].url).toBe("/api/tan/vote");
+    expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
+  });
+
+  it("marks read with an empty body when no conversation is given", async () => {
+    nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, total: 0, revision: 1 } };
+    await markRead();
+    expect(bodyOf(0)).toEqual({});
+  });
+
+  it("fetches Tan media with the author in the body", async () => {
+    nextJson = { ok: true };
+    await fetchTanMedia("a".repeat(64), "b".repeat(32));
+    expect(captured[0].url).toBe(`/api/tan/media/${"a".repeat(64)}/fetch`);
+    expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
+  });
+});
+
+describe("ApiError", () => {
+  it("surfaces the bridge's error message and status", async () => {
+    nextOk = false;
+    nextStatus = 404;
+    nextJson = { error: { message: "no peer matches 'alice'" } };
+    await expect(getMessages()).rejects.toMatchObject({
+      message: "no peer matches 'alice'",
+      status: 404,
+    });
+    await expect(getMessages()).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it("falls back to a generic message on a non-JSON error body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 500, text: async () => "boom" }) as Response),
     );
-
-    let caught: unknown;
-    try {
-      await apiDownload("/api/backup");
-    } catch (error) {
-      caught = error;
-    }
-
-    expect(caught).toBeInstanceOf(ApiError);
-    expect((caught as ApiError).message).toBe("no data directory");
-    expect((caught as ApiError).status).toBe(503);
+    await expect(getMessages()).rejects.toMatchObject({ status: 500 });
   });
+});
 
-  it("falls back to the status when the error body is not JSON", async () => {
-    mockFetch(new Response("gateway exploded", { status: 502 }));
-
-    let caught: unknown;
-    try {
-      await apiDownload("/api/backup");
-    } catch (error) {
-      caught = error;
-    }
-
-    expect(caught).toBeInstanceOf(ApiError);
-    expect((caught as ApiError).message).toBe("request failed (502)");
+describe("URL helpers", () => {
+  it("builds file / media / page / event / ws URLs", () => {
+    expect(fileUrl("sender1", "my file.txt")).toBe("/api/files/sender1/my%20file.txt");
+    expect(tanMediaUrl("a".repeat(64))).toBe(`/api/tan/media/${"a".repeat(64)}`);
+    expect(pageFileUrl("b".repeat(32), "c".repeat(64))).toBe(
+      `/api/pages/${"b".repeat(32)}/files/${"c".repeat(64)}`,
+    );
+    expect(eventsUrl()).toBe("/api/events");
+    expect(eventsUrl(42)).toBe("/api/events?since=42");
+    expect(wsUrl()).toBe("ws://example.com/ws");
   });
 });

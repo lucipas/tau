@@ -1,15 +1,18 @@
-// Visual regression check for the tau web console chat layout.
+// Visual regression check for the rewritten (v2) tau web console.
 //
 // Screenshots the built static export (web/out) as served by a running
-// `tau serve --http` bridge, at a mobile and a desktop viewport, and
-// asserts the layout invariants that broke in Nov 2026 (see the PR that
-// added this directory):
-//   - the message feed does not collapse to ~0px tall on mobile
-//   - the composer does not overlap the message list
-//   - the per-message action row does not overlap the outbox
-//   - the sidebar does not overflow its desktop column (peer buttons
-//     used to be clipped off the right edge)
+// `tau serve --http` bridge, at a mobile and a desktop viewport, for
+// two views — the Social feed (#social) and the seeded bob chat thread
+// (#chat?peer=<bob destination>) — and asserts the layout invariants:
+//
 //   - no horizontal overflow at either width
+//   - the section nav is present (left nav on desktop, bottom tab bar
+//     on mobile) and does not overlap the center column
+//   - Social: the Tan composer sits at the top of the feed in normal
+//     flow and the seeded post renders (article count >= 1)
+//   - Chat: the message thread renders tall enough to show messages,
+//     the composer sits below the thread in normal flow (no overlap),
+//     the conversation list keeps its column on desktop (no clipping)
 //
 // Usage:
 //   node screenshot.mjs <bridge-url> <out-dir> [--update-baselines]
@@ -26,10 +29,10 @@
 // Access checks, which block navigations to loopback addresses. This
 // script works around it by navigating through a file:// hop page first
 // (a local -> local navigation, which is allowed). The hop is harmless
-// on a normal Chromium build, so it is always used. The same build also
-// refuses to start without a WebGL domain policy; when the Hatch build
-// is detected, the policy file is written to the temp dir and passed
-// via --hatch-webgl-allowed-domains-file.
+// on a normal Chromium build, so it is always used. The same build
+// also refuses to start without a WebGL domain policy; when the Hatch
+// build is detected, the policy file is written to the temp dir and
+// passed via --hatch-webgl-allowed-domains-file.
 
 import { createHash } from "node:crypto";
 import { spawn, execSync } from "node:child_process";
@@ -73,8 +76,8 @@ function findChrome() {
 const chrome = findChrome();
 const isHatch = chrome.includes("meta-chromium");
 const port = 9453 + (process.pid % 100);
-const profileDir = join(tmpdir(), `tau-visual-regression-${process.pid}`);
-const hopPath = join(tmpdir(), `tau-lna-hop-${process.pid}.html`);
+const profileDir = join(tmpdir(), `tau-visual-regression-v2-${process.pid}`);
+const hopPath = join(tmpdir(), `tau-lna-hop-v2-${process.pid}.html`);
 
 const chromeArgs = [
   "--headless=new",
@@ -121,71 +124,113 @@ async function waitForDevTools() {
   throw new Error("DevTools endpoint did not come up");
 }
 
+// Bob's destination, so the chat shots can deep-link to the thread
+// via #chat?peer=<destination> instead of clicking through the list.
+async function findBobDestination() {
+  for (let i = 0; i < 30; i++) {
+    try {
+      const res = await fetch(`${bridgeUrl}api/peers`);
+      const data = await res.json();
+      const bob = (data.peers ?? []).find((p) => p.name === "bob");
+      if (bob?.destination) return bob.destination;
+    } catch {
+      // bridge not up yet
+    }
+    await sleep(1000);
+  }
+  throw new Error("bob never appeared in /api/peers");
+}
+
 const VIEWPORTS = [
   { name: "mobile-390", width: 390, height: 844, dpr: 2 },
   { name: "desktop-1280", width: 1280, height: 900, dpr: 1 },
 ];
 
+const VIEWS = [
+  { name: "social", hash: "#social" },
+  { name: "chat", hash: null }, // filled in with #chat?peer=<bob>
+];
+
 const GEOMETRY_EXPRESSION = `(() => {
   const r = (el) => el ? (() => { const b = el.getBoundingClientRect(); return {x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height), bottom: Math.round(b.bottom), right: Math.round(b.right)}; })() : null;
-  const main = document.querySelector('main');
-  const scroll = document.querySelector('[aria-label="Message traffic"]');
-  const feed = scroll ? scroll.closest('section') : null;
-  const textarea = document.querySelector('#message-text');
-  const composer = textarea ? textarea.closest('section') : null;
-  const outboxBtn = [...document.querySelectorAll('button[aria-expanded]')].find((b) => b.textContent.toLowerCase().includes('outbox'));
-  const outbox = outboxBtn ? outboxBtn.closest('div[class*="rounded-2xl"]') || outboxBtn.parentElement : null;
-  const aside = document.querySelector('aside');
-  const articles = [...document.querySelectorAll('article')];
+  const visible = (el) => !!el && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
   const overlap = (a, b) => a && b && a.x < b.right && b.x < a.right && a.y < b.bottom && b.y < a.bottom;
-  const actions = articles.map((a) => {
-    const replyBtn = a.querySelector('button[title="Reply to this message"]');
-    const row = replyBtn ? replyBtn.parentElement : null;
-    return { actionRow: r(row) };
-  });
+  const nav = document.querySelector('nav[aria-label="Sections"]');
+  const thread = document.querySelector('[aria-label="Messages"]');
+  const chatTextarea = document.querySelector('textarea[aria-label="Message"]');
+  const chatComposer = chatTextarea ? chatTextarea.closest('div[class*="border-t"], form') || chatTextarea.parentElement : null;
+  const list = document.querySelector('[aria-label="Conversations"]');
+  const tanTextarea = document.querySelector('textarea[aria-label="Compose a post"]');
+  const tanComposer = tanTextarea ? tanTextarea.closest('section, form, div') : null;
+  const feedTabs = document.querySelector('[aria-label="Feed tabs"]');
+  const articles = [...document.querySelectorAll('article')];
+  const messages = [...document.querySelectorAll('[data-message-id]')];
   return {
     url: location.href,
     viewport: { w: window.innerWidth, h: window.innerHeight },
     docScrollWidth: document.documentElement.scrollWidth,
-    main: r(main),
-    feedSection: r(feed),
-    feedScroll: r(scroll),
-    composer: r(composer),
-    outbox: r(outbox),
-    aside: r(aside),
-    composerOverlapsFeed: overlap(r(composer), r(scroll)),
-    outboxOverlappedByActionRow: actions.some((a) => overlap(a.actionRow, r(outbox))),
-    messages: articles.length,
+    nav: r(nav),
+    list: r(list),
+    thread: r(thread),
+    chatComposer: r(chatComposer),
+    tanComposer: r(tanComposer),
+    feedTabs: r(feedTabs),
+    composerOverlapsThread: overlap(r(chatComposer), r(thread)),
+    navOverlapsThread: overlap(r(nav), r(thread)),
+    navOverlapsComposer: overlap(r(nav), r(tanComposer)),
+    articles: articles.length,
+    messages: messages.length,
+    hasChatTextarea: visible(chatTextarea),
+    hasTanTextarea: visible(tanTextarea),
+    h1Texts: [...document.querySelectorAll('h1')].map((h) => h.textContent.trim()).slice(0, 5),
   };
 })()`;
 
-function checkGeometry(name, g, width) {
+function checkGeometry(view, name, g, width) {
   const failures = [];
-  if (g.messages < 1) failures.push("no messages rendered");
-  if (!g.feedSection || g.feedSection.h < 100) {
-    failures.push(`feed section collapsed (h=${g.feedSection?.h})`);
-  }
-  if (g.composerOverlapsFeed) failures.push("composer overlaps message list");
-  if (g.outboxOverlappedByActionRow) {
-    failures.push("message action row overlaps outbox");
-  }
   if (g.docScrollWidth > width) {
     failures.push(`horizontal overflow (docScrollWidth=${g.docScrollWidth} > ${width})`);
   }
-  if (name.startsWith("desktop") && g.aside && g.main) {
-    // The aside must fit its 340px column: its right edge must not pass
-    // the feed's left edge (the grid gap is 20px at lg).
-    const feedLeft = g.feedSection?.x;
-    if (feedLeft !== undefined && g.aside.right > feedLeft) {
-      failures.push(`sidebar overflows its column (aside right=${g.aside.right}, feed left=${feedLeft})`);
+  if (!g.nav) failures.push("section nav not found");
+  if (view === "social") {
+    if (!g.hasTanTextarea) failures.push("Tan composer textarea not visible");
+    if (!g.feedTabs) failures.push("feed tabs not found");
+    if (g.articles < 1) {
+      failures.push(`expected >= 1 seeded post, got ${g.articles} articles`);
+    }
+    if (g.navOverlapsComposer) failures.push("nav overlaps Tan composer");
+  }
+  if (view === "chat") {
+    if (!g.thread || g.thread.h < 100) {
+      failures.push(`message thread collapsed (h=${g.thread?.h})`);
+    }
+    if (!g.hasChatTextarea) failures.push("chat composer textarea not visible");
+    if (!g.chatComposer) failures.push("chat composer not found");
+    if (g.composerOverlapsThread) failures.push("composer overlaps message thread");
+    if (g.navOverlapsThread) failures.push("nav overlaps message thread");
+    if (g.messages < 2) {
+      failures.push(`expected 2 seeded messages, got ${g.messages}`);
+    }
+    if (name.startsWith("desktop") && g.list && g.thread) {
+      // The conversation list keeps its column: it must end before
+      // the thread starts and stay under ~420px wide.
+      if (g.list.w > 420) {
+        failures.push(`conversation list too wide (w=${g.list.w})`);
+      }
+      if (g.list.right > g.thread.x) {
+        failures.push(`conversation list overlaps thread (list right=${g.list.right}, thread x=${g.thread.x})`);
+      }
     }
   }
   return failures;
 }
 
 let failures = [];
+const shots = [];
 try {
   await waitForDevTools();
+  const bobDest = await findBobDestination();
+  VIEWS.find((v) => v.name === "chat").hash = `#chat?peer=${bobDest}`;
   mkdirSync(outDir, { recursive: true });
   writeFileSync(
     hopPath,
@@ -193,66 +238,76 @@ try {
   );
 
   for (const vp of VIEWPORTS) {
-    const target = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, {
-      method: "PUT",
-    }).then((r) => r.json());
-    const ws = new WebSocket(target.webSocketDebuggerUrl);
-    await new Promise((resolve, reject) => {
-      ws.onopen = resolve;
-      ws.onerror = reject;
-    });
-    let nextId = 1;
-    const pending = new Map();
-    const loadFired = new Promise((resolve) => {
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.method === "Page.loadEventFired") resolve();
-        if (msg.id !== undefined && pending.has(msg.id)) {
-          pending.get(msg.id)(msg);
-          pending.delete(msg.id);
-        }
+    for (const view of VIEWS) {
+      const shotName = `${view.name}-${vp.name}`;
+      const target = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, {
+        method: "PUT",
+      }).then((r) => r.json());
+      const ws = new WebSocket(target.webSocketDebuggerUrl);
+      await new Promise((resolve, reject) => {
+        ws.onopen = resolve;
+        ws.onerror = reject;
+      });
+      let nextId = 1;
+      const pending = new Map();
+      const loadFired = new Promise((resolve) => {
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data);
+          if (msg.method === "Page.loadEventFired") resolve();
+          if (msg.id !== undefined && pending.has(msg.id)) {
+            pending.get(msg.id)(msg);
+            pending.delete(msg.id);
+          }
+        };
+      });
+      const send = (method, params = {}) => {
+        const id = nextId++;
+        ws.send(JSON.stringify({ id, method, params }));
+        return new Promise((resolve) => pending.set(id, resolve));
       };
-    });
-    const send = (method, params = {}) => {
-      const id = nextId++;
-      ws.send(JSON.stringify({ id, method, params }));
-      return new Promise((resolve) => pending.set(id, resolve));
-    };
+      const evaluate = async (expression) => {
+        const res = await send("Runtime.evaluate", {
+          expression,
+          returnByValue: true,
+        });
+        return res.result?.result?.value;
+      };
 
-    await send("Page.enable");
-    await send("Runtime.enable");
-    await send("Emulation.setDeviceMetricsOverride", {
-      width: vp.width,
-      height: vp.height,
-      deviceScaleFactor: vp.dpr,
-      mobile: vp.width < 600,
-    });
-    await send("Page.navigate", { url: `file://${hopPath}` });
-    await Promise.race([loadFired, sleep(15000)]);
-    // Let the hop redirect, the SSE snapshot land, and React render.
-    await sleep(5000);
+      await send("Page.enable");
+      await send("Runtime.enable");
+      await send("Emulation.setDeviceMetricsOverride", {
+        width: vp.width,
+        height: vp.height,
+        deviceScaleFactor: vp.dpr,
+        mobile: vp.width < 600,
+      });
+      await send("Page.navigate", { url: `file://${hopPath}` });
+      await Promise.race([loadFired, sleep(15000)]);
+      // Let the hop redirect, the snapshot land, and React render.
+      await sleep(5000);
+      // Hash navigation to the view (the hop lands on the default
+      // chat section; setting location.hash re-renders via useHash).
+      await evaluate(`location.hash = ${JSON.stringify(view.hash)}; true`);
+      await sleep(3000);
 
-    const evalResult = await send("Runtime.evaluate", {
-      expression: GEOMETRY_EXPRESSION,
-      returnByValue: true,
-    });
-    const geometry =
-      evalResult.result?.result?.value ?? { error: "no value", raw: evalResult };
-    const shot = await send("Page.captureScreenshot", { format: "png" });
-    const png = Buffer.from(shot.result.data, "base64");
-    const pngPath = join(outDir, `${vp.name}.png`);
-    writeFileSync(pngPath, png);
-    writeFileSync(
-      join(outDir, `${vp.name}.geometry.json`),
-      JSON.stringify(geometry, null, 2),
-    );
-    const vpFailures = checkGeometry(vp.name, geometry, vp.width);
-    if (vpFailures.length) {
-      failures.push(`${vp.name}: ${vpFailures.join("; ")}`);
+      const geometry = await evaluate(GEOMETRY_EXPRESSION);
+      const shot = await send("Page.captureScreenshot", { format: "png" });
+      const png = Buffer.from(shot.result.data, "base64");
+      const pngPath = join(outDir, `${shotName}.png`);
+      writeFileSync(pngPath, png);
+      writeFileSync(
+        join(outDir, `${shotName}.geometry.json`),
+        JSON.stringify(geometry, null, 2),
+      );
+      shots.push(shotName);
+      const viewFailures = checkGeometry(view.name, vp.name, geometry, vp.width);
+      if (viewFailures.length) {
+        failures.push(`${shotName}: ${viewFailures.join("; ")}`);
+      }
+      console.log(`${shotName}: ${viewFailures.length ? "FAIL" : "ok"} — ${pngPath}`);
+      console.log(JSON.stringify(geometry, null, 2));
+      ws.close();
     }
-    console.log(`${vp.name}: ${vpFailures.length ? "FAIL" : "ok"} — ${pngPath}`);
-    console.log(JSON.stringify(geometry, null, 2));
-    ws.close();
   }
 } finally {
   child.kill();
@@ -261,8 +316,8 @@ try {
 if (updateBaselines) {
   const baselineDir = join(outDir, "..", "baselines");
   mkdirSync(baselineDir, { recursive: true });
-  for (const vp of VIEWPORTS) {
-    copyFileSync(join(outDir, `${vp.name}.png`), join(baselineDir, `${vp.name}.png`));
+  for (const shotName of shots) {
+    copyFileSync(join(outDir, `${shotName}.png`), join(baselineDir, `${shotName}.png`));
   }
   console.log(`baselines updated in ${baselineDir}`);
 }

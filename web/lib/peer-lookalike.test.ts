@@ -1,124 +1,83 @@
 import { describe, expect, it } from "vitest";
-
+import {
+  findLookalikeAnchor,
+  isLookalike,
+  lookalikeGroups,
+} from "./peer-lookalike";
 import type { Peer } from "./types";
-import { lookalikeOf } from "./peer-lookalike";
 
-function makePeer(overrides: Partial<Peer> = {}): Peer {
+function peer(over: Partial<Peer> & { destination: string }): Peer {
   return {
-    destination: "ab".repeat(16),
-    name: "alice",
-    last_seen: 1000,
-    age: 5,
-    hops: 1,
-    protocol: 1,
-    alias: null,
-    ...overrides,
+    name: "unknown",
+    last_seen: 0,
+    age: 0,
+    hops: null,
+    protocol: null,
+    lxmf: null,
+    alias: "",
+    verified: false,
+    verified_at: null,
+    key_change_at: null,
+    name_change_at: null,
+    previous_name: null,
+    lookalike_of: null,
+    blocked: false,
+    profile: null,
+    ...over,
   };
 }
 
-describe("lookalikeOf", () => {
-  it("returns null for a verified peer", () => {
-    const anchor = makePeer({ destination: "cd".repeat(16), verified: true });
-    const peer = makePeer({
-      destination: "ef".repeat(16),
-      name: "Alice",
-      verified: true,
-    });
-    expect(lookalikeOf([anchor, peer], peer)).toBeNull();
-  });
+const alice = peer({ destination: "a".repeat(32), name: "alice", verified: true });
+const aliceClone = peer({ destination: "b".repeat(32), name: "Alice" });
+const bob = peer({ destination: "c".repeat(32), name: "bob" });
+const bobAlias = peer({ destination: "d".repeat(32), name: "robert", alias: "bob" });
+const bobClone = peer({ destination: "e".repeat(32), name: "BOB" });
 
-  it("returns null when the peer never announced a name", () => {
-    const anchor = makePeer({ destination: "cd".repeat(16), verified: true });
-    expect(
-      lookalikeOf([anchor, makePeer({ name: "unknown" })], makePeer({ name: "unknown" })),
-    ).toBeNull();
+describe("findLookalikeAnchor", () => {
+  it("flags an unverified peer sharing a verified peer's name", () => {
+    expect(findLookalikeAnchor(aliceClone, [alice, aliceClone])?.destination).toBe(
+      alice.destination,
+    );
   });
-
-  it("matches a verified anchor's announced name", () => {
-    const anchor = makePeer({ destination: "cd".repeat(16), verified: true });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "Alice" });
-    expect(lookalikeOf([anchor, peer], peer)).toBe("alice");
+  it("is case-insensitive", () => {
+    expect(findLookalikeAnchor(bobClone, [bobAlias, bobClone])?.destination).toBe(
+      bobAlias.destination,
+    );
   });
-
-  it("prefers the anchor's alias as its display name", () => {
-    const anchor = makePeer({
-      destination: "cd".repeat(16),
-      verified: true,
-      alias: "ally",
-    });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "Ally" });
-    expect(lookalikeOf([anchor, peer], peer)).toBe("ally");
+  it("never flags verified peers or itself", () => {
+    expect(findLookalikeAnchor(alice, [alice, aliceClone])).toBeNull();
+    expect(findLookalikeAnchor(aliceClone, [aliceClone])).toBeNull();
   });
-
-  it("counts a note-only contact as an anchor", () => {
-    const anchor = makePeer({
-      destination: "cd".repeat(16),
-      note: "met at the mesh meetup",
-    });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "Alice" });
-    expect(lookalikeOf([anchor, peer], peer)).toBe("alice");
+  it("ignores unknown names and non-anchors", () => {
+    const unknown = peer({ destination: "f".repeat(32), name: "unknown" });
+    expect(findLookalikeAnchor(unknown, [unknown, bob])).toBeNull();
+    expect(findLookalikeAnchor(bobClone, [bob, bobClone])).toBeNull();
   });
-
-  it("matches case-insensitively, like the server's casefold", () => {
-    const anchor = makePeer({ destination: "cd".repeat(16), verified: true });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "ALICE" });
-    expect(lookalikeOf([anchor, peer], peer)).toBe("alice");
+  it("a saved contact (alias/note) anchors a lookalike", () => {
+    const noted = peer({ destination: "1".repeat(32), name: "carol", note: "met at conf" });
+    const carolClone = peer({ destination: "2".repeat(32), name: "Carol" });
+    expect(findLookalikeAnchor(carolClone, [noted, carolClone])?.destination).toBe(
+      noted.destination,
+    );
   });
+});
 
-  it("casefolds ß the way the server does", () => {
-    const anchor = makePeer({
-      destination: "cd".repeat(16),
-      verified: true,
-      name: "Straße",
-    });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "STRASSE" });
-    expect(lookalikeOf([anchor, peer], peer)).toBe("Straße");
+describe("isLookalike", () => {
+  it("is true exactly when an anchor exists", () => {
+    expect(isLookalike(aliceClone, [alice, aliceClone])).toBe(true);
+    expect(isLookalike(bob, [alice, bob])).toBe(false);
   });
+});
 
-  it("folds ligatures the way the server does, for note-only contacts", () => {
-    const anchor = makePeer({
-      destination: "cd".repeat(16),
-      note: "met at the mesh meetup",
-      name: "ﬀoo",
-    });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "ffoo" });
-    expect(lookalikeOf([anchor, peer], peer)).toBe("ﬀoo");
+describe("lookalikeGroups", () => {
+  it("groups lookalikes under their anchor", () => {
+    const groups = lookalikeGroups([alice, aliceClone, bob, bobClone, bobAlias]);
+    expect(groups).toHaveLength(2);
+    const aliceGroup = groups.find((g) => g.name === "alice");
+    expect(aliceGroup?.anchor.destination).toBe(alice.destination);
+    expect(aliceGroup?.lookalikes).toHaveLength(1);
   });
-
-  it("never compares the peer's own alias", () => {
-    const anchor = makePeer({ destination: "cd".repeat(16), verified: true });
-    const peer = makePeer({
-      destination: "ef".repeat(16),
-      name: "bob",
-      alias: "alice",
-    });
-    expect(lookalikeOf([anchor, peer], peer)).toBeNull();
-  });
-
-  it("never collides with an anchor named unknown", () => {
-    const anchor = makePeer({
-      destination: "cd".repeat(16),
-      verified: true,
-      name: "unknown",
-    });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "unknown" });
-    expect(lookalikeOf([anchor, peer], peer)).toBeNull();
-  });
-
-  it("skips the peer itself", () => {
-    const peer = makePeer({ note: "my own note" });
-    expect(lookalikeOf([peer], peer)).toBeNull();
-  });
-
-  it("returns null when nothing collides", () => {
-    const anchor = makePeer({ destination: "cd".repeat(16), verified: true });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "carol" });
-    expect(lookalikeOf([anchor, peer], peer)).toBeNull();
-  });
-
-  it("ignores an unverified anchor with no alias or note", () => {
-    const anchor = makePeer({ destination: "cd".repeat(16) });
-    const peer = makePeer({ destination: "ef".repeat(16), name: "Alice" });
-    expect(lookalikeOf([anchor, peer], peer)).toBeNull();
+  it("returns nothing when no name collides with an anchor", () => {
+    expect(lookalikeGroups([bob, bobClone])).toEqual([]);
   });
 });
