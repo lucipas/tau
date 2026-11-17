@@ -609,6 +609,14 @@ export function Console() {
                   await tau.reactToMessage(message.wire_id, reaction);
                 }
               }}
+              onVotePoll={async (message, option) => {
+                if (!message.group || !message.wire_id) return;
+                await tau.voteGroupPoll(message.group, message.wire_id, option);
+              }}
+              onClosePoll={async (message) => {
+                if (!message.group || !message.wire_id) return;
+                await tau.closeGroupPoll(message.group, message.wire_id);
+              }}
               onPin={async (message, pinned) => {
                 if (pinned) {
                   await tau.pinMessage(message.id);

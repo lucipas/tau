@@ -6220,6 +6220,310 @@ def test_group_send_delay_no_queue_rejects_before_reading_input(
     assert _FakeGroupSendNode.instances == []
 
 
+def _seed_group_poll_conversation(tmp_path, *, close=False):
+    """A weekend group with one poll from alice, one vote, maybe a close."""
+    from tau.groups import GroupStore
+
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "which day?",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "p" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "cd" * 16,
+            "text": "voted: Saturday",
+            "sent_at": 1002.0,
+            "received_at": 1003.0,
+            "id": "v" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "poll_vote": {
+                "target": {"author": "ab" * 16, "sent_at": 1000.0},
+                "option": 0,
+            },
+        }
+    )
+    if close:
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": "ab" * 16,
+                "text": "closed the poll",
+                "sent_at": 1004.0,
+                "received_at": 1005.0,
+                "id": "c" * 31 + "1",
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "weekend",
+                "direction": "in",
+                "poll_close": {"author": "ab" * 16, "sent_at": 1000.0},
+            }
+        )
+    return data_dir, group
+
+
+def test_parser_group_poll_vote_close_poll():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["group", "poll", "weekend", "which day?", "Saturday", "Sunday"]
+    )
+    assert args.func is cli.cmd_group_poll
+    assert args.options == ["Saturday", "Sunday"]
+    args = parser.parse_args(["group", "vote", "weekend", "pppp", "2"])
+    assert args.func is cli.cmd_group_vote
+    assert args.poll == "pppp"
+    assert args.option == "2"
+    args = parser.parse_args(["group", "close-poll", "weekend", "pppp"])
+    assert args.func is cli.cmd_group_close_poll
+
+
+def test_resolve_group_poll(tmp_path):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    poll = cli._resolve_group_poll(inbox, "pppp", group["id"])
+    assert poll["text"] == "which day?"
+    # A vote record never resolves as the poll itself.
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_group_poll(inbox, "vvvv", group["id"])
+    # A plain message in the group is not a poll either.
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_group_poll(inbox, "aaaa", group["id"])
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_group_poll(inbox, "zzzz", group["id"])
+
+
+def test_group_poll_posts_options(tmp_path, capsys, monkeypatch):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert node.send_kwargs[0]["poll_vote"] is None
+    assert "poll posted to weekend" in capsys.readouterr().out
+
+
+def test_group_poll_rejects_one_option(tmp_path, capsys, monkeypatch):
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "which day?",
+            "Saturday",
+        ]
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_group_vote_sends_target_and_option(tmp_path, capsys, monkeypatch):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+            "2",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_vote"] == {
+        "target": {"author": "ab" * 16, "sent_at": 1000.0},
+        "option": 1,
+    }
+    assert "voted for 'Sunday'" in capsys.readouterr().out
+
+
+def test_group_vote_accepts_option_text(tmp_path, capsys, monkeypatch):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+            "Saturday",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert node.send_kwargs[0]["poll_vote"]["option"] == 0
+
+
+def test_group_vote_rejects_closed_poll_and_bad_option(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, group = _seed_group_poll_conversation(
+        tmp_path / "closed", close=True
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+            "1",
+        ]
+    )
+    assert code == 2
+    assert "this poll is closed" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+    data_dir, group = _seed_group_poll_conversation(tmp_path / "open")
+    code = cli.main(
+        [
+            "group",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+            "3",
+        ]
+    )
+    assert code == 2
+    assert "option must be a number 1-2" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_group_close_poll_requires_creator(tmp_path, capsys, monkeypatch):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "close-poll",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+        ]
+    )
+    assert code == 2
+    assert "only the poll's creator can close it" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_group_close_poll_happy_path(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    own_hash = _id_destination(data_dir, capsys)
+    from tau.groups import GroupStore
+
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create(
+        "weekend", [own_hash, "cd" * 16], created_by=own_hash
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "",
+            "text": "which day?",
+            "sent_at": 1001.0,
+            "received_at": 1001.0,
+            "id": "p" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "out",
+            "leg_sent_at": 1000.0,
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "close-poll",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert node.send_kwargs[0]["poll_close"] == {
+        "author": own_hash,
+        "sent_at": 1000.0,
+    }
+    assert "closed the poll" in capsys.readouterr().out
+
+
+def test_group_messages_renders_poll_tally_and_hides_votes(
+    tmp_path, capsys
+):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "which day?" in out
+    assert "1. Saturday — 1 vote(s)" in out
+    assert "2. Sunday — 0 vote(s)" in out
+    assert "1 voter(s) total" in out
+    # The vote itself is not a chat message.
+    assert "voted: Saturday" not in out
+
+
 def test_parser_group_send_wait():
     parser = cli.build_parser()
     default = parser.parse_args(["group", "send", "weekend", "hello"])

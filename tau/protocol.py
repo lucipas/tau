@@ -459,6 +459,9 @@ def encode_group_message(
     in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
     edited_at: Optional[float] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -489,7 +492,33 @@ def encode_group_message(
     this text (epoch seconds): a re-queued edited leg carries it, so
     the recipient stores it as the record's ``edited_at`` and a
     replayed older edit cannot rewind it.  ``None`` omits it.
+
+    ``poll_options`` makes this message a poll: the text is the
+    question and the options ride alongside it (validated structurally
+    here; the 2-8 distinct, normalised rule is enforced where a poll
+    is created).  ``poll_vote`` casts a vote for one option of the
+    poll its target names, and ``poll_close`` closes that poll — the
+    text of either still reads as a plain message on a client that
+    predates polls.  Only one of the three may be set.
     """
+    if sum(
+        field is not None for field in (poll_options, poll_vote, poll_close)
+    ) > 1:
+        raise ProtocolError(
+            "a group message can carry only one of poll_options, "
+            "poll_vote, poll_close"
+        )
+    cleaned_options = None
+    if poll_options is not None:
+        cleaned_options = _clean_group_poll_options_or_none(poll_options)
+        if cleaned_options is None:
+            raise ProtocolError("poll options must be a list of short strings")
+    cleaned_vote = None
+    if poll_vote is not None:
+        cleaned_vote = clean_group_poll_vote(poll_vote)
+    cleaned_close = None
+    if poll_close is not None:
+        cleaned_close = clean_group_poll_target(poll_close)
     payload = {
         "type": "group_message",
         "v": PROTOCOL_VERSION,
@@ -528,6 +557,12 @@ def encode_group_message(
             edited_value = None
         if edited_value is not None and math.isfinite(edited_value):
             payload["edited_at"] = edited_value
+    if cleaned_options is not None:
+        payload["poll_options"] = cleaned_options
+    if cleaned_vote is not None:
+        payload["poll_vote"] = cleaned_vote
+    if cleaned_close is not None:
+        payload["poll_close"] = cleaned_close
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -590,6 +625,19 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
             edited_at = None
         if edited_at is not None and not math.isfinite(edited_at):
             edited_at = None
+    # A message carrying more than one poll field is contradictory —
+    # the sender cannot have meant both — so all of them are dropped
+    # and the message reads as plain chat instead of a half-poll.
+    parsed_options = _clean_group_poll_options_or_none(
+        payload.get("poll_options")
+    )
+    parsed_vote = _clean_group_poll_vote_or_none(payload.get("poll_vote"))
+    parsed_close = _clean_group_poll_target_or_none(payload.get("poll_close"))
+    if sum(
+        field is not None
+        for field in (parsed_options, parsed_vote, parsed_close)
+    ) > 1:
+        parsed_options = parsed_vote = parsed_close = None
     return {
         "text": text,
         "sent_at": sent_at,
@@ -604,7 +652,98 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),
         "edited_at": edited_at,
+        "poll_options": parsed_options,
+        "poll_vote": parsed_vote,
+        "poll_close": parsed_close,
     }
+
+
+# Group polls: a poll is a group message carrying its options, a
+# vote names the poll by the same logical identity reactions and
+# retracts use — the group, the poll author's destination hash, and
+# the send time every leg of the poll shares — plus the chosen
+# option's index, and a close names the same identity.  The author
+# of a close must be the poll's author (checked where the tally is
+# derived, not on the wire: the wire only proves the sender is a
+# group member).  Like ``in_reply_to``, a malformed poll field is
+# dropped instead of rejecting the message — a poll from a newer
+# client must still read as a plain message on an older one.
+MAX_GROUP_POLL_OPTIONS = 8
+MIN_GROUP_POLL_OPTIONS = 2
+MAX_GROUP_POLL_OPTION_CHARS = 100
+
+
+def clean_group_poll_target(value: Any) -> Dict[str, Any]:
+    """Validate a group-poll reference: author hash plus shared send time."""
+    if not isinstance(value, dict):
+        raise ProtocolError("poll target must be an object")
+    author = value.get("author")
+    if not isinstance(author, str) or len(author) != 32:
+        raise ProtocolError("poll target author must be a 32-hex hash")
+    try:
+        bytes.fromhex(author)
+    except ValueError as exc:
+        raise ProtocolError("poll target author must be a 32-hex hash") from exc
+    sent_at = value.get("sent_at")
+    if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+        raise ProtocolError("poll target sent_at must be a number")
+    try:
+        sent_at = float(sent_at)
+    except (OverflowError, ValueError) as exc:
+        raise ProtocolError("poll target sent_at must be a number") from exc
+    if not math.isfinite(sent_at):
+        raise ProtocolError("poll target sent_at must be finite")
+    return {"author": author.lower(), "sent_at": sent_at}
+
+
+def clean_group_poll_vote(value: Any) -> Dict[str, Any]:
+    """Validate a group-poll vote: its poll target plus an option index."""
+    if not isinstance(value, dict):
+        raise ProtocolError("poll vote must be an object")
+    target = clean_group_poll_target(value.get("target"))
+    option = value.get("option")
+    if isinstance(option, bool) or not isinstance(option, int) or option < 0:
+        raise ProtocolError("poll vote option must be a non-negative integer")
+    return {"target": target, "option": option}
+
+
+def _clean_group_poll_target_or_none(value: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return clean_group_poll_target(value)
+    except ProtocolError:
+        return None
+
+
+def _clean_group_poll_vote_or_none(value: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return clean_group_poll_vote(value)
+    except ProtocolError:
+        return None
+
+
+def _clean_group_poll_options_or_none(value: Any) -> Optional[List[str]]:
+    """Clean poll options for storage: a list of short strings, else None.
+
+    The semantic rules (2-8 distinct, normalised choices) are enforced
+    where a poll is created — see :mod:`tau.group_polls` — so a stored
+    or received list only needs to be structurally sound here.
+    """
+    if not isinstance(value, list):
+        return None
+    if not MIN_GROUP_POLL_OPTIONS <= len(value) <= MAX_GROUP_POLL_OPTIONS:
+        return None
+    options: List[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not raw:
+            return None
+        if len(raw) > MAX_GROUP_POLL_OPTION_CHARS:
+            return None
+        try:
+            raw.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        options.append(raw)
+    return options
 
 
 def clean_reaction(value: Any) -> str:

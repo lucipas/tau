@@ -720,6 +720,129 @@ def test_message_roundtrip_with_expiry():
     assert parsed["expires_at"] == 1893456000.0
 
 
+def _poll_group_kwargs():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    return {
+        "group_id": derive_group_id(members[0], "weekend", members),
+        "group_name": "weekend",
+        "creator": members[0],
+        "members": members,
+    }
+
+
+def test_group_poll_roundtrip():
+    data = encode_group_message(
+        "which day?",
+        message_id="b" * 32,
+        poll_options=["Saturday", "Sunday"],
+        **_poll_group_kwargs(),
+    )
+    parsed = parse_group_message(data)
+    assert parsed["text"] == "which day?"
+    assert parsed["poll_options"] == ["Saturday", "Sunday"]
+    assert parsed["poll_vote"] is None
+    assert parsed["poll_close"] is None
+
+
+def test_group_poll_vote_and_close_roundtrip():
+    target = {"author": "ab" * 16, "sent_at": 1234.5}
+    vote_data = encode_group_message(
+        "voted: Saturday",
+        message_id="c" * 32,
+        poll_vote={"target": target, "option": 0},
+        **_poll_group_kwargs(),
+    )
+    parsed = parse_group_message(vote_data)
+    assert parsed["poll_vote"] == {"target": target, "option": 0}
+    assert parsed["poll_options"] is None
+    close_data = encode_group_message(
+        "closed the poll",
+        message_id="d" * 32,
+        poll_close=target,
+        **_poll_group_kwargs(),
+    )
+    assert parse_group_message(close_data)["poll_close"] == target
+
+
+def test_group_poll_rejects_two_poll_fields():
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "which day?",
+            poll_options=["Saturday", "Sunday"],
+            poll_vote={
+                "target": {"author": "ab" * 16, "sent_at": 1.0},
+                "option": 0,
+            },
+            **_poll_group_kwargs(),
+        )
+
+
+def test_group_poll_rejects_bad_options_and_votes():
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "which day?", poll_options=["only one"], **_poll_group_kwargs()
+        )
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "which day?",
+            poll_options=["ok", 7],
+            **_poll_group_kwargs(),
+        )
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "voted",
+            poll_vote={"target": {"author": "ab" * 16, "sent_at": 1.0}},
+            **_poll_group_kwargs(),
+        )
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "voted",
+            poll_vote={
+                "target": {"author": "ab" * 16, "sent_at": 1.0},
+                "option": -1,
+            },
+            **_poll_group_kwargs(),
+        )
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "closed",
+            poll_close={"author": "not-a-hash", "sent_at": 1.0},
+            **_poll_group_kwargs(),
+        )
+
+
+def test_parse_group_message_drops_malformed_poll_fields():
+    # A contradictory or malformed poll payload reads as plain chat
+    # instead of rejecting the message: an older client keeps working.
+    base = {
+        "type": "group_message",
+        "v": 1,
+        "text": "which day?",
+        "sent_at": 1234.5,
+        "group": _poll_group_kwargs()["group_id"],
+        "group_name": "weekend",
+        "creator": "ab" * 16,
+        "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+    }
+    both = dict(
+        base,
+        poll_options=["Saturday", "Sunday"],
+        poll_vote={
+            "target": {"author": "ab" * 16, "sent_at": 1.0},
+            "option": 0,
+        },
+    )
+    parsed = parse_group_message(encode(both))
+    assert parsed["poll_options"] is None
+    assert parsed["poll_vote"] is None
+    bad_options = dict(base, poll_options=["only one"])
+    assert parse_group_message(encode(bad_options))["poll_options"] is None
+    bad_vote = dict(
+        base,
+        poll_vote={"target": {"author": "ab" * 16, "sent_at": 1.0}},
+    )
+    assert parse_group_message(encode(bad_vote))["poll_vote"] is None
+
 def test_media_request_round_trip():
     from tau.protocol import build_media_request, parse_media_request
 

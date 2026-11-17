@@ -1605,6 +1605,7 @@ export function useTau() {
       expiresIn?: number,
       replyTo?: string,
       sendIn?: number,
+      pollOptions?: string[],
     ) => {
       const body: {
         group: string;
@@ -1612,10 +1613,12 @@ export function useTau() {
         expires_in?: number;
         reply_to?: string;
         send_in?: number;
+        poll_options?: string[];
       } = { group, text };
       if (expiresIn !== undefined) body.expires_in = expiresIn;
       if (replyTo) body.reply_to = replyTo;
       if (sendIn !== undefined) body.send_in = sendIn;
+      if (pollOptions !== undefined) body.poll_options = pollOptions;
       const result = await apiPost<SendGroupResponse>("/api/messages", body);
       setMessages((previous) => {
         const fresh = result.messages.filter(
@@ -2670,6 +2673,44 @@ export function useTau() {
     return apiPost<ReactResponse>("/api/react", { target, clear: true });
   }, []);
 
+  // Vote on a group poll, or close one this node created. The vote
+  // fans out like any group message; the tally on the poll refreshes
+  // from the next snapshot read, so refresh at once — a failed
+  // refresh must not report a successful vote as failed, and the
+  // 15s snapshot tick picks it up anyway.
+  const voteGroupPoll = useCallback(
+    async (group: string, poll: string, option: number) => {
+      const result = await apiPost<SendGroupResponse>("/api/groups/vote", {
+        group,
+        poll,
+        option: option + 1,
+      });
+      try {
+        await refreshMessages();
+      } catch {
+        // The next snapshot tick refreshes the tally.
+      }
+      return result;
+    },
+    [refreshMessages],
+  );
+
+  const closeGroupPoll = useCallback(
+    async (group: string, poll: string) => {
+      const result = await apiPost<SendGroupResponse>("/api/groups/close-poll", {
+        group,
+        poll,
+      });
+      try {
+        await refreshMessages();
+      } catch {
+        // The next snapshot tick refreshes the tally.
+      }
+      return result;
+    },
+    [refreshMessages],
+  );
+
   const sendTyping = useCallback(
     async (
       target: { peer: string } | { group: string },
@@ -2970,6 +3011,8 @@ export function useTau() {
     setPeerNote,
     reactToMessage,
     clearReaction,
+    voteGroupPoll,
+    closeGroupPoll,
     sendTyping,
     createGroup,
     deleteGroup,

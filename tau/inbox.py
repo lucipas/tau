@@ -42,6 +42,9 @@ from .protocol import (
     DEFAULT_MESSAGE_KIND,
     NOTE_KIND,
     ProtocolError,
+    _clean_group_poll_options_or_none,
+    _clean_group_poll_target_or_none,
+    _clean_group_poll_vote_or_none,
     clean_in_reply_to,
     excerpt_hash,
     generate_message_id,
@@ -243,6 +246,29 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
             # plain chat rather than dropping the message.
             kind = DEFAULT_MESSAGE_KIND
         record["kind"] = kind
+    if record["kind"] == "group":
+        # A group poll, vote, or close rides on the record itself so
+        # the tally derives from stored history; a malformed field
+        # drops instead of the record — the message still reads as
+        # plain chat.  Only one poll field is ever set (the wire
+        # forbids more); a hand-edited record carrying several keeps
+        # none of them.
+        poll_options = _clean_group_poll_options_or_none(
+            raw.get("poll_options")
+        )
+        poll_vote = _clean_group_poll_vote_or_none(raw.get("poll_vote"))
+        poll_close = _clean_group_poll_target_or_none(raw.get("poll_close"))
+        if sum(
+            field is not None
+            for field in (poll_options, poll_vote, poll_close)
+        ) > 1:
+            poll_options = poll_vote = poll_close = None
+        if poll_options is not None:
+            record["poll_options"] = poll_options
+        if poll_vote is not None:
+            record["poll_vote"] = poll_vote
+        if poll_close is not None:
+            record["poll_close"] = poll_close
     return record
 
 

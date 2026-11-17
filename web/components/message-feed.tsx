@@ -36,6 +36,8 @@ export function MessageFeed({
   onForwardGroup,
   onReact,
   onPin,
+  onVotePoll,
+  onClosePoll,
   searching,
   searchQuery,
   searchError,
@@ -72,6 +74,10 @@ export function MessageFeed({
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   // `pinned` true pins the message, false unpins it.
   onPin?: (message: TauMessage, pinned: boolean) => Promise<void>;
+  // Vote on a group poll: `option` is the 0-based option index.
+  onVotePoll?: (message: TauMessage, option: number) => Promise<void>;
+  // Close a group poll this node created.
+  onClosePoll?: (message: TauMessage) => Promise<void>;
   searching?: boolean;
   searchQuery?: string | null;
   searchError?: string | null;
@@ -268,24 +274,31 @@ export function MessageFeed({
             <EmptyState node={node} />
           )
         ) : (
-          messages.map((message) => (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              messages={quoteContext ?? messages}
-              node={node}
-              peers={peers}
-              groups={groups}
-              onReply={onReply}
-              onDelete={onDelete}
-              onEdit={onEdit}
-              onRetract={onRetract}
-              onForward={onForward}
-              onForwardGroup={onForwardGroup}
-              onReact={onReact}
-              onPin={onPin}
-            />
-          ))
+          // Vote and close records are not chat: the tally on the
+          // poll itself is the display, so they never render as
+          // bubbles of their own.
+          messages
+            .filter((message) => !message.poll_vote && !message.poll_close)
+            .map((message) => (
+              <MessageBubble
+                key={message.id}
+                message={message}
+                messages={quoteContext ?? messages}
+                node={node}
+                peers={peers}
+                groups={groups}
+                onReply={onReply}
+                onDelete={onDelete}
+                onEdit={onEdit}
+                onRetract={onRetract}
+                onForward={onForward}
+                onForwardGroup={onForwardGroup}
+                onReact={onReact}
+                onPin={onPin}
+                onVotePoll={onVotePoll}
+                onClosePoll={onClosePoll}
+              />
+            ))
         )}
         <div ref={endRef} />
       </div>
@@ -451,6 +464,8 @@ function MessageBubble({
   onForwardGroup,
   onReact,
   onPin,
+  onVotePoll,
+  onClosePoll,
 }: {
   message: TauMessage;
   messages: TauMessage[];
@@ -467,6 +482,10 @@ function MessageBubble({
   onForwardGroup?: (message: TauMessage, group: string) => Promise<void>;
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   onPin?: (message: TauMessage, pinned: boolean) => Promise<void>;
+  // Vote on a group poll: `option` is the 0-based option index.
+  onVotePoll?: (message: TauMessage, option: number) => Promise<void>;
+  // Close a group poll this node created.
+  onClosePoll?: (message: TauMessage) => Promise<void>;
 }) {
   const outbound = message.direction === "out";
   const peerHash = message.peer ?? "";
@@ -654,6 +673,40 @@ function MessageBubble({
     }
   }
 
+  const [votePending, setVotePending] = useState(false);
+  const [voteError, setVoteError] = useState<string | null>(null);
+  const [closePending, setClosePending] = useState(false);
+
+  async function handleVotePoll(option: number) {
+    if (!onVotePoll || votePending) return;
+    setVotePending(true);
+    setVoteError(null);
+    try {
+      await onVotePoll(message, option);
+    } catch (error) {
+      setVoteError(
+        error instanceof Error ? error.message : "vote failed",
+      );
+    } finally {
+      setVotePending(false);
+    }
+  }
+
+  async function handleClosePoll() {
+    if (!onClosePoll || closePending) return;
+    setClosePending(true);
+    setVoteError(null);
+    try {
+      await onClosePoll(message);
+    } catch (error) {
+      setVoteError(
+        error instanceof Error ? error.message : "close failed",
+      );
+    } finally {
+      setClosePending(false);
+    }
+  }
+
   return (
     <article
       className={`flex items-start gap-2.5 ${
@@ -773,6 +826,84 @@ function MessageBubble({
             message.text
           )}
         </div>
+
+        {message.poll_options && message.poll_options.length > 0 ? (
+          <div className="mt-2 w-full space-y-1.5" aria-label="Group poll">
+            {message.poll_options.map((option, index) => {
+              const count = message.poll?.counts[index] ?? 0;
+              const total = message.poll?.total ?? 0;
+              const share =
+                total > 0 ? Math.round((count / total) * 100) : 0;
+              const mine = message.poll?.my_vote === index;
+              const closed = message.poll?.closed ?? false;
+              return (
+                <button
+                  key={`${index}-${option}`}
+                  type="button"
+                  disabled={!onVotePoll || closed || votePending}
+                  onClick={() => void handleVotePoll(index)}
+                  aria-pressed={mine}
+                  title={
+                    closed
+                      ? "This poll is closed"
+                      : mine
+                        ? "Your vote — pick another option to change it"
+                        : `Vote for ${option}`
+                  }
+                  className={`relative block w-full overflow-hidden rounded-lg border px-2.5 py-1.5 text-left text-[12px] transition-colors ${
+                    mine
+                      ? "border-signal/50 bg-signal/10 text-zinc-100"
+                      : "border-line/70 bg-panel/60 text-zinc-200 hover:border-signal/40"
+                  }`}
+                >
+                  <span
+                    aria-hidden="true"
+                    className="absolute inset-y-0 left-0 bg-signal/15"
+                    style={{ width: `${share}%` }}
+                  />
+                  <span className="relative flex items-baseline justify-between gap-2">
+                    <span className="min-w-0 break-words">
+                      {mine ? "✓ " : ""}
+                      {option}
+                    </span>
+                    <span className="shrink-0 font-mono text-[10px] text-mist/80">
+                      {count} · {share}%
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+            <p className="flex flex-wrap items-center gap-x-2 font-mono text-[10px] text-mist/60">
+              <span>
+                {message.poll?.total ?? 0} vote
+                {(message.poll?.total ?? 0) === 1 ? "" : "s"}
+                {message.poll?.my_vote !== null &&
+                message.poll?.my_vote !== undefined
+                  ? " · you voted"
+                  : ""}
+                {message.poll?.closed ? " · closed" : ""}
+              </span>
+              {outbound &&
+              onClosePoll &&
+              !(message.poll?.closed ?? false) ? (
+                <button
+                  type="button"
+                  disabled={closePending}
+                  onClick={() => void handleClosePoll()}
+                  title="Close this poll — no more votes count"
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:border-rose-300/50 hover:text-rose-300 disabled:opacity-50"
+                >
+                  {closePending ? "closing…" : "close poll"}
+                </button>
+              ) : null}
+            </p>
+            {voteError ? (
+              <p className="font-mono text-[10px] text-rose-300">
+                {voteError}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
 
         {message.file ? (
           <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-line/70 bg-void/50 px-2.5 py-1.5 font-mono text-[11px] text-zinc-300">

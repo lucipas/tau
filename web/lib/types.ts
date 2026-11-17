@@ -9,6 +9,32 @@ export interface MessageReaction {
   reaction: string;
 }
 
+export interface GroupPollVoter {
+  // Voter's destination hash.
+  author: string;
+  // Voter's display name at vote time.
+  name: string;
+  // Index into the poll's options.
+  option: number;
+  // Unix time the vote was sent.
+  voted_at: number;
+}
+
+export interface GroupPollTally {
+  // The poll's options, in order.
+  options: string[];
+  // Standing votes per option.
+  counts: number[];
+  // Total standing voters.
+  total: number;
+  // True once the poll's creator closed it.
+  closed: boolean;
+  // One record per standing vote, newest vote first.
+  voters: GroupPollVoter[];
+  // This node's standing vote, an option index, or null.
+  my_vote: number | null;
+}
+
 export interface TauMessage {
   id: number;
   direction: Direction;
@@ -70,6 +96,18 @@ export interface TauMessage {
   // SHA-256 of the file this message carried. Received files can be
   // downloaded from GET /api/files/<sender>/<name>.
   file?: { name: string; size: number; sha256: string };
+  // Group poll context, present on group poll entries: the question
+  // is the message text, `poll_options` the choices, and `poll` the
+  // tally derived from the group's stored votes. A vote or close
+  // entry carries only its marker (`poll_vote` / `poll_close`) and
+  // the feed hides it — the tally on the poll is the display.
+  poll_options?: string[];
+  poll?: GroupPollTally;
+  poll_vote?: {
+    target: { author: string; sent_at: number };
+    option: number;
+  };
+  poll_close?: { author: string; sent_at: number };
 }
 
 export interface TauGroupMember {
