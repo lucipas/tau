@@ -808,6 +808,23 @@ def build_parser() -> argparse.ArgumentParser:
     ping.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
     ping.set_defaults(func=cmd_ping)
 
+    trace = subparsers.add_parser(
+        "trace",
+        parents=[common],
+        help="trace the mesh path to a peer (hops + live probe)",
+    )
+    trace.add_argument("peer", metavar="NAME|HASH")
+    trace.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    trace.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
+    trace.set_defaults(func=cmd_trace)
+
+    mesh = subparsers.add_parser(
+        "mesh",
+        parents=[common],
+        help="list known peers with live reachability and hop counts",
+    )
+    mesh.set_defaults(func=cmd_mesh)
+
     info = subparsers.add_parser(
         "info", parents=[common], help="show a remote peer's information"
     )
@@ -14721,6 +14738,74 @@ def cmd_ping(args: argparse.Namespace) -> int:
         rtt = response.get("_rtt")
         latency = f" ({rtt * 1000:.0f} ms)" if isinstance(rtt, (int, float)) else ""
         print(f"pong from {response.get('server', args.to)}{latency}")
+    return _EXIT_OK
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        result = node.trace(
+            args.peer,
+            timeout=float(getattr(args, "timeout", 15.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        print(f"trace to {result['peer']} ({result['destination']})")
+        if result["has_path"]:
+            print(f"  path: known, {result['hops']} hop(s)")
+        else:
+            print("  path: none known")
+        if result["rtt_ms"] is not None:
+            print(f"  probe: pong in {result['rtt_ms']:.0f} ms")
+        elif result["probe_error"]:
+            print(f"  probe: no reply ({result['probe_error']})")
+        print(f"  last seen: {_ago(time.time() - result['last_seen'])} ago")
+        print(f"  note: {result['note']}")
+    return _EXIT_OK if result["reachable"] else _EXIT_ERROR
+
+
+def cmd_mesh(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        rows = node.mesh_snapshot()
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit({"peers": rows, "count": len(rows)}, True)
+        return _EXIT_OK
+    if not rows:
+        print("No peers known. Run `tau discover` or `tau serve` first.")
+        return _EXIT_OK
+    now = time.time()
+    header = ("NAME", "DESTINATION", "HOPS", "REACHABLE", "LAST SEEN")
+    table: List[tuple] = [header]
+    for row in rows:
+        table.append(
+            (
+                row["name"],
+                row["destination"],
+                str(row["hops"]) if row["hops"] is not None else "—",
+                "yes" if row["reachable"] else "no",
+                _ago(now - row["last_seen"]),
+            )
+        )
+    widths = [max(len(row[i]) for row in table) for i in range(len(header))]
+    for row in table:
+        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+    print(
+        "\nReachability is a snapshot from Reticulum's path table, not a "
+        "promise — paths change as the mesh shifts."
+    )
     return _EXIT_OK
 
 

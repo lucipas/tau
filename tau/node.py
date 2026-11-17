@@ -8386,6 +8386,122 @@ class TauNode:
         )
         return self._request(peer, REQUEST_PING, b"{}", timeout)
 
+    def _path_state(self, dest_hash: bytes) -> Tuple[bool, Optional[int]]:
+        """Live path state for *dest_hash*: (known, hops).
+
+        Hops come from Reticulum's path table, not the peer registry:
+        the registry only records the hop count heard at announce time,
+        which goes stale as the mesh shifts.  ``hops`` is ``None`` when
+        no path is known — ``hops_to`` returns the ``PATHFINDER_M``
+        sentinel (128) for unknown destinations, which is not a hop
+        count.  A transport that is not up yet reads as "no path".
+        """
+        try:
+            if not RNS.Transport.has_path(dest_hash):
+                return False, None
+            hops = RNS.Transport.hops_to(dest_hash)
+        except Exception:  # pragma: no cover - transport not up yet
+            log.debug("Path lookup failed", exc_info=True)
+            return False, None
+        if hops >= _PATHFINDER_MAX_HOPS:
+            return False, None
+        return True, hops
+
+    def trace(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = 15.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Trace the mesh path to *target* and probe it live.
+
+        Returns the peer, whether Reticulum currently knows a path, the
+        hop count from the live path table, and the round-trip of a ping
+        probe over that path.  Reticulum exposes no per-leg timing, so
+        the probe is one end-to-end round-trip, not a hop-by-hop
+        breakdown — the hop count is the path shape, the RTT is the
+        proof the whole path works.  A known path whose probe fails
+        still reports the path: the peer may be up but not answering
+        requests.  The result is a snapshot, not a promise — paths
+        change as the mesh shifts.
+        """
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        has_path, hops = self._path_state(peer.destination_hash)
+        if not has_path:
+            # One explicit path request before giving up: the peer may
+            # have announced since the registry was last read, and a
+            # fresh request can surface a path the table has not got.
+            try:
+                RNS.Transport.request_path(peer.destination_hash)
+            except Exception:  # pragma: no cover - transport not up yet
+                log.debug("Path request failed", exc_info=True)
+            deadline = time.time() + min(3.0, max(0.0, timeout))
+            while time.time() < deadline:
+                has_path, hops = self._path_state(peer.destination_hash)
+                if has_path:
+                    break
+                time.sleep(0.1)
+        rtt_ms: Optional[float] = None
+        probe_error: Optional[str] = None
+        if has_path:
+            try:
+                response = self.ping(peer, timeout=timeout, discover_timeout=0.0)
+                rtt = response.get("_rtt")
+                if isinstance(rtt, (int, float)):
+                    rtt_ms = round(float(rtt) * 1000.0, 1)
+            except (NodeError, PeerRefusedError) as exc:
+                probe_error = str(exc)
+        return {
+            "peer": peer.display_name,
+            "destination": peer.hexhash,
+            "has_path": has_path,
+            "hops": hops,
+            "rtt_ms": rtt_ms,
+            "reachable": rtt_ms is not None,
+            "last_seen": peer.last_seen,
+            "probe_error": probe_error,
+            "note": (
+                "Reticulum reports no per-leg timing; rtt_ms is one "
+                "end-to-end probe over the whole path."
+                if has_path
+                else "No path known; the peer may be offline or out of range."
+            ),
+        }
+
+    def mesh_snapshot(self) -> List[Dict[str, Any]]:
+        """One live reachability row per known peer.
+
+        Unlike ``tau peers``, which reads the registry offline, this
+        re-checks every peer against Reticulum's current path table,
+        so ``hops`` is the path as it stands now and ``reachable``
+        means a path is known — not merely that the peer announced
+        once.  Rows are sorted by display name; a peer whose path
+        vanished keeps its last-seen time so the owner can tell a
+        peer that went quiet from one never heard.
+        """
+        rows = []
+        for peer in self.registry.all():
+            has_path, hops = self._path_state(peer.destination_hash)
+            rows.append(
+                {
+                    "destination": peer.hexhash,
+                    "name": peer.display_name,
+                    "hops": hops,
+                    "has_path": has_path,
+                    "reachable": has_path,
+                    "last_seen": peer.last_seen,
+                    "verified": peer.is_verified,
+                }
+            )
+        rows.sort(key=lambda row: row["name"].lower())
+        return rows
+
     def request_info(
         self,
         target: Union[str, bytes, Peer],
