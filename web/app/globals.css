@@ -3,10 +3,18 @@
 @theme {
   --color-void: #05080a;
   --color-panel: #0a1114;
+  --color-panel-2: #0d161a;
   --color-line: #183035;
+  --color-line-soft: #122528;
   --color-mist: #8aa4a9;
+  --color-faint: #5b7176;
+  --color-ink: #e4e4e7;
   --color-signal: #2dd4bf;
+  --color-signal-dim: #1a8a7c;
   --color-amber: #fbbf24;
+  --color-danger: #f87171;
+  --color-bubble: #122e33;
+  --color-bubble-own: #134e4a;
 
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
@@ -23,7 +31,7 @@ body {
   margin: 0;
   min-height: 100dvh;
   background-color: var(--color-void);
-  color: #e4e4e7;
+  color: var(--color-ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
 }
@@ -31,19 +39,6 @@ body {
 ::selection {
   background: rgba(45, 212, 191, 0.25);
   color: #f4fffd;
-}
-
-.mesh-grid {
-  background-image:
-    linear-gradient(rgba(45, 212, 191, 0.05) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(45, 212, 191, 0.05) 1px, transparent 1px);
-  background-size: 48px 48px;
-  mask-image: radial-gradient(
-    ellipse 80% 60% at 50% 0%,
-    black 20%,
-    transparent 75%
-  );
-  opacity: 0.55;
 }
 
 .thin-scroll {
@@ -63,4 +58,11 @@ body {
 
 .thin-scroll::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* One-line clamp for peer names and titles that must never wrap the row. */
+.clamp-1 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
