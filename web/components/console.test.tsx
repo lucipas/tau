@@ -797,6 +797,55 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("sneakernet"))).toBe(false);
   });
 
+  it("focuses the composer after switching back to the chat tab", async () => {
+    const alice = {
+      destination: "ab".repeat(16),
+      name: "alice",
+      last_seen: Date.now() / 1000,
+      age: 5,
+      hops: 1,
+      protocol: 1,
+    };
+    window.location.hash = "#tools";
+    mockedUseTau.mockReturnValue(tabState({ peers: [alice] }));
+    render(<Console />);
+    expect(isShown(screen.getByText("sneakernet"))).toBe(true);
+
+    // Focusing a hidden textarea is a no-op in the browser, so the
+    // bug is a focus call that lands while the chat panel is still
+    // hidden. Record the panel's visibility at each focus call:
+    // jsdom sets activeElement even when hidden, so that alone
+    // cannot tell the two apart.
+    const focusVisible: boolean[] = [];
+    const originalFocus = HTMLTextAreaElement.prototype.focus;
+    const focusSpy = vi
+      .spyOn(HTMLTextAreaElement.prototype, "focus")
+      .mockImplementation(function (this: HTMLTextAreaElement) {
+        if (this.id === "message-text") {
+          focusVisible.push(this.closest(".hidden") === null);
+        }
+        originalFocus.call(this);
+      });
+
+    try {
+      fireEvent.click(
+        screen.getByTitle(`Message alice (${alice.destination})`),
+      );
+
+      await waitFor(() =>
+        expect(isShown(screen.getByText("traffic"))).toBe(true),
+      );
+      // Exactly one focus, and it happened after the chat tab
+      // rendered — not during the click while it was hidden.
+      expect(focusVisible).toEqual([true]);
+      expect(document.activeElement).toBe(
+        screen.getByPlaceholderText("Write something to the mesh…"),
+      );
+    } finally {
+      focusSpy.mockRestore();
+    }
+  });
+
   it("keeps the composer draft across a tab switch", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
