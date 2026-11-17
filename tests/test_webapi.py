@@ -143,6 +143,12 @@ class FakeRegistry:
     def refresh_aliases(self):
         return 0
 
+    def lookalike_for(self, peer, *, include_notes=True):
+        # The fixture holds a single peer, so nothing can collide with
+        # it; the real registry (PeerRegistry.lookalike_for) is covered
+        # by tests that swap one in (see _seed_alias_registry).
+        return None
+
     def restore(self, peer):
         if self.get(peer.destination_hash) is None:
             self._peers.append(peer)
@@ -752,6 +758,32 @@ def test_peers_endpoint_includes_verification_state(bridge, node):
     assert "verified" not in peer.public_dict()
 
 
+def test_peers_endpoint_flags_lookalike_and_rename(bridge, node, tmp_path):
+    registry = _seed_alias_registry(node, tmp_path)
+    alice = registry.get(bytes.fromhex(PEER_HASH))
+    registry.mark_verified(alice.destination_hash, "00001", now=1500.0)
+    registry.upsert(
+        bytes.fromhex("ef" * 16), b"\x03" * 64, name="Alice", hops=1
+    )
+    carol = registry.upsert(
+        bytes.fromhex("12" * 16), b"\x04" * 64, name="carol", hops=1
+    )
+    registry.mark_verified(carol.destination_hash, "00002", now=1500.0)
+    registry.upsert(
+        bytes.fromhex("12" * 16), b"\x04" * 64, name="caroline", hops=1
+    )
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    by_name = {item["name"]: item for item in payload["peers"]}
+    assert by_name["Alice"]["lookalike_of"] == "alice"
+    assert by_name["Alice"]["verified"] is False
+    assert by_name["alice"]["lookalike_of"] is None
+    assert by_name["caroline"]["name_change_at"] is not None
+    assert by_name["caroline"]["previous_name"] == "carol"
+    assert by_name["caroline"]["lookalike_of"] is None
+
+
 def test_heard_endpoint_lists_foreign_announces(bridge, node):
     node.foreign_announces = lambda: [
         {
@@ -1034,6 +1066,130 @@ def test_peers_alias_waits_for_node_peer_save_lock(bridge, node, tmp_path):
     assert done.is_set()
     assert result["payload"]["alias"] == "laptop"
     assert node.registry.get(PEER_HASH).alias == "laptop"
+
+
+def test_peers_alias_refresh_covers_intervening_alias(bridge, node, tmp_path):
+    """A concurrent alias edit must not leave neighbours stale: the
+    alias captured before the lock may not be the one the edit
+    replaces, so the neighbours announcing the intervening alias
+    must still be re-published when the edit lands."""
+    registry = _seed_alias_registry(node, tmp_path)
+    # M announces "A" but alice carries no alias yet, so M has no warning.
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="A", hops=1)
+    node._save_lock = threading.Lock()
+    node._save_lock.acquire()
+    try:
+        done = threading.Event()
+        result: dict = {}
+
+        def edit():
+            result["payload"] = bridge.set_peer_alias(PEER_HASH, "B")
+            done.set()
+
+        worker = threading.Thread(target=edit, daemon=True)
+        worker.start()
+        # The edit is blocked on the lock, having already read its
+        # previous alias (none). A concurrent edit lands while it
+        # waits: alice is now "A", so M announcing "A" has a warning
+        # the waiting edit must clear when it replaces "A" with "B".
+        assert not done.wait(timeout=1.0)
+        assert worker.is_alive()
+        registry.set_alias(PEER_HASH, "A")
+    finally:
+        node._save_lock.release()
+    worker.join(timeout=5.0)
+    assert done.is_set()
+    assert result["payload"]["alias"] == "B"
+    assert node.registry.get(PEER_HASH).alias == "B"
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour announcing the intervening alias was not re-published"
+    assert mine[-1]["lookalike_of"] is None
+
+
+def test_peers_alias_refresh_covers_pre_refresh_alias(bridge, node, tmp_path):
+    """A one-shot command may have changed the alias on disk since
+    the last refresh: the neighbour announcing the alias the console
+    last saw must still be re-published when the edit lands, even
+    though the refresh under the lock restores a different alias."""
+    registry = _seed_alias_registry(node, tmp_path)
+    registry.set_alias(PEER_HASH, "disk")
+    # M announces "disk", so it carries a warning for alice-as-"disk".
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="disk", hops=1)
+    listed = {item["destination"]: item for item in bridge.peers()}
+    assert listed[PEER_HASH]["lookalike_of"] is None  # alice herself
+    assert listed[BOB_HASH]["lookalike_of"] == "disk"
+
+    # A one-shot command changed the alias on disk to "old"; the
+    # bridge's in-memory alias is still "disk" until its next refresh.
+    peers_file = tmp_path / "peers.json"
+    raw = json.loads(peers_file.read_text(encoding="utf-8"))
+    for entry in raw["peers"]:
+        if entry["destination"] == PEER_HASH:
+            entry["alias"] = "old"
+    peers_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    payload = bridge.set_peer_alias(PEER_HASH, "new")
+    assert payload["alias"] == "new"
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour announcing the pre-refresh alias was not re-published"
+    assert mine[-1]["lookalike_of"] is None
+
+
+def test_peers_note_refreshes_lookalike_neighbours(bridge, node, tmp_path):
+    """A note makes a peer a saved contact — or stops it being one —
+    which anchors or releases the lookalike warning on peers
+    announcing its name, so those rows must be re-published too."""
+    registry = _seed_alias_registry(node, tmp_path)
+    # N announces "alice" but alice carries no alias or note yet.
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="alice", hops=1)
+
+    payload = bridge.set_peer_note(PEER_HASH, "met at the meetup")
+    assert payload["note"] == "met at the meetup"
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour was not re-published after a note was set"
+
+    # Clearing the note releases the anchor again.
+    bridge.set_peer_note(PEER_HASH, "")
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert len(mine) >= 2, "neighbour was not re-published after a note was cleared"
+
+
+def test_peers_note_refresh_covers_pre_refresh_alias(bridge, node, tmp_path):
+    """A one-shot command may have changed the alias on disk since
+    the last refresh: a note edit refreshes aliases from disk, so the
+    neighbour announcing the alias the console last saw must still be
+    re-published when the note edit lands."""
+    registry = _seed_alias_registry(node, tmp_path)
+    registry.set_alias(PEER_HASH, "disk")
+    # M announces "disk" and carries a warning for alice-as-"disk".
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="disk", hops=1)
+    listed = {item["destination"]: item for item in bridge.peers()}
+    assert listed[BOB_HASH]["lookalike_of"] == "disk"
+
+    # A one-shot command changed the alias on disk to "old"; the
+    # bridge's in-memory alias is still "disk" until its next refresh.
+    peers_file = tmp_path / "peers.json"
+    raw = json.loads(peers_file.read_text(encoding="utf-8"))
+    for entry in raw["peers"]:
+        if entry["destination"] == PEER_HASH:
+            entry["alias"] = "old"
+    peers_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    # The note edit refreshes aliases (alice becomes "old"), so M
+    # announcing "disk" must be re-published with no warning.
+    bridge.set_peer_note(PEER_HASH, "met at the meetup")
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour announcing the pre-refresh alias was not re-published"
+    assert mine[-1]["lookalike_of"] is None
 
 
 def test_peers_alias_endpoint_rejects_bad_requests(bridge, node, tmp_path):

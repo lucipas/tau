@@ -3039,7 +3039,15 @@ def _print_peer_table(
     *,
     now: Optional[float] = None,
     safety_numbers: Optional[Dict[str, str]] = None,
+    lookalikes: Optional[Dict[str, Peer]] = None,
 ) -> None:
+    """Print the peers table, flagging possible lookalikes.
+
+    *lookalikes* maps a peer's destination hex hash to the verified
+    peer or saved contact it may be impersonating (see
+    :meth:`PeerRegistry.lookalike_for`); a flagged peer is rendered
+    with the collision in its name cell and a warning below the table.
+    """
     rows = list(peers)
     if not rows:
         print("No peers known. Run `tau discover` or `tau serve` first.")
@@ -3051,6 +3059,9 @@ def _print_peer_table(
         name = peer.display_name
         if peer.alias and peer.alias != peer.name:
             name = f"{peer.alias} ({peer.name})"
+        collided = lookalikes.get(peer.hexhash) if lookalikes else None
+        if collided is not None:
+            name = f"{name} ⚠ lookalike of {collided.display_name}"
         table.append(
             (
                 peer.hexhash,
@@ -3073,6 +3084,33 @@ def _print_peer_table(
             "band before trusting it.",
             file=sys.stderr,
         )
+    if lookalikes:
+        for peer in rows:
+            collided = lookalikes.get(peer.hexhash)
+            if collided is None:
+                continue
+            print(
+                f"WARNING: {peer.display_name} ({short_hash(peer.hexhash)}) "
+                "is unverified and announces with the same name as "
+                f"{collided.display_name} "
+                f"({short_hash(collided.hexhash)}); treat it as a stranger "
+                "until its safety number is compared out of band.",
+                file=sys.stderr,
+            )
+    renamed = [
+        p for p in rows if p.is_verified and p.name_change_at is not None
+    ]
+    for peer in renamed:
+        previous = (
+            f" from {peer.previous_name!r}" if peer.previous_name else ""
+        )
+        print(
+            f"WARNING: verified peer {peer.display_name} "
+            f"({short_hash(peer.hexhash)}) changed its announced name"
+            f"{previous}; re-verify out of band before trusting the "
+            "new name.",
+            file=sys.stderr,
+        )
     if safety_numbers:
         print("\nSafety numbers — compare each with the peer over another "
               "channel; a match confirms the key is theirs:")
@@ -3080,6 +3118,23 @@ def _print_peer_table(
             number = safety_numbers.get(peer.hexhash)
             if number:
                 print(f"  {peer.display_name} ({short_hash(peer.hexhash)}): {number}")
+
+
+def _lookalike_map(
+    registry: PeerRegistry, peers: Iterable[Peer]
+) -> Dict[str, Peer]:
+    """Map destination hex hashes to the peer each lookalike resembles.
+
+    Only peers :meth:`PeerRegistry.lookalike_for` flags appear, so the
+    caller can pass the result straight to :func:`_print_peer_table`
+    or annotate JSON output.
+    """
+    found: Dict[str, Peer] = {}
+    for peer in peers:
+        collided = registry.lookalike_for(peer)
+        if collided is not None:
+            found[peer.hexhash] = collided
+    return found
 
 
 def _make_config(
@@ -7060,10 +7115,17 @@ def cmd_discover(args: argparse.Namespace) -> int:
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
     peers = node.registry.all(max_age=max_age)
+    lookalikes = _lookalike_map(node.registry, peers)
     if _json_mode(args):
+        payload = [peer.to_dict() for peer in peers]
+        for entry in payload:
+            collided = lookalikes.get(entry["destination"])
+            entry["lookalike_of"] = (
+                collided.display_name if collided is not None else None
+            )
         _emit(
             {
-                "peers": [peer.to_dict() for peer in peers],
+                "peers": payload,
                 "count": len(peers),
                 "duration": duration,
             },
@@ -7071,7 +7133,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
         )
     else:
         print()
-        _print_peer_table(peers)
+        _print_peer_table(peers, lookalikes=lookalikes)
         print(f"\n{len(peers)} peer(s) in {duration:.1f}s")
     return _EXIT_OK
 
@@ -7162,12 +7224,22 @@ def cmd_peers(args: argparse.Namespace) -> int:
         }
     if _json_mode(args):
         payload = [peer.to_dict() for peer in peers]
+        lookalikes = _lookalike_map(registry, peers)
+        for entry in payload:
+            collided = lookalikes.get(entry["destination"])
+            entry["lookalike_of"] = (
+                collided.display_name if collided is not None else None
+            )
         if safety_numbers is not None:
             for entry in payload:
                 entry["safety_number"] = safety_numbers[entry["destination"]]
         _emit({"peers": payload, "count": len(peers)}, True)
     else:
-        _print_peer_table(peers, safety_numbers=safety_numbers)
+        _print_peer_table(
+            peers,
+            safety_numbers=safety_numbers,
+            lookalikes=_lookalike_map(registry, peers),
+        )
     return _EXIT_OK
 
 
