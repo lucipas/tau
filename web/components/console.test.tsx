@@ -829,3 +829,27 @@ describe("Console typing indicator", () => {
     expect(screen.queryByText(/is typing/)).toBeNull();
   });
 });
+
+describe("Console chat layout", () => {
+  it("sizes the chat tab to its content on narrow screens and only stretches on lg", () => {
+    render(<Console />);
+    const scroll = screen.getByLabelText("Message traffic");
+    const section = scroll.closest("section");
+    expect(section).not.toBeNull();
+    const tab = section!.parentElement;
+    expect(tab).not.toBeNull();
+    // The tab used to be `flex-1` at every width, which collapsed it to
+    // ~0px tall inside the auto-sized mobile grid row while the feed
+    // content spilled out over the composer.
+    expect(tab!.classList.contains("lg:flex-1")).toBe(true);
+    expect(tab!.classList.contains("flex-1")).toBe(false);
+    // Same for `min-h-0` on the tab and its parent column: at mobile
+    // widths it let both shrink to zero inside the 0px grid row.
+    expect(tab!.classList.contains("lg:min-h-0")).toBe(true);
+    expect(tab!.classList.contains("min-h-0")).toBe(false);
+    const column = tab!.parentElement;
+    expect(column).not.toBeNull();
+    expect(column!.classList.contains("lg:min-h-0")).toBe(true);
+    expect(column!.classList.contains("min-h-0")).toBe(false);
+  });
+});

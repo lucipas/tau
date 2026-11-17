@@ -540,13 +540,15 @@ export function Console() {
           />
           </div>
 
-          <div className="flex min-h-0 min-w-0 flex-col">
+          <div className="flex min-w-0 flex-col lg:min-h-0">
             {/* Stays mounted while another tab is shown, so the
                 composer's draft, attachments, and send error survive
                 a tab switch. */}
             <div
               className={
-                tab === "chat" ? "flex min-h-0 flex-1 flex-col" : "hidden"
+                tab === "chat"
+                  ? "flex flex-col lg:min-h-0 lg:flex-1"
+                  : "hidden"
               }
             >
             <MessageFeed

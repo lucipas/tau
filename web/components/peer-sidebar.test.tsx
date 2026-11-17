@@ -1555,3 +1555,27 @@ describe("PeerSidebar profiles", () => {
     expect(screen.queryByText("example.com")).toBeNull();
   });
 });
+
+describe("PeerSidebar layout", () => {
+  it("constrains the sidebar to the column width instead of sizing to its widest content", () => {
+    const { container } = renderSidebar({});
+    const aside = container.querySelector("aside");
+    expect(aside).not.toBeNull();
+    // The aside used to be `lg:self-start` with no width, so in the
+    // 340px desktop column it sized to the peer row's max-content width
+    // (~812px) and the wrapper clipped the peer action buttons.
+    expect(aside!.classList.contains("w-full")).toBe(true);
+    expect(aside!.classList.contains("min-w-0")).toBe(true);
+  });
+
+  it("wraps the peer action cluster instead of forcing the row wider than the card", () => {
+    renderSidebar({});
+    const ping = screen.getByLabelText("Ping alice");
+    const cluster = ping.closest("div");
+    expect(cluster).not.toBeNull();
+    expect(cluster!.classList.contains("flex-wrap")).toBe(true);
+    const row = cluster!.parentElement;
+    expect(row).not.toBeNull();
+    expect(row!.classList.contains("flex-wrap")).toBe(true);
+  });
+});
