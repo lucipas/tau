@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import Shell from "@/components/chrome/Shell";
 
 export const metadata: Metadata = {
   title: "τ — Mesh Console",
@@ -11,7 +12,9 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className="dark">
-      <body className="bg-zinc-950 text-zinc-100 antialiased">{children}</body>
+      <body className="bg-zinc-950 text-zinc-100 antialiased">
+        <Shell>{children}</Shell>
+      </body>
     </html>
   );
 }
