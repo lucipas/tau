@@ -105,6 +105,72 @@ def test_send_message_sends_kind_on_the_wire(tmp_path, monkeypatch):
     assert parse_message(sent["payload"])["kind"] == "ping"
 
 
+def test_send_message_sends_location_on_the_wire(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    sent = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    node.send_message("alice", "meet here", location=pin)
+    parsed = parse_message(sent["payload"])
+    assert parsed["location"] == pin
+    # A pin without an explicit kind is a location message, so the
+    # receiver can filter on it; an explicit kind wins.
+    assert parsed["kind"] == "location"
+    node.send_message("alice", "meet here", kind="chat", location=pin)
+    assert parse_message(sent["payload"])["kind"] == "chat"
+
+
+def test_send_message_rejects_invalid_location(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_message("alice", "hi", location={"lat": 91, "lon": 0})
+
+
+def test_send_message_queues_location_for_offline_peer(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    # The queue path spawns a background flush; stub it out so the
+    # entry is still queued when the test inspects it.
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: None)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no path to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    response = node.send_message("alice", "meet here", location=pin)
+
+    assert response["queued"] is True
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.location == pin
+    # The retry re-sends the same pin, and the sent record keeps it.
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout, **kwargs):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(peer, entry, 1.0) is True
+    assert parse_message(sent["payload"])["location"] == pin
+    stored = node.inbox.list_messages(direction="out")
+    assert stored and stored[0]["location"] == pin
+
+
 def test_send_message_rejects_invalid_kind(tmp_path):
     from tau.protocol import ProtocolError
 

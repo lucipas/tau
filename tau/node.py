@@ -141,6 +141,7 @@ from .protocol import (
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_in_reply_to,
+    clean_location,
     clean_reaction,
     decode,
     derive_group_id,
@@ -1773,6 +1774,7 @@ class TauNode:
                     request_expires_at=received_at + DM_REQUEST_TTL,
                     expires_at=message.get("expires_at"),
                     in_reply_to=message.get("in_reply_to"),
+                    location=message.get("location"),
                 ),
                 now=received_at,
             )
@@ -2149,6 +2151,8 @@ class TauNode:
                 }
                 if message.get("in_reply_to") is not None:
                     record["in_reply_to"] = message["in_reply_to"]
+                if message.get("location") is not None:
+                    record["location"] = message["location"]
                 log.info(
                     "Message from %s (%s): %s",
                     caller_name,
@@ -2550,6 +2554,8 @@ class TauNode:
             }
             if message.get("in_reply_to") is not None:
                 record["in_reply_to"] = message["in_reply_to"]
+            if message.get("location") is not None:
+                record["location"] = message["location"]
             if message.get("poll_options") is not None:
                 record["poll_options"] = message["poll_options"]
             if message.get("poll_vote") is not None:
@@ -4660,6 +4666,7 @@ class TauNode:
                 ),
                 in_reply_to=fresh.in_reply_to,
                 expires_at=fresh.message_expires_at,
+                location=fresh.location,
                 poll_options=fresh.poll_options,
                 poll_vote=fresh.poll_vote,
                 poll_close=fresh.poll_close,
@@ -4705,6 +4712,7 @@ class TauNode:
                 sent_at=fresh.wire_sent_at,
                 expires_at=fresh.message_expires_at,
                 in_reply_to=fresh.in_reply_to,
+                location=fresh.location,
                 kind=getattr(fresh, "kind", None),
             )
         # A replacement can still land after the fresh read: abort the
@@ -4989,6 +4997,7 @@ class TauNode:
                 group=sealed_group,
                 expires_at=fresh.message_expires_at,
                 in_reply_to=fresh.in_reply_to,
+                location=fresh.location,
                 kind=getattr(fresh, "kind", None),
                 edited_at=fresh.edited_at,
             )
@@ -5467,6 +5476,8 @@ class TauNode:
             record["group_name"] = pinned["name"]
         if message.get("in_reply_to") is not None:
             record["in_reply_to"] = message["in_reply_to"]
+        if message.get("location") is not None:
+            record["location"] = message["location"]
         if message.get("edited_at") is not None:
             # A relayed copy of an edited leg carries the edit's send
             # time inside its signed envelope: the record starts life
@@ -5885,6 +5896,7 @@ class TauNode:
         expires_at: Optional[float] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         kind: Optional[str] = None,
+        location: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
@@ -5895,7 +5907,10 @@ class TauNode:
         delivery is retried automatically whenever the peer — or any peer
         willing to hold a sealed copy — is heard from.  ``kind`` tags the
         message (``chat`` by default); it travels on the wire, survives
-        queueing, and is stored in the recipient's inbox.
+        queueing, and is stored in the recipient's inbox.  ``location``
+        pins a place on the message (see :func:`clean_location`): it
+        travels the same way, and a pin without an explicit kind is
+        tagged ``location`` so the receiver can filter on it.
 
         ``expires_at`` is an optional sender-set expiry (epoch seconds):
         it travels in the message payload and inside sealed relay
@@ -5921,6 +5936,15 @@ class TauNode:
         normalized = normalize_message(text)
         reply_to = clean_in_reply_to(in_reply_to)
         clean_kind = normalize_message_kind(kind)
+        cleaned_location = clean_location(location)
+        if location is not None and cleaned_location is None:
+            raise NodeError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
+        if cleaned_location is not None and kind is None:
+            # A pin without an explicit kind is a location message, so
+            # the receiver can filter on it; an explicit kind wins.
+            clean_kind = "location"
         if send_after is not None:
             if isinstance(send_after, bool) or not isinstance(
                 send_after, (int, float)
@@ -5972,6 +5996,7 @@ class TauNode:
             kind=clean_kind,
             expires_at=expires_at,
             in_reply_to=reply_to,
+            location=cleaned_location,
         )
         peer: Optional[Peer] = None
         try:
@@ -6002,6 +6027,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         in_reply_to=reply_to,
+                        location=cleaned_location,
                         kind=clean_kind,
                         send_after=send_after,
                     )
@@ -6032,6 +6058,11 @@ class TauNode:
                         "id": message_id,
                         "direction": "out",
                         **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                        **(
+                            {"location": cleaned_location}
+                            if cleaned_location is not None
+                            else {}
+                        ),
                     }
                 )
                 self.mailbox.record_sent(
@@ -6090,6 +6121,11 @@ class TauNode:
                     "id": message_id,
                     "direction": "out",
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    **(
+                        {"location": cleaned_location}
+                        if cleaned_location is not None
+                        else {}
+                    ),
                 }
             )
             if self.registry.get(peer.destination_hash) is None:
@@ -6130,6 +6166,7 @@ class TauNode:
                 message_id=message_id,
                 expires_at=expires_at,
                 in_reply_to=reply_to,
+                location=cleaned_location,
                 kind=clean_kind,
                 # A scheduled send to an undiscovered peer queues here:
                 # the not-before time must survive the fallback, or the
@@ -6148,6 +6185,11 @@ class TauNode:
                     "id": message_id,
                     "direction": "out",
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    **(
+                        {"location": cleaned_location}
+                        if cleaned_location is not None
+                        else {}
+                    ),
                 }
             )
             self.mailbox.record_sent(
@@ -6268,6 +6310,7 @@ class TauNode:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -6323,6 +6366,11 @@ class TauNode:
         both ride on every leg the same way, and a queued leg
         re-sends the same poll payload on retry.  At most one of the
         three may be set.
+
+        ``location`` pins a place on the message (see
+        :func:`clean_location`): it rides on every leg, through
+        queued legs and sealed relay copies, exactly like a direct
+        message pin.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -6395,6 +6443,11 @@ class TauNode:
         reply_to = clean_in_reply_to(in_reply_to)
         if reply_to is not None:
             reply_to = self._group_reply_reference(group["id"], reply_to)
+        cleaned_location = clean_location(location)
+        if location is not None and cleaned_location is None:
+            raise NodeError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         context = {
@@ -6433,6 +6486,7 @@ class TauNode:
                 poll_options=cleaned_options,
                 poll_vote=cleaned_vote,
                 poll_close=cleaned_close,
+                location=cleaned_location,
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -6493,6 +6547,7 @@ class TauNode:
                         sent_at=sent_at,
                         send_after=send_after,
                         in_reply_to=reply_to,
+                        location=cleaned_location,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -6547,6 +6602,7 @@ class TauNode:
                 poll_options=cleaned_options,
                 poll_vote=cleaned_vote,
                 poll_close=cleaned_close,
+                location=cleaned_location,
             )
             peer: Optional[Peer] = None
             if budget <= 0.0:
@@ -6593,6 +6649,7 @@ class TauNode:
                         group=context,
                         sent_at=sent_at,
                         in_reply_to=reply_to,
+                        location=cleaned_location,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -6740,6 +6797,7 @@ class TauNode:
                         group=context,
                         sent_at=sent_at,
                         in_reply_to=reply_to,
+                        location=cleaned_location,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -6815,6 +6873,11 @@ class TauNode:
                     "leg_sent_at": sent_at,
                     "direction": "out",
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    **(
+                        {"location": cleaned_location}
+                        if cleaned_location is not None
+                        else {}
+                    ),
                     **(
                         {"poll_options": cleaned_options}
                         if cleaned_options is not None
@@ -8049,6 +8112,7 @@ class TauNode:
                             sent_at=entry.wire_sent_at,
                             send_after=entry.send_after,
                             in_reply_to=entry.in_reply_to,
+                            location=entry.location,
                             edited_at=float(payload["sent_at"]),
                         )
                         requeued.append(entry.id)
@@ -8078,6 +8142,7 @@ class TauNode:
                                     sent_at=entry.wire_sent_at,
                                     send_after=entry.send_after,
                                     in_reply_to=entry.in_reply_to,
+                                    location=entry.location,
                                     edited_at=entry.edited_at,
                                 )
                             except MailboxError:

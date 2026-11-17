@@ -174,6 +174,100 @@ def test_send_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
     assert code == 0
 
 
+def test_parser_send_location():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["send", "--to", "alice", "--location", "34.05,-83.88 Rock Springs Park"]
+    )
+    assert args.location == "34.05,-83.88 Rock Springs Park"
+    args = parser.parse_args(["group", "send", "weekend", "--location", "34.05,-83.88"])
+    assert args.location == "34.05,-83.88"
+
+
+def test_send_location_reaches_node_and_defaults_text(
+    tmp_path, capsys, monkeypatch
+):
+    # A bare pin needs no message text: the place name becomes the
+    # text, and the pin rides as a structured field.  stdin is not a
+    # TTY under pytest, so stand in a TTY for the default-text branch.
+    import io
+    import sys
+
+    class _TtyStdin(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--location", "34.05,-83.88 Rock Springs Park"],
+        behaviour={"alice": "delivered"},
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[-1]
+    assert node.calls == [("alice", "Rock Springs Park")]
+    assert node.send_kwargs[0]["location"] == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+    assert node.send_kwargs[0]["kind"] is None
+
+
+def test_send_location_with_text_keeps_text(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--location", "34.05,-83.88", "meet here"],
+        behaviour={"alice": "delivered"},
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[-1]
+    assert node.calls == [("alice", "meet here")]
+    assert node.send_kwargs[0]["location"] == {"lat": 34.05, "lon": -83.88}
+
+
+def test_send_location_rejects_bad_coordinates(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--location", "91,0", "hi"]
+    )
+    assert code == 1
+    assert "out of range" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--location", "not-a-place", "hi"]
+    )
+    assert code == 1
+    assert "--location needs" in capsys.readouterr().err
+
+
+def test_print_message_entry_shows_location_pin(tmp_path, capsys):
+    from tau.inbox import Inbox
+    from tau.peers import PeerRegistry
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    entry = {
+        "from": "alice",
+        "destination": "ab" * 16,
+        "text": "Rock Springs Park",
+        "kind": "location",
+        "sent_at": 10.0,
+        "received_at": 20.0,
+        "id": "msg-1",
+        "direction": "in",
+        "location": {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+    }
+    cli._print_message_entry(
+        inbox, registry, entry, blocked=set(), own_hash="00" * 16
+    )
+    out = capsys.readouterr().out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    assert "openstreetmap.org" in out
+    assert "mlat=34.05&mlon=-83.88" in out
+
+
 def test_outbox_lists_scheduled_entry_next_try(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     capsys.readouterr()  # drain the --json output of `tau init`
