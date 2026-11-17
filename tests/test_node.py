@@ -634,6 +634,117 @@ def test_send_group_message_uses_one_send_time_for_all_legs(
     assert len(sent_ats) == 1
 
 
+def test_send_group_poll_carries_options_on_every_leg(tmp_path, monkeypatch):
+    from tau.protocol import parse_group_message
+
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_message(
+        "crew", "which day?", poll_options=["Saturday", "Sunday"]
+    )
+
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert parse_group_message(payload)["poll_options"] == [
+            "Saturday",
+            "Sunday",
+        ]
+    # The sender's own record carries the options and the shared time,
+    # so the tally can resolve the poll it sent.
+    stored = node.inbox.list_messages(
+        limit=None, group=group["id"], direction=None
+    )
+    assert len(stored) == 1
+    assert stored[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert stored[0]["leg_sent_at"] == response["sent_at"]
+
+
+def test_send_group_poll_rejects_bad_options(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_group_message("crew", "which day?", poll_options=["only one"])
+    with pytest.raises(NodeError):
+        node.send_group_message(
+            "crew", "which day?", poll_options=["Saturday", "saturday"]
+        )
+    with pytest.raises(NodeError):
+        node.send_group_message(
+            "crew",
+            "which day?",
+            poll_options=["Saturday", "Sunday"],
+            poll_vote={
+                "target": {"author": "ab" * 16, "sent_at": 1.0},
+                "option": 0,
+            },
+        )
+
+
+def test_send_group_vote_carries_target_and_option(tmp_path, monkeypatch):
+    from tau.protocol import parse_group_message
+
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    first = node.send_group_message(
+        "crew", "which day?", poll_options=["Saturday", "Sunday"]
+    )
+    assert first["ok"] is True
+    payloads.clear()
+    target = {"author": node.destination.hexhash, "sent_at": first["sent_at"]}
+    response = node.send_group_message(
+        "crew",
+        "voted: Sunday",
+        poll_vote={"target": target, "option": 1},
+    )
+
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert parse_group_message(payload)["poll_vote"] == {
+            "target": target,
+            "option": 1,
+        }
+    stored = node.inbox.list_messages(
+        limit=None, group=group["id"], direction=None
+    )
+    assert stored[0]["poll_vote"] == {"target": target, "option": 1}
+
+
+def test_send_group_poll_scheduled_queues_poll_payload(tmp_path):
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message(
+        "crew",
+        "which day?",
+        poll_options=["Saturday", "Sunday"],
+        send_after=send_after,
+    )
+
+    assert response["ok"] is True
+    assert all(result.get("queued") for result in response["results"])
+    for result in response["results"]:
+        entry = node.mailbox.get_outbox(result["id"])
+        assert entry is not None
+        # A queued leg re-sends the poll payload on retry, not plain chat.
+        assert entry.poll_options == ["Saturday", "Sunday"]
+        assert entry.poll_vote is None
+        assert entry.poll_close is None
+
+
 def test_send_group_message_reply_attaches_logical_reference(
     tmp_path, monkeypatch
 ):
@@ -1947,6 +2058,237 @@ def test_exchange_peers_rejects_malformed_response(tmp_path):
     node._request = lambda peer, path, payload, timeout: {"ok": True}
     with pytest.raises(Exception, match="invalid peers response"):
         node.exchange_peers(source)
+
+
+def _profile_peer():
+    """A peer identity plus its signed profile document."""
+    from tau.profile import build_profile
+
+    identity = RNS.Identity()
+    destination = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    peer = Peer(
+        destination_hash=destination,
+        name="alice",
+        public_key=identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    doc = build_profile(
+        identity,
+        name="alice",
+        bio="mesh tinkerer",
+        avatar="ab" * 16,
+        links=["https://example.com"],
+        version=2,
+        created_at=1000.0,
+    )
+    return peer, doc
+
+
+def test_handle_profile_serves_local_profile_when_newer(tmp_path):
+    from tau.profile import save_local_profile
+    from tau.protocol import encode_profile_request
+
+    node = make_node(tmp_path)
+    _, doc = _profile_peer()
+    save_local_profile(node.config.profile_path, doc)
+    raw = node._handle_profile(
+        "/tau/profile",
+        encode_profile_request(1),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is True
+    assert response["profile"]["version"] == 2
+    assert response["profile"]["bio"] == "mesh tinkerer"
+
+
+def test_handle_profile_withholds_profile_when_not_newer(tmp_path):
+    from tau.profile import save_local_profile
+    from tau.protocol import encode_profile_request
+
+    node = make_node(tmp_path)
+    _, doc = _profile_peer()
+    save_local_profile(node.config.profile_path, doc)
+    raw = node._handle_profile(
+        "/tau/profile",
+        encode_profile_request(2),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    assert decode(raw)["profile"] is None
+
+
+def test_handle_profile_without_local_profile_answers_none(tmp_path):
+    from tau.protocol import encode_profile_request
+
+    node = make_node(tmp_path)
+    assert node.local_profile is None
+    raw = node._handle_profile(
+        "/tau/profile",
+        encode_profile_request(0),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    assert decode(raw)["profile"] is None
+
+
+def test_handle_profile_rejects_bad_request(tmp_path):
+    node = make_node(tmp_path)
+    raw = node._handle_profile(
+        "/tau/profile", b'{"type": "ping"}', b"request-id", None, time.time()
+    )
+    response = decode(raw)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "bad_request"
+
+
+def test_request_profile_stores_verified_profile(tmp_path):
+    from tau.protocol import REQUEST_PROFILE, encode_profile_request
+
+    node = make_node(tmp_path)
+    peer, doc = _profile_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    seen = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        seen["path"] = path
+        seen["payload"] = payload
+        return {"ok": True, "v": 1, "profile": doc}
+
+    node._request = fake_request
+    result = node.request_profile(peer)
+    assert seen["path"] == REQUEST_PROFILE
+    assert result is not None and result["version"] == 2
+    stored = node.profile_store.get(peer.hexhash)
+    assert stored is not None and stored["bio"] == "mesh tinkerer"
+    # The request names the version already held (0 here), so a peer
+    # with nothing newer can answer with nothing.
+    assert decode(seen["payload"])["known_version"] == 0
+
+
+def test_request_profile_returns_none_when_peer_has_nothing_new(tmp_path):
+    node = make_node(tmp_path)
+    peer, doc = _profile_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node.profile_store.store(doc)
+    seen = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        seen["payload"] = payload
+        return {"ok": True, "v": 1, "profile": None}
+
+    node._request = fake_request
+    assert node.request_profile(peer) is None
+    # The request named the stored version, so the peer knew not to send.
+    assert decode(seen["payload"])["known_version"] == 2
+
+
+def test_request_profile_rejects_profile_for_another_peer(tmp_path):
+    node = make_node(tmp_path)
+    peer, _doc = _profile_peer()
+    other_peer, other_doc = _profile_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "v": 1,
+        "profile": other_doc,
+    }
+    with pytest.raises(NodeError, match="does not match the peer"):
+        node.request_profile(peer)
+    assert node.profile_store.get(peer.hexhash) is None
+
+
+def test_request_profile_rejects_tampered_profile(tmp_path):
+    node = make_node(tmp_path)
+    peer, doc = _profile_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    tampered = dict(doc)
+    tampered["bio"] = "forged"
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "v": 1,
+        "profile": tampered,
+    }
+    with pytest.raises(NodeError, match="invalid profile"):
+        node.request_profile(peer)
+    assert node.profile_store.get(peer.hexhash) is None
+
+
+def test_request_profile_rejects_bad_response(tmp_path):
+    node = make_node(tmp_path)
+    peer, _doc = _profile_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node._request = lambda p, path, payload, timeout: {"ok": False}
+    with pytest.raises(NodeError, match="invalid profile response"):
+        node.request_profile(peer)
+
+
+def test_on_announce_fetches_newer_profile(tmp_path, monkeypatch):
+    node = _heard_node(tmp_path, monkeypatch, hops=1)
+    fetches = []
+    rounds = []
+    monkeypatch.setattr(node, "_spawn_mail_round", lambda peer: rounds.append(peer))
+    monkeypatch.setattr(
+        node, "_spawn_profile_fetch", lambda peer: fetches.append(peer)
+    )
+    monkeypatch.setattr(node, "_save_peers", lambda: None)
+    # The fetch only runs on a started node (reticulum up).
+    node.reticulum = object()
+    identity = RNS.Identity()
+    announced_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+
+    node._on_announce(announced_hash, identity, build_announce("alice", profile_version=3))
+
+    assert len(fetches) == 1
+    assert fetches[0].hexhash == announced_hash.hex()
+    assert len(rounds) == 1
+
+
+def test_on_announce_skips_profile_fetch_when_version_known(
+    tmp_path, monkeypatch
+):
+    node = _heard_node(tmp_path, monkeypatch, hops=1)
+    fetches = []
+    monkeypatch.setattr(node, "_spawn_mail_round", lambda peer: None)
+    monkeypatch.setattr(
+        node, "_spawn_profile_fetch", lambda peer: fetches.append(peer)
+    )
+    monkeypatch.setattr(node, "_save_peers", lambda: None)
+    node.reticulum = object()
+    peer, doc = _profile_peer()
+    node.profile_store.store(doc)
+    identity = RNS.Identity()
+    # Rebuild the announce from the profile owner's key so the
+    # destination matches the stored profile's author.
+    announced_hash = peer.destination_hash
+    # Announce the same version the store already holds.
+    node._on_announce(
+        announced_hash,
+        _identity_for_peer(peer),
+        build_announce("alice", profile_version=2),
+    )
+    assert fetches == []
+
+
+def _identity_for_peer(peer: Peer) -> RNS.Identity:
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(peer.public_key)
+    return identity
 
 
 def test_mail_round_exchanges_peers(tmp_path):

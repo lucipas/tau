@@ -14,6 +14,9 @@ encrypted Reticulum ``Link``:
     /tau/peers    -> ask a peer which peers it has heard from; the answer
                     carries each peer's public key, so the receiver can verify
                     the key derives the reported destination hash (peer exchange)
+    /tau/profile  -> ask a peer for its signed public profile; the answer
+                    carries the profile document, or nothing when the peer
+                    has none (or none newer than the version asked about)
     /tau/typing   -> ephemeral typing indicator for a DM or a group;
                     live-only, never queued or stored
 
@@ -104,6 +107,7 @@ REQUEST_REACT = "/tau/react"
 REQUEST_RETRACT = "/tau/dm/retract"
 REQUEST_DM_EDIT = "/tau/dm/edit"
 REQUEST_PEERS = "/tau/peers"
+REQUEST_PROFILE = "/tau/profile"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
 REQUEST_GROUP_MESSAGE = "/tau/group"
@@ -119,6 +123,7 @@ REQUEST_PATHS = (
     REQUEST_RETRACT,
     REQUEST_DM_EDIT,
     REQUEST_PEERS,
+    REQUEST_PROFILE,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
     REQUEST_GROUP_MESSAGE,
@@ -250,14 +255,28 @@ def decode(raw: Any, *, max_bytes: int = MAX_RESPONSE_BYTES) -> Dict[str, Any]:
     return obj
 
 
-def build_announce(name: str) -> bytes:
-    """Build the compact app_data advertised in a Reticulum announce."""
+def build_announce(name: str, *, profile_version: Optional[int] = None) -> bytes:
+    """Build the compact app_data advertised in a Reticulum announce.
+
+    ``profile_version`` is the author's current public-profile
+    revision, when one is published: a single small integer is all
+    the 256-byte budget can spare — the profile itself is fetched
+    over a link (``/tau/profile``) by peers that see a newer version
+    than the one they hold.  ``None`` (no profile) omits the field,
+    so peers that predate profiles keep working.
+    """
     payload = {
         "v": PROTOCOL_VERSION,
         "name": sanitize_name(name),
         "proto": APP_NAME,
         "caps": ["message", "ping", "peers", "mail", "file", "read"],
     }
+    if (
+        isinstance(profile_version, int)
+        and not isinstance(profile_version, bool)
+        and profile_version >= 1
+    ):
+        payload["pv"] = profile_version
     data = encode(payload)
     # Reticulum announces have a very small payload budget.  Shorten the name
     # rather than dropping the announcement entirely.
@@ -277,15 +296,29 @@ def parse_announce(app_data: Any) -> Dict[str, Any]:
             "name": "unknown",
             "proto": None,
             "caps": [],
+            "profile_version": None,
         }
     try:
         payload = decode(app_data, max_bytes=ANNOUNCE_MAX_BYTES)
     except ProtocolError:
-        return {"v": 0, "name": "unknown", "proto": None, "caps": []}
+        return {
+            "v": 0,
+            "name": "unknown",
+            "proto": None,
+            "caps": [],
+            "profile_version": None,
+        }
 
     caps = payload.get("caps")
     if not isinstance(caps, list):
         caps = []
+    profile_version = payload.get("pv")
+    if (
+        isinstance(profile_version, bool)
+        or not isinstance(profile_version, int)
+        or profile_version < 1
+    ):
+        profile_version = None
     return {
         "v": payload.get("v") if isinstance(payload.get("v"), int) else 0,
         "name": sanitize_name(payload.get("name")),
@@ -293,6 +326,7 @@ def parse_announce(app_data: Any) -> Dict[str, Any]:
         if isinstance(payload.get("proto"), str)
         else None,
         "caps": [cap for cap in caps if isinstance(cap, str)][:16],
+        "profile_version": profile_version,
     }
 
 
@@ -425,6 +459,9 @@ def encode_group_message(
     in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
     edited_at: Optional[float] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -455,7 +492,33 @@ def encode_group_message(
     this text (epoch seconds): a re-queued edited leg carries it, so
     the recipient stores it as the record's ``edited_at`` and a
     replayed older edit cannot rewind it.  ``None`` omits it.
+
+    ``poll_options`` makes this message a poll: the text is the
+    question and the options ride alongside it (validated structurally
+    here; the 2-8 distinct, normalised rule is enforced where a poll
+    is created).  ``poll_vote`` casts a vote for one option of the
+    poll its target names, and ``poll_close`` closes that poll — the
+    text of either still reads as a plain message on a client that
+    predates polls.  Only one of the three may be set.
     """
+    if sum(
+        field is not None for field in (poll_options, poll_vote, poll_close)
+    ) > 1:
+        raise ProtocolError(
+            "a group message can carry only one of poll_options, "
+            "poll_vote, poll_close"
+        )
+    cleaned_options = None
+    if poll_options is not None:
+        cleaned_options = _clean_group_poll_options_or_none(poll_options)
+        if cleaned_options is None:
+            raise ProtocolError("poll options must be a list of short strings")
+    cleaned_vote = None
+    if poll_vote is not None:
+        cleaned_vote = clean_group_poll_vote(poll_vote)
+    cleaned_close = None
+    if poll_close is not None:
+        cleaned_close = clean_group_poll_target(poll_close)
     payload = {
         "type": "group_message",
         "v": PROTOCOL_VERSION,
@@ -494,6 +557,12 @@ def encode_group_message(
             edited_value = None
         if edited_value is not None and math.isfinite(edited_value):
             payload["edited_at"] = edited_value
+    if cleaned_options is not None:
+        payload["poll_options"] = cleaned_options
+    if cleaned_vote is not None:
+        payload["poll_vote"] = cleaned_vote
+    if cleaned_close is not None:
+        payload["poll_close"] = cleaned_close
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -556,6 +625,19 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
             edited_at = None
         if edited_at is not None and not math.isfinite(edited_at):
             edited_at = None
+    # A message carrying more than one poll field is contradictory —
+    # the sender cannot have meant both — so all of them are dropped
+    # and the message reads as plain chat instead of a half-poll.
+    parsed_options = _clean_group_poll_options_or_none(
+        payload.get("poll_options")
+    )
+    parsed_vote = _clean_group_poll_vote_or_none(payload.get("poll_vote"))
+    parsed_close = _clean_group_poll_target_or_none(payload.get("poll_close"))
+    if sum(
+        field is not None
+        for field in (parsed_options, parsed_vote, parsed_close)
+    ) > 1:
+        parsed_options = parsed_vote = parsed_close = None
     return {
         "text": text,
         "sent_at": sent_at,
@@ -570,7 +652,98 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),
         "edited_at": edited_at,
+        "poll_options": parsed_options,
+        "poll_vote": parsed_vote,
+        "poll_close": parsed_close,
     }
+
+
+# Group polls: a poll is a group message carrying its options, a
+# vote names the poll by the same logical identity reactions and
+# retracts use — the group, the poll author's destination hash, and
+# the send time every leg of the poll shares — plus the chosen
+# option's index, and a close names the same identity.  The author
+# of a close must be the poll's author (checked where the tally is
+# derived, not on the wire: the wire only proves the sender is a
+# group member).  Like ``in_reply_to``, a malformed poll field is
+# dropped instead of rejecting the message — a poll from a newer
+# client must still read as a plain message on an older one.
+MAX_GROUP_POLL_OPTIONS = 8
+MIN_GROUP_POLL_OPTIONS = 2
+MAX_GROUP_POLL_OPTION_CHARS = 100
+
+
+def clean_group_poll_target(value: Any) -> Dict[str, Any]:
+    """Validate a group-poll reference: author hash plus shared send time."""
+    if not isinstance(value, dict):
+        raise ProtocolError("poll target must be an object")
+    author = value.get("author")
+    if not isinstance(author, str) or len(author) != 32:
+        raise ProtocolError("poll target author must be a 32-hex hash")
+    try:
+        bytes.fromhex(author)
+    except ValueError as exc:
+        raise ProtocolError("poll target author must be a 32-hex hash") from exc
+    sent_at = value.get("sent_at")
+    if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+        raise ProtocolError("poll target sent_at must be a number")
+    try:
+        sent_at = float(sent_at)
+    except (OverflowError, ValueError) as exc:
+        raise ProtocolError("poll target sent_at must be a number") from exc
+    if not math.isfinite(sent_at):
+        raise ProtocolError("poll target sent_at must be finite")
+    return {"author": author.lower(), "sent_at": sent_at}
+
+
+def clean_group_poll_vote(value: Any) -> Dict[str, Any]:
+    """Validate a group-poll vote: its poll target plus an option index."""
+    if not isinstance(value, dict):
+        raise ProtocolError("poll vote must be an object")
+    target = clean_group_poll_target(value.get("target"))
+    option = value.get("option")
+    if isinstance(option, bool) or not isinstance(option, int) or option < 0:
+        raise ProtocolError("poll vote option must be a non-negative integer")
+    return {"target": target, "option": option}
+
+
+def _clean_group_poll_target_or_none(value: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return clean_group_poll_target(value)
+    except ProtocolError:
+        return None
+
+
+def _clean_group_poll_vote_or_none(value: Any) -> Optional[Dict[str, Any]]:
+    try:
+        return clean_group_poll_vote(value)
+    except ProtocolError:
+        return None
+
+
+def _clean_group_poll_options_or_none(value: Any) -> Optional[List[str]]:
+    """Clean poll options for storage: a list of short strings, else None.
+
+    The semantic rules (2-8 distinct, normalised choices) are enforced
+    where a poll is created — see :mod:`tau.group_polls` — so a stored
+    or received list only needs to be structurally sound here.
+    """
+    if not isinstance(value, list):
+        return None
+    if not MIN_GROUP_POLL_OPTIONS <= len(value) <= MAX_GROUP_POLL_OPTIONS:
+        return None
+    options: List[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not raw:
+            return None
+        if len(raw) > MAX_GROUP_POLL_OPTION_CHARS:
+            return None
+        try:
+            raw.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        options.append(raw)
+    return options
 
 
 def clean_reaction(value: Any) -> str:
@@ -1150,6 +1323,45 @@ def edit_unsigned_bytes(raw: Any) -> bytes:
     payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
     unsigned = {key: value for key, value in payload.items() if key != "sig"}
     return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
+
+
+def encode_profile_request(known_version: int = 0) -> bytes:
+    """Encode a ``/tau/profile`` request.
+
+    ``known_version`` is the newest profile version the requester
+    already holds for this peer (0 when none): the peer answers with
+    its profile only when its version is newer, so a re-announce of
+    an unchanged profile costs one small round trip instead of the
+    whole document.
+    """
+    if isinstance(known_version, bool) or not isinstance(known_version, int):
+        raise ProtocolError("known_version must be an integer")
+    if known_version < 0:
+        raise ProtocolError("known_version must not be negative")
+    return encode(
+        {
+            "type": "profile_request",
+            "v": PROTOCOL_VERSION,
+            "known_version": known_version,
+            "client": f"tau/{__version__}",
+        },
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_profile_request(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/profile`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "profile_request":
+        raise ProtocolError("expected a profile_request payload")
+    known_version = payload.get("known_version", 0)
+    if (
+        isinstance(known_version, bool)
+        or not isinstance(known_version, int)
+        or known_version < 0
+    ):
+        known_version = 0
+    return {"known_version": known_version}
 def excerpt_hash(text: str) -> str:
     """Short hash of a quoted message's text (first 16 hex of SHA-256).
 

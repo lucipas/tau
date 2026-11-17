@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -1741,6 +1742,286 @@ def test_peers_show_via_exchange(tmp_path, capsys):
     assert "via exchange: yes — never heard directly" in out
     assert "queued mail:  0 message(s)" in out
     assert "received:     0 message(s)" in out
+
+
+def _init_owner_node(tmp_path, capsys):
+    """Init a node directory and drain the init payload."""
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "owner",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    return data_dir
+
+
+def test_parser_profile_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "profile",
+            "set",
+            "--bio",
+            "hello",
+            "--link",
+            "https://a.example",
+            "--link",
+            "https://b.example",
+        ]
+    )
+    assert args.command == "profile"
+    assert args.profile_command == "set"
+    assert args.bio == "hello"
+    assert args.links == ["https://a.example", "https://b.example"]
+    assert args.func is cli.cmd_profile_set
+
+    show = parser.parse_args(["profile", "show"])
+    assert show.profile_command == "show"
+    assert show.func is cli.cmd_profile_show
+
+    peer_profile = parser.parse_args(["peers", "profile", "alice"])
+    assert peer_profile.peers_command == "profile"
+    assert peer_profile.target == "alice"
+    assert peer_profile.cached is False
+    assert peer_profile.func is cli.cmd_peers_profile
+
+    # A bare `tau profile` names no subcommand: argparse must fail
+    # cleanly instead of dispatching with no function set.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["profile"])
+
+
+def test_profile_set_and_show_end_to_end(tmp_path, capsys):
+    from tau.profile import load_local_profile
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    avatar = tmp_path / "avatar.png"
+    avatar.write_bytes(b"fake image bytes")
+
+    code = cli.main(
+        [
+            "profile",
+            "set",
+            "--display-name",
+            "Owner",
+            "--bio",
+            "mesh tinkerer",
+            "--avatar",
+            str(avatar),
+            "--link",
+            "https://example.com",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Published profile version 1 for Owner." in out
+    assert "mesh tinkerer" in out
+    assert "https://example.com" in out
+
+    stored = load_local_profile(data_dir / "profile.json")
+    assert stored is not None
+    assert stored["version"] == 1
+    assert stored["bio"] == "mesh tinkerer"
+    assert stored["links"] == ["https://example.com"]
+    assert stored["avatar"] == hashlib.sha256(b"fake image bytes").hexdigest()
+
+    # A second set bumps the version and keeps what was not re-set.
+    code = cli.main(
+        ["profile", "set", "--bio", "still tinkering", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "Published profile version 2" in capsys.readouterr().out
+    stored = load_local_profile(data_dir / "profile.json")
+    assert stored["version"] == 2
+    assert stored["bio"] == "still tinkering"
+    assert stored["links"] == ["https://example.com"]
+    assert stored["name"] == "Owner"
+
+    code = cli.main(["profile", "show", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["version"] == 2
+    assert payload["bio"] == "still tinkering"
+    assert payload["links"] == ["https://example.com"]
+
+    code = cli.main(["profile", "show", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "name:    Owner" in out
+    assert "bio:     still tinkering" in out
+    assert "version: 2" in out
+
+
+def test_profile_show_without_profile(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    code = cli.main(["profile", "show", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No profile published yet" in capsys.readouterr().out
+
+    code = cli.main(["profile", "show", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == {"profile": None}
+
+
+def test_profile_set_rejects_bad_values(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    base = ["profile", "set", "--data-dir", str(data_dir)]
+
+    code = cli.main(base + ["--bio", "x" * 281])
+    assert code == 1
+    assert "longer than 280" in capsys.readouterr().err
+
+    code = cli.main(
+        base
+        + [
+            "--link",
+            "https://a.example",
+            "--link",
+            "https://b.example",
+            "--link",
+            "https://c.example",
+            "--link",
+            "https://d.example",
+        ]
+    )
+    assert code == 1
+    assert "at most 3 links" in capsys.readouterr().err
+
+    code = cli.main(base + ["--link", "ftp://example.com/file"])
+    assert code == 1
+    assert "must be an http(s) URL" in capsys.readouterr().err
+
+    code = cli.main(base + ["--avatar", "no-such-file.png"])
+    assert code == 1
+    assert "neither an existing file" in capsys.readouterr().err
+
+
+def test_profile_set_without_identity(tmp_path, capsys):
+    code = cli.main(
+        ["profile", "set", "--bio", "hi", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 1
+    assert "no identity" in capsys.readouterr().err
+
+
+def _seed_peer_profile(tmp_path):
+    """One peer in the registry with a signed profile in the store."""
+    from tau.profile import ProfileStore, build_profile
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    doc = build_profile(
+        peer_identity,
+        name="alice",
+        bio="mesh tinkerer",
+        avatar="ab" * 16,
+        links=["https://example.com"],
+        version=2,
+        created_at=1000.0,
+    )
+    store = ProfileStore(config.profiles_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+    return data_dir, peer_identity, doc
+
+
+def test_peers_profile_cached(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_profile(tmp_path)
+    code = cli.main(
+        ["peers", "profile", "alice", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "name:    alice" in out
+    assert "bio:     mesh tinkerer" in out
+    assert "avatar:  " + "ab" * 16 in out
+    assert "link:    https://example.com" in out
+    assert "version: 2" in out
+
+    code = cli.main(
+        [
+            "peers",
+            "profile",
+            "alice",
+            "--cached",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile"]["bio"] == "mesh tinkerer"
+    assert payload["profile"]["version"] == 2
+    assert payload["fetched"] is False
+
+
+def test_peers_profile_cached_without_profile(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    registry = PeerRegistry(config.peers_path)
+    identity = RNS.Identity()
+    registry.upsert(
+        destination_hash(identity),
+        identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    code = cli.main(
+        ["peers", "profile", "alice", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "has no public profile yet" in capsys.readouterr().out
+
+
+def test_peers_profile_unknown_peer(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_profile(tmp_path)
+    code = cli.main(
+        ["peers", "profile", "nobody", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def test_peers_show_includes_profile(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_profile(tmp_path)
+    code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "profile:" in out
+    assert "bio:     mesh tinkerer" in out
+    assert "link:    https://example.com" in out
+
+    code = cli.main(
+        ["peers", "show", "alice", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile"]["bio"] == "mesh tinkerer"
+    assert payload["profile"]["version"] == 2
+
 
 def _init_and_seed_peer(tmp_path, peer_name="alice", capsys=None):
     """Init a node and register one peer built from a real identity."""
@@ -5937,6 +6218,310 @@ def test_group_send_delay_no_queue_rejects_before_reading_input(
     assert code == 2
     assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
     assert _FakeGroupSendNode.instances == []
+
+
+def _seed_group_poll_conversation(tmp_path, *, close=False):
+    """A weekend group with one poll from alice, one vote, maybe a close."""
+    from tau.groups import GroupStore
+
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "which day?",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "p" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "cd" * 16,
+            "text": "voted: Saturday",
+            "sent_at": 1002.0,
+            "received_at": 1003.0,
+            "id": "v" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "poll_vote": {
+                "target": {"author": "ab" * 16, "sent_at": 1000.0},
+                "option": 0,
+            },
+        }
+    )
+    if close:
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": "ab" * 16,
+                "text": "closed the poll",
+                "sent_at": 1004.0,
+                "received_at": 1005.0,
+                "id": "c" * 31 + "1",
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "weekend",
+                "direction": "in",
+                "poll_close": {"author": "ab" * 16, "sent_at": 1000.0},
+            }
+        )
+    return data_dir, group
+
+
+def test_parser_group_poll_vote_close_poll():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["group", "poll", "weekend", "which day?", "Saturday", "Sunday"]
+    )
+    assert args.func is cli.cmd_group_poll
+    assert args.options == ["Saturday", "Sunday"]
+    args = parser.parse_args(["group", "vote", "weekend", "pppp", "2"])
+    assert args.func is cli.cmd_group_vote
+    assert args.poll == "pppp"
+    assert args.option == "2"
+    args = parser.parse_args(["group", "close-poll", "weekend", "pppp"])
+    assert args.func is cli.cmd_group_close_poll
+
+
+def test_resolve_group_poll(tmp_path):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    poll = cli._resolve_group_poll(inbox, "pppp", group["id"])
+    assert poll["text"] == "which day?"
+    # A vote record never resolves as the poll itself.
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_group_poll(inbox, "vvvv", group["id"])
+    # A plain message in the group is not a poll either.
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_group_poll(inbox, "aaaa", group["id"])
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_group_poll(inbox, "zzzz", group["id"])
+
+
+def test_group_poll_posts_options(tmp_path, capsys, monkeypatch):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert node.send_kwargs[0]["poll_vote"] is None
+    assert "poll posted to weekend" in capsys.readouterr().out
+
+
+def test_group_poll_rejects_one_option(tmp_path, capsys, monkeypatch):
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "which day?",
+            "Saturday",
+        ]
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_group_vote_sends_target_and_option(tmp_path, capsys, monkeypatch):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+            "2",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_vote"] == {
+        "target": {"author": "ab" * 16, "sent_at": 1000.0},
+        "option": 1,
+    }
+    assert "voted for 'Sunday'" in capsys.readouterr().out
+
+
+def test_group_vote_accepts_option_text(tmp_path, capsys, monkeypatch):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+            "Saturday",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert node.send_kwargs[0]["poll_vote"]["option"] == 0
+
+
+def test_group_vote_rejects_closed_poll_and_bad_option(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, group = _seed_group_poll_conversation(
+        tmp_path / "closed", close=True
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+            "1",
+        ]
+    )
+    assert code == 2
+    assert "this poll is closed" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+    data_dir, group = _seed_group_poll_conversation(tmp_path / "open")
+    code = cli.main(
+        [
+            "group",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+            "3",
+        ]
+    )
+    assert code == 2
+    assert "option must be a number 1-2" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_group_close_poll_requires_creator(tmp_path, capsys, monkeypatch):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "close-poll",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+        ]
+    )
+    assert code == 2
+    assert "only the poll's creator can close it" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_group_close_poll_happy_path(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    own_hash = _id_destination(data_dir, capsys)
+    from tau.groups import GroupStore
+
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create(
+        "weekend", [own_hash, "cd" * 16], created_by=own_hash
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "",
+            "text": "which day?",
+            "sent_at": 1001.0,
+            "received_at": 1001.0,
+            "id": "p" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "out",
+            "leg_sent_at": 1000.0,
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "close-poll",
+            "--data-dir",
+            str(data_dir),
+            "weekend",
+            "pppp",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert node.send_kwargs[0]["poll_close"] == {
+        "author": own_hash,
+        "sent_at": 1000.0,
+    }
+    assert "closed the poll" in capsys.readouterr().out
+
+
+def test_group_messages_renders_poll_tally_and_hides_votes(
+    tmp_path, capsys
+):
+    data_dir, group = _seed_group_poll_conversation(tmp_path)
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "which day?" in out
+    assert "1. Saturday — 1 vote(s)" in out
+    assert "2. Sunday — 0 vote(s)" in out
+    assert "1 voter(s) total" in out
+    # The vote itself is not a chat message.
+    assert "voted: Saturday" not in out
 
 
 def test_parser_group_send_wait():

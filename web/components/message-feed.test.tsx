@@ -1145,3 +1145,222 @@ describe("MessageFeed pins", () => {
     expect(screen.getByText("No pinned messages")).toBeTruthy();
   });
 });
+
+describe("MessageFeed peer profile", () => {
+  it("shows the open peer's profile bio and links in the header", () => {
+    const message = makeMessage();
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        peer={{
+          destination: "ab".repeat(16),
+          name: "alice",
+          last_seen: 1000,
+          age: 5,
+          hops: 1,
+          protocol: 1,
+          profile: {
+            author: "ab".repeat(16),
+            name: "alice",
+            bio: "mesh tinkerer",
+            avatar: "ab".repeat(32),
+            links: ["https://example.com"],
+            version: 2,
+            created_at: 1000,
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("alice — mesh tinkerer")).toBeTruthy();
+    expect(screen.getByText("example.com")).toBeTruthy();
+    expect(
+      screen.getByTitle(`Avatar SHA-256 ${"ab".repeat(32)}`),
+    ).toBeTruthy();
+  });
+
+  it("shows no profile strip without a peer profile", () => {
+    const message = makeMessage();
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        peer={{
+          destination: "ab".repeat(16),
+          name: "alice",
+          last_seen: 1000,
+          age: 5,
+          hops: 1,
+          protocol: 1,
+          profile: null,
+        }}
+      />,
+    );
+
+    expect(screen.queryByText(/mesh tinkerer/)).toBeNull();
+  });
+});
+
+describe("MessageFeed group polls", () => {
+  const poll = makeMessage({
+    id: 1,
+    group: "g1",
+    group_name: "crew",
+    text: "Tea or coffee?",
+    wire_id: "wire-poll",
+    poll_options: ["Tea", "Coffee"],
+    poll: {
+      options: ["Tea", "Coffee"],
+      counts: [0, 1],
+      total: 1,
+      closed: false,
+      voters: [
+        { author: "cd".repeat(16), name: "carol", option: 1, voted_at: 110 },
+      ],
+      my_vote: null,
+    },
+  });
+
+  it("renders the options with counts and the total", () => {
+    render(
+      <MessageFeed
+        messages={[poll]}
+        node={null}
+        live={true}
+        onVotePoll={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTitle("Vote for Tea")).toBeTruthy();
+    expect(screen.getByTitle("Vote for Coffee")).toBeTruthy();
+    expect(screen.getByText("0 · 0%")).toBeTruthy();
+    expect(screen.getByText("1 · 100%")).toBeTruthy();
+    expect(screen.getByText("1 vote")).toBeTruthy();
+  });
+
+  it("marks the viewer's vote and lets it change", () => {
+    const mine = { ...poll, poll: { ...poll.poll!, my_vote: 1 } };
+    render(
+      <MessageFeed
+        messages={[mine]}
+        node={null}
+        live={true}
+        onVotePoll={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByTitle("Your vote — pick another option to change it"),
+    ).toBeTruthy();
+    expect(screen.getByText("1 vote · you voted")).toBeTruthy();
+  });
+
+  it("votes for the clicked option", () => {
+    const onVotePoll = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[poll]}
+        node={null}
+        live={true}
+        onVotePoll={onVotePoll}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Vote for Tea"));
+    expect(onVotePoll).toHaveBeenCalledTimes(1);
+    expect(onVotePoll).toHaveBeenCalledWith(poll, 0);
+  });
+
+  it("disables voting when no vote handler is wired", () => {
+    render(<MessageFeed messages={[poll]} node={null} live={true} />);
+
+    expect(
+      screen.getByTitle("Vote for Tea") as HTMLButtonElement,
+    ).toHaveProperty("disabled", true);
+  });
+
+  it("hides vote and close entries from the feed", () => {
+    const vote = makeMessage({
+      id: 2,
+      group: "g1",
+      group_name: "crew",
+      text: "voted: Coffee",
+      wire_id: "wire-vote",
+      poll_vote: {
+        target: { author: "ab".repeat(16), sent_at: 100 },
+        option: 1,
+      },
+    });
+    const close = makeMessage({
+      id: 3,
+      group: "g1",
+      group_name: "crew",
+      text: "closed the poll",
+      wire_id: "wire-close",
+      poll_close: { author: "ab".repeat(16), sent_at: 100 },
+    });
+    render(
+      <MessageFeed
+        messages={[poll, vote, close]}
+        node={null}
+        live={true}
+        onVotePoll={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Tea or coffee?")).toBeTruthy();
+    expect(screen.queryByText("voted: Coffee")).toBeNull();
+    expect(screen.queryByText("closed the poll")).toBeNull();
+  });
+
+  it("shows the tally without voting on a closed poll", () => {
+    const closed = { ...poll, poll: { ...poll.poll!, closed: true } };
+    render(
+      <MessageFeed
+        messages={[closed]}
+        node={null}
+        live={true}
+        onVotePoll={vi.fn()}
+      />,
+    );
+
+    // Every option button carries the closed title, so one per option.
+    expect(screen.getAllByTitle("This poll is closed")).toHaveLength(2);
+    expect(screen.getByText("1 vote · closed")).toBeTruthy();
+  });
+
+  it("offers close on the creator's own open poll", () => {
+    const own = { ...poll, direction: "out" as const };
+    const onClosePoll = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[own]}
+        node={null}
+        live={true}
+        onVotePoll={vi.fn()}
+        onClosePoll={onClosePoll}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("close poll"));
+    expect(onClosePoll).toHaveBeenCalledTimes(1);
+    expect(onClosePoll).toHaveBeenCalledWith(own);
+  });
+
+  it("offers no close button on someone else's poll", () => {
+    render(
+      <MessageFeed
+        messages={[poll]}
+        node={null}
+        live={true}
+        onVotePoll={vi.fn()}
+        onClosePoll={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("close poll")).toBeNull();
+  });
+});

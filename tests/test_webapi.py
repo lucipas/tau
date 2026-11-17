@@ -352,11 +352,15 @@ class FakeNode:
     def send_group_message(
         self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
         expires_at=None, send_after=None, in_reply_to=None,
+        poll_options=None, poll_vote=None, poll_close=None,
     ):
         self.group_sent.append((group["name"], text))
         self.last_group_expires_at = expires_at
         self.last_group_send_after = send_after
         self.last_group_in_reply_to = in_reply_to
+        self.last_group_poll_options = poll_options
+        self.last_group_poll_vote = poll_vote
+        self.last_group_poll_close = poll_close
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -871,6 +875,57 @@ def test_heard_endpoint_empty_without_accessor(bridge, node):
     status, _, payload = _json(bridge, "/api/heard")
     assert status == 200
     assert payload == {"heard": [], "count": 0}
+
+
+def test_peers_endpoint_includes_profile(bridge, node, tmp_path):
+    from tau.profile import ProfileStore, build_profile
+
+    registry = _seed_alias_registry(node, tmp_path)
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    registry.upsert(
+        peer_hash, identity.get_public_key(), name="carol", hops=1
+    )
+    registry.save()
+    store = ProfileStore(tmp_path / "profiles.json")
+    doc = build_profile(
+        identity,
+        name="carol",
+        bio="mesh tinkerer",
+        avatar="ab" * 16,
+        links=["https://example.com"],
+        version=2,
+        created_at=1000.0,
+    )
+    assert store.store(doc) is True
+    assert store.save() is True
+    node.profile_store = store
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    by_name = {item["name"]: item for item in payload["peers"]}
+    carol = by_name["carol"]["profile"]
+    assert carol["bio"] == "mesh tinkerer"
+    assert carol["avatar"] == "ab" * 16
+    assert carol["links"] == ["https://example.com"]
+    assert carol["version"] == 2
+    assert carol["author"] == peer_hash.hex()
+    # The display view carries no key or signature.
+    assert "sig" not in carol and "key" not in carol
+    # A peer with no profile reads as null, not as a missing key.
+    assert by_name["alice"]["profile"] is None
+
+
+def test_peers_endpoint_without_profile_store_has_null_profiles(
+    bridge, node
+):
+    # A node-like without a profile store (like this fixture's
+    # FakeNode) simply has no profiles — the endpoint still answers.
+    assert not hasattr(node, "profile_store")
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    assert payload["peers"][0]["profile"] is None
 
 
 def _seed_alias_registry(node, tmp_path):
@@ -12494,6 +12549,206 @@ def test_react_endpoint_uses_own_hash_for_outbound_group_leg(bridge, node):
     assert node.group_reactions == [
         ("crew", wire_id, "👍", node.destination_hexhash, 1000.0)
     ]
+
+
+CAROL_HASH = "cd" * 16
+
+
+def _seed_group_poll(node, bridge, *, author=PEER_HASH, close=False):
+    """A group poll in the node inbox and the console history.
+
+    Alice (``PEER_HASH``) asks "Tea or coffee?" at sent time 100;
+    carol votes for Coffee (option index 1).  An optional close from
+    the poll's author freezes the tally.  Returns the group id.
+    """
+    group_id = node.groups.list_groups()[0]["id"]
+    poll = {
+        "from": "alice",
+        "destination": author,
+        "text": "Tea or coffee?",
+        "kind": "group",
+        "group": group_id,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-poll",
+        "poll_options": ["Tea", "Coffee"],
+    }
+    node.inbox.append(dict(poll))
+    bridge.record_inbound(dict(poll), publish=False)
+    vote = {
+        "from": "carol",
+        "destination": CAROL_HASH,
+        "text": "voted: Coffee",
+        "kind": "group",
+        "group": group_id,
+        "group_name": "crew",
+        "sent_at": 110.0,
+        "received_at": 111.0,
+        "id": "wire-vote",
+        "poll_vote": {"target": {"author": author, "sent_at": 100.0}, "option": 1},
+    }
+    node.inbox.append(dict(vote))
+    bridge.record_inbound(dict(vote), publish=False)
+    if close:
+        close_record = {
+            "from": "alice",
+            "destination": author,
+            "text": "closed the poll",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 120.0,
+            "received_at": 121.0,
+            "id": "wire-close",
+            "poll_close": {"author": author, "sent_at": 100.0},
+        }
+        node.inbox.append(dict(close_record))
+        bridge.record_inbound(dict(close_record), publish=False)
+    return group_id
+
+
+def test_messages_overlays_group_poll_tally(bridge, node):
+    _seed_group_poll(node, bridge)
+    entries = bridge.messages()
+    poll = next(entry for entry in entries if entry.get("wire_id") == "wire-poll")
+    assert poll["poll_options"] == ["Tea", "Coffee"]
+    assert poll["poll"] == {
+        "options": ["Tea", "Coffee"],
+        "counts": [0, 1],
+        "total": 1,
+        "closed": False,
+        "voters": [
+            {
+                "author": CAROL_HASH,
+                "name": "carol",
+                "option": 1,
+                "voted_at": 110.0,
+            }
+        ],
+        "my_vote": None,
+    }
+    vote = next(entry for entry in entries if entry.get("wire_id") == "wire-vote")
+    assert vote["poll_vote"] == {
+        "target": {"author": PEER_HASH, "sent_at": 100.0},
+        "option": 1,
+    }
+
+
+def test_group_send_with_poll_options_posts_poll(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={
+            "group": "crew",
+            "text": "Tea or coffee?",
+            "poll_options": ["Tea", "Coffee"],
+        },
+    )
+    assert status == 200
+    assert node.last_group_poll_options == ["Tea", "Coffee"]
+    assert node.last_group_poll_vote is None
+    assert node.last_group_poll_close is None
+
+
+def test_group_poll_vote_endpoint_votes_by_number_and_text(bridge, node):
+    group_id = _seed_group_poll(node, bridge)
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/vote",
+        method="POST",
+        body={"group": "crew", "poll": "wire-poll", "option": 2},
+    )
+    assert status == 200
+    assert node.group_sent[-1] == ("crew", "voted: Coffee")
+    assert node.last_group_poll_vote == {
+        "target": {"author": PEER_HASH, "sent_at": 100.0},
+        "option": 1,
+    }
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/vote",
+        method="POST",
+        body={"group": group_id, "poll": "wire-p", "option": "Tea"},
+    )
+    assert status == 200
+    assert node.last_group_poll_vote["option"] == 0
+
+
+def test_group_poll_vote_endpoint_rejects_bad_option(bridge, node):
+    _seed_group_poll(node, bridge)
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/vote",
+        method="POST",
+        body={"group": "crew", "poll": "wire-poll", "option": 3},
+    )
+    assert status == 400
+    assert "option must be" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/vote",
+        method="POST",
+        body={"group": "crew", "poll": "wire-nope", "option": 1},
+    )
+    assert status == 400
+    assert "no poll" in payload["error"]["message"]
+
+
+def test_group_poll_vote_endpoint_refuses_closed_poll(bridge, node):
+    _seed_group_poll(node, bridge, close=True)
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/vote",
+        method="POST",
+        body={"group": "crew", "poll": "wire-poll", "option": 1},
+    )
+    assert status == 400
+    assert "closed" in payload["error"]["message"]
+
+
+def test_group_poll_close_endpoint_requires_creator(bridge, node):
+    _seed_group_poll(node, bridge)
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/close-poll",
+        method="POST",
+        body={"group": "crew", "poll": "wire-poll"},
+    )
+    assert status == 400
+    assert "only the poll's creator" in payload["error"]["message"]
+
+
+def test_group_poll_close_endpoint_closes_own_poll(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    poll = {
+        "from": "tester",
+        "destination": PEER_HASH,
+        "text": "Tea or coffee?",
+        "kind": "group",
+        "group": group_id,
+        "group_name": "crew",
+        "direction": "out",
+        "leg_sent_at": 100.0,
+        "sent_at": 101.0,
+        "received_at": 101.0,
+        "id": "wire-own-poll",
+        "poll_options": ["Tea", "Coffee"],
+    }
+    node.inbox.append(dict(poll))
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/close-poll",
+        method="POST",
+        body={"group": "crew", "poll": "wire-own-poll"},
+    )
+    assert status == 200
+    assert node.group_sent[-1] == ("crew", "closed the poll")
+    assert node.last_group_poll_close == {
+        "author": node.destination_hexhash,
+        "sent_at": 100.0,
+    }
 
 
 def test_react_endpoint_group_gone_is_a_404(bridge, node):

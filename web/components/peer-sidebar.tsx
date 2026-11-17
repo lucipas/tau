@@ -1017,6 +1017,35 @@ export function PeerSidebar({
                               lxmf {shortHash(peer.lxmf, 10)}
                             </span>
                           ) : null}
+                          {peer.profile?.bio ? (
+                            <span
+                              className="block truncate text-[11px] text-zinc-300"
+                              title={peer.profile.bio}
+                            >
+                              {peer.profile.bio}
+                            </span>
+                          ) : null}
+                          {peer.profile?.avatar ? (
+                            <span
+                              className="block truncate font-mono text-[10px] text-mist"
+                              title={`Avatar SHA-256 ${peer.profile.avatar}`}
+                            >
+                              avatar {shortHash(peer.profile.avatar, 10)}
+                            </span>
+                          ) : null}
+                          {peer.profile?.links?.length ? (
+                            <span className="flex flex-wrap gap-x-2 gap-y-0.5">
+                              {peer.profile.links.map((link) => (
+                                <span
+                                  key={link}
+                                  title={link}
+                                  className="max-w-full truncate font-mono text-[10px] text-signal"
+                                >
+                                  {link.replace(/^https?:\/\//, "")}
+                                </span>
+                              ))}
+                            </span>
+                          ) : null}
                         </span>
                       </button>
                       {onSetAlias ? (

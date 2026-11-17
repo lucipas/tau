@@ -345,6 +345,14 @@ export function Console() {
       : canonicalPeerTarget(target, tau.peers);
   const typists =
     target.trim() === "" ? [] : (tau.typing[typingKey] ?? []);
+  // The peer this DM conversation is with, for the profile strip in
+  // the message header: groups have no peer profile.
+  const selectedPeer =
+    mode === "peer"
+      ? (tau.peers.find(
+          (candidate) => candidate.destination === typingKey,
+        ) ?? null)
+      : null;
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden">
@@ -550,6 +558,7 @@ export function Console() {
               node={tau.node}
               peers={tau.peers}
               groups={tau.groups}
+              peer={selectedPeer}
               live={tau.connection === "live"}
               searching={tau.searchQuery !== null}
               searchQuery={tau.searchQuery}
@@ -600,6 +609,14 @@ export function Console() {
                 } else {
                   await tau.reactToMessage(message.wire_id, reaction);
                 }
+              }}
+              onVotePoll={async (message, option) => {
+                if (!message.group || !message.wire_id) return;
+                await tau.voteGroupPoll(message.group, message.wire_id, option);
+              }}
+              onClosePoll={async (message) => {
+                if (!message.group || !message.wire_id) return;
+                await tau.closeGroupPoll(message.group, message.wire_id);
               }}
               onPin={async (message, pinned) => {
                 if (pinned) {
