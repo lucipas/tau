@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiDownload, apiGet, apiPost, apiPostText, eventsUrl, websocketUrl } from "./api";
+import { lookalikeOf, recomputeLookalikeWarnings } from "./peer-lookalike";
 import type {
   AcceptDmRequestResponse,
   AllowlistResponse,
@@ -484,6 +485,22 @@ export function useTau() {
       : incoming;
   };
 
+  // A live peer event carries lookalike_of computed without private
+  // notes, so it can erase a warning the loopback snapshot supplied
+  // from a note-only contact. When the incoming value is null,
+  // recompute it from the merged list — the list holds exactly what
+  // this console knows (notes only on loopback), so the recompute
+  // respects the same boundary. A non-null value from the server is
+  // authoritative and kept as-is, so a warning the server cleared
+  // (alias removed, contact forgotten) clears here too.
+  const keepLookalikeWarning = (peers: Peer[], incoming: Peer): Peer => {
+    if (incoming.lookalike_of != null) return incoming;
+    const recomputed = lookalikeOf(peers, incoming);
+    return recomputed === incoming.lookalike_of
+      ? incoming
+      : { ...incoming, lookalike_of: recomputed };
+  };
+
   useEffect(() => {
     let disposed = false;
     // Edits made before this connection opened are in its snapshot;
@@ -683,7 +700,9 @@ export function useTau() {
         const next = previous.filter(
           (entry) => entry.destination !== currentPeer.destination,
         );
-        next.push(keepKnownNote(previous, currentPeer));
+        const merged = keepKnownNote(previous, currentPeer);
+        next.push(merged);
+        next[next.length - 1] = keepLookalikeWarning(next, merged);
         return sortPeers(next);
       });
     };
@@ -2330,12 +2349,15 @@ export function useTau() {
         (peerEventVersion.current[destination] ?? 0) === versionBefore &&
         snapshotGeneration.current === snapshotBefore
       ) {
-        setPeers((previous) =>
-          sortPeers([
+        setPeers((previous) => {
+          const merged = keepKnownNote(previous, result.peer);
+          const next = [
             ...previous.filter((entry) => entry.destination !== destination),
-            keepKnownNote(previous, result.peer),
-          ]),
-        );
+            merged,
+          ];
+          next[next.length - 1] = keepLookalikeWarning(next, merged);
+          return sortPeers(next);
+        });
       }
       return result.peer;
     },
@@ -2365,6 +2387,38 @@ export function useTau() {
             result.peer,
           ]),
         );
+      } else if (snapshotGeneration.current === snapshotBefore) {
+        // A peer event arrived first — usually this edit's own
+        // note-blind event, published by the server before the reply.
+        // Skipping the reply outright would leave the note stale and
+        // warnings recomputed from it wrong. The reply's note is
+        // still authoritative: events never carry a note, so no event
+        // can supersede it, and a snapshot (which could carry a newer
+        // note from another tab) has not arrived. Apply just the note
+        // — and the reply's warning, computed with it — without
+        // overwriting newer peer fields the event delivered, then
+        // recompute warnings for peers matching this contact, so a
+        // set note flags them and a cleared note unflags them.
+        setPeers((previous) => {
+          const known = previous.find(
+            (entry) => entry.destination === destination,
+          );
+          if (!known) return previous;
+          const merged = {
+            ...known,
+            note: result.peer.note,
+            lookalike_of: result.peer.lookalike_of,
+          };
+          // A verified peer is never a lookalike, even if the reply
+          // predates a verify that arrived as an event meanwhile.
+          const contact = merged.verified
+            ? { ...merged, lookalike_of: null }
+            : merged;
+          const next = previous.map((entry) =>
+            entry.destination === destination ? contact : entry,
+          );
+          return sortPeers(recomputeLookalikeWarnings(next, contact));
+        });
       }
       return result.peer;
     },

@@ -31,6 +31,7 @@ from tau.mailbox import Mailbox
 from tau.node import NodeError
 from tau.peers import AmbiguousPeer, Peer, PeerError
 from tau.webapi import (
+    SUBSCRIBER_QUEUE_SIZE,
     PeerForgetBlocked,
     WebBridge,
     WebBridgeError,
@@ -141,6 +142,12 @@ class FakeRegistry:
 
     def refresh_aliases(self):
         return 0
+
+    def lookalike_for(self, peer, *, include_notes=True):
+        # The fixture holds a single peer, so nothing can collide with
+        # it; the real registry (PeerRegistry.lookalike_for) is covered
+        # by tests that swap one in (see _seed_alias_registry).
+        return None
 
     def restore(self, peer):
         if self.get(peer.destination_hash) is None:
@@ -756,6 +763,32 @@ def test_peers_endpoint_includes_verification_state(bridge, node):
     assert "verified" not in peer.public_dict()
 
 
+def test_peers_endpoint_flags_lookalike_and_rename(bridge, node, tmp_path):
+    registry = _seed_alias_registry(node, tmp_path)
+    alice = registry.get(bytes.fromhex(PEER_HASH))
+    registry.mark_verified(alice.destination_hash, "00001", now=1500.0)
+    registry.upsert(
+        bytes.fromhex("ef" * 16), b"\x03" * 64, name="Alice", hops=1
+    )
+    carol = registry.upsert(
+        bytes.fromhex("12" * 16), b"\x04" * 64, name="carol", hops=1
+    )
+    registry.mark_verified(carol.destination_hash, "00002", now=1500.0)
+    registry.upsert(
+        bytes.fromhex("12" * 16), b"\x04" * 64, name="caroline", hops=1
+    )
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    by_name = {item["name"]: item for item in payload["peers"]}
+    assert by_name["Alice"]["lookalike_of"] == "alice"
+    assert by_name["Alice"]["verified"] is False
+    assert by_name["alice"]["lookalike_of"] is None
+    assert by_name["caroline"]["name_change_at"] is not None
+    assert by_name["caroline"]["previous_name"] == "carol"
+    assert by_name["caroline"]["lookalike_of"] is None
+
+
 def test_heard_endpoint_lists_foreign_announces(bridge, node):
     node.foreign_announces = lambda: [
         {
@@ -1038,6 +1071,130 @@ def test_peers_alias_waits_for_node_peer_save_lock(bridge, node, tmp_path):
     assert done.is_set()
     assert result["payload"]["alias"] == "laptop"
     assert node.registry.get(PEER_HASH).alias == "laptop"
+
+
+def test_peers_alias_refresh_covers_intervening_alias(bridge, node, tmp_path):
+    """A concurrent alias edit must not leave neighbours stale: the
+    alias captured before the lock may not be the one the edit
+    replaces, so the neighbours announcing the intervening alias
+    must still be re-published when the edit lands."""
+    registry = _seed_alias_registry(node, tmp_path)
+    # M announces "A" but alice carries no alias yet, so M has no warning.
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="A", hops=1)
+    node._save_lock = threading.Lock()
+    node._save_lock.acquire()
+    try:
+        done = threading.Event()
+        result: dict = {}
+
+        def edit():
+            result["payload"] = bridge.set_peer_alias(PEER_HASH, "B")
+            done.set()
+
+        worker = threading.Thread(target=edit, daemon=True)
+        worker.start()
+        # The edit is blocked on the lock, having already read its
+        # previous alias (none). A concurrent edit lands while it
+        # waits: alice is now "A", so M announcing "A" has a warning
+        # the waiting edit must clear when it replaces "A" with "B".
+        assert not done.wait(timeout=1.0)
+        assert worker.is_alive()
+        registry.set_alias(PEER_HASH, "A")
+    finally:
+        node._save_lock.release()
+    worker.join(timeout=5.0)
+    assert done.is_set()
+    assert result["payload"]["alias"] == "B"
+    assert node.registry.get(PEER_HASH).alias == "B"
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour announcing the intervening alias was not re-published"
+    assert mine[-1]["lookalike_of"] is None
+
+
+def test_peers_alias_refresh_covers_pre_refresh_alias(bridge, node, tmp_path):
+    """A one-shot command may have changed the alias on disk since
+    the last refresh: the neighbour announcing the alias the console
+    last saw must still be re-published when the edit lands, even
+    though the refresh under the lock restores a different alias."""
+    registry = _seed_alias_registry(node, tmp_path)
+    registry.set_alias(PEER_HASH, "disk")
+    # M announces "disk", so it carries a warning for alice-as-"disk".
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="disk", hops=1)
+    listed = {item["destination"]: item for item in bridge.peers()}
+    assert listed[PEER_HASH]["lookalike_of"] is None  # alice herself
+    assert listed[BOB_HASH]["lookalike_of"] == "disk"
+
+    # A one-shot command changed the alias on disk to "old"; the
+    # bridge's in-memory alias is still "disk" until its next refresh.
+    peers_file = tmp_path / "peers.json"
+    raw = json.loads(peers_file.read_text(encoding="utf-8"))
+    for entry in raw["peers"]:
+        if entry["destination"] == PEER_HASH:
+            entry["alias"] = "old"
+    peers_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    payload = bridge.set_peer_alias(PEER_HASH, "new")
+    assert payload["alias"] == "new"
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour announcing the pre-refresh alias was not re-published"
+    assert mine[-1]["lookalike_of"] is None
+
+
+def test_peers_note_refreshes_lookalike_neighbours(bridge, node, tmp_path):
+    """A note makes a peer a saved contact — or stops it being one —
+    which anchors or releases the lookalike warning on peers
+    announcing its name, so those rows must be re-published too."""
+    registry = _seed_alias_registry(node, tmp_path)
+    # N announces "alice" but alice carries no alias or note yet.
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="alice", hops=1)
+
+    payload = bridge.set_peer_note(PEER_HASH, "met at the meetup")
+    assert payload["note"] == "met at the meetup"
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour was not re-published after a note was set"
+
+    # Clearing the note releases the anchor again.
+    bridge.set_peer_note(PEER_HASH, "")
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert len(mine) >= 2, "neighbour was not re-published after a note was cleared"
+
+
+def test_peers_note_refresh_covers_pre_refresh_alias(bridge, node, tmp_path):
+    """A one-shot command may have changed the alias on disk since
+    the last refresh: a note edit refreshes aliases from disk, so the
+    neighbour announcing the alias the console last saw must still be
+    re-published when the note edit lands."""
+    registry = _seed_alias_registry(node, tmp_path)
+    registry.set_alias(PEER_HASH, "disk")
+    # M announces "disk" and carries a warning for alice-as-"disk".
+    registry.upsert(bytes.fromhex(BOB_HASH), b"\x03" * 64, name="disk", hops=1)
+    listed = {item["destination"]: item for item in bridge.peers()}
+    assert listed[BOB_HASH]["lookalike_of"] == "disk"
+
+    # A one-shot command changed the alias on disk to "old"; the
+    # bridge's in-memory alias is still "disk" until its next refresh.
+    peers_file = tmp_path / "peers.json"
+    raw = json.loads(peers_file.read_text(encoding="utf-8"))
+    for entry in raw["peers"]:
+        if entry["destination"] == PEER_HASH:
+            entry["alias"] = "old"
+    peers_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    # The note edit refreshes aliases (alice becomes "old"), so M
+    # announcing "disk" must be re-published with no warning.
+    bridge.set_peer_note(PEER_HASH, "met at the meetup")
+
+    events = [e for e in bridge.bus.replay(0) if e["type"] == "peer"]
+    mine = [e["peer"] for e in events if e["peer"]["destination"] == BOB_HASH]
+    assert mine, "neighbour announcing the pre-refresh alias was not re-published"
+    assert mine[-1]["lookalike_of"] is None
 
 
 def test_peers_alias_endpoint_rejects_bad_requests(bridge, node, tmp_path):
@@ -4304,6 +4461,110 @@ def test_websocket_survives_idle_client(bridge):
         sock.close()
 
 
+def test_websocket_slow_client_does_not_outlive_bridge_stop(bridge):
+    # A client that stops reading must not keep the bridge alive: once
+    # its TCP buffers fill, the sender blocks in wfile.flush(), and
+    # bridge.stop() must still return promptly with the connection
+    # closed (see #425).
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # A small receive buffer caps the bytes in flight, so the sender
+    # blocks after a modest flood instead of megabytes of buffering.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.settimeout(5)
+    sock.connect(("127.0.0.1", bridge.port))
+    sock.sendall(
+        (
+            "GET /ws HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("latin-1")
+    )
+    buffer = _WSBuffer(sock)
+    try:
+        headers = buffer.read_until(b"\r\n\r\n")
+        assert headers.startswith(b"HTTP/1.1 101")
+        opcode, payload = _ws_read_frame(buffer)
+        assert opcode == 1
+        assert json.loads(payload)["type"] == "snapshot"
+        # Flood the stream and never read again: the sender drains the
+        # subscriber queue into the socket until the kernel send buffer
+        # fills, then blocks in wfile.flush(). The flood must attempt
+        # far more than the send buffer can absorb (several MiB) plus
+        # the subscriber queue, so the sender is parked in a write
+        # rather than merely behind.
+        flooding = threading.Event()
+        published = [0]
+
+        def flood() -> None:
+            while not flooding.is_set():
+                bridge.bus.publish(
+                    {"type": "status", "node": {"name": "x" * 1024}}
+                )
+                published[0] += 1
+
+        flooder = threading.Thread(target=flood, daemon=True)
+        flooder.start()
+        try:
+            deadline = time.monotonic() + 30
+            while published[0] < 65536 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert published[0] >= 65536, "flooder did not publish enough"
+            # Keep flooding a moment so the sender is parked in a
+            # write, then stop: a sender keeping up would drain the
+            # queue to empty within milliseconds.
+            time.sleep(1.0)
+            flooding.set()
+            flooder.join(timeout=5)
+            subscribers = list(bridge.bus._subscribers)
+            assert len(subscribers) == 1
+            assert (
+                subscribers[0].qsize() >= SUBSCRIBER_QUEUE_SIZE - 1
+            ), "sender was not blocked on the slow client"
+        finally:
+            flooding.set()
+            flooder.join(timeout=5)
+        stopped = []
+        stopper = threading.Thread(
+            target=lambda: (bridge.stop(), stopped.append(True)),
+            daemon=True,
+        )
+        stopper.start()
+        stopper.join(timeout=10)
+        assert not stopper.is_alive(), "bridge.stop() hung on a slow client"
+        assert stopped == [True]
+        # The sender was parked in wfile.flush(): on the fixed code the
+        # shutdown fails that write and the pump thread exits. Draining
+        # the client socket cannot be the check — reading frees window
+        # and unblocks the sender on its own, so the pump would drain
+        # its queue, notice bridge.closing, and exit even unfixed.
+        deadline = time.monotonic() + 5
+        while any(
+            thread.name == "tau-ws-pump" and thread.is_alive()
+            for thread in threading.enumerate()
+        ):
+            assert time.monotonic() < deadline, (
+                "ws pump thread outlived bridge.stop()"
+            )
+            time.sleep(0.05)
+        # With the pump gone the connection is closed: drain whatever
+        # the client already buffered, then expect EOF.
+        sock.settimeout(5)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                pytest.fail("server left the slow client's connection open")
+            if not chunk:
+                break
+            assert time.monotonic() < deadline
+    finally:
+        sock.close()
+
+
 def test_websocket_streams_snapshot_events_and_ping(bridge):
     sock = socket.create_connection(("127.0.0.1", bridge.port), timeout=5)
     try:
@@ -4432,6 +4693,95 @@ def test_tan_timeline_and_follow(tmp_path):
         )
         assert status == 503
         assert "not enabled" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_channels_via_api(tmp_path):
+    from types import SimpleNamespace
+
+    import RNS
+
+    from tau import cli
+    from tau.channels import (
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    tester = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        bob_message = create_message(
+            conn, bob, "general", "hello channels", name="bob", now=1000
+        )
+        create_message(
+            conn, tester, "general", "from tester", name="tester", now=1001
+        )
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/channels")
+        assert status == 200
+        assert [item["channel"] for item in payload["channels"]] == ["general"]
+        assert payload["channels"][0]["messages"] == 2
+
+        status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == [
+            "from tester",
+            "hello channels",
+        ]
+
+        status, _, payload = _json(bridge, "/api/channels/messages")
+        assert status == 400
+
+        # A blocked author is hidden, like the timeline hides their posts.
+        node.blocklist = SimpleNamespace(
+            blocked=frozenset({bob_message["author"]}), block_all=False
+        )
+        status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == ["from tester"]
+        node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert payload["messages"] == []
+        node.blocklist = None
+
+        status, _, payload = _json(
+            bridge, "/api/channels/join", method="POST", body={"channel": "other"}
+        )
+        assert status == 200
+        assert payload["channel"] == "other"
+        status, _, payload = _json(
+            bridge, "/api/channels/leave", method="POST", body={"channel": "other"}
+        )
+        assert status == 200
+        assert payload["left"] is True
+
+        # Sending and syncing need channels enabled on the serving node.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "nope"},
+        )
+        assert status == 503
+        assert "not enabled" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge, "/api/channels/sync", method="POST", body={}
+        )
+        assert status == 503
     finally:
         bridge.stop()
 

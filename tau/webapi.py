@@ -151,6 +151,12 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/media/<sha256> bytes of a cached Tan image
     POST /api/tan/media/<sha256>/fetch fetch a Tan image from its author
     POST /api/tan/import   import an export document (every entry verified)
+    GET  /api/channels     joined channels, most recently joined first
+    GET  /api/channels/messages  stored messages for a channel (``?channel=<name>&limit=20``)
+    POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
+    POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
+    POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/tan/saved    saved posts, newest save first
     POST /api/tan/save     save a post to read later
     POST /api/tan/unsave   remove a post from the saved list
@@ -190,7 +196,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
@@ -1180,6 +1186,12 @@ class WebBridge:
         self._server: Optional[_WebServer] = None
         self._thread: Optional[threading.Thread] = None
         self._closing = threading.Event()
+        # Live /ws connections, guarded by _ws_lock: each handler
+        # registers its per-connection stop callable here so bridge
+        # shutdown can close a connection whose sender is blocked in
+        # wfile.flush() for a client that stopped reading (see #425).
+        self._ws_lock = threading.Lock()
+        self._ws_stops: Set[Callable[[], None]] = set()
         # Backup bookkeeping, guarded by _backup_lock: archives being built,
         # archives awaiting download, and the temp paths to clean up on stop.
         self._backup_lock = threading.Lock()
@@ -1219,10 +1231,37 @@ class WebBridge:
         log.info("tau web console listening on %s", self.url)
         return self.url
 
+    def _register_ws_connection(self, stop: Callable[[], None]) -> None:
+        """Track one live /ws connection so :meth:`stop` can close it."""
+        with self._ws_lock:
+            self._ws_stops.add(stop)
+
+    def _unregister_ws_connection(self, stop: Callable[[], None]) -> None:
+        with self._ws_lock:
+            self._ws_stops.discard(stop)
+
+    def _close_ws_connections(self) -> None:
+        """Shut down every live /ws connection.
+
+        A sender blocked in ``wfile.flush()`` for a client that stopped
+        reading reaches neither the pump's own stop path nor the
+        ``closing`` flag; shutting the socket down fails the blocked
+        write (and wakes the reader parked in ``read_message``) so the
+        handler unwinds instead of outliving bridge shutdown.
+        """
+        with self._ws_lock:
+            stops = list(self._ws_stops)
+        for stop in stops:
+            try:
+                stop()
+            except OSError:
+                pass
+
     def stop(self) -> None:
         with self._backup_lock:
             self._closing.set()
         self.bus.close()
+        self._close_ws_connections()
         server = self._server
         self._server = None
         if server is not None:
@@ -1501,7 +1540,13 @@ class WebBridge:
         # a loopback-gated listing does.
         payload = peer.local_dict(include_note=include_note)
         # Annotate like the snapshot does, so a live update or alias
-        # response does not erase the frontend's blocked badge.
+        # response does not erase the frontend's blocked badge or the
+        # lookalike warning.  The collision uses the same note boundary
+        # as the snapshot, so a live event never reveals a note-only contact.
+        collided = self.node.registry.lookalike_for(peer, include_notes=include_note)
+        payload["lookalike_of"] = (
+            collided.display_name if collided is not None else None
+        )
         blocklist = getattr(self.node, "blocklist", None)
         payload["blocked"] = bool(
             blocklist is not None and blocklist.is_blocked(payload.get("destination"))
@@ -1510,6 +1555,29 @@ class WebBridge:
 
     def record_peer(self, peer: Peer) -> None:
         self.bus.publish({"type": "peer", "peer": self._local_peer_payload(peer)})
+
+    def _refresh_lookalike_neighbours(
+        self, changed: Peer, *previous_names: Optional[str]
+    ) -> None:
+        """Re-publish peers whose lookalike state *changed* may have affected.
+
+        A lookalike warning depends on other peers' aliases and
+        verification, so editing one contact changes the rows of peers
+        announcing the same name.  Those rows are republished here, using
+        the names *changed* carries now or carried before (*previous_names*).
+        """
+        names = {
+            name.casefold()
+            for name in (changed.name, changed.alias, *previous_names)
+            if name and name.casefold() != "unknown"
+        }
+        if not names:
+            return
+        for other in self.node.registry.all():
+            if other.destination_hash == changed.destination_hash:
+                continue
+            if other.name.casefold() in names:
+                self.record_peer(other)
 
     def _remember_removed_wire_id(self, wire_id: str) -> None:
         """Remember a wire id whose console entry is gone (caller holds the lock).
@@ -2068,6 +2136,11 @@ class WebBridge:
         with self._lock:
             self._tan_posts.append(dict(record))
         self.bus.publish({"type": "post", "post": dict(record)})
+        return record
+
+    def record_channel_message(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Fan a channel message out to SSE subscribers."""
+        self.bus.publish({"type": "channel-message", "message": dict(record)})
         return record
 
     # -- Tan social feed ---------------------------------------------------
@@ -3653,6 +3726,105 @@ class WebBridge:
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
+
+    # -- Public channels ---------------------------------------------------
+
+    def _channel_app(self) -> Optional[Any]:
+        app = getattr(self.node, "channel_app", None)
+        return app if getattr(app, "db_path", None) is not None else None
+
+    def _channel_db_path(self) -> Path:
+        app = self._channel_app()
+        if app is not None:
+            return Path(app.db_path)
+        return Path(self.node.config.channels_db_path)
+
+    def _channel_conn(self) -> Any:
+        from .channels import init_db
+
+        return init_db(self._channel_db_path())
+
+    def _local_channel_app(self) -> Any:
+        """A ChannelApp for local-only ops (join/leave/list/read).
+
+        The attached app when channels are enabled, so the console
+        sees exactly what the running node serves; otherwise a fresh
+        app over the same store, which never touches the network.
+        """
+        from .channels import ChannelApp
+        from .identity import load_identity
+
+        app = self._channel_app()
+        if app is not None:
+            return app
+        identity = load_identity(self.node.config.identity_path)
+        if identity is None:
+            raise WebBridgeError("no identity; run `tau init` first")
+        return ChannelApp(
+            self.node.config, identity, name=getattr(self.node, "name", None)
+        )
+
+    def channel_list(self) -> List[Dict[str, Any]]:
+        """Joined channels, most recently joined first."""
+        return self._local_channel_app().memberships()
+
+    def channel_messages(
+        self, channel: str, *, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Stored messages for *channel*, newest first, minus blocked authors."""
+        from .channels import channel_history, clean_channel_name
+
+        name = clean_channel_name(channel)
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._channel_conn()
+        try:
+            messages = channel_history(conn, name, limit=limit)
+        finally:
+            conn.close()
+        if exclude_all:
+            return []
+        return [
+            message
+            for message in messages
+            if str(message.get("author", "")) not in blocked
+        ]
+
+    def channel_join(self, channel: str) -> Dict[str, Any]:
+        """Join *channel*, recording membership locally."""
+        return self._local_channel_app().join(channel)
+
+    def channel_leave(self, channel: str) -> Dict[str, Any]:
+        """Leave *channel*; cached messages are kept."""
+        from .channels import clean_channel_name
+
+        left = self._local_channel_app().leave(channel)
+        return {"channel": clean_channel_name(channel), "left": left}
+
+    def channel_send(self, channel: str, text: str) -> Dict[str, Any]:
+        """Send *text* to a joined channel, gossiping it to peers."""
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        return app.send(channel, text, publish=True)
+
+    def channel_sync(
+        self, channel: Optional[str] = None, *, limit: int = 20
+    ) -> Dict[str, Any]:
+        """Pull missing history for *channel*, or every joined channel."""
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        if channel:
+            return app.sync(self.node, channel, limit=limit)
+        return app.sync_all(self.node, limit=limit)
 
     def tan_rules(self) -> Dict[str, Any]:
         """This node's Tan admission ruleset, as ``tau tan rules`` reports it.
@@ -6885,10 +7057,21 @@ class WebBridge:
             # Notes are stricter still — a remote console must never see
             # them — so they are included only when the caller asked,
             # which the HTTP layer does only for loopback clients.
-            items = [
-                peer.local_dict(now, include_note=include_notes)
-                for peer in self.node.registry.all()
-            ]
+            # lookalike_of is the same kind of local-only trust state:
+            # the display name of the verified peer or saved contact
+            # this unverified peer may be impersonating, or None.  A
+            # note-only contact counts only when notes are included, so a
+            # remote listing cannot reveal which peers carry a note.
+            items = []
+            for peer in self.node.registry.all():
+                item = peer.local_dict(now, include_note=include_notes)
+                collided = self.node.registry.lookalike_for(
+                    peer, include_notes=include_notes
+                )
+                item["lookalike_of"] = (
+                    collided.display_name if collided is not None else None
+                )
+                items.append(item)
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
@@ -6936,15 +7119,32 @@ class WebBridge:
         # Mirrors peers_verify; a node-like without the lock (e.g. in
         # tests) simply edits.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        # The alias the console last saw, before any edit lands: a
+        # neighbour announcing it loses its warning when this edit
+        # lands, so it must be refreshed even if the alias on disk
+        # (and therefore the one read under the lock) differs by now.
+        before = self.node.registry.get(destination)
+        previous_alias = before.alias if before is not None else None
         with lock:
             # Pick up notes a one-shot command saved since the last
             # periodic refresh, so this save does not write back stale ones.
             self.node.registry.refresh_aliases()
+            # Capture the alias being replaced only now, under the
+            # lock: a concurrent edit may have changed it between the
+            # read above and lock acquisition, and the refresh may
+            # have just restored a different alias from disk — either
+            # stale value would leave the neighbours announcing the
+            # intervening alias with a stale lookalike badge.
+            current = self.node.registry.get(destination)
+            replaced_alias = current.alias if current is not None else None
             if alias is not None and alias.strip():
                 peer = self.node.registry.set_alias(destination, alias)
             else:
                 peer = self.node.registry.clear_alias(destination)
         self.record_peer(peer)
+        self._refresh_lookalike_neighbours(
+            peer, previous_alias, replaced_alias
+        )
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.
@@ -6968,6 +7168,13 @@ class WebBridge:
         # note or alias a one-shot command saved since the last
         # periodic refresh, so this save does not write back stale ones.
         lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        # The alias the console last saw, before any edit lands: the
+        # refresh below may restore a different alias from disk, and
+        # neighbours announcing the former value must still be
+        # refreshed when the note edit lands — same gap as the alias
+        # edit's pre-lock value.
+        before = self.node.registry.get(destination)
+        previous_alias = before.alias if before is not None else None
         with lock:
             self.node.registry.refresh_aliases()
             if note is not None and note.strip():
@@ -6975,6 +7182,10 @@ class WebBridge:
             else:
                 peer = self.node.registry.clear_note(destination)
         self.record_peer(peer)
+        # A note makes this peer a saved contact — or stops it being
+        # one — which anchors or releases the lookalike warning on
+        # peers announcing its name, so refresh those rows too.
+        self._refresh_lookalike_neighbours(peer, previous_alias)
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
         # the blocked badge until the next snapshot.
@@ -7036,6 +7247,10 @@ class WebBridge:
             self.node.registry.refresh_aliases()
             self.node.registry.mark_verified(peer.destination_hash, number)
             self.node.registry.save()
+        # Rows of unverified peers announcing this name lose or gain their
+        # warning with this verification; the verified row itself is
+        # updated by the console from the response.
+        self._refresh_lookalike_neighbours(peer)
         return {
             "peer": peer.hexhash,
             "name": peer.display_name,
@@ -9579,6 +9794,32 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(report, head_only)
                 return
+            if path == "/api/channels":
+                channels = self.bridge.channel_list()
+                self._send_json(
+                    {"channels": channels, "count": len(channels)}, head_only
+                )
+                return
+            if path == "/api/channels/messages":
+                channel = query.get("channel", [None])[0]
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "query 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                limit = _int_param(query, "limit", default=20, minimum=1, maximum=50)
+                try:
+                    messages = self.bridge.channel_messages(channel, limit=limit)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(
+                    {"channel": channel, "messages": messages, "count": len(messages)},
+                    head_only,
+                )
+                return
             self._send_json({"error": {"message": "not found"}}, head_only, 404)
             return
 
@@ -10899,6 +11140,91 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "sync": result}, head_only)
                 return
+            if path in ("/api/channels/join", "/api/channels/leave"):
+                channel = body.get("channel")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/channels/join":
+                        result = self.bridge.channel_join(channel)
+                    else:
+                        result = self.bridge.channel_leave(channel)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/channels/send":
+                channel = body.get("channel")
+                text = body.get("text")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    message = self.bridge.channel_send(channel, text)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/sync":
+                channel = body.get("channel")
+                if channel is not None and (
+                    not isinstance(channel, str) or not channel.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'channel' must be a channel name"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                limit = body.get("limit", 20)
+                if (
+                    not isinstance(limit, int)
+                    or isinstance(limit, bool)
+                    or not 1 <= limit <= 50
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'limit' must be 1-50"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.channel_sync(channel, limit=limit)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                self._send_json({"ok": True, "sync": result}, head_only)
+                return
             if path == "/api/tan/rules":
                 try:
                     rules = self.bridge.update_tan_rules(body)
@@ -12096,6 +12422,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             target=pump, name="tau-ws-pump", daemon=True
         )
         try:
+            self.bridge._register_ws_connection(stop)
+            # A shutdown that started between the handshake and this
+            # registration is not in the bridge's snapshot; bail out
+            # instead of serving a connection stop() will never close.
+            if self.bridge.closing:
+                return
             if not send_json(
                 {
                     "type": "snapshot",
@@ -12129,7 +12461,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 # Text frames from the client are a no-op: a future
                 # client message must not mutate node state unasked.
         finally:
+            # Shut the socket down before unregistering: a sender
+            # blocked in a write to a non-reading client must be failed
+            # here, or bridge shutdown can miss it — the handler may
+            # unregister between the bridge's snapshot of live
+            # connections and its shutdown of them. The join below
+            # then returns promptly instead of waiting on the sender.
+            stop()
             stopped.set()
+            self.bridge._unregister_ws_connection(stop)
             try:
                 subscriber.put_nowait(None)
             except queue.Full:

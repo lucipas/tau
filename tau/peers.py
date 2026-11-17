@@ -107,6 +107,15 @@ def safety_number(*public_keys: bytes) -> str:
     return " ".join(groups)
 
 
+def _is_saved_contact(peer: "Peer") -> bool:
+    """True when the owner has verified *peer* or saved it as a contact.
+
+    Such records are kept by age pruning and capacity eviction, so the
+    lookalike warning they anchor does not silently disappear.
+    """
+    return peer.is_verified or bool(peer.alias or peer.note)
+
+
 class PeerError(RuntimeError):
     """Base class for peer lookup problems."""
 
@@ -149,6 +158,13 @@ class Peer:
     # change here means tampering or corruption, never a re-key — the
     # registry keeps the recorded key and the node warns instead.
     key_change_at: Optional[float] = None
+    # Last time a *verified* peer changed its announced name, and the
+    # name it carried before the change.  A verified peer renaming
+    # itself is the one impersonation-adjacent event tau can see
+    # locally, so the rename is recorded and warned about until the
+    # owner re-verifies the peer under its new name.
+    name_change_at: Optional[float] = None
+    previous_name: Optional[str] = None
     # Outbound delivery history: how many messages this node has
     # successfully delivered directly to this peer, and when the last
     # one landed.  A peer with a delivered history is a proven peer —
@@ -210,6 +226,10 @@ class Peer:
             payload["verified_fingerprint"] = self.verified_fingerprint
         if self.key_change_at is not None:
             payload["key_change_at"] = self.key_change_at
+        if self.name_change_at is not None:
+            payload["name_change_at"] = self.name_change_at
+        if self.previous_name is not None:
+            payload["previous_name"] = self.previous_name
         return payload
 
     @staticmethod
@@ -263,6 +283,11 @@ class Peer:
         last_delivered_at = raw.get("last_delivered_at")
         if not isinstance(last_delivered_at, (int, float)):
             last_delivered_at = None
+        previous_name = raw.get("previous_name")
+        if not isinstance(previous_name, str):
+            previous_name = None
+        else:
+            previous_name = sanitize_name(previous_name, fallback="") or None
         return cls(
             destination_hash=destination_bytes,
             name=sanitize_name(raw.get("name"), fallback="unknown"),
@@ -278,6 +303,8 @@ class Peer:
             verified_at=cls._optional_timestamp(raw, "verified_at"),
             verified_fingerprint=verified_fingerprint,
             key_change_at=cls._optional_timestamp(raw, "key_change_at"),
+            name_change_at=cls._optional_timestamp(raw, "name_change_at"),
+            previous_name=previous_name,
             delivered_count=delivered_count,
             last_delivered_at=(
                 float(last_delivered_at)
@@ -322,6 +349,8 @@ class Peer:
         payload["verified"] = self.is_verified
         payload["verified_at"] = self.verified_at
         payload["key_change_at"] = self.key_change_at
+        payload["name_change_at"] = self.name_change_at
+        payload["previous_name"] = self.previous_name
         return payload
 
     def exchange_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
@@ -604,6 +633,48 @@ class PeerRegistry:
                     changed += 1
         return changed
 
+    def lookalike_for(
+        self, peer: Peer, *, include_notes: bool = True
+    ) -> Optional[Peer]:
+        """Return the verified peer or saved contact *peer* may impersonate.
+
+        An unverified peer is a lookalike when its *announced* name
+        matches (case-insensitively) the display name — local alias or
+        announced name — of another peer the owner has verified out of
+        band or saved as a contact (a peer with an alias or a private
+        note).  The candidate's own alias is never compared: it is the
+        owner's label, not something the peer announced.  A bare
+        ``"unknown"`` never collides — it is the fallback for peers
+        that never announced a name.  Returns ``None`` for verified
+        peers and when nothing collides.  The result is local-only: it
+        is never sent to other peers.
+
+        With *include_notes* false, a peer whose only saved-contact
+        context is a private note does not count: callers that show
+        results to a non-loopback console must not reveal which peers
+        carry a note.
+        """
+        if peer.is_verified:
+            return None
+        claimed = peer.name.casefold()
+        if not claimed or claimed == "unknown":
+            return None
+        with self._lock:
+            for other in self._peers.values():
+                if other.destination_hash == peer.destination_hash:
+                    continue
+                contact = other.alias or (include_notes and other.note)
+                if not (other.is_verified or contact):
+                    continue
+                names = {
+                    name.casefold()
+                    for name in (other.name, other.alias)
+                    if name and name.casefold() != "unknown"
+                }
+                if claimed in names:
+                    return other
+        return None
+
     def upsert(
         self,
         destination_hash: bytes,
@@ -627,6 +698,9 @@ class PeerRegistry:
 
         with self._lock:
             existing = self._peers.get(destination_hash)
+            is_new = existing is None
+            name_changed = False
+            first_direct = False
             if existing is None:
                 peer = Peer(
                     destination_hash=destination_hash,
@@ -659,9 +733,41 @@ class PeerRegistry:
                     existing.key_change_at = timestamp
                     return existing
                 if clean_name != "unknown" or existing.name == "unknown":
+                    if (
+                        existing.is_verified
+                        and clean_name != "unknown"
+                        and clean_name != existing.name
+                        and existing.name != "unknown"
+                    ):
+                        if clean_name == existing.previous_name:
+                            # Renamed back to the name it was verified
+                            # under: the rename warning is answered.
+                            existing.name_change_at = None
+                            existing.previous_name = None
+                        else:
+                            log.warning(
+                                "Verified peer %s (%s) changed its "
+                                "announced name from %r to %r; re-verify "
+                                "out of band before trusting the new name",
+                                existing.display_name,
+                                existing.hexhash,
+                                existing.name,
+                                clean_name,
+                            )
+                            # Keep the first post-verification baseline:
+                            # an intermediate name must not replace the
+                            # name the owner verified under.
+                            if existing.previous_name is None:
+                                existing.previous_name = existing.name
+                            existing.name_change_at = timestamp
+                    if clean_name != existing.name:
+                        name_changed = True
                     existing.name = clean_name
                 existing.public_key = public_key
                 # Heard directly (e.g. via announce): this is first-hand now.
+                # A first direct announce of an exchange-learned peer is
+                # logged too, since it is the first chance to warn.
+                first_direct = existing.via_exchange
                 existing.via_exchange = False
                 existing.last_seen = max(existing.last_seen, timestamp)
                 existing.hops = max(0, int(hops))
@@ -670,6 +776,18 @@ class PeerRegistry:
                     existing.caps = caps_tuple
                 peer = existing
             self._enforce_limit()
+            if (is_new or name_changed or first_direct) and not peer.is_verified:
+                collided = self.lookalike_for(peer)
+                if collided is not None:
+                    log.warning(
+                        "Unverified peer %s (%s) announces with the same "
+                        "name as %s (%s) — a possible lookalike; it is "
+                        "not verified, treat it as a stranger",
+                        peer.display_name,
+                        peer.hexhash,
+                        collided.display_name,
+                        collided.hexhash,
+                    )
             return peer
 
     def mark_verified(
@@ -698,6 +816,10 @@ class PeerRegistry:
             # key-change warning about it is answered, not left to warn
             # on every subsequent view.
             peer.key_change_at = None
+            # Same for a rename warning: verifying under the current
+            # name accepts it as the peer's name going forward.
+            peer.name_change_at = None
+            peer.previous_name = None
             return peer
 
     def clear_verifications(self) -> int:
@@ -714,7 +836,14 @@ class PeerRegistry:
                 if peer.is_verified:
                     peer.verified_at = None
                     peer.verified_fingerprint = None
+                    # A rename warning is about a *verified* peer; once the
+                    # verification is gone it must not keep describing one.
+                    peer.name_change_at = None
+                    peer.previous_name = None
                     cleared += 1
+                elif peer.name_change_at is not None:
+                    peer.name_change_at = None
+                    peer.previous_name = None
             return cleared
 
     def forget(self, target: Union[bytes, str]) -> Peer:
@@ -800,7 +929,7 @@ class PeerRegistry:
                 for key, peer in self._peers.items()
                 if timestamp - peer.last_seen > max_age
                 and key not in keep_set
-                and not peer.is_verified
+                and not _is_saved_contact(peer)
             ]
             for key in stale:
                 del self._peers[key]
@@ -822,12 +951,13 @@ class PeerRegistry:
         excess = len(self._peers) - self.max_peers
         # Peers in *keep* (e.g. recipients of queued mail) are never evicted;
         # the registry may briefly exceed the cap rather than lose them.
-        # Verified peers are keepers too, for the same reason as in prune().
+        # Verified peers and saved contacts are keepers too, for the same
+        # reason as in prune().
         candidates = sorted(
             (
                 p
                 for p in self._peers.values()
-                if p.destination_hash not in keep_set and not p.is_verified
+                if p.destination_hash not in keep_set and not _is_saved_contact(p)
             ),
             key=lambda p: p.last_seen,
         )

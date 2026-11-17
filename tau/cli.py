@@ -228,6 +228,15 @@ from .tangents.tan import (
     unsave_post,
     verify_store,
 )
+from .channels import (
+    DEFAULT_CHANNEL_LIMIT,
+    ChannelApp,
+    ChannelError,
+    clean_channel_name,
+    create_message as create_channel_message,
+    init_db as init_channel_db,
+    is_member as is_channel_member,
+)
 
 log = logging.getLogger(__name__)
 
@@ -392,6 +401,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--social",
         action="store_true",
         help="enable the Tan social feed request handlers",
+    )
+    serve.add_argument(
+        "--channels",
+        action="store_true",
+        help="enable the public channels request handlers",
     )
     serve.add_argument(
         "--social-sync-interval",
@@ -2710,6 +2724,104 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_rules.set_defaults(func=cmd_tan_rules)
 
+    channel = subparsers.add_parser(
+        "channel",
+        parents=[common],
+        help="use public channels — open topic rooms anyone can join",
+    )
+    channel_sub = channel.add_subparsers(dest="channel_command", metavar="CHANNEL_COMMAND")
+    channel_sub.required = True
+
+    channel_join = channel_sub.add_parser(
+        "join",
+        parents=[common],
+        help="join a channel by name, then fetch its recent history with `tau channel sync`",
+    )
+    channel_join.add_argument("channel", metavar="NAME", help="channel name to join")
+    channel_join.set_defaults(func=cmd_channel_join)
+
+    channel_leave = channel_sub.add_parser(
+        "leave",
+        parents=[common],
+        help="leave a channel (cached messages are kept)",
+    )
+    channel_leave.add_argument("channel", metavar="NAME", help="channel name to leave")
+    channel_leave.set_defaults(func=cmd_channel_leave)
+
+    channel_list = channel_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list joined channels with cached message counts",
+    )
+    channel_list.set_defaults(func=cmd_channel_list)
+
+    channel_send = channel_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a message to a joined channel",
+    )
+    channel_send.add_argument("channel", metavar="NAME", help="channel to send to")
+    channel_send.add_argument(
+        "text", nargs="?", help="message text (reads stdin when omitted)"
+    )
+    channel_send.add_argument("--file", type=Path, help="read the message text from a file")
+    channel_send.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_send.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_send.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_send.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_send.set_defaults(func=cmd_channel_send)
+
+    channel_read = channel_sub.add_parser(
+        "read",
+        parents=[common],
+        help="show stored messages for a channel, oldest first",
+    )
+    channel_read.add_argument("channel", metavar="NAME", help="channel to read")
+    channel_read.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_CHANNEL_LIMIT,
+        metavar="N",
+        help="show the newest N messages (default 20)",
+    )
+    channel_read.set_defaults(func=cmd_channel_read)
+
+    channel_sync = channel_sub.add_parser(
+        "sync",
+        parents=[common],
+        help="pull missing history for a channel (or every joined channel)",
+    )
+    channel_sync.add_argument(
+        "channel", nargs="?", default=None, metavar="NAME",
+        help="channel to sync (default: every joined channel)",
+    )
+    channel_sync.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="sync only from these peers (repeatable)",
+    )
+    channel_sync.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_CHANNEL_LIMIT,
+        metavar="N",
+        help="messages per page (default 20)",
+    )
+    channel_sync.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_sync.set_defaults(func=cmd_channel_sync)
+
     bundle = subparsers.add_parser(
         "bundle",
         parents=[common],
@@ -2969,7 +3081,15 @@ def _print_peer_table(
     *,
     now: Optional[float] = None,
     safety_numbers: Optional[Dict[str, str]] = None,
+    lookalikes: Optional[Dict[str, Peer]] = None,
 ) -> None:
+    """Print the peers table, flagging possible lookalikes.
+
+    *lookalikes* maps a peer's destination hex hash to the verified
+    peer or saved contact it may be impersonating (see
+    :meth:`PeerRegistry.lookalike_for`); a flagged peer is rendered
+    with the collision in its name cell and a warning below the table.
+    """
     rows = list(peers)
     if not rows:
         print("No peers known. Run `tau discover` or `tau serve` first.")
@@ -2981,6 +3101,9 @@ def _print_peer_table(
         name = peer.display_name
         if peer.alias and peer.alias != peer.name:
             name = f"{peer.alias} ({peer.name})"
+        collided = lookalikes.get(peer.hexhash) if lookalikes else None
+        if collided is not None:
+            name = f"{name} ⚠ lookalike of {collided.display_name}"
         table.append(
             (
                 peer.hexhash,
@@ -3003,6 +3126,33 @@ def _print_peer_table(
             "band before trusting it.",
             file=sys.stderr,
         )
+    if lookalikes:
+        for peer in rows:
+            collided = lookalikes.get(peer.hexhash)
+            if collided is None:
+                continue
+            print(
+                f"WARNING: {peer.display_name} ({short_hash(peer.hexhash)}) "
+                "is unverified and announces with the same name as "
+                f"{collided.display_name} "
+                f"({short_hash(collided.hexhash)}); treat it as a stranger "
+                "until its safety number is compared out of band.",
+                file=sys.stderr,
+            )
+    renamed = [
+        p for p in rows if p.is_verified and p.name_change_at is not None
+    ]
+    for peer in renamed:
+        previous = (
+            f" from {peer.previous_name!r}" if peer.previous_name else ""
+        )
+        print(
+            f"WARNING: verified peer {peer.display_name} "
+            f"({short_hash(peer.hexhash)}) changed its announced name"
+            f"{previous}; re-verify out of band before trusting the "
+            "new name.",
+            file=sys.stderr,
+        )
     if safety_numbers:
         print("\nSafety numbers — compare each with the peer over another "
               "channel; a match confirms the key is theirs:")
@@ -3010,6 +3160,23 @@ def _print_peer_table(
             number = safety_numbers.get(peer.hexhash)
             if number:
                 print(f"  {peer.display_name} ({short_hash(peer.hexhash)}): {number}")
+
+
+def _lookalike_map(
+    registry: PeerRegistry, peers: Iterable[Peer]
+) -> Dict[str, Peer]:
+    """Map destination hex hashes to the peer each lookalike resembles.
+
+    Only peers :meth:`PeerRegistry.lookalike_for` flags appear, so the
+    caller can pass the result straight to :func:`_print_peer_table`
+    or annotate JSON output.
+    """
+    found: Dict[str, Peer] = {}
+    for peer in peers:
+        collided = registry.lookalike_for(peer)
+        if collided is not None:
+            found[peer.hexhash] = collided
+    return found
 
 
 def _make_config(
@@ -3650,6 +3817,39 @@ def _tan_identity(config: TauConfig) -> Any:
     return identity
 
 
+def _publish_local_channel_message(
+    node: TauNode,
+    *,
+    channel: str,
+    text: Optional[str] = None,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    if text is None:
+        raise ChannelError("nothing to publish")
+    name = clean_channel_name(channel)
+    conn = publisher.connect()
+    try:
+        if not is_channel_member(conn, name):
+            raise ChannelError(f"not a member of channel {name!r}; join it first")
+        message = create_channel_message(
+            conn, node.identity, name, text, name=node.name
+        )
+    finally:
+        conn.close()
+    published = publisher.publish(
+        message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
+    return {"message": message, "published": published}
+
+
 def _publish_local_post(
     node: TauNode,
     *,
@@ -3662,7 +3862,19 @@ def _publish_local_post(
     timeout: float = 15.0,
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
+    channel: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if channel is not None:
+        # A channel send rides the same local publish socket as a Tan
+        # post; route it before the Tan-only handling below.
+        return _publish_local_channel_message(
+            node,
+            channel=channel,
+            text=text,
+            to=to,
+            ttl=ttl,
+            timeout=timeout,
+        )
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = TanApp(
         node.config, node.identity, name=node.name, request_timeout=float(timeout)
@@ -6117,6 +6329,240 @@ def cmd_tan_sync(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _print_channel_messages(
+    messages: List[Dict[str, Any]], *, json_output: bool, channel: str
+) -> None:
+    if json_output:
+        _emit({"channel": channel, "messages": messages, "count": len(messages)}, True)
+        return
+    if not messages:
+        print(f"No stored messages in #{channel}.")
+        return
+    for message in messages:
+        name = message.get("name") or "anonymous"
+        author = short_hash(str(message.get("author", "")))
+        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}):")
+        for line in str(message.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+
+
+def cmd_channel_join(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        membership = app.join(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit(membership, True)
+    else:
+        print(f"joined #{membership['channel']}")
+        print(f"  fetch its history with `tau channel sync {membership['channel']}`")
+    return _EXIT_OK
+
+
+def cmd_channel_leave(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        left = app.leave(args.channel)
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit({"channel": name, "left": left}, True)
+    else:
+        if left:
+            print(f"left #{name} (cached messages kept)")
+        else:
+            print(f"not a member of #{name}")
+    return _EXIT_OK
+
+
+def cmd_channel_list(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    memberships = app.memberships()
+    if json_output:
+        _emit({"channels": memberships, "count": len(memberships)}, True)
+        return _EXIT_OK
+    if not memberships:
+        print("No channels joined yet — join one with `tau channel join <name>`.")
+        return _EXIT_OK
+    for membership in memberships:
+        count = membership["messages"]
+        noun = "message" if count == 1 else "messages"
+        print(
+            f"#{membership['channel']} — {count} cached {noun}, "
+            f"joined {_ago(time.time() - membership['joined_at'])} ago"
+        )
+    return _EXIT_OK
+
+
+def cmd_channel_send(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            message = app.send(name, text)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel=name,
+                text=text,
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            message, published = result["message"], result["published"]
+        else:
+            try:
+                app = ChannelApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                app.attach(node)
+                result = _publish_local_channel_message(
+                    node,
+                    channel=name,
+                    text=text,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                message, published = result["message"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"message": message, "published": published}, True)
+    else:
+        print(f"sent to #{name} {short_hash(message['hash'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_read(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    blocked = load_blocked_set(config.blocklist_path)
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    messages = app.history(name, limit=int(getattr(args, "limit", DEFAULT_CHANNEL_LIMIT)))
+    if blocked is None:
+        # The block-list failed closed: hide everything, like the
+        # timeline does, instead of showing messages we cannot vet.
+        messages = []
+    else:
+        messages = [
+            message
+            for message in messages
+            if str(message.get("author", "")) not in blocked
+        ]
+    # History comes newest first; reading is oldest first.
+    messages = list(reversed(messages))
+    _print_channel_messages(messages, json_output=json_output, channel=name)
+    return _EXIT_OK
+
+
+def cmd_channel_sync(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    identity = load_or_create_identity(config.identity_path)
+    node = TauNode(config, name=config.name)
+    node.start(announce=False)
+    try:
+        app = ChannelApp(
+            config,
+            identity,
+            name=config.name,
+            request_timeout=float(getattr(args, "timeout", 15.0)),
+        )
+        # Direct attach, not attach_app: a serving node already
+        # carries Tan through node.app, and channels are a second
+        # application layer on the same destination.
+        app.attach(node)
+        targets = None
+        if getattr(args, "to", None):
+            targets = [node.resolve_peer(target) for target in args.to]
+
+        if getattr(args, "channel", None):
+            try:
+                name = clean_channel_name(args.channel)
+            except ChannelError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            summary = app.sync(
+                node,
+                name,
+                targets=targets,
+                limit=int(getattr(args, "limit", DEFAULT_CHANNEL_LIMIT)),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            summaries = {name: summary}
+        else:
+            result = app.sync_all(
+                node,
+                targets=targets,
+                limit=int(getattr(args, "limit", DEFAULT_CHANNEL_LIMIT)),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            summaries = result["channels"]
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit({"channels": summaries}, True)
+    else:
+        if not summaries:
+            print("No channels joined yet — join one with `tau channel join <name>`.")
+            return _EXIT_OK
+        for name, summary in summaries.items():
+            print(
+                f"#{name}: synced {summary['stored']} new message(s) "
+                f"from {summary['peers']} peer(s); "
+                f"{summary['duplicates']} duplicate(s)"
+            )
+            for error in summary["errors"]:
+                print(f"  {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
 def cmd_tan_export(args: argparse.Namespace) -> int:
     config = _make_config(args)
     conn = init_db(config.social_db_path)
@@ -6657,6 +7103,43 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         node.attach_app(social_app)
 
+    channel_app = None
+    if getattr(args, "channels", False):
+
+        def on_channel_message(record: Dict[str, Any]) -> None:
+            if _json_mode(args):
+                _emit_event(args, "channel-message", message=record)
+            else:
+                name = record.get("name") or "anonymous"
+                author = short_hash(str(record.get("author", "")))
+                print(
+                    f"[#{record.get('channel', '?')}] "
+                    f"[{_stamp(record.get('created_at'))}] {name} ({author}):",
+                    flush=True,
+                )
+                for line in str(record.get("text", "")).splitlines() or [""]:
+                    print(f"  {line}", flush=True)
+            if bridge is not None:
+                try:
+                    bridge.record_channel_message(record)
+                except Exception:  # pragma: no cover - optional web layer
+                    log.debug(
+                        "Could not forward channel message to web console",
+                        exc_info=True,
+                    )
+
+        # Direct attach, not attach_app: the node already carries Tan
+        # through node.app when --social is also given, and channels
+        # are a second application layer on the same destination.
+        channel_app = ChannelApp(
+            config,
+            node.identity,
+            name=node.name,
+            on_message=on_channel_message,
+        )
+        channel_app.attach(node)
+        node.channel_app = channel_app
+
     console_url = None
     if bridge is not None:
         try:
@@ -6690,7 +7173,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         ).start()
 
     publish_server = None
-    if social_app is not None and hasattr(socket, "AF_UNIX"):
+    if (social_app is not None or channel_app is not None) and hasattr(
+        socket, "AF_UNIX"
+    ):
         from .local_publish import PublishServer
 
         try:
@@ -6776,6 +7261,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 db=str(config.social_db_path),
                 feed="/tan/feed",
             )
+        if channel_app is not None:
+            _emit_event(
+                args,
+                "channels",
+                enabled=True,
+                db=str(config.channels_db_path),
+                feed="/tau/channel/feed",
+            )
     else:
         print(f'tau node "{info["name"]}" ready', flush=True)
         print(f"  destination: {info['destination']}")
@@ -6858,10 +7351,17 @@ def cmd_discover(args: argparse.Namespace) -> int:
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
     peers = node.registry.all(max_age=max_age)
+    lookalikes = _lookalike_map(node.registry, peers)
     if _json_mode(args):
+        payload = [peer.to_dict() for peer in peers]
+        for entry in payload:
+            collided = lookalikes.get(entry["destination"])
+            entry["lookalike_of"] = (
+                collided.display_name if collided is not None else None
+            )
         _emit(
             {
-                "peers": [peer.to_dict() for peer in peers],
+                "peers": payload,
                 "count": len(peers),
                 "duration": duration,
             },
@@ -6869,7 +7369,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
         )
     else:
         print()
-        _print_peer_table(peers)
+        _print_peer_table(peers, lookalikes=lookalikes)
         print(f"\n{len(peers)} peer(s) in {duration:.1f}s")
     return _EXIT_OK
 
@@ -6960,12 +7460,22 @@ def cmd_peers(args: argparse.Namespace) -> int:
         }
     if _json_mode(args):
         payload = [peer.to_dict() for peer in peers]
+        lookalikes = _lookalike_map(registry, peers)
+        for entry in payload:
+            collided = lookalikes.get(entry["destination"])
+            entry["lookalike_of"] = (
+                collided.display_name if collided is not None else None
+            )
         if safety_numbers is not None:
             for entry in payload:
                 entry["safety_number"] = safety_numbers[entry["destination"]]
         _emit({"peers": payload, "count": len(peers)}, True)
     else:
-        _print_peer_table(peers, safety_numbers=safety_numbers)
+        _print_peer_table(
+            peers,
+            safety_numbers=safety_numbers,
+            lookalikes=_lookalike_map(registry, peers),
+        )
     return _EXIT_OK
 
 
@@ -8061,6 +8571,9 @@ def _send_via_local_node(
     send_after: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    log.info("starting a local one-shot node (data dir %s)", config.data_dir)
     node = TauNode(config, name=config.name)
     node.start()
     results: List[Dict[str, Any]] = []
@@ -8073,6 +8586,7 @@ def _send_via_local_node(
             # pre-existing id (e.g. one it holds a sealed copy of) is
             # treated as delivered — the link request succeeded.
             queued_before = {entry.id for entry in node.mailbox.outbox_list()}
+            started = time.monotonic()
             try:
                 reply_to = None
                 if getattr(args, "reply_to", None):
@@ -8080,14 +8594,21 @@ def _send_via_local_node(
                         node,
                         target,
                         args.reply_to,
-                        float(getattr(args, "discover_timeout", 10.0)),
+                        discover_timeout,
                     )
                     reply_ids[target] = reply_to["id"]
+                log.debug(
+                    "sending to %s via the local node "
+                    "(timeout %.0fs, discover %.0fs)",
+                    target,
+                    timeout,
+                    discover_timeout,
+                )
                 response = node.send_message(
                     target,
                     text,
-                    timeout=float(getattr(args, "timeout", 20.0)),
-                    discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
                     queue=not getattr(args, "no_queue", False),
                     in_reply_to=reply_to,
                     expires_at=expires_at,
@@ -8095,6 +8616,12 @@ def _send_via_local_node(
                     send_after=send_after,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
+                log.debug(
+                    "send to %s failed after %.2fs: %s",
+                    target,
+                    time.monotonic() - started,
+                    exc,
+                )
                 if len(targets) == 1:
                     # Single recipient keeps the historical behaviour:
                     # the error reaches main() and exits non-zero.
@@ -8106,15 +8633,28 @@ def _send_via_local_node(
                 # remaining recipients.
                 results.append({"target": target, "ok": False, "error": str(exc)})
                 continue
-            results.append(
-                _finalize_send_result(
-                    response,
-                    target=target,
-                    expires_at=expires_at,
-                    queued_before=queued_before,
-                )
+            result = _finalize_send_result(
+                response,
+                target=target,
+                expires_at=expires_at,
+                queued_before=queued_before,
             )
+            if result.get("queued"):
+                outcome = f"queued (id {short_hash(str(result.get('id', '')))})"
+            else:
+                outcome = "delivered"
+            log.debug(
+                "send to %s finished in %.2fs: %s",
+                target,
+                time.monotonic() - started,
+                outcome,
+            )
+            results.append(result)
         if wait > 0:
+            queued = sum(1 for result in results if result.get("queued"))
+            log.debug(
+                "waiting up to %.1fs for %d queued send(s)", wait, queued
+            )
             _wait_for_queued_sends(node, results, wait)
         else:
             _reconcile_queued_sends(node, results, expires_at)
@@ -8138,15 +8678,25 @@ def _send_via_running_node(
     from .local_ipc import LocalIPCUnavailable
     from .local_send import send_running
 
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
     results: List[Dict[str, Any]] = []
     for target in targets:
+        started = time.monotonic()
         try:
+            log.debug(
+                "sending to %s via the running node's send socket "
+                "(timeout %.0fs, discover %.0fs)",
+                target,
+                timeout,
+                discover_timeout,
+            )
             result = send_running(
                 config.data_dir,
                 target=target,
                 text=text,
-                timeout=float(getattr(args, "timeout", 20.0)),
-                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
                 queue=not getattr(args, "no_queue", False),
                 expires_at=expires_at,
                 reply_to=getattr(args, "reply_to", None),
@@ -8159,6 +8709,12 @@ def _send_via_running_node(
                 "the running node stopped answering mid-send; retry the send"
             ) from exc
         except (NodeError, PeerError, MailboxError) as exc:
+            log.debug(
+                "send to %s failed after %.2fs: %s",
+                target,
+                time.monotonic() - started,
+                exc,
+            )
             if len(targets) == 1:
                 raise
             results.append({"target": target, "ok": False, "error": str(exc)})
@@ -8166,6 +8722,18 @@ def _send_via_running_node(
         reply_id = result.pop("_reply_id", None)
         if reply_id is not None:
             reply_ids[target] = reply_id
+        if result.get("queued"):
+            outcome = f"queued (id {short_hash(str(result.get('id', '')))})"
+        elif result.get("delivered") is False:
+            outcome = "sent (no delivery confirmation)"
+        else:
+            outcome = "delivered"
+        log.debug(
+            "send to %s finished in %.2fs: %s",
+            target,
+            time.monotonic() - started,
+            outcome,
+        )
         results.append(result)
     return results
 
@@ -8441,15 +9009,28 @@ def _send_routes_via_running_node(config: TauConfig) -> bool:
 
     has_socket = hasattr(socket, "AF_UNIX")
     if has_socket and send_server_available(config.data_dir):
+        log.debug("send socket answers; routing via the running node")
         return True
     config.prepare()
     if _instance_lock_free(config):
+        log.debug(
+            "no serving node holds the data directory; "
+            "starting a local one-shot node"
+        )
         return False
+    log.debug(
+        "data directory is locked; waiting for the serving node's send socket"
+    )
     deadline = time.monotonic() + _SEND_ROUTE_WAIT_SECONDS
     while True:
         if has_socket and send_server_available(config.data_dir):
+            log.debug("send socket answered while waiting; routing via the running node")
             return True
         if _instance_lock_free(config):
+            log.debug(
+                "data-directory lock freed while waiting; "
+                "starting a local one-shot node"
+            )
             return False
         if time.monotonic() >= deadline:
             break
@@ -8601,14 +9182,24 @@ def cmd_send(args: argparse.Namespace) -> int:
             return 2
     targets = args.to if isinstance(args.to, list) else [args.to]
     reply_ids: Dict[str, str] = {}
+    log.debug(
+        "send: %d target(s), kind=%s, wait=%.1fs, expires_at=%s, send_after=%s",
+        len(targets),
+        kind,
+        wait,
+        expires_at,
+        send_after,
+    )
     # A serving node owns the data directory: send through it instead of
     # starting a second Reticulum instance on the same identity.
     if _send_routes_via_running_node(config):
+        log.info("sending via the running node")
         results = _send_via_running_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after,
         )
     else:
+        log.info("sending via a local one-shot node")
         results = _send_via_local_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after,

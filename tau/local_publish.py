@@ -29,5 +29,5 @@ def publish_running(data_dir: Path, **request: Any) -> Dict[str, Any]:
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "could not publish through the running node; ensure it is running "
-            "with --social (a lost reply may mean the post was published)"
+            "with --social or --channels (a lost reply may mean the post was published)"
         ) from exc
