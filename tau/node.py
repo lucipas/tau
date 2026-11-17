@@ -44,6 +44,7 @@ from .dm_requests import (
 )
 from .disappearing import group_default_for, peer_default_for
 from .groups import GroupStore, pinned_group
+from .group_polls import PostError, clean_poll_options
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -120,6 +121,8 @@ from .protocol import (
     build_mail_store,
     build_media_request,
     build_read_receipt,
+    clean_group_poll_target,
+    clean_group_poll_vote,
     clean_in_reply_to,
     clean_reaction,
     decode,
@@ -2215,6 +2218,12 @@ class TauNode:
             }
             if message.get("in_reply_to") is not None:
                 record["in_reply_to"] = message["in_reply_to"]
+            if message.get("poll_options") is not None:
+                record["poll_options"] = message["poll_options"]
+            if message.get("poll_vote") is not None:
+                record["poll_vote"] = message["poll_vote"]
+            if message.get("poll_close") is not None:
+                record["poll_close"] = message["poll_close"]
             if message.get("edited_at") is not None:
                 # A re-queued edited leg carries the edit's signed send
                 # time: the record starts life with its edit ordering
@@ -4319,6 +4328,9 @@ class TauNode:
                 ),
                 in_reply_to=fresh.in_reply_to,
                 expires_at=fresh.message_expires_at,
+                poll_options=fresh.poll_options,
+                poll_vote=fresh.poll_vote,
+                poll_close=fresh.poll_close,
             )
             # Re-read the topic at retry time, not queue time: a topic
             # set or cleared after queueing travels with the retry, and
@@ -5902,6 +5914,9 @@ class TauNode:
         in_reply_to: Optional[Dict[str, Any]] = None,
         expires_at: Optional[float] = None,
         send_after: Optional[float] = None,
+        poll_options: Optional[List[str]] = None,
+        poll_vote: Optional[Dict[str, Any]] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -5948,6 +5963,15 @@ class TauNode:
         sees a normal group message, and the legs keep the shared
         send time, so reactions and retracts still name the logical
         message.
+
+        ``poll_options`` makes this send a poll: the text is the
+        question and the options ride on every leg (validated with
+        the Tan poll rules — 2-8 distinct, short, normalised
+        choices).  ``poll_vote`` casts a vote for one option of the
+        poll its target names, and ``poll_close`` closes that poll;
+        both ride on every leg the same way, and a queued leg
+        re-sends the same poll payload on retry.  At most one of the
+        three may be set.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -5957,6 +5981,32 @@ class TauNode:
                 "group record has no creator; delete it and re-create it"
             )
         normalized = normalize_message(text)
+        if sum(
+            field is not None
+            for field in (poll_options, poll_vote, poll_close)
+        ) > 1:
+            raise NodeError(
+                "a group message can carry only one of poll_options, "
+                "poll_vote, poll_close"
+            )
+        cleaned_options: Optional[List[str]] = None
+        if poll_options is not None:
+            try:
+                cleaned_options = clean_poll_options(poll_options)
+            except PostError as exc:
+                raise NodeError(str(exc)) from exc
+        cleaned_vote: Optional[Dict[str, Any]] = None
+        if poll_vote is not None:
+            try:
+                cleaned_vote = clean_group_poll_vote(poll_vote)
+            except ProtocolError as exc:
+                raise NodeError(f"invalid poll vote: {exc}") from exc
+        cleaned_close: Optional[Dict[str, Any]] = None
+        if poll_close is not None:
+            try:
+                cleaned_close = clean_group_poll_target(poll_close)
+            except ProtocolError as exc:
+                raise NodeError(f"invalid poll close: {exc}") from exc
         if send_after is not None:
             if isinstance(send_after, bool) or not isinstance(
                 send_after, (int, float)
@@ -6029,6 +6079,9 @@ class TauNode:
                 renamed_from=group.get("renamed_from") or None,
                 in_reply_to=reply_to,
                 expires_at=expires_at,
+                poll_options=cleaned_options,
+                poll_vote=cleaned_vote,
+                poll_close=cleaned_close,
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -6089,6 +6142,9 @@ class TauNode:
                         sent_at=sent_at,
                         send_after=send_after,
                         in_reply_to=reply_to,
+                        poll_options=cleaned_options,
+                        poll_vote=cleaned_vote,
+                        poll_close=cleaned_close,
                     )
                 except MailboxError as queue_exc:
                     # A schedule past the message's own expiry is
@@ -6137,6 +6193,9 @@ class TauNode:
                 renamed_from=group.get("renamed_from") or None,
                 in_reply_to=reply_to,
                 expires_at=expires_at,
+                poll_options=cleaned_options,
+                poll_vote=cleaned_vote,
+                poll_close=cleaned_close,
             )
             peer: Optional[Peer] = None
             if budget <= 0.0:
@@ -6183,6 +6242,9 @@ class TauNode:
                         group=context,
                         sent_at=sent_at,
                         in_reply_to=reply_to,
+                        poll_options=cleaned_options,
+                        poll_vote=cleaned_vote,
+                        poll_close=cleaned_close,
                     )
                 except MailboxError as queue_exc:
                     results.append(
@@ -6327,6 +6389,9 @@ class TauNode:
                         group=context,
                         sent_at=sent_at,
                         in_reply_to=reply_to,
+                        poll_options=cleaned_options,
+                        poll_vote=cleaned_vote,
+                        poll_close=cleaned_close,
                     )
                 except MailboxError as queue_exc:
                     # The outbox is full (or the write failed): record the
@@ -6399,6 +6464,21 @@ class TauNode:
                     "leg_sent_at": sent_at,
                     "direction": "out",
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    **(
+                        {"poll_options": cleaned_options}
+                        if cleaned_options is not None
+                        else {}
+                    ),
+                    **(
+                        {"poll_vote": cleaned_vote}
+                        if cleaned_vote is not None
+                        else {}
+                    ),
+                    **(
+                        {"poll_close": cleaned_close}
+                        if cleaned_close is not None
+                        else {}
+                    ),
                 }
             )
         if any_queued:

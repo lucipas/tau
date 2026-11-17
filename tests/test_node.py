@@ -634,6 +634,117 @@ def test_send_group_message_uses_one_send_time_for_all_legs(
     assert len(sent_ats) == 1
 
 
+def test_send_group_poll_carries_options_on_every_leg(tmp_path, monkeypatch):
+    from tau.protocol import parse_group_message
+
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_message(
+        "crew", "which day?", poll_options=["Saturday", "Sunday"]
+    )
+
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert parse_group_message(payload)["poll_options"] == [
+            "Saturday",
+            "Sunday",
+        ]
+    # The sender's own record carries the options and the shared time,
+    # so the tally can resolve the poll it sent.
+    stored = node.inbox.list_messages(
+        limit=None, group=group["id"], direction=None
+    )
+    assert len(stored) == 1
+    assert stored[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert stored[0]["leg_sent_at"] == response["sent_at"]
+
+
+def test_send_group_poll_rejects_bad_options(tmp_path):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_group_message("crew", "which day?", poll_options=["only one"])
+    with pytest.raises(NodeError):
+        node.send_group_message(
+            "crew", "which day?", poll_options=["Saturday", "saturday"]
+        )
+    with pytest.raises(NodeError):
+        node.send_group_message(
+            "crew",
+            "which day?",
+            poll_options=["Saturday", "Sunday"],
+            poll_vote={
+                "target": {"author": "ab" * 16, "sent_at": 1.0},
+                "option": 0,
+            },
+        )
+
+
+def test_send_group_vote_carries_target_and_option(tmp_path, monkeypatch):
+    from tau.protocol import parse_group_message
+
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    first = node.send_group_message(
+        "crew", "which day?", poll_options=["Saturday", "Sunday"]
+    )
+    assert first["ok"] is True
+    payloads.clear()
+    target = {"author": node.destination.hexhash, "sent_at": first["sent_at"]}
+    response = node.send_group_message(
+        "crew",
+        "voted: Sunday",
+        poll_vote={"target": target, "option": 1},
+    )
+
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert parse_group_message(payload)["poll_vote"] == {
+            "target": target,
+            "option": 1,
+        }
+    stored = node.inbox.list_messages(
+        limit=None, group=group["id"], direction=None
+    )
+    assert stored[0]["poll_vote"] == {"target": target, "option": 1}
+
+
+def test_send_group_poll_scheduled_queues_poll_payload(tmp_path):
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message(
+        "crew",
+        "which day?",
+        poll_options=["Saturday", "Sunday"],
+        send_after=send_after,
+    )
+
+    assert response["ok"] is True
+    assert all(result.get("queued") for result in response["results"])
+    for result in response["results"]:
+        entry = node.mailbox.get_outbox(result["id"])
+        assert entry is not None
+        # A queued leg re-sends the poll payload on retry, not plain chat.
+        assert entry.poll_options == ["Saturday", "Sunday"]
+        assert entry.poll_vote is None
+        assert entry.poll_close is None
+
+
 def test_send_group_message_reply_attaches_logical_reference(
     tmp_path, monkeypatch
 ):

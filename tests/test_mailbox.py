@@ -1938,3 +1938,72 @@ def test_seal_rejects_invalid_expiry():
             sent_at=4242.0,
             expires_at="soon",
         )
+
+
+def test_enqueue_group_poll_fields_survive_reload(tmp_path):
+    # A queued poll leg re-sends the poll payload on retry, so the
+    # poll fields must survive the on-disk round trip like sent_at.
+    from tau.mailbox import OutboxEntry
+
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(
+        to=BOB,
+        text="which day?",
+        now=2000.0,
+        sent_at=100.0,
+        group={
+            "id": "cd" * 16,
+            "name": "crew",
+            "creator": "aa" * 16,
+            "members": ["aa" * 16, "bb" * 16],
+        },
+        poll_options=["Saturday", "Sunday"],
+    )
+    assert entry.poll_options == ["Saturday", "Sunday"]
+    assert entry.poll_vote is None
+    assert entry.poll_close is None
+    assert entry.to_dict()["poll_options"] == ["Saturday", "Sunday"]
+
+    reloaded = Mailbox(path)
+    stored = reloaded.outbox_list()[0]
+    assert stored.poll_options == ["Saturday", "Sunday"]
+    assert OutboxEntry.from_dict(stored.to_dict()).poll_options == [
+        "Saturday",
+        "Sunday",
+    ]
+
+    vote = box.enqueue(
+        to=BOB,
+        text="voted: Sunday",
+        now=2001.0,
+        group={
+            "id": "cd" * 16,
+            "name": "crew",
+            "creator": "aa" * 16,
+            "members": ["aa" * 16, "bb" * 16],
+        },
+        poll_vote={"target": {"author": "aa" * 16, "sent_at": 100.0}, "option": 1},
+    )
+    assert vote.poll_vote == {
+        "target": {"author": "aa" * 16, "sent_at": 100.0},
+        "option": 1,
+    }
+    assert Mailbox(path).outbox_list()[1].poll_vote == vote.poll_vote
+
+
+def test_enqueue_rejects_two_poll_fields(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="which day?",
+            poll_options=["Saturday", "Sunday"],
+            poll_vote={
+                "target": {"author": "aa" * 16, "sent_at": 100.0},
+                "option": 0,
+            },
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(to=BOB, text="which day?", poll_options=["only one"])
