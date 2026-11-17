@@ -133,6 +133,14 @@ from .node import (
     instance_lock_holder,
 )
 from .peers import Peer, PeerError, PeerRegistry, safety_number
+from .follows import (
+    FollowListError,
+    FollowListStore,
+    build_follow_list,
+    load_local_follow_list,
+    public_follow_list,
+    save_local_follow_list,
+)
 from .pages import (
     PageError,
     PageStore,
@@ -2826,6 +2834,38 @@ def build_parser() -> argparse.ArgumentParser:
         "following", parents=[common], help="list followed authors"
     )
     tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_publish_follows = tan_sub.add_parser(
+        "publish-follows",
+        parents=[common],
+        help="publish your follow list as a signed document peers can fetch",
+    )
+    tan_publish_follows.set_defaults(func=cmd_tan_publish_follows)
+
+    tan_follows_of = tan_sub.add_parser(
+        "follows-of",
+        parents=[common],
+        help="show who a peer follows, fetching their signed follow list "
+        "when this node does not hold a copy",
+    )
+    tan_follows_of.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer name, destination hash or hash prefix",
+    )
+    tan_follows_of.add_argument(
+        "--cached",
+        action="store_true",
+        help="show the stored copy without fetching from the peer",
+    )
+    tan_follows_of.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="how long to wait for the peer to answer (default: %(default)s)",
+    )
+    tan_follows_of.set_defaults(func=cmd_tan_follows_of)
 
     tan_authors = tan_sub.add_parser(
         "authors", parents=[common], help="list every author in the local Tan store"
@@ -6146,6 +6186,148 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s)"
             )
+    return _EXIT_OK
+
+
+def _print_follow_list(
+    doc: Dict[str, Any],
+    registry: Optional[PeerRegistry] = None,
+    *,
+    indent: str = "",
+) -> None:
+    """Print one follow-list document in text form.
+
+    Names come from the peer registry when it knows the author;
+    otherwise the destination hash speaks for itself.
+    """
+    print(
+        f"{indent}version: {doc['version']} "
+        f"({_format_message_time(doc['updated_at'])})"
+    )
+    if not doc["authors"]:
+        print(f"{indent}follows: —")
+        return
+    print(f"{indent}follows ({len(doc['authors'])}):")
+    for author in doc["authors"]:
+        name = None
+        if registry is not None:
+            peer = registry.get(author)
+            if peer is not None:
+                name = peer.display_name
+        if name:
+            print(f"{indent}  {name:<20} {short_hash(author)}")
+        else:
+            print(f"{indent}  {author}")
+
+
+def cmd_tan_publish_follows(args: argparse.Namespace) -> int:
+    """Publish this node's follow list as a signed document.
+
+    The list is built from the local Tan follows and signed with the
+    node identity, so peers can fetch and verify it over ``/tau/follows``
+    — the piece the sync-depth setting needs to expand a sync to the
+    authors your follows follow.  The version bumps on every publish;
+    publishing after unfollowing everyone writes an empty list, which
+    is a real statement, not an error.
+    """
+    config = _make_config(args)
+    config.prepare()
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    conn = init_db(config.social_db_path)
+    try:
+        authors = [record["author"] for record in following(conn)]
+    finally:
+        conn.close()
+    existing = load_local_follow_list(config.follow_list_path)
+    version = existing["version"] + 1 if existing is not None else 1
+    try:
+        doc = build_follow_list(identity, authors=authors, version=version)
+    except FollowListError as exc:
+        raise NodeError(str(exc)) from exc
+    save_local_follow_list(config.follow_list_path, doc)
+    if _json_mode(args):
+        _emit(public_follow_list(doc), True)
+    else:
+        print(
+            f"Published follow list version {version} "
+            f"({len(doc['authors'])} author(s))."
+        )
+        print("  Peers can fetch it with `tau tan follows-of <your name>`.")
+    return _EXIT_OK
+
+
+def cmd_tan_follows_of(args: argparse.Namespace) -> int:
+    """Show who a peer follows, fetching their signed follow list.
+
+    A live fetch is attempted first (unless ``--cached``): the peer
+    answers with its follow list only when it holds a newer version
+    than this node.  When the fetch fails, the stored copy is shown
+    instead and the failure is named; when nothing is stored at all,
+    the fetch failure is the error.
+    """
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    store = FollowListStore(config.follow_lists_path)
+    fetch_error: Optional[str] = None
+    fetched = False
+    if not getattr(args, "cached", False):
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            node.request_follows(peer, timeout=args.timeout)
+            fetched = True
+        except NodeError as exc:
+            fetch_error = str(exc)
+        finally:
+            node.stop()
+        # The node saved any newer list it fetched; re-read the
+        # store rather than trusting the in-memory copy above.
+        store = FollowListStore(config.follow_lists_path)
+    follow_list = store.get(peer.hexhash)
+    if follow_list is None:
+        if fetch_error is not None:
+            raise NodeError(
+                f"could not fetch a follow list from {peer.display_name}: "
+                f"{fetch_error}"
+            )
+        if _json_mode(args):
+            _emit(
+                {
+                    "peer": peer.hexhash,
+                    "name": peer.display_name,
+                    "follow_list": None,
+                },
+                True,
+            )
+        else:
+            print(f"{peer.display_name} has not published a follow list yet.")
+        return _EXIT_OK
+    if _json_mode(args):
+        _emit(
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "follow_list": public_follow_list(follow_list),
+                "fetched": fetched,
+                "fetch_error": fetch_error,
+            },
+            True,
+        )
+    else:
+        print(f"{peer.display_name} follows:")
+        _print_follow_list(follow_list, registry, indent="  ")
+        if fetch_error is not None:
+            print(f"  (showing the stored copy — fetch failed: {fetch_error})")
     return _EXIT_OK
 
 

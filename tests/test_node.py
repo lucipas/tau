@@ -2304,6 +2304,182 @@ def test_request_profile_rejects_bad_response(tmp_path):
         node.request_profile(peer)
 
 
+def _follow_list_peer():
+    """A peer identity plus its signed follow-list document."""
+    from tau.follows import build_follow_list
+
+    identity = RNS.Identity()
+    destination = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    peer = Peer(
+        destination_hash=destination,
+        name="alice",
+        public_key=identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    followed = [
+        RNS.Destination.hash(RNS.Identity(), APP_NAME, ASPECT).hex()
+        for _ in range(2)
+    ]
+    doc = build_follow_list(
+        identity, authors=followed, version=2, updated_at=1000.0
+    )
+    return peer, doc
+
+
+def test_handle_follows_serves_local_follow_list_when_newer(tmp_path):
+    from tau.follows import save_local_follow_list
+    from tau.protocol import encode_follows_request
+
+    node = make_node(tmp_path)
+    _, doc = _follow_list_peer()
+    save_local_follow_list(node.config.follow_list_path, doc)
+    raw = node._handle_follows(
+        "/tau/follows",
+        encode_follows_request(1),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is True
+    assert response["follow_list"]["version"] == 2
+    assert response["follow_list"]["authors"] == doc["authors"]
+
+
+def test_handle_follows_withholds_follow_list_when_not_newer(tmp_path):
+    from tau.follows import save_local_follow_list
+    from tau.protocol import encode_follows_request
+
+    node = make_node(tmp_path)
+    _, doc = _follow_list_peer()
+    save_local_follow_list(node.config.follow_list_path, doc)
+    raw = node._handle_follows(
+        "/tau/follows",
+        encode_follows_request(2),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    assert decode(raw)["follow_list"] is None
+
+
+def test_handle_follows_without_local_list_answers_none(tmp_path):
+    from tau.protocol import encode_follows_request
+
+    node = make_node(tmp_path)
+    assert node.local_follow_list is None
+    raw = node._handle_follows(
+        "/tau/follows",
+        encode_follows_request(0),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    assert decode(raw)["follow_list"] is None
+
+
+def test_handle_follows_rejects_bad_request(tmp_path):
+    node = make_node(tmp_path)
+    raw = node._handle_follows(
+        "/tau/follows", b'{"type": "ping"}', b"request-id", None, time.time()
+    )
+    response = decode(raw)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "bad_request"
+
+
+def test_request_follows_stores_verified_list(tmp_path):
+    from tau.protocol import REQUEST_FOLLOWS, encode_follows_request
+
+    node = make_node(tmp_path)
+    peer, doc = _follow_list_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    seen = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        seen["path"] = path
+        seen["payload"] = payload
+        return {"ok": True, "v": 1, "follow_list": doc}
+
+    node._request = fake_request
+    result = node.request_follows(peer)
+    assert seen["path"] == REQUEST_FOLLOWS
+    assert result is not None and result["version"] == 2
+    stored = node.follow_list_store.get(peer.hexhash)
+    assert stored is not None and stored["authors"] == doc["authors"]
+    # The request names the version already held (0 here), so a peer
+    # with nothing newer can answer with nothing.
+    assert decode(seen["payload"])["known_version"] == 0
+
+
+def test_request_follows_returns_none_when_peer_has_nothing_new(tmp_path):
+    node = make_node(tmp_path)
+    peer, doc = _follow_list_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node.follow_list_store.store(doc)
+    seen = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        seen["payload"] = payload
+        return {"ok": True, "v": 1, "follow_list": None}
+
+    node._request = fake_request
+    assert node.request_follows(peer) is None
+    # The request named the stored version, so the peer knew not to send.
+    assert decode(seen["payload"])["known_version"] == 2
+
+
+def test_request_follows_rejects_list_for_another_peer(tmp_path):
+    node = make_node(tmp_path)
+    peer, _doc = _follow_list_peer()
+    other_peer, other_doc = _follow_list_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "v": 1,
+        "follow_list": other_doc,
+    }
+    with pytest.raises(NodeError, match="does not match the peer"):
+        node.request_follows(peer)
+    assert node.follow_list_store.get(peer.hexhash) is None
+
+
+def test_request_follows_rejects_tampered_list(tmp_path):
+    node = make_node(tmp_path)
+    peer, doc = _follow_list_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    tampered = dict(doc)
+    tampered["authors"] = []
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "v": 1,
+        "follow_list": tampered,
+    }
+    with pytest.raises(NodeError, match="invalid follow list"):
+        node.request_follows(peer)
+    assert node.follow_list_store.get(peer.hexhash) is None
+
+
+def test_request_follows_rejects_bad_response(tmp_path):
+    node = make_node(tmp_path)
+    peer, _doc = _follow_list_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node._request = lambda p, path, payload, timeout: {"ok": False}
+    with pytest.raises(NodeError, match="invalid follow list response"):
+        node.request_follows(peer)
+
+
 def _page_peer():
     """A peer identity plus its signed personal page document."""
     from tau.pages import build_page

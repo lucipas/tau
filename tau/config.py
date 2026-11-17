@@ -44,6 +44,8 @@ JOIN_REQUESTS_FILE_NAME = "join-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
 PROFILE_FILE_NAME = "profile.json"
 PROFILES_FILE_NAME = "profiles.json"
+FOLLOW_LIST_FILE_NAME = "follow-list.json"
+FOLLOW_LISTS_FILE_NAME = "follow-lists.json"
 PAGE_FILE_NAME = "page.json"
 PAGES_FILE_NAME = "pages.json"
 PAGE_ALLOWLIST_FILE_NAME = "page-allowed.json"
@@ -89,6 +91,8 @@ class TauConfig:
     scheduled_posts_path: Path
     profile_path: Path
     profiles_path: Path
+    follow_list_path: Path
+    follow_lists_path: Path
     page_path: Path
     pages_path: Path
     page_allowlist_path: Path
@@ -140,6 +144,8 @@ class TauConfig:
             scheduled_posts_path=base / SCHEDULED_POSTS_FILE_NAME,
             profile_path=base / PROFILE_FILE_NAME,
             profiles_path=base / PROFILES_FILE_NAME,
+            follow_list_path=base / FOLLOW_LIST_FILE_NAME,
+            follow_lists_path=base / FOLLOW_LISTS_FILE_NAME,
             page_path=base / PAGE_FILE_NAME,
             pages_path=base / PAGES_FILE_NAME,
             page_allowlist_path=base / PAGE_ALLOWLIST_FILE_NAME,

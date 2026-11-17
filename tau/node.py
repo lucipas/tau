@@ -61,6 +61,12 @@ from .identity import (
     load_or_create_identity,
     load_public_key,
 )
+from .follows import (
+    FollowListError,
+    FollowListStore,
+    load_local_follow_list,
+    verify_follow_list,
+)
 from .inbox import Inbox, InboxError
 from .instance_lock import (
     InstanceAlreadyRunning,
@@ -127,6 +133,7 @@ from .protocol import (
     REQUEST_PEERS,
     REQUEST_PING,
     REQUEST_PROFILE,
+    REQUEST_FOLLOWS,
     REQUEST_PAGE,
     REQUEST_READ,
     REQUEST_REACT,
@@ -153,6 +160,7 @@ from .protocol import (
     encode_group_message,
     encode,
     encode_message,
+    encode_follows_request,
     encode_page_request,
     encode_profile_request,
     encode_typing,
@@ -167,6 +175,7 @@ from .protocol import (
     parse_mail_store,
     parse_media_request,
     parse_message,
+    parse_follows_request,
     parse_page_request,
     parse_profile_request,
     parse_read_receipt,
@@ -593,6 +602,17 @@ class TauNode:
         self.local_profile = load_local_profile(
             getattr(config, "profile_path", None)
         )
+        # Signed follow lists: the local one this node publishes
+        # (reloaded from disk on every fetch, so a one-shot
+        # `tau tan publish-follows` reaches peers without a restart)
+        # and the received ones, keyed by author, newest signed
+        # version only.
+        self.follow_list_store = FollowListStore(
+            getattr(config, "follow_lists_path", None)
+        )
+        self.local_follow_list = load_local_follow_list(
+            getattr(config, "follow_list_path", None)
+        )
         # Personal mesh pages: the local one this node serves (reloaded
         # from disk on every fetch, so a one-shot `tau page publish`
         # reaches peers without a restart) and the received ones, keyed
@@ -817,6 +837,28 @@ class TauNode:
         return True
 
     @property
+    def local_follow_list_version(self) -> Optional[int]:
+        """The local follow list's version, or None when none is published."""
+        if self.local_follow_list is None:
+            return None
+        return self.local_follow_list["version"]
+
+    def refresh_local_follow_list(self) -> bool:
+        """Reload the local follow list from disk; True when it changed.
+
+        A one-shot ``tau tan publish-follows`` writes the file while
+        this node serves; the fetch handler calls this first, so the
+        new version is served without a restart.
+        """
+        fresh = load_local_follow_list(
+            getattr(self.config, "follow_list_path", None)
+        )
+        if fresh == self.local_follow_list:
+            return False
+        self.local_follow_list = fresh
+        return True
+
+    @property
     def local_page_version(self) -> Optional[int]:
         """The local page's version, or None when none is published."""
         if self.local_page is None:
@@ -983,6 +1025,7 @@ class TauNode:
             REQUEST_TYPING: self._handle_typing,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_PROFILE: self._handle_profile,
+            REQUEST_FOLLOWS: self._handle_follows,
             REQUEST_PAGE: self._handle_page,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -1767,6 +1810,36 @@ class TauNode:
         if profile is not None and profile["version"] <= request["known_version"]:
             profile = None
         return response_ok(profile=profile)
+
+    def _handle_follows(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Answer a ``/tau/follows`` request with the local follow list.
+
+        The follow list is public by design, like the profile, so any
+        peer may ask — but only a version newer than the one the
+        requester already holds is sent, so asking again about an
+        unchanged list costs one small round trip instead of the whole
+        document.
+        """
+        try:
+            request = parse_follows_request(data)
+        except ProtocolError as exc:
+            return response_error("bad_request", str(exc))
+        # Pick up a follow list published since this node started.
+        self.refresh_local_follow_list()
+        follow_list = self.local_follow_list
+        if (
+            follow_list is not None
+            and follow_list["version"] <= request["known_version"]
+        ):
+            follow_list = None
+        return response_ok(follow_list=follow_list)
 
     def _handle_page(
         self,
@@ -8726,6 +8799,58 @@ class TauNode:
             raise NodeError("profile key does not match the peer")
         if self.profile_store.store(verified):
             self.profile_store.save()
+        return verified
+
+    def request_follows(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = 15.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a peer's signed follow list over a link.
+
+        The request names the newest version already held, so the peer
+        answers with its follow list only when it has a newer one.  A
+        returned list is verified before it is trusted: the signature
+        must cover the document, the key must derive the author's
+        destination hash, and that key must be the one the registry
+        holds for this peer — a list for anyone else is refused.  A
+        newer verified list is stored (and the store saved); anything
+        else returns the stored copy's fate — ``None`` when the peer
+        has nothing newer for us.  Raises :class:`NodeError` when the
+        peer cannot be reached or answers with a malformed or forged
+        follow list.
+        """
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        stored = self.follow_list_store.get(peer.hexhash)
+        known_version = stored["version"] if stored is not None else 0
+        response = self._request(
+            peer,
+            REQUEST_FOLLOWS,
+            encode_follows_request(known_version),
+            timeout,
+        )
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise NodeError("peer gave an invalid follow list response")
+        follow_list = response.get("follow_list")
+        if follow_list is None:
+            return None
+        try:
+            verified = verify_follow_list(follow_list)
+        except FollowListError as exc:
+            raise NodeError(f"peer gave an invalid follow list: {exc}") from exc
+        if verified["author"] != peer.hexhash:
+            raise NodeError("follow list author does not match the peer")
+        if verified["key"] != peer.public_key.hex():
+            raise NodeError("follow list key does not match the peer")
+        if self.follow_list_store.store(verified):
+            self.follow_list_store.save()
         return verified
 
     def request_page(

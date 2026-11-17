@@ -2235,6 +2235,164 @@ def test_peers_profile_unknown_peer(tmp_path, capsys):
     assert "no peer matches" in capsys.readouterr().err
 
 
+def _seed_peer_follow_list(tmp_path):
+    """One peer in the registry with a signed follow list in the store."""
+    from tau.follows import FollowListStore, build_follow_list
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    followed = [
+        destination_hash(RNS.Identity()).hex(),
+        destination_hash(RNS.Identity()).hex(),
+    ]
+    doc = build_follow_list(
+        peer_identity, authors=followed, version=2, updated_at=1000.0
+    )
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+    return data_dir, peer_identity, doc
+
+
+def test_parser_tan_follow_list_arguments():
+    parser = cli.build_parser()
+    publish = parser.parse_args(["tan", "publish-follows"])
+    assert publish.tan_command == "publish-follows"
+    assert publish.func is cli.cmd_tan_publish_follows
+
+    follows_of = parser.parse_args(["tan", "follows-of", "alice"])
+    assert follows_of.tan_command == "follows-of"
+    assert follows_of.target == "alice"
+    assert follows_of.cached is False
+    assert follows_of.func is cli.cmd_tan_follows_of
+
+    cached = parser.parse_args(["tan", "follows-of", "alice", "--cached"])
+    assert cached.cached is True
+
+
+def test_tan_publish_follows_end_to_end(tmp_path, capsys):
+    from tau.follows import load_local_follow_list
+    from tau.tangents.tan import follow, init_db
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    followed_hashes = [
+        destination_hash(RNS.Identity()).hex(),
+        destination_hash(RNS.Identity()).hex(),
+    ]
+    conn = init_db(config.social_db_path)
+    try:
+        for author in followed_hashes:
+            follow(conn, author, name="peer")
+    finally:
+        conn.close()
+
+    code = cli.main(["tan", "publish-follows", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Published follow list version 1 (2 author(s))." in out
+
+    stored = load_local_follow_list(data_dir / "follow-list.json")
+    assert stored is not None
+    assert stored["version"] == 1
+    assert stored["authors"] == sorted(followed_hashes)
+
+    # A second publish bumps the version and keeps the same list.
+    code = cli.main(["tan", "publish-follows", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Published follow list version 2" in capsys.readouterr().out
+    stored = load_local_follow_list(data_dir / "follow-list.json")
+    assert stored["version"] == 2
+    assert stored["authors"] == sorted(followed_hashes)
+
+    code = cli.main(
+        ["tan", "publish-follows", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["version"] == 3
+    assert payload["authors"] == sorted(followed_hashes)
+    assert "key" not in payload and "sig" not in payload
+
+
+def test_tan_publish_follows_empty_list(tmp_path, capsys):
+    from tau.follows import load_local_follow_list
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    code = cli.main(["tan", "publish-follows", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Published follow list version 1 (0 author(s))." in capsys.readouterr().out
+    stored = load_local_follow_list(data_dir / "follow-list.json")
+    assert stored is not None and stored["authors"] == []
+
+
+def test_tan_follows_of_cached(tmp_path, capsys):
+    data_dir, _, doc = _seed_peer_follow_list(tmp_path)
+    code = cli.main(
+        ["tan", "follows-of", "alice", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "alice follows:" in out
+    assert "version: 2" in out
+    for author in doc["authors"]:
+        assert author in out
+
+    code = cli.main(
+        [
+            "tan",
+            "follows-of",
+            "alice",
+            "--cached",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["follow_list"]["authors"] == doc["authors"]
+    assert payload["follow_list"]["version"] == 2
+    assert payload["fetched"] is False
+
+
+def test_tan_follows_of_cached_without_list(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    registry = PeerRegistry(config.peers_path)
+    identity = RNS.Identity()
+    registry.upsert(
+        destination_hash(identity),
+        identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    code = cli.main(
+        ["tan", "follows-of", "alice", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "has not published a follow list yet" in capsys.readouterr().out
+
+
+def test_tan_follows_of_unknown_peer(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_follow_list(tmp_path)
+    code = cli.main(
+        ["tan", "follows-of", "nobody", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
 def test_peers_show_includes_profile(tmp_path, capsys):
     data_dir, _, _ = _seed_peer_profile(tmp_path)
     code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])
