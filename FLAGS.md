@@ -28,6 +28,11 @@ Global options may appear before or after the command:
 | `tau react MESSAGE-ID EMOJI` | React to a received message (one emoji or short token; `--clear` retracts) |
 | `tau typing start\|stop --to PEER` | Send a live typing event to a peer (`--group NAME\|ID` types in a group instead; live-only, never queued) |
 | `tau send-file --to PEER PATH` | Send a small file (at most 10 MiB) over an RNS Resource on a direct link |
+| `tau draft save --to PEER TEXT` | Save an unsent message as a draft for a peer (`--group NAME` drafts for a group instead; one draft per conversation, saving again overwrites; local-only, never sent until `draft send`) |
+| `tau draft list` | List saved message drafts with a text preview |
+| `tau draft show --to PEER` | Print a saved draft's full text (`--group NAME` for a group draft) |
+| `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft) |
+| `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group) |
 | `tau config accept-files on\|off` | Opt in or out of receiving files (off by default) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |

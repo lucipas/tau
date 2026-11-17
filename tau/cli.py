@@ -81,6 +81,7 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .drafts import DraftStore
 from .muted import (
     MutedError,
     expand_muted_groups,
@@ -700,6 +701,118 @@ def build_parser() -> argparse.ArgumentParser:
     )
     note.add_argument("--file", type=Path, help="read the note from a file")
     note.set_defaults(func=cmd_note)
+
+    # A draft is an unsent message parked for one peer or group: saved
+    # locally with `draft save`, sent later with `draft send`.  Like a
+    # Tan draft, it never leaves the machine until it is sent.
+    draft = subparsers.add_parser(
+        "draft",
+        parents=[common],
+        help="save an unsent DM or group message to send later",
+    )
+    draft_sub = draft.add_subparsers(dest="draft_command", metavar="DRAFT_COMMAND")
+
+    draft_save = draft_sub.add_parser(
+        "save",
+        parents=[common],
+        help="save a message as a draft for a peer or a group",
+    )
+    draft_save_target = draft_save.add_mutually_exclusive_group(required=True)
+    draft_save_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_save_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: draft for the group instead of a peer",
+    )
+    draft_save.add_argument(
+        "message", nargs="?", help="draft text (reads stdin when omitted)"
+    )
+    draft_save.set_defaults(func=cmd_draft_save)
+
+    draft_list = draft_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list saved message drafts",
+    )
+    draft_list.set_defaults(func=cmd_draft_list)
+
+    draft_show = draft_sub.add_parser(
+        "show",
+        parents=[common],
+        help="print a saved draft's full text",
+    )
+    draft_show_target = draft_show.add_mutually_exclusive_group(required=True)
+    draft_show_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_show_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id",
+    )
+    draft_show.set_defaults(func=cmd_draft_show)
+
+    draft_delete = draft_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="discard a saved draft",
+    )
+    draft_delete_target = draft_delete.add_mutually_exclusive_group(required=True)
+    draft_delete_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_delete_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id",
+    )
+    draft_delete.set_defaults(func=cmd_draft_delete)
+
+    draft_send = draft_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a saved draft (and delete it once queued)",
+    )
+    draft_send_target = draft_send.add_mutually_exclusive_group(required=True)
+    draft_send_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_send_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: send the draft into the group",
+    )
+    draft_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    draft_send.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    draft_send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    draft_send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    draft_send.set_defaults(func=cmd_draft_send)
 
     react = subparsers.add_parser(
         "react",
@@ -14622,6 +14735,176 @@ def cmd_note(args: argparse.Namespace) -> int:
         print(f"note saved #{_safe_id_prefix(str(entry['id']))} [note]")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+    return _EXIT_OK
+
+
+def _resolve_draft_target(
+    config: TauConfig, args: argparse.Namespace
+) -> Tuple[str, str, str]:
+    """Resolve a draft command's ``--to``/``--group`` to ``(kind, id, name)``.
+
+    Peers resolve through the local registry only — a draft is local
+    state for someone this node already knows, so there is no reason to
+    start a node and discover.  Groups resolve through the group store.
+    """
+    if getattr(args, "group", None):
+        try:
+            group = GroupStore(config.groups_path).find(args.group)
+        except ValueError:
+            raise NodeError(f"unknown group: {args.group!r}") from None
+        return "group", str(group["id"]), str(group["name"])
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = _resolve_sent_peer(registry, args.to)
+    identity = load_identity(config.identity_path)
+    if identity is not None and peer_hash == destination_hash(identity).hex():
+        raise NodeError(
+            "cannot draft a message to yourself — save a note instead"
+        )
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    return "peer", peer_hash, name
+
+
+def _describe_draft(
+    draft: Dict[str, Any], config: TauConfig
+) -> Dict[str, Any]:
+    """A draft plus its conversation's display name, for output."""
+    if draft["kind"] == "group":
+        group = GroupStore(config.groups_path).get(str(draft["target"]))
+        name = str(group["name"]) if group is not None else short_hash(draft["target"])
+    else:
+        peer = PeerRegistry(config.peers_path).get(str(draft["target"]))
+        name = peer.display_name if peer is not None else short_hash(draft["target"])
+    return {
+        "kind": draft["kind"],
+        "target": draft["target"],
+        "target_name": name,
+        "text": draft["text"],
+        "updated_at": draft["updated_at"],
+    }
+
+
+def _draft_preview(text: str) -> str:
+    """First line of a draft, truncated for a list row."""
+    first = text.splitlines()[0] if text.splitlines() else ""
+    return first if len(first) <= 60 else first[:57] + "…"
+
+
+def cmd_draft_save(args: argparse.Namespace) -> int:
+    """Save a message as a draft for a peer or a group.
+
+    Local-only: the text is validated like a send but never queued or
+    transmitted.  Saving again overwrites the conversation's draft.
+    """
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    text = _read_message(args)
+    try:
+        draft = DraftStore(config.drafts_path).save(kind, target, text)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_draft(draft, config)
+    if _json_mode(args):
+        _emit({"draft": described}, True)
+    else:
+        print(f"draft saved for {name}")
+        for line in described["text"].splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_draft_list(args: argparse.Namespace) -> int:
+    """List saved message drafts, oldest first."""
+    config = _make_config(args)
+    drafts = [
+        _describe_draft(draft, config)
+        for draft in DraftStore(config.drafts_path).list_drafts()
+    ]
+    if _json_mode(args):
+        _emit({"drafts": drafts, "count": len(drafts)}, True)
+        return _EXIT_OK
+    if not drafts:
+        print("No drafts yet — save one with `tau draft save --to PEER \"text\"`.")
+        return _EXIT_OK
+    for draft in drafts:
+        where = "group " if draft["kind"] == "group" else ""
+        age = _ago(time.time() - float(draft["updated_at"]))
+        print(
+            f"{where}{draft['target_name']} ({draft['target'][:8]}) — "
+            f"{_draft_preview(str(draft['text']))} [{age} ago]"
+        )
+    return _EXIT_OK
+
+
+def cmd_draft_show(args: argparse.Namespace) -> int:
+    """Print a saved draft's full text."""
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    draft = DraftStore(config.drafts_path).get(kind, target)
+    if draft is None:
+        raise NodeError(f"no draft for {name}")
+    if _json_mode(args):
+        _emit({"draft": _describe_draft(draft, config)}, True)
+    else:
+        print(draft["text"])
+    return _EXIT_OK
+
+
+def cmd_draft_delete(args: argparse.Namespace) -> int:
+    """Discard a saved draft."""
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    if not DraftStore(config.drafts_path).delete(kind, target):
+        raise NodeError(f"no draft for {name}")
+    if _json_mode(args):
+        _emit(
+            {"deleted": {"kind": kind, "target": target, "target_name": name}},
+            True,
+        )
+    else:
+        print(f"deleted draft for {name}")
+    return _EXIT_OK
+
+
+def cmd_draft_send(args: argparse.Namespace) -> int:
+    """Send a saved draft through the normal send path.
+
+    The draft is deleted once the message is queued or delivered — a
+    failed send keeps it, so nothing is lost to a transient failure.
+    Delivery reuses :func:`cmd_send` wholesale for a peer target, or
+    :func:`cmd_group_send` for a group target, exactly like a forward.
+    """
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    store = DraftStore(config.drafts_path)
+    draft = store.get(kind, target)
+    if draft is None:
+        raise NodeError(f"no draft for {name}")
+    # `cmd_send`/`cmd_group_send` read their text from `args.message`;
+    # hand them the draft text and let them own delivery, queueing, and
+    # output.  The remaining flags come from this subcommand's parser.
+    args.message = str(draft["text"])
+    args.file = None
+    args.location = None
+    args.kind = None
+    args.delay = None
+    args.expire = None
+    args.reply_to = None
+    if kind == "group":
+        args.group = target
+        code = cmd_group_send(args)
+    else:
+        args.to = [target]
+        code = cmd_send(args)
+    if code != _EXIT_OK:
+        print(
+            f"draft for {name} kept — the send failed",
+            file=sys.stderr,
+        )
+        return code
+    store.delete(kind, target)
+    if not _json_mode(args):
+        print(f"sent draft to {name}")
     return _EXIT_OK
 
 
