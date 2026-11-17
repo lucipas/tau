@@ -700,7 +700,7 @@ export function PeerSidebar({
   );
 
   return (
-    <aside className="flex flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
+    <aside className="flex w-full min-w-0 flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
       <section className="rounded-2xl border border-line/80 bg-panel/60 p-4 shadow-[0_20px_60px_-40px_rgba(0,0,0,0.9)]">
         <div className="flex items-center justify-between">
           <SectionLabel>this node</SectionLabel>
@@ -920,7 +920,7 @@ export function PeerSidebar({
                         : "border-transparent hover:border-line hover:bg-void/40"
                     }`}
                   >
-                    <div className="flex items-center gap-2.5">
+                    <div className="flex flex-wrap items-center gap-2.5">
                       <button
                         type="button"
                         onClick={() => onSelectPeer(peer.destination)}
@@ -932,7 +932,7 @@ export function PeerSidebar({
                         </span>
                         <span className="min-w-0">
                           <span className="flex items-center gap-1.5">
-                            <span className="block truncate text-xs font-medium text-zinc-200">
+                            <span className="block min-w-0 truncate text-xs font-medium text-zinc-200">
                               {displayName}
                             </span>
                             {peer.alias ? (
@@ -1085,7 +1085,7 @@ export function PeerSidebar({
                           note
                         </button>
                       ) : null}
-                      <div className="flex shrink-0 items-center gap-1">
+                      <div className="flex flex-wrap items-center gap-1">
                         <button
                           type="button"
                           onClick={() => onPing(peer.destination)}
