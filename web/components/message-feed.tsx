@@ -140,7 +140,7 @@ export function MessageFeed({
   }
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col rounded-2xl border border-line/80 bg-panel/40">
+    <section className="flex flex-col rounded-2xl border border-line/80 bg-panel/40 lg:min-h-0 lg:flex-1">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
         <div className="flex items-center gap-3">
           <SectionLabel>
@@ -263,7 +263,7 @@ export function MessageFeed({
         onScroll={onScroll}
         aria-live="polite"
         aria-label="Message traffic"
-        className="thin-scroll min-h-[320px] flex-1 space-y-4 overflow-y-auto px-4 py-5"
+        className="thin-scroll max-h-[62dvh] min-h-[320px] space-y-4 overflow-y-auto px-4 py-5 lg:max-h-none lg:flex-1"
       >
         {messages.length === 0 ? (
           searching ? (
@@ -973,7 +973,7 @@ function MessageBubble({
         ) : null}
 
         <div
-          className={`flex items-center gap-2 px-1 pt-1 font-mono text-[10px] ${
+          className={`flex flex-wrap items-center gap-x-2 gap-y-1 px-1 pt-1 font-mono text-[10px] ${
             outbound ? "text-signal/70" : "text-mist/60"
           }`}
         >

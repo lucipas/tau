@@ -689,6 +689,7 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("sneakernet"))).toBe(false);
     expect(isShown(screen.queryByText("dm allow-list"))).toBe(false);
     expect(isShown(screen.queryByTestId("social-tab-feed"))).toBe(false);
+    expect(isShown(screen.queryByTestId("pages-tab"))).toBe(false);
   });
 
   it("switches to the tools tab on click", () => {
@@ -714,6 +715,16 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("traffic"))).toBe(false);
   });
 
+  it("switches to the pages tab on click", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "pages" }));
+
+    expect(isShown(screen.queryByTestId("pages-tab"))).toBe(true);
+    expect(isShown(screen.queryByText("traffic"))).toBe(false);
+  });
+
   it("switches to the settings tab on click", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
@@ -733,12 +744,15 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("traffic"))).toBe(false);
   });
 
-  it("jumps between tabs with Alt+1 through Alt+5", () => {
+  it("jumps between tabs with Alt+1 through Alt+6", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
 
-    fireEvent.keyDown(document.body, { key: "4", code: "Digit4", altKey: true });
+    fireEvent.keyDown(document.body, { key: "5", code: "Digit5", altKey: true });
     expect(isShown(screen.getByText("sneakernet"))).toBe(true);
+
+    fireEvent.keyDown(document.body, { key: "4", code: "Digit4", altKey: true });
+    expect(isShown(screen.queryByTestId("pages-tab"))).toBe(true);
 
     fireEvent.keyDown(document.body, { key: "3", code: "Digit3", altKey: true });
     expect(isShown(screen.getByTestId("channels-tab-feed"))).toBe(true);
@@ -901,5 +915,29 @@ describe("Console typing indicator", () => {
       expect(screen.getByDisplayValue("crew · 2 members")).toBeTruthy(),
     );
     expect(screen.queryByText(/is typing/)).toBeNull();
+  });
+});
+
+describe("Console chat layout", () => {
+  it("sizes the chat tab to its content on narrow screens and only stretches on lg", () => {
+    render(<Console />);
+    const scroll = screen.getByLabelText("Message traffic");
+    const section = scroll.closest("section");
+    expect(section).not.toBeNull();
+    const tab = section!.parentElement;
+    expect(tab).not.toBeNull();
+    // The tab used to be `flex-1` at every width, which collapsed it to
+    // ~0px tall inside the auto-sized mobile grid row while the feed
+    // content spilled out over the composer.
+    expect(tab!.classList.contains("lg:flex-1")).toBe(true);
+    expect(tab!.classList.contains("flex-1")).toBe(false);
+    // Same for `min-h-0` on the tab and its parent column: at mobile
+    // widths it let both shrink to zero inside the 0px grid row.
+    expect(tab!.classList.contains("lg:min-h-0")).toBe(true);
+    expect(tab!.classList.contains("min-h-0")).toBe(false);
+    const column = tab!.parentElement;
+    expect(column).not.toBeNull();
+    expect(column!.classList.contains("lg:min-h-0")).toBe(true);
+    expect(column!.classList.contains("min-h-0")).toBe(false);
   });
 });
