@@ -1400,3 +1400,51 @@ describe("MessageFeed location", () => {
     expect(screen.queryByText("Open in Maps")).toBeNull();
   });
 });
+
+describe("MessageFeed mobile layout", () => {
+  it("sizes the feed to its content on narrow screens and only stretches on lg", () => {
+    const { container } = render(
+      <MessageFeed messages={[makeMessage()]} node={null} live={true} />,
+    );
+    const section = container.querySelector("section");
+    expect(section).not.toBeNull();
+    // The section used to be `flex-1` at every width, which collapsed it
+    // to ~0px tall inside the auto-sized mobile grid row while its
+    // content spilled out over the composer.
+    expect(section!.classList.contains("lg:flex-1")).toBe(true);
+    expect(section!.classList.contains("flex-1")).toBe(false);
+    // Same for `min-h-0`: at mobile widths it let the section shrink
+    // to its borders inside the 0px grid row.
+    expect(section!.classList.contains("lg:min-h-0")).toBe(true);
+    expect(section!.classList.contains("min-h-0")).toBe(false);
+  });
+
+  it("bounds the message list height on narrow screens instead of flexing to zero", () => {
+    render(
+      <MessageFeed messages={[makeMessage()]} node={null} live={true} />,
+    );
+    const scroll = screen.getByLabelText("Message traffic");
+    expect(scroll.classList.contains("max-h-[62dvh]")).toBe(true);
+    expect(scroll.classList.contains("lg:flex-1")).toBe(true);
+    expect(scroll.classList.contains("flex-1")).toBe(false);
+  });
+
+  it("wraps the per-message action row instead of overflowing the bubble", () => {
+    render(
+      <MessageFeed
+        messages={[makeMessage({ wire_id: "wire-1" })]}
+        node={null}
+        live={true}
+        onReply={vi.fn()}
+        onDelete={async () => {}}
+        onReact={async () => {}}
+        onPin={async () => {}}
+        onForward={async () => {}}
+      />,
+    );
+    const reply = screen.getByTitle("Reply to this message");
+    const row = reply.closest("div");
+    expect(row).not.toBeNull();
+    expect(row!.classList.contains("flex-wrap")).toBe(true);
+  });
+});

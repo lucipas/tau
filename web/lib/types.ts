@@ -1355,3 +1355,32 @@ export interface ChannelSyncResponse {
   ok: boolean;
   sync: ChannelSyncSummary;
 }
+
+// A personal mesh page, as the console renders it: the signed
+// document minus its key and signature (public by design, but the
+// console only needs the page itself).
+export interface MeshPageFile {
+  name: string;
+  sha256: string;
+  size: number;
+}
+
+export interface MeshPage {
+  author: string;
+  title: string;
+  markdown: string;
+  files: MeshPageFile[];
+  version: number;
+  updated_at: number;
+}
+
+export interface PagesResponse {
+  pages: MeshPage[];
+  mine: MeshPage | null;
+  count: number;
+}
+
+export interface PageFetchResponse {
+  ok: boolean;
+  page: MeshPage | null;
+}

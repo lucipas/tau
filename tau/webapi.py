@@ -164,6 +164,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
     POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
+    GET  /api/pages       cached personal mesh pages, plus this node's own
+    POST /api/pages/fetch fetch a peer's page over RNS (``{"peer": "<name or hash>"}``)
+    GET  /api/pages/<author>/files/<sha256> bytes of a stored linked page file
     GET  /api/tan/saved    saved posts, newest save first
     POST /api/tan/save     save a post to read later
     POST /api/tan/unsave   remove a post from the saved list
@@ -3911,6 +3914,105 @@ class WebBridge:
         if channel:
             return app.sync(self.node, channel, limit=limit)
         return app.sync_all(self.node, limit=limit)
+
+    # -- Personal mesh pages -------------------------------------------------
+
+    def page_list(self) -> Dict[str, Any]:
+        """Cached peer pages plus this node's own page, display-ready.
+
+        A node-like without a page store (e.g. in tests) simply has
+        no cached pages, mirroring :meth:`_peer_profile` returning
+        None without a profile store.  Blocked authors never reach
+        this view, the same as channel history.
+        """
+        from .pages import public_page
+
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        pages: List[Dict[str, Any]] = []
+        store = getattr(self.node, "page_store", None)
+        if store is not None and not exclude_all:
+            pages = [
+                public_page(doc)
+                for doc in store.all()
+                if str(doc.get("author", "")) not in blocked
+            ]
+        refresh = getattr(self.node, "refresh_local_page", None)
+        if callable(refresh):
+            refresh()
+        local = getattr(self.node, "local_page", None)
+        mine = public_page(local) if local is not None else None
+        return {"pages": pages, "mine": mine, "count": len(pages)}
+
+    def page_fetch(self, peer: str) -> Dict[str, Any]:
+        """Fetch *peer*'s page over RNS and return its display view.
+
+        The peer is resolved first, so a bad name is a client error
+        (``ValueError``) while a peer that cannot be reached raises
+        ``NodeError``.  When the peer has nothing newer than the
+        stored copy, the stored copy is returned; ``page`` is None
+        when the peer publishes no page at all.
+        """
+        from .pages import public_page
+
+        if not isinstance(peer, str) or not peer.strip():
+            raise ValueError("field 'peer' is required")
+        resolve = getattr(self.node, "resolve_peer", None)
+        if resolve is None or not callable(resolve):
+            raise WebBridgeError("this node cannot fetch pages")
+        try:
+            peer_obj = resolve(peer.strip())
+        except (NodeError, PeerError) as exc:
+            raise ValueError(str(exc)) from exc
+        doc = self.node.request_page(peer_obj)
+        if doc is None:
+            store = getattr(self.node, "page_store", None)
+            doc = store.get(peer_obj.hexhash) if store is not None else None
+        return {"page": public_page(doc) if doc is not None else None}
+
+    def page_file(self, author: str, sha256: str) -> Optional[Tuple[bytes, str]]:
+        """Return ``(bytes, name)`` for a stored linked page file, or None.
+
+        The digest is the address: only a blob this node actually
+        holds under that digest is ever served, and only when the
+        author's stored page still links it — a file from another
+        page cannot be pulled under this author's name.  The bytes
+        are re-checked against the digest before serving.
+        """
+        from .pages import load_page_file
+
+        author_hex = str(author).strip().lower()
+        digest = str(sha256).strip().lower()
+        if len(author_hex) != 32 or len(digest) != 64:
+            return None
+        try:
+            bytes.fromhex(author_hex)
+            bytes.fromhex(digest)
+        except ValueError:
+            return None
+        store = getattr(self.node, "page_store", None)
+        if store is None:
+            return None
+        doc = store.get(author_hex)
+        if doc is None:
+            return None
+        entry = next(
+            (
+                item
+                for item in doc.get("files", [])
+                if item.get("sha256") == digest
+            ),
+            None,
+        )
+        if entry is None:
+            return None
+        data = load_page_file(
+            getattr(self.node.config, "page_files_dir", None), digest
+        )
+        if data is None:
+            return None
+        return data, str(entry["name"])
 
     def tan_rules(self) -> Dict[str, Any]:
         """This node's Tan admission ruleset, as ``tau tan rules`` reports it.
@@ -10254,6 +10356,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path == "/api/pages":
+                self._send_json(self.bridge.page_list(), head_only)
+                return
+            if path.startswith("/api/pages/"):
+                parts = path[len("/api/pages/") :].split("/")
+                if len(parts) != 3 or parts[1] != "files" or not parts[0] or not parts[2]:
+                    self._send_json(
+                        {"error": {"message": "not found"}}, head_only, 404
+                    )
+                    return
+                self._handle_page_file(parts[0], parts[2], head_only)
+                return
             self._send_json({"error": {"message": "not found"}}, head_only, 404)
             return
 
@@ -11740,6 +11854,28 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "sync": result}, head_only)
                 return
+            if path == "/api/pages/fetch":
+                peer = body.get("peer")
+                if not isinstance(peer, str) or not peer.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'peer' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.page_fetch(peer)
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
+                return
             if path == "/api/tan/rules":
                 try:
                     rules = self.bridge.update_tan_rules(body)
@@ -11834,6 +11970,40 @@ class _WebHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Disposition",
             f'inline; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(file_name)}",
+        )
+        self._cors_headers()
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(data)
+
+    def _handle_page_file(self, author: str, sha256: str, head_only: bool) -> None:
+        """Serve one stored linked page file's bytes as a download.
+
+        The author and digest are the address: only a file this node
+        actually holds under that digest, linked from that author's
+        stored page, is ever served; anything else is a 404.
+        """
+        found = self.bridge.page_file(author, sha256)
+        if found is None:
+            self._send_json(
+                {"error": {"message": "no such page file"}}, head_only, 404
+            )
+            return
+        data, file_name = found
+        mime, _ = mimetypes.guess_type(file_name)
+        ascii_name = "".join(
+            char if 32 <= ord(char) < 127 and char not in '"\\' else "_"
+            for char in file_name
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime or "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{ascii_name}"; '
             f"filename*=UTF-8''{quote(file_name)}",
         )
         self._cors_headers()

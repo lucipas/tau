@@ -1,0 +1,64 @@
+# Visual regression check for the tau web console
+
+Screenshots the built static export as served by a running
+`tau serve --http` bridge, at a mobile (390px) and a desktop (1280px)
+viewport, and asserts the layout invariants that broke in Nov 2026:
+
+- the message feed does not collapse to ~0px tall on mobile
+- the composer does not overlap the message list
+- the per-message action row does not overlap the outbox
+- the sidebar does not overflow its desktop column (peer action
+  buttons used to be clipped off the right edge)
+- no horizontal overflow at either width
+
+## Run it
+
+```sh
+web/visual-regression/run.sh            # builds, seeds, screenshots, checks
+SKIP_BUILD=1 web/visual-regression/run.sh   # skip the `make web-build` step
+web/visual-regression/run.sh /tmp/shots --update-baselines
+```
+
+`run.sh` starts a fresh two-node demo (alice serves the console on
+http://127.0.0.1:8787, bob is the peer), seeds one inbound and one
+outbound message, runs `screenshot.mjs`, then stops both nodes. It
+exits non-zero and prints the failing invariant when a check fails.
+Screenshots and geometry JSON land in `out/` (default:
+`web/visual-regression/out/`).
+
+`--update-baselines` copies the freshly captured screenshots into
+`baselines/` — only do this after eyeballing them and confirming the
+layout is good.
+
+## How it works
+
+- `run.sh` — builds the export, starts the demo nodes, seeds messages.
+- `seed.py` — waits for alice's bridge, sends bob → alice over the
+  wire (CLI send, recorded as inbound on alice) and alice → bob via
+  POST /api/messages (recorded as outbound on alice), then waits for
+  both to land.
+- `screenshot.mjs` — drives headless Chromium over CDP with Node's
+  built-in WebSocket client (no npm dependencies). It navigates via a
+  `file://` hop page, waits for the SSE snapshot + React render,
+  evaluates bounding-box geometry, captures a PNG per viewport, and
+  fails when an invariant breaks.
+
+The check is geometry assertions (`getBoundingClientRect`), not pixel
+diffs: layout overlap is what broke last time, and rects are
+deterministic where pixels are not. The `baselines/` PNGs are for
+eyeball comparison in review, not for automated diffing.
+
+## Chromium notes
+
+Chromium is located via `CHROME_BIN`, then `chromium`,
+`chromium-browser`, `google-chrome`, `google-chrome-stable`, then
+`/opt/meta-chromium/chrome` (the Hatch CVM build).
+
+The Hatch CVM Chromium build force-enables Local Network Access
+checks, which block navigations to loopback addresses. The script
+works around it by navigating through a `file://` hop page first (a
+local → local navigation, which is allowed). The hop is harmless on a
+normal Chromium build, so it is always used. The same build refuses
+to start without a WebGL domain policy; when it is detected, the
+policy file is written to the temp dir and passed via
+`--hatch-webgl-allowed-domains-file`.

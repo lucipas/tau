@@ -1,0 +1,93 @@
+{
+  "url": "http://127.0.0.1:8787/",
+  "title": "tau · mesh console",
+  "viewport": {
+    "w": 1280,
+    "h": 900
+  },
+  "docScrollWidth": 1280,
+  "main": {
+    "x": 0,
+    "y": 69,
+    "w": 1280,
+    "h": 792,
+    "bottom": 861,
+    "right": 1280
+  },
+  "feedSection": {
+    "x": 392,
+    "y": 93,
+    "w": 856,
+    "h": 458,
+    "bottom": 550,
+    "right": 1248
+  },
+  "feedScroll": {
+    "x": 393,
+    "y": 206,
+    "w": 854,
+    "h": 343,
+    "bottom": 549,
+    "right": 1247
+  },
+  "feedScrollH": 343,
+  "composer": {
+    "x": 392,
+    "y": 578,
+    "w": 856,
+    "h": 168,
+    "bottom": 747,
+    "right": 1248
+  },
+  "outbox": {
+    "x": 451,
+    "y": 290,
+    "w": 328,
+    "h": 23,
+    "bottom": 313,
+    "right": 779
+  },
+  "composerOverlapsFeed": false,
+  "articles": [
+    {
+      "text": "Bbob43f4a3d9…aca417:45:50wooo i loike sh",
+      "rect": {
+        "x": 409,
+        "y": 226,
+        "w": 822,
+        "h": 87,
+        "bottom": 313,
+        "right": 1231
+      },
+      "actionRow": {
+        "x": 451,
+        "y": 226,
+        "w": 328,
+        "h": 87,
+        "bottom": 313,
+        "right": 779
+      }
+    },
+    {
+      "text": "→you43f4a3d9…aca417:46:34You do I want t",
+      "rect": {
+        "x": 409,
+        "y": 329,
+        "w": 822,
+        "h": 87,
+        "bottom": 416,
+        "right": 1231
+      },
+      "actionRow": {
+        "x": 677,
+        "y": 329,
+        "w": 512,
+        "h": 87,
+        "bottom": 416,
+        "right": 1189
+      }
+    }
+  ],
+  "outboxOverlappedByActionRow": true,
+  "messages": 2
+}
