@@ -2853,3 +2853,47 @@ def test_unreceipted_excludes_notes(tmp_path):
     inbox.mark_read([note["id"], peer["id"]])
     assert [item["id"] for item in inbox.read_unreceipted()] == ["peer-1"]
     assert [item["id"] for item in inbox.unreceipted()] == ["peer-1"]
+
+
+def test_append_group_message_keeps_poll_fields(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append_group_message(
+        _group_copy(poll_options=["Saturday", "Sunday"]),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members={"ab" * 16, "aa" * 16},
+    )
+    stored = inbox.list_messages(direction=None)
+    assert len(stored) == 1
+    assert stored[0]["poll_options"] == ["Saturday", "Sunday"]
+    # A reload keeps them: the tally derives from stored history.
+    assert Inbox(tmp_path / "inbox.json").list_messages(direction=None)[0][
+        "poll_options"
+    ] == ["Saturday", "Sunday"]
+
+
+def test_append_group_message_drops_malformed_poll_fields(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append_group_message(
+        _group_copy(id="copy-2", poll_options=["only one"]),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members={"ab" * 16, "aa" * 16},
+    )
+    inbox.append_group_message(
+        _group_copy(
+            id="copy-3",
+            poll_vote={"target": {"author": "aa" * 16, "sent_at": 100.0}},
+        ),
+        group="cd" * 16,
+        author="ab" * 16,
+        sent_at=101.0,
+        members={"ab" * 16, "aa" * 16},
+    )
+    stored = inbox.list_messages(direction=None)
+    assert len(stored) == 2
+    # Malformed poll fields drop; the messages themselves still store.
+    assert "poll_options" not in stored[0]
+    assert "poll_vote" not in stored[1]

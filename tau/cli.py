@@ -93,6 +93,16 @@ from .identity import (
     save_identity,
 )
 from .groups import GroupStore, pinned_rosters, visible_reactions
+from .group_polls import (
+    PostError,
+    attach_group_poll_tallies,
+    clean_poll_options,
+    group_poll_tally,
+    is_group_poll,
+    is_group_poll_close,
+    is_group_poll_vote,
+    poll_identity,
+)
 from .ignored_groups import (
     IgnoredGroups,
     IgnoredGroupsError,
@@ -1639,6 +1649,84 @@ def build_parser() -> argparse.ArgumentParser:
         "new_name", metavar="NAME", help="the new group name"
     )
     group_rename.set_defaults(func=cmd_group_rename)
+
+    group_poll = group_sub.add_parser(
+        "poll",
+        parents=[common],
+        help="post a poll in a group (question + 2-8 options)",
+    )
+    group_poll.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_poll.add_argument(
+        "question", metavar="QUESTION", help="the poll question"
+    )
+    group_poll.add_argument(
+        "options",
+        metavar="OPTION",
+        nargs="+",
+        help="2-8 distinct options",
+    )
+    group_poll.add_argument(
+        "--timeout", type=float, default=20.0, metavar="SECONDS"
+    )
+    group_poll.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the poll when a member is offline",
+    )
+    group_poll.set_defaults(func=cmd_group_poll)
+
+    group_vote = group_sub.add_parser(
+        "vote",
+        parents=[common],
+        help="vote on a group poll (option number or exact option text)",
+    )
+    group_vote.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_vote.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message id or unique prefix (see `tau messages --group`)",
+    )
+    group_vote.add_argument(
+        "option",
+        metavar="OPTION",
+        help="option number (1-based) or the exact option text",
+    )
+    group_vote.add_argument(
+        "--timeout", type=float, default=20.0, metavar="SECONDS"
+    )
+    group_vote.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the vote when a member is offline",
+    )
+    group_vote.set_defaults(func=cmd_group_vote)
+
+    group_close_poll = group_sub.add_parser(
+        "close-poll",
+        parents=[common],
+        help="close a group poll you created (freezes the tally)",
+    )
+    group_close_poll.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_close_poll.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message id or unique prefix (see `tau messages --group`)",
+    )
+    group_close_poll.add_argument(
+        "--timeout", type=float, default=20.0, metavar="SECONDS"
+    )
+    group_close_poll.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the close when a member is offline",
+    )
+    group_close_poll.set_defaults(func=cmd_group_close_poll)
 
     group_send = group_sub.add_parser(
         "send",
@@ -8027,6 +8115,9 @@ def _send_group_local_message(
     expires_at: Optional[float] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Fan one group message out on the running node, for the local send server.
 
@@ -8055,6 +8146,9 @@ def _send_group_local_message(
         in_reply_to=in_reply_to,
         expires_at=expires_at,
         send_after=send_after,
+        poll_options=poll_options,
+        poll_vote=poll_vote,
+        poll_close=poll_close,
     )
     if wait > 0:
         _wait_for_queued_sends(
@@ -9587,6 +9681,81 @@ def _resolve_group_pin_target(
     return matches[0]
 
 
+def _resolve_group_poll(
+    inbox: Inbox, ref: str, group_id: str
+) -> Dict[str, Any]:
+    """Resolve ``tau group vote`` / ``close-poll`` to one stored group poll.
+
+    Same scoping as :func:`_resolve_group_pin_target` but restricted
+    to polls: the reference (a message id or unique leg prefix, as
+    shown by ``tau messages --group``) must match exactly one stored
+    poll record in this group.  A vote or close record never resolves
+    — only the poll itself can be voted on or closed.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("poll must not be empty")
+    matches = [
+        item
+        for item in inbox.find_prefix(ref, group=group_id)
+        if is_group_poll(item)
+    ]
+    exact = [m for m in matches if str(m["id"]) == ref]
+    if not exact:
+        folded = ref.lower()
+        exact = [m for m in matches if str(m["id"]).lower() == folded]
+    if exact:
+        matches = exact
+    if len(matches) > 1:
+        raise NodeError(
+            f"{len(matches)} polls in this group match {ref!r};"
+            " use a longer prefix"
+        )
+    if not matches:
+        raise NodeError(
+            f"no poll {ref!r} in this group;"
+            " votes name a poll from this group's history"
+        )
+    return matches[0]
+
+
+def _attach_group_poll_tallies(
+    inbox: Inbox,
+    entries: List[Dict[str, Any]],
+    own_hash: Optional[str],
+) -> None:
+    """Attach a ``poll`` tally to each group-poll record in *entries*.
+
+    The tally derives from the group's full stored history — votes a
+    filter left out of *entries* (read votes under ``--unread``, say)
+    still count — so the history is re-read per group involved.
+    Entries are the copies :meth:`Inbox.list_messages` returns, so
+    attaching here never touches the stored records.
+    """
+    group_ids = {
+        str(entry.get("group"))
+        for entry in entries
+        if entry.get("kind") == "group" and entry.get("group")
+    }
+    if not group_ids:
+        return
+    history = inbox.list_messages(
+        limit=None, group=sorted(group_ids), direction=None
+    )
+    attach_group_poll_tallies(history, own_hash=own_hash)
+    by_id = {
+        (str(item.get("group")), str(item.get("id"))): item for item in history
+    }
+    for entry in entries:
+        if not is_group_poll(entry):
+            continue
+        match = by_id.get(
+            (str(entry.get("group")), str(entry.get("id")))
+        )
+        if match is not None and "poll" in match:
+            entry["poll"] = match["poll"]
+
+
 def _own_destination_hash(config: TauConfig) -> Optional[str]:
     """This node's destination hash, or ``None`` without an identity."""
     identity = load_identity(config.identity_path)
@@ -9752,6 +9921,21 @@ def _print_message_entry(
         print(f"  {quote}")
     for line in str(entry.get("text", "")).splitlines() or [""]:
         print(f"  {line}")
+    poll = entry.get("poll")
+    if isinstance(poll, dict) and poll.get("options"):
+        # A group poll renders its tally under the question, like a
+        # Tan poll: one line per option with its vote count, plus the
+        # total and the closed state.  Votes and closes themselves are
+        # never printed as messages (see cmd_messages).
+        options = poll["options"]
+        counts = poll.get("counts") or [0] * len(options)
+        for position, option in enumerate(options):
+            count = counts[position] if position < len(counts) else 0
+            mine = " ← your vote" if poll.get("my_vote") == position else ""
+            print(f"  🗳️ {position + 1}. {option} — {count} vote(s){mine}")
+        total = poll.get("total", 0)
+        closed = " (closed)" if poll.get("closed") else ""
+        print(f"  {total} voter(s) total{closed}")
     for reaction in entry.get("reactions") or []:
         reactor = registry.get(str(reaction.get("destination") or ""))
         reactor_name = (
@@ -10017,6 +10201,13 @@ def cmd_messages(args: argparse.Namespace) -> int:
     unread_only = getattr(args, "unread", False)
     if unread_only:
         entries = [entry for entry in entries if entry.get("unread")]
+    # Group polls carry their tally on the poll record itself, derived
+    # from the group's full history (see _attach_group_poll_tallies).
+    # Votes and closes are not chat: they stay in the listing for
+    # read-cursor purposes but are never printed as messages.
+    _attach_group_poll_tallies(
+        inbox, entries, _own_destination_hash(config)
+    )
     shown = entries if limit is None else entries[:limit]
     omitted = entries[len(shown):]
     # Unread mail the window omitted: reported, never silently cleared.
@@ -10051,10 +10242,18 @@ def cmd_messages(args: argparse.Namespace) -> int:
             _print_archived_unread(archived_unread)
     else:
         own_hash = _own_destination_hash(config)
-        for entry in shown:
+        printable = [
+            entry
+            for entry in shown
+            if not is_group_poll_vote(entry)
+            and not is_group_poll_close(entry)
+        ]
+        for entry in printable:
             _print_message_entry(
                 inbox, registry, entry, blocked=blocked, own_hash=own_hash
             )
+        if not printable and shown:
+            print("No chat messages to show — only poll votes.")
         if more_unread:
             _print_more_unread(registry, more_unread)
         if ignored_unread:
@@ -10281,6 +10480,7 @@ def cmd_pinned(args: argparse.Namespace) -> int:
         print("No pinned messages.")
     else:
         own_hash = _own_destination_hash(config)
+        _attach_group_poll_tallies(inbox, shown, own_hash)
         for entry in shown:
             _print_message_entry(
                 inbox, registry, entry, blocked=blocked, own_hash=own_hash
@@ -11557,6 +11757,9 @@ def _send_group_via_running_node(
     send_after: Optional[float],
     wait: float,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Send a group message through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -11577,6 +11780,9 @@ def _send_group_via_running_node(
             expires_at=expires_at,
             wait=wait,
             send_after=send_after,
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
         )
     except LocalIPCUnavailable as exc:
         raise NodeError(
@@ -11593,6 +11799,9 @@ def _send_group_via_local_node(
     send_after: Optional[float],
     wait: float,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One-shot group send on a node this process starts and stops itself."""
     delivered_ids: Set[str] = set()
@@ -11609,6 +11818,9 @@ def _send_group_via_local_node(
             in_reply_to=in_reply_to,
             expires_at=expires_at,
             send_after=send_after,
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
         )
         # --wait replaces the one-shot flush: wait for each queued leg
         # for the requested duration, recording delivered or still
@@ -11781,6 +11993,216 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         print("  it will be delivered at its scheduled time;")
         print("  check `tau outbox` for the queue, or just leave a node serving")
     return exit_code
+
+
+def _send_group_poll_message(
+    args: argparse.Namespace,
+    config: TauConfig,
+    text: str,
+    *,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Fan one group poll, vote, or close out, like ``cmd_group_send``.
+
+    Polls carry no expiry, schedule, quote, or wait — the same two
+    routes as a plain group send (the serving node, else a one-shot
+    local node) with the poll payload attached.
+    """
+    if _send_routes_via_running_node(config):
+        return _send_group_via_running_node(
+            args,
+            config,
+            text,
+            expires_at=None,
+            send_after=None,
+            wait=0.0,
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+    return _send_group_via_local_node(
+        args,
+        config,
+        text,
+        expires_at=None,
+        send_after=None,
+        wait=0.0,
+        poll_options=poll_options,
+        poll_vote=poll_vote,
+        poll_close=poll_close,
+    )
+
+
+def _report_group_poll_send(
+    args: argparse.Namespace,
+    response: Dict[str, Any],
+    summary: str,
+) -> int:
+    """Report a group poll/vote/close fan-out: per-member results."""
+    results = response.get("results") or []
+    failed = [r for r in results if not r.get("delivered") and not r.get("queued")]
+    if _json_mode(args):
+        _emit(response, True)
+        return _EXIT_ERROR if failed else _EXIT_OK
+    print(summary)
+    for result in results:
+        name = result.get("to_name") or (result.get("to") or "")[:8]
+        if result.get("delivered"):
+            print(f"delivered to {name}")
+        elif result.get("queued"):
+            print(f"queued for {name} — they are unreachable right now")
+        else:
+            print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+    return _EXIT_ERROR if failed else _EXIT_OK
+
+
+def _group_poll_history(
+    inbox: Inbox, group_id: str
+) -> List[Dict[str, Any]]:
+    """This group's stored messages, for tallying one of its polls."""
+    return inbox.list_messages(limit=None, group=group_id, direction=None)
+
+
+def cmd_group_poll(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        options = clean_poll_options(list(args.options))
+    except PostError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    group = GroupStore(config.groups_path).find(args.group)
+    if group is None:
+        print(f"error: unknown group: {args.group!r}", file=sys.stderr)
+        return 2
+    try:
+        response = _send_group_poll_message(
+            args, config, args.question, poll_options=options
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    poll_id = ""
+    results = response.get("results") or []
+    if results:
+        poll_id = str(results[0].get("id") or "")
+    summary = (
+        f"poll posted to {group['name']}"
+        + (f" #{_safe_id_prefix(poll_id)}" if poll_id else "")
+        + ": "
+        + args.question
+    )
+    return _report_group_poll_send(args, response, summary)
+
+
+def cmd_group_vote(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    group = GroupStore(config.groups_path).find(args.group)
+    if group is None:
+        print(f"error: unknown group: {args.group!r}", file=sys.stderr)
+        return 2
+    inbox = Inbox(config.inbox_path)
+    try:
+        poll = _resolve_group_poll(inbox, args.poll, group["id"])
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    history = _group_poll_history(inbox, group["id"])
+    own_hash = _own_destination_hash(config)
+    tally = group_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is closed", file=sys.stderr)
+        return 2
+    options = tally["options"]
+    choice = str(args.option).strip()
+    index: Optional[int] = None
+    if choice.isdigit():
+        index = int(choice) - 1
+    else:
+        for position, option in enumerate(options):
+            if option == choice:
+                index = position
+                break
+    if index is None or not 0 <= index < len(options):
+        print(
+            "error: option must be a number 1-"
+            f"{len(options)} or one of: {', '.join(options)}",
+            file=sys.stderr,
+        )
+        return 2
+    identity = poll_identity(poll, own_hash)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        response = _send_group_poll_message(
+            args,
+            config,
+            f"voted: {options[index]}",
+            poll_vote={
+                "target": {"author": identity[0], "sent_at": identity[1]},
+                "option": index,
+            },
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    summary = (
+        f"voted for {options[index]!r} on {poll.get('text')!r}"
+        f" in {group['name']}"
+    )
+    return _report_group_poll_send(args, response, summary)
+
+
+def cmd_group_close_poll(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    group = GroupStore(config.groups_path).find(args.group)
+    if group is None:
+        print(f"error: unknown group: {args.group!r}", file=sys.stderr)
+        return 2
+    inbox = Inbox(config.inbox_path)
+    try:
+        poll = _resolve_group_poll(inbox, args.poll, group["id"])
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    own_hash = _own_destination_hash(config)
+    identity = poll_identity(poll, own_hash)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    if own_hash is None or identity[0] != own_hash.lower():
+        print(
+            "error: only the poll's creator can close it",
+            file=sys.stderr,
+        )
+        return 2
+    history = _group_poll_history(inbox, group["id"])
+    tally = group_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is already closed", file=sys.stderr)
+        return 2
+    try:
+        response = _send_group_poll_message(
+            args,
+            config,
+            "closed the poll",
+            poll_close={"author": identity[0], "sent_at": identity[1]},
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    summary = f"closed the poll {poll.get('text')!r} in {group['name']}"
+    return _report_group_poll_send(args, response, summary)
 
 
 def _report_group_reaction(

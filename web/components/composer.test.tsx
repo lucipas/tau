@@ -406,3 +406,97 @@ describe("Composer typing", () => {
     expect(onTyping).toHaveBeenCalledWith("stop");
   });
 });
+
+describe("Composer group polls", () => {
+  function renderGroupComposer(onSendGroup = vi.fn().mockResolvedValue([])) {
+    render(
+      <Composer
+        peers={peers}
+        groups={groups}
+        target={GROUP_ID}
+        mode="group"
+        onTargetChange={vi.fn()}
+        onModeChange={vi.fn()}
+        onSend={vi.fn()}
+        onSendGroup={onSendGroup}
+      />,
+    );
+    return onSendGroup;
+  }
+
+  it("offers a poll toggle in group mode only", () => {
+    renderGroupComposer();
+    expect(screen.getByText("🗳️ ask a poll")).toBeTruthy();
+  });
+
+  it("asks the poll with the question and options", async () => {
+    const onSendGroup = renderGroupComposer();
+
+    fireEvent.click(screen.getByText("🗳️ ask a poll"));
+    expect(
+      screen.getByPlaceholderText("Ask the group a question…"),
+    ).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Poll option 1"), {
+      target: { value: "Tea" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 2"), {
+      target: { value: "Coffee" },
+    });
+    fireEvent.change(
+      screen.getByPlaceholderText("Ask the group a question…"),
+      { target: { value: "Tea or coffee?" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "ask poll" }));
+
+    await waitFor(() => expect(onSendGroup).toHaveBeenCalledTimes(1));
+    expect(onSendGroup).toHaveBeenCalledWith(
+      GROUP_ID,
+      "Tea or coffee?",
+      undefined,
+      undefined,
+      undefined,
+      ["Tea", "Coffee"],
+    );
+  });
+
+  it("adds and removes options up to eight", () => {
+    renderGroupComposer();
+    fireEvent.click(screen.getByText("🗳️ ask a poll"));
+
+    fireEvent.click(screen.getByText("+ add option"));
+    expect(screen.getByLabelText("Poll option 3")).toBeTruthy();
+    fireEvent.click(screen.getByLabelText("Remove option 3"));
+    expect(screen.queryByLabelText("Poll option 3")).toBeNull();
+  });
+
+  it("refuses to ask a poll with fewer than two options", async () => {
+    const onSendGroup = renderGroupComposer();
+    fireEvent.click(screen.getByText("🗳️ ask a poll"));
+    fireEvent.change(screen.getByLabelText("Poll option 1"), {
+      target: { value: "Tea" },
+    });
+    fireEvent.change(
+      screen.getByPlaceholderText("Ask the group a question…"),
+      { target: { value: "Tea or coffee?" } },
+    );
+    // The ask-poll button is disabled with fewer than two options,
+    // so submit through the keyboard: Enter reaches the same guard
+    // and reports why the poll cannot go out.
+    fireEvent.keyDown(
+      screen.getByPlaceholderText("Ask the group a question…"),
+      { key: "Enter" },
+    );
+
+    expect(screen.getByText("Add at least two poll options.")).toBeTruthy();
+    expect(onSendGroup).not.toHaveBeenCalled();
+  });
+
+  it("hides the send-later picker while asking a poll", () => {
+    renderGroupComposer();
+    expect(screen.getByLabelText("Send later")).toBeTruthy();
+    fireEvent.click(screen.getByText("🗳️ ask a poll"));
+    expect(screen.queryByLabelText("Send later")).toBeNull();
+    fireEvent.click(screen.getByText("cancel poll"));
+    expect(screen.getByLabelText("Send later")).toBeTruthy();
+  });
+});

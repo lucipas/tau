@@ -66,6 +66,9 @@ from .protocol import (
     MAX_MAIL_BLOB_BYTES,
     MAX_MAIL_TTL,
     ProtocolError,
+    _clean_group_poll_options_or_none,
+    clean_group_poll_target,
+    clean_group_poll_vote,
     clean_group_topic,
     clean_in_reply_to,
     decode,
@@ -355,6 +358,12 @@ class OutboxEntry:
     # older edit cannot rewind it (see ``TauNode.send_group_edit``).
     # ``None`` means the text was never edited — the common case.
     edited_at: Optional[float] = None
+    # Group-poll context: when present, this leg is a poll, a vote on
+    # one, or a close — a retry re-sends the same poll payload
+    # instead of plain chat (see ``TauNode._deliver_entry``).
+    poll_options: Optional[List[str]] = None
+    poll_vote: Optional[Dict[str, Any]] = None
+    poll_close: Optional[Dict[str, Any]] = None
 
     @property
     def to_hex(self) -> str:
@@ -435,6 +444,12 @@ class OutboxEntry:
             }
         if self.in_reply_to is not None:
             payload["in_reply_to"] = dict(self.in_reply_to)
+        if self.poll_options is not None:
+            payload["poll_options"] = list(self.poll_options)
+        if self.poll_vote is not None:
+            payload["poll_vote"] = dict(self.poll_vote)
+        if self.poll_close is not None:
+            payload["poll_close"] = dict(self.poll_close)
         return payload
 
     @classmethod
@@ -556,6 +571,25 @@ class OutboxEntry:
                 edited_at = None
             if edited_at is not None and not math.isfinite(edited_at):
                 edited_at = None
+        # Poll fields from an entry written before they existed are
+        # absent; a corrupt value drops the field instead of the
+        # entry — the leg still delivers, just as plain chat.
+        poll_options = _clean_group_poll_options_or_none(
+            raw.get("poll_options")
+        )
+        try:
+            poll_vote = clean_group_poll_vote(raw.get("poll_vote"))
+        except ProtocolError:
+            poll_vote = None
+        try:
+            poll_close = clean_group_poll_target(raw.get("poll_close"))
+        except ProtocolError:
+            poll_close = None
+        if sum(
+            field is not None
+            for field in (poll_options, poll_vote, poll_close)
+        ) > 1:
+            poll_options = poll_vote = poll_close = None
         return cls(
             id=message_id,
             to=destination,
@@ -587,6 +621,9 @@ class OutboxEntry:
             sent_at=sent_at,
             edited_at=edited_at,
             in_reply_to=in_reply_to,
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
         )
 
 
@@ -1311,6 +1348,9 @@ class Mailbox:
         send_after: Optional[float] = None,
         sent_at: Optional[float] = None,
         edited_at: Optional[float] = None,
+        poll_options: Optional[List[str]] = None,
+        poll_vote: Optional[Dict[str, Any]] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
     ) -> OutboxEntry:
         """Queue *text* for delivery to destination *to*.
 
@@ -1334,7 +1374,38 @@ class Mailbox:
         passes its edit time, so the recipient stores it as the
         record's ``edited_at`` and a replayed older edit cannot
         rewind it.
+
+        ``poll_options`` / ``poll_vote`` / ``poll_close`` mark this
+        leg as one of a group poll: a retry re-sends the same poll
+        payload instead of plain chat.  At most one may be set.
         """
+        if sum(
+            field is not None
+            for field in (poll_options, poll_vote, poll_close)
+        ) > 1:
+            raise MailboxError(
+                "an outbox entry can carry only one of poll_options, "
+                "poll_vote, poll_close"
+            )
+        clean_options: Optional[List[str]] = None
+        if poll_options is not None:
+            clean_options = _clean_group_poll_options_or_none(poll_options)
+            if clean_options is None:
+                raise MailboxError(
+                    "poll options must be a list of short strings"
+                )
+        clean_vote: Optional[Dict[str, Any]] = None
+        if poll_vote is not None:
+            try:
+                clean_vote = clean_group_poll_vote(poll_vote)
+            except ProtocolError as exc:
+                raise MailboxError(f"invalid poll vote: {exc}") from exc
+        clean_close: Optional[Dict[str, Any]] = None
+        if poll_close is not None:
+            try:
+                clean_close = clean_group_poll_target(poll_close)
+            except ProtocolError as exc:
+                raise MailboxError(f"invalid poll close: {exc}") from exc
         if len(to) != _DESTINATION_BYTES:
             raise MailboxError("destination hash must be 16 bytes")
         timestamp = now if now is not None else time.time()
@@ -1469,6 +1540,9 @@ class Mailbox:
                 sent_at=sent_at_value,
                 edited_at=edited_at_value,
                 in_reply_to=reply_to,
+                poll_options=clean_options,
+                poll_vote=clean_vote,
+                poll_close=clean_close,
             )
             self._outbox[entry.id] = entry
             self.save()

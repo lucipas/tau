@@ -27,6 +27,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/rename rename ``{"group": "<id | prefix | name>", "name": "<new name>"}``
     POST /api/groups/topic set or clear the topic ``{"group": "...", "topic": "..."}`` / ``{"group": "...", "clear": true}``
+    POST /api/groups/vote vote on a group poll ``{"group": "...", "poll": "<wire id>", "option": <1-based number or exact text>}``
+    POST /api/groups/close-poll close a group poll you created ``{"group": "...", "poll": "<wire id>"}``
     POST /api/groups/leave leave ``{"group": "..."}`` — members only;
                            a group this node created uses delete instead
     POST /api/groups/rejoin rejoin a left group ``{"group": "<32-char id>"}``
@@ -42,7 +44,8 @@ script) can read what arrives from the mesh and send messages back:
                            ``"send_in"`` seconds to schedule it for later)
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
                            (one outbound entry per member; ``"reply_to"``,
-                           ``"expires_in"`` and ``"send_in"`` work for DM and group sends)
+                           ``"expires_in"`` and ``"send_in"`` work for DM and group sends;
+                           ``"poll_options"`` posts the text as a poll question)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -194,7 +197,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Callable, Collection, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
@@ -243,6 +246,14 @@ from .config import (
     write_node_metadata,
 )
 from .groups import GroupStore, pinned_rosters, visible_reactions
+from .group_polls import (
+    PostError,
+    attach_group_poll_tallies,
+    clean_poll_options,
+    group_poll_tally,
+    is_group_poll,
+    poll_identity,
+)
 from .ignored_groups import (
     IgnoredGroupsError,
     ignored_groups_lock,
@@ -259,6 +270,9 @@ from .protocol import (
     MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     ProtocolError,
+    _clean_group_poll_options_or_none,
+    _clean_group_poll_target_or_none,
+    _clean_group_poll_vote_or_none,
     clean_in_reply_to,
     clean_reaction,
     excerpt_hash,
@@ -868,6 +882,23 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         in_reply_to = None
     if in_reply_to is not None:
         message["in_reply_to"] = in_reply_to
+    # Group-poll fields ride on the console entry so a restarted
+    # console still renders its polls; a malformed field drops
+    # instead of the entry, and a hand-edited entry carrying several
+    # keeps none of them.
+    poll_options = _clean_group_poll_options_or_none(entry.get("poll_options"))
+    poll_vote = _clean_group_poll_vote_or_none(entry.get("poll_vote"))
+    poll_close = _clean_group_poll_target_or_none(entry.get("poll_close"))
+    if sum(
+        field is not None for field in (poll_options, poll_vote, poll_close)
+    ) > 1:
+        poll_options = poll_vote = poll_close = None
+    if poll_options is not None:
+        message["poll_options"] = poll_options
+    if poll_vote is not None:
+        message["poll_vote"] = poll_vote
+    if poll_close is not None:
+        message["poll_close"] = poll_close
     stored_file = _clean_stored_file(entry.get("file"))
     if stored_file is not None:
         message["file"] = stored_file
@@ -1652,6 +1683,9 @@ class WebBridge:
             wire_id=wire_id if isinstance(wire_id, str) else None,
             in_reply_to=record.get("in_reply_to"),
             file=record.get("file"),
+            poll_options=record.get("poll_options"),
+            poll_vote=record.get("poll_vote"),
+            poll_close=record.get("poll_close"),
             reject_removed_wire_id=True,
         )
         if message is None:
@@ -1708,6 +1742,20 @@ class WebBridge:
             # restart reloads it without the reactions until a later
             # save.
             self._save_messages()
+        # A group poll's tally derives from the inbox's group history,
+        # like the reactions above: attach it so the live event and
+        # the stored entry both carry the current count.  A vote or
+        # close arriving here also refreshes the poll it names — the
+        # feed re-reads the tally on its next snapshot, and the live
+        # event for the vote itself is hidden by the console.
+        if isinstance(group_id, str) and group_id:
+            overlay = self._group_poll_records({group_id})
+            wire_id = message.get("wire_id")
+            if isinstance(wire_id, str) and wire_id:
+                matched = overlay.get((group_id, wire_id))
+                if matched is not None and "poll" in matched:
+                    message["poll"] = matched["poll"]
+                    self._save_messages()
         if not publish:
             return message
         # The node appends to its inbox before this callback runs, so
@@ -4621,6 +4669,9 @@ class WebBridge:
         expires_at: Optional[float] = None,
         send_after: Optional[float] = None,
         reply_to: Optional[str] = None,
+        poll_options: Optional[List[str]] = None,
+        poll_vote: Optional[Dict[str, Any]] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a message to every member of a group from the console.
 
@@ -4638,6 +4689,16 @@ class WebBridge:
         ``reply_to`` is a console wire id (full id or unique prefix)
         of a message in this group's history; it is resolved to the
         ``in_reply_to`` reference the node carries on every leg.
+
+        ``poll_options`` makes this send a poll: the text is the
+        question and the options ride on every leg (validated with
+        the Tan poll rules — 2-8 distinct, short, normalised
+        choices).  The outbound feed entries carry the options too,
+        so the console renders the poll as soon as it is sent.
+        ``poll_vote`` and ``poll_close`` are the same fan-out for a
+        vote and a close (used by :meth:`send_group_poll_vote` and
+        :meth:`close_group_poll`); at most one of the three may be
+        set.
 
         The group is resolved by id, id prefix, or exact name through
         ``GroupStore.find`` (unknown or ambiguous queries raise
@@ -4703,6 +4764,22 @@ class WebBridge:
         in_reply_to = self._resolve_console_group_reply(
             group_record["id"], reply_to
         )
+        cleaned_options: Optional[List[str]] = None
+        if poll_options is not None:
+            if not isinstance(poll_options, list):
+                raise ValueError("poll_options must be a list of options")
+            try:
+                cleaned_options = clean_poll_options(list(poll_options))
+            except PostError as exc:
+                raise ValueError(str(exc)) from exc
+        if sum(
+            field is not None
+            for field in (poll_options, poll_vote, poll_close)
+        ) > 1:
+            raise ValueError(
+                "a group message can carry only one of poll_options, "
+                "poll_vote, poll_close"
+            )
         response = self.node.send_group_message(
             group_record,
             text,
@@ -4710,6 +4787,9 @@ class WebBridge:
             expires_at=expires_at,
             send_after=send_after,
             in_reply_to=in_reply_to,
+            poll_options=cleaned_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
         )
         # Every leg shares one wire send time (the node's send_group_
         # message returns it): record that on each outbound entry, not
@@ -4761,6 +4841,9 @@ class WebBridge:
                     send_after=send_after,
                     in_reply_to=in_reply_to,
                     wire_id=wire_id,
+                    poll_options=cleaned_options,
+                    poll_vote=poll_vote,
+                    poll_close=poll_close,
                 )
                 if message is None:
                     # This leg was retracted while its console record
@@ -4799,6 +4882,135 @@ class WebBridge:
             messages.append(message)
         return messages, response
 
+    def _resolve_group_poll_record(
+        self, group_id: str, ref: Any
+    ) -> Dict[str, Any]:
+        """Resolve a console poll reference to its inbox poll record.
+
+        *ref* is a wire id or unique prefix, as shown by
+        ``tau messages --group`` or carried on the console entry.
+        Only a poll resolves — a vote or close record never does.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise ValueError("no inbox available")
+        ref = str(ref or "").strip()
+        if not ref:
+            raise ValueError("poll reference is required")
+        matches = [
+            item
+            for item in inbox.find_prefix(ref, group=group_id)
+            if is_group_poll(item)
+        ]
+        exact = [m for m in matches if str(m["id"]) == ref]
+        if not exact:
+            folded = ref.lower()
+            exact = [m for m in matches if str(m["id"]).lower() == folded]
+        if exact:
+            matches = exact
+        if len(matches) > 1:
+            raise ValueError(
+                f"{len(matches)} polls in this group match {ref!r};"
+                " use a longer prefix"
+            )
+        if not matches:
+            raise ValueError(f"no poll {ref!r} in this group")
+        return matches[0]
+
+    def send_group_poll_vote(
+        self,
+        group: str,
+        poll_ref: Any,
+        option: Any,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Vote on a group poll from the console.
+
+        ``poll_ref`` is a wire id or unique prefix of the poll;
+        ``option`` is a 1-based option number or the exact option
+        text.  The vote fans out like any group message, so an
+        offline member still gets it from the outbox; the tally
+        refreshes on the next snapshot read.  A closed poll refuses
+        the vote, like the CLI does.
+        """
+        if not isinstance(group, str) or not group.strip():
+            raise ValueError("target group is required")
+        self.node.groups.list_groups()
+        group_record = self.node.groups.find(group.strip())
+        poll = self._resolve_group_poll_record(group_record["id"], poll_ref)
+        inbox = getattr(self.node, "inbox", None)
+        history = (
+            inbox.list_messages(
+                limit=None, group=group_record["id"], direction=None
+            )
+            if inbox is not None
+            else []
+        )
+        own_hash = getattr(self.node, "destination_hexhash", None)
+        tally = group_poll_tally(history, poll, own_hash=own_hash)
+        if tally["closed"]:
+            raise ValueError("this poll is closed")
+        options = tally["options"]
+        choice = str(option).strip() if option is not None else ""
+        index: Optional[int] = None
+        if choice.isdigit():
+            index = int(choice) - 1
+        else:
+            for position, text in enumerate(options):
+                if text == choice:
+                    index = position
+                    break
+        if index is None or not 0 <= index < len(options):
+            raise ValueError(
+                "option must be a number 1-"
+                f"{len(options)} or one of: {', '.join(options)}"
+            )
+        identity = poll_identity(poll, own_hash)
+        if identity is None:
+            raise ValueError("this poll has no usable identity")
+        return self.send_group_message(
+            group_record["id"],
+            f"voted: {options[index]}",
+            poll_vote={
+                "target": {"author": identity[0], "sent_at": identity[1]},
+                "option": index,
+            },
+        )
+
+    def close_group_poll(
+        self, group: str, poll_ref: Any
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Close a group poll this node created, from the console.
+
+        Only the poll's creator may close it; closing freezes the
+        tally, like the CLI does.
+        """
+        if not isinstance(group, str) or not group.strip():
+            raise ValueError("target group is required")
+        self.node.groups.list_groups()
+        group_record = self.node.groups.find(group.strip())
+        poll = self._resolve_group_poll_record(group_record["id"], poll_ref)
+        own_hash = getattr(self.node, "destination_hexhash", None)
+        identity = poll_identity(poll, own_hash)
+        if identity is None:
+            raise ValueError("this poll has no usable identity")
+        if own_hash is None or identity[0] != own_hash.lower():
+            raise ValueError("only the poll's creator can close it")
+        inbox = getattr(self.node, "inbox", None)
+        history = (
+            inbox.list_messages(
+                limit=None, group=group_record["id"], direction=None
+            )
+            if inbox is not None
+            else []
+        )
+        tally = group_poll_tally(history, poll, own_hash=own_hash)
+        if tally["closed"]:
+            raise ValueError("this poll is already closed")
+        return self.send_group_message(
+            group_record["id"],
+            "closed the poll",
+            poll_close={"author": identity[0], "sent_at": identity[1]},
+        )
 
     def send_file(
         self,
@@ -8255,10 +8467,44 @@ class WebBridge:
                     if isinstance(item.get("group"), str) and item.get("group")
                 },
             )
+        # Group polls: the tally derives from the node inbox, so each
+        # group entry is matched to its inbox record by wire id and
+        # the tally attached to the poll itself; vote and close entries
+        # carry their marker so the feed can hide them.
+        poll_records = self._group_poll_records(
+            {
+                str(item.get("group"))
+                for item in items
+                if isinstance(item.get("group"), str) and item.get("group")
+            }
+        )
+
+        def _with_group_poll(item: Dict[str, Any]) -> Dict[str, Any]:
+            group = item.get("group")
+            wire_id = item.get("wire_id")
+            if not isinstance(group, str) or not group:
+                return item
+            if not isinstance(wire_id, str) or not wire_id:
+                return item
+            record = poll_records.get((group, wire_id))
+            if record is None:
+                return item
+            if record.get("poll_options") is not None:
+                item["poll_options"] = list(record["poll_options"])
+                if "poll" in record:
+                    item["poll"] = record["poll"]
+            if record.get("poll_vote") is not None:
+                item["poll_vote"] = dict(record["poll_vote"])
+            if record.get("poll_close") is not None:
+                item["poll_close"] = dict(record["poll_close"])
+            return item
+
         return [
-            self._with_inbox_pinned(
-                self._with_inbox_reactions(dict(item), by_target, rosters),
-                pinned_ids,
+            _with_group_poll(
+                self._with_inbox_pinned(
+                    self._with_inbox_reactions(dict(item), by_target, rosters),
+                    pinned_ids,
+                )
             )
             for item in items
         ]
@@ -8400,6 +8646,43 @@ class WebBridge:
             if isinstance(target, str) and target:
                 by_target.setdefault(target, []).append(entry)
         return by_target
+
+    def _group_poll_records(
+        self, group_ids: Collection[str]
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Poll/vote/close inbox records for these groups, by wire id.
+
+        One reload serves the whole listing, like
+        :meth:`_inbox_reactions_by_target`: each record carries its
+        derived ``poll`` tally when it is a poll.  The key covers the
+        record's own id and every leg id, so both an inbound copy and
+        an outbound leg resolve to the same record.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None or not group_ids:
+            return {}
+        try:
+            history = inbox.list_messages(
+                limit=None, group=sorted(group_ids), direction=None
+            )
+        except Exception:  # pragma: no cover - defensive
+            return {}
+        own_hash = getattr(self.node, "destination_hexhash", None)
+        attach_group_poll_tallies(history, own_hash=own_hash)
+        by_wire: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for record in history:
+            if (
+                record.get("poll_options") is None
+                and record.get("poll_vote") is None
+                and record.get("poll_close") is None
+            ):
+                continue
+            group = str(record.get("group") or "")
+            ids = [record.get("id")] + list(record.get("leg_ids") or [])
+            for wire_id in ids:
+                if isinstance(wire_id, str) and wire_id:
+                    by_wire[(group, wire_id)] = record
+        return by_wire
 
     def _with_inbox_reactions(
         self,
@@ -8789,6 +9072,9 @@ class WebBridge:
         delivered_via: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         file: Optional[Dict[str, Any]] = None,
+        poll_options: Optional[List[str]] = None,
+        poll_vote: Optional[Dict[str, Any]] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
         save: bool = True,
         reject_removed_wire_id: bool = False,
     ) -> Optional[Dict[str, Any]]:
@@ -8862,6 +9148,15 @@ class WebBridge:
             cleaned_file = _clean_stored_file(file) if file is not None else None
             if cleaned_file is not None:
                 message["file"] = cleaned_file
+            # A group poll, vote, or close rides on the console entry
+            # itself, so the feed can render the tally and hide the
+            # votes without another inbox lookup per entry.
+            if poll_options is not None:
+                message["poll_options"] = list(poll_options)
+            if poll_vote is not None:
+                message["poll_vote"] = dict(poll_vote)
+            if poll_close is not None:
+                message["poll_close"] = dict(poll_close)
             self._next_message_id += 1
             self._messages.append(message)
         # A bulk caller (import mirroring) passes save=False and saves
@@ -10221,6 +10516,50 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, **updated}, head_only)
                 return
+            if path in ("/api/groups/vote", "/api/groups/close-poll"):
+                target = body.get("group")
+                poll_ref = body.get("poll")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(poll_ref, str) or not poll_ref.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'poll' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/groups/vote":
+                        messages, response = self.bridge.send_group_poll_vote(
+                            target.strip(), poll_ref.strip(), body.get("option")
+                        )
+                    else:
+                        messages, response = self.bridge.close_group_poll(
+                            target.strip(), poll_ref.strip()
+                        )
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                except MailboxError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(
+                    {
+                        "ok": bool(response.get("ok", True)),
+                        "messages": messages,
+                        "response": response,
+                    },
+                    head_only,
+                )
+                return
             if path == "/api/outbox/retry":
                 self._handle_outbox_retry(body, head_only)
                 return
@@ -11363,6 +11702,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 expires_at=expires_at,
                 send_after=send_after,
                 reply_to=reply_to,
+                poll_options=body.get("poll_options"),
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown

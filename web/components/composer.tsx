@@ -64,6 +64,7 @@ export function Composer({
     expiresIn?: number,
     replyTo?: string,
     sendIn?: number,
+    pollOptions?: string[],
   ) => Promise<TauMessage[]>;
   onSendFile?: (to: string, file: File) => Promise<TauMessage | null>;
   onSendGroupFile?: (
@@ -84,6 +85,15 @@ export function Composer({
   const [sendSeconds, setSendSeconds] = useState<number | null>(null);
   const [savingDefault, setSavingDefault] = useState(false);
   const [file, setFile] = useState<File | null>(null);
+  // Group poll mode: the text is the question and the option fields
+  // are the choices. A poll cannot be a reply, a file, or scheduled
+  // — entering poll mode clears those — and the bridge validates the
+  // options (2–8 distinct) on submit.
+  const [pollMode, setPollMode] = useState(false);
+  const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
+  const filledPollOptions = pollOptions
+    .map((option) => option.trim())
+    .filter((option) => option !== "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -217,16 +227,23 @@ export function Composer({
       setError("Write a message first.");
       return;
     }
+    if (groupMode && pollMode && filledPollOptions.length < 2) {
+      setError("Add at least two poll options.");
+      return;
+    }
     setSending(true);
     setError(null);
     try {
       if (groupMode) {
+        // The poll options travel as a sixth argument only in poll
+        // mode, so a plain group send keeps its existing call shape.
         await onSendGroup(
           trimmedTarget,
           text,
           expireSeconds === null ? undefined : expireSeconds,
-          replyTo?.wire_id,
-          sendSeconds === null ? undefined : sendSeconds,
+          pollMode ? undefined : replyTo?.wire_id,
+          pollMode ? undefined : sendSeconds === null ? undefined : sendSeconds,
+          ...(pollMode ? [filledPollOptions] : []),
         );
       } else {
         await onSend(
@@ -238,6 +255,10 @@ export function Composer({
         );
       }
       setText("");
+      if (pollMode) {
+        setPollMode(false);
+        setPollOptions(["", ""]);
+      }
       reportTyping("stop");
       // A delay applies to one send only: the next message goes now
       // unless the picker is set again.
@@ -397,6 +418,57 @@ export function Composer({
         </div>
       ) : null}
 
+      {pollMode && groupMode ? (
+        <div className="mt-2 space-y-1.5">
+          {pollOptions.map((option, index) => (
+            <div key={index} className="flex items-center gap-2">
+              <input
+                value={option}
+                onChange={(event) =>
+                  setPollOptions((current) =>
+                    current.map((currentOption, currentIndex) =>
+                      currentIndex === index
+                        ? event.target.value.slice(0, 100)
+                        : currentOption,
+                    ),
+                  )
+                }
+                maxLength={100}
+                placeholder={`Option ${index + 1}`}
+                aria-label={`Poll option ${index + 1}`}
+                className="w-full rounded-xl border border-line bg-void/70 px-3 py-2 text-[13px] text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+              />
+              {pollOptions.length > 2 ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setPollOptions((current) =>
+                      current.filter(
+                        (_currentOption, currentIndex) =>
+                          currentIndex !== index,
+                      ),
+                    )
+                  }
+                  aria-label={`Remove option ${index + 1}`}
+                  className="shrink-0 rounded-lg border border-line px-2 py-1 font-mono text-[11px] text-mist/80 transition hover:border-rose-300/50 hover:text-rose-300"
+                >
+                  remove
+                </button>
+              ) : null}
+            </div>
+          ))}
+          {pollOptions.length < 8 ? (
+            <button
+              type="button"
+              onClick={() => setPollOptions((current) => [...current, ""])}
+              className="font-mono text-[11px] text-signal transition hover:text-zinc-100"
+            >
+              + add option
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="mt-2 flex items-end gap-2">
         <textarea
           ref={textareaRef}
@@ -417,11 +489,13 @@ export function Composer({
           rows={2}
           maxLength={MAX_MESSAGE_CHARS}
           placeholder={
-            groupMode
-              ? "Write something to the group…"
-              : replyTo
-                ? `Replying to ${replyTo.direction === "out" ? "you" : replyTo.peer_name}…`
-                : "Write something to the mesh…"
+            groupMode && pollMode
+              ? "Ask the group a question…"
+              : groupMode
+                ? "Write something to the group…"
+                : replyTo
+                  ? `Replying to ${replyTo.direction === "out" ? "you" : replyTo.peer_name}…`
+                  : "Write something to the mesh…"
           }
           className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
@@ -458,7 +532,12 @@ export function Composer({
         <button
           type="button"
           onClick={() => void submit()}
-          disabled={sending || (!text.trim() && !file) || !target.trim()}
+          disabled={
+            sending ||
+            (!text.trim() && !file) ||
+            !target.trim() ||
+            (groupMode && pollMode && filledPollOptions.length < 2)
+          }
           className="inline-flex h-[52px] shrink-0 items-center gap-2 rounded-xl border border-signal/40 bg-signal/15 px-4 text-xs font-medium text-signal transition hover:border-signal/70 hover:bg-signal/25 disabled:cursor-not-allowed disabled:border-line disabled:bg-void/60 disabled:text-mist/60"
         >
           <SendIcon className="h-4 w-4" />
@@ -467,9 +546,11 @@ export function Composer({
               ? "sending…"
               : file
                 ? "send file"
-                : sendSeconds === null
-                  ? "send"
-                  : "schedule"}
+                : pollMode
+                  ? "ask poll"
+                  : sendSeconds === null
+                    ? "send"
+                    : "schedule"}
           </span>
         </button>
       </div>
@@ -494,8 +575,39 @@ export function Composer({
             expiry and schedule apply to every member&apos;s copy
           </span>
         ) : null}
-        <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
-          send later
+        {groupMode ? (
+          <button
+            type="button"
+            onClick={() => {
+              if (pollMode) {
+                setPollMode(false);
+              } else {
+                // A poll is its own message: not a reply, a file, or
+                // scheduled — entering poll mode clears those.
+                setPollMode(true);
+                setFile(null);
+                setSendSeconds(null);
+                onCancelReply?.();
+                if (fileInputRef.current) fileInputRef.current.value = "";
+              }
+            }}
+            title={
+              pollMode
+                ? "Back to a plain group message"
+                : "Ask the group a question with options to vote on"
+            }
+            className={`rounded-lg border px-2 py-1 font-mono text-[10px] transition ${
+              pollMode
+                ? "border-signal/50 bg-signal/10 text-signal"
+                : "border-line bg-void/70 text-mist/80 hover:border-signal/40 hover:text-zinc-200"
+            }`}
+          >
+            {pollMode ? "cancel poll" : "🗳️ ask a poll"}
+          </button>
+        ) : null}
+        {pollMode ? null : (
+          <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+            send later
           <select
             aria-label="Send later"
             value={sendSeconds === null ? "" : String(sendSeconds)}
@@ -511,7 +623,8 @@ export function Composer({
             <option value="10800">in 3 hours</option>
             <option value="86400">in 24 hours</option>
           </select>
-        </label>
+          </label>
+        )}
         <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
           disappears
           <select
