@@ -5,6 +5,7 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    GET  /api/mesh         peers with live path-table reachability
     GET  /api/heard        non-tau announces heard since this node started
     POST /api/peers/forget  forget a peer ``{"target": "<name or hash>"}``
                            (optional ``"force": true`` strands queued mail)
@@ -7296,7 +7297,39 @@ class WebBridge:
                 blocklist is not None
                 and blocklist.is_blocked(item.get("destination"))
             )
+        # Live reachability from the serving node's path table, so the
+        # console peers table can tell a peer with a path now from one
+        # merely heard once: the registry's stored hop count is the
+        # announce-time value and goes stale as the mesh shifts.  A
+        # failed snapshot leaves the rows without the live keys rather
+        # than failing the whole peers poll.
+        try:
+            live = {
+                row["destination"]: row for row in self.mesh()
+            }
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read mesh snapshot", exc_info=True)
+            live = {}
+        for item in items:
+            row = live.get(item.get("destination"))
+            if row is not None:
+                item["reachable"] = row["reachable"]
+                item["live_hops"] = row["hops"]
         return items
+
+    def mesh(self) -> List[Dict[str, Any]]:
+        """Live reachability snapshot for every known peer.
+
+        Delegates to the serving node's path-table check; a node that
+        is not up yet has no live paths, so the snapshot is empty
+        rather than a stale registry read.  A node without the method
+        (older doubles) reads as no live paths instead of failing.
+        """
+        node = getattr(self, "node", None)
+        snapshot = getattr(node, "mesh_snapshot", None) if node else None
+        if not callable(snapshot):
+            return []
+        return snapshot()
 
     def heard(self) -> List[Dict[str, Any]]:
         """Non-tau announces heard since this node started, newest first.
@@ -9561,6 +9594,10 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                 )
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
+                return
+            if path == "/api/mesh":
+                rows = self.bridge.mesh()
+                self._send_json({"peers": rows, "count": len(rows)}, head_only)
                 return
             if path == "/api/heard":
                 heard = self.bridge.heard()

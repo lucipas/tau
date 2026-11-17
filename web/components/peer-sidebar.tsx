@@ -993,8 +993,21 @@ export function PeerSidebar({
                             ) : null}
                           </span>
                           <span className="block truncate font-mono text-[10px] text-mist">
-                            {shortHash(peer.destination, 10)} · {peer.hops} hop
-                            {peer.hops === 1 ? "" : "s"} · {formatAge(age)}
+                            {peer.reachable === undefined ? null : (
+                              <span
+                                title={
+                                  peer.reachable
+                                    ? `Reachable via ${peer.live_hops ?? peer.hops} hop${(peer.live_hops ?? peer.hops) === 1 ? "" : "s"} (live path table)`
+                                    : "No path known right now — last seen below is when they last announced"
+                                }
+                              >
+                                {peer.reachable ? "● " : "○ "}
+                              </span>
+                            )}
+                            {shortHash(peer.destination, 10)} ·{" "}
+                            {peer.live_hops ?? peer.hops} hop
+                            {(peer.live_hops ?? peer.hops) === 1 ? "" : "s"} ·{" "}
+                            {formatAge(age)}
                           </span>
                           {peer.alias ? (
                             <span className="block truncate font-mono text-[10px] text-mist">

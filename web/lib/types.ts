@@ -244,6 +244,13 @@ export interface Peer {
   // True when the peer is on this node's block-list: their DMs are
   // dropped and their Tan posts hidden.
   blocked?: boolean;
+  // Live reachability from the serving node's Reticulum path table
+  // (see GET /api/mesh): true when a path is known right now, with
+  // the current hop count. Absent when the console predates the
+  // mesh endpoint or the snapshot failed — then the row falls back
+  // to the registry's announce-time hop count with no dot.
+  reachable?: boolean;
+  live_hops?: number | null;
 }
 
 export interface BlockPeerResult {

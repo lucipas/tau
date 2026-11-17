@@ -236,6 +236,55 @@ describe("PeerSidebar unread badges", () => {
   });
 });
 
+describe("PeerSidebar reachability", () => {
+  it("shows a reachable peer's live hop count", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        peers: [
+          makePeer({ hops: 5, live_hops: 2, reachable: true }),
+          makePeer({ destination: "cd".repeat(16), name: "bob" }),
+        ],
+      },
+    );
+
+    expect(
+      screen.getByTitle("Reachable via 2 hops (live path table)"),
+    ).toBeTruthy();
+    // The live count replaces the stale registry count in the row.
+    expect(screen.getByText(/2 hops/)).toBeTruthy();
+    expect(screen.queryByText(/5 hops/)).toBeNull();
+  });
+
+  it("shows an unreachable peer with no live path", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        peers: [
+          makePeer({ hops: 1, live_hops: null, reachable: false }),
+        ],
+      },
+    );
+
+    expect(
+      screen.getByTitle(/No path known right now/),
+    ).toBeTruthy();
+  });
+
+  it("shows no reachability dot when the snapshot is absent", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      { peers: [makePeer()] },
+    );
+
+    expect(screen.queryByTitle(/Reachable via/)).toBeNull();
+    expect(screen.queryByTitle(/No path known/)).toBeNull();
+  });
+});
+
 describe("PeerSidebar mute", () => {
   const aliceHash = "ab".repeat(16);
   const groupId = "11".repeat(16);

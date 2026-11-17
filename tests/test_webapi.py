@@ -696,6 +696,23 @@ class FakeNode:
     def announce(self):
         self.announced += 1
 
+    def mesh_snapshot(self):
+        # Live path-table view, derived from the registry like the real
+        # node derives it from Reticulum: every known peer reads as
+        # reachable here unless a test overrides the method.
+        return [
+            {
+                "destination": peer.hexhash,
+                "name": peer.display_name,
+                "hops": peer.hops,
+                "has_path": True,
+                "reachable": True,
+                "last_seen": peer.last_seen,
+                "verified": peer.is_verified,
+            }
+            for peer in self.registry.all()
+        ]
+
 
 @pytest.fixture()
 def node(tmp_path):
@@ -765,6 +782,51 @@ def test_peers_endpoint_includes_verification_state(bridge, node):
     assert entry["key_change_at"] is None
     # Verification state is local-only: the public description stays clean.
     assert "verified" not in peer.public_dict()
+
+
+def test_mesh_endpoint_returns_live_snapshot(bridge, node):
+    status, _, payload = _json(bridge, "/api/mesh")
+    assert status == 200
+    assert payload["count"] == 1
+    row = payload["peers"][0]
+    assert row["name"] == "alice"
+    assert row["destination"] == PEER_HASH
+    assert row["hops"] == 1
+    assert row["has_path"] is True
+    assert row["reachable"] is True
+
+
+def test_peers_endpoint_includes_live_reachability(bridge, node):
+    # The registry hop count is announce-time; the mesh snapshot is
+    # the live one, so the peers row carries both.
+    node.mesh_snapshot = lambda: [
+        {
+            "destination": PEER_HASH,
+            "name": "alice",
+            "hops": 2,
+            "has_path": True,
+            "reachable": True,
+            "last_seen": 1000.0,
+            "verified": False,
+        }
+    ]
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    entry = payload["peers"][0]
+    assert entry["hops"] == 1
+    assert entry["live_hops"] == 2
+    assert entry["reachable"] is True
+
+
+def test_peers_endpoint_without_mesh_snapshot_omits_reachability(
+    bridge, node
+):
+    node.mesh_snapshot = None
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    entry = payload["peers"][0]
+    assert "reachable" not in entry
+    assert "live_hops" not in entry
 
 
 def test_peers_endpoint_flags_lookalike_and_rename(bridge, node, tmp_path):
