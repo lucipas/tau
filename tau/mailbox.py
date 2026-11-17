@@ -71,6 +71,7 @@ from .protocol import (
     clean_group_poll_vote,
     clean_group_topic,
     clean_in_reply_to,
+    clean_location,
     decode,
     encode,
     generate_message_id,
@@ -344,6 +345,10 @@ class OutboxEntry:
     # not-before time is the sender's instruction, not retry pacing.
     send_after: Optional[float] = None
     in_reply_to: Optional[Dict[str, Any]] = None
+    # Static location pin this entry carries (``tau send --location``):
+    # a retry or a sealed relay copy re-sends the same pin, exactly
+    # like the quote above.  ``None`` means no pin — the common case.
+    location: Optional[Dict[str, Any]] = None
     # Logical send time every copy of this message carries on the wire.
     # A group fan-out records its shared send time here (see
     # ``TauNode.send_group_message``), so a reaction can name the
@@ -444,6 +449,8 @@ class OutboxEntry:
             }
         if self.in_reply_to is not None:
             payload["in_reply_to"] = dict(self.in_reply_to)
+        if self.location is not None:
+            payload["location"] = dict(self.location)
         if self.poll_options is not None:
             payload["poll_options"] = list(self.poll_options)
         if self.poll_vote is not None:
@@ -590,6 +597,9 @@ class OutboxEntry:
             for field in (poll_options, poll_vote, poll_close)
         ) > 1:
             poll_options = poll_vote = poll_close = None
+        # A corrupt pin on an already-queued entry must not make the
+        # outbox unreadable; the message still delivers, just without it.
+        location = clean_location(raw.get("location"))
         return cls(
             id=message_id,
             to=destination,
@@ -621,6 +631,7 @@ class OutboxEntry:
             sent_at=sent_at,
             edited_at=edited_at,
             in_reply_to=in_reply_to,
+            location=location,
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
@@ -1345,6 +1356,7 @@ class Mailbox:
         now: Optional[float] = None,
         group: Optional[Dict[str, Any]] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
         sent_at: Optional[float] = None,
         edited_at: Optional[float] = None,
@@ -1456,6 +1468,11 @@ class Mailbox:
             if not math.isfinite(expires_at):
                 raise MailboxError("expires_at must be a finite number")
         reply_to = clean_in_reply_to(in_reply_to)
+        cleaned_location = clean_location(location)
+        if location is not None and cleaned_location is None:
+            raise MailboxError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
         send_after_value: Optional[float] = None
         if send_after is not None:
             if isinstance(send_after, bool) or not isinstance(
@@ -1540,6 +1557,7 @@ class Mailbox:
                 sent_at=sent_at_value,
                 edited_at=edited_at_value,
                 in_reply_to=reply_to,
+                location=cleaned_location,
                 poll_options=clean_options,
                 poll_vote=clean_vote,
                 poll_close=clean_close,
@@ -2724,6 +2742,7 @@ def seal_message(
     group: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
     edited_at: Optional[float] = None,
 ) -> bytes:
@@ -2848,6 +2867,13 @@ def seal_message(
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         inner["in_reply_to"] = reply_to
+    cleaned_location = clean_location(location)
+    if location is not None and cleaned_location is None:
+        raise MailboxError(
+            "location must have a latitude -90..90 and a longitude -180..180"
+        )
+    if cleaned_location is not None:
+        inner["location"] = cleaned_location
     canonical = encode(inner)
     signature = sender_identity.sign(canonical)
     if signature is None:  # pragma: no cover - identity without private keys
@@ -3080,6 +3106,7 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "expires_at": expires_at,
         "edited_at": edited_at,
         "in_reply_to": in_reply_to,
+        "location": clean_location(payload.get("location")),
     }
     group_raw = payload.get("group")
     if group_raw is not None:

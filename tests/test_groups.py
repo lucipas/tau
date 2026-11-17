@@ -3444,6 +3444,49 @@ def test_send_group_message_with_reply_carries_reference_on_every_leg(tmp_path):
     assert node.inbox.list_messages() == []
 
 
+def test_send_group_message_carries_location_on_every_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    calls = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        calls.append((peer.hexhash, path, payload, deadline))
+        return {"ok": True}
+
+    def fake_resolve(target, timeout=10.0):
+        if target == OTHER_HASH:
+            return _stub_peer(OTHER_HASH, "bob")
+        raise NodeError("unreachable")
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    result = node.send_group_message(group, "meet here", location=pin)
+    assert result["ok"] is True
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH]["delivered"] is True
+    assert by_to[THIRD_HASH]["queued"] is True
+    # The delivered leg carries the pin on the wire.
+    assert len(calls) == 1
+    assert parse_group_message(calls[0][2])["location"] == pin
+    # The queued leg keeps the pin in the outbox, so a retry
+    # re-sends it.
+    queued = node.mailbox.outbox_list()
+    assert len(queued) == 1
+    assert queued[0].location == pin
+    # The one sent record per fan-out carries the pin too.
+    out_records = [
+        entry
+        for entry in node.inbox.export_document()["messages"]
+        if entry.get("direction") == "out"
+    ]
+    assert len(out_records) == 1
+    assert out_records[0]["location"] == pin
+
+
 def test_send_group_message_carries_expiry_to_legs_and_queue(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()  # started enough for queueing

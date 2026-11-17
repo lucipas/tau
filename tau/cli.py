@@ -169,10 +169,14 @@ from .protocol import (
     PROTOCOL_VERSION,
     ProtocolError,
     clean_in_reply_to,
+    clean_location,
     clean_reaction,
     excerpt_hash,
+    location_default_text,
+    location_maps_url,
     normalize_message,
     normalize_message_kind,
+    parse_location_arg,
     sanitize_name,
     short_hash,
 )
@@ -542,6 +546,15 @@ def build_parser() -> argparse.ArgumentParser:
         " filter their inbox by kind",
     )
     send.add_argument(
+        "--location",
+        default=None,
+        metavar='"LAT,LON [PLACE]"',
+        help="pin a place on the message (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park"); without message text the '
+        "place name (or the coordinates) becomes the text, and the "
+        "message is tagged location unless --kind says otherwise",
+    )
+    send.add_argument(
         "--wait",
         type=float,
         default=None,
@@ -816,6 +829,23 @@ def build_parser() -> argparse.ArgumentParser:
     ping.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     ping.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
     ping.set_defaults(func=cmd_ping)
+
+    trace = subparsers.add_parser(
+        "trace",
+        parents=[common],
+        help="trace the mesh path to a peer (hops + live probe)",
+    )
+    trace.add_argument("peer", metavar="NAME|HASH")
+    trace.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    trace.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
+    trace.set_defaults(func=cmd_trace)
+
+    mesh = subparsers.add_parser(
+        "mesh",
+        parents=[common],
+        help="list known peers with live reachability and hop counts",
+    )
+    mesh.set_defaults(func=cmd_mesh)
 
     info = subparsers.add_parser(
         "info", parents=[common], help="show a remote peer's information"
@@ -2062,6 +2092,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--reply-to",
         metavar="ID|PREFIX",
         help="quote an earlier message in this group (message id or unique prefix)",
+    )
+    group_send.add_argument(
+        "--location",
+        default=None,
+        metavar='"LAT,LON [PLACE]"',
+        help="pin a place on the message (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park"); without message text the '
+        "place name (or the coordinates) becomes the text",
     )
     group_send.add_argument(
         "--discover-timeout",
@@ -3603,6 +3641,37 @@ def _read_message(args: argparse.Namespace) -> str:
     if not sys.stdin.isatty():
         return sys.stdin.read()
     raise NodeError("provide a message, --file, or pipe text on stdin")
+
+
+def _location_from_args(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Parse a ``--location`` flag, or ``None`` when it was not given."""
+    raw = getattr(args, "location", None)
+    if raw is None:
+        return None
+    try:
+        return parse_location_arg(raw)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+
+
+def _message_text_with_location(
+    args: argparse.Namespace, location: Optional[Dict[str, Any]]
+) -> str:
+    """Message text for a send, defaulting a bare pin to its label.
+
+    A ``--location`` without message text, a --file, or piped stdin
+    sends the place name (or the coordinates) as the text, so `tau
+    send --location "..."` works on its own; the pin itself rides as
+    a structured field either way.
+    """
+    if (
+        location is not None
+        and getattr(args, "message", None) is None
+        and getattr(args, "file", None) is None
+        and sys.stdin.isatty()
+    ):
+        return location_default_text(location)
+    return _read_message(args)
 
 
 def _detect_image_mime(data: bytes) -> Optional[str]:
@@ -9014,6 +9083,7 @@ def _send_local_message(
     expires_at: Optional[float] = None,
     reply_to: Optional[str] = None,
     kind: Optional[str] = None,
+    location: Optional[Dict[str, Any]] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -9042,6 +9112,7 @@ def _send_local_message(
         in_reply_to=in_reply_to,
         expires_at=expires_at,
         kind=kind,
+        location=location,
         send_after=send_after,
     )
     result = _finalize_send_result(
@@ -9066,6 +9137,7 @@ def _send_group_local_message(
     discover_timeout: Optional[float] = None,
     queue: bool = True,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
@@ -9100,6 +9172,7 @@ def _send_group_local_message(
         in_reply_to=in_reply_to,
         expires_at=expires_at,
         send_after=send_after,
+        location=location,
         poll_options=poll_options,
         poll_vote=poll_vote,
         poll_close=poll_close,
@@ -9381,6 +9454,7 @@ def _send_via_local_node(
     kind: Optional[str] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
     timeout = float(getattr(args, "timeout", 20.0))
@@ -9425,6 +9499,7 @@ def _send_via_local_node(
                     in_reply_to=reply_to,
                     expires_at=expires_at,
                     kind=kind,
+                    location=location,
                     send_after=send_after,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
@@ -9485,6 +9560,7 @@ def _send_via_running_node(
     kind: Optional[str] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Send through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -9513,6 +9589,7 @@ def _send_via_running_node(
                 expires_at=expires_at,
                 reply_to=getattr(args, "reply_to", None),
                 kind=kind,
+                location=location,
                 wait=wait,
                 send_after=send_after,
             )
@@ -9957,10 +10034,19 @@ def cmd_send(args: argparse.Namespace) -> int:
     if wait_given and getattr(args, "no_queue", False):
         print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
         return 2
-    text = _read_message(args)
+    # Validate the pin before reading the message, so an invalid
+    # --location fails at once instead of blocking on stdin.
+    location = _location_from_args(args)
+    text = _message_text_with_location(args, location)
     config = _make_config(args)
     try:
-        kind = normalize_message_kind(getattr(args, "kind", None))
+        # No --kind means no kind: the node tags a pin ``location``
+        # and defaults anything else to ``chat``.
+        kind = (
+            normalize_message_kind(getattr(args, "kind", None))
+            if getattr(args, "kind", None) is not None
+            else None
+        )
     except ProtocolError as exc:
         raise NodeError(str(exc)) from exc
     expires_at = None
@@ -10008,13 +10094,13 @@ def cmd_send(args: argparse.Namespace) -> int:
         log.info("sending via the running node")
         results = _send_via_running_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
-            send_after=send_after,
+            send_after=send_after, location=location,
         )
     else:
         log.info("sending via a local one-shot node")
         results = _send_via_local_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
-            send_after=send_after,
+            send_after=send_after, location=location,
         )
 
     failed = [result for result in results if not result.get("ok", True)]
@@ -10875,6 +10961,16 @@ def _print_message_entry(
         print(f"  {quote}")
     for line in str(entry.get("text", "")).splitlines() or [""]:
         print(f"  {line}")
+    location = clean_location(entry.get("location"))
+    if location is not None:
+        # A static pin prints under the text with its map link, so a
+        # location message reads in the terminal the way it renders
+        # in the console; a hand-edited record with a bad pin just
+        # shows its text.
+        name = location.get("name")
+        label = name if isinstance(name, str) and name else "Location"
+        print(f"  📍 {label} — {location['lat']}, {location['lon']}")
+        print(f"  {location_maps_url(location)}")
     poll = entry.get("poll")
     if isinstance(poll, dict) and poll.get("options"):
         # A group poll renders its tally under the question, like a
@@ -13024,6 +13120,7 @@ def _send_group_via_running_node(
     send_after: Optional[float],
     wait: float,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -13044,6 +13141,7 @@ def _send_group_via_running_node(
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             queue=not getattr(args, "no_queue", False),
             in_reply_to=in_reply_to,
+            location=location,
             expires_at=expires_at,
             wait=wait,
             send_after=send_after,
@@ -13066,6 +13164,7 @@ def _send_group_via_local_node(
     send_after: Optional[float],
     wait: float,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -13085,6 +13184,7 @@ def _send_group_via_local_node(
             in_reply_to=in_reply_to,
             expires_at=expires_at,
             send_after=send_after,
+            location=location,
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
@@ -13142,7 +13242,10 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     if getattr(args, "wait", None) is not None and getattr(args, "no_queue", False):
         print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
         return 2
-    text = _read_message(args)
+    # Validate the pin before reading the message, so an invalid
+    # --location fails at once instead of blocking on stdin.
+    location = _location_from_args(args)
+    text = _message_text_with_location(args, location)
     config = _make_config(args)
     expires_at = None
     expire_text = getattr(args, "expire", None)
@@ -13186,6 +13289,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             send_after=send_after,
             wait=wait,
             in_reply_to=in_reply_to,
+            location=location,
         )
     else:
         response = _send_group_via_local_node(
@@ -13196,6 +13300,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             send_after=send_after,
             wait=wait,
             in_reply_to=in_reply_to,
+            location=location,
         )
     failed_legs = [
         r for r in response["results"] if not r.get("delivered") and not r.get("queued")
@@ -15068,6 +15173,74 @@ def cmd_ping(args: argparse.Namespace) -> int:
         rtt = response.get("_rtt")
         latency = f" ({rtt * 1000:.0f} ms)" if isinstance(rtt, (int, float)) else ""
         print(f"pong from {response.get('server', args.to)}{latency}")
+    return _EXIT_OK
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        result = node.trace(
+            args.peer,
+            timeout=float(getattr(args, "timeout", 15.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        print(f"trace to {result['peer']} ({result['destination']})")
+        if result["has_path"]:
+            print(f"  path: known, {result['hops']} hop(s)")
+        else:
+            print("  path: none known")
+        if result["rtt_ms"] is not None:
+            print(f"  probe: pong in {result['rtt_ms']:.0f} ms")
+        elif result["probe_error"]:
+            print(f"  probe: no reply ({result['probe_error']})")
+        print(f"  last seen: {_ago(time.time() - result['last_seen'])} ago")
+        print(f"  note: {result['note']}")
+    return _EXIT_OK if result["reachable"] else _EXIT_ERROR
+
+
+def cmd_mesh(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        rows = node.mesh_snapshot()
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit({"peers": rows, "count": len(rows)}, True)
+        return _EXIT_OK
+    if not rows:
+        print("No peers known. Run `tau discover` or `tau serve` first.")
+        return _EXIT_OK
+    now = time.time()
+    header = ("NAME", "DESTINATION", "HOPS", "REACHABLE", "LAST SEEN")
+    table: List[tuple] = [header]
+    for row in rows:
+        table.append(
+            (
+                row["name"],
+                row["destination"],
+                str(row["hops"]) if row["hops"] is not None else "—",
+                "yes" if row["reachable"] else "no",
+                _ago(now - row["last_seen"]),
+            )
+        )
+    widths = [max(len(row[i]) for row in table) for i in range(len(header))]
+    for row in table:
+        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+    print(
+        "\nReachability is a snapshot from Reticulum's path table, not a "
+        "promise — paths change as the mesh shifts."
+    )
     return _EXIT_OK
 
 

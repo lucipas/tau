@@ -20,6 +20,7 @@ Global options may appear before or after the command:
 | `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER [--to PEER ...] TEXT` | Send a message over an encrypted link (queued if the peer is offline; `--to` is repeatable) |
 | `tau send --to PEER --reply-to ID TEXT` | Reply to an earlier message in the conversation, quoting it |
+| `tau send --to PEER --location "LAT,LON [PLACE]"` | Pin a place on the message (static pin; without message text the place name — or the coordinates — becomes the text; the pin renders in `tau messages` and the console with an open-in-maps link; a live beacon is a later step) |
 | `tau react MESSAGE-ID EMOJI` | React to a received message (one emoji or short token; `--clear` retracts) |
 | `tau typing start\|stop --to PEER` | Send a live typing event to a peer (`--group NAME\|ID` types in a group instead; live-only, never queued) |
 | `tau send-file --to PEER PATH` | Send a small file (at most 10 MiB) over an RNS Resource on a direct link |
@@ -43,7 +44,7 @@ Global options may appear before or after the command:
 | `tau group leave GROUP` | Leave a group you joined: drop it and remember the id, so the next message for it is rejected instead of re-pinning the group (refuses groups this node created — delete those instead) |
 | `tau group rejoin ID` | Undo a leave so the next message pins the group again (full group id) |
 | `tau group left` | List groups this node has left |
-| `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline; `--expire 30s` makes it a disappearing message, purged from receivers' inboxes after the duration; `--reply-to ID` replies to an earlier message in the group, quoting it; `--wait SECONDS` waits for queued legs to be delivered, exiting non-zero if one is still queued when the wait expires — options come before the group name, as with `--timeout`) |
+| `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline; `--expire 30s` makes it a disappearing message, purged from receivers' inboxes after the duration; `--reply-to ID` replies to an earlier message in the group, quoting it; `--location "LAT,LON [PLACE]"` pins a place on the message; `--wait SECONDS` waits for queued legs to be delivered, exiting non-zero if one is still queued when the wait expires — options come before the group name, as with `--timeout`) |
 | `tau group topic GROUP [TEXT]` | Set the topic of a group you created (`--clear` removes it; omit TEXT to show it; travels with group messages, members pin it from the creator) |
 | `tau group send-file GROUP FILE` | Send a file (at most 10 MiB) to every member of a group, one direct transfer per member (a member that cannot be reached or refuses is reported as failed, not queued) |
 | `tau group pin GROUP MESSAGE` | Pin one stored message in a group (message id or unique prefix within the group's history, received or sent; a message from another conversation is refused) — local-only, like `tau pin` |

@@ -165,6 +165,7 @@ def build_bundle(
                 group=group,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to if group is None else None,
+                location=entry.location if group is None else None,
                 kind=getattr(entry, "kind", None) if group is None else None,
                 edited_at=entry.edited_at,
             )

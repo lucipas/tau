@@ -144,6 +144,7 @@ from .protocol import (
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_in_reply_to,
+    clean_location,
     clean_reaction,
     decode,
     derive_group_id,
@@ -1852,6 +1853,7 @@ class TauNode:
                     request_expires_at=received_at + DM_REQUEST_TTL,
                     expires_at=message.get("expires_at"),
                     in_reply_to=message.get("in_reply_to"),
+                    location=message.get("location"),
                 ),
                 now=received_at,
             )
@@ -2228,6 +2230,8 @@ class TauNode:
                 }
                 if message.get("in_reply_to") is not None:
                     record["in_reply_to"] = message["in_reply_to"]
+                if message.get("location") is not None:
+                    record["location"] = message["location"]
                 log.info(
                     "Message from %s (%s): %s",
                     caller_name,
@@ -2629,6 +2633,8 @@ class TauNode:
             }
             if message.get("in_reply_to") is not None:
                 record["in_reply_to"] = message["in_reply_to"]
+            if message.get("location") is not None:
+                record["location"] = message["location"]
             if message.get("poll_options") is not None:
                 record["poll_options"] = message["poll_options"]
             if message.get("poll_vote") is not None:
@@ -4739,6 +4745,7 @@ class TauNode:
                 ),
                 in_reply_to=fresh.in_reply_to,
                 expires_at=fresh.message_expires_at,
+                location=fresh.location,
                 poll_options=fresh.poll_options,
                 poll_vote=fresh.poll_vote,
                 poll_close=fresh.poll_close,
@@ -4784,6 +4791,7 @@ class TauNode:
                 sent_at=fresh.wire_sent_at,
                 expires_at=fresh.message_expires_at,
                 in_reply_to=fresh.in_reply_to,
+                location=fresh.location,
                 kind=getattr(fresh, "kind", None),
             )
         # A replacement can still land after the fresh read: abort the
@@ -5068,6 +5076,7 @@ class TauNode:
                 group=sealed_group,
                 expires_at=fresh.message_expires_at,
                 in_reply_to=fresh.in_reply_to,
+                location=fresh.location,
                 kind=getattr(fresh, "kind", None),
                 edited_at=fresh.edited_at,
             )
@@ -5546,6 +5555,8 @@ class TauNode:
             record["group_name"] = pinned["name"]
         if message.get("in_reply_to") is not None:
             record["in_reply_to"] = message["in_reply_to"]
+        if message.get("location") is not None:
+            record["location"] = message["location"]
         if message.get("edited_at") is not None:
             # A relayed copy of an edited leg carries the edit's send
             # time inside its signed envelope: the record starts life
@@ -5964,6 +5975,7 @@ class TauNode:
         expires_at: Optional[float] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         kind: Optional[str] = None,
+        location: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
@@ -5974,7 +5986,10 @@ class TauNode:
         delivery is retried automatically whenever the peer — or any peer
         willing to hold a sealed copy — is heard from.  ``kind`` tags the
         message (``chat`` by default); it travels on the wire, survives
-        queueing, and is stored in the recipient's inbox.
+        queueing, and is stored in the recipient's inbox.  ``location``
+        pins a place on the message (see :func:`clean_location`): it
+        travels the same way, and a pin without an explicit kind is
+        tagged ``location`` so the receiver can filter on it.
 
         ``expires_at`` is an optional sender-set expiry (epoch seconds):
         it travels in the message payload and inside sealed relay
@@ -6000,6 +6015,15 @@ class TauNode:
         normalized = normalize_message(text)
         reply_to = clean_in_reply_to(in_reply_to)
         clean_kind = normalize_message_kind(kind)
+        cleaned_location = clean_location(location)
+        if location is not None and cleaned_location is None:
+            raise NodeError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
+        if cleaned_location is not None and kind is None:
+            # A pin without an explicit kind is a location message, so
+            # the receiver can filter on it; an explicit kind wins.
+            clean_kind = "location"
         if send_after is not None:
             if isinstance(send_after, bool) or not isinstance(
                 send_after, (int, float)
@@ -6051,6 +6075,7 @@ class TauNode:
             kind=clean_kind,
             expires_at=expires_at,
             in_reply_to=reply_to,
+            location=cleaned_location,
         )
         peer: Optional[Peer] = None
         try:
@@ -6081,6 +6106,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         in_reply_to=reply_to,
+                        location=cleaned_location,
                         kind=clean_kind,
                         send_after=send_after,
                     )
@@ -6111,6 +6137,11 @@ class TauNode:
                         "id": message_id,
                         "direction": "out",
                         **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                        **(
+                            {"location": cleaned_location}
+                            if cleaned_location is not None
+                            else {}
+                        ),
                     }
                 )
                 self.mailbox.record_sent(
@@ -6169,6 +6200,11 @@ class TauNode:
                     "id": message_id,
                     "direction": "out",
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    **(
+                        {"location": cleaned_location}
+                        if cleaned_location is not None
+                        else {}
+                    ),
                 }
             )
             if self.registry.get(peer.destination_hash) is None:
@@ -6209,6 +6245,7 @@ class TauNode:
                 message_id=message_id,
                 expires_at=expires_at,
                 in_reply_to=reply_to,
+                location=cleaned_location,
                 kind=clean_kind,
                 # A scheduled send to an undiscovered peer queues here:
                 # the not-before time must survive the fallback, or the
@@ -6227,6 +6264,11 @@ class TauNode:
                     "id": message_id,
                     "direction": "out",
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    **(
+                        {"location": cleaned_location}
+                        if cleaned_location is not None
+                        else {}
+                    ),
                 }
             )
             self.mailbox.record_sent(
@@ -6347,6 +6389,7 @@ class TauNode:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -6402,6 +6445,11 @@ class TauNode:
         both ride on every leg the same way, and a queued leg
         re-sends the same poll payload on retry.  At most one of the
         three may be set.
+
+        ``location`` pins a place on the message (see
+        :func:`clean_location`): it rides on every leg, through
+        queued legs and sealed relay copies, exactly like a direct
+        message pin.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -6474,6 +6522,11 @@ class TauNode:
         reply_to = clean_in_reply_to(in_reply_to)
         if reply_to is not None:
             reply_to = self._group_reply_reference(group["id"], reply_to)
+        cleaned_location = clean_location(location)
+        if location is not None and cleaned_location is None:
+            raise NodeError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         context = {
@@ -6512,6 +6565,7 @@ class TauNode:
                 poll_options=cleaned_options,
                 poll_vote=cleaned_vote,
                 poll_close=cleaned_close,
+                location=cleaned_location,
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -6572,6 +6626,7 @@ class TauNode:
                         sent_at=sent_at,
                         send_after=send_after,
                         in_reply_to=reply_to,
+                        location=cleaned_location,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -6626,6 +6681,7 @@ class TauNode:
                 poll_options=cleaned_options,
                 poll_vote=cleaned_vote,
                 poll_close=cleaned_close,
+                location=cleaned_location,
             )
             peer: Optional[Peer] = None
             if budget <= 0.0:
@@ -6672,6 +6728,7 @@ class TauNode:
                         group=context,
                         sent_at=sent_at,
                         in_reply_to=reply_to,
+                        location=cleaned_location,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -6819,6 +6876,7 @@ class TauNode:
                         group=context,
                         sent_at=sent_at,
                         in_reply_to=reply_to,
+                        location=cleaned_location,
                         poll_options=cleaned_options,
                         poll_vote=cleaned_vote,
                         poll_close=cleaned_close,
@@ -6894,6 +6952,11 @@ class TauNode:
                     "leg_sent_at": sent_at,
                     "direction": "out",
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    **(
+                        {"location": cleaned_location}
+                        if cleaned_location is not None
+                        else {}
+                    ),
                     **(
                         {"poll_options": cleaned_options}
                         if cleaned_options is not None
@@ -8128,6 +8191,7 @@ class TauNode:
                             sent_at=entry.wire_sent_at,
                             send_after=entry.send_after,
                             in_reply_to=entry.in_reply_to,
+                            location=entry.location,
                             edited_at=float(payload["sent_at"]),
                         )
                         requeued.append(entry.id)
@@ -8157,6 +8221,7 @@ class TauNode:
                                     sent_at=entry.wire_sent_at,
                                     send_after=entry.send_after,
                                     in_reply_to=entry.in_reply_to,
+                                    location=entry.location,
                                     edited_at=entry.edited_at,
                                 )
                             except MailboxError:
@@ -8464,6 +8529,122 @@ class TauNode:
             else min(timeout, 10.0),
         )
         return self._request(peer, REQUEST_PING, b"{}", timeout)
+
+    def _path_state(self, dest_hash: bytes) -> Tuple[bool, Optional[int]]:
+        """Live path state for *dest_hash*: (known, hops).
+
+        Hops come from Reticulum's path table, not the peer registry:
+        the registry only records the hop count heard at announce time,
+        which goes stale as the mesh shifts.  ``hops`` is ``None`` when
+        no path is known — ``hops_to`` returns the ``PATHFINDER_M``
+        sentinel (128) for unknown destinations, which is not a hop
+        count.  A transport that is not up yet reads as "no path".
+        """
+        try:
+            if not RNS.Transport.has_path(dest_hash):
+                return False, None
+            hops = RNS.Transport.hops_to(dest_hash)
+        except Exception:  # pragma: no cover - transport not up yet
+            log.debug("Path lookup failed", exc_info=True)
+            return False, None
+        if hops >= _PATHFINDER_MAX_HOPS:
+            return False, None
+        return True, hops
+
+    def trace(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = 15.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Trace the mesh path to *target* and probe it live.
+
+        Returns the peer, whether Reticulum currently knows a path, the
+        hop count from the live path table, and the round-trip of a ping
+        probe over that path.  Reticulum exposes no per-leg timing, so
+        the probe is one end-to-end round-trip, not a hop-by-hop
+        breakdown — the hop count is the path shape, the RTT is the
+        proof the whole path works.  A known path whose probe fails
+        still reports the path: the peer may be up but not answering
+        requests.  The result is a snapshot, not a promise — paths
+        change as the mesh shifts.
+        """
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        has_path, hops = self._path_state(peer.destination_hash)
+        if not has_path:
+            # One explicit path request before giving up: the peer may
+            # have announced since the registry was last read, and a
+            # fresh request can surface a path the table has not got.
+            try:
+                RNS.Transport.request_path(peer.destination_hash)
+            except Exception:  # pragma: no cover - transport not up yet
+                log.debug("Path request failed", exc_info=True)
+            deadline = time.time() + min(3.0, max(0.0, timeout))
+            while time.time() < deadline:
+                has_path, hops = self._path_state(peer.destination_hash)
+                if has_path:
+                    break
+                time.sleep(0.1)
+        rtt_ms: Optional[float] = None
+        probe_error: Optional[str] = None
+        if has_path:
+            try:
+                response = self.ping(peer, timeout=timeout, discover_timeout=0.0)
+                rtt = response.get("_rtt")
+                if isinstance(rtt, (int, float)):
+                    rtt_ms = round(float(rtt) * 1000.0, 1)
+            except (NodeError, PeerRefusedError) as exc:
+                probe_error = str(exc)
+        return {
+            "peer": peer.display_name,
+            "destination": peer.hexhash,
+            "has_path": has_path,
+            "hops": hops,
+            "rtt_ms": rtt_ms,
+            "reachable": rtt_ms is not None,
+            "last_seen": peer.last_seen,
+            "probe_error": probe_error,
+            "note": (
+                "Reticulum reports no per-leg timing; rtt_ms is one "
+                "end-to-end probe over the whole path."
+                if has_path
+                else "No path known; the peer may be offline or out of range."
+            ),
+        }
+
+    def mesh_snapshot(self) -> List[Dict[str, Any]]:
+        """One live reachability row per known peer.
+
+        Unlike ``tau peers``, which reads the registry offline, this
+        re-checks every peer against Reticulum's current path table,
+        so ``hops`` is the path as it stands now and ``reachable``
+        means a path is known — not merely that the peer announced
+        once.  Rows are sorted by display name; a peer whose path
+        vanished keeps its last-seen time so the owner can tell a
+        peer that went quiet from one never heard.
+        """
+        rows = []
+        for peer in self.registry.all():
+            has_path, hops = self._path_state(peer.destination_hash)
+            rows.append(
+                {
+                    "destination": peer.hexhash,
+                    "name": peer.display_name,
+                    "hops": hops,
+                    "has_path": has_path,
+                    "reachable": has_path,
+                    "last_seen": peer.last_seen,
+                    "verified": peer.is_verified,
+                }
+            )
+        rows.sort(key=lambda row: row["name"].lower())
+        return rows
 
     def request_info(
         self,

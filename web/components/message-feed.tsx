@@ -932,6 +932,26 @@ function MessageBubble({
           </div>
         ) : null}
 
+        {message.location ? (
+          <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-line/70 bg-void/50 px-2.5 py-1.5 font-mono text-[11px] text-zinc-300">
+            <span aria-hidden="true">📍</span>
+            <span className="min-w-0 flex-1 truncate">
+              {message.location.name ?? "Location"}
+            </span>
+            <span className="shrink-0 text-mist">
+              {message.location.lat}, {message.location.lon}
+            </span>
+            <a
+              className="shrink-0 text-signal hover:underline"
+              href={`https://www.openstreetmap.org/?mlat=${message.location.lat}&mlon=${message.location.lon}#map=15/${message.location.lat}/${message.location.lon}`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Open in Maps
+            </a>
+          </div>
+        ) : null}
+
         {message.reactions && message.reactions.length > 0 ? (
           <div
             className={`flex flex-wrap gap-1.5 px-1 pt-1.5 ${

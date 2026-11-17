@@ -1376,6 +1376,32 @@ def test_seal_and_open_keep_kind():
     assert message["kind"] == "ping"
 
 
+def test_seal_and_open_carries_location():
+    sender, recipient = make_identity_pair()
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-pin",
+        text="meet here",
+        sent_at=4242.0,
+        location=pin,
+    )
+    message = open_message(recipient, blob)
+    assert message["location"] == pin
+    # A sealed copy without a pin carries none, like a plain message.
+    plain = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-plain-pin",
+        text="hello",
+        sent_at=4242.0,
+    )
+    assert open_message(recipient, plain)["location"] is None
+
+
 def test_seal_and_open_default_kind_is_chat():
     sender, recipient = make_identity_pair()
     blob = seal_message(
@@ -1972,6 +1998,21 @@ def test_enqueue_group_poll_fields_survive_reload(tmp_path):
         "Saturday",
         "Sunday",
     ]
+
+    # A queued pin survives the outbox round-trip like a quote does.
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    pinned = box.enqueue(to=BOB, text="meet here", now=2002.0, location=pin)
+    assert pinned.location == pin
+    assert pinned.to_dict()["location"] == pin
+    reloaded = Mailbox(path)
+    stored = [e for e in reloaded.outbox_list() if e.id == pinned.id][0]
+    assert stored.location == pin
+    assert OutboxEntry.from_dict(stored.to_dict()).location == pin
+    # A malformed pin on an already-queued entry drops instead of
+    # making the outbox unreadable.
+    raw = pinned.to_dict()
+    raw["location"] = {"lat": 91, "lon": 0}
+    assert OutboxEntry.from_dict(raw).location is None
 
     vote = box.enqueue(
         to=BOB,

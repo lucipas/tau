@@ -464,6 +464,7 @@ def encode_group_message(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -502,6 +503,10 @@ def encode_group_message(
     poll its target names, and ``poll_close`` closes that poll — the
     text of either still reads as a plain message on a client that
     predates polls.  Only one of the three may be set.
+
+    ``location`` optionally pins a place on the message (see
+    :func:`clean_location`): a pin without coordinates is rejected,
+    so a caller cannot send a location message that renders nowhere.
     """
     if sum(
         field is not None for field in (poll_options, poll_vote, poll_close)
@@ -565,6 +570,11 @@ def encode_group_message(
         payload["poll_vote"] = cleaned_vote
     if cleaned_close is not None:
         payload["poll_close"] = cleaned_close
+    cleaned_location = clean_location(location)
+    if location is not None and cleaned_location is None:
+        raise ProtocolError("location must have a latitude -90..90 and a longitude -180..180")
+    if cleaned_location is not None:
+        payload["location"] = cleaned_location
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -657,6 +667,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "poll_options": parsed_options,
         "poll_vote": parsed_vote,
         "poll_close": parsed_close,
+        "location": clean_location(payload.get("location")),
     }
 
 
@@ -1479,6 +1490,118 @@ def clean_in_reply_to(value: Any) -> Optional[Dict[str, Any]]:
         "author": author,
         "sent_at": sent_at,
     }
+
+
+# A static location pin (``tau send --location``): latitude and
+# longitude in decimal degrees, plus an optional place name.  The
+# pin rides as a structured field on a message — a ``location``-kind
+# DM or a group message — so the receiver can render it with an
+# open-in-maps link instead of parsing coordinates out of the text.
+# A live beacon (periodic updates, expiry) is a later step; v1 is
+# the static pin only.
+MAX_LOCATION_NAME_LENGTH = 200
+_LOCATION_ARG_RE = re.compile(
+    r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)(?:\s+(.*?))?\s*$"
+)
+
+
+def clean_location(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate a location pin, or ``None`` when absent or malformed.
+
+    A malformed pin drops instead of breaking the message that
+    carries it — the text still reads — exactly like a malformed
+    ``in_reply_to`` drops the quote in the inbox.  Callers that
+    must reject a bad pin (``encode_message``) check the input was
+    not ``None`` and raise when cleaning returns ``None``.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    lat = value.get("lat")
+    lon = value.get("lon")
+    if (
+        isinstance(lat, bool)
+        or not isinstance(lat, (int, float))
+        or isinstance(lon, bool)
+        or not isinstance(lon, (int, float))
+    ):
+        return None
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        return None
+    if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+        return None
+    name = value.get("name")
+    if name is not None:
+        if not isinstance(name, str):
+            return None
+        name = name.strip()
+        if len(name) > MAX_LOCATION_NAME_LENGTH:
+            return None
+    cleaned: Dict[str, Any] = {"lat": lat, "lon": lon}
+    if name:
+        cleaned["name"] = name
+    return cleaned
+
+
+def parse_location_arg(text: Any) -> Dict[str, Any]:
+    """Parse a ``--location`` argument: ``"lat,lon [place name]"``.
+
+    The coordinates are decimal degrees; whitespace around the
+    comma is tolerated, and anything after the comma pair is the
+    place name.  Raises :class:`ValueError` with a usage-shaped
+    message when the argument does not parse.
+    """
+    if not isinstance(text, str):
+        raise ValueError(
+            '--location needs "lat,lon [place name]" '
+            '(e.g. --location "34.05,-83.88 Rock Springs Park")'
+        )
+    match = _LOCATION_ARG_RE.match(text)
+    if match is None:
+        raise ValueError(
+            '--location needs "lat,lon [place name]" '
+            '(e.g. --location "34.05,-83.88 Rock Springs Park")'
+        )
+    lat = float(match.group(1))
+    lon = float(match.group(2))
+    name = match.group(3)
+    location = clean_location({"lat": lat, "lon": lon, "name": name})
+    if location is None:
+        raise ValueError(
+            "location out of range: latitude -90..90, longitude -180..180"
+            + (
+                f", and the place name at most {MAX_LOCATION_NAME_LENGTH} "
+                "characters"
+                if name is not None and len(name) > MAX_LOCATION_NAME_LENGTH
+                else ""
+            )
+        )
+    return location
+
+
+def location_maps_url(location: Dict[str, Any]) -> str:
+    """OpenStreetMap link for a cleaned location pin."""
+    return (
+        "https://www.openstreetmap.org/?"
+        f"mlat={location['lat']}&mlon={location['lon']}"
+        f"#map=15/{location['lat']}/{location['lon']}"
+    )
+
+
+def location_default_text(location: Dict[str, Any]) -> str:
+    """Message text for a pin sent without its own text: the place name, or the coordinates."""
+    name = location.get("name")
+    if isinstance(name, str) and name:
+        return name
+    return f"📍 {location['lat']}, {location['lon']}"
+
+
 def encode_message(
     text: str,
     *,
@@ -1486,6 +1609,7 @@ def encode_message(
     sent_at: Optional[float] = None,
     expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
 ) -> bytes:
     """Encode a chat message for the ``/tau/message`` request.
@@ -1496,7 +1620,10 @@ def encode_message(
     it travels inside the encrypted payload (and inside the signed
     sealed envelope for relayed mail), so a relay cannot extend it.
     ``in_reply_to`` optionally names the earlier message this one
-    quotes.
+    quotes.  ``location`` optionally pins a place on the message
+    (see :func:`clean_location`): a pin without coordinates is
+    rejected, so a caller cannot send a location message that
+    renders nowhere.
     """
     payload = {
         "type": "message",
@@ -1514,6 +1641,11 @@ def encode_message(
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         payload["in_reply_to"] = reply_to
+    cleaned_location = clean_location(location)
+    if location is not None and cleaned_location is None:
+        raise ProtocolError("location must have a latitude -90..90 and a longitude -180..180")
+    if cleaned_location is not None:
+        payload["location"] = cleaned_location
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -1536,6 +1668,7 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         "id": message_id,
         "expires_at": _clean_expires_at(payload.get("expires_at")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
+        "location": clean_location(payload.get("location")),
     }
 
 

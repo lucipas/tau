@@ -5,6 +5,7 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    GET  /api/mesh         peers with live path-table reachability
     GET  /api/heard        non-tau announces heard since this node started
     POST /api/peers/forget  forget a peer ``{"target": "<name or hash>"}``
                            (optional ``"force": true`` strands queued mail)
@@ -281,6 +282,7 @@ from .protocol import (
     _clean_group_poll_target_or_none,
     _clean_group_poll_vote_or_none,
     clean_in_reply_to,
+    clean_location,
     clean_reaction,
     excerpt_hash,
     normalize_message,
@@ -894,6 +896,12 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         in_reply_to = None
     if in_reply_to is not None:
         message["in_reply_to"] = in_reply_to
+    # A location pin rides on the console entry so the feed can
+    # render it with an open-in-maps link; a malformed pin drops
+    # instead of the entry, and a hand-edited entry keeps its text.
+    location = clean_location(entry.get("location"))
+    if location is not None:
+        message["location"] = location
     # Group-poll fields ride on the console entry so a restarted
     # console still renders its polls; a malformed field drops
     # instead of the entry, and a hand-edited entry carrying several
@@ -7378,7 +7386,39 @@ class WebBridge:
                 blocklist is not None
                 and blocklist.is_blocked(item.get("destination"))
             )
+        # Live reachability from the serving node's path table, so the
+        # console peers table can tell a peer with a path now from one
+        # merely heard once: the registry's stored hop count is the
+        # announce-time value and goes stale as the mesh shifts.  A
+        # failed snapshot leaves the rows without the live keys rather
+        # than failing the whole peers poll.
+        try:
+            live = {
+                row["destination"]: row for row in self.mesh()
+            }
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read mesh snapshot", exc_info=True)
+            live = {}
+        for item in items:
+            row = live.get(item.get("destination"))
+            if row is not None:
+                item["reachable"] = row["reachable"]
+                item["live_hops"] = row["hops"]
         return items
+
+    def mesh(self) -> List[Dict[str, Any]]:
+        """Live reachability snapshot for every known peer.
+
+        Delegates to the serving node's path-table check; a node that
+        is not up yet has no live paths, so the snapshot is empty
+        rather than a stale registry read.  A node without the method
+        (older doubles) reads as no live paths instead of failing.
+        """
+        node = getattr(self, "node", None)
+        snapshot = getattr(node, "mesh_snapshot", None) if node else None
+        if not callable(snapshot):
+            return []
+        return snapshot()
 
     def heard(self) -> List[Dict[str, Any]]:
         """Non-tau announces heard since this node started, newest first.
@@ -9643,6 +9683,10 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                 )
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
+                return
+            if path == "/api/mesh":
+                rows = self.bridge.mesh()
+                self._send_json({"peers": rows, "count": len(rows)}, head_only)
                 return
             if path == "/api/heard":
                 heard = self.bridge.heard()

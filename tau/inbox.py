@@ -46,6 +46,7 @@ from .protocol import (
     _clean_group_poll_target_or_none,
     _clean_group_poll_vote_or_none,
     clean_in_reply_to,
+    clean_location,
     excerpt_hash,
     generate_message_id,
     normalize_message,
@@ -168,6 +169,10 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         # A corrupt or hand-edited reference never blocks the inbox;
         # the message itself is still readable, just unquoted.
         in_reply_to = None
+    # A location pin rides on the record the same way: a malformed
+    # pin drops instead of the record — the message is still
+    # readable, just without its map link.
+    location = clean_location(raw.get("location"))
     seq = raw.get("seq")
     if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
         seq = None
@@ -191,6 +196,8 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["edited_at"] = edited_at
     if in_reply_to is not None:
         record["in_reply_to"] = in_reply_to
+    if location is not None:
+        record["location"] = location
     leg_ids = raw.get("leg_ids")
     if isinstance(leg_ids, list):
         # One record per group send keeps every leg id, so any leg can
