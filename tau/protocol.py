@@ -108,6 +108,7 @@ REQUEST_RETRACT = "/tau/dm/retract"
 REQUEST_DM_EDIT = "/tau/dm/edit"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_PROFILE = "/tau/profile"
+REQUEST_FOLLOWS = "/tau/follows"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
 REQUEST_GROUP_MESSAGE = "/tau/group"
@@ -124,6 +125,7 @@ REQUEST_PATHS = (
     REQUEST_DM_EDIT,
     REQUEST_PEERS,
     REQUEST_PROFILE,
+    REQUEST_FOLLOWS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
     REQUEST_GROUP_MESSAGE,
@@ -1373,6 +1375,47 @@ def parse_profile_request(raw: Any) -> Dict[str, Any]:
     ):
         known_version = 0
     return {"known_version": known_version}
+
+
+def encode_follows_request(known_version: int = 0) -> bytes:
+    """Encode a ``/tau/follows`` request.
+
+    ``known_version`` is the newest follow-list version the requester
+    already holds for this peer (0 when none): the peer answers with
+    its follow list only when its version is newer, so asking again
+    about an unchanged list costs one small round trip instead of
+    the whole document.
+    """
+    if isinstance(known_version, bool) or not isinstance(known_version, int):
+        raise ProtocolError("known_version must be an integer")
+    if known_version < 0:
+        raise ProtocolError("known_version must not be negative")
+    return encode(
+        {
+            "type": "follows_request",
+            "v": PROTOCOL_VERSION,
+            "known_version": known_version,
+            "client": f"tau/{__version__}",
+        },
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_follows_request(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/follows`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "follows_request":
+        raise ProtocolError("expected a follows_request payload")
+    known_version = payload.get("known_version", 0)
+    if (
+        isinstance(known_version, bool)
+        or not isinstance(known_version, int)
+        or known_version < 0
+    ):
+        known_version = 0
+    return {"known_version": known_version}
+
+
 def excerpt_hash(text: str) -> str:
     """Short hash of a quoted message's text (first 16 hex of SHA-256).
 
