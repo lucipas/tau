@@ -62,9 +62,10 @@ Global options may appear before or after the command:
 | `tau outbox held` | List sealed messages held for other peers |
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
-| `tau page publish FILE.md [--title TEXT]` | Publish a Markdown file (at most 8 KiB) as this node's signed personal page (title defaults to the file's first `# ` heading) |
+| `tau page publish FILE.md [--title TEXT] [--file PATH ...]` | Publish a Markdown file (at most 8 KiB) as this node's signed personal page (title defaults to the file's first `# ` heading); each `--file` attaches one small file (at most 5, 32 KiB each) |
 | `tau page show` | Show your published personal page |
 | `tau page fetch PEER [--cached]` | Show a peer's signed personal page, fetching it live unless `--cached` |
+| `tau page file PEER NAME\|SHA256 [--to PATH] [--force] [--cached]` | Save one of a peer's linked page files to disk (fetched live unless `--cached`) |
 | `tau page allow list\|add PEER\|remove PEER\|on\|off` | Control who may fetch this node's page (public unless enforced) |
 | `tau block` | Silence a peer: drop their DMs and hide their Tan posts |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |

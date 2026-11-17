@@ -104,7 +104,17 @@ from .mailbox import (
     seal_message,
     seal_receipt,
 )
-from .pages import PageError, PageStore, load_local_page, verify_page
+from .pages import (
+    MAX_PAGE_FILE_BYTES,
+    PageError,
+    PageStore,
+    clean_page_file,
+    hash_page_file,
+    load_local_page,
+    load_page_file,
+    store_page_file,
+    verify_page,
+)
 from .peers import DESTINATION_HASH_BYTES, Peer, PeerError, PeerRegistry
 from .profile import (
     ProfileError,
@@ -144,6 +154,7 @@ from .protocol import (
     REQUEST_PROFILE,
     REQUEST_FOLLOWS,
     REQUEST_PAGE,
+    REQUEST_PAGE_FILE,
     REQUEST_READ,
     REQUEST_REACT,
     REQUEST_RETRACT,
@@ -171,6 +182,7 @@ from .protocol import (
     encode,
     encode_message,
     encode_follows_request,
+    encode_page_file_request,
     encode_page_request,
     encode_profile_request,
     encode_typing,
@@ -187,6 +199,7 @@ from .protocol import (
     parse_media_request,
     parse_message,
     parse_follows_request,
+    parse_page_file_request,
     parse_page_request,
     parse_profile_request,
     parse_read_receipt,
@@ -1038,6 +1051,7 @@ class TauNode:
             REQUEST_PROFILE: self._handle_profile,
             REQUEST_FOLLOWS: self._handle_follows,
             REQUEST_PAGE: self._handle_page,
+            REQUEST_PAGE_FILE: self._handle_page_file,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
         }
@@ -1882,6 +1896,64 @@ class TauNode:
         if page is not None and page["version"] <= request["known_version"]:
             page = None
         return response_ok(page=page)
+
+    def _handle_page_file(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Answer a ``/tau/page/file`` request with one linked file.
+
+        The file is named by its SHA-256 alone, and the bytes are
+        checked against that hash before they are sent — the name is
+        the trust, so a corrupted blob on disk is never served.  The
+        fetch is gated by the same allow-list as the page itself: a
+        file is part of the page, so whoever may not fetch the page
+        may not fetch its files either.
+        """
+        try:
+            request = parse_page_file_request(data)
+        except ProtocolError as exc:
+            return response_error("bad_request", str(exc))
+        caller = self._caller_label(remote_identity)
+        if not self._page_allowlist().is_allowed(caller):
+            return response_error("not_allowed", "page fetch not allowed")
+        # Pick up a page published since this node started.
+        self.refresh_local_page()
+        page = self.local_page
+        if page is None:
+            return response_error("no_page", "no page published")
+        entry = next(
+            (
+                item
+                for item in page.get("files", [])
+                if item["sha256"] == request["sha256"]
+            ),
+            None,
+        )
+        if entry is None:
+            return response_error(
+                "unknown_file", "no linked file with that SHA-256"
+            )
+        data = load_page_file(
+            getattr(self.config, "page_files_dir", None),
+            request["sha256"],
+        )
+        if data is None:
+            return response_error(
+                "unavailable", "linked file is not stored on this node"
+            )
+        return response_ok(
+            file={
+                "name": entry["name"],
+                "sha256": entry["sha256"],
+                "size": entry["size"],
+                "data": base64.b64encode(data).decode("ascii"),
+            }
+        )
 
     def _record_received(self, record: Dict[str, Any]) -> None:
         """Persist a delivered DM to the inbox; never break delivery."""
@@ -9133,7 +9205,88 @@ class TauNode:
             raise NodeError("page key does not match the peer")
         if self.page_store.store(verified):
             self.page_store.save()
+        # A newer page may link files this node does not hold yet;
+        # fetch each missing one.  A file that cannot be fetched
+        # leaves the page stored without it — the page is the
+        # record, its files are attachments — so a failure is logged
+        # and the fetch of the other files continues.
+        for entry in verified.get("files", []):
+            if load_page_file(
+                getattr(self.config, "page_files_dir", None),
+                entry["sha256"],
+            ) is not None:
+                continue
+            try:
+                self.request_page_file(peer, entry, timeout=timeout)
+            except NodeError as exc:
+                log.warning(
+                    "Could not fetch linked page file %s from %s: %s",
+                    entry["name"],
+                    peer.display_name,
+                    exc,
+                )
         return verified
+
+    def request_page_file(
+        self,
+        target: Union[str, bytes, Peer],
+        entry: Dict[str, Any],
+        *,
+        timeout: float = 15.0,
+        discover_timeout: Optional[float] = None,
+    ) -> bytes:
+        """Fetch one linked page file from a peer, verifying its hash.
+
+        *entry* is one file entry from the peer's signed page
+        (name, SHA-256, size).  The returned bytes are checked
+        against the entry's hash and size before they are stored, so
+        a peer that answers with the wrong bytes cannot plant a file
+        under a trusted name.  Raises :class:`NodeError` when the
+        peer cannot be reached, refuses the fetch, or answers with
+        bytes that do not match the entry.
+        """
+        try:
+            clean = clean_page_file(entry)
+        except PageError as exc:
+            raise NodeError(f"invalid page file entry: {exc}") from exc
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        response = self._request(
+            peer,
+            REQUEST_PAGE_FILE,
+            encode_page_file_request(clean["sha256"]),
+            timeout,
+        )
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise NodeError("peer gave an invalid page file response")
+        payload = response.get("file")
+        if not isinstance(payload, dict):
+            raise NodeError("peer gave an invalid page file response")
+        if payload.get("sha256") != clean["sha256"]:
+            raise NodeError("page file hash does not match the page")
+        if payload.get("size") != clean["size"]:
+            raise NodeError("page file size does not match the page")
+        try:
+            data = base64.b64decode(payload.get("data"), validate=True)
+        except (TypeError, ValueError, base64.binascii.Error) as exc:
+            raise NodeError("peer gave an invalid page file encoding") from exc
+        if len(data) != clean["size"] or len(data) > MAX_PAGE_FILE_BYTES:
+            raise NodeError("page file bytes do not match the page")
+        if hash_page_file(data) != clean["sha256"]:
+            raise NodeError("page file bytes do not match the page")
+        try:
+            store_page_file(
+                getattr(self.config, "page_files_dir", None),
+                clean["sha256"],
+                data,
+            )
+        except PageError as exc:
+            raise NodeError(f"could not store page file: {exc}") from exc
+        return data
 
     def exchange_peers(
         self,

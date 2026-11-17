@@ -17,6 +17,15 @@ is kept; older or invalidly-signed versions are dropped.
 Fetching is gated by a NomadNet-style allow-list (``page-allowed.json``):
 with no list file the page is public; once the list is enabled, only
 listed destination hashes may fetch it.
+
+A page may link up to five small files (32 KiB each — small enough
+that one still fits a 64 KiB response as base64).  The file list is
+part of the signed body (name, SHA-256 and size per file), so a peer
+cannot swap a file without breaking the signature; the bytes
+themselves travel over ``/tau/page/file`` and are checked against
+their hash on arrival.  File bytes live under ``page-files/`` in the
+data directory, one file per SHA-256, so identical content is stored
+once no matter which author linked it.
 """
 
 from __future__ import annotations
@@ -35,16 +44,28 @@ import RNS
 
 from .identity import load_public_key
 from .protocol import APP_NAME, ASPECT
-from .util import atomic_write_json, read_json
+from .util import atomic_write_bytes, atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
 
-PAGE_VERSION = 1
+PAGE_VERSION = 2
+# Version 1 pages (no linked files) still verify: their canonical
+# body has no "files" field, so a v1 signature is checked against
+# the v1 field set.  New pages are v2 and sign the file list too.
+SUPPORTED_PAGE_VERSIONS = (1, 2)
 # A page is a small Markdown document: 8 KiB of UTF-8 is a notice
 # board, a meetup page or a status page, and it still fits the 64 KiB
 # response budget with the signature and key beside it.
 MAX_PAGE_BYTES = 8 * 1024
 MAX_PAGE_TITLE_CHARS = 200
+# Linked files: five at most, 32 KiB each — a 32 KiB file is ~43 KiB
+# as base64, so one file still fits a single 64 KiB response with
+# the envelope beside it.  Anything bigger is a file transfer, not
+# a page attachment.
+MAX_PAGE_FILES = 5
+MAX_PAGE_FILE_BYTES = 32 * 1024
+MAX_PAGE_FILE_NAME_CHARS = 100
+SHA256_HEX_LENGTH = 64
 SIG_HEX_LENGTH = 128
 KEY_HEX_LENGTH = 128
 AUTHOR_HEX_LENGTH = 32
@@ -114,6 +135,90 @@ def title_from_markdown(markdown: str) -> str:
     return ""
 
 
+def clean_page_file_name(value: Any) -> str:
+    """Normalise a linked file's display name: a plain basename.
+
+    The name is what the file is saved as on fetch, so it must not
+    carry a path — no separators, no ``.`` or ``..``, no control
+    characters — and it stays short enough to be a sane filename.
+    """
+    if not isinstance(value, str):
+        raise PageError("file name must be a string")
+    name = value.strip()
+    if not name:
+        raise PageError("file name must not be blank")
+    if name in (".", "..") or "/" in name or "\\" in name:
+        raise PageError(f"file name must be a plain filename: {value!r}")
+    if any(not char.isprintable() for char in name):
+        raise PageError("file name must contain only printable characters")
+    if len(name) > MAX_PAGE_FILE_NAME_CHARS:
+        raise PageError(
+            f"file name is longer than {MAX_PAGE_FILE_NAME_CHARS} characters "
+            f"({len(name)} given)"
+        )
+    return name
+
+
+def hash_page_file(data: bytes) -> str:
+    """SHA-256 of file bytes, as lowercase hex."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def make_page_file_entry(name: str, data: bytes) -> Dict[str, Any]:
+    """The signed file-list entry for *name* holding *data*."""
+    if len(data) > MAX_PAGE_FILE_BYTES:
+        raise PageError(
+            f"page file is larger than {MAX_PAGE_FILE_BYTES} bytes "
+            f"({len(data)} given)"
+        )
+    if not data:
+        raise PageError("page file must not be empty")
+    return {
+        "name": clean_page_file_name(name),
+        "sha256": hash_page_file(data),
+        "size": len(data),
+    }
+
+
+def clean_page_file(value: Any) -> Dict[str, Any]:
+    """Validate one linked-file entry (name, SHA-256, size)."""
+    if not isinstance(value, dict):
+        raise PageError("page file must be a JSON object")
+    name = clean_page_file_name(value.get("name"))
+    sha256 = _require_hex(value.get("sha256"), SHA256_HEX_LENGTH, "sha256")
+    size = value.get("size")
+    if isinstance(size, bool) or not isinstance(size, int):
+        raise PageError("page file size must be an integer")
+    if size < 1 or size > MAX_PAGE_FILE_BYTES:
+        raise PageError(
+            f"page file size must be between 1 and {MAX_PAGE_FILE_BYTES} "
+            f"bytes ({size!r} given)"
+        )
+    return {"name": name, "sha256": sha256, "size": size}
+
+
+def clean_page_files(value: Any) -> List[Dict[str, Any]]:
+    """Validate a page's linked-file list: at most five, unique names.
+
+    An absent list is ``[]``, so pages published before files existed
+    keep verifying unchanged.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise PageError("page files must be a list")
+    if len(value) > MAX_PAGE_FILES:
+        raise PageError(
+            f"a page links at most {MAX_PAGE_FILES} files "
+            f"({len(value)} given)"
+        )
+    cleaned = [clean_page_file(entry) for entry in value]
+    names = [entry["name"] for entry in cleaned]
+    if len(set(names)) != len(names):
+        raise PageError("page file names must be unique")
+    return cleaned
+
+
 def _require_hex(value: Any, length: int, field: str) -> str:
     if not isinstance(value, str):
         raise PageError(f"{field} must be a hex string")
@@ -137,8 +242,12 @@ def _require_timestamp(value: Any, field: str) -> float:
 
 
 def _unsigned_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """The fields covered by the signature, in canonical form."""
-    return {
+    """The fields covered by the signature, in canonical form.
+
+    Version 1 pages sign the field set they were built with (no
+    ``files``); version 2 adds the linked-file list.
+    """
+    fields: Dict[str, Any] = {
         "v": doc["v"],
         "author": doc["author"],
         "key": doc["key"],
@@ -147,6 +256,9 @@ def _unsigned_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
         "version": doc["version"],
         "updated_at": doc["updated_at"],
     }
+    if doc["v"] == PAGE_VERSION:
+        fields["files"] = doc["files"]
+    return fields
 
 
 def canonical_page_bytes(doc: Dict[str, Any]) -> bytes:
@@ -177,7 +289,9 @@ def normalize_page(doc: Any, *, now: Optional[float] = None) -> Dict[str, Any]:
         raise PageError("page must be a JSON object")
 
     version_field = doc.get("v", PAGE_VERSION)
-    if isinstance(version_field, bool) or version_field != PAGE_VERSION:
+    if isinstance(version_field, bool) or version_field not in (
+        SUPPORTED_PAGE_VERSIONS
+    ):
         raise PageError(f"unsupported page version: {version_field!r}")
 
     author = _require_hex(doc.get("author"), AUTHOR_HEX_LENGTH, "author")
@@ -185,6 +299,13 @@ def normalize_page(doc: Any, *, now: Optional[float] = None) -> Dict[str, Any]:
 
     title = clean_title(doc.get("title", ""))
     markdown = clean_markdown(doc.get("markdown", ""))
+    # A v1 page never signed a file list, so one it carries is
+    # unsigned and ignored; v2 validates it as part of the body.
+    files = (
+        clean_page_files(doc.get("files"))
+        if version_field == PAGE_VERSION
+        else []
+    )
 
     version = doc.get("version")
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
@@ -195,11 +316,12 @@ def normalize_page(doc: Any, *, now: Optional[float] = None) -> Dict[str, Any]:
         raise PageError("page timestamp is too far in the future")
 
     return {
-        "v": PAGE_VERSION,
+        "v": version_field,
         "author": author,
         "key": key,
         "title": title,
         "markdown": markdown,
+        "files": files,
         "version": version,
         "updated_at": updated_at,
     }
@@ -210,6 +332,7 @@ def build_page(
     *,
     title: str,
     markdown: str,
+    files: Optional[List[Dict[str, Any]]] = None,
     version: int = 1,
     updated_at: Optional[float] = None,
     now: Optional[float] = None,
@@ -220,7 +343,10 @@ def build_page(
     Tan entry: the digest is signed, so any change to a field breaks
     verification.  *version* is the author's monotonic revision
     number — callers bump it on every publish, and receivers keep
-    only the newest version they have seen.
+    only the newest version they have seen.  *files* is the page's
+    linked-file list (entries from :func:`make_page_file_entry`); the
+    list is part of the signed body, so a swapped file breaks the
+    signature just like swapped text.
     """
     timestamp = round(float(updated_at if updated_at is not None else time.time()), 3)
     unsigned = normalize_page(
@@ -230,6 +356,7 @@ def build_page(
             "key": identity.get_public_key().hex(),
             "title": title,
             "markdown": markdown,
+            "files": clean_page_files(files),
             "version": version,
             "updated_at": timestamp,
         },
@@ -285,6 +412,7 @@ def public_page(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "author": doc["author"],
         "title": doc["title"],
         "markdown": doc["markdown"],
+        "files": [dict(entry) for entry in doc.get("files", [])],
         "version": doc["version"],
         "updated_at": doc["updated_at"],
     }
@@ -314,6 +442,53 @@ def save_local_page(path: Union[str, Path], doc: Dict[str, Any]) -> Path:
     target = Path(path).expanduser()
     atomic_write_json(target, doc, mode=0o600)
     return target
+
+
+def page_file_path(directory: Optional[Union[str, Path]], sha256: str) -> Optional[Path]:
+    """Where the blob for *sha256* lives under *directory*, or None."""
+    if directory is None:
+        return None
+    return Path(directory).expanduser() / sha256
+
+
+def store_page_file(
+    directory: Optional[Union[str, Path]], sha256: str, data: bytes
+) -> Optional[Path]:
+    """Store file bytes under their SHA-256, verifying the hash first.
+
+    Returns the stored path, or None with no directory.  Raises
+    :class:`PageError` when the bytes do not hash to *sha256* — a
+    stored blob is trusted by its name, so a mismatch is never
+    written.
+    """
+    target = page_file_path(directory, sha256)
+    if target is None:
+        return None
+    if hash_page_file(data) != sha256:
+        raise PageError("page file bytes do not match their SHA-256")
+    return atomic_write_bytes(target, data, mode=0o600)
+
+
+def load_page_file(
+    directory: Optional[Union[str, Path]], sha256: str
+) -> Optional[bytes]:
+    """Load stored file bytes, or None when absent or hash-mismatched.
+
+    A blob whose bytes no longer match its name is treated as
+    missing (with a warning), never served: the name is the trust.
+    """
+    target = page_file_path(directory, sha256)
+    if target is None or not target.is_file():
+        return None
+    try:
+        data = target.read_bytes()
+    except OSError as exc:
+        log.warning("Could not read stored page file at %s: %s", target, exc)
+        return None
+    if hash_page_file(data) != sha256:
+        log.warning("Ignoring stored page file at %s: hash mismatch", target)
+        return None
+    return data
 
 
 class PageStore:

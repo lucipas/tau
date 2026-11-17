@@ -110,6 +110,7 @@ REQUEST_PEERS = "/tau/peers"
 REQUEST_PROFILE = "/tau/profile"
 REQUEST_FOLLOWS = "/tau/follows"
 REQUEST_PAGE = "/tau/page"
+REQUEST_PAGE_FILE = "/tau/page/file"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
 REQUEST_GROUP_MESSAGE = "/tau/group"
@@ -128,6 +129,7 @@ REQUEST_PATHS = (
     REQUEST_PROFILE,
     REQUEST_FOLLOWS,
     REQUEST_PAGE,
+    REQUEST_PAGE_FILE,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
     REQUEST_GROUP_MESSAGE,
@@ -1470,6 +1472,52 @@ def parse_page_request(raw: Any) -> Dict[str, Any]:
     ):
         known_version = 0
     return {"known_version": known_version}
+
+
+def encode_page_file_request(sha256: str) -> bytes:
+    """Encode a ``/tau/page/file`` request for one linked file.
+
+    The file is named by its SHA-256 alone: the hash is the trust,
+    so the peer answers with the bytes its page lists under that
+    hash, and the requester checks the bytes against the hash before
+    storing them.
+    """
+    if not isinstance(sha256, str):
+        raise ProtocolError("sha256 must be a hex string")
+    digest = sha256.strip().lower()
+    if len(digest) != 64:
+        raise ProtocolError("sha256 must be 64 hex characters")
+    try:
+        bytes.fromhex(digest)
+    except ValueError as exc:
+        raise ProtocolError("sha256 is not valid hex") from exc
+    return encode(
+        {
+            "type": "page_file_request",
+            "v": PROTOCOL_VERSION,
+            "sha256": digest,
+            "client": f"tau/{__version__}",
+        },
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_page_file_request(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/page/file`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "page_file_request":
+        raise ProtocolError("expected a page_file_request payload")
+    sha256 = payload.get("sha256")
+    if not isinstance(sha256, str):
+        raise ProtocolError("sha256 must be a hex string")
+    digest = sha256.strip().lower()
+    if len(digest) != 64:
+        raise ProtocolError("sha256 must be 64 hex characters")
+    try:
+        bytes.fromhex(digest)
+    except ValueError as exc:
+        raise ProtocolError("sha256 is not valid hex") from exc
+    return {"sha256": digest}
 
 
 def excerpt_hash(text: str) -> str:

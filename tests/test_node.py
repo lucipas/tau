@@ -2738,6 +2738,226 @@ def test_request_page_rejects_bad_response(tmp_path):
         node.request_page(peer)
 
 
+def _page_peer_with_files():
+    """A peer identity, its signed page with one linked file, and the bytes."""
+    from tau.pages import build_page, make_page_file_entry
+
+    data = b"meetup notes and map"
+    entry = make_page_file_entry("notes.txt", data)
+    peer_identity = RNS.Identity()
+    destination = RNS.Destination.hash(peer_identity, APP_NAME, ASPECT)
+    peer = Peer(
+        destination_hash=destination,
+        name="alice",
+        public_key=peer_identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    doc = build_page(
+        peer_identity,
+        title="Mesh meetup",
+        markdown="# Mesh meetup\n\nSaturday, 2pm.\n",
+        files=[entry],
+        version=2,
+        updated_at=1000.0,
+    )
+    return peer, doc, entry, data
+
+
+def test_handle_page_file_serves_linked_file(tmp_path):
+    import base64
+
+    from tau.pages import save_local_page, store_page_file
+    from tau.protocol import decode, encode_page_file_request
+
+    node = make_node(tmp_path)
+    _peer, doc, entry, data = _page_peer_with_files()
+    save_local_page(node.config.page_path, doc)
+    store_page_file(node.config.page_files_dir, entry["sha256"], data)
+    raw = node._handle_page_file(
+        "/tau/page/file",
+        encode_page_file_request(entry["sha256"]),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is True
+    assert response["file"]["name"] == "notes.txt"
+    assert response["file"]["sha256"] == entry["sha256"]
+    assert response["file"]["size"] == len(data)
+    assert base64.b64decode(response["file"]["data"]) == data
+
+
+def test_handle_page_file_rejects_unknown_sha(tmp_path):
+    from tau.pages import save_local_page
+    from tau.protocol import decode, encode_page_file_request
+
+    node = make_node(tmp_path)
+    _peer, doc, entry, data = _page_peer_with_files()
+    save_local_page(node.config.page_path, doc)
+    raw = node._handle_page_file(
+        "/tau/page/file",
+        encode_page_file_request("0" * 64),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unknown_file"
+
+
+def test_handle_page_file_without_local_page(tmp_path):
+    from tau.protocol import decode, encode_page_file_request
+
+    node = make_node(tmp_path)
+    assert node.local_page is None
+    raw = node._handle_page_file(
+        "/tau/page/file",
+        encode_page_file_request("0" * 64),
+        b"request-id",
+        None,
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "no_page"
+
+
+def test_handle_page_file_denies_unlisted_caller(tmp_path):
+    import json
+
+    from tau.pages import save_local_page, store_page_file
+    from tau.protocol import decode, encode_page_file_request
+
+    node = make_node(tmp_path)
+    _peer, doc, entry, data = _page_peer_with_files()
+    save_local_page(node.config.page_path, doc)
+    store_page_file(node.config.page_files_dir, entry["sha256"], data)
+    other = RNS.Identity()
+    other_hash = RNS.Destination.hash(other, APP_NAME, ASPECT).hex()
+    node.config.page_allowlist_path.write_text(
+        json.dumps({"enabled": True, "allow": [other_hash]}),
+        encoding="utf-8",
+    )
+    raw = node._handle_page_file(
+        "/tau/page/file",
+        encode_page_file_request(entry["sha256"]),
+        b"request-id",
+        RNS.Identity(),
+        time.time(),
+    )
+    response = decode(raw)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+
+
+def test_request_page_fetches_linked_files(tmp_path):
+    import base64
+
+    from tau.pages import load_page_file
+    from tau.protocol import REQUEST_PAGE, REQUEST_PAGE_FILE
+
+    node = make_node(tmp_path)
+    peer, doc, entry, data = _page_peer_with_files()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    seen = []
+
+    def fake_request(peer_arg, path, payload, timeout):
+        seen.append(path)
+        if path == REQUEST_PAGE:
+            return {"ok": True, "v": 1, "page": doc}
+        assert path == REQUEST_PAGE_FILE
+        return {
+            "ok": True,
+            "v": 1,
+            "file": {
+                "name": entry["name"],
+                "sha256": entry["sha256"],
+                "size": len(data),
+                "data": base64.b64encode(data).decode("ascii"),
+            },
+        }
+
+    node._request = fake_request
+    result = node.request_page(peer)
+    assert result is not None and result["version"] == 2
+    assert seen == [REQUEST_PAGE, REQUEST_PAGE_FILE]
+    assert load_page_file(node.config.page_files_dir, entry["sha256"]) == data
+
+
+def test_request_page_tolerates_failed_file_fetch(tmp_path):
+    from tau.pages import load_page_file
+    from tau.protocol import REQUEST_PAGE, REQUEST_PAGE_FILE
+
+    node = make_node(tmp_path)
+    peer, doc, entry, _data = _page_peer_with_files()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+
+    def fake_request(peer_arg, path, payload, timeout):
+        if path == REQUEST_PAGE:
+            return {"ok": True, "v": 1, "page": doc}
+        assert path == REQUEST_PAGE_FILE
+        return {"ok": False, "v": 1, "error": {"code": "gone", "message": "x"}}
+
+    node._request = fake_request
+    result = node.request_page(peer)
+    assert result is not None and result["version"] == 2
+    # The page is stored even though its file could not be fetched.
+    assert node.page_store.get(peer.hexhash) is not None
+    assert load_page_file(node.config.page_files_dir, entry["sha256"]) is None
+
+
+def test_request_page_file_rejects_hash_mismatch(tmp_path):
+    import base64
+
+    node = make_node(tmp_path)
+    peer, _doc, entry, _data = _page_peer_with_files()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    wrong = base64.b64encode(b"different bytes here").decode("ascii")
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "v": 1,
+        "file": {
+            "name": entry["name"],
+            "sha256": entry["sha256"],
+            "size": len(b"different bytes here"),
+            "data": wrong,
+        },
+    }
+    with pytest.raises(NodeError, match="do not match the page"):
+        node.request_page_file(peer, entry)
+
+
+def test_request_page_file_rejects_wrong_size(tmp_path):
+    import base64
+
+    node = make_node(tmp_path)
+    peer, _doc, entry, data = _page_peer_with_files()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "v": 1,
+        "file": {
+            "name": entry["name"],
+            "sha256": entry["sha256"],
+            "size": 999,
+            "data": base64.b64encode(data).decode("ascii"),
+        },
+    }
+    with pytest.raises(NodeError, match="size does not match"):
+        node.request_page_file(peer, entry)
+
+
 def test_on_announce_fetches_newer_profile(tmp_path, monkeypatch):
     node = _heard_node(tmp_path, monkeypatch, hops=1)
     fetches = []
