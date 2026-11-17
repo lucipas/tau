@@ -39,7 +39,11 @@ ARCHIVED_FILE_NAME = "archived.json"
 DISAPPEARING_FILE_NAME = "disappearing.json"
 MUTED_FILE_NAME = "muted.json"
 DM_REQUESTS_FILE_NAME = "dm-requests.json"
+INVITES_FILE_NAME = "invites.json"
+JOIN_REQUESTS_FILE_NAME = "join-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
+PROFILE_FILE_NAME = "profile.json"
+PROFILES_FILE_NAME = "profiles.json"
 NODE_LOCK_FILE_NAME = "node.lock"
 RNS_DIR_NAME = "reticulum"
 RNS_CONFIG_FILE_NAME = "config"
@@ -77,7 +81,11 @@ class TauConfig:
     disappearing_path: Path
     muted_path: Path
     dm_requests_path: Path
+    invites_path: Path
+    join_requests_path: Path
     scheduled_posts_path: Path
+    profile_path: Path
+    profiles_path: Path
     name: str
     rns_loglevel: int = 2
     announce_interval: float = 300.0
@@ -121,7 +129,11 @@ class TauConfig:
             disappearing_path=base / DISAPPEARING_FILE_NAME,
             muted_path=base / MUTED_FILE_NAME,
             dm_requests_path=base / DM_REQUESTS_FILE_NAME,
+            invites_path=base / INVITES_FILE_NAME,
+            join_requests_path=base / JOIN_REQUESTS_FILE_NAME,
             scheduled_posts_path=base / SCHEDULED_POSTS_FILE_NAME,
+            profile_path=base / PROFILE_FILE_NAME,
+            profiles_path=base / PROFILES_FILE_NAME,
             name=node_name,
             rns_loglevel=rns_loglevel,
             announce_interval=announce_interval,

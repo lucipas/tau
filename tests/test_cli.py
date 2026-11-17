@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -1756,6 +1757,286 @@ def test_peers_show_via_exchange(tmp_path, capsys):
     assert "via exchange: yes — never heard directly" in out
     assert "queued mail:  0 message(s)" in out
     assert "received:     0 message(s)" in out
+
+
+def _init_owner_node(tmp_path, capsys):
+    """Init a node directory and drain the init payload."""
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "owner",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    return data_dir
+
+
+def test_parser_profile_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "profile",
+            "set",
+            "--bio",
+            "hello",
+            "--link",
+            "https://a.example",
+            "--link",
+            "https://b.example",
+        ]
+    )
+    assert args.command == "profile"
+    assert args.profile_command == "set"
+    assert args.bio == "hello"
+    assert args.links == ["https://a.example", "https://b.example"]
+    assert args.func is cli.cmd_profile_set
+
+    show = parser.parse_args(["profile", "show"])
+    assert show.profile_command == "show"
+    assert show.func is cli.cmd_profile_show
+
+    peer_profile = parser.parse_args(["peers", "profile", "alice"])
+    assert peer_profile.peers_command == "profile"
+    assert peer_profile.target == "alice"
+    assert peer_profile.cached is False
+    assert peer_profile.func is cli.cmd_peers_profile
+
+    # A bare `tau profile` names no subcommand: argparse must fail
+    # cleanly instead of dispatching with no function set.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["profile"])
+
+
+def test_profile_set_and_show_end_to_end(tmp_path, capsys):
+    from tau.profile import load_local_profile
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    avatar = tmp_path / "avatar.png"
+    avatar.write_bytes(b"fake image bytes")
+
+    code = cli.main(
+        [
+            "profile",
+            "set",
+            "--display-name",
+            "Owner",
+            "--bio",
+            "mesh tinkerer",
+            "--avatar",
+            str(avatar),
+            "--link",
+            "https://example.com",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Published profile version 1 for Owner." in out
+    assert "mesh tinkerer" in out
+    assert "https://example.com" in out
+
+    stored = load_local_profile(data_dir / "profile.json")
+    assert stored is not None
+    assert stored["version"] == 1
+    assert stored["bio"] == "mesh tinkerer"
+    assert stored["links"] == ["https://example.com"]
+    assert stored["avatar"] == hashlib.sha256(b"fake image bytes").hexdigest()
+
+    # A second set bumps the version and keeps what was not re-set.
+    code = cli.main(
+        ["profile", "set", "--bio", "still tinkering", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "Published profile version 2" in capsys.readouterr().out
+    stored = load_local_profile(data_dir / "profile.json")
+    assert stored["version"] == 2
+    assert stored["bio"] == "still tinkering"
+    assert stored["links"] == ["https://example.com"]
+    assert stored["name"] == "Owner"
+
+    code = cli.main(["profile", "show", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["version"] == 2
+    assert payload["bio"] == "still tinkering"
+    assert payload["links"] == ["https://example.com"]
+
+    code = cli.main(["profile", "show", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "name:    Owner" in out
+    assert "bio:     still tinkering" in out
+    assert "version: 2" in out
+
+
+def test_profile_show_without_profile(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    code = cli.main(["profile", "show", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No profile published yet" in capsys.readouterr().out
+
+    code = cli.main(["profile", "show", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == {"profile": None}
+
+
+def test_profile_set_rejects_bad_values(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    base = ["profile", "set", "--data-dir", str(data_dir)]
+
+    code = cli.main(base + ["--bio", "x" * 281])
+    assert code == 1
+    assert "longer than 280" in capsys.readouterr().err
+
+    code = cli.main(
+        base
+        + [
+            "--link",
+            "https://a.example",
+            "--link",
+            "https://b.example",
+            "--link",
+            "https://c.example",
+            "--link",
+            "https://d.example",
+        ]
+    )
+    assert code == 1
+    assert "at most 3 links" in capsys.readouterr().err
+
+    code = cli.main(base + ["--link", "ftp://example.com/file"])
+    assert code == 1
+    assert "must be an http(s) URL" in capsys.readouterr().err
+
+    code = cli.main(base + ["--avatar", "no-such-file.png"])
+    assert code == 1
+    assert "neither an existing file" in capsys.readouterr().err
+
+
+def test_profile_set_without_identity(tmp_path, capsys):
+    code = cli.main(
+        ["profile", "set", "--bio", "hi", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 1
+    assert "no identity" in capsys.readouterr().err
+
+
+def _seed_peer_profile(tmp_path):
+    """One peer in the registry with a signed profile in the store."""
+    from tau.profile import ProfileStore, build_profile
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    doc = build_profile(
+        peer_identity,
+        name="alice",
+        bio="mesh tinkerer",
+        avatar="ab" * 16,
+        links=["https://example.com"],
+        version=2,
+        created_at=1000.0,
+    )
+    store = ProfileStore(config.profiles_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+    return data_dir, peer_identity, doc
+
+
+def test_peers_profile_cached(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_profile(tmp_path)
+    code = cli.main(
+        ["peers", "profile", "alice", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "name:    alice" in out
+    assert "bio:     mesh tinkerer" in out
+    assert "avatar:  " + "ab" * 16 in out
+    assert "link:    https://example.com" in out
+    assert "version: 2" in out
+
+    code = cli.main(
+        [
+            "peers",
+            "profile",
+            "alice",
+            "--cached",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile"]["bio"] == "mesh tinkerer"
+    assert payload["profile"]["version"] == 2
+    assert payload["fetched"] is False
+
+
+def test_peers_profile_cached_without_profile(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    registry = PeerRegistry(config.peers_path)
+    identity = RNS.Identity()
+    registry.upsert(
+        destination_hash(identity),
+        identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    code = cli.main(
+        ["peers", "profile", "alice", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "has no public profile yet" in capsys.readouterr().out
+
+
+def test_peers_profile_unknown_peer(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_profile(tmp_path)
+    code = cli.main(
+        ["peers", "profile", "nobody", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def test_peers_show_includes_profile(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_profile(tmp_path)
+    code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "profile:" in out
+    assert "bio:     mesh tinkerer" in out
+    assert "link:    https://example.com" in out
+
+    code = cli.main(
+        ["peers", "show", "alice", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile"]["bio"] == "mesh tinkerer"
+    assert payload["profile"]["version"] == 2
+
 
 def _init_and_seed_peer(tmp_path, peer_name="alice", capsys=None):
     """Init a node and register one peer built from a real identity."""

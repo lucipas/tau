@@ -10,6 +10,7 @@ import { ChannelsConsole } from "./channels-console";
 import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
 import { DmRequestsSection } from "./dm-requests-section";
+import { JoinRequestsSection } from "./join-requests-section";
 import { DoctorSection } from "./doctor-section";
 import { CONSOLE_TABS, Header, type ConsoleTab } from "./header";
 import { MessageFeed } from "./message-feed";
@@ -344,6 +345,14 @@ export function Console() {
       : canonicalPeerTarget(target, tau.peers);
   const typists =
     target.trim() === "" ? [] : (tau.typing[typingKey] ?? []);
+  // The peer this DM conversation is with, for the profile strip in
+  // the message header: groups have no peer profile.
+  const selectedPeer =
+    mode === "peer"
+      ? (tau.peers.find(
+          (candidate) => candidate.destination === typingKey,
+        ) ?? null)
+      : null;
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden">
@@ -549,6 +558,7 @@ export function Console() {
               node={tau.node}
               peers={tau.peers}
               groups={tau.groups}
+              peer={selectedPeer}
               live={tau.connection === "live"}
               searching={tau.searchQuery !== null}
               searchQuery={tau.searchQuery}
@@ -687,6 +697,13 @@ export function Console() {
                 onAccept={tau.acceptDmRequest}
                 onDecline={tau.declineDmRequest}
               />
+              <div className="mt-4">
+                <JoinRequestsSection
+                  requests={tau.joinRequests}
+                  onApprove={tau.approveJoinRequest}
+                  onDeny={tau.denyJoinRequest}
+                />
+              </div>
             </div>
             <div className="mt-4 shrink-0 rounded-2xl border border-line/80 bg-panel/40">
               <button

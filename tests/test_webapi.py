@@ -172,6 +172,7 @@ class FakeNode:
             social_db_path=data_dir / "social.db",
             tan_rules_path=data_dir / "tan-rules.json",
             dm_requests_path=data_dir / "dm-requests.json",
+            join_requests_path=data_dir / "join-requests.json",
             allowlist_path=data_dir / "allowlist.json",
             blocklist_path=data_dir / "blocklist.json",
             ignored_groups_path=data_dir / "ignored-groups.json",
@@ -405,6 +406,61 @@ class FakeNode:
             # One send time shared by every leg, like the real node.
             "sent_at": 1000.0,
             "results": results,
+        }
+
+    def approve_join_request(self, group, peer):
+        """Test stand-in for TauNode.approve_join_request."""
+        from tau.group_invites import resolve_join_request
+
+        found = self.groups.find(group)
+        if not found["local"] or found["creator"] != self.destination_hexhash:
+            raise ValueError("only the creator can approve join requests")
+        if not resolve_join_request(
+            self.config.join_requests_path, found["name"], peer
+        ):
+            raise ValueError("no pending join request from that peer")
+        summary = {
+            "id": found["id"],
+            "name": found["name"],
+            "members": list(found["members"]),
+            "creator": found["creator"],
+        }
+        if peer in found["members"]:
+            return {"status": "already_member", "group": summary}
+        members = list(found["members"]) + [peer]
+        new_group = self.groups.update_members(
+            found["id"], members, created_by=self.destination_hexhash
+        )
+        self.send_group_message(
+            new_group, f"joined {found['name']} via an invite link."
+        )
+        summary = {
+            "id": new_group["id"],
+            "name": new_group["name"],
+            "members": list(new_group["members"]),
+            "creator": new_group["creator"],
+        }
+        return {"status": "added", "group": summary}
+
+    def deny_join_request(self, group, peer):
+        """Test stand-in for TauNode.deny_join_request."""
+        from tau.group_invites import resolve_join_request
+
+        found = self.groups.find(group)
+        if not found["local"] or found["creator"] != self.destination_hexhash:
+            raise ValueError("only the creator can deny join requests")
+        if not resolve_join_request(
+            self.config.join_requests_path, found["name"], peer
+        ):
+            raise ValueError("no pending join request from that peer")
+        return {
+            "status": "denied",
+            "group": {
+                "id": found["id"],
+                "name": found["name"],
+                "members": list(found["members"]),
+                "creator": found["creator"],
+            },
         }
 
     def send_group_reaction(
@@ -881,6 +937,57 @@ def test_heard_endpoint_empty_without_accessor(bridge, node):
     status, _, payload = _json(bridge, "/api/heard")
     assert status == 200
     assert payload == {"heard": [], "count": 0}
+
+
+def test_peers_endpoint_includes_profile(bridge, node, tmp_path):
+    from tau.profile import ProfileStore, build_profile
+
+    registry = _seed_alias_registry(node, tmp_path)
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    registry.upsert(
+        peer_hash, identity.get_public_key(), name="carol", hops=1
+    )
+    registry.save()
+    store = ProfileStore(tmp_path / "profiles.json")
+    doc = build_profile(
+        identity,
+        name="carol",
+        bio="mesh tinkerer",
+        avatar="ab" * 16,
+        links=["https://example.com"],
+        version=2,
+        created_at=1000.0,
+    )
+    assert store.store(doc) is True
+    assert store.save() is True
+    node.profile_store = store
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    by_name = {item["name"]: item for item in payload["peers"]}
+    carol = by_name["carol"]["profile"]
+    assert carol["bio"] == "mesh tinkerer"
+    assert carol["avatar"] == "ab" * 16
+    assert carol["links"] == ["https://example.com"]
+    assert carol["version"] == 2
+    assert carol["author"] == peer_hash.hex()
+    # The display view carries no key or signature.
+    assert "sig" not in carol and "key" not in carol
+    # A peer with no profile reads as null, not as a missing key.
+    assert by_name["alice"]["profile"] is None
+
+
+def test_peers_endpoint_without_profile_store_has_null_profiles(
+    bridge, node
+):
+    # A node-like without a profile store (like this fixture's
+    # FakeNode) simply has no profiles — the endpoint still answers.
+    assert not hasattr(node, "profile_store")
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    assert payload["peers"][0]["profile"] is None
 
 
 def _seed_alias_registry(node, tmp_path):
@@ -12951,6 +13058,97 @@ def test_dm_requests_endpoint_lists_held_requests(bridge):
     # unknown peer falls back to the short hash.
     assert payload["requests"][0]["sender_name"] == "alice"
     assert payload["requests"][1]["sender_name"] == OTHER_HASH[:8]
+
+
+def _record_join_request(bridge, *, group="crew", peer=PEER_HASH, now=None):
+    from tau.group_invites import record_join_request
+
+    moment = time.time() if now is None else now
+    return record_join_request(
+        bridge.node.config.join_requests_path, group, peer, now=moment
+    )
+
+
+def test_join_requests_endpoint_lists_pending_requests(bridge, node):
+    status, _, payload = _json(bridge, "/api/groups/join-requests")
+    assert status == 200
+    assert payload == {"requests": [], "count": 0}
+
+    _record_join_request(bridge, group="crew", peer=PEER_HASH)
+    _record_join_request(bridge, group="crew", peer=OTHER_HASH)
+    status, _, payload = _json(bridge, "/api/groups/join-requests")
+    assert status == 200
+    assert payload["count"] == 2
+    assert [entry["peer"] for entry in payload["requests"]] == [
+        PEER_HASH,
+        OTHER_HASH,
+    ]
+    # The requester's display name comes from the node's registry; an
+    # unknown peer falls back to the short hash.
+    assert payload["requests"][0]["peer_name"] == "alice"
+    assert payload["requests"][1]["peer_name"] == OTHER_HASH[:8]
+    assert payload["requests"][0]["group"] == "crew"
+
+
+def test_approve_join_request_endpoint_admits_peer(bridge, node):
+    node.groups.create("team", [BOB_HASH, PEER_HASH], created_by=BOB_HASH)
+    _record_join_request(bridge, group="team", peer=OTHER_HASH)
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/approve-join",
+        method="POST",
+        body={"group": "team", "peer": OTHER_HASH},
+    )
+    assert status == 200
+    assert payload["status"] == "added"
+    assert OTHER_HASH in payload["group"]["members"]
+    _, _, listed = _json(bridge, "/api/groups/join-requests")
+    assert listed == {"requests": [], "count": 0}
+    # The welcome group message went out to the new roster.
+    assert node.group_sent
+
+
+def test_deny_join_request_endpoint_refuses_peer(bridge, node):
+    node.groups.create("team", [BOB_HASH, PEER_HASH], created_by=BOB_HASH)
+    _record_join_request(bridge, group="team", peer=OTHER_HASH)
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/deny-join",
+        method="POST",
+        body={"group": "team", "peer": OTHER_HASH},
+    )
+    assert status == 200
+    assert payload["status"] == "denied"
+    _, _, listed = _json(bridge, "/api/groups/join-requests")
+    assert listed == {"requests": [], "count": 0}
+    assert node.group_sent == []
+
+
+def test_join_request_endpoints_validate_fields(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/approve-join",
+        method="POST",
+        body={},
+    )
+    assert status == 400
+    assert "field 'group'" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/approve-join",
+        method="POST",
+        body={"group": "team"},
+    )
+    assert status == 400
+    assert "field 'peer'" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/approve-join",
+        method="POST",
+        body={"group": "nope", "peer": OTHER_HASH},
+    )
+    assert status == 400
+    assert "unknown group" in payload["error"]["message"]
 
 
 def test_accept_dm_request_endpoint_delivers_and_allowlists(bridge, node):

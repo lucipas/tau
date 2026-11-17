@@ -18,6 +18,7 @@ import type {
   ChangeGroupMembersResponse,
   ChannelMessage,
   CreateGroupResponse,
+  DecideJoinRequestResponse,
   DeclineDmRequestResponse,
   DeleteGroupResponse,
   DeleteMessageResponse,
@@ -37,6 +38,8 @@ import type {
   HeldMailResponse,
   IgnoreGroupResponse,
   IgnoredGroupEntry,
+  JoinRequestEntry,
+  JoinRequestsResponse,
   LeaveGroupResponse,
   LeftGroup,
   LeftGroupsResponse,
@@ -234,6 +237,7 @@ export function useTau() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
   const [dmRequests, setDmRequests] = useState<DmRequestEntry[]>([]);
+  const [joinRequests, setJoinRequests] = useState<JoinRequestEntry[]>([]);
   const [archivedConversations, setArchivedConversations] = useState<
     ArchivedConversation[]
   >([]);
@@ -1003,6 +1007,19 @@ export function useTau() {
     setDmRequests(result.requests);
   }, []);
 
+  const refreshJoinRequestsSeq = useRef(0);
+
+  const refreshJoinRequests = useCallback(async () => {
+    // Same stale-response guard as the DM requests refresh: a slow
+    // poll must not restore a request an approve or deny removed.
+    const requestId = ++refreshJoinRequestsSeq.current;
+    const result = await apiGet<JoinRequestsResponse>(
+      "/api/groups/join-requests",
+    );
+    if (requestId !== refreshJoinRequestsSeq.current) return;
+    setJoinRequests(result.requests);
+  }, []);
+
   const refreshArchivedSeq = useRef(0);
 
   // Removes archived direct threads from every view that may still hold
@@ -1212,6 +1229,7 @@ export function useTau() {
         refreshOutbox(),
         refreshHeldMail(),
         refreshDmRequests(),
+        refreshJoinRequests(),
         refreshArchived(),
         refreshDisappearing(),
         refreshMuted(),
@@ -1226,7 +1244,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshArchived, refreshDisappearing, refreshMuted, refreshGroups, refreshLeftGroups, refreshSettings, refreshAllowlist]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshDmRequests, refreshJoinRequests, refreshArchived, refreshDisappearing, refreshMuted, refreshGroups, refreshLeftGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
     (target: string) =>
@@ -2928,6 +2946,64 @@ export function useTau() {
     [refreshDmRequests],
   );
 
+  const approveJoinRequest = useCallback(
+    async (group: string, peer: string) => {
+      const result = await apiPost<DecideJoinRequestResponse>(
+        "/api/groups/approve-join",
+        { group, peer },
+      );
+      // The approve already succeeded: drop the request locally at
+      // once, and treat the follow-up refreshes as best-effort so a
+      // failed GET cannot make a successful approve look like a
+      // failure. The roster changed (successor group) and the welcome
+      // message lands in the feed, so the groups and messages refresh
+      // runs too.
+      setJoinRequests((previous) =>
+        previous.filter(
+          (entry) => !(entry.group === group && entry.peer === peer),
+        ),
+      );
+      try {
+        await refreshJoinRequests();
+      } catch {
+        // The next poll reconciles.
+      }
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      try {
+        await refreshMessages();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshJoinRequests, refreshGroups, refreshMessages],
+  );
+
+  const denyJoinRequest = useCallback(
+    async (group: string, peer: string) => {
+      const result = await apiPost<DecideJoinRequestResponse>(
+        "/api/groups/deny-join",
+        { group, peer },
+      );
+      setJoinRequests((previous) =>
+        previous.filter(
+          (entry) => !(entry.group === group && entry.peer === peer),
+        ),
+      );
+      try {
+        await refreshJoinRequests();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshJoinRequests],
+  );
+
   return {
     node,
     peers,
@@ -2956,6 +3032,10 @@ export function useTau() {
     acceptDmRequest,
     declineDmRequest,
     refreshDmRequests,
+    joinRequests,
+    approveJoinRequest,
+    denyJoinRequest,
+    refreshJoinRequests,
     archivedConversations,
     archivedError,
     archiveConversation,

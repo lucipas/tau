@@ -43,6 +43,16 @@ from .dm_requests import (
     record_dm_request,
 )
 from .disappearing import group_default_for, peer_default_for
+from .group_invites import (
+    JOIN_REQUEST_KIND,
+    InviteError,
+    invite_status,
+    list_join_requests,
+    load_invites,
+    record_join_request,
+    resolve_join_request,
+    verify_invite_link,
+)
 from .groups import GroupStore, pinned_group
 from .group_polls import PostError, clean_poll_options
 from .identity import (
@@ -79,6 +89,12 @@ from .mailbox import (
     seal_receipt,
 )
 from .peers import DESTINATION_HASH_BYTES, Peer, PeerError, PeerRegistry
+from .profile import (
+    ProfileError,
+    ProfileStore,
+    load_local_profile,
+    verify_profile,
+)
 from .tangents.tan import (
     MAX_IMAGE_BYTES,
     TanError,
@@ -108,6 +124,7 @@ from .protocol import (
     REQUEST_MESSAGE,
     REQUEST_PEERS,
     REQUEST_PING,
+    REQUEST_PROFILE,
     REQUEST_READ,
     REQUEST_REACT,
     REQUEST_RETRACT,
@@ -132,6 +149,7 @@ from .protocol import (
     encode_group_message,
     encode,
     encode_message,
+    encode_profile_request,
     encode_typing,
     generate_message_id,
     normalize_message,
@@ -144,6 +162,7 @@ from .protocol import (
     parse_mail_store,
     parse_media_request,
     parse_message,
+    parse_profile_request,
     parse_read_receipt,
     parse_reaction,
     parse_retract,
@@ -165,6 +184,16 @@ def _budget(timeout: float, deadline: Optional[float]) -> float:
     if deadline is None:
         return timeout
     return max(0.0, min(timeout, deadline - time.monotonic()))
+
+
+def _invite_group_summary(group: Dict[str, Any]) -> Dict[str, Any]:
+    """The group record a join-request reply carries to the requester."""
+    return {
+        "id": group["id"],
+        "name": group["name"],
+        "members": list(group["members"]),
+        "creator": group.get("creator", ""),
+    }
 
 
 def _past(deadline: Optional[float]) -> bool:
@@ -548,6 +577,16 @@ class TauNode:
         self.mailbox = Mailbox(config.mailbox_path)
         self.inbox = Inbox(config.inbox_path)
         self.groups = GroupStore(getattr(config, "groups_path", None))
+        # Public profiles: the local one this node publishes (reloaded
+        # from disk on every announce, so a one-shot `tau profile set`
+        # reaches peers without a restart) and the received ones, keyed
+        # by author, newest signed version only.
+        self.profile_store = ProfileStore(
+            getattr(config, "profiles_path", None)
+        )
+        self.local_profile = load_local_profile(
+            getattr(config, "profile_path", None)
+        )
         self.on_message = on_message
         # Record-only twin of on_message: the console history write
         # without the live event.  A delivery whose live publication
@@ -746,6 +785,26 @@ class TauNode:
         return self.destination.hexhash
 
     @property
+    def local_profile_version(self) -> Optional[int]:
+        """The local profile's version, or None when none is published."""
+        if self.local_profile is None:
+            return None
+        return self.local_profile["version"]
+
+    def refresh_local_profile(self) -> bool:
+        """Reload the local profile from disk; True when it changed.
+
+        A one-shot ``tau profile set`` writes the file while this node
+        serves; the announce path calls this first, so the new version
+        rides the next announce without a restart.
+        """
+        fresh = load_local_profile(getattr(self.config, "profile_path", None))
+        if fresh == self.local_profile:
+            return False
+        self.local_profile = fresh
+        return True
+
+    @property
     def started(self) -> bool:
         return self.reticulum is not None
 
@@ -855,7 +914,11 @@ class TauNode:
         self.destination.set_max_request_size(
             max(_REQUEST_WIRE_LIMIT, _MAIL_WIRE_LIMIT)
         )
-        self.destination.set_default_app_data(lambda: build_announce(self.name))
+        self.destination.set_default_app_data(
+            lambda: build_announce(
+                self.name, profile_version=self.local_profile_version
+            )
+        )
         self.destination.set_link_established_callback(self._on_incoming_link)
 
         handlers = {
@@ -871,6 +934,7 @@ class TauNode:
             REQUEST_DM_EDIT: self._handle_dm_edit,
             REQUEST_TYPING: self._handle_typing,
             REQUEST_PEERS: self._handle_peers,
+            REQUEST_PROFILE: self._handle_profile,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
         }
@@ -1240,7 +1304,14 @@ class TauNode:
         """Send a signed announce for this node's destination."""
         if self.destination is None:
             raise NodeError("node has not been started")
-        self.destination.announce(app_data=build_announce(self.name))
+        # Pick up a profile a one-shot command published since the
+        # last announce, so its version rides this one.
+        self.refresh_local_profile()
+        self.destination.announce(
+            app_data=build_announce(
+                self.name, profile_version=self.local_profile_version
+            )
+        )
 
     def _announce_loop(self) -> None:
         interval = max(1.0, float(self.config.announce_interval))
@@ -1296,6 +1367,19 @@ class TauNode:
             peer.hops,
         )
         self._save_peers()
+        # The announce carries the peer's profile version, not the
+        # profile itself: when it is newer than the version held, fetch
+        # the document over a link in the background, best-effort.
+        announced_profile = info.get("profile_version")
+        if (
+            isinstance(announced_profile, int)
+            and announced_profile > 0
+            and self.reticulum is not None
+        ):
+            stored = self.profile_store.get(peer.hexhash)
+            stored_version = stored["version"] if stored is not None else 0
+            if announced_profile > stored_version:
+                self._spawn_profile_fetch(peer)
         if self.on_peer is not None:
             try:
                 self.on_peer(peer)
@@ -1404,6 +1488,28 @@ class TauNode:
         with self._mail_rounds_lock:
             self._mail_round_threads.add(thread)
         thread.start()
+
+    def _spawn_profile_fetch(self, peer: Peer) -> None:
+        """Fetch an announcing peer's newer profile on its own thread.
+
+        Best-effort gossip: a peer that never answers, or answers with
+        a profile that fails verification, simply leaves the stored
+        copy (or nothing) in place — the next announce with a still
+        newer version tries again.  Untracked, unlike mail rounds: no
+        caller waits on a profile fetch before reading state.
+        """
+
+        def _run() -> None:
+            try:
+                self.request_profile(peer)
+            except Exception:  # pragma: no cover - network dependent
+                log.debug(
+                    "Could not fetch profile from %s", peer.hexhash, exc_info=True
+                )
+
+        threading.Thread(
+            target=_run, name="tau-profile-fetch", daemon=True
+        ).start()
 
     def wait_for_mail_rounds(self, timeout: float = 30.0) -> bool:
         """Wait for announce-triggered mail rounds to finish.
@@ -1585,6 +1691,33 @@ class TauNode:
     ) -> bytes:
         peers = self.registry.public_peers(include_keys=True)
         return response_ok(peers=peers[:100], count=len(peers))
+
+    def _handle_profile(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Answer a ``/tau/profile`` request with the local profile.
+
+        The profile is public by design, so any peer may ask — but
+        only a version newer than the one the requester already holds
+        is sent, so a re-announce of an unchanged profile costs one
+        small round trip instead of the whole document.
+        """
+        try:
+            request = parse_profile_request(data)
+        except ProtocolError as exc:
+            return response_error("bad_request", str(exc))
+        # Pick up a profile published since this node started, the
+        # same way announce() does.
+        self.refresh_local_profile()
+        profile = self.local_profile
+        if profile is not None and profile["version"] <= request["known_version"]:
+            profile = None
+        return response_ok(profile=profile)
 
     def _record_received(self, record: Dict[str, Any]) -> None:
         """Persist a delivered DM to the inbox; never break delivery."""
@@ -1942,6 +2075,14 @@ class TauNode:
             return response_error(
                 "unavailable", "message could not be delivered"
             )
+        if message.get("kind") == JOIN_REQUEST_KIND:
+            # A join request carries a signed invite token: it is a
+            # capability the creator issued, so it is decided here,
+            # before the DM allow-list — a stranger holding a valid
+            # token is not a stranger any more.  An invalid one is
+            # rejected outright (never stored as chat, never a DM
+            # request): the kind is never a chat message.
+            return self._handle_join_request(message, caller_hash, received_at)
         if not self.allowlist.is_allowed(caller_hash):
             log.info(
                 "Message from %s denied by the DM allow-list",
@@ -2036,6 +2177,197 @@ class TauNode:
             expired=expired,
             retracted=retracted,
         )
+
+    def _handle_join_request(
+        self,
+        message: Dict[str, Any],
+        caller_hash: str,
+        received_at: float,
+    ) -> bytes:
+        """Answer a ``group-join-request`` message (``/tau/message``).
+
+        The message text is the invite link.  A valid token is
+        decided here — open groups add the requester at once, closed
+        groups record a pending request — and the reply carries the
+        outcome plus the group record, so the requester learns the
+        roster from the reply itself.  An invalid token gets the same
+        generic error whatever failed (unknown group, wrong mode or
+        generation, bad signature), so the reply never leaks whether
+        a group id is real.
+        """
+        try:
+            result = self._process_join_request(
+                message.get("text", ""), caller_hash, received_at
+            )
+        except InviteError as exc:
+            log.info(
+                "Join request from %s rejected: %s",
+                caller_hash or "anonymous",
+                exc,
+            )
+            return response_error("invalid_invite", "invite link is not valid")
+        return response_ok(
+            received_at=received_at,
+            server=self.name,
+            node=self.destination_hexhash,
+            **result,
+        )
+
+    def _process_join_request(
+        self,
+        link_text: Any,
+        caller_hash: str,
+        received_at: float,
+    ) -> Dict[str, Any]:
+        """Decide a join request; shared by the live and relayed paths.
+
+        Returns ``{"status": ..., "group": ...}`` where status is
+        ``added`` (open group), ``pending`` (closed group, request
+        recorded), or ``already_member``.  Raises
+        :class:`InviteError` for any token or group problem.  The
+        decision is idempotent: a retried or relayed duplicate of a
+        request that already landed answers ``already_member`` (open)
+        or re-records the pending request (closed).
+        """
+        if not caller_hash:
+            raise InviteError("join request needs a sender identity")
+        if self.identity is None:
+            raise InviteError("node has no identity")
+        invites = load_invites(self.config.invites_path)
+        invite = verify_invite_link(
+            link_text, identity=self.identity, invites=invites
+        )
+        own_hash = self.destination_hexhash
+        # The token names the group: the id derives from the roster,
+        # so the first join already retires the id it was minted for.
+        # Resolve the name to the current roster on every join.
+        try:
+            group = self.groups.find(invite["group"])
+        except ValueError as exc:
+            raise InviteError("invite is not valid for this group") from exc
+        if (
+            group is None
+            or not group.get("local")
+            or group.get("creator") != own_hash
+        ):
+            raise InviteError("invite is not valid for this group")
+        if caller_hash in group["members"]:
+            return {
+                "status": "already_member",
+                "group": _invite_group_summary(group),
+            }
+        if invite["mode"] == "open":
+            members = list(group["members"]) + [caller_hash]
+            try:
+                new_group = self.groups.update_members(
+                    group["id"], members, created_by=own_hash
+                )
+            except ValueError as exc:
+                raise InviteError(str(exc)) from exc
+            self._welcome_joiner(new_group, caller_hash)
+            return {"status": "added", "group": _invite_group_summary(new_group)}
+        record_join_request(
+            self.config.join_requests_path,
+            group["name"],
+            caller_hash,
+            now=received_at,
+        )
+        return {"status": "pending", "group": _invite_group_summary(group)}
+
+    def _welcome_joiner(self, group: Dict[str, Any], peer_hash: str) -> None:
+        """Announce a new member to the group, off the request thread.
+
+        The welcome is a group message to the new roster: it pins
+        the roster for the joiner (who has never seen the group) and
+        tells the existing members someone joined.  It runs on a
+        daemon thread because the fan-out can take a while and the
+        join request is answered from a link-request handler; a
+        queued leg (joiner offline) still delivers on retry.
+        """
+        peer = self.registry.get(peer_hash)
+        name = peer.display_name if peer is not None else peer_hash[:8]
+
+        def _send() -> None:
+            try:
+                self.send_group_message(
+                    group,
+                    f"{name} joined {group['name']} via an invite link.",
+                    timeout=20.0,
+                )
+            except Exception:  # pragma: no cover - delivery is best-effort
+                log.warning(
+                    "Could not send join welcome to %s", group["id"][:8],
+                    exc_info=True,
+                )
+
+        thread = threading.Thread(
+            target=_send, daemon=True, name="tau-join-welcome"
+        )
+        thread.start()
+
+    def list_join_requests(
+        self, group_name: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Pending join requests, optionally for one group (by name)."""
+        return [
+            entry.to_dict()
+            for entry in list_join_requests(
+                self.config.join_requests_path, group_name=group_name
+            )
+        ]
+
+    def approve_join_request(
+        self, group_name: str, peer_hash: str
+    ) -> Dict[str, Any]:
+        """Admit a pending join request: roster change + welcome.
+
+        The successor group (new id, same name) is created and a
+        welcome group message pins the roster for the new member.
+        Raises :class:`ValueError` when there is no pending request,
+        the group is unknown, or this node did not create it.
+        """
+        group = self.groups.find(group_name)
+        if group is None:
+            raise ValueError(f"unknown group: {group_name!r}")
+        own_hash = self.destination_hexhash
+        if not group.get("local") or group.get("creator") != own_hash:
+            raise ValueError("only the creator can approve join requests")
+        if not resolve_join_request(
+            self.config.join_requests_path, group["name"], peer_hash
+        ):
+            raise ValueError("no pending join request from that peer")
+        if peer_hash in group["members"]:
+            return {"status": "already_member", "group": _invite_group_summary(group)}
+        members = list(group["members"]) + [peer_hash]
+        new_group = self.groups.update_members(
+            group["id"], members, created_by=own_hash
+        )
+        peer = self.registry.get(peer_hash)
+        name = peer.display_name if peer is not None else peer_hash[:8]
+        self.send_group_message(
+            new_group,
+            f"{name} joined {group['name']} via an invite link.",
+            timeout=20.0,
+        )
+        return {"status": "added", "group": _invite_group_summary(new_group)}
+
+    def deny_join_request(self, group_name: str, peer_hash: str) -> Dict[str, Any]:
+        """Refuse a pending join request without changing the roster.
+
+        Raises :class:`ValueError` when there is no pending request
+        or this node did not create the group.
+        """
+        group = self.groups.find(group_name)
+        if group is None:
+            raise ValueError(f"unknown group: {group_name!r}")
+        own_hash = self.destination_hexhash
+        if not group.get("local") or group.get("creator") != own_hash:
+            raise ValueError("only the creator can deny join requests")
+        if not resolve_join_request(
+            self.config.join_requests_path, group["name"], peer_hash
+        ):
+            raise ValueError("no pending join request from that peer")
+        return {"status": "denied", "group": _invite_group_summary(group)}
 
     def _accept_group_message(
         self,
@@ -5061,6 +5393,25 @@ class TauNode:
                 sender or "unknown",
             )
             return False
+        if message.get("kind") == JOIN_REQUEST_KIND:
+            # Same interception as the live path: a relayed join
+            # request is decided, never stored as chat and never a
+            # DM request.  Processing is idempotent, so a duplicate
+            # relayed copy re-answers instead of double-adding, and
+            # the delivery counts as resolved either way.
+            try:
+                self._process_join_request(
+                    message.get("text", ""),
+                    sender if isinstance(sender, str) else "",
+                    time.time(),
+                )
+            except InviteError as exc:
+                log.info(
+                    "Relayed join request from %s rejected: %s",
+                    sender or "unknown",
+                    exc,
+                )
+            return True
         if not self.allowlist.is_allowed(
             sender if isinstance(sender, str) else None
         ):
@@ -8180,6 +8531,58 @@ class TauNode:
             else min(timeout, 10.0),
         )
         return self._request(peer, REQUEST_PEERS, b"{}", timeout)
+
+    def request_profile(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = 15.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a peer's signed public profile over a link.
+
+        The request names the newest version already held, so the peer
+        answers with its profile only when it has a newer one.  A
+        returned profile is verified before it is trusted: the
+        signature must cover the document, the key must derive the
+        author's destination hash, and that key must be the one the
+        registry holds for this peer — a profile for anyone else is
+        refused.  A newer verified profile is stored (and the store
+        saved); anything else returns the stored copy's fate — ``None``
+        when the peer has nothing newer for us.  Raises
+        :class:`NodeError` when the peer cannot be reached or answers
+        with a malformed or forged profile.
+        """
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        stored = self.profile_store.get(peer.hexhash)
+        known_version = stored["version"] if stored is not None else 0
+        response = self._request(
+            peer,
+            REQUEST_PROFILE,
+            encode_profile_request(known_version),
+            timeout,
+        )
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise NodeError("peer gave an invalid profile response")
+        profile = response.get("profile")
+        if profile is None:
+            return None
+        try:
+            verified = verify_profile(profile)
+        except ProfileError as exc:
+            raise NodeError(f"peer gave an invalid profile: {exc}") from exc
+        if verified["author"] != peer.hexhash:
+            raise NodeError("profile author does not match the peer")
+        if verified["key"] != peer.public_key.hex():
+            raise NodeError("profile key does not match the peer")
+        if self.profile_store.store(verified):
+            self.profile_store.save()
+        return verified
 
     def exchange_peers(
         self,

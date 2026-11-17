@@ -214,6 +214,16 @@ export interface UnignoreGroupResponse {
   changed: boolean;
 }
 
+export interface PeerProfile {
+  author: string;
+  name: string;
+  bio: string;
+  avatar: string | null;
+  links: string[];
+  version: number;
+  created_at: number;
+}
+
 export interface Peer {
   destination: string;
   name: string;
@@ -221,6 +231,9 @@ export interface Peer {
   age: number;
   hops: number;
   protocol: number;
+  // The peer's signed public profile (display name, bio, avatar
+  // hash, links), when one has been fetched — null otherwise.
+  profile?: PeerProfile | null;
   // Local-only label for this peer, set with `tau peers alias` or from
   // the console. Never sent to peers.
   alias?: string | null;
@@ -771,6 +784,35 @@ export interface AcceptDmRequestResponse {
 export interface DeclineDmRequestResponse {
   declined: DmRequestEntry;
   blocked: boolean;
+}
+
+// A pending group join request, as `GET /api/groups/join-requests`
+// returns it: the group by name (the stable handle across roster
+// changes), the requester's hash and display name, and the time the
+// request arrived.
+export interface JoinRequestEntry {
+  group: string;
+  group_id: string;
+  peer: string;
+  peer_name: string;
+  requested_at: number;
+  expires_at: number;
+}
+
+export interface JoinRequestsResponse {
+  requests: JoinRequestEntry[];
+  count: number;
+}
+
+export interface DecideJoinRequestResponse {
+  ok: boolean;
+  status: string;
+  group: {
+    id: string;
+    name: string;
+    members: string[];
+    creator: string;
+  };
 }
 
 export interface AllowlistEntry {

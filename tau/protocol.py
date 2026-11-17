@@ -14,6 +14,9 @@ encrypted Reticulum ``Link``:
     /tau/peers    -> ask a peer which peers it has heard from; the answer
                     carries each peer's public key, so the receiver can verify
                     the key derives the reported destination hash (peer exchange)
+    /tau/profile  -> ask a peer for its signed public profile; the answer
+                    carries the profile document, or nothing when the peer
+                    has none (or none newer than the version asked about)
     /tau/typing   -> ephemeral typing indicator for a DM or a group;
                     live-only, never queued or stored
 
@@ -104,6 +107,7 @@ REQUEST_REACT = "/tau/react"
 REQUEST_RETRACT = "/tau/dm/retract"
 REQUEST_DM_EDIT = "/tau/dm/edit"
 REQUEST_PEERS = "/tau/peers"
+REQUEST_PROFILE = "/tau/profile"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
 REQUEST_GROUP_MESSAGE = "/tau/group"
@@ -119,6 +123,7 @@ REQUEST_PATHS = (
     REQUEST_RETRACT,
     REQUEST_DM_EDIT,
     REQUEST_PEERS,
+    REQUEST_PROFILE,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
     REQUEST_GROUP_MESSAGE,
@@ -250,14 +255,28 @@ def decode(raw: Any, *, max_bytes: int = MAX_RESPONSE_BYTES) -> Dict[str, Any]:
     return obj
 
 
-def build_announce(name: str) -> bytes:
-    """Build the compact app_data advertised in a Reticulum announce."""
+def build_announce(name: str, *, profile_version: Optional[int] = None) -> bytes:
+    """Build the compact app_data advertised in a Reticulum announce.
+
+    ``profile_version`` is the author's current public-profile
+    revision, when one is published: a single small integer is all
+    the 256-byte budget can spare — the profile itself is fetched
+    over a link (``/tau/profile``) by peers that see a newer version
+    than the one they hold.  ``None`` (no profile) omits the field,
+    so peers that predate profiles keep working.
+    """
     payload = {
         "v": PROTOCOL_VERSION,
         "name": sanitize_name(name),
         "proto": APP_NAME,
         "caps": ["message", "ping", "peers", "mail", "file", "read"],
     }
+    if (
+        isinstance(profile_version, int)
+        and not isinstance(profile_version, bool)
+        and profile_version >= 1
+    ):
+        payload["pv"] = profile_version
     data = encode(payload)
     # Reticulum announces have a very small payload budget.  Shorten the name
     # rather than dropping the announcement entirely.
@@ -277,15 +296,29 @@ def parse_announce(app_data: Any) -> Dict[str, Any]:
             "name": "unknown",
             "proto": None,
             "caps": [],
+            "profile_version": None,
         }
     try:
         payload = decode(app_data, max_bytes=ANNOUNCE_MAX_BYTES)
     except ProtocolError:
-        return {"v": 0, "name": "unknown", "proto": None, "caps": []}
+        return {
+            "v": 0,
+            "name": "unknown",
+            "proto": None,
+            "caps": [],
+            "profile_version": None,
+        }
 
     caps = payload.get("caps")
     if not isinstance(caps, list):
         caps = []
+    profile_version = payload.get("pv")
+    if (
+        isinstance(profile_version, bool)
+        or not isinstance(profile_version, int)
+        or profile_version < 1
+    ):
+        profile_version = None
     return {
         "v": payload.get("v") if isinstance(payload.get("v"), int) else 0,
         "name": sanitize_name(payload.get("name")),
@@ -293,6 +326,7 @@ def parse_announce(app_data: Any) -> Dict[str, Any]:
         if isinstance(payload.get("proto"), str)
         else None,
         "caps": [cap for cap in caps if isinstance(cap, str)][:16],
+        "profile_version": profile_version,
     }
 
 
@@ -1289,6 +1323,45 @@ def edit_unsigned_bytes(raw: Any) -> bytes:
     payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
     unsigned = {key: value for key, value in payload.items() if key != "sig"}
     return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
+
+
+def encode_profile_request(known_version: int = 0) -> bytes:
+    """Encode a ``/tau/profile`` request.
+
+    ``known_version`` is the newest profile version the requester
+    already holds for this peer (0 when none): the peer answers with
+    its profile only when its version is newer, so a re-announce of
+    an unchanged profile costs one small round trip instead of the
+    whole document.
+    """
+    if isinstance(known_version, bool) or not isinstance(known_version, int):
+        raise ProtocolError("known_version must be an integer")
+    if known_version < 0:
+        raise ProtocolError("known_version must not be negative")
+    return encode(
+        {
+            "type": "profile_request",
+            "v": PROTOCOL_VERSION,
+            "known_version": known_version,
+            "client": f"tau/{__version__}",
+        },
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_profile_request(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/profile`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "profile_request":
+        raise ProtocolError("expected a profile_request payload")
+    known_version = payload.get("known_version", 0)
+    if (
+        isinstance(known_version, bool)
+        or not isinstance(known_version, int)
+        or known_version < 0
+    ):
+        known_version = 0
+    return {"known_version": known_version}
 def excerpt_hash(text: str) -> str:
     """Short hash of a quoted message's text (first 16 hex of SHA-256).
 
