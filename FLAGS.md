@@ -62,6 +62,10 @@ Global options may appear before or after the command:
 | `tau outbox held` | List sealed messages held for other peers |
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
+| `tau page publish FILE.md [--title TEXT]` | Publish a Markdown file (at most 8 KiB) as this node's signed personal page (title defaults to the file's first `# ` heading) |
+| `tau page show` | Show your published personal page |
+| `tau page fetch PEER [--cached]` | Show a peer's signed personal page, fetching it live unless `--cached` |
+| `tau page allow list\|add PEER\|remove PEER\|on\|off` | Control who may fetch this node's page (public unless enforced) |
 | `tau block` | Silence a peer: drop their DMs and hide their Tan posts |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
 | `tau id` | Show this node's name, destination hash, LXMF delivery address, and safety number (fingerprint of this identity) |
@@ -88,6 +92,8 @@ Global options may appear before or after the command:
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan publish-follows` | Publish your follow list as a signed document peers can fetch |
+| `tau tan follows-of PEER` | Show who a peer follows, from their signed follow list |
 | `tau tan suggest` | Suggest authors to follow, from who the authors you follow engage with |
 | `tau tan mute-keyword WORD` | Hide posts containing a word or phrase from local views |
 | `tau tan unmute-keyword WORD` | Stop hiding posts containing a word or phrase |
@@ -243,6 +249,11 @@ tau tan search mesh --author alice
 # Follow by destination hash or by a unique hash prefix
 tau tan follow 5c04c868
 tau tan following
+
+# Publish your follow list so peers can fetch it, and read a peer's list
+tau tan publish-follows
+tau tan follows-of alice
+tau tan follows-of alice --cached
 
 # Hide a word or phrase from your local views (whole-word match,
 # case-insensitive; entries keep syncing, so unmuting restores them)

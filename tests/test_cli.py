@@ -1910,6 +1910,127 @@ def test_parser_profile_arguments():
         parser.parse_args(["profile"])
 
 
+def test_parser_page_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["page", "publish", "meetup.md"])
+    assert args.command == "page"
+    assert args.page_command == "publish"
+    assert args.file == "meetup.md"
+    assert args.title is None
+    assert args.func is cli.cmd_page_publish
+
+    titled = parser.parse_args(
+        ["page", "publish", "meetup.md", "--title", "Mesh meetup"]
+    )
+    assert titled.title == "Mesh meetup"
+
+    show = parser.parse_args(["page", "show"])
+    assert show.page_command == "show"
+    assert show.func is cli.cmd_page_show
+
+    fetch = parser.parse_args(["page", "fetch", "alice"])
+    assert fetch.page_command == "fetch"
+    assert fetch.target == "alice"
+    assert fetch.cached is False
+    assert fetch.timeout == 15.0
+    assert fetch.func is cli.cmd_page_fetch
+
+    allow = parser.parse_args(["page", "allow", "add", "alice"])
+    assert allow.page_command == "allow"
+    assert allow.page_allow_command == "add"
+    assert allow.peer == "alice"
+    assert allow.func is cli.cmd_page_allow
+
+    allow_list = parser.parse_args(["page", "allow", "list"])
+    assert allow_list.page_allow_command == "list"
+    assert allow_list.func is cli.cmd_page_allow
+
+    # A bare `tau page` names no subcommand: argparse must fail
+    # cleanly instead of dispatching with no function set.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["page"])
+
+
+def test_page_publish_and_show_end_to_end(tmp_path, capsys):
+    from tau.pages import load_local_page
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    page_file = tmp_path / "meetup.md"
+    page_file.write_text(
+        "# Mesh meetup\n\nSaturday, 2pm, Rock Springs Park.\n",
+        encoding="utf-8",
+    )
+
+    code = cli.main(
+        ["page", "publish", str(page_file), "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Published page version 1 — Mesh meetup." in out
+
+    stored = load_local_page(data_dir / "page.json")
+    assert stored is not None
+    assert stored["version"] == 1
+    assert stored["title"] == "Mesh meetup"
+    assert "Rock Springs Park" in stored["markdown"]
+
+    # A second publish bumps the version and takes the new title.
+    page_file.write_text(
+        "# New heading\n\nMoved to Sunday.\n", encoding="utf-8"
+    )
+    code = cli.main(
+        [
+            "page",
+            "publish",
+            str(page_file),
+            "--title",
+            "Sunday meetup",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert "Published page version 2 — Sunday meetup." in capsys.readouterr().out
+    stored = load_local_page(data_dir / "page.json")
+    assert stored["version"] == 2
+    assert stored["title"] == "Sunday meetup"
+
+    code = cli.main(["page", "show", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["version"] == 2
+    assert payload["title"] == "Sunday meetup"
+    assert "Moved to Sunday" in payload["markdown"]
+    assert "key" not in payload and "sig" not in payload
+
+    code = cli.main(["page", "show", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "title:   Sunday meetup" in out
+    assert "version: 2" in out
+    assert "Moved to Sunday" in out
+
+
+def test_page_show_without_page(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    code = cli.main(["page", "show", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No page published yet" in capsys.readouterr().out
+
+
+def test_page_publish_rejects_oversize_file(tmp_path, capsys):
+    from tau.pages import load_local_page
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    page_file = tmp_path / "big.md"
+    page_file.write_text("# Big\n\n" + "x" * 9000, encoding="utf-8")
+    code = cli.main(
+        ["page", "publish", str(page_file), "--data-dir", str(data_dir)]
+    )
+    assert code != 0
+    assert load_local_page(data_dir / "page.json") is None
+
+
 def test_profile_set_and_show_end_to_end(tmp_path, capsys):
     from tau.profile import load_local_profile
 
@@ -2109,6 +2230,164 @@ def test_peers_profile_unknown_peer(tmp_path, capsys):
     data_dir, _, _ = _seed_peer_profile(tmp_path)
     code = cli.main(
         ["peers", "profile", "nobody", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def _seed_peer_follow_list(tmp_path):
+    """One peer in the registry with a signed follow list in the store."""
+    from tau.follows import FollowListStore, build_follow_list
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    followed = [
+        destination_hash(RNS.Identity()).hex(),
+        destination_hash(RNS.Identity()).hex(),
+    ]
+    doc = build_follow_list(
+        peer_identity, authors=followed, version=2, updated_at=1000.0
+    )
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+    return data_dir, peer_identity, doc
+
+
+def test_parser_tan_follow_list_arguments():
+    parser = cli.build_parser()
+    publish = parser.parse_args(["tan", "publish-follows"])
+    assert publish.tan_command == "publish-follows"
+    assert publish.func is cli.cmd_tan_publish_follows
+
+    follows_of = parser.parse_args(["tan", "follows-of", "alice"])
+    assert follows_of.tan_command == "follows-of"
+    assert follows_of.target == "alice"
+    assert follows_of.cached is False
+    assert follows_of.func is cli.cmd_tan_follows_of
+
+    cached = parser.parse_args(["tan", "follows-of", "alice", "--cached"])
+    assert cached.cached is True
+
+
+def test_tan_publish_follows_end_to_end(tmp_path, capsys):
+    from tau.follows import load_local_follow_list
+    from tau.tangents.tan import follow, init_db
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    followed_hashes = [
+        destination_hash(RNS.Identity()).hex(),
+        destination_hash(RNS.Identity()).hex(),
+    ]
+    conn = init_db(config.social_db_path)
+    try:
+        for author in followed_hashes:
+            follow(conn, author, name="peer")
+    finally:
+        conn.close()
+
+    code = cli.main(["tan", "publish-follows", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Published follow list version 1 (2 author(s))." in out
+
+    stored = load_local_follow_list(data_dir / "follow-list.json")
+    assert stored is not None
+    assert stored["version"] == 1
+    assert stored["authors"] == sorted(followed_hashes)
+
+    # A second publish bumps the version and keeps the same list.
+    code = cli.main(["tan", "publish-follows", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Published follow list version 2" in capsys.readouterr().out
+    stored = load_local_follow_list(data_dir / "follow-list.json")
+    assert stored["version"] == 2
+    assert stored["authors"] == sorted(followed_hashes)
+
+    code = cli.main(
+        ["tan", "publish-follows", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["version"] == 3
+    assert payload["authors"] == sorted(followed_hashes)
+    assert "key" not in payload and "sig" not in payload
+
+
+def test_tan_publish_follows_empty_list(tmp_path, capsys):
+    from tau.follows import load_local_follow_list
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    code = cli.main(["tan", "publish-follows", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Published follow list version 1 (0 author(s))." in capsys.readouterr().out
+    stored = load_local_follow_list(data_dir / "follow-list.json")
+    assert stored is not None and stored["authors"] == []
+
+
+def test_tan_follows_of_cached(tmp_path, capsys):
+    data_dir, _, doc = _seed_peer_follow_list(tmp_path)
+    code = cli.main(
+        ["tan", "follows-of", "alice", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "alice follows:" in out
+    assert "version: 2" in out
+    for author in doc["authors"]:
+        assert author in out
+
+    code = cli.main(
+        [
+            "tan",
+            "follows-of",
+            "alice",
+            "--cached",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["follow_list"]["authors"] == doc["authors"]
+    assert payload["follow_list"]["version"] == 2
+    assert payload["fetched"] is False
+
+
+def test_tan_follows_of_cached_without_list(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    registry = PeerRegistry(config.peers_path)
+    identity = RNS.Identity()
+    registry.upsert(
+        destination_hash(identity),
+        identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    code = cli.main(
+        ["tan", "follows-of", "alice", "--cached", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "has not published a follow list yet" in capsys.readouterr().out
+
+
+def test_tan_follows_of_unknown_peer(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_follow_list(tmp_path)
+    code = cli.main(
+        ["tan", "follows-of", "nobody", "--cached", "--data-dir", str(data_dir)]
     )
     assert code == 1
     assert "no peer matches" in capsys.readouterr().err

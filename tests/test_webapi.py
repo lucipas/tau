@@ -4685,17 +4685,28 @@ def test_websocket_slow_client_does_not_outlive_bridge_stop(bridge):
             while published[0] < 65536 and time.monotonic() < deadline:
                 time.sleep(0.05)
             assert published[0] >= 65536, "flooder did not publish enough"
-            # Keep flooding a moment so the sender is parked in a
-            # write, then stop: a sender keeping up would drain the
-            # queue to empty within milliseconds.
-            time.sleep(1.0)
+            # Poll for the blocked state while the flood still runs:
+            # the flooder refills the queue as fast as the pump
+            # drains it, so once the sender parks in a write the
+            # queue sits at (near) capacity.  A single read after a
+            # fixed sleep is marginal under CI load — the queue drains
+            # a few messages into kernel buffers in the gap between
+            # the flooder stopping and the read (250/256 on 3.10, and
+            # 244/256 before that) — while a sender that kept up
+            # would leave the queue empty, so the poll still fails
+            # the test instead of masking a real regression.
+            deadline = time.monotonic() + 10
+            while True:
+                subscribers = list(bridge.bus._subscribers)
+                assert len(subscribers) == 1
+                if subscribers[0].qsize() >= SUBSCRIBER_QUEUE_SIZE - 1:
+                    break
+                assert time.monotonic() < deadline, (
+                    "sender was not blocked on the slow client"
+                )
+                time.sleep(0.05)
             flooding.set()
             flooder.join(timeout=5)
-            subscribers = list(bridge.bus._subscribers)
-            assert len(subscribers) == 1
-            assert (
-                subscribers[0].qsize() >= SUBSCRIBER_QUEUE_SIZE - 1
-            ), "sender was not blocked on the slow client"
         finally:
             flooding.set()
             flooder.join(timeout=5)
