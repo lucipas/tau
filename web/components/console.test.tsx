@@ -615,6 +615,7 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("sneakernet"))).toBe(false);
     expect(isShown(screen.queryByText("dm allow-list"))).toBe(false);
     expect(isShown(screen.queryByTestId("social-tab-feed"))).toBe(false);
+    expect(isShown(screen.queryByTestId("pages-tab"))).toBe(false);
   });
 
   it("switches to the tools tab on click", () => {
@@ -640,6 +641,16 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("traffic"))).toBe(false);
   });
 
+  it("switches to the pages tab on click", () => {
+    mockedUseTau.mockReturnValue(tabState());
+    render(<Console />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "pages" }));
+
+    expect(isShown(screen.queryByTestId("pages-tab"))).toBe(true);
+    expect(isShown(screen.queryByText("traffic"))).toBe(false);
+  });
+
   it("switches to the settings tab on click", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
@@ -659,12 +670,15 @@ describe("Console tabs", () => {
     expect(isShown(screen.queryByText("traffic"))).toBe(false);
   });
 
-  it("jumps between tabs with Alt+1 through Alt+5", () => {
+  it("jumps between tabs with Alt+1 through Alt+6", () => {
     mockedUseTau.mockReturnValue(tabState());
     render(<Console />);
 
-    fireEvent.keyDown(document.body, { key: "4", code: "Digit4", altKey: true });
+    fireEvent.keyDown(document.body, { key: "5", code: "Digit5", altKey: true });
     expect(isShown(screen.getByText("sneakernet"))).toBe(true);
+
+    fireEvent.keyDown(document.body, { key: "4", code: "Digit4", altKey: true });
+    expect(isShown(screen.queryByTestId("pages-tab"))).toBe(true);
 
     fireEvent.keyDown(document.body, { key: "3", code: "Digit3", altKey: true });
     expect(isShown(screen.getByTestId("channels-tab-feed"))).toBe(true);

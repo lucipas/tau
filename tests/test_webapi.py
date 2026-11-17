@@ -4970,6 +4970,152 @@ def test_channels_via_api(tmp_path):
         bridge.stop()
 
 
+def test_pages_via_api(tmp_path):
+    from types import SimpleNamespace
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.pages import (
+        PageStore,
+        build_page,
+        load_local_page,
+        make_page_file_entry,
+        save_local_page,
+        store_page_file,
+    )
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    # A peer page with one linked file, stored as if fetched over RNS.
+    author_identity = RNS.Identity()
+    file_bytes = b"meetup notes"
+    file_entry = make_page_file_entry("notes.txt", file_bytes)
+    author_page = build_page(
+        author_identity,
+        title="Mesh meetup",
+        markdown="# Mesh meetup\n\nSaturday, 2pm.\n",
+        files=[file_entry],
+        version=1,
+        updated_at=1000.0,
+    )
+    author_hash = author_page["author"]
+    store = PageStore(node.config.pages_path)
+    assert store.store(author_page) is True
+    store.save()
+    node.page_store = store
+    node.config.page_files_dir.mkdir(parents=True, exist_ok=True)
+    store_page_file(node.config.page_files_dir, file_entry["sha256"], file_bytes)
+
+    # This node's own page, as `tau page publish` writes it.
+    own_page = build_page(
+        node.identity,
+        title="Tester page",
+        markdown="# Hello\n\nThis is my page.\n",
+        version=1,
+        updated_at=1001.0,
+    )
+    save_local_page(node.config.page_path, own_page)
+    node.local_page = load_local_page(node.config.page_path)
+
+    # The console fetches through the node: "alice" resolves to the
+    # page author, "bob" to a peer with no page, anything else fails.
+    def _resolve(target):
+        if target == "alice":
+            return SimpleNamespace(hexhash=author_hash)
+        if target == "bob":
+            return SimpleNamespace(hexhash=BOB_HASH)
+        raise NodeError(f"unknown peer: {target!r}")
+
+    node.resolve_peer = _resolve
+    node.request_page = lambda peer: node.page_store.get(peer.hexhash)
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/pages")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["pages"][0]["title"] == "Mesh meetup"
+        assert payload["pages"][0]["author"] == author_hash
+        assert payload["pages"][0]["files"] == [file_entry]
+        assert "sig" not in payload["pages"][0]
+        assert "key" not in payload["pages"][0]
+        assert payload["mine"]["title"] == "Tester page"
+
+        # A blocked author never reaches the list; the own page stays.
+        node.blocklist = SimpleNamespace(
+            blocked=frozenset({author_hash}), block_all=False
+        )
+        status, _, payload = _json(bridge, "/api/pages")
+        assert status == 200
+        assert payload["pages"] == []
+        assert payload["mine"]["title"] == "Tester page"
+        node.blocklist = None
+
+        status, _, payload = _json(
+            bridge, "/api/pages/fetch", method="POST", body={"peer": "alice"}
+        )
+        assert status == 200
+        assert payload["page"]["title"] == "Mesh meetup"
+
+        status, _, payload = _json(
+            bridge, "/api/pages/fetch", method="POST", body={"peer": "bob"}
+        )
+        assert status == 200
+        assert payload["page"] is None
+
+        status, _, payload = _json(
+            bridge, "/api/pages/fetch", method="POST", body={"peer": "nobody"}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/pages/fetch", method="POST", body={}
+        )
+        assert status == 400
+
+        # An unreachable peer is a 502, like a failed channel sync.
+        def _failing_request(peer):
+            raise NodeError("peer unreachable")
+
+        node.request_page = _failing_request
+        status, _, payload = _json(
+            bridge, "/api/pages/fetch", method="POST", body={"peer": "alice"}
+        )
+        assert status == 502
+
+        status, headers, body = _request(
+            bridge, f"/api/pages/{author_hash}/files/{file_entry['sha256']}"
+        )
+        assert status == 200
+        assert body == file_bytes
+        assert "attachment" in headers["Content-Disposition"]
+        assert "notes.txt" in headers["Content-Disposition"]
+
+        # An unknown digest, an unlinked digest, or a malformed
+        # author is a 404 — never a neighbouring page's file.
+        status, _, payload = _json(
+            bridge, f"/api/pages/{author_hash}/files/{'00' * 32}"
+        )
+        assert status == 404
+        status, _, payload = _json(
+            bridge, f"/api/pages/{'cd' * 16}/files/{file_entry['sha256']}"
+        )
+        assert status == 404
+        status, _, payload = _json(
+            bridge, f"/api/pages/not-a-hash/files/{file_entry['sha256']}"
+        )
+        assert status == 404
+        status, _, payload = _json(
+            bridge, f"/api/pages/{author_hash}/files/not-a-digest"
+        )
+        assert status == 404
+    finally:
+        bridge.stop()
+
+
 def test_tan_authors_via_api(tmp_path):
     import RNS
     from types import SimpleNamespace
