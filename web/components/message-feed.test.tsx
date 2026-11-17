@@ -1364,3 +1364,39 @@ describe("MessageFeed group polls", () => {
     expect(screen.queryByText("close poll")).toBeNull();
   });
 });
+
+describe("MessageFeed location", () => {
+  it("renders a pin with an open-in-maps link", () => {
+    const message = makeMessage({
+      text: "meet here",
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+    });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("meet here")).toBeTruthy();
+    expect(screen.getByText("Rock Springs Park")).toBeTruthy();
+    expect(screen.getByText("34.05, -83.88")).toBeTruthy();
+    const link = screen.getByText("Open in Maps");
+    expect(link.getAttribute("href")).toBe(
+      "https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88#map=15/34.05/-83.88",
+    );
+  });
+
+  it("labels a nameless pin Location", () => {
+    const message = makeMessage({
+      text: "📍 34.05, -83.88",
+      location: { lat: 34.05, lon: -83.88 },
+    });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("Location")).toBeTruthy();
+    expect(screen.getByText("Open in Maps")).toBeTruthy();
+  });
+
+  it("renders nothing extra when a message has no pin", () => {
+    render(
+      <MessageFeed messages={[makeMessage()]} node={null} live={true} />,
+    );
+    expect(screen.queryByText("Open in Maps")).toBeNull();
+  });
+});

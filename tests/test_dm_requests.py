@@ -72,6 +72,20 @@ def test_record_and_load_roundtrip_and_mode(tmp_path):
     assert json.loads(path.read_text())["requests"][0]["sender"] == BOB
 
 
+def test_request_roundtrip_keeps_location_pin(tmp_path):
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    path = tmp_path / "dm-requests.json"
+    assert record_dm_request(path, make_request(location=pin)) is True
+    loaded = load_dm_requests(path)
+    assert loaded == [make_request(location=pin)]
+    assert json.loads(path.read_text())["requests"][0]["location"] == pin
+    # A malformed pin on a stored request drops instead of the request.
+    data = json.loads(path.read_text())
+    data["requests"][0]["location"] = {"lat": 91, "lon": 0}
+    path.write_text(json.dumps(data))
+    assert load_dm_requests(path)[0].location is None
+
+
 def test_duplicate_id_keeps_first_receipt(tmp_path):
     path = tmp_path / "dm-requests.json"
     assert record_dm_request(path, make_request(received_at=1000.0), now=1000.0) is True

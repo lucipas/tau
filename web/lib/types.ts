@@ -96,6 +96,10 @@ export interface TauMessage {
   // SHA-256 of the file this message carried. Received files can be
   // downloaded from GET /api/files/<sender>/<name>.
   file?: { name: string; size: number; sha256: string };
+  // Static location pin, present on location messages: decimal
+  // degrees plus an optional place name. The feed renders it with
+  // an open-in-maps link; a live beacon is a later step.
+  location?: { lat: number; lon: number; name?: string };
   // Group poll context, present on group poll entries: the question
   // is the message text, `poll_options` the choices, and `poll` the
   // tally derived from the group's stored votes. A vote or close
@@ -759,6 +763,9 @@ export interface DmRequestEntry {
   request_expires_at: number;
   expires_at?: number;
   in_reply_to?: { id: string; excerpt?: string } | null;
+  // Static location pin the held message carried, like the quote
+  // above: rendered with the message once the request is accepted.
+  location?: { lat: number; lon: number; name?: string };
 }
 
 export interface DmRequestsResponse {

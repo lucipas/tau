@@ -2136,6 +2136,25 @@ def test_record_drops_corrupt_reply_reference(tmp_path):
     assert len(inbox) == 1
 
 
+def test_record_keeps_location_pin(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    inbox.append(_record(id="msg-9", location=pin, direction="in"))
+
+    reloaded = Inbox(tmp_path / "inbox.json")
+    entry = reloaded.list_messages()[0]
+    assert entry["location"] == pin
+
+
+def test_record_drops_corrupt_location_pin(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-9", location={"lat": 91, "lon": 0}))
+
+    entry = inbox.list_messages()[0]
+    assert "location" not in entry
+    assert len(inbox) == 1
+
+
 def test_reaction_clear_of_unknown_is_a_noop(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     assert inbox.record_reaction(_reaction(reaction="")) is None

@@ -10495,6 +10495,22 @@ def test_stored_file_metadata_survives_load_and_bad_shapes_drop():
     assert "file" not in _clean_stored_message(entry)
 
 
+def test_stored_location_pin_survives_load_and_bad_shapes_drop():
+    from tau.webapi import _clean_stored_message
+
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    entry = _stored_message(1, "meet here", direction="out")
+    entry["location"] = pin
+    cleaned = _clean_stored_message(entry)
+    assert cleaned is not None
+    assert cleaned["location"] == pin
+
+    entry["location"] = {"lat": 91, "lon": 0}
+    assert "location" not in _clean_stored_message(entry)
+    entry["location"] = "34.05,-83.88"
+    assert "location" not in _clean_stored_message(entry)
+
+
 def test_corrupt_message_history_starts_empty(node, tmp_path):
     (tmp_path / "messages.json").write_text("{not json", encoding="utf-8")
     bridge = _bridge_with_data_dir(node, tmp_path)

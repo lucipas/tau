@@ -11,15 +11,18 @@ from tau.protocol import (
     MAX_REQUEST_BYTES,
     ProtocolError,
     build_announce,
+    clean_location,
     decode,
     derive_group_id,
     encode,
     encode_group_message,
     encode_message,
     excerpt_hash,
+    location_maps_url,
     normalize_message,
     parse_announce,
     parse_group_message,
+    parse_location_arg,
     parse_message,
     response_error,
     response_ok,
@@ -161,6 +164,106 @@ def test_message_rejects_malformed_reply():
                     "in_reply_to": {"id": "a" * 32, "excerpt": "zz"},
                 }
             )
+        )
+
+
+def test_clean_location_accepts_named_and_bare_pins():
+    assert clean_location({"lat": 34.05, "lon": -83.88}) == {
+        "lat": 34.05,
+        "lon": -83.88,
+    }
+    assert clean_location(
+        {"lat": 34.05, "lon": -83.88, "name": "  Rock Springs Park  "}
+    ) == {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    # An empty name is no name, not a blank one.
+    assert clean_location({"lat": 0, "lon": 0, "name": "   "}) == {
+        "lat": 0.0,
+        "lon": 0.0,
+    }
+    assert clean_location(None) is None
+    # The poles and the antimeridian are valid pins.
+    assert clean_location({"lat": -90, "lon": 180}) == {"lat": -90.0, "lon": 180.0}
+
+
+def test_clean_location_rejects_out_of_range_and_bad_types():
+    assert clean_location({"lat": 91, "lon": 0}) is None
+    assert clean_location({"lat": 0, "lon": -181}) is None
+    assert clean_location({"lat": "34.05", "lon": -83.88}) is None
+    assert clean_location({"lat": True, "lon": 0}) is None
+    assert clean_location({"lat": float("nan"), "lon": 0}) is None
+    assert clean_location({"lat": 34.05}) is None
+    assert clean_location({"lat": 34.05, "lon": -83.88, "name": 42}) is None
+    assert clean_location(
+        {"lat": 34.05, "lon": -83.88, "name": "x" * 201}
+    ) is None
+    assert clean_location("34.05,-83.88") is None
+
+
+def test_parse_location_arg():
+    assert parse_location_arg("34.05,-83.88 Rock Springs Park") == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+    assert parse_location_arg("34.05,-83.88") == {"lat": 34.05, "lon": -83.88}
+    assert parse_location_arg("  -12.5,  45.0  the park  ") == {
+        "lat": -12.5,
+        "lon": 45.0,
+        "name": "the park",
+    }
+    for bad in ("", "34.05", "34.05,-83.88,10", "north,-83.88", "91,0", "0,181"):
+        with pytest.raises(ValueError):
+            parse_location_arg(bad)
+
+
+def test_location_maps_url():
+    url = location_maps_url({"lat": 34.05, "lon": -83.88})
+    assert url.startswith("https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88")
+    assert url.endswith("#map=15/34.05/-83.88")
+
+
+def test_message_roundtrip_with_location():
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    data = encode_message("meet here", message_id="b" * 32, location=pin)
+    parsed = parse_message(data)
+    assert parsed["text"] == "meet here"
+    assert parsed["location"] == pin
+    # A pin without coordinates is rejected at encode time, and a
+    # malformed pin on the wire drops instead of the message.
+    with pytest.raises(ProtocolError):
+        encode_message("hi", location={"lat": 91, "lon": 0})
+    with pytest.raises(ProtocolError):
+        encode_message("hi", location={"lat": 34.05})
+    dropped = parse_message(
+        encode({"type": "message", "text": "hi", "location": {"lat": 91, "lon": 0}})
+    )
+    assert dropped["location"] is None
+    assert dropped["text"] == "hi"
+
+
+def test_group_message_roundtrip_with_location():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    data = encode_group_message(
+        "meet here",
+        message_id="b" * 32,
+        group_id=derive_group_id(members[0], "weekend", members),
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+        location=pin,
+    )
+    parsed = parse_group_message(data)
+    assert parsed["text"] == "meet here"
+    assert parsed["location"] == pin
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            group_id=derive_group_id(members[0], "weekend", members),
+            group_name="weekend",
+            creator=members[0],
+            members=members,
+            location={"lat": 91, "lon": 0},
         )
 
 
