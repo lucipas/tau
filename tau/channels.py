@@ -411,7 +411,13 @@ def store_message(
     now: Optional[float] = None,
     verify: bool = True,
 ) -> Tuple[Dict[str, Any], bool]:
-    """Validate and store a channel message, returning ``(message, is_new)``."""
+    """Validate and store a channel message, returning ``(message, is_new)``.
+
+    ``is_new`` is false when the message was already stored — or when
+    retention evicted it during its own insert (an old message arriving
+    into a full store).  Eviction is not an error: the message was
+    accepted, it simply did not survive the per-channel bound.
+    """
     timestamp = float(now if now is not None else time.time())
     if verify:
         message = verify_message(mesg, now=timestamp)
@@ -453,8 +459,12 @@ def store_message(
         return _canonical_message(dict(existing)), False
 
     record = get_message(conn, digest)
-    if record is None:  # pragma: no cover - insert should guarantee this
-        raise ChannelError("channel message disappeared after it was stored")
+    if record is None:
+        # Retention evicted the message during its own insert: an old
+        # message arriving into a full store.  Report it as not newly
+        # stored rather than as a disappearance — the caller already
+        # has the validated message, and the store bound is working.
+        return _canonical_message(message), False
     return _canonical_message(record), True
 
 
@@ -469,11 +479,16 @@ def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
     store without limit.  Runs inside the caller's transaction, and
     only touches the channel just written plus the eviction check, so
     a busy relay does not rescan the whole store per message.
+
+    Retention ranks by ``MIN(created_at, received_at)``: a peer's
+    future-dated post is capped at the time it arrived, so it cannot
+    crowd out current-time sends — 500 posts dated a day ahead must
+    not stop this node from sending now.
     """
     conn.execute(
         "DELETE FROM messages WHERE channel = ? AND hash NOT IN ("
         "SELECT hash FROM messages WHERE channel = ? "
-        "ORDER BY created_at DESC, hash DESC "
+        "ORDER BY MIN(created_at, received_at) DESC, hash DESC "
         f"LIMIT {MAX_STORED_PER_CHANNEL})",
         (channel, channel),
     )
@@ -913,15 +928,25 @@ class ChannelApp:
                     # older history still exists, and a page can end
                     # inside a timestamp tie.  Only valid entries
                     # count as a cursor; a page of nothing usable
-                    # ends the walk for this peer.
-                    stamps = [
-                        (float(raw["created_at"]), str(raw["hash"]))
-                        for raw in messages
-                        if isinstance(raw, dict)
-                        and isinstance(raw.get("created_at"), (int, float))
-                        and not isinstance(raw.get("created_at"), bool)
-                        and isinstance(raw.get("hash"), str)
-                    ]
+                    # ends the walk for this peer.  Each entry is
+                    # validated on its own: a peer timestamp too large
+                    # for a double (or a malformed hash) must not
+                    # abort the walk — such an entry was already
+                    # recorded (or skipped as blocked) above.
+                    stamps: List[Tuple[float, str]] = []
+                    for raw in messages:
+                        if not isinstance(raw, dict):
+                            continue
+                        try:
+                            stamp = _require_timestamp(
+                                raw.get("created_at"), "created_at"
+                            )
+                            digest = _require_hex(
+                                raw.get("hash"), HASH_HEX_LENGTH, "hash"
+                            )
+                        except (ChannelError, OverflowError):
+                            continue
+                        stamps.append((stamp, digest))
                     if not stamps:
                         break
                     before, before_hash = min(stamps)

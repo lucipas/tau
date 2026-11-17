@@ -399,6 +399,40 @@ def test_sync_survives_bad_peer_entries(identities, tmp_path):
     assert [item["text"] for item in app.history("general")] == ["good"]
 
 
+def test_sync_survives_huge_peer_timestamp(identities, tmp_path):
+    # Qodo Warning on #477: sync built its pagination cursor with
+    # float(raw["created_at"]) outside the per-entry error handler,
+    # so one peer entry with a timestamp too large for a double raised
+    # OverflowError and aborted sync for the remaining peers.  The
+    # huge entry is recorded as an error; the good entry still lands.
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    good = create_message(source, bob, "general", "good", name="bob", now=1000)
+    huge = dict(good, hash="22" * 32, created_at=10**400)
+
+    class _HugeNode(_FakeNode):
+        def request(self, peer, path, payload, *, timeout=20.0):
+            return {"ok": True, "messages": [huge, good], "has_more": False}
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(author_of(bob)),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _HugeNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, "general", limit=20)
+    assert summary["stored"] == 1
+    assert len(summary["errors"]) == 1
+    assert "too large" in summary["errors"][0]["error"]
+    assert [item["text"] for item in app.history("general")] == ["good"]
+
+
 def test_handle_feed_trims_large_pages_and_reports_more(identities, tmp_path):
     # Fifty 2,000-character messages exceed the 64 KiB response
     # budget, so the feed must trim — and say so, so sync keeps paging.
@@ -543,6 +577,55 @@ def test_store_prunes_per_channel_and_evicted_rooms(identities, tmp_path):
     rooms = conn.execute("SELECT DISTINCT channel FROM messages").fetchall()
     assert len(rooms) == 100
     assert len(channel_history(conn, "general", limit=1)) == 1
+
+
+def test_future_dated_posts_do_not_block_local_sends(identities, tmp_path):
+    # Qodo Critical on #477: _prune_store ranked by signed created_at,
+    # so 500 peer posts dated a day ahead filled the retention budget
+    # and a current-time local send was pruned during its own insert.
+    # Retention is now capped at receipt time, so the local send lands.
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    join_channel(conn, "general")
+    source = init_db(tmp_path / "source.sqlite3")
+    now = time.time()
+    for index in range(MAX_STORED_PER_CHANNEL):
+        future = create_message(
+            source, bob, "general", f"future {index}", name="bob",
+            now=now + 3600 + index,
+        )
+        store_message(conn, future, now=now + index)
+    record = create_message(
+        conn, alice, "general", "hello now", name="alice",
+        now=now + MAX_STORED_PER_CHANNEL,
+    )
+    assert get_message(conn, record["hash"]) is not None
+    # Retention kept the local send and evicted a future-dated post
+    # instead: the store still holds exactly the bound.
+    stored = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE channel = 'general'"
+    ).fetchone()[0]
+    assert stored == MAX_STORED_PER_CHANNEL
+
+
+def test_store_message_reports_eviction_instead_of_raising(identities, tmp_path):
+    # An old message arriving into a store that already holds 500
+    # newer messages is accepted, then immediately evicted by
+    # retention during its own insert.  That is not a disappearance:
+    # store_message returns it as not newly stored, without raising.
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    join_channel(conn, "general")
+    for index in range(MAX_STORED_PER_CHANNEL):
+        create_message(
+            conn, alice, "general", f"msg {index}", name="alice", now=2000 + index
+        )
+    source = init_db(tmp_path / "source.sqlite3")
+    old = create_message(source, bob, "general", "old news", name="bob", now=1000)
+    record, is_new = store_message(conn, old, now=1500)
+    assert is_new is False
+    assert record["hash"] == old["hash"]
+    assert get_message(conn, old["hash"]) is None
 
 
 def test_sync_skips_blocked_authors(identities, tmp_path):
