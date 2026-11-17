@@ -448,6 +448,10 @@ tau messages --kind ping
 # See what is waiting on offline peers
 tau outbox
 
+# Broadcast lists: one message, many private DMs (no shared group)
+tau broadcast create team --peer alice --peer bob
+tau broadcast send team "meet at noon"
+
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json

@@ -57,6 +57,13 @@ Global options may appear before or after the command:
 | `tau group ignore GROUP` | Hide a group's messages from `tau messages` (history kept, mail keeps arriving; idempotent) |
 | `tau group unignore GROUP` | Show an ignored group's messages in `tau messages` again (idempotent) |
 | `tau group ignored` | List ignored groups (group name + id, message count) |
+| `tau broadcast create NAME --peer PEER --peer PEER` | Save a named list of peers to message together (yourself is the sender, not a member; lists are local-only and never travel) |
+| `tau broadcast list` | List saved broadcast lists |
+| `tau broadcast show NAME` | Show one broadcast list and its members |
+| `tau broadcast add-member NAME --peer PEER` | Add peers to a broadcast list |
+| `tau broadcast remove-member NAME --peer PEER` | Remove peers from a broadcast list |
+| `tau broadcast delete NAME` | Delete a broadcast list (frees capacity when the list cap is reached) |
+| `tau broadcast send NAME TEXT` | Send a message to every member of a broadcast list, as a private DM each (same delivery flags as `tau send`: `--timeout`, `--no-queue`, `--kind`, `--location`, `--expire`, `--delay`, `--wait`; each member gets their own sent record and store-and-forward envelope) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -188,6 +195,11 @@ tau group ignore weekend
 tau messages --ignored         # only ignored groups
 tau group ignored
 tau group unignore weekend
+
+# Broadcast lists: one message, many private DMs (no shared group)
+tau broadcast create team --peer alice --peer bob
+tau broadcast send team "meet at noon"
+tau broadcast list
 
 # Reply to an earlier message in the conversation (message id or prefix)
 tau send --to alice --reply-to a1b2c3d4 "seconded"
