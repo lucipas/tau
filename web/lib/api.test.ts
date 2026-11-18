@@ -9,6 +9,7 @@ import {
   eventsUrl,
   fetchTanMedia,
   fileUrl,
+  getAwayMessage,
   getChannelMessages,
   getMessages,
   getTanThread,
@@ -20,6 +21,7 @@ import {
   closeDmPoll,
   sendChannelMessage,
   sendMessage,
+  setAwayMessage,
   tanMediaUrl,
   voteDmPoll,
   voteTanPoll,
@@ -110,6 +112,18 @@ describe("GET endpoints", () => {
       reaction: "👍",
     });
   });
+
+  it("fetches the away message", async () => {
+    nextJson = {
+      enabled: false,
+      message: "I'm away right now. I'll reply when I'm back.",
+      since: null,
+      replied_to: [],
+      replied_count: 0,
+    };
+    await getAwayMessage();
+    expect(captured[0].url).toBe("/api/settings/away-message");
+  });
 });
 
 describe("POST endpoints", () => {
@@ -192,6 +206,16 @@ describe("POST endpoints", () => {
     await fetchTanMedia("a".repeat(64), "b".repeat(32));
     expect(captured[0].url).toBe(`/api/tan/media/${"a".repeat(64)}/fetch`);
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
+  });
+
+  it("sets the away message with only the changed fields", async () => {
+    nextJson = { ok: true, away_message: {} };
+    await setAwayMessage({ enabled: true, message: "back on Monday" });
+    expect(captured[0].url).toBe("/api/settings/away-message");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ enabled: true, message: "back on Monday" });
+    await setAwayMessage({ enabled: false });
+    expect(bodyOf(1)).toEqual({ enabled: false });
   });
 });
 

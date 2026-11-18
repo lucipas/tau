@@ -358,6 +358,14 @@ export interface DisappearingDefaults {
   groups: Record<string, number>;
 }
 
+export interface AwayMessageSettings {
+  enabled: boolean;
+  message: string;
+  since: number | null;
+  replied_to: string[];
+  replied_count: number;
+}
+
 export interface MutedConversations {
   peers: string[];
   groups: string[];

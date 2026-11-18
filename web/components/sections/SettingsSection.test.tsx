@@ -1,5 +1,5 @@
-// SettingsSection.test.tsx — settings toggles, rename, disappearing
-// defaults. Runs inside a TauContext.Provider with a fake node.
+// SettingsSection.test.tsx — settings toggles, rename, away message,
+// disappearing defaults. Runs inside a TauContext.Provider with a fake node.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -12,7 +12,26 @@ let settings = { accept_files: true, send_read_receipts: false };
 
 beforeEach(() => {
   settings = { accept_files: true, send_read_receipts: false };
-  const router = mockFetch((url) => {
+  const router = mockFetch((url, method) => {
+    if (url.includes("/api/settings/away-message"))
+      return method === "POST"
+        ? {
+            ok: true,
+            away_message: {
+              enabled: true,
+              message: "back on Monday",
+              since: 1234567890,
+              replied_to: [],
+              replied_count: 0,
+            },
+          }
+        : {
+            enabled: false,
+            message: "I'm away right now. I'll reply when I'm back.",
+            since: null,
+            replied_to: [],
+            replied_count: 0,
+          };
     if (url.includes("/api/settings")) return settings;
     if (url.includes("/api/messages/disappearing")) return { peers: {}, groups: {} };
     return { ok: true };
@@ -64,6 +83,18 @@ describe("SettingsSection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
     await waitFor(() => expect(calls).toContain("POST /api/id/rename"));
     expect(await screen.findByText(/Node renamed to/)).toBeTruthy();
+  });
+
+  it("shows the away message and saves a new one", async () => {
+    renderSettings();
+    expect(await screen.findByText(/Off — DMs arrive as usual/)).toBeTruthy();
+    const message = screen.getByLabelText("Away reply text") as HTMLInputElement;
+    expect(message.value).toBe("I'm away right now. I'll reply when I'm back.");
+    fireEvent.click(screen.getByLabelText("Enable away reply"));
+    fireEvent.change(message, { target: { value: "back on Monday" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls).toContain("POST /api/settings/away-message"));
+    expect(await screen.findByText(/On — replying: “back on Monday”/)).toBeTruthy();
   });
 
   it("saves a disappearing default for a peer", async () => {
