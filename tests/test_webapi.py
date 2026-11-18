@@ -5069,6 +5069,71 @@ def test_channels_via_api(tmp_path):
             bridge, "/api/channels/sync", method="POST", body={}
         )
         assert status == 503
+
+        # Pins: pinning, listing, blocked-author hiding, unpinning.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/pin",
+            method="POST",
+            body={"channel": "general", "hash": bob_message["hash"]},
+        )
+        assert status == 200
+        assert payload["channel"] == "general"
+        assert payload["hash"] == bob_message["hash"]
+        status, _, payload = _json(
+            bridge, "/api/channels/pins?channel=general"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["pins"]] == ["hello channels"]
+        assert payload["pins"][0]["pinned_at"] is not None
+        # Pinning twice, and pinning without a hash, are client errors.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/pin",
+            method="POST",
+            body={"channel": "general", "hash": bob_message["hash"]},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/pin",
+            method="POST",
+            body={"channel": "general"},
+        )
+        assert status == 400
+        status, _, payload = _json(bridge, "/api/channels/pins")
+        assert status == 400
+        # A blocked author is hidden from pins, like from history.
+        node.blocklist = SimpleNamespace(
+            blocked=frozenset({bob_message["author"]}), block_all=False
+        )
+        status, _, payload = _json(
+            bridge, "/api/channels/pins?channel=general"
+        )
+        assert status == 200
+        assert payload["pins"] == []
+        node.blocklist = None
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/unpin",
+            method="POST",
+            body={"channel": "general", "hash": bob_message["hash"]},
+        )
+        assert status == 200
+        assert payload["unpinned"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/unpin",
+            method="POST",
+            body={"channel": "general", "hash": bob_message["hash"]},
+        )
+        assert status == 200
+        assert payload["unpinned"] is False
+        status, _, payload = _json(
+            bridge, "/api/channels/pins?channel=general"
+        )
+        assert status == 200
+        assert payload["pins"] == []
     finally:
         bridge.stop()
 

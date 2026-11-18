@@ -421,6 +421,9 @@ Global options may appear before or after the command:
 | `tau channel edit NAME DIGEST NEW-TEXT` | Edit your own channel message (digest or hex prefix) |
 | `tau channel edits NAME` | List edit notices for a channel, newest first |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
+| `tau channel pin NAME HASH` | Pin a stored message so it stays surfaced (and survives pruning) |
+| `tau channel unpin NAME HASH` | Drop the pin on a message in a channel |
+| `tau channel pins NAME` | List pinned messages for a channel, newest pin first |
 | `tau channel search NAME TEXT` | Search stored messages in a channel by keyword, newest first |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
 | `tau channel retract NAME DIGEST` | Retract one of your own channel messages (signed notice, gossiped to peers) |

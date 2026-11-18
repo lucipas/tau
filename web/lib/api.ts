@@ -1014,6 +1014,21 @@ export async function reactToChannelMessage(
   return post("/api/channels/react", { channel, target, reaction });
 }
 
+export async function getChannelPins(channel: string): Promise<ChannelMessage[]> {
+  const data = await get<{ channel: string; pins: ChannelMessage[]; count: number }>(
+    `/api/channels/pins${query({ channel })}`,
+  );
+  return data.pins;
+}
+
+export async function pinChannelMessage(channel: string, hash: string): Promise<{ channel: string; hash: string; pinned_at: number }> {
+  return post("/api/channels/pin", { channel, hash });
+}
+
+export async function unpinChannelMessage(channel: string, hash: string): Promise<{ channel: string; hash: string; unpinned: boolean }> {
+  return post("/api/channels/unpin", { channel, hash });
+}
+
 /** Pull missing history for one channel, or every joined channel when omitted. */
 export async function syncChannels(channel?: string, limit = 20): Promise<unknown> {
   return post("/api/channels/sync", channel ? { channel, limit } : { limit });

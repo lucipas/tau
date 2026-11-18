@@ -3964,6 +3964,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_read.set_defaults(func=cmd_channel_read)
 
+    channel_pin = channel_sub.add_parser(
+        "pin",
+        parents=[common],
+        help="pin a stored message so it stays surfaced (and survives pruning)",
+    )
+    channel_pin.add_argument("channel", metavar="NAME", help="channel holding the message")
+    channel_pin.add_argument("digest", metavar="HASH", help="message hash to pin")
+    channel_pin.set_defaults(func=cmd_channel_pin)
+
+    channel_unpin = channel_sub.add_parser(
+        "unpin",
+        parents=[common],
+        help="drop the pin on a message in a channel",
+    )
+    channel_unpin.add_argument("channel", metavar="NAME", help="channel holding the message")
+    channel_unpin.add_argument("digest", metavar="HASH", help="message hash to unpin")
+    channel_unpin.set_defaults(func=cmd_channel_unpin)
+
+    channel_pins = channel_sub.add_parser(
+        "pins",
+        parents=[common],
+        help="list pinned messages for a channel, newest pin first",
+    )
+    channel_pins.add_argument("channel", metavar="NAME", help="channel to list pins for")
+    channel_pins.set_defaults(func=cmd_channel_pins)
     channel_search = channel_sub.add_parser(
         "search",
         parents=[common],
@@ -8487,6 +8512,64 @@ def cmd_channel_edits(args: argparse.Namespace) -> int:
         print(f"[{_stamp(edit.get('created_at'))}] {target} by {author}:")
         for line in str(edit.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_channel_pin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        pin = app.pin(args.channel, args.digest)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit(pin, True)
+    else:
+        print(f"pinned {short_hash(pin['hash'])} in #{pin['channel']}")
+    return _EXIT_OK
+
+
+def cmd_channel_unpin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        unpinned = app.unpin(args.channel, args.digest)
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit(
+            {"channel": name, "hash": args.digest, "unpinned": unpinned}, True
+        )
+    else:
+        if unpinned:
+            print(f"unpinned {short_hash(args.digest)} in #{name}")
+        else:
+            print(f"not pinned in #{name}: {short_hash(args.digest)}")
+    return _EXIT_OK
+
+
+def cmd_channel_pins(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    pins = app.pins(name)
+    if json_output:
+        _emit({"channel": name, "pins": pins, "count": len(pins)}, True)
+        return _EXIT_OK
+    if not pins:
+        print(f"No pinned messages in #{name}.")
+        return _EXIT_OK
+    _print_channel_messages(pins, json_output=False, channel=name)
     return _EXIT_OK
 
 

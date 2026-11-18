@@ -119,6 +119,24 @@ export default function ChannelsSection() {
     }
   }
 
+  async function handlePin(hash: string) {
+    setError(null);
+    try {
+      await channels.pin(hash);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleUnpin(hash: string) {
+    setError(null);
+    try {
+      await channels.unpin(hash);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function handleSearch(e: React.FormEvent) {
     e.preventDefault();
     const query = searchText.trim();
@@ -145,6 +163,8 @@ export default function ChannelsSection() {
   const messages = showingSearch
     ? channels.searchResults!
     : [...channels.messages].reverse();
+  // Pins arrive newest pin first and stay in that order up top.
+  const pinnedHashes = new Set(channels.pins.map((p) => p.hash));
   // Replies quote their parent from the loaded page; a parent that
   // has not arrived yet shows its short digest instead.
   const byHash = new Map(channels.messages.map((m) => [m.hash, m]));
@@ -288,6 +308,39 @@ export default function ChannelsSection() {
           )}
 
           <div className="px-3 py-2 sm:px-4">
+            {channels.pins.length > 0 && (
+              <div className="mb-2 rounded-lg border border-amber-800/60 bg-amber-950/40 px-3 py-2">
+                <p className="text-xs font-bold uppercase tracking-wide text-amber-400">
+                  Pinned
+                </p>
+                {channels.pins.map((m) => (
+                  <div key={m.hash} className="flex gap-3 border-b border-amber-800/30 py-2 last:border-b-0">
+                    <Avatar name={m.name} seed={m.author} size="sm" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm">
+                        <span className="font-bold text-zinc-100">
+                          {m.name || shortHash(m.author)}
+                        </span>{" "}
+                        <span className="text-xs text-zinc-500">
+                          · {formatRelative(m.created_at)}
+                        </span>
+                      </p>
+                      <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
+                        {m.text}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleUnpin(m.hash)}
+                      aria-label={`Unpin pinned message from ${m.name || shortHash(m.author)}`}
+                      className="h-fit shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs font-semibold text-zinc-300 hover:bg-zinc-900"
+                    >
+                      Unpin
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             {messages.length === 0 && !showingSearch && (
               <p className="py-6 text-center text-sm text-zinc-500">
                 No messages in this channel yet — say hello.
@@ -408,6 +461,18 @@ export default function ChannelsSection() {
                     Reply
                   </button>
                 </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    void (pinnedHashes.has(m.hash)
+                      ? handleUnpin(m.hash)
+                      : handlePin(m.hash))
+                  }
+                  aria-label={`${pinnedHashes.has(m.hash) ? "Unpin" : "Pin"} message from ${m.name || shortHash(m.author)}`}
+                  className="h-fit shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs font-semibold text-zinc-300 hover:bg-zinc-900"
+                >
+                  {pinnedHashes.has(m.hash) ? "Pinned" : "Pin"}
+                </button>
               </div>
               );
             })}

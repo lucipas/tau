@@ -1248,6 +1248,16 @@ CREATE TABLE IF NOT EXISTS memberships (
     joined_at REAL NOT NULL
 );
 
+-- Pins are local-only: a message this node marked to keep surfaced.
+-- A pinned message is never dropped by per-channel pruning, and its
+-- row is deleted with the channel when a merely-cached room is
+-- evicted whole, so a pin can never outlive its message.
+CREATE TABLE IF NOT EXISTS pins (
+    channel TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    pinned_at REAL NOT NULL,
+    PRIMARY KEY (channel, hash)
+);
 CREATE TABLE IF NOT EXISTS edits (
     v INTEGER NOT NULL DEFAULT 1,
     hash TEXT PRIMARY KEY,
@@ -1784,8 +1794,9 @@ def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
         "DELETE FROM messages WHERE channel = ? AND hash NOT IN ("
         "SELECT hash FROM messages WHERE channel = ? "
         "ORDER BY MIN(created_at, received_at) DESC, hash DESC "
-        f"LIMIT {MAX_STORED_PER_CHANNEL})",
-        (channel, channel),
+        f"LIMIT {MAX_STORED_PER_CHANNEL}) "
+        "AND hash NOT IN (SELECT hash FROM pins WHERE channel = ?)",
+        (channel, channel, channel),
     )
     # Reactions on a pruned message go with it: a reaction whose
     # target is gone can never be displayed, and a peer re-serving
@@ -1818,6 +1829,8 @@ def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
             # Every cached channel is joined: nothing evictable.
             return
         conn.execute("DELETE FROM messages WHERE channel = ?", (row[0],))
+        # A pin must never outlive its message.
+        conn.execute("DELETE FROM pins WHERE channel = ?", (row[0],))
         conn.execute("DELETE FROM reactions WHERE channel = ?", (row[0],))
         conn.execute("DELETE FROM edits WHERE channel = ?", (row[0],))
         # The room is gone: its retract notices go with it, so a
@@ -2050,6 +2063,102 @@ def list_memberships(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def pin_message(
+    conn: sqlite3.Connection,
+    channel: str,
+    digest: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Pin a stored message so pruning never drops it; return the pin.
+
+    Pins are local-only: they mark a message in this node's store,
+    they are not gossiped, and a pin on a message that is not stored
+    here (or is stored under another channel) is an error.  Pinning
+    the same message twice is an error, not a silent no-op.
+    """
+    name = clean_channel_name(channel)
+    digest = _require_hex(digest, HASH_HEX_LENGTH, "hash")
+    row = _fetch_message(conn, digest)
+    if row is None or row["channel"] != name:
+        raise ChannelError(
+            f"no stored message {digest} in channel {name!r}"
+        )
+    pinned_at = float(now if now is not None else time.time())
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO pins(channel, hash, pinned_at) VALUES(?, ?, ?)",
+                (name, digest, pinned_at),
+            )
+    except sqlite3.IntegrityError:
+        raise ChannelError(
+            f"message {digest} is already pinned in channel {name!r}"
+        )
+    return {"channel": name, "hash": digest, "pinned_at": pinned_at}
+
+
+def unpin_message(conn: sqlite3.Connection, channel: str, digest: str) -> bool:
+    """Drop the pin on a message; ``True`` when a pin was removed."""
+    name = clean_channel_name(channel)
+    digest = _require_hex(digest, HASH_HEX_LENGTH, "hash")
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM pins WHERE channel = ? AND hash = ?",
+            (name, digest),
+        )
+    return cursor.rowcount > 0
+
+
+def is_pinned(conn: sqlite3.Connection, channel: str, digest: str) -> bool:
+    """Whether *digest* is pinned in *channel*."""
+    name = clean_channel_name(channel)
+    digest = _require_hex(digest, HASH_HEX_LENGTH, "hash")
+    row = conn.execute(
+        "SELECT hash FROM pins WHERE channel = ? AND hash = ?",
+        (name, digest),
+    ).fetchone()
+    return row is not None
+
+
+def list_pins(
+    conn: sqlite3.Connection,
+    channel: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Pinned messages for *channel*, newest pin first.
+
+    Each entry is the stored message plus ``pinned_at``.  A pin whose
+    message is gone (evicted with its channel) never surfaces: the
+    join drops it rather than returning a pin with nothing behind it.
+    """
+    name = clean_channel_name(channel)
+    excluded = [author for author in (exclude_authors or []) if author]
+    clauses = ["p.channel = ?"]
+    params: List[Any] = [name]
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(f"m.author NOT IN ({placeholders})")
+        params.extend(excluded)
+    columns = ", ".join(f"m.{column}" for column in _MESSAGE_COLUMNS)
+    rows = conn.execute(
+        f"SELECT {columns}, p.pinned_at FROM pins p "
+        "JOIN messages m ON m.hash = p.hash "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY p.pinned_at DESC, p.hash DESC",
+        params,
+    ).fetchall()
+    return [
+        {**_row_to_message(row), "pinned_at": row["pinned_at"]} for row in rows
+    ]
+
+
+# -- application layer -------------------------------------------------------
+
+
 class ChannelApp:
     """Serve and synchronise channel messages for a running :class:`TauNode`."""
 
@@ -2178,6 +2287,37 @@ class ChannelApp:
         conn = self.connect()
         try:
             return channel_history(conn, channel, limit=limit, before=before)
+        finally:
+            conn.close()
+
+    def pin(self, channel: str, digest: str) -> Dict[str, Any]:
+        """Pin a stored message in *channel*; pins survive pruning."""
+        conn = self.connect()
+        try:
+            return pin_message(conn, channel, digest)
+        finally:
+            conn.close()
+
+    def unpin(self, channel: str, digest: str) -> bool:
+        """Drop the pin on a message in *channel*."""
+        conn = self.connect()
+        try:
+            return unpin_message(conn, channel, digest)
+        finally:
+            conn.close()
+
+    def pins(self, channel: str) -> List[Dict[str, Any]]:
+        """Pinned messages for *channel*, newest pin first.
+
+        Blocked authors never surface, and a block-list that cannot
+        be read fails closed to no pins — the same rule as history.
+        """
+        conn = self.connect()
+        try:
+            excluded = self._blocked_authors()
+            if excluded is None:
+                return []
+            return list_pins(conn, channel, exclude_authors=excluded)
         finally:
             conn.close()
 

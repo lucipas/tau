@@ -22,13 +22,17 @@ from tau.channels import (
     get_message,
     init_db,
     is_member,
+    is_pinned,
     join_channel,
     leave_channel,
     list_memberships,
+    list_pins,
+    pin_message,
     reactions_for_messages,
     search_channel_messages,
     store_message,
     store_reaction,
+    unpin_message,
     summarize_reactions,
     verify_message,
     verify_reaction,
@@ -1209,6 +1213,156 @@ def test_cli_channel_send_without_name_flag_keeps_node_name(tmp_path, capsys):
     capsys.readouterr()
     assert main(["id", "--data-dir", str(data_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["name"] == "alice"
+
+
+# -- pins ----------------------------------------------------------------------
+
+
+def test_pin_unpin_list(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    first = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+    second = create_message(conn, bob, "general", "bring snacks", name="bob", now=1001)
+    other = create_message(conn, alice, "other", "not here", name="alice", now=1002)
+
+    pin = pin_message(conn, "general", first["hash"], now=2000)
+    assert pin == {"channel": "general", "hash": first["hash"], "pinned_at": 2000}
+    pin_message(conn, "general", second["hash"], now=2001)
+    assert is_pinned(conn, "general", first["hash"]) is True
+    assert is_pinned(conn, "general", second["hash"]) is True
+
+    # Newest pin first, each entry carrying the stored message.
+    pins = list_pins(conn, "general")
+    assert [entry["hash"] for entry in pins] == [second["hash"], first["hash"]]
+    assert pins[0]["text"] == "bring snacks"
+    assert pins[0]["pinned_at"] == 2001
+
+    # Pinning twice, pinning a missing digest, and pinning a message
+    # stored under another channel are all errors, not silent no-ops.
+    with pytest.raises(ChannelError, match="already pinned"):
+        pin_message(conn, "general", first["hash"])
+    with pytest.raises(ChannelError, match="no stored message"):
+        pin_message(conn, "general", "0" * 64)
+    with pytest.raises(ChannelError, match="no stored message"):
+        pin_message(conn, "general", other["hash"])
+
+    assert unpin_message(conn, "general", first["hash"]) is True
+    assert is_pinned(conn, "general", first["hash"]) is False
+    assert unpin_message(conn, "general", first["hash"]) is False
+    assert [entry["hash"] for entry in list_pins(conn, "general")] == [second["hash"]]
+
+
+def test_list_pins_hides_blocked_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    mine = create_message(conn, alice, "general", "mine", name="alice", now=1000)
+    theirs = create_message(conn, bob, "general", "theirs", name="bob", now=1001)
+    pin_message(conn, "general", mine["hash"], now=2000)
+    pin_message(conn, "general", theirs["hash"], now=2001)
+    pins = list_pins(conn, "general", exclude_authors=[author_of(bob)])
+    assert [entry["hash"] for entry in pins] == [mine["hash"]]
+
+
+def test_pinned_message_survives_pruning(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    join_channel(conn, "general")
+    oldest = create_message(
+        conn, alice, "general", "msg 0", name="alice", now=1000
+    )
+    for index in range(1, MAX_STORED_PER_CHANNEL):
+        create_message(
+            conn, alice, "general", f"msg {index}", name="alice", now=1000 + index
+        )
+    pin_message(conn, "general", oldest["hash"], now=3000)
+    for index in range(MAX_STORED_PER_CHANNEL, MAX_STORED_PER_CHANNEL + 5):
+        create_message(
+            conn, alice, "general", f"msg {index}", name="alice", now=1000 + index
+        )
+    # The bound holds for unpinned messages, plus the one pinned extra.
+    stored = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE channel = 'general'"
+    ).fetchone()[0]
+    assert stored == MAX_STORED_PER_CHANNEL + 1
+    assert get_message(conn, oldest["hash"]) is not None
+    assert is_pinned(conn, "general", oldest["hash"]) is True
+    assert list_pins(conn, "general")[0]["text"] == "msg 0"
+
+
+def test_cli_channel_pin_unpin_pins(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "general",
+                "meet at the park",
+            ]
+        )
+        == 0
+    )
+    digest = json.loads(capsys.readouterr().out)["message"]["hash"]
+
+    assert (
+        main(["channel", "pin", "--data-dir", str(data_dir), "general", digest])
+        == 0
+    )
+    assert "pinned" in capsys.readouterr().out
+    # Pinning twice is an error.
+    assert (
+        main(["channel", "pin", "--data-dir", str(data_dir), "general", digest])
+        == 2
+    )
+    assert "already pinned" in capsys.readouterr().err
+    # Pinning a digest that is not stored is an error.
+    assert (
+        main(
+            ["channel", "pin", "--data-dir", str(data_dir), "general", "0" * 64]
+        )
+        == 2
+    )
+    assert "no stored message" in capsys.readouterr().err
+
+    assert (
+        main(["channel", "pins", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    assert "meet at the park" in capsys.readouterr().out
+
+    assert (
+        main(["channel", "unpin", "--data-dir", str(data_dir), "general", digest])
+        == 0
+    )
+    assert "unpinned" in capsys.readouterr().out
+    # Unpinning again is a no-op that says so, not an error.
+    assert (
+        main(["channel", "unpin", "--data-dir", str(data_dir), "general", digest])
+        == 0
+    )
+    assert "not pinned" in capsys.readouterr().out
+
+    assert (
+        main(
+            [
+                "channel",
+                "pins",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "general",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"channel": "general", "pins": [], "count": 0}
 
 
 # -- reactions ---------------------------------------------------------------
