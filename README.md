@@ -359,6 +359,9 @@ Global options may appear before or after the command:
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau send --to PEER TEXT --poll-options A B` | Ask a question with 2–8 options in a DM (the poll renders with its tally in `tau messages` and the console) |
+| `tau vote --to PEER POLL OPTION` | Vote on a DM poll (option number or exact text; one standing vote per voter, latest wins) |
+| `tau close-poll --to PEER POLL` | Close a DM poll you created (freezes the tally; only the creator can close it) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau doctor` | Check the local data directory's health (read-only; `--json` for scripting) |
