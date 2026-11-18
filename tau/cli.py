@@ -3878,6 +3878,56 @@ def build_parser() -> argparse.ArgumentParser:
     channel_sync.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     channel_sync.set_defaults(func=cmd_channel_sync)
 
+    channel_retract = channel_sub.add_parser(
+        "retract",
+        parents=[common],
+        help="retract one of your own messages from a channel",
+    )
+    channel_retract.add_argument(
+        "channel", metavar="NAME", help="channel the message is in"
+    )
+    channel_retract.add_argument(
+        "digest",
+        metavar="DIGEST|PREFIX",
+        help="message hash or unique prefix (shown by `tau channel read`)",
+    )
+    channel_retract.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="gossip only to these peers (repeatable)",
+    )
+    channel_retract.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="retract locally without gossiping it to peers",
+    )
+    channel_retract.add_argument(
+        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
+    )
+    channel_retract.add_argument(
+        "--timeout", type=float, default=15.0, metavar="SECONDS"
+    )
+    channel_retract.set_defaults(func=cmd_channel_retract)
+
+    channel_retractions = channel_sub.add_parser(
+        "retractions",
+        parents=[common],
+        help="list stored retract notices for a channel",
+    )
+    channel_retractions.add_argument(
+        "channel", metavar="NAME", help="channel to list"
+    )
+    channel_retractions.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_CHANNEL_LIMIT,
+        metavar="N",
+        help="show the newest N notices (default 20)",
+    )
+    channel_retractions.set_defaults(func=cmd_channel_retractions)
+
     bundle = subparsers.add_parser(
         "bundle",
         parents=[common],
@@ -5049,6 +5099,31 @@ def _publish_local_channel_message(
     return {"message": message, "published": published}
 
 
+def _publish_local_channel_retraction(
+    node: TauNode,
+    *,
+    channel: str,
+    digest: str,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    name = clean_channel_name(channel)
+    return publisher.retract(
+        name,
+        digest,
+        publish=True,
+        targets=targets,
+        ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)),
+    )
+
+
 def _publish_local_post(
     node: TauNode,
     *,
@@ -5062,7 +5137,21 @@ def _publish_local_post(
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
+    retract_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if retract_digest is not None:
+        # A channel retract rides the same local publish socket as a
+        # channel send; route it before the Tan-only handling below.
+        if channel is None:
+            raise ChannelError("a channel is required to retract a message")
+        return _publish_local_channel_retraction(
+            node,
+            channel=channel,
+            digest=retract_digest,
+            to=to,
+            ttl=ttl,
+            timeout=timeout,
+        )
     if channel is not None:
         # A channel send rides the same local publish socket as a Tan
         # post; route it before the Tan-only handling below.
@@ -7682,7 +7771,8 @@ def _print_channel_messages(
     for message in messages:
         name = message.get("name") or "anonymous"
         author = short_hash(str(message.get("author", "")))
-        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}):")
+        digest = short_hash(str(message.get("hash", "")))
+        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}) [{digest}]:")
         for line in str(message.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
 
@@ -7894,13 +7984,113 @@ def cmd_channel_sync(args: argparse.Namespace) -> int:
             print("No channels joined yet — join one with `tau channel join <name>`.")
             return _EXIT_OK
         for name, summary in summaries.items():
-            print(
+            line = (
                 f"#{name}: synced {summary['stored']} new message(s) "
                 f"from {summary['peers']} peer(s); "
                 f"{summary['duplicates']} duplicate(s)"
             )
+            if summary.get("retracted"):
+                line += f"; {summary['retracted']} retraction(s)"
+            print(line)
             for error in summary["errors"]:
                 print(f"  {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_retract(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        if getattr(args, "no_publish", False):
+            app = ChannelApp(config, _tan_identity(config), name=config.name)
+            result = app.retract(name, args.digest)
+            notice, published = result["retraction"], result["published"]
+        else:
+            node = TauNode(config, name=config.name)
+            try:
+                node.start(exclusive=True)
+            except InstanceAlreadyRunning:
+                from .local_publish import publish_running
+
+                result = publish_running(
+                    config.data_dir,
+                    retract_digest=args.digest,
+                    channel=name,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                notice, published = result["retraction"], result["published"]
+            else:
+                try:
+                    app = ChannelApp(
+                        config,
+                        node.identity,
+                        name=config.name,
+                        request_timeout=float(getattr(args, "timeout", 15.0)),
+                    )
+                    app.attach(node)
+                    result = app.retract(
+                        name,
+                        args.digest,
+                        publish=True,
+                        targets=(
+                            [node.resolve_peer(target) for target in args.to]
+                            if getattr(args, "to", None)
+                            else None
+                        ),
+                        ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    )
+                    notice, published = result["retraction"], result["published"]
+                finally:
+                    node.stop()
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if json_output:
+        _emit({"channel": name, "retraction": notice, "published": published}, True)
+    else:
+        print(f"retracted {short_hash(notice['hash'])} from #{name}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_retractions(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    notices = app.retractions(name, limit=int(getattr(args, "limit", DEFAULT_CHANNEL_LIMIT)))
+    if json_output:
+        _emit({"channel": name, "retractions": notices, "count": len(notices)}, True)
+        return _EXIT_OK
+    if not notices:
+        print(f"No retractions recorded in #{name}.")
+        return _EXIT_OK
+    for notice in notices:
+        print(
+            f"[{_stamp(notice.get('created_at'))}] "
+            f"{short_hash(str(notice.get('author', '')))} retracted "
+            f"{short_hash(str(notice.get('hash', '')))}"
+        )
     return _EXIT_OK
 
 

@@ -416,6 +416,8 @@ Global options may appear before or after the command:
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
+| `tau channel retract NAME DIGEST` | Retract one of your own channel messages (signed notice, gossiped to peers) |
+| `tau channel retractions NAME` | List stored retract notices for a channel |
 
 Useful flags:
 
