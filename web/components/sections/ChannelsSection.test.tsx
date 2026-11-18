@@ -80,3 +80,53 @@ describe("ChannelsSection", () => {
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
   });
 });
+
+  it("reacts to a message from the quick-react row", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    await screen.findByText("hello channel");
+    fireEvent.click(
+      screen.getByRole("button", { name: "React 👍 to this message" }),
+    );
+    await waitFor(() => expect(calls).toContain("POST /api/channels/react"));
+  });
+
+  it("shows reaction counts and their reactors", async () => {
+    mockFetch((url) => {
+      if (url.includes("/api/channels/messages")) {
+        return {
+          channel: "mesh-general",
+          messages: [
+            {
+              v: 1,
+              hash: "m1".padEnd(64, "0"),
+              channel: "mesh-general",
+              author: "a".repeat(32),
+              key: "a".repeat(32),
+              name: "alice",
+              text: "hello channel",
+              created_at: 1000,
+              received_at: 1000,
+              sig: "s",
+              reactions: [
+                { reaction: "👍", count: 2, reactors: ["alice", "bob"] },
+                { reaction: "🎉", count: 1, reactors: ["carol"] },
+              ],
+            },
+          ],
+          count: 1,
+        };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    });
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByRole("button", { name: "React 👍 (2)" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "React 🎉 (1)" })).toBeTruthy();
+  });

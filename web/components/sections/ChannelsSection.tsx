@@ -16,8 +16,21 @@ export default function ChannelsSection() {
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [reacting, setReacting] = useState<string | null>(null);
 
   const selectedChannel = channels.channels.find((c) => c.channel === channels.selected);
+
+  async function handleReact(hash: string, reaction: string) {
+    setReacting(hash);
+    setError(null);
+    try {
+      await channels.react(hash, reaction);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setReacting(null);
+    }
+  }
 
   async function handleJoin(e: React.FormEvent) {
     e.preventDefault();
@@ -185,6 +198,35 @@ export default function ChannelsSection() {
                   <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
                     {m.text}
                   </p>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    {(m.reactions ?? []).map((r) => (
+                      <button
+                        key={r.reaction}
+                        type="button"
+                        title={r.reactors.join(", ")}
+                        aria-label={`React ${r.reaction} (${r.count})`}
+                        onClick={() => void handleReact(m.hash, r.reaction)}
+                        disabled={reacting === m.hash}
+                        className="rounded-full border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-xs text-zinc-200 hover:border-zinc-500 disabled:opacity-50"
+                      >
+                        {r.reaction} {r.count}
+                      </button>
+                    ))}
+                    {["👍", "❤️", "🎉", "🚀", "👀"]
+                      .filter((token) => !(m.reactions ?? []).some((r) => r.reaction === token))
+                      .map((token) => (
+                        <button
+                          key={token}
+                          type="button"
+                          aria-label={`React ${token} to this message`}
+                          onClick={() => void handleReact(m.hash, token)}
+                          disabled={reacting === m.hash}
+                          className="rounded-full border border-transparent px-1.5 py-0.5 text-xs text-zinc-500 hover:border-zinc-700 hover:text-zinc-200 disabled:opacity-50"
+                        >
+                          {token}
+                        </button>
+                      ))}
+                  </div>
                 </div>
               </div>
             ))}

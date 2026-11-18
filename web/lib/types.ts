@@ -613,6 +613,12 @@ export interface Channel {
   joined_at: number;
 }
 
+export interface ChannelReaction {
+  reaction: string;
+  count: number;
+  reactors: string[];
+}
+
 export interface ChannelMessage {
   v: number;
   hash: string;
@@ -624,6 +630,8 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Reaction summary, grouped by token; absent on old servers. */
+  reactions?: ChannelReaction[];
 }
 
 // ---------------------------------------------------------------- pages --

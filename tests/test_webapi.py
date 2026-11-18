@@ -17908,3 +17908,92 @@ def test_other_endpoints_keep_the_json_body_cap(bridge):
     )
     assert status == 400
     assert "too large" in payload["error"]["message"]
+
+
+def test_channel_react_via_api(tmp_path):
+    from tau.channels import (
+        ChannelApp,
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node.registry = FakeRegistry([])
+    bob = RNS.Identity()
+    tester = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        bob_message = create_message(
+            conn, bob, "general", "hello channels", name="bob", now=1000
+        )
+    finally:
+        conn.close()
+
+    app = ChannelApp(node.config, tester, name="tester")
+    app.node = node  # type: ignore[assignment]
+    node.channel_app = app
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Reacting attaches a summary to the message in the feed.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={
+                "channel": "general",
+                "target": bob_message["hash"][:12],
+                "reaction": "👍",
+            },
+        )
+        assert status == 200
+        assert payload["reaction"]["reaction"] == "👍"
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert payload["messages"][0]["reactions"] == [
+            {"reaction": "👍", "count": 1, "reactors": ["tester"]}
+        ]
+
+        # Validation errors are 400s: a non-string token, an unknown target.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={"channel": "general", "target": bob_message["hash"], "reaction": 5},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={"channel": "general", "target": "0" * 64, "reaction": "👍"},
+        )
+        assert status == 400
+        assert "no stored message" in payload["error"]["message"]
+
+        # An empty reaction clears yours: the summary disappears.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={
+                "channel": "general",
+                "target": bob_message["hash"],
+                "reaction": "",
+            },
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert payload["messages"][0]["reactions"] == []
+    finally:
+        bridge.stop()

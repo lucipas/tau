@@ -958,6 +958,15 @@ export async function sendChannelMessage(channel: string, text: string): Promise
   return post("/api/channels/send", { channel, text });
 }
 
+/** React to a stored channel message; an empty reaction clears yours. */
+export async function reactToChannelMessage(
+  channel: string,
+  target: string,
+  reaction: string,
+): Promise<{ reaction: string }> {
+  return post("/api/channels/react", { channel, target, reaction });
+}
+
 /** Pull missing history for one channel, or every joined channel when omitted. */
 export async function syncChannels(channel?: string, limit = 20): Promise<unknown> {
   return post("/api/channels/sync", channel ? { channel, limit } : { limit });

@@ -163,6 +163,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/react  react to a stored channel message (``{"channel", "target", "reaction"}``; an empty ``reaction`` clears yours)
     POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/pages       cached personal mesh pages, plus this node's own
     POST /api/pages/fetch fetch a peer's page over RNS (``{"peer": "<name or hash>"}``)
@@ -3860,8 +3861,18 @@ class WebBridge:
     def channel_messages(
         self, channel: str, *, limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Stored messages for *channel*, newest first, minus blocked authors."""
-        from .channels import channel_history, clean_channel_name
+        """Stored messages for *channel*, newest first, minus blocked authors.
+
+        Each message carries a ``reactions`` summary — ``[{reaction,
+        count, reactors}]`` grouped by token — so the console renders
+        counts without re-fetching.
+        """
+        from .channels import (
+            channel_history,
+            clean_channel_name,
+            reactions_for_messages,
+            summarize_reactions,
+        )
 
         name = clean_channel_name(channel)
         # One snapshot for every console surface: the node's cached
@@ -3872,15 +3883,26 @@ class WebBridge:
         conn = self._channel_conn()
         try:
             messages = channel_history(conn, name, limit=limit)
+            grouped = reactions_for_messages(
+                conn,
+                name,
+                [str(item.get("hash", "")) for item in messages],
+                exclude_authors=sorted(blocked),
+            )
         finally:
             conn.close()
         if exclude_all:
             return []
-        return [
+        visible = [
             message
             for message in messages
             if str(message.get("author", "")) not in blocked
         ]
+        for message in visible:
+            message["reactions"] = summarize_reactions(
+                grouped.get(str(message.get("hash", "")), [])
+            )
+        return visible
 
     def channel_join(self, channel: str) -> Dict[str, Any]:
         """Join *channel*, recording membership locally."""
@@ -3901,6 +3923,21 @@ class WebBridge:
                 "public channels are not enabled; run serve --channels"
             )
         return app.send(channel, text, publish=True)
+
+    def channel_react(
+        self, channel: str, target: str, reaction: str
+    ) -> Dict[str, Any]:
+        """React to a stored channel message, gossiping it to peers.
+
+        An empty *reaction* clears this node's reaction to the
+        message.
+        """
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        return app.react(channel, target, reaction, publish=True)
 
     def channel_sync(
         self, channel: Optional[str] = None, *, limit: int = 20
@@ -11817,6 +11854,46 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/react":
+                channel = body.get("channel")
+                target = body.get("target")
+                reaction = body.get("reaction")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(reaction, str):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'reaction' is required "
+                                "(empty clears yours)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    record = self.bridge.channel_react(channel, target, reaction)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "reaction": record}, head_only)
                 return
             if path == "/api/channels/sync":
                 channel = body.get("channel")
