@@ -10,36 +10,42 @@ from tau.blocklist import BlockList, save_blocklist
 from tau.channels import (
     CHANNEL_FEED_PATH,
     CHANNEL_POST_PATH,
+    CHANNEL_REACT_PATH,
+    MAX_STORED_PER_CHANNEL,
     ChannelApp,
     ChannelError,
-    MAX_STORED_PER_CHANNEL,
     channel_history,
     channel_history_page,
     clean_channel_name,
-    create_edit,
     create_message,
-    create_retraction,
-    current_message_text,
-    get_edit,
+    create_reaction,
     get_message,
-    get_retraction,
-    hash_message,
-    hash_retraction,
     init_db,
     is_member,
     join_channel,
-    latest_edit_for,
     leave_channel,
-    list_edits,
     list_memberships,
+    reactions_for_messages,
+    store_message,
+    store_reaction,
+    summarize_reactions,
+    verify_message,
+    verify_reaction,
+    create_edit,
+    create_retraction,
+    current_message_text,
+    get_edit,
+    get_retraction,
+    hash_message,
+    hash_retraction,
+    latest_edit_for,
+    list_edits,
     list_retractions,
     reply_parent,
     resolve_message_digest,
     store_edit,
-    store_message,
     store_retraction,
     verify_edit,
-    verify_message,
     verify_retraction,
 )
 from tau.cli import main
@@ -1102,6 +1108,412 @@ def test_cli_channel_send_without_name_flag_keeps_node_name(tmp_path, capsys):
     capsys.readouterr()
     assert main(["id", "--data-dir", str(data_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["name"] == "alice"
+
+
+# -- reactions ---------------------------------------------------------------
+
+def _make_reaction_target(identities, tmp_path):
+    """A stored message plus a connected app; returns (app, target)."""
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, bob, "general", "meet at the park", name="bob", now=1000)
+    conn.close()
+    return _make_app(identities, tmp_path), message
+
+
+def test_create_reaction_signs_and_verifies(identities, tmp_path):
+    alice, bob = identities
+    app, message = _make_reaction_target(identities, tmp_path)
+    conn = app.connect()
+    try:
+        record = create_reaction(
+            conn, alice, "general", message["hash"], "👍", name="alice", now=1001
+        )
+    finally:
+        conn.close()
+    assert record["target"] == message["hash"]
+    assert record["reactor"] == author_of(alice)
+    assert record["reaction"] == "👍"
+    assert verify_reaction(record)["hash"] == record["hash"]
+
+    # The target is part of the signed body: re-pointing breaks the hash.
+    with pytest.raises(ChannelError):
+        verify_reaction(dict(record, target="0" * 64))
+    # So does changing the token.
+    with pytest.raises(ChannelError):
+        verify_reaction(dict(record, reaction="🎉"))
+
+
+def test_reaction_target_must_be_stored(identities, tmp_path):
+    alice, bob = identities
+    app, message = _make_reaction_target(identities, tmp_path)
+    conn = app.connect()
+    try:
+        with pytest.raises(ChannelError, match="no stored message"):
+            create_reaction(conn, alice, "general", "0" * 64, "👍", name="alice", now=1001)
+        with pytest.raises(ChannelError, match="at least 8 hex"):
+            create_reaction(conn, alice, "general", "abc", "👍", name="alice", now=1001)
+        with pytest.raises(ChannelError, match="hex prefix"):
+            create_reaction(conn, alice, "general", "zz" * 8, "👍", name="alice", now=1001)
+        with pytest.raises(ChannelError, match="hex prefix"):
+            create_reaction(conn, alice, "general", "a" * 65, "👍", name="alice", now=1001)
+        # A unique prefix resolves; a reaction that is too long does not.
+        record = create_reaction(
+            conn, alice, "general", message["hash"][:12], "👍", name="alice", now=1001
+        )
+        assert record["target"] == message["hash"]
+        with pytest.raises(ChannelError, match="longer than"):
+            create_reaction(
+                conn, alice, "general", message["hash"], "x" * 100, name="alice", now=1002
+            )
+    finally:
+        conn.close()
+
+
+def _signed_reaction(identities, tmp_path, token, now, *, subdir):
+    """A signed reaction record built in a throwaway db, never stored here.
+
+    ``create_reaction`` stores as it signs, so a record meant for a
+    later ``store_reaction`` call is built in its own database: the
+    message is identical (same author, text and time), so the target
+    hash matches.
+    """
+    alice, bob = identities
+    source = init_db(tmp_path / subdir / "channels.sqlite3")
+    message = create_message(source, bob, "general", "meet at the park", name="bob", now=1000)
+    record = create_reaction(
+        source, alice, "general", message["hash"], token, name="alice", now=now
+    )
+    source.close()
+    return record
+
+
+def test_reaction_latest_wins_and_clear(identities, tmp_path):
+    alice, bob = identities
+    app, message = _make_reaction_target(identities, tmp_path)
+    conn = app.connect()
+    try:
+        create_reaction(conn, alice, "general", message["hash"], "👍", name="alice", now=1001)
+        create_reaction(conn, bob, "general", message["hash"], "🎉", name="bob", now=1002)
+        grouped = reactions_for_messages(conn, "general", [message["hash"]])
+        assert len(grouped[message["hash"]]) == 2
+
+        # Alice changes her mind: one row per reactor, latest wins.
+        heart = _signed_reaction(identities, tmp_path, "❤️", 1003, subdir="heart")
+        record, changed = store_reaction(conn, dict(heart))
+        assert changed is True
+        grouped = reactions_for_messages(conn, "general", [message["hash"]])
+        mine = [item for item in grouped[message["hash"]] if item["reactor"] == author_of(alice)]
+        assert [item["reaction"] for item in mine] == ["❤️"]
+
+        # Clearing stores a retraction record, and readers filter it out.
+        clear = _signed_reaction(identities, tmp_path, "", 1004, subdir="clear")
+        record, changed = store_reaction(conn, dict(clear))
+        assert changed is True
+        grouped = reactions_for_messages(conn, "general", [message["hash"]])
+        assert [item["reactor"] for item in grouped[message["hash"]]] == [author_of(bob)]
+        assert summarize_reactions(grouped[message["hash"]]) == [
+            {"reaction": "🎉", "count": 1, "reactors": ["bob"]}
+        ]
+    finally:
+        conn.close()
+
+
+def test_stale_reaction_does_not_overwrite_newer(identities, tmp_path):
+    alice, bob = identities
+    app, message = _make_reaction_target(identities, tmp_path)
+    conn = app.connect()
+    try:
+        newer = _signed_reaction(identities, tmp_path, "🎉", 1005, subdir="newer")
+        older = _signed_reaction(identities, tmp_path, "👍", 1001, subdir="older")
+        record, changed = store_reaction(conn, dict(newer))
+        assert changed is True
+        # A stale re-send of the older reaction arrives late.
+        record, changed = store_reaction(conn, dict(older))
+        assert changed is False
+        assert record["reaction"] == "🎉"
+    finally:
+        conn.close()
+
+
+def test_handle_react_stores_and_answers(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi all", name="bob", now=1000)
+    reaction = create_reaction(
+        source, alice, "general", message["hash"], "👍", name="alice", now=1001
+    )
+
+    app = _make_app(identities, tmp_path)
+    response = app._handle_react(
+        CHANNEL_REACT_PATH,
+        encode({"reaction": reaction, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert payload["new"] is True
+    assert payload["stored"] == reaction["hash"]
+
+    # A second copy is a duplicate, not an error.
+    response = app._handle_react(
+        CHANNEL_REACT_PATH,
+        encode({"reaction": reaction, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    assert decode(response)["new"] is False
+
+
+def test_handle_react_rejects_tampered_and_blocked(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi all", name="bob", now=1000)
+    reaction = create_reaction(
+        source, alice, "general", message["hash"], "👍", name="alice", now=1001
+    )
+
+    app = _make_app(identities, tmp_path)
+    response = app._handle_react(
+        CHANNEL_REACT_PATH,
+        encode({"reaction": dict(reaction, reaction="🎉"), "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    assert decode(response)["ok"] is False
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({reaction["reactor"]}))
+    )
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    response = app._handle_react(
+        CHANNEL_REACT_PATH,
+        encode({"reaction": reaction, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_admitted"
+    conn = app.connect()
+    try:
+        assert reactions_for_messages(conn, "general", [message["hash"]]) == {
+            message["hash"]: []
+        }
+    finally:
+        conn.close()
+
+
+def test_handle_feed_carries_reactions(identities, tmp_path):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        message = create_message(conn, bob, "general", "one", name="bob", now=1000)
+        create_reaction(conn, alice, "general", message["hash"], "👍", name="alice", now=1001)
+        create_reaction(conn, bob, "general", message["hash"], "🎉", name="bob", now=1002)
+    finally:
+        conn.close()
+
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert [item["reaction"] for item in payload["reactions"]] == ["👍", "🎉"]
+
+    # A blocked reactor's reactions are not served to peers either —
+    # but the message itself (bob's, unblocked) still is.
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({author_of(alice)}))
+    )
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert len(payload["messages"]) == 1
+    assert [item["reaction"] for item in payload["reactions"]] == ["🎉"]
+
+
+def test_sync_pulls_reactions(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "bob one", name="bob", now=1000)
+    create_reaction(source, alice, "general", message["hash"], "👍", name="alice", now=1001)
+
+    class _ReactingNode(_FakeNode):
+        def request(self, peer, path, payload, *, timeout=20.0):
+            request = decode(payload)
+            self.requests.append((path, request))
+            assert path == CHANNEL_FEED_PATH
+            messages, has_more = channel_history_page(
+                self.source,
+                request["channel"],
+                limit=request.get("limit", 20),
+                before=request.get("before"),
+                before_hash=request.get("before_hash"),
+            )
+            grouped = reactions_for_messages(
+                self.source,
+                request["channel"],
+                [item["hash"] for item in messages],
+            )
+            reactions = [
+                record for item in messages for record in grouped.get(item["hash"], [])
+            ]
+            return {
+                "ok": True,
+                "messages": messages,
+                "reactions": reactions,
+                "has_more": has_more,
+            }
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(message["author"]),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _ReactingNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, "general", limit=20)
+    assert summary["stored"] == 1
+    assert summary["reactions_stored"] == 1
+    assert summary["errors"] == []
+    conn = app.connect()
+    try:
+        grouped = reactions_for_messages(conn, "general", [message["hash"]])
+    finally:
+        conn.close()
+    assert [item["reaction"] for item in grouped[message["hash"]]] == ["👍"]
+
+
+def test_prune_drops_reactions_with_messages(identities, tmp_path, monkeypatch):
+    from tau import channels as channels_mod
+
+    alice, bob = identities
+    monkeypatch.setattr(channels_mod, "MAX_STORED_PER_CHANNEL", 1)
+    conn = init_db(tmp_path / "channels.sqlite3")
+    join_channel(conn, "general")
+    old = create_message(conn, bob, "general", "old", name="bob", now=1000)
+    create_reaction(conn, alice, "general", old["hash"], "👍", name="alice", now=1001)
+    create_message(conn, bob, "general", "new", name="bob", now=1002)
+    assert reactions_for_messages(conn, "general", [old["hash"]]) == {old["hash"]: []}
+    assert channel_history(conn, "general")[-1]["text"] == "new"
+
+
+def test_cli_channel_react_round_trip(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        target = channel_history(conn, "general")[0]["hash"]
+    finally:
+        conn.close()
+
+    assert (
+        main(
+            [
+                "channel",
+                "react",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                target[:12],
+                "👍",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "reacted 👍" in out
+
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    out = capsys.readouterr().out
+    assert "hello from the cli" in out
+    assert "👍×1" in out
+
+    # JSON read carries the reactions with the message.
+    assert (
+        main(["channel", "read", "--data-dir", str(data_dir), "--json", "general"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["messages"][0]["reactions"][0]["reaction"] == "👍"
+
+    # Clearing removes the count.
+    assert (
+        main(
+            [
+                "channel",
+                "react",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--clear",
+                "general",
+                target,
+            ]
+        )
+        == 0
+    )
+    assert "retracted your reaction" in capsys.readouterr().out
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    assert "👍" not in capsys.readouterr().out
+
+    # An unknown target is a usage error, not a silent store.
+    assert (
+        main(
+            [
+                "channel",
+                "react",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "0" * 64,
+                "👍",
+            ]
+        )
+        == 2
+    )
+    assert "no stored message" in capsys.readouterr().err
 
 
 # -- channel edits --------------------------------------------------------------

@@ -28,11 +28,12 @@ does not own the author's identity, so nodes can cache and re-serve
 messages for each other — which is how a new joiner fetches the last
 N messages as history.
 
-The network protocol is two request paths served on the same
+The network protocol is three request paths served on the same
 Reticulum destination as the rest of tau:
 
     /tau/channel/feed   {"channel": "...", "before": 1760000000.0, "limit": 20}
     /tau/channel/post   {"message": {...}, "ttl": 2}
+    /tau/channel/react  {"reaction": {...}, "ttl": 2}
     /tau/channel/post   {"retraction": {...}, "ttl": 2}
 
 ``/tau/channel/feed`` reads cached messages for a channel.  It
@@ -101,6 +102,33 @@ A reply whose parent has not arrived yet still stores and verifies —
 readers resolve the parent locally and show its digest until the
 parent lands.
 
+A reaction is a separate signed record naming a stored message by
+hash::
+
+    {
+      "v": 1,
+      "channel": "mesh-meetup",
+      "target": "<64 hex message hash>",
+      "reactor": "<32 hex destination hash>",
+      "key": "<128 hex public key>",
+      "name": "alice",
+      "reaction": "👍",
+      "created_at": 1760000000.0,
+      "hash": "<64 hex sha256(canonical body)>",
+      "sig": "<128 hex Ed25519 signature over the hash>"
+    }
+
+One reaction per reactor per message: a new reaction from the same
+reactor replaces the old one, and an empty ``reaction`` clears it.
+The target must already be stored in the same channel when reacting
+locally — a reaction to a message you have never seen would leave
+readers with a dangling reference.  A reaction arriving from a peer
+whose target has not landed yet still stores and verifies; readers
+show it once the message arrives.  Reactions ride
+``/tau/channel/react`` with the same TTL/fanout as posts, and a feed
+page carries the reactions for the messages on that page, so sync
+pulls reactions along with history.
+
 Membership is local-only and never gossiped: joining records the
 name in the local store, leaving drops it (cached messages stay
 until the node stops serving them — a leave is about what *you*
@@ -133,6 +161,7 @@ from .protocol import (
     MAX_MESSAGE_CHARS,
     MAX_REQUEST_BYTES,
     ProtocolError,
+    clean_reaction,
     decode,
     encode,
     normalize_message,
@@ -147,6 +176,7 @@ log = logging.getLogger(__name__)
 CHANNEL_VERSION = 1
 CHANNEL_FEED_PATH = "/tau/channel/feed"
 CHANNEL_POST_PATH = "/tau/channel/post"
+CHANNEL_REACT_PATH = "/tau/channel/react"
 
 AUTHOR_HEX_LENGTH = 32
 HASH_HEX_LENGTH = 64
@@ -197,6 +227,24 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # re-pointed at another message either.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
 
+# Fields covered by a reaction's hash: the channel and the target
+# keep a reaction in its room and on its message, so a relay cannot
+# move it or re-point it without breaking the hash.
+REACTION_HASH_FIELDS = (
+    "v",
+    "channel",
+    "target",
+    "reactor",
+    "key",
+    "name",
+    "reaction",
+    "created_at",
+)
+
+# Minimum hex characters for a message-hash prefix to resolve: short
+# enough to type, long enough that a collision is a real ambiguity
+# rather than a typo.
+MIN_DIGEST_PREFIX = 8
 # Fields covered by an edit notice's hash.  The target digest pins
 # the notice to one message, so it cannot be replayed onto another.
 EDIT_HASH_FIELDS = (
@@ -230,6 +278,22 @@ _MESSAGE_COLUMNS = (
     "received_at",
     "sig",
     "reply_to",
+)
+
+# Column order for reaction rows.  A reaction is keyed by
+# (target, reactor): one live reaction per reactor per message.
+_REACTION_COLUMNS = (
+    "v",
+    "hash",
+    "channel",
+    "target",
+    "reactor",
+    "key",
+    "name",
+    "reaction",
+    "created_at",
+    "received_at",
+    "sig",
 )
 
 
@@ -922,6 +986,169 @@ def _normalize_retraction(
     }
 
 
+# -- reactions ---------------------------------------------------------------
+
+# A reaction is a signed record in its own right, so it can travel
+# and be verified without its target message: the hash covers the
+# channel, the target and the token, and one row per (target,
+# reactor) keeps the latest reaction from each reactor.
+
+
+def _canonical_reaction_body(reaction: Dict[str, Any]) -> bytes:
+    body = {field: reaction[field] for field in REACTION_HASH_FIELDS}
+    return json.dumps(
+        body,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def hash_reaction(reaction: Dict[str, Any]) -> str:
+    """Hash a channel reaction: lowercase hex sha256 of its body."""
+    if not isinstance(reaction, dict):
+        raise ChannelError("a channel reaction must be a JSON object")
+    missing = [field for field in REACTION_HASH_FIELDS if field not in reaction]
+    if missing:
+        raise ChannelError(
+            f"channel reaction is missing fields: {', '.join(missing)}"
+        )
+    return hashlib.sha256(_canonical_reaction_body(reaction)).hexdigest()
+
+
+def _check_reaction_wire_size(reaction: Dict[str, Any]) -> None:
+    """Reject a reaction whose publish envelope exceeds the budget."""
+    envelope = dict(reaction)
+    envelope.setdefault("hash", "0" * HASH_HEX_LENGTH)
+    envelope.setdefault("sig", "0" * SIG_HEX_LENGTH)
+    try:
+        encode(
+            {"reaction": envelope, "ttl": MAX_GOSSIP_TTL},
+            max_bytes=MAX_REQUEST_BYTES,
+        )
+    except ProtocolError as exc:
+        raise ChannelError(
+            f"channel reaction is too large to publish: {exc}"
+        ) from exc
+
+
+def _normalize_reaction(
+    mesg: Dict[str, Any], *, now: Optional[float] = None
+) -> Dict[str, Any]:
+    """Validate and normalise the signed part of a channel reaction."""
+    if not isinstance(mesg, dict):
+        raise ChannelError("a channel reaction must be a JSON object")
+
+    version = mesg.get("v", CHANNEL_VERSION)
+    if isinstance(version, bool) or version != CHANNEL_VERSION:
+        raise ChannelError(f"unsupported channel reaction version: {version!r}")
+
+    channel = clean_channel_name(mesg.get("channel"))
+    target = _require_hex(mesg.get("target"), HASH_HEX_LENGTH, "target")
+    reactor = _require_hex(mesg.get("reactor"), AUTHOR_HEX_LENGTH, "reactor")
+    key = _require_hex(mesg.get("key"), KEY_HEX_LENGTH, "key")
+
+    raw_name = mesg.get("name", "")
+    name = sanitize_name(raw_name)
+    if name != raw_name:
+        raise ChannelError("channel reaction name is not normalised")
+
+    try:
+        reaction = clean_reaction(mesg.get("reaction"))
+    except ProtocolError as exc:
+        # clean_reaction raises ProtocolError, but every channel
+        # handler catches ChannelError: wrap it so a malformed peer
+        # entry is a validation failure, never an unhandled error.
+        raise ChannelError(f"invalid channel reaction: {exc}") from exc
+
+    created_at = _require_timestamp(mesg.get("created_at"), "created_at")
+    if now is not None and created_at > float(now) + 86400.0:
+        raise ChannelError("channel reaction timestamp is too far in the future")
+
+    record = {
+        "v": CHANNEL_VERSION,
+        "channel": channel,
+        "target": target,
+        "reactor": reactor,
+        "key": key,
+        "name": name,
+        "reaction": reaction,
+        "created_at": created_at,
+    }
+    _check_reaction_wire_size(record)
+    return record
+
+
+def verify_reaction(
+    mesg: Dict[str, Any], *, now: Optional[float] = None
+) -> Dict[str, Any]:
+    """Validate a complete channel reaction, including hash and signature."""
+    reaction = _normalize_reaction(mesg, now=now)
+
+    digest = mesg.get("hash")
+    expected = hash_reaction(reaction)
+    if not isinstance(digest, str) or digest.strip().lower() != expected:
+        raise ChannelError("channel reaction hash does not match its contents")
+    reaction["hash"] = expected
+
+    signature = _require_hex(mesg.get("sig"), SIG_HEX_LENGTH, "sig")
+    reaction["sig"] = signature
+
+    identity = _identity_from_message(reaction)
+    reactor = _author_from_identity(identity)
+    if reactor != reaction["reactor"]:
+        raise ChannelError("public key does not match the reaction reactor")
+    try:
+        valid = identity.validate(bytes.fromhex(signature), bytes.fromhex(expected))
+    except Exception as exc:  # pragma: no cover - depends on RNS internals
+        raise ChannelError(f"could not check signature: {exc}") from exc
+    if not valid:
+        raise ChannelError("channel reaction signature is invalid")
+    return reaction
+
+
+def _canonical_reaction(reaction: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the public, canonical representation of a reaction."""
+    return {
+        "v": reaction["v"],
+        "channel": reaction["channel"],
+        "target": reaction["target"],
+        "reactor": reaction["reactor"],
+        "key": reaction["key"],
+        "name": reaction["name"],
+        "reaction": reaction["reaction"],
+        "created_at": reaction["created_at"],
+        "hash": reaction["hash"],
+        "sig": reaction["sig"],
+    }
+
+
+def summarize_reactions(
+    reactions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Group reactions by token: ``[{reaction, count, reactors}]``.
+
+    ``reactors`` names the reactors in the order they reacted, so a
+    reader can show who reacted without re-sorting.  Tokens sort by
+    count descending, then token, so the most-reacted token leads.
+    """
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for record in reactions:
+        token = str(record.get("reaction", ""))
+        if not token:
+            continue
+        entry = grouped.setdefault(
+            token, {"reaction": token, "count": 0, "reactors": []}
+        )
+        entry["count"] += 1
+        entry["reactors"].append(str(record.get("name") or "anonymous"))
+    return sorted(
+        grouped.values(), key=lambda item: (-item["count"], item["reaction"])
+    )
+
+
+# -- storage ---------------------------------------------------------------
 def verify_retraction(
     notice: Dict[str, Any], *, now: Optional[float] = None
 ) -> Dict[str, Any]:
@@ -980,6 +1207,27 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_channel_created
     ON messages(channel, created_at DESC, hash);
 
+-- One live reaction per reactor per message: a new reaction from
+-- the same reactor replaces the old one, and an empty ``reaction``
+-- is a retraction that readers filter out.  The hash is stored so
+-- a re-sent copy is recognised without re-verifying.
+CREATE TABLE IF NOT EXISTS reactions (
+    v INTEGER NOT NULL DEFAULT 1,
+    hash TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    target TEXT NOT NULL,
+    reactor TEXT NOT NULL,
+    key TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    reaction TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    received_at REAL NOT NULL,
+    sig TEXT NOT NULL,
+    PRIMARY KEY (target, reactor)
+);
+
+CREATE INDEX IF NOT EXISTS reactions_channel_target
+    ON reactions(channel, target, created_at);
 CREATE TABLE IF NOT EXISTS retractions (
     hash TEXT NOT NULL,
     channel TEXT NOT NULL,
@@ -1311,6 +1559,210 @@ def store_message(
         # has the validated message, and the store bound is working.
         return _canonical_message(message), False
     return _canonical_message(record), True
+
+
+def resolve_reaction_target(
+    conn: sqlite3.Connection, channel: str, ref: str
+) -> str:
+    """Resolve a full message hash or a unique hex prefix to a hash.
+
+    The target of a reaction must be a message this node has already
+    stored in the same channel: reacting to a message you have never
+    seen would leave readers with a dangling reference and no way to
+    check the target is even in this room.
+    """
+    name = clean_channel_name(channel)
+    text = ref.strip().lower() if isinstance(ref, str) else ""
+    if not text or re.fullmatch(r"[0-9a-f]+", text) is None:
+        raise ChannelError("reaction target must be a message hash or hex prefix")
+    if len(text) < MIN_DIGEST_PREFIX:
+        raise ChannelError(
+            f"reaction target prefix must be at least {MIN_DIGEST_PREFIX} hex characters"
+        )
+    if len(text) == HASH_HEX_LENGTH:
+        row = conn.execute(
+            "SELECT hash FROM messages WHERE channel = ? AND hash = ?",
+            (name, text),
+        ).fetchone()
+        if row is None:
+            raise ChannelError(
+                f"no stored message with hash {text} in #{name}"
+            )
+        return text
+    if len(text) > HASH_HEX_LENGTH:
+        raise ChannelError("reaction target must be a message hash or hex prefix")
+    rows = conn.execute(
+        "SELECT hash FROM messages WHERE channel = ? AND hash LIKE ? ORDER BY hash",
+        (name, text + "%"),
+    ).fetchall()
+    if not rows:
+        raise ChannelError(f"no stored message with prefix {text} in #{name}")
+    if len(rows) > 1:
+        raise ChannelError(
+            f"reaction target prefix {text} is ambiguous in #{name}; "
+            "use more characters"
+        )
+    return rows[0][0]
+
+
+def _row_to_reaction(row: sqlite3.Row) -> Dict[str, Any]:
+    return _canonical_reaction(dict(row))
+
+
+def _fetch_reaction(
+    conn: sqlite3.Connection, target: str, reactor: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        f"SELECT {', '.join(_REACTION_COLUMNS)} FROM reactions "
+        "WHERE target = ? AND reactor = ?",
+        (target, reactor),
+    ).fetchone()
+
+
+def store_reaction(
+    conn: sqlite3.Connection,
+    mesg: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+    verify: bool = True,
+) -> Tuple[Dict[str, Any], bool]:
+    """Validate and store a channel reaction, returning ``(reaction, changed)``.
+
+    ``changed`` is false when the stored reaction is already this
+    one — or when an older copy arrived after a newer one (a stale
+    re-send must not overwrite the reactor's latest reaction: the
+    newer ``(created_at, hash)`` wins, so two nodes converge on the
+    same reaction regardless of arrival order).  An empty
+    ``reaction`` is a retraction: it replaces the row, and readers
+    filter it out, so the clear itself gossips.
+    """
+    timestamp = float(now if now is not None else time.time())
+    if verify:
+        reaction = verify_reaction(mesg, now=timestamp)
+    else:
+        base = _normalize_reaction(mesg, now=timestamp)
+        reaction = dict(base)
+        reaction["hash"] = hash_reaction(base)
+        reaction["sig"] = _require_hex(mesg.get("sig"), SIG_HEX_LENGTH, "sig")
+
+    existing = _fetch_reaction(conn, reaction["target"], reaction["reactor"])
+    if existing is not None:
+        before = (existing["created_at"], existing["hash"])
+        after = (reaction["created_at"], reaction["hash"])
+        if before >= after:
+            return _canonical_reaction(dict(existing)), False
+    changed = existing is None or existing["reaction"] != reaction["reaction"]
+
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO reactions("
+            + ", ".join(_REACTION_COLUMNS)
+            + ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                CHANNEL_VERSION,
+                reaction["hash"],
+                reaction["channel"],
+                reaction["target"],
+                reaction["reactor"],
+                reaction["key"],
+                reaction["name"],
+                reaction["reaction"],
+                reaction["created_at"],
+                timestamp,
+                reaction["sig"],
+            ),
+        )
+    row = _fetch_reaction(conn, reaction["target"], reaction["reactor"])
+    if row is None:  # pragma: no cover - the insert just succeeded
+        raise ChannelError("channel reaction was not stored")
+    return _canonical_reaction(dict(row)), changed
+
+
+def create_reaction(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    channel: str,
+    target: str,
+    reaction: str,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a reaction owned by *identity*.
+
+    ``target`` is a parent message's hash or unique hex prefix; it
+    must already be stored in this channel.  ``reaction`` is an emoji
+    or short token; an empty value clears the reactor's reaction.
+    """
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    reactor = _author_from_identity(identity)
+    try:
+        token = clean_reaction(reaction)
+    except ProtocolError as exc:
+        raise ChannelError(f"invalid channel reaction: {exc}") from exc
+    body = {
+        "v": CHANNEL_VERSION,
+        "channel": clean_channel_name(channel),
+        "target": resolve_reaction_target(conn, channel, target),
+        "reactor": reactor,
+        "key": identity.get_public_key().hex(),
+        "name": sanitize_name(name),
+        "reaction": token,
+        "created_at": timestamp,
+    }
+    digest = hash_reaction(body)
+    mesg = dict(body)
+    mesg["hash"] = digest
+    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    # Measure the signed envelope, not the unsigned body: a multibyte
+    # token near the budget would otherwise store locally and only
+    # fail when publish() encodes it for peers.
+    _check_reaction_wire_size(mesg)
+    record, _ = store_reaction(conn, mesg, now=timestamp)
+    return record
+
+
+def reactions_for_messages(
+    conn: sqlite3.Connection,
+    channel: str,
+    targets: Sequence[str],
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Live reactions for *targets* in *channel*, keyed by target hash.
+
+    Retractions (an empty ``reaction``) are filtered out, and so are
+    reactions from *exclude_authors* — a blocked reactor's reactions
+    are never displayed or served on, like a blocked author's
+    messages.  Reactions whose target has not arrived yet are stored
+    but not returned here: a reader can only show them once the
+    message lands.
+    """
+    name = clean_channel_name(channel)
+    wanted = [str(target) for target in targets if target]
+    if not wanted:
+        return {}
+    placeholders = ", ".join("?" for _ in wanted)
+    clauses = ["channel = ?", f"target IN ({placeholders})", "reaction != ''"]
+    params: List[Any] = [name, *wanted]
+    excluded = [author for author in (exclude_authors or []) if author]
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(f"reactor NOT IN ({placeholders})")
+        params.extend(excluded)
+    rows = conn.execute(
+        f"SELECT {', '.join(_REACTION_COLUMNS)} FROM reactions "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at ASC, hash ASC",
+        params,
+    ).fetchall()
+    grouped: Dict[str, List[Dict[str, Any]]] = {target: [] for target in wanted}
+    for row in rows:
+        record = _row_to_reaction(row)
+        grouped.setdefault(record["target"], []).append(record)
+    return grouped
+
+
 def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
     """Bound the channel store so one peer cannot fill the disk.
 
@@ -1333,6 +1785,14 @@ def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
         "SELECT hash FROM messages WHERE channel = ? "
         "ORDER BY MIN(created_at, received_at) DESC, hash DESC "
         f"LIMIT {MAX_STORED_PER_CHANNEL})",
+        (channel, channel),
+    )
+    # Reactions on a pruned message go with it: a reaction whose
+    # target is gone can never be displayed, and a peer re-serving
+    # it would only grow the store again.
+    conn.execute(
+        "DELETE FROM reactions WHERE channel = ? AND target NOT IN ("
+        "SELECT hash FROM messages WHERE channel = ?)",
         (channel, channel),
     )
     # An edit notice is only useful while its message survives: drop
@@ -1358,6 +1818,7 @@ def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
             # Every cached channel is joined: nothing evictable.
             return
         conn.execute("DELETE FROM messages WHERE channel = ?", (row[0],))
+        conn.execute("DELETE FROM reactions WHERE channel = ?", (row[0],))
         conn.execute("DELETE FROM edits WHERE channel = ?", (row[0],))
         # The room is gone: its retract notices go with it, so a
         # re-joined room starts from a clean slate.
@@ -1621,6 +2082,7 @@ class ChannelApp:
         self.node = node
         node.add_request_handler(CHANNEL_FEED_PATH, self._handle_feed)
         node.add_request_handler(CHANNEL_POST_PATH, self._handle_post)
+        node.add_request_handler(CHANNEL_REACT_PATH, self._handle_react)
         log.info("Channel feed ready at %s", CHANNEL_FEED_PATH)
 
     def detach(self) -> None:
@@ -1701,6 +2163,61 @@ class ChannelApp:
         if publish and self.node is not None:
             self.publish(message, targets=targets, ttl=ttl)
         return message
+
+    def react(
+        self,
+        channel: str,
+        target: str,
+        reaction: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """React to a stored message in a joined channel, gossiping it when asked.
+
+        Reacting requires membership, like sending, and the target
+        must already be stored in this channel.  An empty
+        ``reaction`` clears this node's reaction to the message.
+        """
+        name = clean_channel_name(channel)
+        conn = self.connect()
+        try:
+            if not is_member(conn, name):
+                raise ChannelError(
+                    f"not a member of channel {name!r}; join it first"
+                )
+            record = create_reaction(
+                conn, self.identity, name, target, reaction, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish_reaction(record, targets=targets, ttl=ttl)
+        return record
+
+    def reactions(
+        self,
+        channel: str,
+        targets: Sequence[str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Live reactions for *targets* in *channel*, keyed by target hash.
+
+        Blocked reactors are excluded, like blocked authors in
+        history: a block placed after their reactions were cached
+        must stop them being displayed.
+        """
+        name = clean_channel_name(channel)
+        excluded = self._blocked_authors()
+        if excluded is None:
+            return {str(target): [] for target in targets}
+        conn = self.connect()
+        try:
+            return reactions_for_messages(
+                conn, name, targets, exclude_authors=excluded
+            )
+        finally:
+            conn.close()
 
     def edit(
         self,
@@ -1784,6 +2301,8 @@ class ChannelApp:
             )
         finally:
             conn.close()
+
+    # -- sync --------------------------------------------------------------
     def sync(
         self,
         node: Any,
@@ -1805,6 +2324,8 @@ class ChannelApp:
                 "peers": 0,
                 "stored": 0,
                 "duplicates": 0,
+                "reactions_stored": 0,
+                "reactions_duplicates": 0,
                 "edited": 0,
                 "retracted": 0,
                 "skipped": 0,
@@ -1816,6 +2337,8 @@ class ChannelApp:
         conn = self.connect()
         stored = 0
         duplicates = 0
+        reactions_stored = 0
+        reactions_duplicates = 0
         edited = 0
         retracted = 0
         skipped = 0
@@ -1881,6 +2404,41 @@ class ChannelApp:
                             stored += 1
                         else:
                             duplicates += 1
+                    # Reactions ride the same feed page as the
+                    # messages they belong to: store them with the
+                    # same per-entry care, and skip a blocked
+                    # reactor's reactions like a blocked author's
+                    # messages.  A reaction whose target has not
+                    # arrived yet still stores — it shows once the
+                    # message lands.
+                    incoming = response.get("reactions")
+                    if isinstance(incoming, list):
+                        for raw in incoming:
+                            if not isinstance(raw, dict):
+                                errors.append(
+                                    {
+                                        "peer": getattr(peer, "hexhash", "?"),
+                                        "error": "feed reaction is not an object",
+                                    }
+                                )
+                                continue
+                            if self._blocked(str(raw.get("reactor", ""))):
+                                skipped += 1
+                                continue
+                            try:
+                                _, changed = store_reaction(conn, raw)
+                            except (ChannelError, ProtocolError) as exc:
+                                errors.append(
+                                    {
+                                        "peer": getattr(peer, "hexhash", "?"),
+                                        "error": str(exc),
+                                    }
+                                )
+                                continue
+                            if changed:
+                                reactions_stored += 1
+                            else:
+                                reactions_duplicates += 1
                     # Retract notices ride every page, independent of
                     # the message page itself: a page with no messages
                     # can still carry a retract for one already held.
@@ -1978,6 +2536,8 @@ class ChannelApp:
             "peers": len(peers),
             "stored": stored,
             "duplicates": duplicates,
+            "reactions_stored": reactions_stored,
+            "reactions_duplicates": reactions_duplicates,
             "edited": edited,
             "retracted": retracted,
             "skipped": skipped,
@@ -2040,6 +2600,45 @@ class ChannelApp:
             try:
                 node.request(
                     peer, CHANNEL_POST_PATH, payload, timeout=self.request_timeout
+                )
+                delivered += 1
+            except Exception as exc:
+                errors.append(
+                    {"peer": getattr(peer, "hexhash", "?"), "error": str(exc)}
+                )
+        return {"delivered": delivered, "peers": len(peers), "errors": errors}
+
+    def publish_reaction(
+        self,
+        reaction: Dict[str, Any],
+        *,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+        exclude: Optional[str] = None,
+        fanout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Push a channel reaction to peers; return delivery counts."""
+        node = self.node
+        if node is None:
+            raise ChannelError("channels are not attached to a running node")
+        peers = list(targets) if targets is not None else list(node.registry.all())
+        peers = [
+            peer
+            for peer in peers
+            if getattr(peer, "hexhash", "") not in (self.author, exclude)
+        ]
+        if fanout is not None and len(peers) > max(1, int(fanout)):
+            peers = random.sample(peers, max(1, int(fanout)))
+        payload = encode(
+            {"reaction": reaction, "ttl": max(0, min(int(ttl), MAX_GOSSIP_TTL))},
+            max_bytes=MAX_REQUEST_BYTES,
+        )
+        delivered = 0
+        errors: List[Dict[str, str]] = []
+        for peer in peers:
+            try:
+                node.request(
+                    peer, CHANNEL_REACT_PATH, payload, timeout=self.request_timeout
                 )
                 delivered += 1
             except Exception as exc:
@@ -2165,6 +2764,7 @@ class ChannelApp:
                 messages: List[Dict[str, Any]] = []
                 edits: List[Dict[str, Any]] = []
                 retractions: List[Dict[str, Any]] = []
+                reactions: List[Dict[str, Any]] = []
                 has_more = False
             else:
                 conn = self.connect()
@@ -2181,6 +2781,17 @@ class ChannelApp:
                         # the notices below.
                         apply_edits=False,
                     )
+                    grouped = reactions_for_messages(
+                        conn,
+                        channel,
+                        [item["hash"] for item in messages],
+                        exclude_authors=excluded,
+                    )
+                    reactions = [
+                        record
+                        for item in messages
+                        for record in grouped.get(item["hash"], [])
+                    ]
                     edits = list_edits(
                         conn,
                         channel,
@@ -2204,6 +2815,7 @@ class ChannelApp:
             try:
                 return response_ok(
                     messages=messages,
+                    reactions=reactions,
                     edits=edits,
                     retractions=retractions,
                     count=len(messages),
@@ -2212,15 +2824,24 @@ class ChannelApp:
                     has_more=has_more,
                 )
             except ProtocolError as exc:
-                if len(messages) <= 1 and not edits and not retractions:
+                if len(messages) <= 1 and not reactions and not edits and not retractions:
                     return response_error("feed_too_large", str(exc))
                 if len(messages) > 1:
+                    dropped = messages[-1]
                     messages = messages[:-1]
+                    reactions = [
+                        record
+                        for record in reactions
+                        if record["target"] != dropped["hash"]
+                    ]
                     # The page was shortened to fit: older messages
                     # still exist past it, so say so instead of
                     # letting the requester mistake a short page for
                     # the end.
                     has_more = True
+                    continue
+                if reactions:
+                    reactions = reactions[:-1]
                     continue
                 if edits:
                     edits = edits[:-1]
@@ -2229,6 +2850,7 @@ class ChannelApp:
                     retractions = retractions[:-1]
                     continue
                 return response_error("feed_too_large", str(exc))
+
     def _handle_post(
         self,
         path: str,
@@ -2347,6 +2969,63 @@ class ChannelApp:
         except (ProtocolError, ChannelError) as exc:
             return response_error("invalid_post", str(exc))
 
+    def _handle_react(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            request = decode(data, max_bytes=MAX_REQUEST_BYTES)
+            raw_reaction = request.get("reaction")
+            if not isinstance(raw_reaction, dict):
+                raise ChannelError("reaction must be a JSON object")
+            ttl = request.get("ttl", 0)
+            if isinstance(ttl, bool) or not isinstance(ttl, int):
+                ttl = 0
+            ttl = max(0, min(ttl, MAX_GOSSIP_TTL))
+
+            verified = verify_reaction(raw_reaction)
+            if self._blocked(verified["reactor"]):
+                log.info(
+                    "Channel reaction from blocked %s dropped",
+                    verified["reactor"][:8],
+                )
+                return response_error(
+                    "not_admitted",
+                    "reactor is blocked on this node",
+                )
+            conn = self.connect()
+            try:
+                record, changed = store_reaction(conn, raw_reaction)
+            finally:
+                conn.close()
+
+            if changed:
+                log.info(
+                    "Channel #%s reaction from %s (%s): %s on %s",
+                    record.get("channel", "?"),
+                    record.get("name", "unknown"),
+                    record.get("reactor", "")[:8],
+                    record.get("reaction", ""),
+                    record.get("target", "")[:8],
+                )
+                if self.gossip and ttl > 0:
+                    self._spawn_gossip_reaction(
+                        record,
+                        ttl=ttl - 1,
+                        exclude=self._caller_hash(remote_identity),
+                    )
+            return response_ok(
+                stored=record["hash"],
+                new=changed,
+                server=self.name,
+                node=getattr(self.node, "destination_hexhash", None),
+            )
+        except (ProtocolError, ChannelError) as exc:
+            return response_error("invalid_react", str(exc))
     def _handle_retraction_post(
         self,
         raw_retraction: Any,
@@ -2417,6 +3096,31 @@ class ChannelApp:
                 self._gossip_slots.release()
 
         threading.Thread(target=run, name="tau-channel-gossip", daemon=True).start()
+
+    def _spawn_gossip_reaction(
+        self, reaction: Dict[str, Any], *, ttl: int, exclude: Optional[str]
+    ) -> None:
+        if not self._gossip_slots.acquire(blocking=False):
+            log.debug("Skipping channel reaction gossip: too many pending relays")
+            return
+
+        def run() -> None:
+            try:
+                if self.node is not None and not self._closed:
+                    self.publish_reaction(
+                        reaction,
+                        ttl=ttl,
+                        exclude=exclude,
+                        fanout=self.gossip_fanout,
+                    )
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Channel reaction gossip failed", exc_info=True)
+            finally:
+                self._gossip_slots.release()
+
+        threading.Thread(
+            target=run, name="tau-channel-reaction-gossip", daemon=True
+        ).start()
 
     def _spawn_edit_gossip(
         self, edit: Dict[str, Any], *, ttl: int, exclude: Optional[str]

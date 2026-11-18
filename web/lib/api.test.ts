@@ -15,6 +15,7 @@ import {
   getTanTimeline,
   markRead,
   pageFileUrl,
+  reactToChannelMessage,
   reactToMessage,
   closeDmPoll,
   sendChannelMessage,
@@ -96,6 +97,18 @@ describe("GET endpoints", () => {
     nextJson = { channel: "general", messages: [], count: 0 };
     await getChannelMessages("my channel", 5);
     expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
+  });
+
+  it("reacts to a channel message by hash", async () => {
+    nextJson = { ok: true, reaction: {} };
+    await reactToChannelMessage("general", "ab12", "👍");
+    expect(captured[0].url).toBe("/api/channels/react");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      channel: "general",
+      target: "ab12",
+      reaction: "👍",
+    });
   });
 });
 

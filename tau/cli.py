@@ -327,6 +327,7 @@ from .channels import (
     clean_channel_name,
     create_edit as create_channel_edit,
     create_message as create_channel_message,
+    create_reaction as create_channel_reaction,
     init_db as init_channel_db,
     is_member as is_channel_member,
     reply_parent as channel_reply_parent,
@@ -3909,6 +3910,45 @@ def build_parser() -> argparse.ArgumentParser:
     channel_send.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     channel_send.set_defaults(func=cmd_channel_send)
 
+    channel_react = channel_sub.add_parser(
+        "react",
+        parents=[common],
+        help="react to a stored channel message (one reaction per reactor; empty clears yours)",
+    )
+    channel_react.add_argument("channel", metavar="NAME", help="channel to react in")
+    channel_react.add_argument(
+        "target",
+        metavar="HASH",
+        help="message hash or unique hex prefix (at least 8 characters)",
+    )
+    channel_react.add_argument(
+        "reaction",
+        nargs="?",
+        default=None,
+        metavar="EMOJI",
+        help="emoji or short token (omit with --clear to retract yours)",
+    )
+    channel_react.add_argument(
+        "--clear",
+        action="store_true",
+        help="retract your reaction to the message",
+    )
+    channel_react.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_react.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_react.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_react.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_react.set_defaults(func=cmd_channel_react)
+
     channel_read = channel_sub.add_parser(
         "read",
         parents=[common],
@@ -5218,6 +5258,38 @@ def _publish_local_channel_message(
     return {"message": message, "published": published}
 
 
+def _publish_local_channel_reaction(
+    node: TauNode,
+    *,
+    channel: str,
+    target: str,
+    reaction: str,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    name = clean_channel_name(channel)
+    conn = publisher.connect()
+    try:
+        if not is_channel_member(conn, name):
+            raise ChannelError(f"not a member of channel {name!r}; join it first")
+        record = create_channel_reaction(
+            conn, node.identity, name, target, reaction, name=node.name
+        )
+    finally:
+        conn.close()
+    published = publisher.publish_reaction(
+        record, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
+    return {"reaction": record, "published": published}
+
+
 def _publish_local_channel_edit(
     node: TauNode,
     *,
@@ -5273,6 +5345,8 @@ def _publish_local_channel_retraction(
         targets=targets,
         ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)),
     )
+
+
 def _publish_local_post(
     node: TauNode,
     *,
@@ -5286,6 +5360,8 @@ def _publish_local_post(
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
+    reaction_target: Optional[str] = None,
+    reaction: Optional[str] = None,
     channel_edit: Optional[Dict[str, Any]] = None,
     retract_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -5315,6 +5391,18 @@ def _publish_local_post(
             timeout=timeout,
         )
     if channel is not None:
+        if reaction_target is not None:
+            # A channel reaction rides the same local publish socket
+            # as a Tan post; route it before the Tan-only handling.
+            return _publish_local_channel_reaction(
+                node,
+                channel=channel,
+                target=reaction_target,
+                reaction=reaction if reaction is not None else "",
+                to=to,
+                ttl=ttl,
+                timeout=timeout,
+            )
         # A channel send rides the same local publish socket as a Tan
         # post; route it before the Tan-only handling below.  The
         # channel reply target rides along: it is a channel message
@@ -7923,9 +8011,18 @@ def cmd_tan_sync(args: argparse.Namespace) -> int:
             print(f"  {short_hash(error['peer'])}: {error['error']}")
     return _EXIT_OK
 def _print_channel_messages(
-    messages: List[Dict[str, Any]], *, json_output: bool, channel: str
+    messages: List[Dict[str, Any]],
+    *,
+    json_output: bool,
+    channel: str,
+    reactions: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> None:
+    from .channels import summarize_reactions
+
     if json_output:
+        if reactions:
+            for message in messages:
+                message["reactions"] = reactions.get(str(message.get("hash", "")), [])
         _emit({"channel": channel, "messages": messages, "count": len(messages)}, True)
         return
     if not messages:
@@ -7953,6 +8050,14 @@ def _print_channel_messages(
                 )
         for line in str(message.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        summary = summarize_reactions(
+            (reactions or {}).get(str(message.get("hash", "")), [])
+        )
+        if summary:
+            joined = "  ".join(
+                f"{item['reaction']}×{item['count']}" for item in summary
+            )
+            print(f"  {joined}")
 
 
 def cmd_channel_join(args: argparse.Namespace) -> int:
@@ -8087,6 +8192,92 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_channel_react(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "clear", False):
+        if getattr(args, "reaction", None):
+            print("error: --clear takes no reaction", file=sys.stderr)
+            return 2
+        token = ""
+    else:
+        token = getattr(args, "reaction", None)
+        if token is None:
+            print("error: a reaction is required (or --clear to retract yours)", file=sys.stderr)
+            return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            record = app.react(name, args.target, token)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel=name,
+                reaction_target=args.target,
+                reaction=token,
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            record, published = result["reaction"], result["published"]
+        else:
+            try:
+                app = ChannelApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                app.attach(node)
+                result = _publish_local_channel_reaction(
+                    node,
+                    channel=name,
+                    target=args.target,
+                    reaction=token,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                record, published = result["reaction"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"reaction": record, "published": published}, True)
+    else:
+        if token:
+            print(
+                f"reacted {token} to {short_hash(record['target'])} in #{name}"
+            )
+        else:
+            print(f"retracted your reaction to {short_hash(record['target'])} in #{name}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
 def cmd_channel_read(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
@@ -8102,12 +8293,16 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
         # The block-list failed closed: hide everything, like the
         # timeline does, instead of showing messages we cannot vet.
         messages = []
+        reactions: Dict[str, List[Dict[str, Any]]] = {}
     else:
         messages = [
             message
             for message in messages
             if str(message.get("author", "")) not in blocked
         ]
+        reactions = app.reactions(
+            name, [str(message.get("hash", "")) for message in messages]
+        )
     # History comes newest first; reading is oldest first.
     messages = list(reversed(messages))
     # Resolve each reply's parent from the local store so the reader
@@ -8131,7 +8326,7 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
             }
     finally:
         conn.close()
-    _print_channel_messages(messages, json_output=json_output, channel=name)
+    _print_channel_messages(messages, json_output=json_output, channel=name, reactions=reactions)
     return _EXIT_OK
 
 
@@ -8289,6 +8484,10 @@ def cmd_channel_sync(args: argparse.Namespace) -> int:
                 f"from {summary['peers']} peer(s); "
                 f"{summary['duplicates']} duplicate(s)"
             )
+            reactions = summary.get("reactions_stored", 0)
+            if reactions:
+                noun = "reaction" if reactions == 1 else "reactions"
+                line += f"; {reactions} new {noun}"
             if summary.get("edited"):
                 line += f"; {summary['edited']} edit(s) applied"
             if summary.get("retracted"):
