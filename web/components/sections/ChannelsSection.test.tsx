@@ -9,6 +9,11 @@ let calls: string[] = [];
 
 beforeEach(() => {
   const router = mockFetch((url) => {
+    if (url.includes("/api/status")) {
+      // This node is alice: the fixture message below is hers, so
+      // the Edit button shows for it and for nothing else.
+      return { node: { destination: "a".repeat(32) } };
+    }
     if (url.includes("/api/channels/messages")) {
       return {
         channel: "mesh-general",
@@ -38,6 +43,20 @@ beforeEach(() => {
             created_at: 1000,
             received_at: 1000,
             sig: "s",
+          },
+          {
+            v: 1,
+            hash: "m2".padEnd(64, "0"),
+            channel: "mesh-general",
+            author: "b".repeat(32),
+            key: "b".repeat(32),
+            name: "bob",
+            text: "hello, fixed",
+            created_at: 1001,
+            received_at: 1001,
+            sig: "s",
+            edited: true,
+            edited_at: 1002,
           },
         ],
         count: 2,
@@ -117,5 +136,27 @@ describe("ChannelsSection", () => {
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
+  });
+
+  it("marks edited messages", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByText("hello, fixed")).toBeTruthy();
+    expect(screen.getByText(/edited/)).toBeTruthy();
+    // Only alice's own message gets an Edit button; bob's does not.
+    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(1);
+  });
+
+  it("edits your own message from the console", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Edit message"), {
+      target: { value: "hello channel, fixed" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/channels/edit"),
+    );
   });
 });

@@ -16,9 +16,11 @@ import {
   markRead,
   pageFileUrl,
   reactToMessage,
+  closeDmPoll,
   sendChannelMessage,
   sendMessage,
   tanMediaUrl,
+  voteDmPoll,
   voteTanPoll,
   wsUrl,
 } from "./api";
@@ -154,6 +156,16 @@ describe("POST endpoints", () => {
     await voteTanPoll("posthash", 2);
     expect(captured[0].url).toBe("/api/tan/vote");
     expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
+  });
+
+  it("votes and closes a DM poll on the DM routes", async () => {
+    nextJson = { ok: true, messages: [], response: {} };
+    await voteDmPoll("alice", "wire1", 2);
+    expect(captured[0].url).toBe("/api/dm/vote");
+    expect(bodyOf(0)).toEqual({ to: "alice", poll: "wire1", option: 2 });
+    await closeDmPoll("alice", "wire1");
+    expect(captured[1].url).toBe("/api/dm/close-poll");
+    expect(bodyOf(1)).toEqual({ to: "alice", poll: "wire1" });
   });
 
   it("marks read with an empty body when no conversation is given", async () => {

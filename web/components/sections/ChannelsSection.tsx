@@ -4,9 +4,10 @@
 
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import { formatRelative, shortHash } from "@/lib/format";
+import { getStatus } from "@/lib/api";
 import { useChannels } from "@/lib/use-channels";
 
 export default function ChannelsSection() {
@@ -20,6 +21,44 @@ export default function ChannelsSection() {
   const [replyTo, setReplyTo] = useState<{ hash: string; name: string } | null>(
     null,
   );
+
+  // This node's own destination hash, so only its messages get an
+  // Edit button — an edit is author-only on the wire.  Null until
+  // /api/status answers, or when it cannot (edit stays hidden).
+  const [ownHash, setOwnHash] = useState<string | null>(null);
+  const [editingHash, setEditingHash] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    getStatus()
+      .then((snapshot) => {
+        if (live) setOwnHash(snapshot?.node?.destination ?? null);
+      })
+      .catch(() => {
+        // Status unavailable: no edit buttons, reading still works.
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  async function handleSaveEdit(hash: string) {
+    const body = editText.trim();
+    if (!body) return;
+    setSavingEdit(true);
+    setError(null);
+    try {
+      await channels.edit(hash, body);
+      setEditingHash(null);
+      setEditText("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingEdit(false);
+    }
+  }
 
   const selectedChannel = channels.channels.find((c) => c.channel === channels.selected);
 
@@ -190,7 +229,20 @@ export default function ChannelsSection() {
                     </span>{" "}
                     <span className="text-xs text-zinc-500">
                       · {formatRelative(m.created_at)}
+                      {m.edited ? " · edited" : ""}
                     </span>
+                    {ownHash && m.author === ownHash && editingHash !== m.hash && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingHash(m.hash);
+                          setEditText(m.text);
+                        }}
+                        className="ml-2 text-xs font-semibold text-cyan-400 hover:text-cyan-300"
+                      >
+                        Edit
+                      </button>
+                    )}
                   </p>
                   {m.reply_to && (
                     <p className="mt-0.5 truncate border-l-2 border-zinc-700 pl-2 text-xs text-zinc-500">
@@ -200,9 +252,41 @@ export default function ChannelsSection() {
                         : `replying to ${shortHash(m.reply_to)}`}
                     </p>
                   )}
-                  <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
-                    {m.text}
-                  </p>
+                  {editingHash === m.hash ? (
+                    <div className="mt-1">
+                      <textarea
+                        value={editText}
+                        onChange={(e) => setEditText(e.target.value)}
+                        aria-label="Edit message"
+                        rows={3}
+                        className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500"
+                      />
+                      <div className="mt-1 flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleSaveEdit(m.hash)}
+                          disabled={savingEdit || !editText.trim() || editText === m.text}
+                          className="rounded-full bg-cyan-500 px-3 py-1 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                        >
+                          {savingEdit ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingHash(null);
+                            setEditText("");
+                          }}
+                          className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
+                      {m.text}
+                    </p>
+                  )}
                   <button
                     type="button"
                     aria-label={`Reply to ${m.name || shortHash(m.author)}`}

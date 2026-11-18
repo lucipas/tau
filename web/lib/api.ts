@@ -360,6 +360,21 @@ export async function closeGroupPoll(group: string, poll: string): Promise<Group
   return post("/api/groups/close-poll", { group, poll });
 }
 
+/** Voting/closing a DM poll returns the sent vote/close + node response. */
+export type DmPollActionResult = GroupPollActionResult;
+
+export async function voteDmPoll(
+  peer: string,
+  poll: string,
+  option: number | string,
+): Promise<DmPollActionResult> {
+  return post("/api/dm/vote", { to: peer, poll, option });
+}
+
+export async function closeDmPoll(peer: string, poll: string): Promise<DmPollActionResult> {
+  return post("/api/dm/close-poll", { to: peer, poll });
+}
+
 // -------------------------------------------------------------- messages --
 
 export interface SendMessageOptions {
@@ -369,7 +384,7 @@ export interface SendMessageOptions {
   expiresIn?: number;
   /** Delay before sending, in seconds (0 < n <= 29d23h). */
   sendIn?: number;
-  /** Post `text` as a group poll question with these options. */
+  /** Post `text` as a poll question with these options. */
   pollOptions?: string[];
   timeout?: number;
 }
@@ -963,6 +978,19 @@ export async function sendChannelMessage(
     "/api/channels/send",
     replyTo ? { channel, text, reply_to: replyTo } : { channel, text },
   );
+}
+
+export async function editChannelMessage(
+  channel: string,
+  target: string,
+  text: string,
+): Promise<{ hash: string }> {
+  const data = await post<{ edit: { hash: string } }>("/api/channels/edit", {
+    channel,
+    target,
+    text,
+  });
+  return data.edit;
 }
 
 /** Pull missing history for one channel, or every joined channel when omitted. */
