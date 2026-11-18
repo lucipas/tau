@@ -33,13 +33,39 @@ Reticulum destination as the rest of tau:
 
     /tau/channel/feed   {"channel": "...", "before": 1760000000.0, "limit": 20}
     /tau/channel/post   {"message": {...}, "ttl": 2}
+    /tau/channel/post   {"retraction": {...}, "ttl": 2}
 
-``/tau/channel/feed`` reads cached messages for a channel.
+``/tau/channel/feed`` reads cached messages for a channel.  It
+also carries the channel's recent retract notices, so a peer that
+was offline when a message was retracted still learns the retract
+on its next sync instead of re-fetching the message.
 ``/tau/channel/post`` accepts a signed message and, when it is new,
-gossips it to a small number of other peers.  Pulling a feed and
-pushing a message are deliberately separate: a node can read a
-channel it joined even when the author of a message is offline, as
-long as any peer still has that message cached.
+gossips it to a small number of other peers — or a signed retract
+notice, which deletes the message and is gossipped the same way.
+Pulling a feed and pushing a message are deliberately separate: a
+node can read a channel it joined even when the author of a message
+is offline, as long as any peer still has that message cached.
+
+A retract notice is a signed record of its own::
+
+    {
+      "v": 1,
+      "kind": "channel-retract",
+      "channel": "mesh-meetup",
+      "hash": "<64 hex digest of the retracted message>",
+      "author": "<32 hex destination hash>",
+      "key": "<128 hex public key>",
+      "created_at": 1760000000.0,
+      "sig": "<128 hex Ed25519 signature over the notice hash>"
+    }
+
+Only the message's author can retract it: the notice is only
+applied when its signer is the author of the message it names, so
+a notice signed by anyone else is stored as a tombstone but never
+deletes anything — a forged retract cannot censor another peer's
+message.  A tombstone is remembered even when the message is not
+held yet, so a message that arrives later from another peer is
+refused instead of re-appearing.
 
 Membership is local-only and never gossiped: joining records the
 name in the local store, leaving drops it (cached messages stay
@@ -104,6 +130,13 @@ MAX_STORED_PER_CHANNEL = 500
 # channels are never evicted, so a peer spraying random room names
 # cannot grow the store without limit either.
 MAX_CACHED_CHANNELS = 100
+# Bound on how many retract notices one channel may hold on disk:
+# the same bound as messages, so a peer spraying retracts cannot
+# grow the store without limit either.
+MAX_RETRACTIONS_PER_CHANNEL = 500
+# How many of a channel's newest retract notices ride on one feed
+# response, so a peer syncing history learns retracts it missed.
+MAX_FEED_RETRACTIONS = 50
 DEFAULT_CHANNEL_LIMIT = 20
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
@@ -119,6 +152,12 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # signed body, so a relay cannot move a message into another room
 # without breaking the hash.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
+
+# Fields covered by a retract notice's hash.  ``kind`` pins the
+# signed body to a retract, so a notice can never be mistaken for a
+# message, and ``hash`` names the message being retracted.
+RETRACTION_KIND = "channel-retract"
+RETRACT_HASH_FIELDS = ("v", "kind", "channel", "hash", "author", "key", "created_at")
 
 # Column order used by every SELECT so rows convert consistently.
 _MESSAGE_COLUMNS = (
@@ -337,6 +376,103 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# -- retract notices -------------------------------------------------------
+
+
+def _canonical_retraction_body(notice: Dict[str, Any]) -> bytes:
+    body = {field: notice[field] for field in RETRACT_HASH_FIELDS}
+    return json.dumps(
+        body,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def hash_retraction(notice: Dict[str, Any]) -> str:
+    """Hash a retract notice: lowercase hex sha256 of its signed body."""
+    if not isinstance(notice, dict):
+        raise ChannelError("a channel retraction must be a JSON object")
+    missing = [field for field in RETRACT_HASH_FIELDS if field not in notice]
+    if missing:
+        raise ChannelError(
+            f"channel retraction is missing fields: {', '.join(missing)}"
+        )
+    return hashlib.sha256(_canonical_retraction_body(notice)).hexdigest()
+
+
+def _normalize_retraction(
+    notice: Dict[str, Any], *, now: Optional[float] = None
+) -> Dict[str, Any]:
+    """Validate and normalise the signed part of a retract notice."""
+    if not isinstance(notice, dict):
+        raise ChannelError("a channel retraction must be a JSON object")
+
+    version = notice.get("v", CHANNEL_VERSION)
+    if isinstance(version, bool) or version != CHANNEL_VERSION:
+        raise ChannelError(f"unsupported channel retraction version: {version!r}")
+
+    kind = notice.get("kind")
+    if kind != RETRACTION_KIND:
+        raise ChannelError(f"unsupported channel retraction kind: {kind!r}")
+
+    channel = clean_channel_name(notice.get("channel"))
+    author = _require_hex(notice.get("author"), AUTHOR_HEX_LENGTH, "author")
+    key = _require_hex(notice.get("key"), KEY_HEX_LENGTH, "key")
+    digest = _require_hex(notice.get("hash"), HASH_HEX_LENGTH, "hash")
+    created_at = _require_timestamp(notice.get("created_at"), "created_at")
+    if now is not None and created_at > float(now) + 86400.0:
+        raise ChannelError("channel retraction timestamp is too far in the future")
+
+    return {
+        "v": CHANNEL_VERSION,
+        "kind": RETRACTION_KIND,
+        "channel": channel,
+        "hash": digest,
+        "author": author,
+        "key": key,
+        "created_at": created_at,
+    }
+
+
+def verify_retraction(
+    notice: Dict[str, Any], *, now: Optional[float] = None
+) -> Dict[str, Any]:
+    """Validate a complete retract notice, including its signature."""
+    retraction = _normalize_retraction(notice, now=now)
+
+    digest = hash_retraction(retraction)
+    signature = _require_hex(notice.get("sig"), SIG_HEX_LENGTH, "sig")
+    retraction["sig"] = signature
+
+    identity = _identity_from_message(retraction)
+    author = _author_from_identity(identity)
+    if author != retraction["author"]:
+        raise ChannelError("public key does not match the retraction author")
+    try:
+        valid = identity.validate(bytes.fromhex(signature), bytes.fromhex(digest))
+    except Exception as exc:  # pragma: no cover - depends on RNS internals
+        raise ChannelError(f"could not check signature: {exc}") from exc
+    if not valid:
+        raise ChannelError("channel retraction signature is invalid")
+    return retraction
+
+
+def _canonical_retraction(notice: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the public, canonical representation of a retract notice."""
+    return {
+        "v": notice["v"],
+        "kind": notice["kind"],
+        "channel": notice["channel"],
+        "hash": notice["hash"],
+        "author": notice["author"],
+        "key": notice["key"],
+        "created_at": notice["created_at"],
+        "sig": notice["sig"],
+    }
+
+
 # -- storage ---------------------------------------------------------------
 
 _SCHEMA = """
@@ -360,6 +496,20 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS messages_channel_created
     ON messages(channel, created_at DESC, hash);
+
+CREATE TABLE IF NOT EXISTS retractions (
+    hash TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    author TEXT NOT NULL,
+    key TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    received_at REAL NOT NULL,
+    sig TEXT NOT NULL,
+    PRIMARY KEY (hash, author)
+);
+
+CREATE INDEX IF NOT EXISTS retractions_channel_created
+    ON retractions(channel, created_at DESC, hash);
 
 CREATE TABLE IF NOT EXISTS memberships (
     channel TEXT PRIMARY KEY,
@@ -404,6 +554,191 @@ def get_message(conn: sqlite3.Connection, digest: str) -> Optional[Dict[str, Any
     return _row_to_message(row) if row is not None else None
 
 
+# -- retract notices: storage ------------------------------------------------
+
+
+def _retraction_for(
+    conn: sqlite3.Connection, digest: str, author: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT hash FROM retractions WHERE hash = ? AND author = ?",
+        (digest, author),
+    ).fetchone()
+
+
+def _prune_retractions(conn: sqlite3.Connection, channel: str) -> None:
+    """Bound one channel's retract notices to the newest ones."""
+    conn.execute(
+        "DELETE FROM retractions WHERE channel = ? AND rowid NOT IN ("
+        "SELECT rowid FROM retractions WHERE channel = ? "
+        "ORDER BY created_at DESC, hash DESC "
+        f"LIMIT {MAX_RETRACTIONS_PER_CHANNEL})",
+        (channel, channel),
+    )
+
+
+def resolve_message_digest(
+    conn: sqlite3.Connection, channel: str, prefix: str
+) -> str:
+    """Resolve a message hash (or unique prefix) in *channel* to its full digest."""
+    name = clean_channel_name(channel)
+    needle = str(prefix or "").strip().lower()
+    if len(needle) < 4:
+        raise ChannelError("message digest prefix must be at least 4 characters")
+    if any(char not in "0123456789abcdef" for char in needle):
+        raise ChannelError("message digest prefix must be hexadecimal")
+    rows = conn.execute(
+        "SELECT hash FROM messages WHERE channel = ? AND hash LIKE ? ORDER BY hash",
+        (name, needle + "%"),
+    ).fetchall()
+    if not rows:
+        raise ChannelError(f"no message in #{name} matches {needle!r}")
+    if len(rows) > 1:
+        raise ChannelError(
+            f"digest prefix {needle!r} is ambiguous "
+            f"({len(rows)} messages in #{name}); use a longer prefix"
+        )
+    return str(rows[0][0])
+
+
+def create_retraction(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    channel: str,
+    digest: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Sign and store a retract notice for one of *identity*'s own messages.
+
+    The message is deleted from the local store and the signed notice
+    recorded, so the retract survives to be gossiped and served on
+    sync.  Retracting a message that is already retracted is a no-op
+    returning the stored notice.
+    """
+    name = clean_channel_name(channel)
+    message = get_message(conn, digest)
+    if message is None:
+        # Already retracted: the message is gone, but the notice
+        # stands — return it instead of failing, so re-running a
+        # retract is a no-op rather than an error.
+        author = _author_from_identity(identity)
+        existing = get_retraction(conn, digest, author)
+        if existing is not None and existing["channel"] == name:
+            return existing
+        raise ChannelError(f"unknown channel message: {digest}")
+    if message["channel"] != name:
+        raise ChannelError(f"that message is not in #{name}")
+    author = _author_from_identity(identity)
+    if message["author"] != author:
+        raise ChannelError("only the author can retract a channel message")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    body = {
+        "v": CHANNEL_VERSION,
+        "kind": RETRACTION_KIND,
+        "channel": name,
+        "hash": message["hash"],
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "created_at": timestamp,
+    }
+    notice_digest = hash_retraction(body)
+    notice = dict(body)
+    notice["sig"] = identity.sign(bytes.fromhex(notice_digest)).hex()
+    stored, _, _ = store_retraction(conn, notice)
+    return stored
+
+
+def store_retraction(
+    conn: sqlite3.Connection, notice: Dict[str, Any]
+) -> Tuple[Dict[str, Any], bool, bool]:
+    """Validate and store a retract notice.
+
+    Returns ``(notice, is_new, applied)``: ``is_new`` is false when
+    the same author already retracted the same message, and
+    ``applied`` is true when a held copy of the message was deleted.
+    A notice whose author is not the message's author is stored but
+    never applied — it is a tombstone for a message that may arrive
+    later, and the authorship check runs again then, so a forged
+    notice cannot censor someone else's message.
+    """
+    retraction = verify_retraction(notice)
+    timestamp = time.time()
+    with conn:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO retractions"
+            "(hash, channel, author, key, created_at, received_at, sig) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (
+                retraction["hash"],
+                retraction["channel"],
+                retraction["author"],
+                retraction["key"],
+                retraction["created_at"],
+                timestamp,
+                retraction["sig"],
+            ),
+        )
+        is_new = cursor.rowcount == 1
+        applied = False
+        if is_new:
+            message = _fetch_message(conn, retraction["hash"])
+            if message is not None and message["author"] == retraction["author"]:
+                conn.execute(
+                    "DELETE FROM messages WHERE hash = ?", (retraction["hash"],)
+                )
+                applied = True
+            _prune_retractions(conn, retraction["channel"])
+    return _canonical_retraction(retraction), is_new, applied
+
+
+def get_retraction(
+    conn: sqlite3.Connection, digest: str, author: str
+) -> Optional[Dict[str, Any]]:
+    """Return a stored retract notice by message digest and author, or ``None``."""
+    row = conn.execute(
+        "SELECT hash, channel, author, key, created_at, sig "
+        "FROM retractions WHERE hash = ? AND author = ?",
+        (digest, author),
+    ).fetchone()
+    if row is None:
+        return None
+    return _canonical_retraction(
+        {"v": CHANNEL_VERSION, "kind": RETRACTION_KIND, **dict(row)}
+    )
+
+
+def list_retractions(
+    conn: sqlite3.Connection,
+    channel: str,
+    *,
+    limit: int = MAX_FEED_RETRACTIONS,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Return a channel's retract notices, newest first."""
+    name = clean_channel_name(channel)
+    clauses = ["channel = ?"]
+    params: List[Any] = [name]
+    excluded = [author for author in (exclude_authors or []) if author]
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(f"author NOT IN ({placeholders})")
+        params.extend(excluded)
+    rows = conn.execute(
+        "SELECT hash, channel, author, key, created_at, sig "
+        "FROM retractions "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at DESC, hash DESC LIMIT ?",
+        (*params, max(1, int(limit))),
+    ).fetchall()
+    return [
+        _canonical_retraction(
+            {"v": CHANNEL_VERSION, "kind": RETRACTION_KIND, **dict(row)}
+        )
+        for row in rows
+    ]
+
+
 def store_message(
     conn: sqlite3.Connection,
     mesg: Dict[str, Any],
@@ -413,9 +748,11 @@ def store_message(
 ) -> Tuple[Dict[str, Any], bool]:
     """Validate and store a channel message, returning ``(message, is_new)``.
 
-    ``is_new`` is false when the message was already stored — or when
-    retention evicted it during its own insert (an old message arriving
-    into a full store).  Eviction is not an error: the message was
+    ``is_new`` is false when the message was already stored, when a
+    retract notice for it is already held — a retracted message must
+    never re-appear from another peer's copy — or when retention
+    evicted it during its own insert (an old message arriving into a
+    full store).  Eviction is not an error: the message was
     accepted, it simply did not survive the per-channel bound.
     """
     timestamp = float(now if now is not None else time.time())
@@ -428,6 +765,10 @@ def store_message(
         message["sig"] = _require_hex(mesg.get("sig"), SIG_HEX_LENGTH, "sig")
 
     digest = message["hash"]
+    if _retraction_for(conn, digest, message["author"]) is not None:
+        # A retract notice arrived before the message did: the
+        # tombstone stands, and the message is refused, not stored.
+        return _canonical_message(message), False
     existing = _fetch_message(conn, digest)
     if existing is not None:
         return _canonical_message(dict(existing)), False
@@ -507,6 +848,9 @@ def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
             # Every cached channel is joined: nothing evictable.
             return
         conn.execute("DELETE FROM messages WHERE channel = ?", (row[0],))
+        # The room is gone: its retract notices go with it, so a
+        # re-joined room starts from a clean slate.
+        conn.execute("DELETE FROM retractions WHERE channel = ?", (row[0],))
 
 
 def create_message(
@@ -583,6 +927,13 @@ def channel_history_page(
         placeholders = ", ".join("?" for _ in excluded)
         clauses.append(f"author NOT IN ({placeholders})")
         params.extend(excluded)
+    # A retracted message is gone from history: the tombstone is
+    # checked per message, so a forged notice (whose author is not
+    # the message's author) never hides anything.
+    clauses.append(
+        "NOT EXISTS (SELECT 1 FROM retractions r "
+        "WHERE r.hash = messages.hash AND r.author = messages.author)"
+    )
     rows = conn.execute(
         f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
         f"WHERE {' AND '.join(clauses)} "
@@ -827,6 +1178,49 @@ class ChannelApp:
             self.publish(message, targets=targets, ttl=ttl)
         return message
 
+    def retract(
+        self,
+        channel: str,
+        digest: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Retract one of this node's own messages in *channel*.
+
+        *digest* is the message hash or a unique prefix of it (the
+        prefixes ``tau channel read`` prints).  The message is deleted
+        locally and a signed retract notice recorded; when *publish*
+        is set and this app is attached to a running node, the notice
+        is gossiped to peers like a message.  Retracting needs no
+        membership: leaving a channel does not take back the right to
+        retract what you posted in it.
+        """
+        name = clean_channel_name(channel)
+        conn = self.connect()
+        try:
+            full = resolve_message_digest(conn, name, digest)
+            notice = create_retraction(conn, self.identity, name, full)
+        finally:
+            conn.close()
+        published = None
+        if publish and self.node is not None:
+            published = self.publish_retraction(notice, targets=targets, ttl=ttl)
+        return {"retraction": notice, "published": published}
+
+    def retractions(
+        self, channel: str, *, limit: int = DEFAULT_CHANNEL_LIMIT
+    ) -> List[Dict[str, Any]]:
+        """Stored retract notices for *channel*, newest first."""
+        conn = self.connect()
+        try:
+            return list_retractions(
+                conn, clean_channel_name(channel), limit=limit
+            )
+        finally:
+            conn.close()
+
     # -- sync --------------------------------------------------------------
 
     def sync(
@@ -851,6 +1245,7 @@ class ChannelApp:
                 "stored": 0,
                 "duplicates": 0,
                 "skipped": 0,
+                "retracted": 0,
                 "errors": [],
             }
 
@@ -860,6 +1255,7 @@ class ChannelApp:
         stored = 0
         duplicates = 0
         skipped = 0
+        retracted = 0
         errors: List[Dict[str, str]] = []
         try:
             for peer in peers:
@@ -891,6 +1287,34 @@ class ChannelApp:
                         )
                         break
                     messages = response.get("messages")
+                    # Retract notices ride every page, independent of
+                    # the message page itself: a page with no messages
+                    # can still carry a retract for one already held.
+                    # Each entry is validated on its own, like messages.
+                    for raw in response.get("retractions") or []:
+                        if not isinstance(raw, dict):
+                            errors.append(
+                                {
+                                    "peer": getattr(peer, "hexhash", "?"),
+                                    "error": "retraction entry is not an object",
+                                }
+                            )
+                            continue
+                        if self._blocked(str(raw.get("author", ""))):
+                            skipped += 1
+                            continue
+                        try:
+                            _, is_new, _ = store_retraction(conn, raw)
+                        except (ChannelError, ProtocolError) as exc:
+                            errors.append(
+                                {
+                                    "peer": getattr(peer, "hexhash", "?"),
+                                    "error": str(exc),
+                                }
+                            )
+                            continue
+                        if is_new:
+                            retracted += 1
                     if not isinstance(messages, list) or not messages:
                         break
                     # Entries arrive from an untrusted peer: a bad one
@@ -961,6 +1385,7 @@ class ChannelApp:
             "stored": stored,
             "duplicates": duplicates,
             "skipped": skipped,
+            "retracted": retracted,
             "errors": errors,
         }
 
@@ -1026,6 +1451,45 @@ class ChannelApp:
                 )
         return {"delivered": delivered, "peers": len(peers), "errors": errors}
 
+    def publish_retraction(
+        self,
+        notice: Dict[str, Any],
+        *,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+        exclude: Optional[str] = None,
+        fanout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Push a retract notice to peers; return delivery counts."""
+        node = self.node
+        if node is None:
+            raise ChannelError("channels are not attached to a running node")
+        peers = list(targets) if targets is not None else list(node.registry.all())
+        peers = [
+            peer
+            for peer in peers
+            if getattr(peer, "hexhash", "") not in (self.author, exclude)
+        ]
+        if fanout is not None and len(peers) > max(1, int(fanout)):
+            peers = random.sample(peers, max(1, int(fanout)))
+        payload = encode(
+            {"retraction": notice, "ttl": max(0, min(int(ttl), MAX_GOSSIP_TTL))},
+            max_bytes=MAX_REQUEST_BYTES,
+        )
+        delivered = 0
+        errors: List[Dict[str, str]] = []
+        for peer in peers:
+            try:
+                node.request(
+                    peer, CHANNEL_POST_PATH, payload, timeout=self.request_timeout
+                )
+                delivered += 1
+            except Exception as exc:
+                errors.append(
+                    {"peer": getattr(peer, "hexhash", "?"), "error": str(exc)}
+                )
+        return {"delivered": delivered, "peers": len(peers), "errors": errors}
+
     # -- request handlers --------------------------------------------------
 
     def _caller_hash(self, remote_identity: Optional[RNS.Identity]) -> Optional[str]:
@@ -1064,6 +1528,7 @@ class ChannelApp:
             excluded = self._blocked_authors()
             if excluded is None:
                 messages: List[Dict[str, Any]] = []
+                retractions: List[Dict[str, Any]] = []
                 has_more = False
             else:
                 conn = self.connect()
@@ -1076,6 +1541,15 @@ class ChannelApp:
                         before_hash=before_hash,
                         exclude_authors=excluded,
                     )
+                    # The channel's recent retract notices ride every
+                    # page, so a peer syncing history learns about
+                    # retracts for messages it already holds.
+                    retractions = list_retractions(
+                        conn,
+                        channel,
+                        limit=MAX_FEED_RETRACTIONS,
+                        exclude_authors=excluded,
+                    )
                 finally:
                     conn.close()
         except (ProtocolError, ChannelError) as exc:
@@ -1084,18 +1558,23 @@ class ChannelApp:
             try:
                 return response_ok(
                     messages=messages,
+                    retractions=retractions,
                     count=len(messages),
                     channel=channel,
                     has_more=has_more,
                 )
             except ProtocolError as exc:
-                if len(messages) <= 1:
-                    return response_error("feed_too_large", str(exc))
-                messages = messages[:-1]
-                # The page was shortened to fit: older messages still
-                # exist past it, so say so instead of letting the
-                # requester mistake a short page for the end.
-                has_more = True
+                if len(messages) > 1:
+                    messages = messages[:-1]
+                    # The page was shortened to fit: older messages still
+                    # exist past it, so say so instead of letting the
+                    # requester mistake a short page for the end.
+                    has_more = True
+                    continue
+                if retractions:
+                    retractions = retractions[:-1]
+                    continue
+                return response_error("feed_too_large", str(exc))
 
     def _handle_post(
         self,
@@ -1108,12 +1587,21 @@ class ChannelApp:
         try:
             request = decode(data, max_bytes=MAX_REQUEST_BYTES)
             raw_message = request.get("message")
-            if not isinstance(raw_message, dict):
-                raise ChannelError("message must be a JSON object")
+            raw_retraction = request.get("retraction")
+            if raw_message is None and raw_retraction is None:
+                raise ChannelError("a channel post needs a message or a retraction")
+            if raw_message is not None and raw_retraction is not None:
+                raise ChannelError("a channel post carries one message or one retraction")
             ttl = request.get("ttl", 0)
             if isinstance(ttl, bool) or not isinstance(ttl, int):
                 ttl = 0
             ttl = max(0, min(ttl, MAX_GOSSIP_TTL))
+
+            if raw_retraction is not None:
+                return self._handle_retraction_post(raw_retraction, ttl, remote_identity)
+
+            if not isinstance(raw_message, dict):
+                raise ChannelError("message must be a JSON object")
 
             verified = verify_message(raw_message)
             if self._blocked(verified["author"]):
@@ -1159,6 +1647,54 @@ class ChannelApp:
         except (ProtocolError, ChannelError) as exc:
             return response_error("invalid_post", str(exc))
 
+    def _handle_retraction_post(
+        self,
+        raw_retraction: Any,
+        ttl: int,
+        remote_identity: Optional[RNS.Identity],
+    ) -> bytes:
+        """Store a gossiped retract notice, deleting the message it names."""
+        if not isinstance(raw_retraction, dict):
+            raise ChannelError("retraction must be a JSON object")
+        notice = verify_retraction(raw_retraction)
+        if self._blocked(notice["author"]):
+            log.info(
+                "Channel retraction from blocked %s dropped",
+                notice["author"][:8],
+            )
+            return response_error(
+                "not_admitted",
+                "author is blocked on this node",
+            )
+        conn = self.connect()
+        try:
+            stored, is_new, applied = store_retraction(conn, notice)
+        finally:
+            conn.close()
+
+        if is_new:
+            log.info(
+                "Channel #%s retraction for %s from %s (applied: %s)",
+                stored.get("channel", "?"),
+                stored.get("hash", "")[:8],
+                stored.get("author", "")[:8],
+                applied,
+            )
+            if self.gossip and ttl > 0:
+                self._spawn_retraction_gossip(
+                    stored,
+                    ttl=ttl - 1,
+                    exclude=self._caller_hash(remote_identity),
+                )
+        return response_ok(
+            stored=stored["hash"],
+            new=is_new,
+            retraction=True,
+            applied=applied,
+            server=self.name,
+            node=getattr(self.node, "destination_hexhash", None),
+        )
+
     def _spawn_gossip(
         self, message: Dict[str, Any], *, ttl: int, exclude: Optional[str]
     ) -> None:
@@ -1181,3 +1717,28 @@ class ChannelApp:
                 self._gossip_slots.release()
 
         threading.Thread(target=run, name="tau-channel-gossip", daemon=True).start()
+
+    def _spawn_retraction_gossip(
+        self, notice: Dict[str, Any], *, ttl: int, exclude: Optional[str]
+    ) -> None:
+        if not self._gossip_slots.acquire(blocking=False):
+            log.debug("Skipping channel retraction gossip: too many pending relays")
+            return
+
+        def run() -> None:
+            try:
+                if self.node is not None and not self._closed:
+                    self.publish_retraction(
+                        notice,
+                        ttl=ttl,
+                        exclude=exclude,
+                        fanout=self.gossip_fanout,
+                    )
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Channel retraction gossip failed", exc_info=True)
+            finally:
+                self._gossip_slots.release()
+
+        threading.Thread(
+            target=run, name="tau-channel-retract-gossip", daemon=True
+        ).start()

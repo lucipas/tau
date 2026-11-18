@@ -8873,6 +8873,7 @@ def test_retract_sends_group_retract_and_deletes_the_local_copy(
             timeout=20.0,
             discover_timeout=None,
             target_sent_at=None,
+            target_author=None,
         ):
             self.sent.append((group, message_id, target_sent_at))
             return {
@@ -8917,6 +8918,131 @@ def test_retract_sends_group_retract_and_deletes_the_local_copy(
     assert mailbox.is_sent_retracted("m-10") is False
 
 
+def _seed_moderator_group(tmp_path, *, creator_is_local: bool):
+    """A data dir with an identity, a group, and one received message.
+
+    Returns (data_dir, group_id, author_hash).  When
+    *creator_is_local* the local identity created the group, so it
+    may moderate; otherwise another peer did, so it may not.
+    """
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "bob",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = load_identity(config.identity_path)
+    own_hash = destination_hash(identity).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author)
+    third = RNS.Identity()
+    third_hash = destination_hash(third)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(author_hash, author.get_public_key(), name="alice", now=100.0)
+    registry.upsert(third_hash, third.get_public_key(), name="carol", now=100.0)
+    registry.save()
+    creator_hash = own_hash if creator_is_local else author_hash.hex()
+    members = sorted([own_hash, author_hash.hex(), third_hash.hex()])
+    group_id = derive_group_id(creator_hash, "crew", members)
+    store = GroupStore(config.groups_path)
+    assert (
+        store.create("crew", members, created_by=creator_hash) is not None
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": author_hash.hex(),
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "m-20",
+            "direction": "in",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+        }
+    )
+    return data_dir, group_id, author_hash
+
+
+def test_retract_moderator_group_message(tmp_path, capsys, monkeypatch):
+    data_dir, group_id, author_hash = _seed_moderator_group(
+        tmp_path, creator_is_local=True
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+
+    class _ModeratorNode(_FakeRetractNode):
+        def send_group_retraction(
+            self,
+            group,
+            message_id,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+            target_author=None,
+        ):
+            self.sent.append(
+                (group, message_id, target_sent_at, target_author)
+            )
+            return {
+                "ok": True,
+                "group": group,
+                "target": message_id,
+                "id": "r-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": author_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "deleted": True,
+                        "id": "r-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _ModeratorNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-20"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "retracted alice's group message" in out
+    node = _FakeRetractNode.instances[0]
+    assert node.started is False
+    # The fan-out named the message's author, not this node.
+    assert node.sent == [(group_id, "m-20", 100.0, author_hash.hex())]
+    # The local received copy is gone.
+    assert Inbox(config.inbox_path).list_messages() == []
+
+
+def test_retract_refuses_group_message_from_non_creator(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _, _ = _seed_moderator_group(tmp_path, creator_is_local=False)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-20"])
+    assert code == cli._EXIT_ERROR
+    assert "not sent by this node" in capsys.readouterr().err
+    assert _FakeRetractNode.instances == []
+
+
 def test_retract_keeps_group_copy_when_a_member_is_unreachable(
     tmp_path, capsys, monkeypatch
 ):
@@ -8952,6 +9078,7 @@ def test_retract_keeps_group_copy_when_a_member_is_unreachable(
             timeout=20.0,
             discover_timeout=None,
             target_sent_at=None,
+            target_author=None,
         ):
             return {
                 "ok": False,

@@ -236,6 +236,7 @@ from .muted import (
     muted_peers_for,
     save_muted,
 )
+from .quiet_hours import quiet_hours_active
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
@@ -251,6 +252,7 @@ from .config import (
     DISAPPEARING_FILE_NAME,
     MESSAGES_FILE_NAME,
     MUTED_FILE_NAME,
+    QUIET_HOURS_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
     set_node_setting,
@@ -8135,6 +8137,17 @@ class WebBridge:
             return None
         return data_dir / MUTED_FILE_NAME
 
+    def _quiet_hours_path(self) -> Optional[Path]:
+        """This node's quiet-hours path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "quiet_hours_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / QUIET_HOURS_FILE_NAME
+
     def _muted_sets(self) -> "tuple[FrozenSet[str], FrozenSet[str]]":
         """Muted (peers, groups), failing open on a corrupt file.
 
@@ -9485,7 +9498,9 @@ class WebBridge:
         ignored group's posts never light a badge either, so they are
         excluded too; the members' direct messages still count.  A
         muted conversation never lights a badge either, by the same
-        per-side rule as archived and ignored.  A renamed group's
+        per-side rule as archived and ignored.  Quiet hours silence
+        every conversation at once, like a mute on the whole node, so
+        no badge lights while the window is active.  A renamed group's
         posts count under its current id, so the badge on the group
         covers its whole history.
         """
@@ -9505,6 +9520,9 @@ class WebBridge:
                             )
                         )
                         | muted_groups,
+                        # Quiet hours silence every conversation at
+                        # once, like a mute on the whole node.
+                        quiet=quiet_hours_active(self._quiet_hours_path()),
                     )
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)

@@ -3250,6 +3250,57 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     }
 
 
+def test_api_unread_zero_during_quiet_hours(bridge, node, tmp_path):
+    _inbound_record(node)
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "per_group": {},
+        "total": 1,
+    }
+
+    # A window covering right now silences the badge; turning it off
+    # brings the counts back — the read cursor never moved.
+    now = time.localtime()
+    current = now.tm_hour * 60 + now.tm_min
+    start = (current - 60) % (24 * 60)
+    end = (current + 60) % (24 * 60)
+    node.config.quiet_hours_path = tmp_path / "quiet_hours.json"
+    (tmp_path / "quiet_hours.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "start": f"{start // 60:02d}:{start % 60:02d}",
+                "end": f"{end // 60:02d}:{end % 60:02d}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {},
+        "per_group": {},
+        "total": 0,
+    }
+
+    (tmp_path / "quiet_hours.json").write_text(
+        json.dumps(
+            {
+                "enabled": False,
+                "start": f"{start // 60:02d}:{start % 60:02d}",
+                "end": f"{end // 60:02d}:{end % 60:02d}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "per_group": {},
+        "total": 1,
+    }
+
+
 def test_api_groups_ignore_with_corrupt_list_is_500(bridge, node, tmp_path):
     _learned_group(node, tmp_path)
     (tmp_path / "ignored-groups.json").write_text(
