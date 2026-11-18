@@ -38,6 +38,12 @@ from .beacons import (
     load_beacons,
     save_beacons,
 )
+from .away import (
+    AwayError,
+    away_lock,
+    load_away,
+    save_away,
+)
 from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import (
     TauConfig,
@@ -1322,6 +1328,7 @@ class TauNode:
                 self.on_message(record)
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_message callback failed", exc_info=True)
+        self._maybe_send_away_reply(caller_hash)
 
     def _wait_for_lxmf_deliveries(self) -> None:
         """Wait for in-flight LXMF deliveries, bounded so stop never hangs.
@@ -2276,6 +2283,121 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record sent message", exc_info=True)
 
+    def _maybe_send_away_reply(self, caller_hash: str) -> None:
+        """Queue one away reply for *caller_hash*, once per away period.
+
+        Runs after a DM is stored, on either receive path — never
+        inside a mailbox transaction, and never blocking on delivery:
+        the reply goes straight into the outbox and the serving sweep
+        delivers it (a flush is kicked off, since a peer that just
+        delivered to us is reachable right now).  Only an established
+        peer gets one: a peer outside the registry is a stranger the
+        outbox sweep cannot reach anyway (it visits registry peers),
+        and a stranger must not learn the owner is away.  Group
+        messages, DM requests and blocked peers never reach here —
+        groups have their own handler, requests are held before
+        storage, and blocked senders are dropped before storage.
+
+        The once-per-peer check, the enqueue and the mark run under
+        the away lock, so a direct copy and an LXMF copy racing each
+        other still queue exactly one reply.  Any failure is logged
+        and swallowed: a missed auto-reply must never break delivery
+        of the message that triggered it.
+        """
+        if not caller_hash:
+            return
+        away_path = getattr(self.config, "away_path", None)
+        if away_path is None:
+            return
+        peer = self.registry.get(caller_hash)
+        if peer is None:
+            return
+        try:
+            with away_lock(away_path):
+                try:
+                    state = load_away(away_path)
+                except AwayError as exc:
+                    log.warning(
+                        "Away state at %s is unusable (%s); "
+                        "sending no auto-reply",
+                        away_path,
+                        exc,
+                    )
+                    return
+                if not state.enabled:
+                    return
+                if caller_hash in state.replied_to:
+                    return
+                text = state.message
+                expires_at = None
+                default = peer_default_for(
+                    getattr(self.config, "disappearing_path", None),
+                    caller_hash,
+                )
+                if default is not None:
+                    # A per-conversation disappearing default fills in
+                    # the expiry the reply did not pass, exactly like a
+                    # manual send to this peer.
+                    expires_at = time.time() + default
+                message_id = generate_message_id()
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=peer.destination_hash,
+                        text=text,
+                        to_name=peer.display_name,
+                        message_id=message_id,
+                        expires_at=expires_at,
+                        kind="chat",
+                    )
+                except MailboxError:
+                    # Nothing was queued: do not mark the peer replied,
+                    # so their next message retries the reply.
+                    log.warning(
+                        "Could not queue away reply to %s", caller_hash,
+                        exc_info=True,
+                    )
+                    return
+                self._record_sent(
+                    {
+                        **(
+                            {"expires_at": expires_at}
+                            if expires_at is not None
+                            else {}
+                        ),
+                        "from": self.name,
+                        "destination": peer.hexhash,
+                        "text": text,
+                        "kind": "chat",
+                        "sent_at": time.time(),
+                        "received_at": time.time(),
+                        "id": message_id,
+                        "direction": "out",
+                    }
+                )
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=peer.destination_hash,
+                    text=text,
+                    sent_at=entry.created_at,
+                )
+                save_away(away_path, state.with_replied(caller_hash))
+                log.info(
+                    "Queued away reply %s to %s",
+                    entry.id,
+                    peer.destination_hash.hex(),
+                )
+        except Exception:  # pragma: no cover - defensive
+            log.warning(
+                "Could not send away reply to %s", caller_hash, exc_info=True
+            )
+            return
+        threading.Thread(
+            target=self.flush_outbox,
+            kwargs={"timeout": _MAIL_REQUEST_TIMEOUT, "max_peers": 5},
+            name="tau-mail-flush",
+            daemon=True,
+        ).start()
+
     def _handle_message(
         self,
         path: str,
@@ -2408,6 +2530,10 @@ class TauNode:
             # A message from a peer ends their typing: they sent what
             # they were composing.
             self._clear_typing(caller_hash, caller_hash)
+        if stored_record is not None and caller_hash:
+            # A stored DM is the only trigger: duplicates, expired and
+            # retracted copies never stored, so they never answer.
+            self._maybe_send_away_reply(caller_hash)
 
         return response_ok(
             echo=message["text"],
@@ -3789,6 +3915,38 @@ class TauNode:
                     target_id = str(local["id"])
             else:
                 stored = None
+            # A group creator may retract any member's message
+            # (moderation).  The creator is verified against the
+            # pinned roster for the group id in the signed context —
+            # never against a claim in the payload — and a missing
+            # roster fails closed below, exactly as for membership.
+            # The signed context names the message's author, so the
+            # creator's own hash must differ: an author retracting
+            # their own message is not a moderator retract.
+            moderator = False
+            if has_group_context:
+                pinned = pinned_group(self.groups, group_id)
+                moderator = (
+                    pinned is not None
+                    and (pinned.get("creator") or "") == caller_hash
+                    and caller_hash != target_author
+                )
+            try:
+                own_hash = self.destination_hexhash
+            except NodeError:  # pragma: no cover - a started node has one
+                own_hash = ""
+            if stored is None and moderator and target_author == own_hash:
+                # The author's own copy of their group send is a
+                # sent record (direction "out", no member
+                # destination, the shared time in leg_sent_at),
+                # so the received-copy lookup above never finds
+                # it — resolve it by its shared send time.
+                sent = self.inbox.find_sent_group_message(
+                    group_id, target_sent_at
+                )
+                if sent is not None:
+                    stored = sent
+                    target_id = str(sent["id"])
             if stored is None:
                 # A group-context marker is keyed by the group, so a
                 # caller the pinned roster does not name must not
@@ -3808,26 +3966,44 @@ class TauNode:
                             "not_a_member",
                             "sender is not a group member",
                         )
+                    # A caller retracting someone else's message must
+                    # be the group's verified creator (see moderator
+                    # above): without a pinned roster there is nothing
+                    # to verify against, so fail closed instead of
+                    # recording a marker that could never suppress the
+                    # message — and a member who is neither the author
+                    # nor the creator must not write one either, or
+                    # their marker would sit confirmed in the bounded
+                    # store while suppressing nothing.
+                    if caller_hash != target_author and not moderator:
+                        return response_error(
+                            "not_sender",
+                            "only the message's sender or the group's "
+                            "creator can retract it",
+                        )
                 # No stored copy to check the sender against — the message
                 # may already be deleted or never have arrived.  Record the
                 # marker anyway: the retract is authenticated, and a copy
                 # arriving later (a relayed copy, or one that outlives the
                 # seen cache) must still lose to it.  The key carries the
-                # caller's own hash, so a sender can only ever suppress
-                # their own messages this way.  If the marker cannot be
-                # persisted the retract is not confirmed.  A group
+                # author's hash — the caller's own for an author retract,
+                # the named author for a moderator retract — so a sender
+                # can only ever suppress their own messages, and a
+                # creator only ever their own group's.  If the marker
+                # cannot be persisted the retract is not confirmed.  A group
                 # retract also records the group-context marker, so a
                 # copy arriving later under its own leg id still loses
                 # to it even though no per-leg id can name it.
                 try:
-                    self._record_retraction(caller_hash, retract["target"])
+                    marker_sender = target_author if moderator else caller_hash
+                    self._record_retraction(marker_sender, retract["target"])
                     if has_group_context:
                         # Confirmed only when a pinned roster names the
                         # caller: a marker for a group with no roster
                         # goes in the unknown pool, so a flood of such
                         # retracts cannot evict confirmed markers.
                         self.mailbox.record_group_retraction(
-                            caller_hash,
+                            marker_sender,
                             group_id,
                             target_sent_at,
                             confirmed=pinned is not None,
@@ -3850,9 +4026,35 @@ class TauNode:
             # Only a received record counts: an outgoing record also has the
             # caller's hash in ``destination`` (the recipient), so without the
             # direction check a recipient could delete the sender's own copy.
-            if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
+            # A group creator may also retract a member's message: a
+            # received copy from the named author, or this node's own
+            # sent record when the creator retracts a message this node
+            # authored (its direction is "out" and it carries no member
+            # destination — the shared send time identifies it).
+            is_author = (
+                stored.get("direction") == "in"
+                and stored.get("destination") == caller_hash
+            )
+            is_moderated = (
+                moderator
+                and stored.get("kind") == "group"
+                and stored.get("group") == group_id
+                and (
+                    (
+                        stored.get("direction") == "in"
+                        and stored.get("destination") == target_author
+                    )
+                    or (
+                        stored.get("direction") == "out"
+                        and target_author == own_hash
+                    )
+                )
+            )
+            if not (is_author or is_moderated):
                 return response_error(
-                    "not_sender", "only the message's sender can retract it"
+                    "not_sender",
+                    "only the message's sender or the group's creator "
+                    "can retract it",
                 )
             if stored.get("kind") == "file":
                 # A saved file lives on disk; Inbox.delete drops only the
@@ -3889,10 +4091,15 @@ class TauNode:
             # retract also records the group-context marker, so a copy
             # arriving later under another leg id still loses to it.
             try:
-                self._record_retraction(caller_hash, target_id, confirmed=True)
+                # The marker is keyed by the message's author, never
+                # by the caller: a moderator retract records it under
+                # the named author, or a copy arriving later would
+                # never match it (delivery checks the author's hash).
+                marker_sender = target_author if moderator else caller_hash
+                self._record_retraction(marker_sender, target_id, confirmed=True)
                 if has_group_context:
                     self.mailbox.record_group_retraction(
-                        caller_hash,
+                        marker_sender,
                         group_id,
                         target_sent_at,
                         confirmed=True,
@@ -3915,7 +4122,9 @@ class TauNode:
             # stale between here and the delete.
             try:
                 removed = self.inbox.delete_authorized(
-                    target_id, direction="in", destination=caller_hash
+                    target_id,
+                    direction=str(stored.get("direction") or "in"),
+                    destination=str(stored.get("destination") or ""),
                 )
             except InboxError as exc:
                 return response_error(
@@ -3929,6 +4138,22 @@ class TauNode:
                     received_at=received_at,
                     deleted=False,
                     group_retract=has_group_context,
+                )
+            if is_moderated and stored.get("direction") == "out":
+                # The retracted message is this node's own send: its
+                # queued legs would still deliver it to members who
+                # were offline, so cancel them and record the
+                # sent-retraction marker, exactly as the sender-side
+                # group retract does.  A copy already held by a relay
+                # still loses to the group marker recorded above.
+                for entry in self.mailbox.outbox_list():
+                    if (
+                        entry.group_id == group_id
+                        and entry.wire_sent_at == float(target_sent_at)
+                    ):
+                        self.mailbox.remove_outbox(entry.id)
+                self.mailbox.record_sent_group_retraction(
+                    group_id, float(target_sent_at)
                 )
             # The inbox record is gone; a serving console keeps its own
             # copy of the message, so tell it to drop that too — otherwise
@@ -8278,6 +8503,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         target_sent_at: Optional[float] = None,
+        target_author: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Fan a retraction of a group message out to every member.
 
@@ -8289,6 +8515,13 @@ class TauNode:
         carries the signed group context (group, author, shared send
         time), so each member resolves its own copy even though legs
         carry different wire ids (see :meth:`_handle_retract`).
+
+        ``target_author`` names the message's author: it defaults to
+        this node (an author retracting their own message).  A group
+        creator retracting a member's message passes that member's
+        hash instead, so receivers can resolve the author's copy —
+        and the creator's fan-out reaches the author too, whose sent
+        record the retract deletes (see :meth:`_handle_retract`).
 
         A leg still queued in the outbox when the retract runs is
         cancelled first, so an offline member never receives a message
@@ -8332,7 +8565,7 @@ class TauNode:
         payload_bytes, retract_id, _sent_at = self._signed_retraction_payload(
             target_id,
             group=group["id"],
-            target_author=own_hash,
+            target_author=target_author or own_hash,
             target_sent_at=float(target_sent_at),
         )
         results: List[Dict[str, Any]] = []

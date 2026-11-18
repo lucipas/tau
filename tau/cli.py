@@ -37,6 +37,13 @@ from .archive import (
     load_archived_set,
     save_archive,
 )
+from .away import (
+    AwayError,
+    AwayState,
+    away_lock,
+    load_away,
+    save_away,
+)
 from .backup import create_backup, restore_backup
 from .blocklist import (
     BlockListError,
@@ -81,6 +88,7 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .drafts import DraftStore
 from .muted import (
     MutedError,
     expand_muted_groups,
@@ -115,7 +123,8 @@ from .group_invites import (
     parse_invite_link,
     revoke_invites,
 )
-from .groups import GroupStore, pinned_rosters, visible_reactions
+from .broadcasts import BroadcastStore
+from .groups import GroupStore, pinned_group, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
     attach_group_poll_tallies,
@@ -701,6 +710,118 @@ def build_parser() -> argparse.ArgumentParser:
     note.add_argument("--file", type=Path, help="read the note from a file")
     note.set_defaults(func=cmd_note)
 
+    # A draft is an unsent message parked for one peer or group: saved
+    # locally with `draft save`, sent later with `draft send`.  Like a
+    # Tan draft, it never leaves the machine until it is sent.
+    draft = subparsers.add_parser(
+        "draft",
+        parents=[common],
+        help="save an unsent DM or group message to send later",
+    )
+    draft_sub = draft.add_subparsers(dest="draft_command", metavar="DRAFT_COMMAND")
+
+    draft_save = draft_sub.add_parser(
+        "save",
+        parents=[common],
+        help="save a message as a draft for a peer or a group",
+    )
+    draft_save_target = draft_save.add_mutually_exclusive_group(required=True)
+    draft_save_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_save_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: draft for the group instead of a peer",
+    )
+    draft_save.add_argument(
+        "message", nargs="?", help="draft text (reads stdin when omitted)"
+    )
+    draft_save.set_defaults(func=cmd_draft_save)
+
+    draft_list = draft_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list saved message drafts",
+    )
+    draft_list.set_defaults(func=cmd_draft_list)
+
+    draft_show = draft_sub.add_parser(
+        "show",
+        parents=[common],
+        help="print a saved draft's full text",
+    )
+    draft_show_target = draft_show.add_mutually_exclusive_group(required=True)
+    draft_show_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_show_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id",
+    )
+    draft_show.set_defaults(func=cmd_draft_show)
+
+    draft_delete = draft_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="discard a saved draft",
+    )
+    draft_delete_target = draft_delete.add_mutually_exclusive_group(required=True)
+    draft_delete_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_delete_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id",
+    )
+    draft_delete.set_defaults(func=cmd_draft_delete)
+
+    draft_send = draft_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a saved draft (and delete it once queued)",
+    )
+    draft_send_target = draft_send.add_mutually_exclusive_group(required=True)
+    draft_send_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_send_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: send the draft into the group",
+    )
+    draft_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    draft_send.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    draft_send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    draft_send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    draft_send.set_defaults(func=cmd_draft_send)
+
     react = subparsers.add_parser(
         "react",
         parents=[common],
@@ -812,7 +933,8 @@ def build_parser() -> argparse.ArgumentParser:
     retract = subparsers.add_parser(
         "retract",
         parents=[common],
-        help="retract a sent message from the recipient's inbox",
+        help="retract a sent message from the recipient's inbox "
+        "(a group creator may also retract a member's message)",
     )
     retract.add_argument(
         "message",
@@ -1587,6 +1709,41 @@ def build_parser() -> argparse.ArgumentParser:
         "afterwards the conversation counts as unread again",
     )
     mute.set_defaults(func=cmd_mute)
+
+    away = subparsers.add_parser(
+        "away",
+        parents=[common],
+        help="set an away message that auto-replies to DMs while you are away",
+    )
+    away_sub = away.add_subparsers(dest="away_command", metavar="AWAY_COMMAND")
+    away_sub.required = True
+
+    away_on = away_sub.add_parser(
+        "on",
+        parents=[common],
+        help="turn the away reply on, optionally with a custom message",
+    )
+    away_on.add_argument(
+        "--message",
+        metavar="TEXT",
+        help="custom away message (default: \"I'm away right now. "
+        "I'll reply when I'm back.\")",
+    )
+    away_on.set_defaults(func=cmd_away_on)
+
+    away_off = away_sub.add_parser(
+        "off",
+        parents=[common],
+        help="turn the away reply off",
+    )
+    away_off.set_defaults(func=cmd_away_off)
+
+    away_status = away_sub.add_parser(
+        "status",
+        parents=[common],
+        help="show whether the away reply is on and what it says",
+    )
+    away_status.set_defaults(func=cmd_away_status)
 
     beacon = subparsers.add_parser(
         "beacon",
@@ -2409,6 +2566,182 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N pinned messages (default 30)",
     )
     group_pinned.set_defaults(func=cmd_group_pinned)
+
+    # A broadcast list is a named set of peers for one-to-many DMs: each
+    # send fans out as an ordinary DM per member, so recipients never
+    # see each other or the list — the middle ground between a group
+    # (shared context) and repeating `tau send --to` by hand.
+    broadcast = subparsers.add_parser(
+        "broadcast",
+        parents=[common],
+        help="send one message to many peers as private DMs",
+    )
+    broadcast.set_defaults(func=cmd_broadcast_list)
+    broadcast_sub = broadcast.add_subparsers(
+        dest="broadcast_command", metavar="BROADCAST_COMMAND"
+    )
+
+    broadcast_create = broadcast_sub.add_parser(
+        "create",
+        parents=[common],
+        help="save a named list of peers to message together",
+    )
+    broadcast_create.add_argument(
+        "broadcast_name", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_create.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a member peer (repeatable; yourself is the sender, not a member)",
+    )
+    broadcast_create.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_create.set_defaults(func=cmd_broadcast_create)
+
+    broadcast_list = broadcast_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list saved broadcast lists",
+    )
+    broadcast_list.set_defaults(func=cmd_broadcast_list)
+
+    broadcast_show = broadcast_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show one broadcast list and its members",
+    )
+    broadcast_show.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_show.set_defaults(func=cmd_broadcast_show)
+
+    broadcast_add_member = broadcast_sub.add_parser(
+        "add-member",
+        parents=[common],
+        help="add peers to a broadcast list",
+    )
+    broadcast_add_member.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_add_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to add (repeatable)",
+    )
+    broadcast_add_member.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_add_member.set_defaults(func=cmd_broadcast_add_member)
+
+    broadcast_remove_member = broadcast_sub.add_parser(
+        "remove-member",
+        parents=[common],
+        help="remove peers from a broadcast list",
+    )
+    broadcast_remove_member.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_remove_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to remove (repeatable)",
+    )
+    broadcast_remove_member.set_defaults(func=cmd_broadcast_remove_member)
+
+    broadcast_delete = broadcast_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="delete a broadcast list (frees capacity when the list cap is reached)",
+    )
+    broadcast_delete.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_delete.set_defaults(func=cmd_broadcast_delete)
+
+    # `tau broadcast send` shares `tau send`'s delivery flags: a
+    # broadcast is a fan-out of ordinary DMs, so every flag means what
+    # it means for a one-to-one send.  There is no --reply-to: a
+    # broadcast is never a reply.
+    broadcast_send = broadcast_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a message to every member of a broadcast list, as a private DM each",
+    )
+    broadcast_send.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_send.add_argument(
+        "message", nargs="?", help="message text (reads stdin when omitted)"
+    )
+    broadcast_send.add_argument("--file", type=Path, help="read the message from a file")
+    broadcast_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    broadcast_send.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    broadcast_send.add_argument(
+        "--kind",
+        default=None,
+        metavar="SLUG",
+        help="tag the message with a kind (default chat); receivers can"
+        " filter their inbox by kind",
+    )
+    broadcast_send.add_argument(
+        "--location",
+        default=None,
+        metavar='"LAT,LON [PLACE]"',
+        help="pin a place on the message (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park"); without message text the '
+        "place name (or the coordinates) becomes the text, and the "
+        "message is tagged location unless --kind says otherwise",
+    )
+    broadcast_send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from the receiver's inbox "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
+    broadcast_send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
+    broadcast_send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    broadcast_send.set_defaults(func=cmd_broadcast_send)
 
     tan = subparsers.add_parser(
         "tan",
@@ -9919,6 +10252,7 @@ def _retract_group_local_message(
     timeout: float = 20.0,
     leg_timeout: Optional[float] = None,
     discover_timeout: Optional[float] = None,
+    target_author: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retract a group message on the running node, for the local send server.
 
@@ -9927,7 +10261,9 @@ def _retract_group_local_message(
     wait on the socket is unbounded for a fan-out, so the operation
     timeout cannot travel as ``timeout`` — send_running swallows that
     keyword as the reply wait.  An older client sends no leg timeout
-    and the default bound applies.
+    and the default bound applies.  ``target_author`` names the
+    message's author for a moderator retract; an author retract (and
+    an older client) omits it and the fan-out stamps this node.
     """
     return node.send_group_retraction(
         group,
@@ -9935,6 +10271,7 @@ def _retract_group_local_message(
         timeout=float(leg_timeout if leg_timeout is not None else timeout),
         discover_timeout=discover_timeout,
         target_sent_at=target_sent_at,
+        target_author=target_author,
     )
 
 
@@ -10353,6 +10690,7 @@ def _retract_group_via_running_node(
     *,
     timeout: float,
     discover_timeout: Optional[float],
+    target_author: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retract a group message through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -10367,6 +10705,7 @@ def _retract_group_via_running_node(
             group=group_id,
             message_id=message_id,
             target_sent_at=target_sent_at,
+            target_author=target_author,
             leg_timeout=timeout,
             discover_timeout=discover_timeout,
         )
@@ -11491,6 +11830,24 @@ def _own_destination_hash(config: TauConfig) -> Optional[str]:
     """This node's destination hash, or ``None`` without an identity."""
     identity = load_identity(config.identity_path)
     return destination_hash(identity).hex() if identity is not None else None
+
+
+def _is_group_creator(config: TauConfig, target: Dict[str, Any]) -> bool:
+    """True when this node created the group *target* belongs to.
+
+    The creator is read from the pinned roster for the message's
+    group — the same record the receive path verifies a moderator
+    retract against — so a stale local copy cannot grant moderation
+    this node does not have.
+    """
+    group_id = target.get("group") or ""
+    if not group_id:
+        return False
+    own_hash = _own_destination_hash(config)
+    if own_hash is None:
+        return False
+    pinned = pinned_group(GroupStore(config.groups_path), str(group_id))
+    return pinned is not None and (pinned.get("creator") or "") == own_hash
 
 
 def _quote_line(
@@ -12822,6 +13179,92 @@ def cmd_mute(args: argparse.Namespace) -> int:
             f"Muted {label}: its messages still arrive, but never light "
             "the unread badge."
         )
+    return _EXIT_OK
+
+
+def cmd_away_on(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    # Reload inside the lock: two away commands racing must not
+    # discard each other's change.
+    with away_lock(config.away_path):
+        try:
+            load_away(config.away_path)
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        try:
+            state = AwayState.on(getattr(args, "message", None))
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        save_away(config.away_path, state)
+    if _json_mode(args):
+        _emit(
+            {
+                "enabled": True,
+                "message": state.message,
+                "since": state.since,
+            },
+            True,
+        )
+        return _EXIT_OK
+    print(
+        "Away reply on: the first DM from each peer gets one reply:\n"
+        f"{state.message}"
+    )
+    return _EXIT_OK
+
+
+def cmd_away_off(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    with away_lock(config.away_path):
+        try:
+            current = load_away(config.away_path)
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        was_on = current.enabled
+        if was_on:
+            save_away(config.away_path, current.off())
+    if _json_mode(args):
+        _emit(
+            {"enabled": False, "message": current.message},
+            True,
+        )
+        return _EXIT_OK
+    if was_on:
+        print("Away reply off.")
+    else:
+        print("Away reply is already off.")
+    return _EXIT_OK
+
+
+def cmd_away_status(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        state = load_away(config.away_path)
+    except AwayError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    if _json_mode(args):
+        _emit(
+            {
+                "enabled": state.enabled,
+                "message": state.message,
+                "since": state.since,
+                "replied_to": sorted(state.replied_to),
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not state.enabled:
+        print("Away reply is off.")
+    else:
+        print(f"Away reply is on:\n{state.message}")
+        if state.replied_to:
+            print(
+                f"{len(state.replied_to)} peer(s) answered in this away period."
+            )
     return _EXIT_OK
 
 
@@ -14669,6 +15112,224 @@ def cmd_group_send_file(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _describe_broadcast(
+    broadcast: Dict[str, Any], registry: PeerRegistry
+) -> Dict[str, Any]:
+    """A broadcast list record with member display names for output."""
+    members = []
+    for member_hash in broadcast["members"]:
+        peer = registry.get(member_hash)
+        members.append(
+            {
+                "hash": member_hash,
+                "name": peer.display_name if peer is not None else member_hash[:8],
+            }
+        )
+    return {
+        "name": broadcast["name"],
+        "members": members,
+        "created_at": broadcast["created_at"],
+    }
+
+
+def cmd_broadcast_create(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        members: List[str] = []
+        for target in getattr(args, "peer", []):
+            peer = node.resolve_peer(
+                target,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+            if peer.hexhash == own_hash:
+                raise NodeError(
+                    "cannot add yourself to a broadcast list;"
+                    " you are the sender, not a member"
+                )
+            if peer.hexhash not in members:
+                members.append(peer.hexhash)
+        if not members:
+            raise NodeError("a broadcast list needs at least one peer")
+        store = BroadcastStore(config.broadcasts_path)
+        try:
+            broadcast = store.create(args.broadcast_name, members)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    finally:
+        node.stop()
+
+    described = _describe_broadcast(broadcast, node.registry)
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    print(f"created broadcast list {broadcast['name']}")
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members get a private DM each — they never see the list.")
+    return _EXIT_OK
+
+
+def cmd_broadcast_list(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    registry = PeerRegistry(config.peers_path)
+    lists = [_describe_broadcast(entry, registry) for entry in store.list_broadcasts()]
+    if _json_mode(args):
+        _emit({"broadcasts": lists, "count": len(lists)}, True)
+        return _EXIT_OK
+    if not lists:
+        print("No broadcast lists yet — create one with `tau broadcast create NAME --peer ...`.")
+        return _EXIT_OK
+    for entry in lists:
+        names = ", ".join(member["name"] for member in entry["members"])
+        print(f"{entry['name']} ({len(entry['members'])} members) — {names}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_show(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_broadcast(broadcast, PeerRegistry(config.peers_path))
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    print(f"{described['name']} ({len(described['members'])} members)")
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    return _EXIT_OK
+
+
+def _change_broadcast_members(args: argparse.Namespace, *, adding: bool) -> int:
+    """Add peers to, or remove peers from, a broadcast list.
+
+    Adding resolves each peer (with discovery, like ``tau group
+    add-member``), so a mistyped or unknown peer is refused before the
+    list changes.  Removing only needs the hash already in the list:
+    an offline member may have left the registry, and resolving it
+    would wait out the whole discover timeout.
+    """
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    members = list(broadcast["members"])
+    if adding:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            own_hash = node.destination_hexhash
+            resolved: List[str] = []
+            for target in getattr(args, "peer", []):
+                peer = node.resolve_peer(
+                    target,
+                    timeout=float(getattr(args, "discover_timeout", 10.0)),
+                )
+                if peer.hexhash == own_hash:
+                    raise NodeError(
+                        "cannot add yourself to a broadcast list;"
+                        " you are the sender, not a member"
+                    )
+                if peer.hexhash in members:
+                    raise NodeError(
+                        f"{peer.display_name} is already on"
+                        f" broadcast list {broadcast['name']!r}"
+                    )
+                if peer.hexhash not in resolved:
+                    resolved.append(peer.hexhash)
+            try:
+                updated = store.add_members(broadcast["name"], resolved)
+            except ValueError as exc:
+                raise NodeError(str(exc)) from exc
+        finally:
+            node.stop()
+    else:
+        registry = PeerRegistry(config.peers_path)
+        resolved = []
+        for target in getattr(args, "peer", []):
+            fast = _roster_hash(target, members)
+            if fast is not None:
+                resolved.append(fast)
+                continue
+            peer = registry.resolve(target)
+            if peer is None:
+                raise NodeError(f"unknown peer: {target!r}")
+            if peer.hexhash not in members:
+                raise NodeError(
+                    f"{peer.display_name} is not on"
+                    f" broadcast list {broadcast['name']!r}"
+                )
+            resolved.append(peer.hexhash)
+        try:
+            updated = store.remove_members(broadcast["name"], resolved)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    described = _describe_broadcast(updated, PeerRegistry(config.peers_path))
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    names = ", ".join(member["name"] for member in described["members"])
+    print(f"{described['name']} ({len(described['members'])} members) — {names}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_add_member(args: argparse.Namespace) -> int:
+    return _change_broadcast_members(args, adding=True)
+
+
+def cmd_broadcast_remove_member(args: argparse.Namespace) -> int:
+    return _change_broadcast_members(args, adding=False)
+
+
+def cmd_broadcast_delete(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not store.delete(broadcast["name"]):
+        raise NodeError(f"unknown broadcast list: {args.broadcast!r}")
+    if _json_mode(args):
+        _emit({"deleted": broadcast["name"]}, True)
+        return _EXIT_OK
+    print(f"deleted broadcast list {broadcast['name']}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_send(args: argparse.Namespace) -> int:
+    """Send a message to every member of a broadcast list, as a private DM each.
+
+    Delivery reuses :func:`cmd_send` wholesale: each member gets their
+    own send, sent record and store-and-forward envelope, so an offline
+    member queues exactly like a one-to-one DM and no list metadata
+    ever reaches a recipient.
+    """
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not broadcast["members"]:
+        # Unreachable through the store (it refuses empty lists), but
+        # a hand-edited broadcasts.json must not send to nobody silently.
+        raise NodeError(f"broadcast list {broadcast['name']!r} has no members")
+    # `cmd_send` reads its text from `args.message` and its targets from
+    # `args.to`; hand it the list's members and let it own delivery,
+    # queueing, and output.
+    args.to = list(broadcast["members"])
+    return cmd_send(args)
+
+
 def cmd_note(args: argparse.Namespace) -> int:
     """Save a private note to self in the local inbox.
 
@@ -14695,6 +15356,176 @@ def cmd_note(args: argparse.Namespace) -> int:
         print(f"note saved #{_safe_id_prefix(str(entry['id']))} [note]")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+    return _EXIT_OK
+
+
+def _resolve_draft_target(
+    config: TauConfig, args: argparse.Namespace
+) -> Tuple[str, str, str]:
+    """Resolve a draft command's ``--to``/``--group`` to ``(kind, id, name)``.
+
+    Peers resolve through the local registry only — a draft is local
+    state for someone this node already knows, so there is no reason to
+    start a node and discover.  Groups resolve through the group store.
+    """
+    if getattr(args, "group", None):
+        try:
+            group = GroupStore(config.groups_path).find(args.group)
+        except ValueError:
+            raise NodeError(f"unknown group: {args.group!r}") from None
+        return "group", str(group["id"]), str(group["name"])
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = _resolve_sent_peer(registry, args.to)
+    identity = load_identity(config.identity_path)
+    if identity is not None and peer_hash == destination_hash(identity).hex():
+        raise NodeError(
+            "cannot draft a message to yourself — save a note instead"
+        )
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    return "peer", peer_hash, name
+
+
+def _describe_draft(
+    draft: Dict[str, Any], config: TauConfig
+) -> Dict[str, Any]:
+    """A draft plus its conversation's display name, for output."""
+    if draft["kind"] == "group":
+        group = GroupStore(config.groups_path).get(str(draft["target"]))
+        name = str(group["name"]) if group is not None else short_hash(draft["target"])
+    else:
+        peer = PeerRegistry(config.peers_path).get(str(draft["target"]))
+        name = peer.display_name if peer is not None else short_hash(draft["target"])
+    return {
+        "kind": draft["kind"],
+        "target": draft["target"],
+        "target_name": name,
+        "text": draft["text"],
+        "updated_at": draft["updated_at"],
+    }
+
+
+def _draft_preview(text: str) -> str:
+    """First line of a draft, truncated for a list row."""
+    first = text.splitlines()[0] if text.splitlines() else ""
+    return first if len(first) <= 60 else first[:57] + "…"
+
+
+def cmd_draft_save(args: argparse.Namespace) -> int:
+    """Save a message as a draft for a peer or a group.
+
+    Local-only: the text is validated like a send but never queued or
+    transmitted.  Saving again overwrites the conversation's draft.
+    """
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    text = _read_message(args)
+    try:
+        draft = DraftStore(config.drafts_path).save(kind, target, text)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_draft(draft, config)
+    if _json_mode(args):
+        _emit({"draft": described}, True)
+    else:
+        print(f"draft saved for {name}")
+        for line in described["text"].splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_draft_list(args: argparse.Namespace) -> int:
+    """List saved message drafts, oldest first."""
+    config = _make_config(args)
+    drafts = [
+        _describe_draft(draft, config)
+        for draft in DraftStore(config.drafts_path).list_drafts()
+    ]
+    if _json_mode(args):
+        _emit({"drafts": drafts, "count": len(drafts)}, True)
+        return _EXIT_OK
+    if not drafts:
+        print("No drafts yet — save one with `tau draft save --to PEER \"text\"`.")
+        return _EXIT_OK
+    for draft in drafts:
+        where = "group " if draft["kind"] == "group" else ""
+        age = _ago(time.time() - float(draft["updated_at"]))
+        print(
+            f"{where}{draft['target_name']} ({draft['target'][:8]}) — "
+            f"{_draft_preview(str(draft['text']))} [{age} ago]"
+        )
+    return _EXIT_OK
+
+
+def cmd_draft_show(args: argparse.Namespace) -> int:
+    """Print a saved draft's full text."""
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    draft = DraftStore(config.drafts_path).get(kind, target)
+    if draft is None:
+        raise NodeError(f"no draft for {name}")
+    if _json_mode(args):
+        _emit({"draft": _describe_draft(draft, config)}, True)
+    else:
+        print(draft["text"])
+    return _EXIT_OK
+
+
+def cmd_draft_delete(args: argparse.Namespace) -> int:
+    """Discard a saved draft."""
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    if not DraftStore(config.drafts_path).delete(kind, target):
+        raise NodeError(f"no draft for {name}")
+    if _json_mode(args):
+        _emit(
+            {"deleted": {"kind": kind, "target": target, "target_name": name}},
+            True,
+        )
+    else:
+        print(f"deleted draft for {name}")
+    return _EXIT_OK
+
+
+def cmd_draft_send(args: argparse.Namespace) -> int:
+    """Send a saved draft through the normal send path.
+
+    The draft is deleted once the message is queued or delivered — a
+    failed send keeps it, so nothing is lost to a transient failure.
+    Delivery reuses :func:`cmd_send` wholesale for a peer target, or
+    :func:`cmd_group_send` for a group target, exactly like a forward.
+    """
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    store = DraftStore(config.drafts_path)
+    draft = store.get(kind, target)
+    if draft is None:
+        raise NodeError(f"no draft for {name}")
+    # `cmd_send`/`cmd_group_send` read their text from `args.message`;
+    # hand them the draft text and let them own delivery, queueing, and
+    # output.  The remaining flags come from this subcommand's parser.
+    args.message = str(draft["text"])
+    args.file = None
+    args.location = None
+    args.kind = None
+    args.delay = None
+    args.expire = None
+    args.reply_to = None
+    if kind == "group":
+        args.group = target
+        code = cmd_group_send(args)
+    else:
+        args.to = [target]
+        code = cmd_send(args)
+    if code != _EXIT_OK:
+        print(
+            f"draft for {name} kept — the send failed",
+            file=sys.stderr,
+        )
+        return code
+    store.delete(kind, target)
+    if not _json_mode(args):
+        print(f"sent draft to {name}")
     return _EXIT_OK
 
 
@@ -14936,11 +15767,15 @@ def _retract_group_message(
     registry: PeerRegistry,
     target: Dict[str, Any],
 ) -> int:
-    """Retract a sent group message, fanning out to every member.
+    """Retract a group message, fanning out to every member.
 
-    Queued legs are cancelled by the fan-out (see
+    An author retracts their own sent message; a group creator may
+    also retract a member's message (moderation — see
+    :func:`cmd_retract`), in which case the fan-out carries that
+    member as the target author and reaches the author too.  Queued
+    legs are cancelled by the fan-out (see
     :meth:`tau.node.TauNode.send_group_retraction`), so a member whose
-    leg never left never receives the message.  The local sent copy is
+    leg never left never receives the message.  The local copy is
     dropped only when every member received the retract: a partial
     fan-out keeps it, so the user can retry the members still holding
     the message — re-sending is idempotent, and a member who already
@@ -14949,12 +15784,23 @@ def _retract_group_message(
     group_id = target.get("group") or ""
     if not group_id:
         raise NodeError("that group message has no group to retract from")
+    moderating = target.get("direction") == "in"
     leg_sent_at = target.get("leg_sent_at")
+    if leg_sent_at is None and moderating:
+        # A received copy carries the legs' shared send time as its
+        # sent_at (the author's send time); a sent record carries it
+        # as leg_sent_at instead.
+        leg_sent_at = target.get("sent_at")
     if leg_sent_at is None:
         raise NodeError(
             "that group message was sent before group retracts landed; "
             "it carries no leg send time, so it cannot be retracted"
         )
+    # The author of the message being retracted: this node for an
+    # author retract, the sender of the received copy for a moderator
+    # retract.  Receivers resolve their copy — and key the durable
+    # marker — by this hash (see TauNode._handle_retract).
+    target_author = target.get("destination") or None
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
     via_running_node = _send_routes_via_running_node(config)
@@ -14971,6 +15817,7 @@ def _retract_group_message(
                 float(leg_sent_at),
                 timeout=timeout,
                 discover_timeout=discover_timeout,
+                target_author=target_author,
             )
         except NodeError as exc:
             # Retracts ride the live link only in v1 — there is no
@@ -14991,6 +15838,7 @@ def _retract_group_message(
                     timeout=timeout,
                     discover_timeout=discover_timeout,
                     target_sent_at=float(leg_sent_at),
+                    target_author=target_author,
                 )
             except NodeError as exc:
                 # Retracts ride the live link only in v1 — there is no
@@ -15005,6 +15853,16 @@ def _retract_group_message(
 
     results = response.get("results") or []
     failed = [r for r in results if not r.get("delivered")]
+    if moderating:
+        author_peer = registry.get(target_author or "")
+        author_name = (
+            author_peer.display_name
+            if author_peer is not None
+            else short_hash(target_author or "")
+        )
+        message_label = f"{author_name}'s group message"
+    else:
+        message_label = "your group message"
     if _json_mode(args):
         _emit(
             {
@@ -15025,7 +15883,7 @@ def _retract_group_message(
             if result.get("delivered"):
                 if result.get("deleted"):
                     print(
-                        f"retracted your group message "
+                        f"retracted {message_label} "
                         f"{_safe_id_prefix(str(target['id']))} from {name}'s inbox"
                     )
                 else:
@@ -15291,10 +16149,16 @@ def cmd_retract(args: argparse.Namespace) -> int:
     if not target.get("id"):
         raise NodeError("that message has no id to retract")
     if target.get("direction") != "out":
-        raise NodeError(
-            "that message was not sent by this node;"
-            " only your own sent messages can be retracted"
-        )
+        # A group creator may retract a member's message (moderation):
+        # a received group message is retractable when this node
+        # created the group.  Anything else still needs a sent copy.
+        if target.get("kind") != "group" or not _is_group_creator(
+            config, target
+        ):
+            raise NodeError(
+                "that message was not sent by this node;"
+                " only your own sent messages can be retracted"
+            )
     if target.get("kind") == "group":
         return _retract_group_message(args, config, inbox, registry, target)
     recipient = target.get("destination") or ""
@@ -16351,45 +17215,132 @@ def _cmd_messages_sent(
     registry: PeerRegistry,
     limit: Optional[int],
 ) -> int:
-    """List messages this node sent, with their read state."""
+    """List messages this node sent, with their read state.
+
+    A group send folds into one row: its legs share one send, so the
+    author sees who has read it — ``seen by Alice, Bob · delivered to
+    Carol · queued for Dave`` — instead of one identical row per
+    member.  The fold is keyed on the sender's own group inbox record
+    (``leg_ids``); a leg whose sent record was evicted counts as
+    unknown, and a send whose inbox record is gone (retracted,
+    deleted) keeps today's per-leg rows.
+    """
     mailbox = Mailbox(config.mailbox_path)
+    inbox = Inbox(config.inbox_path)
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_sent_peer(registry, args.peer)
     entries = mailbox.sent_list()
-    if peer_hash is not None:
-        entries = [entry for entry in entries if entry.get("to") == peer_hash]
-    entries.reverse()  # newest first
-    if limit is not None:
-        entries = entries[: max(0, limit)]
     queued_ids = {entry.id for entry in mailbox.outbox_list()}
+    sent_by_id = {entry["id"]: entry for entry in entries}
+    fold_by_leg: Dict[str, Dict[str, Any]] = {}
+    for record in inbox.list_messages(
+        direction="out", kind="group", limit=None
+    ):
+        leg_ids = record.get("leg_ids")
+        if not isinstance(leg_ids, list):
+            continue
+        for leg_id in leg_ids:
+            if isinstance(leg_id, str) and leg_id:
+                fold_by_leg.setdefault(leg_id, record)
+
+    def leg_state(entry: Dict[str, Any]) -> str:
+        read_at = entry.get("read_at")
+        # ``delivered_at`` is set only once a delivery was confirmed.
+        # Records from before it was tracked have no such key and count
+        # as delivered.
+        delivered_at = entry.get("delivered_at", entry.get("sent_at"))
+        if entry["id"] in queued_ids:
+            return "queued"
+        if read_at is not None:
+            return "read"
+        if delivered_at is not None:
+            return "delivered"
+        # Cancelled or expired before any delivery was confirmed.
+        return "unknown"
 
     def describe(entry: Dict[str, Any]) -> Dict[str, Any]:
         peer = registry.get(entry.get("to") or "")
-        read_at = entry.get("read_at")
-        # ``delivered_at`` is set only once a delivery was confirmed.  Records
-        # from before it was tracked have no such key and count as delivered.
-        delivered_at = entry.get("delivered_at", entry.get("sent_at"))
-        if entry["id"] in queued_ids:
-            state = "queued"
-        elif read_at is not None:
-            state = "read"
-        elif delivered_at is not None:
-            state = "delivered"
-        else:
-            # Cancelled or expired before any delivery was confirmed.
-            state = "unknown"
         return {
             "id": entry["id"],
             "to": entry.get("to"),
             "to_name": peer.display_name if peer is not None else "",
             "text": entry.get("text", ""),
             "sent_at": entry.get("sent_at"),
-            "read_at": read_at,
-            "state": state,
+            "read_at": entry.get("read_at"),
+            "state": leg_state(entry),
         }
 
-    described = [describe(entry) for entry in entries]
+    def describe_group(record: Dict[str, Any]) -> Dict[str, Any]:
+        legs = []
+        for leg_id in record.get("leg_ids") or []:
+            sent = sent_by_id.get(leg_id)
+            if sent is None:
+                # The sent record was evicted (see MAX_SENT): the leg
+                # went out, but who it went to is no longer known, so
+                # it counts as unknown without a name.
+                legs.append(
+                    {
+                        "id": leg_id,
+                        "to": None,
+                        "to_name": "",
+                        "state": "unknown",
+                        "read_at": None,
+                    }
+                )
+                continue
+            legs.append(describe(sent))
+        states = {leg["state"] for leg in legs}
+        if states == {"read"}:
+            state = "read"
+        elif states <= {"read", "delivered"}:
+            state = "delivered"
+        elif states == {"queued"}:
+            state = "queued"
+        else:
+            state = "partial"
+        return {
+            "id": record.get("id"),
+            "group": record.get("group"),
+            "group_name": record.get("group_name") or "group",
+            "text": record.get("text", ""),
+            "sent_at": record.get("sent_at"),
+            "state": state,
+            "legs": legs,
+        }
+
+    # Walk the sent records oldest first, as before: a group send's
+    # legs share one send time, so they sit together and the fold
+    # takes the first leg's place.  A fold with no leg left in the
+    # sent records (all evicted) never appears — exactly like the
+    # per-leg rows it replaces.
+    described: List[Dict[str, Any]] = []
+    folded: Set[str] = set()
+    for entry in entries:
+        record = fold_by_leg.get(entry["id"])
+        if record is not None:
+            key = str(record.get("id")) + str(record.get("sent_at"))
+            if key in folded:
+                continue
+            folded.add(key)
+            described.append(describe_group(record))
+        else:
+            described.append(describe(entry))
+    described.reverse()  # newest first
+    if peer_hash is not None:
+        described = [
+            entry
+            for entry in described
+            if (
+                entry.get("to") == peer_hash
+                if "group" not in entry
+                else any(
+                    leg.get("to") == peer_hash for leg in entry.get("legs") or []
+                )
+            )
+        ]
+    if limit is not None:
+        described = described[: max(0, limit)]
     if _json_mode(args):
         _emit({"messages": described, "count": len(described)}, True)
         return _EXIT_OK
@@ -16397,13 +17348,44 @@ def _cmd_messages_sent(
         print("No messages sent yet.")
         return _EXIT_OK
     for entry in described:
-        name = entry["to_name"] or short_hash(entry["to"] or "")
         when = _format_message_time(float(entry.get("sent_at") or 0))
-        if entry["state"] == "read":
-            state = f"read {_format_message_time(float(entry['read_at'] or 0))}"
+        if "group" in entry:
+            seen = [
+                leg["to_name"] or short_hash(leg["to"] or "")
+                for leg in entry.get("legs") or []
+                if leg["state"] == "read"
+            ]
+            delivered = [
+                leg["to_name"] or short_hash(leg["to"] or "")
+                for leg in entry.get("legs") or []
+                if leg["state"] == "delivered"
+            ]
+            queued = [
+                leg["to_name"] or short_hash(leg["to"] or "")
+                for leg in entry.get("legs") or []
+                if leg["state"] == "queued"
+            ]
+            unknown = sum(
+                1 for leg in entry.get("legs") or [] if leg["state"] == "unknown"
+            )
+            parts = []
+            if seen:
+                parts.append("seen by " + ", ".join(seen))
+            if delivered:
+                parts.append("delivered to " + ", ".join(delivered))
+            if queued:
+                parts.append("queued for " + ", ".join(queued))
+            if unknown:
+                parts.append(f"{unknown} unknown")
+            state = " · ".join(parts) or "unknown"
+            print(f"[{when}] to {entry.get('group_name')} — {state}")
         else:
-            state = entry["state"]
-        print(f"[{when}] to {name} — {state}")
+            name = entry["to_name"] or short_hash(entry["to"] or "")
+            if entry["state"] == "read":
+                state = f"read {_format_message_time(float(entry['read_at'] or 0))}"
+            else:
+                state = entry["state"]
+            print(f"[{when}] to {name} — {state}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
