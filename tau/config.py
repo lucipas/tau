@@ -27,6 +27,7 @@ PEERS_FILE_NAME = "peers.json"
 MAILBOX_FILE_NAME = "mailbox.json"
 INBOX_FILE_NAME = "inbox.json"
 GROUPS_FILE_NAME = "groups.json"
+BROADCASTS_FILE_NAME = "broadcasts.json"
 MESSAGES_FILE_NAME = "messages.json"
 SOCIAL_DB_FILE_NAME = "tan.sqlite3"
 CHANNELS_DB_FILE_NAME = "channels.sqlite3"
@@ -37,7 +38,9 @@ BLOCKLIST_FILE_NAME = "blocklist.json"
 IGNORED_GROUPS_FILE_NAME = "ignored-groups.json"
 ARCHIVED_FILE_NAME = "archived.json"
 DISAPPEARING_FILE_NAME = "disappearing.json"
+DRAFTS_FILE_NAME = "drafts.json"
 MUTED_FILE_NAME = "muted.json"
+QUIET_HOURS_FILE_NAME = "quiet_hours.json"
 AWAY_FILE_NAME = "away.json"
 DM_REQUESTS_FILE_NAME = "dm-requests.json"
 INVITES_FILE_NAME = "invites.json"
@@ -78,6 +81,7 @@ class TauConfig:
     mailbox_path: Path
     inbox_path: Path
     groups_path: Path
+    broadcasts_path: Path
     node_file: Path
     social_db_path: Path
     channels_db_path: Path
@@ -87,7 +91,9 @@ class TauConfig:
     ignored_groups_path: Path
     archived_path: Path
     disappearing_path: Path
+    drafts_path: Path
     muted_path: Path
+    quiet_hours_path: Path
     away_path: Path
     dm_requests_path: Path
     invites_path: Path
@@ -134,6 +140,7 @@ class TauConfig:
             mailbox_path=base / MAILBOX_FILE_NAME,
             inbox_path=base / INBOX_FILE_NAME,
             groups_path=base / GROUPS_FILE_NAME,
+            broadcasts_path=base / BROADCASTS_FILE_NAME,
             node_file=base / NODE_FILE_NAME,
             social_db_path=base / SOCIAL_DB_FILE_NAME,
             channels_db_path=base / CHANNELS_DB_FILE_NAME,
@@ -143,7 +150,9 @@ class TauConfig:
             ignored_groups_path=base / IGNORED_GROUPS_FILE_NAME,
             archived_path=base / ARCHIVED_FILE_NAME,
             disappearing_path=base / DISAPPEARING_FILE_NAME,
+            drafts_path=base / DRAFTS_FILE_NAME,
             muted_path=base / MUTED_FILE_NAME,
+            quiet_hours_path=base / QUIET_HOURS_FILE_NAME,
             away_path=base / AWAY_FILE_NAME,
             dm_requests_path=base / DM_REQUESTS_FILE_NAME,
             invites_path=base / INVITES_FILE_NAME,

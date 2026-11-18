@@ -17,10 +17,15 @@ import {
   markRead,
   pageFileUrl,
   pinChannelMessage,
+  reactToChannelMessage,
   reactToMessage,
+  closeDmPoll,
+  searchChannelMessages,
+  sendChannelMessage,
   sendMessage,
   tanMediaUrl,
   unpinChannelMessage,
+  voteDmPoll,
   voteTanPoll,
   wsUrl,
 } from "./api";
@@ -103,9 +108,47 @@ describe("GET endpoints", () => {
     await getChannelPins("my channel");
     expect(captured[0].url).toBe("/api/channels/pins?channel=my%20channel");
   });
+
+  it("builds the channel search query", async () => {
+    nextJson = { channel: "general", query: "hello", messages: [], count: 0 };
+    await searchChannelMessages("my channel", "hello world", 5);
+    expect(captured[0].url).toBe(
+      "/api/channels/search?channel=my%20channel&q=hello%20world&limit=5",
+    );
+  });
+
+  it("reacts to a channel message by hash", async () => {
+    nextJson = { ok: true, reaction: {} };
+    await reactToChannelMessage("general", "ab12", "👍");
+    expect(captured[0].url).toBe("/api/channels/react");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      channel: "general",
+      target: "ab12",
+      reaction: "👍",
+    });
+  });
 });
 
 describe("POST endpoints", () => {
+  it("sends a channel message without reply_to when standalone", async () => {
+    nextJson = { ok: true, message: {} };
+    await sendChannelMessage("mesh-general", "hello");
+    expect(captured[0].url).toBe("/api/channels/send");
+    expect(bodyOf(0)).toEqual({ channel: "mesh-general", text: "hello" });
+  });
+
+  it("sends a channel reply with reply_to", async () => {
+    nextJson = { ok: true, message: {} };
+    await sendChannelMessage("mesh-general", "count me in", "m1".padEnd(64, "0"));
+    expect(captured[0].url).toBe("/api/channels/send");
+    expect(bodyOf(0)).toEqual({
+      channel: "mesh-general",
+      text: "count me in",
+      reply_to: "m1".padEnd(64, "0"),
+    });
+  });
+
   it("sends a DM with reply / expiry / delay / poll options", async () => {
     nextJson = { ok: true, message: {}, response: {} };
     await sendMessage(
@@ -144,6 +187,16 @@ describe("POST endpoints", () => {
     await voteTanPoll("posthash", 2);
     expect(captured[0].url).toBe("/api/tan/vote");
     expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
+  });
+
+  it("votes and closes a DM poll on the DM routes", async () => {
+    nextJson = { ok: true, messages: [], response: {} };
+    await voteDmPoll("alice", "wire1", 2);
+    expect(captured[0].url).toBe("/api/dm/vote");
+    expect(bodyOf(0)).toEqual({ to: "alice", poll: "wire1", option: 2 });
+    await closeDmPoll("alice", "wire1");
+    expect(captured[1].url).toBe("/api/dm/close-poll");
+    expect(bodyOf(1)).toEqual({ to: "alice", poll: "wire1" });
   });
 
   it("marks read with an empty body when no conversation is given", async () => {

@@ -335,10 +335,16 @@ class FakeNode:
         in_reply_to=None,
         expires_at=None,
         send_after=None,
+        poll_options=None,
+        poll_vote=None,
+        poll_close=None,
     ):
         self.sent.append((peer.name, text, in_reply_to))
         self.last_expires_at = expires_at
         self.last_send_after = send_after
+        self.last_poll_options = poll_options
+        self.last_poll_vote = poll_vote
+        self.last_poll_close = poll_close
         # A distinct wire id per send, like the real node's generated id.
         wire_id = f"{len(self.sent):032d}"
         return {
@@ -3244,6 +3250,57 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     }
 
 
+def test_api_unread_zero_during_quiet_hours(bridge, node, tmp_path):
+    _inbound_record(node)
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "per_group": {},
+        "total": 1,
+    }
+
+    # A window covering right now silences the badge; turning it off
+    # brings the counts back — the read cursor never moved.
+    now = time.localtime()
+    current = now.tm_hour * 60 + now.tm_min
+    start = (current - 60) % (24 * 60)
+    end = (current + 60) % (24 * 60)
+    node.config.quiet_hours_path = tmp_path / "quiet_hours.json"
+    (tmp_path / "quiet_hours.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "start": f"{start // 60:02d}:{start % 60:02d}",
+                "end": f"{end // 60:02d}:{end % 60:02d}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {},
+        "per_group": {},
+        "total": 0,
+    }
+
+    (tmp_path / "quiet_hours.json").write_text(
+        json.dumps(
+            {
+                "enabled": False,
+                "start": f"{start // 60:02d}:{start % 60:02d}",
+                "end": f"{end // 60:02d}:{end % 60:02d}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, _, status = _json(bridge, "/api/status")
+    assert _counts(status["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "per_group": {},
+        "total": 1,
+    }
+
+
 def test_api_groups_ignore_with_corrupt_list_is_500(bridge, node, tmp_path):
     _learned_group(node, tmp_path)
     (tmp_path / "ignored-groups.json").write_text(
@@ -4929,6 +4986,16 @@ def test_channels_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/channels/messages")
         assert status == 400
 
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=hello")
+        assert status == 200
+        assert payload["query"] == "hello"
+        assert [item["text"] for item in payload["messages"]] == ["hello channels"]
+
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general")
+        assert status == 400
+        status, _, payload = _json(bridge, "/api/channels/search?q=hello")
+        assert status == 400
+
         # A blocked author is hidden, like the timeline hides their posts.
         node.blocklist = SimpleNamespace(
             blocked=frozenset({bob_message["author"]}), block_all=False
@@ -4936,8 +5003,14 @@ def test_channels_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
         assert status == 200
         assert [item["text"] for item in payload["messages"]] == ["from tester"]
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=hello")
+        assert status == 200
+        assert payload["messages"] == []
         node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
         status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert payload["messages"] == []
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=tester")
         assert status == 200
         assert payload["messages"] == []
         node.blocklist = None
@@ -4962,6 +5035,36 @@ def test_channels_via_api(tmp_path):
         )
         assert status == 503
         assert "not enabled" in payload["error"]["message"]
+
+        # Editing validates its fields before touching the bridge...
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit",
+            method="POST",
+            body={"channel": "general", "text": "nope"},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit",
+            method="POST",
+            body={"channel": "general", "target": bob_message["hash"]},
+        )
+        assert status == 400
+        # ...and reports the same 503 when channels are not enabled.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit",
+            method="POST",
+            body={
+                "channel": "general",
+                "target": bob_message["hash"],
+                "text": "nope",
+            },
+        )
+        assert status == 503
+        assert "not enabled" in payload["error"]["message"]
+
         status, _, payload = _json(
             bridge, "/api/channels/sync", method="POST", body={}
         )
@@ -5031,6 +5134,82 @@ def test_channels_via_api(tmp_path):
         )
         assert status == 200
         assert payload["pins"] == []
+    finally:
+        bridge.stop()
+
+
+def test_channels_send_reply_via_api(tmp_path):
+    import RNS
+
+    from tau import cli
+    from tau.channels import (
+        ChannelApp,
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        parent = create_message(
+            conn, bob, "general", "meet at the park", name="bob", now=1000
+        )
+    finally:
+        conn.close()
+    node.channel_app = ChannelApp(node.config, node.identity, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "see you there",
+                "reply_to": parent["hash"],
+            },
+        )
+        assert status == 200
+        assert payload["message"]["reply_to"] == parent["hash"]
+
+        # An unknown parent is a 400, not a dangling reply.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "dangling", "reply_to": "f" * 64},
+        )
+        assert status == 400
+        assert "unknown message" in payload["error"]["message"]
+
+        # A non-string reply_to is a 400 too.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "bad", "reply_to": 123},
+        )
+        assert status == 400
+
+        # The messages list carries the reply with its parent digest.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == [
+            "see you there",
+            "meet at the park",
+        ]
+        assert payload["messages"][0]["reply_to"] == parent["hash"]
+        assert "reply_to" not in payload["messages"][1]
     finally:
         bridge.stop()
 
@@ -13069,6 +13248,196 @@ def test_group_poll_close_endpoint_closes_own_poll(bridge, node):
     }
 
 
+def _seed_dm_poll(node, bridge, *, author=PEER_HASH, close=False):
+    """A DM poll in the node inbox and the console history.
+
+    Alice (``PEER_HASH``) asks "Tea or coffee?" at sent time 100;
+    she votes for Coffee (option index 1).  An optional close from
+    the poll's author freezes the tally.
+    """
+    poll = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "Tea or coffee?",
+        "kind": "chat",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-dm-poll",
+        "poll_options": ["Tea", "Coffee"],
+    }
+    node.inbox.append(dict(poll))
+    bridge.record_inbound(dict(poll), publish=False)
+    vote = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "voted: Coffee",
+        "kind": "chat",
+        "sent_at": 110.0,
+        "received_at": 111.0,
+        "id": "wire-dm-vote",
+        "poll_vote": {"target": {"author": author, "sent_at": 100.0}, "option": 1},
+    }
+    node.inbox.append(dict(vote))
+    bridge.record_inbound(dict(vote), publish=False)
+    if close:
+        close_record = {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "closed the poll",
+            "kind": "chat",
+            "sent_at": 120.0,
+            "received_at": 121.0,
+            "id": "wire-dm-close",
+            "poll_close": {"author": author, "sent_at": 100.0},
+        }
+        node.inbox.append(dict(close_record))
+        bridge.record_inbound(dict(close_record), publish=False)
+
+
+def test_messages_overlays_dm_poll_tally(bridge, node):
+    _seed_dm_poll(node, bridge)
+    entries = bridge.messages()
+    poll = next(
+        entry for entry in entries if entry.get("wire_id") == "wire-dm-poll"
+    )
+    assert poll["poll_options"] == ["Tea", "Coffee"]
+    assert poll["poll"] == {
+        "options": ["Tea", "Coffee"],
+        "counts": [0, 1],
+        "total": 1,
+        "closed": False,
+        "voters": [
+            {
+                "author": PEER_HASH,
+                "name": "alice",
+                "option": 1,
+                "voted_at": 110.0,
+            }
+        ],
+        "my_vote": None,
+    }
+    vote = next(
+        entry for entry in entries if entry.get("wire_id") == "wire-dm-vote"
+    )
+    assert vote["poll_vote"] == {
+        "target": {"author": PEER_HASH, "sent_at": 100.0},
+        "option": 1,
+    }
+
+
+def test_dm_send_with_poll_options_posts_poll(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={
+            "to": "alice",
+            "text": "Tea or coffee?",
+            "poll_options": ["Tea", "Coffee"],
+        },
+    )
+    assert status == 200
+    assert node.last_poll_options == ["Tea", "Coffee"]
+    assert node.last_poll_vote is None
+    assert node.last_poll_close is None
+
+
+def test_dm_poll_vote_endpoint_votes_by_number_and_text(bridge, node):
+    _seed_dm_poll(node, bridge)
+    status, _, payload = _json(
+        bridge,
+        "/api/dm/vote",
+        method="POST",
+        body={"to": "alice", "poll": "wire-dm-poll", "option": 2},
+    )
+    assert status == 200
+    assert node.sent[-1][1] == "voted: Coffee"
+    assert node.last_poll_vote == {
+        "target": {"author": PEER_HASH, "sent_at": 100.0},
+        "option": 1,
+    }
+    status, _, payload = _json(
+        bridge,
+        "/api/dm/vote",
+        method="POST",
+        body={"to": "alice", "poll": "wire-dm-p", "option": "Tea"},
+    )
+    assert status == 200
+    assert node.last_poll_vote["option"] == 0
+
+
+def test_dm_poll_vote_endpoint_rejects_bad_option(bridge, node):
+    _seed_dm_poll(node, bridge)
+    status, _, payload = _json(
+        bridge,
+        "/api/dm/vote",
+        method="POST",
+        body={"to": "alice", "poll": "wire-dm-poll", "option": 3},
+    )
+    assert status == 400
+    assert "option must be" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/dm/vote",
+        method="POST",
+        body={"to": "alice", "poll": "wire-dm-nope", "option": 1},
+    )
+    assert status == 400
+    assert "no poll" in payload["error"]["message"]
+
+
+def test_dm_poll_vote_endpoint_refuses_closed_poll(bridge, node):
+    _seed_dm_poll(node, bridge, close=True)
+    status, _, payload = _json(
+        bridge,
+        "/api/dm/vote",
+        method="POST",
+        body={"to": "alice", "poll": "wire-dm-poll", "option": 1},
+    )
+    assert status == 400
+    assert "closed" in payload["error"]["message"]
+
+
+def test_dm_poll_close_endpoint_requires_creator(bridge, node):
+    _seed_dm_poll(node, bridge)
+    status, _, payload = _json(
+        bridge,
+        "/api/dm/close-poll",
+        method="POST",
+        body={"to": "alice", "poll": "wire-dm-poll"},
+    )
+    assert status == 400
+    assert "only the poll's creator" in payload["error"]["message"]
+
+
+def test_dm_poll_close_endpoint_closes_own_poll(bridge, node):
+    poll = {
+        "from": "tester",
+        "destination": PEER_HASH,
+        "text": "Tea or coffee?",
+        "kind": "chat",
+        "direction": "out",
+        "leg_sent_at": 100.0,
+        "sent_at": 101.0,
+        "received_at": 101.0,
+        "id": "wire-dm-own-poll",
+        "poll_options": ["Tea", "Coffee"],
+    }
+    node.inbox.append(dict(poll))
+    status, _, payload = _json(
+        bridge,
+        "/api/dm/close-poll",
+        method="POST",
+        body={"to": "alice", "poll": "wire-dm-own-poll"},
+    )
+    assert status == 200
+    assert node.sent[-1][1] == "closed the poll"
+    assert node.last_poll_close == {
+        "author": node.destination_hexhash,
+        "sent_at": 100.0,
+    }
+
+
 def test_react_endpoint_group_gone_is_a_404(bridge, node):
     group_id = node.groups.list_groups()[0]["id"]
     bridge.record_inbound(
@@ -16670,7 +17039,7 @@ def test_reactions_and_wire_id_survive_bridge_restart(node, tmp_path):
 
 
 def test_send_message_records_wire_id(node, tmp_path):
-    def send_with_id(peer, text, *, timeout=20.0, discover_timeout=None, in_reply_to=None, expires_at=None, send_after=None):
+    def send_with_id(peer, text, *, timeout=20.0, discover_timeout=None, in_reply_to=None, expires_at=None, send_after=None, **kwargs):
         return {"ok": True, "echo": text, "server": "tester", "id": "wire-9"}
 
     node.send_message = send_with_id
@@ -17973,3 +18342,92 @@ def test_other_endpoints_keep_the_json_body_cap(bridge):
     )
     assert status == 400
     assert "too large" in payload["error"]["message"]
+
+
+def test_channel_react_via_api(tmp_path):
+    from tau.channels import (
+        ChannelApp,
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node.registry = FakeRegistry([])
+    bob = RNS.Identity()
+    tester = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        bob_message = create_message(
+            conn, bob, "general", "hello channels", name="bob", now=1000
+        )
+    finally:
+        conn.close()
+
+    app = ChannelApp(node.config, tester, name="tester")
+    app.node = node  # type: ignore[assignment]
+    node.channel_app = app
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Reacting attaches a summary to the message in the feed.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={
+                "channel": "general",
+                "target": bob_message["hash"][:12],
+                "reaction": "👍",
+            },
+        )
+        assert status == 200
+        assert payload["reaction"]["reaction"] == "👍"
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert payload["messages"][0]["reactions"] == [
+            {"reaction": "👍", "count": 1, "reactors": ["tester"]}
+        ]
+
+        # Validation errors are 400s: a non-string token, an unknown target.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={"channel": "general", "target": bob_message["hash"], "reaction": 5},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={"channel": "general", "target": "0" * 64, "reaction": "👍"},
+        )
+        assert status == 400
+        assert "no stored message" in payload["error"]["message"]
+
+        # An empty reaction clears yours: the summary disappears.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={
+                "channel": "general",
+                "target": bob_message["hash"],
+                "reaction": "",
+            },
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert payload["messages"][0]["reactions"] == []
+    finally:
+        bridge.stop()

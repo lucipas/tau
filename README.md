@@ -127,7 +127,11 @@ read cursor per sender, `tau messages` marks entries unread with `●` and
 advances the cursor when you read a conversation, and the console shows an
 unread badge next to each peer and the unread total in the tab title.
 Opening a peer in the console clears its badge; read receipts to the sender
-are a separate feature and do not exist yet.
+are a separate feature and do not exist yet. A single conversation can be
+muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
+`tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
+every night instead — while the window is active every conversation counts
+as unread 0, and the counts come back when it ends.
 
 The same bridge is the local integration point for scripts:
 
@@ -355,6 +359,9 @@ Global options may appear before or after the command:
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau send --to PEER TEXT --poll-options A B` | Ask a question with 2–8 options in a DM (the poll renders with its tally in `tau messages` and the console) |
+| `tau vote --to PEER POLL OPTION` | Vote on a DM poll (option number or exact text; one standing vote per voter, latest wins) |
+| `tau close-poll --to PEER POLL` | Close a DM poll you created (freezes the tally; only the creator can close it) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau doctor` | Check the local data directory's health (read-only; `--json` for scripting) |
@@ -365,6 +372,11 @@ Global options may appear before or after the command:
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau messages prune --older-than 90d` | Delete stored messages older than a cutoff (`--peer`, `--group`, `--dry-run`) |
 | `tau note TEXT` | Save a private note to self in the local inbox (never sent; list with `tau messages --kind note`) |
+| `tau draft save --to PEER TEXT` | Save an unsent message as a draft for a peer (`--group NAME` drafts for a group instead; one draft per conversation, saving again overwrites; local-only, never sent until `draft send`) |
+| `tau draft list` | List saved message drafts with a text preview |
+| `tau draft show --to PEER` | Print a saved draft's full text (`--group NAME` for a group draft) |
+| `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft) |
+| `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -404,12 +416,18 @@ Global options may appear before or after the command:
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message counts |
-| `tau channel send NAME TEXT` | Send a signed message to a joined channel |
+| `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message) |
+| `tau channel react NAME HASH EMOJI` | React to a stored channel message (one per reactor; `--clear` retracts yours) |
+| `tau channel edit NAME DIGEST NEW-TEXT` | Edit your own channel message (digest or hex prefix) |
+| `tau channel edits NAME` | List edit notices for a channel, newest first |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
 | `tau channel pin NAME HASH` | Pin a stored message so it stays surfaced (and survives pruning) |
 | `tau channel unpin NAME HASH` | Drop the pin on a message in a channel |
 | `tau channel pins NAME` | List pinned messages for a channel, newest pin first |
+| `tau channel search NAME TEXT` | Search stored messages in a channel by keyword, newest first |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
+| `tau channel retract NAME DIGEST` | Retract one of your own channel messages (signed notice, gossiped to peers) |
+| `tau channel retractions NAME` | List stored retract notices for a channel |
 
 Useful flags:
 
@@ -450,6 +468,10 @@ tau messages --kind ping
 
 # See what is waiting on offline peers
 tau outbox
+
+# Broadcast lists: one message, many private DMs (no shared group)
+tau broadcast create team --peer alice --peer bob
+tau broadcast send team "meet at noon"
 
 # Read back messages this node received (newest first)
 tau messages

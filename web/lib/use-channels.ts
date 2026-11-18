@@ -2,8 +2,10 @@
 //
 // Provides:
 //   useChannels() — joined channels, per-channel message history,
-//                   join/leave/send/sync. History is newest-first from
-//                   /api/channels/messages (default 20, max 50).
+//                   join/leave/send/sync/search. History is newest-first from
+//                   /api/channels/messages (default 20, max 50); search
+//                   matches come from /api/channels/search and replace the
+//                   history view until cleared.
 // New channel messages also arrive as `channel-message` live events on
 // /ws; this hook polls the open channel on an interval (default 30s) and
 // after every mutation, so it stays correct when the socket is down.
@@ -12,12 +14,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  editChannelMessage,
   getChannelMessages,
   getChannelPins,
   getChannels,
   joinChannel,
   leaveChannel,
   pinChannelMessage,
+  reactToChannelMessage,
+  searchChannelMessages,
   sendChannelMessage,
   syncChannels,
   unpinChannelMessage,
@@ -32,12 +37,22 @@ export interface UseChannelsResult {
   messages: ChannelMessage[];
   /** Pinned messages for the selected channel, newest pin first. */
   pins: ChannelMessage[];
+  /** Search matches for the selected channel, or null when not searching. */
+  searchResults: ChannelMessage[] | null;
+  /** The query behind `searchResults`, or null when not searching. */
+  searchQuery: string | null;
+  search: (query: string) => Promise<void>;
+  clearSearch: () => void;
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
-  send: (text: string) => Promise<ChannelMessage>;
+  send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
+  /** React to a message by hash; an empty reaction clears yours. */
+  react: (target: string, reaction: string) => Promise<void>;
+  /** Edit your own message in the selected channel, then refresh. */
+  edit: (target: string, text: string) => Promise<void>;
   sync: (channel?: string) => Promise<void>;
   pin: (hash: string) => Promise<void>;
   unpin: (hash: string) => Promise<void>;
@@ -48,6 +63,8 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
   const [pins, setPins] = useState<ChannelMessage[]>([]);
+  const [searchResults, setSearchResults] = useState<ChannelMessage[] | null>(null);
+  const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -91,8 +108,35 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
 
   const select = useCallback((channel: string | null) => {
     setSelected(channel);
+    // A search belongs to the channel it ran in; switching channels
+    // drops it rather than showing stale matches under a new name.
+    setSearchResults(null);
+    setSearchQuery(null);
     void refreshMessages(channel);
   }, [refreshMessages]);
+
+  const search = useCallback(async (query: string) => {
+    if (!selected) throw new Error("no channel selected");
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setSearchResults(null);
+      setSearchQuery(null);
+      return;
+    }
+    try {
+      const results = await searchChannelMessages(selected, trimmed);
+      setSearchResults(results);
+      setSearchQuery(trimmed);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [selected]);
+
+  const clearSearch = useCallback(() => {
+    setSearchResults(null);
+    setSearchQuery(null);
+  }, []);
 
   return {
     channels,
@@ -100,6 +144,10 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     select,
     messages,
     pins,
+    searchResults,
+    searchQuery,
+    search,
+    clearSearch,
     loading,
     error,
     refresh,
@@ -116,13 +164,25 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
         setSelected(null);
         setMessages([]);
         setPins([]);
+        setSearchResults(null);
+        setSearchQuery(null);
       }
     },
-    send: async (text) => {
+    send: async (text, replyTo) => {
       if (!selected) throw new Error("no channel selected");
-      const sent = await sendChannelMessage(selected, text);
+      const sent = await sendChannelMessage(selected, text, replyTo);
       await refreshMessages(selected);
       return sent;
+    },
+    react: async (target, reaction) => {
+      if (!selected) throw new Error("no channel selected");
+      await reactToChannelMessage(selected, target, reaction);
+      await refreshMessages(selected);
+    },
+    edit: async (target, text) => {
+      if (!selected) throw new Error("no channel selected");
+      await editChannelMessage(selected, target, text);
+      await refreshMessages(selected);
     },
     sync: async (channel) => {
       await syncChannels(channel ?? selected ?? undefined);

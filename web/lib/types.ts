@@ -324,11 +324,11 @@ export interface ChatMessage {
   in_reply_to?: ReplyRef;
   location?: LocationPin;
   beacon?: LiveBeacon;
-  /** Group poll question carried on the message itself. */
+  /** Group or DM poll question carried on the message itself. */
   poll_options?: string[];
   poll_vote?: GroupPollVote;
   poll_close?: GroupPollClose;
-  /** Group poll tally, attached by the bridge from the node inbox. */
+  /** Group or DM poll tally, attached by the bridge from the node inbox. */
   poll?: GroupPollTally;
   file?: StoredFile;
   excerpt_hash?: string;
@@ -613,6 +613,12 @@ export interface Channel {
   joined_at: number;
 }
 
+export interface ChannelReaction {
+  reaction: string;
+  count: number;
+  reactors: string[];
+}
+
 export interface ChannelMessage {
   v: number;
   hash: string;
@@ -626,6 +632,13 @@ export interface ChannelMessage {
   sig: string;
   /** Present on pins: when this node pinned the message. */
   pinned_at?: number;
+  /** Reaction summary, grouped by token; absent on old servers. */
+  reactions?: ChannelReaction[];
+  /** Digest of the parent message when this message is a reply. */
+  reply_to?: string;
+  /** Present when the author edited this message; the text shown is the latest edit. */
+  edited?: boolean;
+  edited_at?: number;
 }
 
 // ---------------------------------------------------------------- pages --
