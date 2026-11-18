@@ -46,6 +46,32 @@ Pulling a feed and pushing a message are deliberately separate: a
 node can read a channel it joined even when the author of a message
 is offline, as long as any peer still has that message cached.
 
+An edit is a second signed record that points at a message by hash::
+
+    {
+      "v": 1,
+      "kind": "channel-edit",
+      "channel": "mesh-meetup",
+      "target": "<64 hex digest of the original message>",
+      "text": "see you at the park — 6pm, not 5",
+      "author": "<32 hex destination hash>",
+      "key": "<128 hex public key>",
+      "created_at": 1760000000.0,
+      "hash": "<64 hex sha256(canonical body)>",
+      "sig": "<128 hex Ed25519 signature over the hash>"
+    }
+
+Only the message's author can edit it, and only the newest
+author-matching edit changes what a reader sees: the original
+message is never rewritten — its hash must stay valid so peers can
+still verify and store it — so the feed serves original messages
+plus the channel's newest edit notices, and readers overlay the
+latest edit on display.  An edit notice for a message that has not
+arrived yet is stored as pending and applies the moment the message
+does; a notice signed by anyone but the message's author is stored
+but never applies.
+
+
 A retract notice is a signed record of its own::
 
     {
@@ -141,6 +167,14 @@ DEFAULT_CHANNEL_LIMIT = 20
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
 MAX_SYNC_PAGES = 32
+# Bound on how many edit notices one channel may hold: an edit is
+# small, but a peer spamming re-edits must not grow the store
+# without limit.  The newest 500 win; older ones are pruned.
+MAX_EDITS_PER_CHANNEL = 500
+# How many of a channel's newest edit notices a feed response
+# carries, so a syncing peer learns the current text without a
+# second round trip.
+MAX_FEED_EDITS = 50
 
 # Channel names are joined by exact name, so the character set is
 # tight: start alphanumerical, then letters, digits, dots, dashes and
@@ -152,6 +186,20 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # signed body, so a relay cannot move a message into another room
 # without breaking the hash.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
+
+# Fields covered by an edit notice's hash.  The target digest pins
+# the notice to one message, so it cannot be replayed onto another.
+EDIT_HASH_FIELDS = (
+    "v",
+    "kind",
+    "channel",
+    "target",
+    "text",
+    "author",
+    "key",
+    "created_at",
+)
+EDIT_KIND = "channel-edit"
 
 # Fields covered by a retract notice's hash.  ``kind`` pins the
 # signed body to a retract, so a notice can never be mistaken for a
@@ -376,6 +424,414 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# -- edit notices ------------------------------------------------------------
+
+# Column order used by every edit SELECT so rows convert consistently.
+_EDIT_COLUMNS = (
+    "v",
+    "kind",
+    "hash",
+    "channel",
+    "target",
+    "text",
+    "author",
+    "key",
+    "created_at",
+    "received_at",
+    "sig",
+)
+
+
+def _canonical_edit_body(edit: Dict[str, Any]) -> bytes:
+    body = {field: edit[field] for field in EDIT_HASH_FIELDS}
+    return json.dumps(
+        body,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def hash_edit(edit: Dict[str, Any]) -> str:
+    """Hash an edit notice: lowercase hex sha256 of its body."""
+    if not isinstance(edit, dict):
+        raise ChannelError("a channel edit must be a JSON object")
+    missing = [field for field in EDIT_HASH_FIELDS if field not in edit]
+    if missing:
+        raise ChannelError(
+            f"channel edit is missing fields: {', '.join(missing)}"
+        )
+    return hashlib.sha256(_canonical_edit_body(edit)).hexdigest()
+
+
+def _check_edit_wire_size(edit: Dict[str, Any]) -> None:
+    """Reject an edit whose publish envelope exceeds the budget."""
+    envelope = dict(edit)
+    envelope.setdefault("hash", "0" * HASH_HEX_LENGTH)
+    envelope.setdefault("sig", "0" * SIG_HEX_LENGTH)
+    try:
+        encode(
+            {"edit": envelope, "ttl": MAX_GOSSIP_TTL},
+            max_bytes=MAX_REQUEST_BYTES,
+        )
+    except ProtocolError as exc:
+        raise ChannelError(
+            f"channel edit is too large to publish: {exc}"
+        ) from exc
+
+
+def _normalize_edit(edit: Dict[str, Any], *, now: Optional[float] = None) -> Dict[str, Any]:
+    """Validate and normalise the signed part of an edit notice."""
+    if not isinstance(edit, dict):
+        raise ChannelError("a channel edit must be a JSON object")
+
+    version = edit.get("v", CHANNEL_VERSION)
+    if isinstance(version, bool) or version != CHANNEL_VERSION:
+        raise ChannelError(f"unsupported channel edit version: {version!r}")
+    if edit.get("kind") != EDIT_KIND:
+        raise ChannelError(f"unsupported channel edit kind: {edit.get('kind')!r}")
+
+    channel = clean_channel_name(edit.get("channel"))
+    target = _require_hex(edit.get("target"), HASH_HEX_LENGTH, "target")
+    author = _require_hex(edit.get("author"), AUTHOR_HEX_LENGTH, "author")
+    key = _require_hex(edit.get("key"), KEY_HEX_LENGTH, "key")
+
+    raw_text = edit.get("text")
+    try:
+        text = normalize_message(raw_text)
+    except ProtocolError as exc:
+        raise ChannelError(f"invalid channel edit text: {exc}") from exc
+    if text != raw_text:
+        raise ChannelError("channel edit text is not normalised")
+
+    created_at = _require_timestamp(edit.get("created_at"), "created_at")
+    if now is not None and created_at > float(now) + 86400.0:
+        raise ChannelError("channel edit timestamp is too far in the future")
+
+    notice = {
+        "v": CHANNEL_VERSION,
+        "kind": EDIT_KIND,
+        "channel": channel,
+        "target": target,
+        "text": text,
+        "author": author,
+        "key": key,
+        "created_at": created_at,
+    }
+    _check_edit_wire_size(notice)
+    return notice
+
+
+def verify_edit(edit: Dict[str, Any], *, now: Optional[float] = None) -> Dict[str, Any]:
+    """Validate a complete edit notice, including hash and signature."""
+    notice = _normalize_edit(edit, now=now)
+
+    digest = edit.get("hash")
+    expected = hash_edit(notice)
+    if not isinstance(digest, str) or digest.strip().lower() != expected:
+        raise ChannelError("channel edit hash does not match its contents")
+    notice["hash"] = expected
+
+    signature = _require_hex(edit.get("sig"), SIG_HEX_LENGTH, "sig")
+    notice["sig"] = signature
+
+    identity = _identity_from_message(notice)
+    author = _author_from_identity(identity)
+    if author != notice["author"]:
+        raise ChannelError("public key does not match the edit author")
+    try:
+        valid = identity.validate(bytes.fromhex(signature), bytes.fromhex(expected))
+    except Exception as exc:  # pragma: no cover - depends on RNS internals
+        raise ChannelError(f"could not check signature: {exc}") from exc
+    if not valid:
+        raise ChannelError("channel edit signature is invalid")
+    return notice
+
+
+def _canonical_edit(edit: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the public, canonical representation of an edit notice."""
+    return {
+        "v": edit["v"],
+        "kind": edit["kind"],
+        "hash": edit["hash"],
+        "channel": edit["channel"],
+        "target": edit["target"],
+        "text": edit["text"],
+        "author": edit["author"],
+        "key": edit["key"],
+        "created_at": edit["created_at"],
+        "sig": edit["sig"],
+    }
+
+
+def _row_to_edit(row: sqlite3.Row) -> Dict[str, Any]:
+    return _canonical_edit(dict(row))
+
+
+def get_edit(conn: sqlite3.Connection, digest: str) -> Optional[Dict[str, Any]]:
+    """Return a stored edit notice by hash, or ``None``."""
+    row = conn.execute(
+        f"SELECT {', '.join(_EDIT_COLUMNS)} FROM edits WHERE hash = ?",
+        (digest,),
+    ).fetchone()
+    return _row_to_edit(row) if row is not None else None
+
+
+def list_edits(
+    conn: sqlite3.Connection,
+    channel: str,
+    *,
+    limit: int = MAX_FEED_EDITS,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Newest edit notices for *channel*, newest first."""
+    name = clean_channel_name(channel)
+    count = max(1, min(int(limit), MAX_EDITS_PER_CHANNEL))
+    clauses = ["channel = ?"]
+    params: List[Any] = [name]
+    excluded = [author for author in (exclude_authors or []) if author]
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(f"author NOT IN ({placeholders})")
+        params.extend(excluded)
+    rows = conn.execute(
+        f"SELECT {', '.join(_EDIT_COLUMNS)} FROM edits "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at DESC, hash DESC LIMIT ?",
+        (*params, count),
+    ).fetchall()
+    return [_row_to_edit(row) for row in rows]
+
+
+def latest_edit_for(
+    conn: sqlite3.Connection, target: str
+) -> Optional[Dict[str, Any]]:
+    """Newest stored edit notice for one message digest, or ``None``."""
+    row = conn.execute(
+        f"SELECT {', '.join(_EDIT_COLUMNS)} FROM edits WHERE target = ? "
+        "ORDER BY created_at DESC, hash DESC LIMIT 1",
+        (target,),
+    ).fetchone()
+    return _row_to_edit(row) if row is not None else None
+
+
+def store_edit(
+    conn: sqlite3.Connection,
+    edit: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+    verify: bool = True,
+) -> Tuple[Dict[str, Any], bool]:
+    """Validate and store an edit notice, returning ``(edit, is_new)``.
+
+    A notice is stored even when its author is not the message's
+    author — it simply never applies (see
+    :func:`_apply_edits_to_messages`).  Storing it keeps the record
+    for ``tau channel edits`` and for re-sync, and costs nothing
+    beyond the per-channel cap.  A notice for a message that has not
+    arrived yet is pending: it applies the moment the message does.
+    """
+    timestamp = float(now if now is not None else time.time())
+    if verify:
+        notice = verify_edit(edit, now=timestamp)
+    else:
+        base = _normalize_edit(edit, now=timestamp)
+        notice = dict(base)
+        notice["hash"] = hash_edit(base)
+        notice["sig"] = _require_hex(edit.get("sig"), SIG_HEX_LENGTH, "sig")
+
+    digest = notice["hash"]
+    existing = get_edit(conn, digest)
+    if existing is not None:
+        return existing, False
+
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO edits(v, kind, hash, channel, target, text, "
+                "author, key, created_at, received_at, sig) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    CHANNEL_VERSION,
+                    EDIT_KIND,
+                    digest,
+                    notice["channel"],
+                    notice["target"],
+                    notice["text"],
+                    notice["author"],
+                    notice["key"],
+                    notice["created_at"],
+                    timestamp,
+                    notice["sig"],
+                ),
+            )
+            conn.execute(
+                "DELETE FROM edits WHERE channel = ? AND hash NOT IN ("
+                "SELECT hash FROM edits WHERE channel = ? "
+                "ORDER BY created_at DESC, hash DESC "
+                f"LIMIT {MAX_EDITS_PER_CHANNEL})",
+                (notice["channel"], notice["channel"]),
+            )
+    except sqlite3.IntegrityError:
+        existing = get_edit(conn, digest)
+        if existing is None:
+            raise
+        return existing, False
+
+    record = get_edit(conn, digest)
+    if record is None:
+        return _canonical_edit(notice), False
+    return record, True
+
+
+def resolve_message_digest(
+    conn: sqlite3.Connection, channel: str, digest: str
+) -> str:
+    """Resolve a full message digest or a hex prefix to a full digest.
+
+    A prefix must be at least 4 hex characters and match exactly one
+    stored message in *channel*; an ambiguous or unknown prefix is an
+    error, so a typo never edits the wrong message.
+    """
+    name = clean_channel_name(channel)
+    if not isinstance(digest, str):
+        raise ChannelError("message digest must be a hex string")
+    text = digest.strip().lower()
+    if len(text) < 4 or any(ch not in "0123456789abcdef" for ch in text):
+        raise ChannelError(
+            "message digest must be at least 4 hex characters"
+        )
+    if len(text) == HASH_HEX_LENGTH:
+        row = _fetch_message(conn, text)
+        if row is None or row["channel"] != name:
+            raise ChannelError(f"unknown message: {digest!r}")
+        return text
+    if len(text) > HASH_HEX_LENGTH:
+        raise ChannelError("message digest is too long")
+    rows = conn.execute(
+        "SELECT hash FROM messages WHERE channel = ? AND hash LIKE ?",
+        (name, text + "%"),
+    ).fetchall()
+    if not rows:
+        raise ChannelError(f"unknown message: {digest!r}")
+    if len(rows) > 1:
+        raise ChannelError(
+            f"ambiguous message digest prefix {digest!r}: "
+            f"matches {len(rows)} messages"
+        )
+    return rows[0]["hash"]
+
+
+def current_message_text(
+    conn: sqlite3.Connection, message: Dict[str, Any]
+) -> Tuple[str, Optional[float]]:
+    """A message's current text: its latest author-matching edit wins.
+
+    Returns ``(text, edited_at)``; ``edited_at`` is ``None`` when no
+    edit applies, so callers can tell an untouched message from an
+    edited one.  Only an edit signed by the message's own author
+    applies — a notice from anyone else is ignored.
+    """
+    notice = latest_edit_for(conn, message["hash"])
+    if notice is not None and notice["author"] == message["author"]:
+        return notice["text"], notice["created_at"]
+    return message["text"], None
+
+
+def _apply_edits_to_messages(
+    conn: sqlite3.Connection, messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Overlay the latest author-matching edit onto each message.
+
+    The stored message rows are never rewritten — their hashes must
+    stay valid for peers — so the overlay happens on the returned
+    dicts only: an edited message carries its new ``text`` plus
+    ``edited: True`` and ``edited_at``.  Untouched messages pass
+    through unchanged.
+    """
+    if not messages:
+        return messages
+    targets = [message["hash"] for message in messages]
+    placeholders = ", ".join("?" for _ in targets)
+    rows = conn.execute(
+        f"SELECT {', '.join(_EDIT_COLUMNS)} FROM edits "
+        f"WHERE target IN ({placeholders}) "
+        "ORDER BY created_at DESC, hash DESC",
+        targets,
+    ).fetchall()
+    newest: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        notice = _row_to_edit(row)
+        newest.setdefault(notice["target"], notice)
+    applied = []
+    for message in messages:
+        notice = newest.get(message["hash"])
+        if notice is not None and notice["author"] == message["author"]:
+            shown = dict(message)
+            shown["text"] = notice["text"]
+            shown["edited"] = True
+            shown["edited_at"] = notice["created_at"]
+            applied.append(shown)
+        else:
+            applied.append(message)
+    return applied
+
+
+def create_edit(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    channel: str,
+    target: str,
+    text: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store an edit notice owned by *identity*.
+
+    Only the message's author may edit it.  Re-editing to the text
+    the message already shows returns the stored notice instead of
+    signing a duplicate; editing to the message's own current text
+    with no notice on file is an error — there is nothing to change.
+    """
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    name = clean_channel_name(channel)
+    digest = resolve_message_digest(conn, name, target)
+    message = get_message(conn, digest)
+    if message is None:  # pragma: no cover - resolver already checked
+        raise ChannelError(f"unknown message: {target!r}")
+    author = _author_from_identity(identity)
+    if author != message["author"]:
+        raise ChannelError("only the message author can edit it")
+    current, _ = current_message_text(conn, message)
+    try:
+        new_text = normalize_message(text)
+    except ProtocolError as exc:
+        raise ChannelError(f"invalid channel edit text: {exc}") from exc
+    if new_text == current:
+        notice = latest_edit_for(conn, digest)
+        if notice is not None and notice["author"] == author:
+            return notice
+        raise ChannelError("message already has that text")
+    body = {
+        "v": CHANNEL_VERSION,
+        "kind": EDIT_KIND,
+        "channel": name,
+        "target": digest,
+        "text": new_text,
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "created_at": timestamp,
+    }
+    digest_hash = hash_edit(body)
+    notice = dict(body)
+    notice["hash"] = digest_hash
+    notice["sig"] = identity.sign(bytes.fromhex(digest_hash)).hex()
+    _check_edit_wire_size(notice)
+    record, _ = store_edit(conn, notice, now=timestamp)
+    return record
+
+
 # -- retract notices -------------------------------------------------------
 
 
@@ -471,10 +927,6 @@ def _canonical_retraction(notice: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": notice["created_at"],
         "sig": notice["sig"],
     }
-
-
-# -- storage ---------------------------------------------------------------
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -511,10 +963,28 @@ CREATE TABLE IF NOT EXISTS retractions (
 CREATE INDEX IF NOT EXISTS retractions_channel_created
     ON retractions(channel, created_at DESC, hash);
 
+
 CREATE TABLE IF NOT EXISTS memberships (
     channel TEXT PRIMARY KEY,
     joined_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS edits (
+    v INTEGER NOT NULL DEFAULT 1,
+    hash TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'channel-edit',
+    channel TEXT NOT NULL,
+    target TEXT NOT NULL,
+    text TEXT NOT NULL,
+    author TEXT NOT NULL,
+    key TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    received_at REAL NOT NULL,
+    sig TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS edits_channel_target
+    ON edits(channel, target, created_at DESC, hash DESC);
 """
 
 
@@ -575,30 +1045,6 @@ def _prune_retractions(conn: sqlite3.Connection, channel: str) -> None:
         f"LIMIT {MAX_RETRACTIONS_PER_CHANNEL})",
         (channel, channel),
     )
-
-
-def resolve_message_digest(
-    conn: sqlite3.Connection, channel: str, prefix: str
-) -> str:
-    """Resolve a message hash (or unique prefix) in *channel* to its full digest."""
-    name = clean_channel_name(channel)
-    needle = str(prefix or "").strip().lower()
-    if len(needle) < 4:
-        raise ChannelError("message digest prefix must be at least 4 characters")
-    if any(char not in "0123456789abcdef" for char in needle):
-        raise ChannelError("message digest prefix must be hexadecimal")
-    rows = conn.execute(
-        "SELECT hash FROM messages WHERE channel = ? AND hash LIKE ? ORDER BY hash",
-        (name, needle + "%"),
-    ).fetchall()
-    if not rows:
-        raise ChannelError(f"no message in #{name} matches {needle!r}")
-    if len(rows) > 1:
-        raise ChannelError(
-            f"digest prefix {needle!r} is ambiguous "
-            f"({len(rows)} messages in #{name}); use a longer prefix"
-        )
-    return str(rows[0][0])
 
 
 def create_retraction(
@@ -807,8 +1253,6 @@ def store_message(
         # has the validated message, and the store bound is working.
         return _canonical_message(message), False
     return _canonical_message(record), True
-
-
 def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
     """Bound the channel store so one peer cannot fill the disk.
 
@@ -833,6 +1277,14 @@ def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
         f"LIMIT {MAX_STORED_PER_CHANNEL})",
         (channel, channel),
     )
+    # An edit notice is only useful while its message survives: drop
+    # notices whose target is gone, so a pruned message does not
+    # leave orphaned edits behind.
+    conn.execute(
+        "DELETE FROM edits WHERE channel = ? AND target NOT IN ("
+        "SELECT hash FROM messages WHERE channel = ?)",
+        (channel, channel),
+    )
     while True:
         count = conn.execute(
             "SELECT COUNT(DISTINCT channel) FROM messages"
@@ -848,6 +1300,7 @@ def _prune_store(conn: sqlite3.Connection, channel: str) -> None:
             # Every cached channel is joined: nothing evictable.
             return
         conn.execute("DELETE FROM messages WHERE channel = ?", (row[0],))
+        conn.execute("DELETE FROM edits WHERE channel = ?", (row[0],))
         # The room is gone: its retract notices go with it, so a
         # re-joined room starts from a clean slate.
         conn.execute("DELETE FROM retractions WHERE channel = ?", (row[0],))
@@ -884,8 +1337,6 @@ def create_message(
     _check_wire_size(mesg)
     record, _ = store_message(conn, mesg, now=timestamp)
     return record
-
-
 def channel_history_page(
     conn: sqlite3.Connection,
     channel: str,
@@ -894,6 +1345,7 @@ def channel_history_page(
     before: Optional[float] = None,
     before_hash: Optional[str] = None,
     exclude_authors: Optional[Sequence[str]] = None,
+    apply_edits: bool = True,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """Return one page of stored messages for *channel*, newest first.
 
@@ -908,6 +1360,11 @@ def channel_history_page(
     messages can share one ``created_at``, and ordering breaks ties
     by hash.  The predicate matches the ``(created_at DESC, hash
     DESC)`` order exactly, so every message is returned once.
+
+    With ``apply_edits`` (the default) each message shows its latest
+    author-matching edit, marked ``edited``.  The feed handler passes
+    ``False``: a peer must receive the original, hash-valid text plus
+    the edit notices separately, or it could not verify what it stores.
     """
     name = clean_channel_name(channel)
     count = max(1, min(int(limit), MAX_CHANNEL_HISTORY))
@@ -934,6 +1391,7 @@ def channel_history_page(
         "NOT EXISTS (SELECT 1 FROM retractions r "
         "WHERE r.hash = messages.hash AND r.author = messages.author)"
     )
+
     rows = conn.execute(
         f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
         f"WHERE {' AND '.join(clauses)} "
@@ -941,7 +1399,10 @@ def channel_history_page(
         (*params, count + 1),
     ).fetchall()
     has_more = len(rows) > count
-    return [_row_to_message(row) for row in rows[:count]], has_more
+    messages = [_row_to_message(row) for row in rows[:count]]
+    if apply_edits:
+        messages = _apply_edits_to_messages(conn, messages)
+    return messages, has_more
 
 
 def channel_history(
@@ -1013,11 +1474,6 @@ def list_memberships(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
-
-
-# -- application layer -------------------------------------------------------
-
-
 class ChannelApp:
     """Serve and synchronise channel messages for a running :class:`TauNode`."""
 
@@ -1178,6 +1634,46 @@ class ChannelApp:
             self.publish(message, targets=targets, ttl=ttl)
         return message
 
+    def edit(
+        self,
+        channel: str,
+        target: str,
+        text: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Edit your own message in a joined channel, gossiping it when asked.
+
+        Editing requires membership, like sending.  The notice is
+        signed by this node's identity, so peers can verify it came
+        from the message's author.
+        """
+        name = clean_channel_name(channel)
+        conn = self.connect()
+        try:
+            if not is_member(conn, name):
+                raise ChannelError(
+                    f"not a member of channel {name!r}; join it first"
+                )
+            notice = create_edit(conn, self.identity, name, target, text)
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish_edit(notice, targets=targets, ttl=ttl)
+        return notice
+
+    def edits(
+        self, channel: str, *, limit: int = MAX_FEED_EDITS
+    ) -> List[Dict[str, Any]]:
+        """Stored edit notices for *channel*, newest first."""
+        conn = self.connect()
+        try:
+            return list_edits(conn, channel, limit=limit)
+        finally:
+            conn.close()
+
     def retract(
         self,
         channel: str,
@@ -1220,9 +1716,6 @@ class ChannelApp:
             )
         finally:
             conn.close()
-
-    # -- sync --------------------------------------------------------------
-
     def sync(
         self,
         node: Any,
@@ -1244,8 +1737,9 @@ class ChannelApp:
                 "peers": 0,
                 "stored": 0,
                 "duplicates": 0,
-                "skipped": 0,
+                "edited": 0,
                 "retracted": 0,
+                "skipped": 0,
                 "errors": [],
             }
 
@@ -1254,8 +1748,9 @@ class ChannelApp:
         conn = self.connect()
         stored = 0
         duplicates = 0
-        skipped = 0
+        edited = 0
         retracted = 0
+        skipped = 0
         errors: List[Dict[str, str]] = []
         try:
             for peer in peers:
@@ -1287,34 +1782,6 @@ class ChannelApp:
                         )
                         break
                     messages = response.get("messages")
-                    # Retract notices ride every page, independent of
-                    # the message page itself: a page with no messages
-                    # can still carry a retract for one already held.
-                    # Each entry is validated on its own, like messages.
-                    for raw in response.get("retractions") or []:
-                        if not isinstance(raw, dict):
-                            errors.append(
-                                {
-                                    "peer": getattr(peer, "hexhash", "?"),
-                                    "error": "retraction entry is not an object",
-                                }
-                            )
-                            continue
-                        if self._blocked(str(raw.get("author", ""))):
-                            skipped += 1
-                            continue
-                        try:
-                            _, is_new, _ = store_retraction(conn, raw)
-                        except (ChannelError, ProtocolError) as exc:
-                            errors.append(
-                                {
-                                    "peer": getattr(peer, "hexhash", "?"),
-                                    "error": str(exc),
-                                }
-                            )
-                            continue
-                        if is_new:
-                            retracted += 1
                     if not isinstance(messages, list) or not messages:
                         break
                     # Entries arrive from an untrusted peer: a bad one
@@ -1346,6 +1813,65 @@ class ChannelApp:
                             stored += 1
                         else:
                             duplicates += 1
+                    # Retract notices ride every page, independent of
+                    # the message page itself: a page with no messages
+                    # can still carry a retract for one already held.
+                    # Each entry is validated on its own, like messages.
+                    for raw in response.get("retractions") or []:
+                        if not isinstance(raw, dict):
+                            errors.append(
+                                {
+                                    "peer": getattr(peer, "hexhash", "?"),
+                                    "error": "retraction entry is not an object",
+                                }
+                            )
+                            continue
+                        if self._blocked(str(raw.get("author", ""))):
+                            skipped += 1
+                            continue
+                        try:
+                            _, is_new, _ = store_retraction(conn, raw)
+                        except (ChannelError, ProtocolError) as exc:
+                            errors.append(
+                                {
+                                    "peer": getattr(peer, "hexhash", "?"),
+                                    "error": str(exc),
+                                }
+                            )
+                            continue
+                        if is_new:
+                            retracted += 1
+                    # Edit notices travel with the feed: the newest
+                    # ones for this channel, applied on arrival so a
+                    # reader never sees text the author already fixed.
+                    # A notice for a message not stored yet is kept
+                    # as pending and applies when the message lands.
+                    notices = response.get("edits")
+                    if isinstance(notices, list):
+                        for raw in notices:
+                            if not isinstance(raw, dict):
+                                errors.append(
+                                    {
+                                        "peer": getattr(peer, "hexhash", "?"),
+                                        "error": "feed edit is not an object",
+                                    }
+                                )
+                                continue
+                            if self._blocked(str(raw.get("author", ""))):
+                                skipped += 1
+                                continue
+                            try:
+                                _, is_new = store_edit(conn, raw)
+                            except (ChannelError, ProtocolError) as exc:
+                                errors.append(
+                                    {
+                                        "peer": getattr(peer, "hexhash", "?"),
+                                        "error": str(exc),
+                                    }
+                                )
+                                continue
+                            if is_new:
+                                edited += 1
                     # Page backwards from the last message actually
                     # received — its (timestamp, hash) cursor, not the
                     # page length: a trimmed page can be short while
@@ -1384,8 +1910,9 @@ class ChannelApp:
             "peers": len(peers),
             "stored": stored,
             "duplicates": duplicates,
-            "skipped": skipped,
+            "edited": edited,
             "retracted": retracted,
+            "skipped": skipped,
             "errors": errors,
         }
 
@@ -1400,6 +1927,7 @@ class ChannelApp:
         """Pull history for every joined channel; return a per-channel summary."""
         summaries = {}
         total_stored = 0
+        total_edited = 0
         for membership in self.memberships():
             summary = self.sync(
                 node,
@@ -1410,7 +1938,8 @@ class ChannelApp:
             )
             summaries[membership["channel"]] = summary
             total_stored += summary["stored"]
-        return {"channels": summaries, "stored": total_stored}
+            total_edited += summary.get("edited", 0)
+        return {"channels": summaries, "stored": total_stored, "edited": total_edited}
 
     def publish(
         self,
@@ -1435,6 +1964,45 @@ class ChannelApp:
             peers = random.sample(peers, max(1, int(fanout)))
         payload = encode(
             {"message": message, "ttl": max(0, min(int(ttl), MAX_GOSSIP_TTL))},
+            max_bytes=MAX_REQUEST_BYTES,
+        )
+        delivered = 0
+        errors: List[Dict[str, str]] = []
+        for peer in peers:
+            try:
+                node.request(
+                    peer, CHANNEL_POST_PATH, payload, timeout=self.request_timeout
+                )
+                delivered += 1
+            except Exception as exc:
+                errors.append(
+                    {"peer": getattr(peer, "hexhash", "?"), "error": str(exc)}
+                )
+        return {"delivered": delivered, "peers": len(peers), "errors": errors}
+
+    def publish_edit(
+        self,
+        edit: Dict[str, Any],
+        *,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+        exclude: Optional[str] = None,
+        fanout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Push an edit notice to peers; return delivery counts."""
+        node = self.node
+        if node is None:
+            raise ChannelError("channels are not attached to a running node")
+        peers = list(targets) if targets is not None else list(node.registry.all())
+        peers = [
+            peer
+            for peer in peers
+            if getattr(peer, "hexhash", "") not in (self.author, exclude)
+        ]
+        if fanout is not None and len(peers) > max(1, int(fanout)):
+            peers = random.sample(peers, max(1, int(fanout)))
+        payload = encode(
+            {"edit": edit, "ttl": max(0, min(int(ttl), MAX_GOSSIP_TTL))},
             max_bytes=MAX_REQUEST_BYTES,
         )
         delivered = 0
@@ -1499,7 +2067,6 @@ class ChannelApp:
             return _author_from_identity(remote_identity)
         except Exception:  # pragma: no cover - defensive
             return None
-
     def _handle_feed(
         self,
         path: str,
@@ -1528,6 +2095,7 @@ class ChannelApp:
             excluded = self._blocked_authors()
             if excluded is None:
                 messages: List[Dict[str, Any]] = []
+                edits: List[Dict[str, Any]] = []
                 retractions: List[Dict[str, Any]] = []
                 has_more = False
             else:
@@ -1539,6 +2107,16 @@ class ChannelApp:
                         limit=limit,
                         before=before,
                         before_hash=before_hash,
+                        exclude_authors=excluded,
+                        # Serve the original, hash-verifiable text:
+                        # the requester overlays edits itself from
+                        # the notices below.
+                        apply_edits=False,
+                    )
+                    edits = list_edits(
+                        conn,
+                        channel,
+                        limit=MAX_FEED_EDITS,
                         exclude_authors=excluded,
                     )
                     # The channel's recent retract notices ride every
@@ -1558,24 +2136,31 @@ class ChannelApp:
             try:
                 return response_ok(
                     messages=messages,
+                    edits=edits,
                     retractions=retractions,
                     count=len(messages),
+                    edits_count=len(edits),
                     channel=channel,
                     has_more=has_more,
                 )
             except ProtocolError as exc:
+                if len(messages) <= 1 and not edits and not retractions:
+                    return response_error("feed_too_large", str(exc))
                 if len(messages) > 1:
                     messages = messages[:-1]
-                    # The page was shortened to fit: older messages still
-                    # exist past it, so say so instead of letting the
-                    # requester mistake a short page for the end.
+                    # The page was shortened to fit: older messages
+                    # still exist past it, so say so instead of
+                    # letting the requester mistake a short page for
+                    # the end.
                     has_more = True
+                    continue
+                if edits:
+                    edits = edits[:-1]
                     continue
                 if retractions:
                     retractions = retractions[:-1]
                     continue
                 return response_error("feed_too_large", str(exc))
-
     def _handle_post(
         self,
         path: str,
@@ -1587,16 +2172,63 @@ class ChannelApp:
         try:
             request = decode(data, max_bytes=MAX_REQUEST_BYTES)
             raw_message = request.get("message")
+            raw_edit = request.get("edit")
             raw_retraction = request.get("retraction")
-            if raw_message is None and raw_retraction is None:
-                raise ChannelError("a channel post needs a message or a retraction")
-            if raw_message is not None and raw_retraction is not None:
-                raise ChannelError("a channel post carries one message or one retraction")
+            present = [
+                part
+                for part in (raw_message, raw_edit, raw_retraction)
+                if part is not None
+            ]
+            if not present:
+                raise ChannelError(
+                    "a channel post needs a message, an edit or a retraction"
+                )
+            if len(present) > 1:
+                raise ChannelError(
+                    "a channel post carries one message, edit or retraction"
+                )
             ttl = request.get("ttl", 0)
             if isinstance(ttl, bool) or not isinstance(ttl, int):
                 ttl = 0
             ttl = max(0, min(ttl, MAX_GOSSIP_TTL))
+            if raw_edit is not None:
+                if not isinstance(raw_edit, dict):
+                    raise ChannelError("edit must be a JSON object")
+                verified = verify_edit(raw_edit)
+                if self._blocked(verified["author"]):
+                    log.info(
+                        "Channel edit from blocked %s dropped",
+                        verified["author"][:8],
+                    )
+                    return response_error(
+                        "not_admitted",
+                        "author is blocked on this node",
+                    )
+                conn = self.connect()
+                try:
+                    record, is_new = store_edit(conn, raw_edit)
+                finally:
+                    conn.close()
 
+                if is_new:
+                    log.info(
+                        "Channel #%s edit from %s for %s",
+                        record.get("channel", "?"),
+                        record.get("author", "")[:8],
+                        record.get("target", "")[:8],
+                    )
+                    if self.gossip and ttl > 0:
+                        self._spawn_edit_gossip(
+                            record,
+                            ttl=ttl - 1,
+                            exclude=self._caller_hash(remote_identity),
+                        )
+                return response_ok(
+                    stored=record["hash"],
+                    new=is_new,
+                    server=self.name,
+                    node=getattr(self.node, "destination_hexhash", None),
+                )
             if raw_retraction is not None:
                 return self._handle_retraction_post(raw_retraction, ttl, remote_identity)
 
@@ -1717,6 +2349,31 @@ class ChannelApp:
                 self._gossip_slots.release()
 
         threading.Thread(target=run, name="tau-channel-gossip", daemon=True).start()
+
+    def _spawn_edit_gossip(
+        self, edit: Dict[str, Any], *, ttl: int, exclude: Optional[str]
+    ) -> None:
+        if not self._gossip_slots.acquire(blocking=False):
+            log.debug("Skipping channel edit gossip: too many pending relays")
+            return
+
+        def run() -> None:
+            try:
+                if self.node is not None and not self._closed:
+                    self.publish_edit(
+                        edit,
+                        ttl=ttl,
+                        exclude=exclude,
+                        fanout=self.gossip_fanout,
+                    )
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Channel edit gossip failed", exc_info=True)
+            finally:
+                self._gossip_slots.release()
+
+        threading.Thread(
+            target=run, name="tau-channel-edit-gossip", daemon=True
+        ).start()
 
     def _spawn_retraction_gossip(
         self, notice: Dict[str, Any], *, ttl: int, exclude: Optional[str]

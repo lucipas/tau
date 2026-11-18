@@ -5019,6 +5019,36 @@ def test_channels_via_api(tmp_path):
         )
         assert status == 503
         assert "not enabled" in payload["error"]["message"]
+
+        # Editing validates its fields before touching the bridge...
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit",
+            method="POST",
+            body={"channel": "general", "text": "nope"},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit",
+            method="POST",
+            body={"channel": "general", "target": bob_message["hash"]},
+        )
+        assert status == 400
+        # ...and reports the same 503 when channels are not enabled.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit",
+            method="POST",
+            body={
+                "channel": "general",
+                "target": bob_message["hash"],
+                "text": "nope",
+            },
+        )
+        assert status == 503
+        assert "not enabled" in payload["error"]["message"]
+
         status, _, payload = _json(
             bridge, "/api/channels/sync", method="POST", body={}
         )
