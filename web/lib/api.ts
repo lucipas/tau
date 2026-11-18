@@ -958,6 +958,40 @@ export async function sendChannelMessage(channel: string, text: string): Promise
   return post("/api/channels/send", { channel, text });
 }
 
+export async function postChannelPoll(
+  channel: string,
+  question: string,
+  options: string[],
+): Promise<ChannelMessage> {
+  const data = await post<{ ok: boolean; message: ChannelMessage }>("/api/channels/poll", {
+    channel,
+    question,
+    options,
+  });
+  return data.message;
+}
+
+export async function voteChannelPoll(
+  channel: string,
+  poll: string,
+  option: number | string,
+): Promise<ChannelMessage> {
+  const data = await post<{ ok: boolean; message: ChannelMessage }>("/api/channels/vote", {
+    channel,
+    poll,
+    option,
+  });
+  return data.message;
+}
+
+export async function closeChannelPoll(channel: string, poll: string): Promise<ChannelMessage> {
+  const data = await post<{ ok: boolean; message: ChannelMessage }>("/api/channels/close-poll", {
+    channel,
+    poll,
+  });
+  return data.message;
+}
+
 /** Pull missing history for one channel, or every joined channel when omitted. */
 export async function syncChannels(channel?: string, limit = 20): Promise<unknown> {
   return post("/api/channels/sync", channel ? { channel, limit } : { limit });

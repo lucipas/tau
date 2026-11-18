@@ -613,6 +613,17 @@ export interface Channel {
   joined_at: number;
 }
 
+export interface ChannelPollTally {
+  options: string[];
+  counts: number[];
+  total: number;
+  closed: boolean;
+  voters: { author: string; name: string; option: number; voted_at: number }[];
+  my_vote: number | null;
+  /** True when this node authored the poll (so it may close it). */
+  own: boolean;
+}
+
 export interface ChannelMessage {
   v: number;
   hash: string;
@@ -624,6 +635,12 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Channel poll question carried on the message itself. */
+  poll_options?: string[];
+  poll_vote?: { target: { author: string; sent_at: number }; option: number };
+  poll_close?: { author: string; sent_at: number };
+  /** Channel poll tally, attached by the bridge from the channel store. */
+  poll?: ChannelPollTally;
 }
 
 // ---------------------------------------------------------------- pages --

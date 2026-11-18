@@ -4970,6 +4970,171 @@ def test_channels_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_polls_via_api(tmp_path):
+    from tau.channels import (
+        ChannelApp,
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+    from tau.protocol import APP_NAME, ASPECT
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    tester = RNS.Identity()
+    tester_hash = RNS.Destination.hash(tester, APP_NAME, ASPECT).hex()
+    node.destination_hexhash = tester_hash
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+    app = ChannelApp(node.config, tester, name="tester")
+    node.channel_app = app
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Posting needs 2-8 options.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/poll",
+            method="POST",
+            body={"channel": "general", "question": "q?", "options": ["only"]},
+        )
+        assert status == 400
+
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/poll",
+            method="POST",
+            body={
+                "channel": "general",
+                "question": "which day?",
+                "options": ["Saturday", "Sunday"],
+            },
+        )
+        assert status == 200
+        poll = payload["message"]
+        assert poll["poll_options"] == ["Saturday", "Sunday"]
+        assert poll["author"] == tester_hash
+
+        # A peer's vote, stored directly, counts in the tally — and
+        # the vote record itself never shows in the listing.
+        conn = init_channel_db(node.config.channels_db_path)
+        try:
+            create_message(
+                conn,
+                bob,
+                "general",
+                "voted: Sunday",
+                name="bob",
+                now=1001,
+                poll_vote={
+                    "target": {
+                        "author": poll["author"],
+                        "sent_at": poll["created_at"],
+                    },
+                    "option": 1,
+                },
+            )
+        finally:
+            conn.close()
+
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == ["which day?"]
+        shown = payload["messages"][0]
+        assert shown["poll"]["counts"] == [0, 1]
+        assert shown["poll"]["total"] == 1
+        assert shown["poll"]["closed"] is False
+        assert shown["poll"]["own"] is True
+
+        # Voting through the API moves the tally; a bad option is 400.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/vote",
+            method="POST",
+            body={"channel": "general", "poll": poll["hash"][:8], "option": "3"},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/vote",
+            method="POST",
+            body={"channel": "general", "poll": poll["hash"][:8], "option": 1},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert payload["messages"][0]["poll"]["counts"] == [1, 1]
+        assert payload["messages"][0]["poll"]["my_vote"] == 0
+
+        # Only the poll's creator can close it: a poll from alice
+        # refuses the close, then the own poll closes.
+        conn = init_channel_db(node.config.channels_db_path)
+        try:
+            alice_poll = create_message(
+                conn,
+                alice,
+                "general",
+                "alice asks?",
+                name="alice",
+                now=1002,
+                poll_options=["Yes", "No"],
+            )
+        finally:
+            conn.close()
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/close-poll",
+            method="POST",
+            body={"channel": "general", "poll": alice_poll["hash"]},
+        )
+        assert status == 400
+        assert "only the poll's creator" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/close-poll",
+            method="POST",
+            body={"channel": "general", "poll": poll["hash"]},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert payload["messages"][0]["poll"]["closed"] is True
+
+        # A closed poll takes no more votes.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/vote",
+            method="POST",
+            body={"channel": "general", "poll": poll["hash"], "option": 2},
+        )
+        assert status == 400
+        assert "closed" in payload["error"]["message"]
+
+        # An unknown poll hash is a 400, not a 500.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/vote",
+            method="POST",
+            body={"channel": "general", "poll": "f" * 8, "option": 1},
+        )
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
 def test_pages_via_api(tmp_path):
     from types import SimpleNamespace
 

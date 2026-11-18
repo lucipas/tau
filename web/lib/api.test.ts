@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   clearReaction,
+  closeChannelPoll,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
@@ -15,9 +16,11 @@ import {
   getTanTimeline,
   markRead,
   pageFileUrl,
+  postChannelPoll,
   reactToMessage,
   sendMessage,
   tanMediaUrl,
+  voteChannelPoll,
   voteTanPoll,
   wsUrl,
 } from "./api";
@@ -93,6 +96,33 @@ describe("GET endpoints", () => {
     nextJson = { channel: "general", messages: [], count: 0 };
     await getChannelMessages("my channel", 5);
     expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
+  });
+
+  it("posts a channel poll with question and options", async () => {
+    nextJson = { ok: true, message: { hash: "p".repeat(64) } };
+    const message = await postChannelPoll("general", "which day?", ["Saturday", "Sunday"]);
+    expect(captured[0].url).toBe("/api/channels/poll");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      channel: "general",
+      question: "which day?",
+      options: ["Saturday", "Sunday"],
+    });
+    expect(message.hash).toBe("p".repeat(64));
+  });
+
+  it("votes on a channel poll by index", async () => {
+    nextJson = { ok: true, message: { hash: "v".repeat(64) } };
+    await voteChannelPoll("general", "p".repeat(64), 1);
+    expect(captured[0].url).toBe("/api/channels/vote");
+    expect(bodyOf(0)).toEqual({ channel: "general", poll: "p".repeat(64), option: 1 });
+  });
+
+  it("closes a channel poll", async () => {
+    nextJson = { ok: true, message: { hash: "c".repeat(64) } };
+    await closeChannelPoll("general", "p".repeat(64));
+    expect(captured[0].url).toBe("/api/channels/close-poll");
+    expect(bodyOf(0)).toEqual({ channel: "general", poll: "p".repeat(64) });
   });
 });
 

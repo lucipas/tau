@@ -12,12 +12,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  closeChannelPoll,
   getChannelMessages,
   getChannels,
   joinChannel,
   leaveChannel,
+  postChannelPoll,
   sendChannelMessage,
   syncChannels,
+  voteChannelPoll,
 } from "./api";
 import type { Channel, ChannelMessage } from "./types";
 
@@ -33,6 +36,9 @@ export interface UseChannelsResult {
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
   send: (text: string) => Promise<ChannelMessage>;
+  poll: (question: string, options: string[]) => Promise<ChannelMessage>;
+  vote: (poll: string, option: number) => Promise<ChannelMessage>;
+  closePoll: (poll: string) => Promise<ChannelMessage>;
   sync: (channel?: string) => Promise<void>;
 }
 
@@ -111,6 +117,24 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       const sent = await sendChannelMessage(selected, text);
       await refreshMessages(selected);
       return sent;
+    },
+    poll: async (question, options) => {
+      if (!selected) throw new Error("no channel selected");
+      const posted = await postChannelPoll(selected, question, options);
+      await refreshMessages(selected);
+      return posted;
+    },
+    vote: async (poll, option) => {
+      if (!selected) throw new Error("no channel selected");
+      const cast = await voteChannelPoll(selected, poll, option);
+      await refreshMessages(selected);
+      return cast;
+    },
+    closePoll: async (poll) => {
+      if (!selected) throw new Error("no channel selected");
+      const closed = await closeChannelPoll(selected, poll);
+      await refreshMessages(selected);
+      return closed;
     },
     sync: async (channel) => {
       await syncChannels(channel ?? selected ?? undefined);

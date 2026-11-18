@@ -410,6 +410,9 @@ Global options may appear before or after the command:
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel |
+| `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
+| `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
+| `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
 

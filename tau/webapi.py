@@ -163,6 +163,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/poll  post a poll (``{"channel", "question", "options": [...]}``)
+    POST /api/channels/vote  vote on a poll (``{"channel", "poll", "option"}``)
+    POST /api/channels/close-poll  close a poll you created (``{"channel", "poll"}``)
     POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/pages       cached personal mesh pages, plus this node's own
     POST /api/pages/fetch fetch a peer's page over RNS (``{"peer": "<name or hash>"}``)
@@ -253,6 +256,16 @@ from .config import (
     send_read_receipts_enabled,
     set_node_setting,
     write_node_metadata,
+)
+from .channel_polls import (
+    attach_channel_poll_tallies,
+    channel_poll_tally,
+    clean_poll_options as clean_channel_poll_options,
+    is_channel_poll,
+    is_channel_poll_close,
+    is_channel_poll_vote,
+    poll_identity as channel_poll_identity,
+    resolve_channel_poll,
 )
 from .group_invites import list_join_requests
 from .groups import GroupStore, pinned_rosters, visible_reactions
@@ -3860,8 +3873,18 @@ class WebBridge:
     def channel_messages(
         self, channel: str, *, limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Stored messages for *channel*, newest first, minus blocked authors."""
-        from .channels import channel_history, clean_channel_name
+        """Stored messages for *channel*, newest first, minus blocked authors.
+
+        Vote and close records are hidden — they render on the poll
+        itself — and each poll carries its derived ``poll`` tally,
+        counted from the channel's full history so votes a page left
+        out still count.
+        """
+        from .channels import (
+            channel_history,
+            channel_messages_all,
+            clean_channel_name,
+        )
 
         name = clean_channel_name(channel)
         # One snapshot for every console surface: the node's cached
@@ -3872,15 +3895,32 @@ class WebBridge:
         conn = self._channel_conn()
         try:
             messages = channel_history(conn, name, limit=limit)
+            full = channel_messages_all(conn, name)
         finally:
             conn.close()
         if exclude_all:
             return []
-        return [
-            message
-            for message in messages
-            if str(message.get("author", "")) not in blocked
+        full = [
+            record
+            for record in full
+            if str(record.get("author", "")) not in blocked
         ]
+        attach_channel_poll_tallies(
+            full,
+            own_hash=getattr(self.node, "destination_hexhash", None),
+        )
+        by_hash = {str(record.get("hash")): record for record in full}
+        visible = []
+        for message in messages:
+            if str(message.get("author", "")) in blocked:
+                continue
+            if is_channel_poll_vote(message) or is_channel_poll_close(message):
+                continue
+            match = by_hash.get(str(message.get("hash")))
+            if match is not None and "poll" in match:
+                message["poll"] = match["poll"]
+            visible.append(message)
+        return visible
 
     def channel_join(self, channel: str) -> Dict[str, Any]:
         """Join *channel*, recording membership locally."""
@@ -3901,6 +3941,101 @@ class WebBridge:
                 "public channels are not enabled; run serve --channels"
             )
         return app.send(channel, text, publish=True)
+
+    def channel_poll(
+        self, channel: str, question: str, options: Any
+    ) -> Dict[str, Any]:
+        """Post a poll in a joined channel, gossiping it to peers."""
+        from .channels import clean_channel_name
+
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        name = clean_channel_name(channel)
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("field 'question' is required")
+        cleaned = clean_channel_poll_options(options)
+        return app.send(name, question, publish=True, poll_options=cleaned)
+
+    def channel_vote(
+        self, channel: str, poll: str, option: Any
+    ) -> Dict[str, Any]:
+        """Vote on a channel poll: *option* is a 1-based number or exact text."""
+        from .channels import clean_channel_name
+
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        name = clean_channel_name(channel)
+        if not isinstance(poll, str) or not poll.strip():
+            raise ValueError("field 'poll' is required")
+        history = app.all_history(name)
+        record = resolve_channel_poll(history, poll)
+        own_hash = getattr(self.node, "destination_hexhash", None)
+        tally = channel_poll_tally(history, record, own_hash=own_hash)
+        if tally["closed"]:
+            raise ValueError("this poll is closed")
+        options = tally["options"]
+        choice = str(option).strip() if option is not None else ""
+        index: Optional[int] = None
+        if choice.isdigit():
+            index = int(choice) - 1
+        else:
+            for position, text in enumerate(options):
+                if text == choice:
+                    index = position
+                    break
+        if index is None or not 0 <= index < len(options):
+            raise ValueError(
+                "option must be a number 1-"
+                f"{len(options)} or one of: {', '.join(options)}"
+            )
+        identity = channel_poll_identity(record)
+        if identity is None:
+            raise ValueError("this poll has no usable identity")
+        return app.send(
+            name,
+            f"voted: {options[index]}",
+            publish=True,
+            poll_vote={
+                "target": {"author": identity[0], "sent_at": identity[1]},
+                "option": index,
+            },
+        )
+
+    def channel_close_poll(self, channel: str, poll: str) -> Dict[str, Any]:
+        """Close a channel poll this node created, freezing the tally."""
+        from .channels import clean_channel_name
+
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        name = clean_channel_name(channel)
+        if not isinstance(poll, str) or not poll.strip():
+            raise ValueError("field 'poll' is required")
+        history = app.all_history(name)
+        record = resolve_channel_poll(history, poll)
+        own_hash = getattr(self.node, "destination_hexhash", None)
+        identity = channel_poll_identity(record)
+        if identity is None:
+            raise ValueError("this poll has no usable identity")
+        if own_hash is None or identity[0] != own_hash.lower():
+            raise ValueError("only the poll's creator can close it")
+        tally = channel_poll_tally(history, record, own_hash=own_hash)
+        if tally["closed"]:
+            raise ValueError("this poll is already closed")
+        return app.send(
+            name,
+            "closed the poll",
+            publish=True,
+            poll_close={"author": identity[0], "sent_at": identity[1]},
+        )
 
     def channel_sync(
         self, channel: Optional[str] = None, *, limit: int = 20
@@ -11810,6 +11945,103 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     message = self.bridge.channel_send(channel, text)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/poll":
+                channel = body.get("channel")
+                question = body.get("question")
+                options = body.get("options")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(question, str) or not question.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'question' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(options, list):
+                    self._send_json(
+                        {"error": {"message": "field 'options' must be a list"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    message = self.bridge.channel_poll(channel, question, options)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/vote":
+                channel = body.get("channel")
+                poll = body.get("poll")
+                option = body.get("option")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(poll, str) or not poll.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'poll' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if option is None or (isinstance(option, str) and not option.strip()):
+                    self._send_json(
+                        {"error": {"message": "field 'option' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    message = self.bridge.channel_vote(channel, poll, option)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/close-poll":
+                channel = body.get("channel")
+                poll = body.get("poll")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(poll, str) or not poll.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'poll' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    message = self.bridge.channel_close_poll(channel, poll)
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
