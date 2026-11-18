@@ -260,13 +260,13 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
             # plain chat rather than dropping the message.
             kind = DEFAULT_MESSAGE_KIND
         record["kind"] = kind
-    if record["kind"] == "group":
-        # A group poll, vote, or close rides on the record itself so
-        # the tally derives from stored history; a malformed field
-        # drops instead of the record — the message still reads as
-        # plain chat.  Only one poll field is ever set (the wire
-        # forbids more); a hand-edited record carrying several keeps
-        # none of them.
+    if record["kind"] in ("group", "chat"):
+        # A group or DM poll, vote, or close rides on the record
+        # itself so the tally derives from stored history; a
+        # malformed field drops instead of the record — the message
+        # still reads as plain chat.  Only one poll field is ever
+        # set (the wire forbids more); a hand-edited record carrying
+        # several keeps none of them.
         poll_options = _clean_group_poll_options_or_none(
             raw.get("poll_options")
         )

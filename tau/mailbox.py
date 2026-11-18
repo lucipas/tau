@@ -1403,7 +1403,7 @@ class Mailbox:
         rewind it.
 
         ``poll_options`` / ``poll_vote`` / ``poll_close`` mark this
-        leg as one of a group poll: a retry re-sends the same poll
+        entry as one of a group or DM poll: a retry re-sends the same poll
         payload instead of plain chat.  At most one may be set.
         """
         if sum(

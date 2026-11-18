@@ -118,9 +118,14 @@ from .group_invites import (
 from .groups import GroupStore, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
+    attach_dm_poll_tallies,
     attach_group_poll_tallies,
     clean_poll_options,
+    dm_poll_tally,
     group_poll_tally,
+    is_dm_poll,
+    is_dm_poll_close,
+    is_dm_poll_vote,
     is_group_poll,
     is_group_poll_close,
     is_group_poll_vote,
@@ -586,6 +591,13 @@ def build_parser() -> argparse.ArgumentParser:
         "message is tagged location unless --kind says otherwise",
     )
     send.add_argument(
+        "--poll-options",
+        nargs="+",
+        default=None,
+        metavar="OPTION",
+        help="post the message as a poll question with 2-8 options",
+    )
+    send.add_argument(
         "--wait",
         type=float,
         default=None,
@@ -828,6 +840,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     retract.set_defaults(func=cmd_retract)
+
+    vote = subparsers.add_parser(
+        "vote",
+        parents=[common],
+        help="vote on a DM poll (option number or exact option text)",
+    )
+    vote.add_argument(
+        "--to",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    vote.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message id or unique prefix (see `tau messages`)",
+    )
+    vote.add_argument(
+        "option",
+        metavar="OPTION",
+        help="option number (1-based) or the exact option text",
+    )
+    vote.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    vote.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the vote when the peer is offline",
+    )
+    vote.set_defaults(func=cmd_vote)
+
+    close_poll = subparsers.add_parser(
+        "close-poll",
+        parents=[common],
+        help="close a DM poll you created (freezes the tally)",
+    )
+    close_poll.add_argument(
+        "--to",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    close_poll.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message id or unique prefix (see `tau messages`)",
+    )
+    close_poll.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    close_poll.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the close when the peer is offline",
+    )
+    close_poll.set_defaults(func=cmd_close_poll)
 
     edit = subparsers.add_parser(
         "edit",
@@ -9767,6 +9832,9 @@ def _send_local_message(
     location: Optional[Dict[str, Any]] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Send one DM on the running node, for the local send server.
 
@@ -9795,6 +9863,9 @@ def _send_local_message(
         kind=kind,
         location=location,
         send_after=send_after,
+        poll_options=poll_options,
+        poll_vote=poll_vote,
+        poll_close=poll_close,
     )
     result = _finalize_send_result(
         response, target=target, expires_at=expires_at, queued_before=queued_before
@@ -10138,6 +10209,9 @@ def _send_via_local_node(
     wait: float = 0.0,
     send_after: Optional[float] = None,
     location: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
     timeout = float(getattr(args, "timeout", 20.0))
@@ -10184,6 +10258,9 @@ def _send_via_local_node(
                     kind=kind,
                     location=location,
                     send_after=send_after,
+                    poll_options=poll_options,
+                    poll_vote=poll_vote,
+                    poll_close=poll_close,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 log.debug(
@@ -10244,6 +10321,9 @@ def _send_via_running_node(
     wait: float = 0.0,
     send_after: Optional[float] = None,
     location: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Send through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -10275,6 +10355,9 @@ def _send_via_running_node(
                 location=location,
                 wait=wait,
                 send_after=send_after,
+                poll_options=poll_options,
+                poll_vote=poll_vote,
+                poll_close=poll_close,
             )
         except LocalIPCUnavailable as exc:
             raise NodeError(
@@ -10717,6 +10800,13 @@ def cmd_send(args: argparse.Namespace) -> int:
     if wait_given and getattr(args, "no_queue", False):
         print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
         return 2
+    poll_options = None
+    if getattr(args, "poll_options", None):
+        try:
+            poll_options = clean_poll_options(list(args.poll_options))
+        except PostError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     # Validate the pin before reading the message, so an invalid
     # --location fails at once instead of blocking on stdin.
     location = _location_from_args(args)
@@ -10778,12 +10868,14 @@ def cmd_send(args: argparse.Namespace) -> int:
         results = _send_via_running_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after, location=location,
+            poll_options=poll_options,
         )
     else:
         log.info("sending via a local one-shot node")
         results = _send_via_local_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after, location=location,
+            poll_options=poll_options,
         )
 
     failed = [result for result in results if not result.get("ok", True)]
@@ -11479,6 +11571,47 @@ def _attach_group_poll_tallies(
             entry["poll"] = match["poll"]
 
 
+def _attach_dm_poll_tallies(
+    inbox: Inbox,
+    entries: List[Dict[str, Any]],
+    own_hash: Optional[str],
+) -> None:
+    """Attach a ``poll`` tally to each DM-poll record in *entries*.
+
+    The tally derives from the conversation's full stored history —
+    votes a filter left out of *entries* (read votes under
+    ``--unread``, say) still count — so the history is re-read per
+    peer involved.  Entries are the copies
+    :meth:`Inbox.list_messages` returns, so attaching here never
+    touches the stored records.
+    """
+    peer_hashes = {
+        str(entry.get("destination"))
+        for entry in entries
+        if entry.get("kind") != "group" and entry.get("destination")
+    }
+    if not peer_hashes:
+        return
+    history: List[Dict[str, Any]] = []
+    for peer_hash in sorted(peer_hashes):
+        history.extend(
+            inbox.list_messages(limit=None, peer=peer_hash, direction=None)
+        )
+    attach_dm_poll_tallies(history, own_hash=own_hash)
+    by_id = {
+        (str(item.get("destination")), str(item.get("id"))): item
+        for item in history
+    }
+    for entry in entries:
+        if not is_dm_poll(entry):
+            continue
+        match = by_id.get(
+            (str(entry.get("destination")), str(entry.get("id")))
+        )
+        if match is not None and "poll" in match:
+            entry["poll"] = match["poll"]
+
+
 def _own_destination_hash(config: TauConfig) -> Optional[str]:
     """This node's destination hash, or ``None`` without an identity."""
     identity = load_identity(config.identity_path)
@@ -11670,7 +11803,7 @@ def _print_message_entry(
                 print(f"  live beacon · update {beacon['seq']} · expired")
     poll = entry.get("poll")
     if isinstance(poll, dict) and poll.get("options"):
-        # A group poll renders its tally under the question, like a
+        # A group or DM poll renders its tally under the question, like a
         # Tan poll: one line per option with its vote count, plus the
         # total and the closed state.  Votes and closes themselves are
         # never printed as messages (see cmd_messages).
@@ -11955,6 +12088,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
     _attach_group_poll_tallies(
         inbox, entries, _own_destination_hash(config)
     )
+    _attach_dm_poll_tallies(
+        inbox, entries, _own_destination_hash(config)
+    )
     shown = entries if limit is None else entries[:limit]
     omitted = entries[len(shown):]
     # Unread mail the window omitted: reported, never silently cleared.
@@ -11994,6 +12130,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             for entry in shown
             if not is_group_poll_vote(entry)
             and not is_group_poll_close(entry)
+            and not is_dm_poll_vote(entry)
+            and not is_dm_poll_close(entry)
         ]
         for entry in printable:
             _print_message_entry(
@@ -12228,6 +12366,7 @@ def cmd_pinned(args: argparse.Namespace) -> int:
     else:
         own_hash = _own_destination_hash(config)
         _attach_group_poll_tallies(inbox, shown, own_hash)
+        _attach_dm_poll_tallies(inbox, shown, own_hash)
         for entry in shown:
             _print_message_entry(
                 inbox, registry, entry, blocked=blocked, own_hash=own_hash
@@ -14379,6 +14518,245 @@ def _group_poll_history(
 ) -> List[Dict[str, Any]]:
     """This group's stored messages, for tallying one of its polls."""
     return inbox.list_messages(limit=None, group=group_id, direction=None)
+
+
+def _resolve_dm_poll(
+    inbox: Inbox, ref: str, peer_hash: str
+) -> Dict[str, Any]:
+    """Resolve ``tau vote`` / ``close-poll`` to one stored DM poll.
+
+    Same scoping as :func:`_resolve_group_poll` but for a DM
+    conversation: the reference (a message id or unique prefix, as
+    shown by ``tau messages``) must match exactly one stored poll
+    record with this peer.  A vote or close record never resolves
+    — only the poll itself can be voted on or closed.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("poll must not be empty")
+    matches = [
+        item
+        for item in inbox.find_prefix(ref, peer=peer_hash)
+        if is_dm_poll(item)
+    ]
+    exact = [m for m in matches if str(m["id"]) == ref]
+    if not exact:
+        folded = ref.lower()
+        exact = [m for m in matches if str(m["id"]).lower() == folded]
+    if exact:
+        matches = exact
+    if len(matches) > 1:
+        raise NodeError(
+            f"{len(matches)} polls with this peer match {ref!r};"
+            " use a longer prefix"
+        )
+    if not matches:
+        raise NodeError(
+            f"no poll {ref!r} with this peer;"
+            " votes name a poll from this conversation's history"
+        )
+    return matches[0]
+
+
+def _dm_poll_history(inbox: Inbox, peer_hash: str) -> List[Dict[str, Any]]:
+    """This conversation's stored messages, for tallying one of its polls."""
+    return inbox.list_messages(limit=None, peer=peer_hash, direction=None)
+
+
+def _send_dm_poll_message(
+    args: argparse.Namespace,
+    config: TauConfig,
+    peer: str,
+    text: str,
+    *,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Send one DM poll vote or close, like ``cmd_send``.
+
+    Votes and closes carry no expiry, schedule, quote, or wait —
+    the same two routes as a plain DM send (the serving node, else
+    a one-shot local node) with the poll payload attached.
+    """
+    if _send_routes_via_running_node(config):
+        results = _send_via_running_node(
+            args,
+            config,
+            text,
+            [peer],
+            expires_at=None,
+            reply_ids={},
+            wait=0.0,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+    else:
+        results = _send_via_local_node(
+            args,
+            config,
+            text,
+            [peer],
+            expires_at=None,
+            reply_ids={},
+            wait=0.0,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+    return {"results": results}
+
+
+def _report_dm_poll_send(
+    args: argparse.Namespace,
+    response: Dict[str, Any],
+    summary: str,
+) -> int:
+    """Report a DM poll vote/close send, like ``cmd_send`` does."""
+    results = response.get("results") or []
+    # A direct delivery keeps no "delivered" key — the single-recipient
+    # send shape carries "ok" instead (see _finalize_send_result) — so
+    # delivered is "ok" and not queued and not explicitly undelivered,
+    # the same rule cmd_send reports by.
+    failed = [
+        result
+        for result in results
+        if not result.get("ok", True) or result.get("delivered") is False
+    ]
+    if _json_mode(args):
+        _emit(response, True)
+        return _EXIT_ERROR if failed else _EXIT_OK
+    print(summary)
+    for result in results:
+        name = result.get("target") or (result.get("to") or "")[:8]
+        if result.get("queued"):
+            print(f"queued for {name} — they are unreachable right now")
+        elif result.get("ok", True) and result.get("delivered") is not False:
+            print(f"delivered to {name}")
+        else:
+            print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+    return _EXIT_ERROR if failed else _EXIT_OK
+
+
+def cmd_vote(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.to, direction=None
+        )
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        poll = _resolve_dm_poll(inbox, args.poll, peer_hash)
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    history = _dm_poll_history(inbox, peer_hash)
+    own_hash = _own_destination_hash(config)
+    tally = dm_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is closed", file=sys.stderr)
+        return 2
+    options = tally["options"]
+    choice = str(args.option).strip()
+    index: Optional[int] = None
+    if choice.isdigit():
+        index = int(choice) - 1
+    else:
+        for position, option in enumerate(options):
+            if option == choice:
+                index = position
+                break
+    if index is None or not 0 <= index < len(options):
+        print(
+            "error: option must be a number 1-"
+            f"{len(options)} or one of: {', '.join(options)}",
+            file=sys.stderr,
+        )
+        return 2
+    identity = poll_identity(poll, own_hash)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        response = _send_dm_poll_message(
+            args,
+            config,
+            args.to,
+            f"voted: {options[index]}",
+            poll_vote={
+                "target": {"author": identity[0], "sent_at": identity[1]},
+                "option": index,
+            },
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    summary = (
+        f"voted for {options[index]!r} on {poll.get('text')!r}"
+        f" with {name}"
+    )
+    return _report_dm_poll_send(args, response, summary)
+
+
+def cmd_close_poll(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.to, direction=None
+        )
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        poll = _resolve_dm_poll(inbox, args.poll, peer_hash)
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    own_hash = _own_destination_hash(config)
+    identity = poll_identity(poll, own_hash)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    if own_hash is None or identity[0] != own_hash.lower():
+        print(
+            "error: only the poll's creator can close it",
+            file=sys.stderr,
+        )
+        return 2
+    history = _dm_poll_history(inbox, peer_hash)
+    tally = dm_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is already closed", file=sys.stderr)
+        return 2
+    try:
+        response = _send_dm_poll_message(
+            args,
+            config,
+            args.to,
+            "closed the poll",
+            poll_close={"author": identity[0], "sent_at": identity[1]},
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    summary = f"closed the poll {poll.get('text')!r} with {name}"
+    return _report_dm_poll_send(args, response, summary)
 
 
 def cmd_group_poll(args: argparse.Namespace) -> int:
