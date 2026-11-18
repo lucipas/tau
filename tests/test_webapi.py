@@ -4986,6 +4986,16 @@ def test_channels_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/channels/messages")
         assert status == 400
 
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=hello")
+        assert status == 200
+        assert payload["query"] == "hello"
+        assert [item["text"] for item in payload["messages"]] == ["hello channels"]
+
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general")
+        assert status == 400
+        status, _, payload = _json(bridge, "/api/channels/search?q=hello")
+        assert status == 400
+
         # A blocked author is hidden, like the timeline hides their posts.
         node.blocklist = SimpleNamespace(
             blocked=frozenset({bob_message["author"]}), block_all=False
@@ -4993,8 +5003,14 @@ def test_channels_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
         assert status == 200
         assert [item["text"] for item in payload["messages"]] == ["from tester"]
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=hello")
+        assert status == 200
+        assert payload["messages"] == []
         node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
         status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert payload["messages"] == []
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=tester")
         assert status == 200
         assert payload["messages"] == []
         node.blocklist = None

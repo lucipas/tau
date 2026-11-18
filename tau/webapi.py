@@ -162,6 +162,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/import   import an export document (every entry verified)
     GET  /api/channels     joined channels, most recently joined first
     GET  /api/channels/messages  stored messages for a channel (``?channel=<name>&limit=20``)
+    GET  /api/channels/search  stored messages in a channel matching a keyword (``?channel=<name>&q=<text>&limit=20``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
@@ -3912,6 +3913,30 @@ class WebBridge:
                 grouped.get(str(message.get("hash", "")), [])
             )
         return visible
+
+    def channel_search(
+        self, channel: str, query: str, *, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Stored messages in *channel* matching *query*, newest first, minus blocked authors."""
+        from .channels import clean_channel_name, search_channel_messages
+
+        name = clean_channel_name(channel)
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query 'q' is required")
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        if exclude_all:
+            return []
+        conn = self._channel_conn()
+        try:
+            return search_channel_messages(
+                conn, name, query, limit=limit, exclude_authors=blocked
+            )
+        finally:
+            conn.close()
 
     def channel_join(self, channel: str) -> Dict[str, Any]:
         """Join *channel*, recording membership locally."""
@@ -10680,6 +10705,39 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(
                     {"channel": channel, "messages": messages, "count": len(messages)},
+                    head_only,
+                )
+                return
+            if path == "/api/channels/search":
+                channel = query.get("channel", [None])[0]
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "query 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                q = query.get("q", [None])[0]
+                if not isinstance(q, str) or not q.strip():
+                    self._send_json(
+                        {"error": {"message": "query 'q' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                limit = _int_param(query, "limit", default=20, minimum=1, maximum=50)
+                try:
+                    messages = self.bridge.channel_search(channel, q, limit=limit)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(
+                    {
+                        "channel": channel,
+                        "query": q.strip(),
+                        "messages": messages,
+                        "count": len(messages),
+                    },
                     head_only,
                 )
                 return

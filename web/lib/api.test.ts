@@ -18,6 +18,7 @@ import {
   reactToChannelMessage,
   reactToMessage,
   closeDmPoll,
+  searchChannelMessages,
   sendChannelMessage,
   sendMessage,
   tanMediaUrl,
@@ -97,6 +98,14 @@ describe("GET endpoints", () => {
     nextJson = { channel: "general", messages: [], count: 0 };
     await getChannelMessages("my channel", 5);
     expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
+  });
+
+  it("builds the channel search query", async () => {
+    nextJson = { channel: "general", query: "hello", messages: [], count: 0 };
+    await searchChannelMessages("my channel", "hello world", 5);
+    expect(captured[0].url).toBe(
+      "/api/channels/search?channel=my%20channel&q=hello%20world&limit=5",
+    );
   });
 
   it("reacts to a channel message by hash", async () => {

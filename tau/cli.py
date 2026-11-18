@@ -3964,6 +3964,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_read.set_defaults(func=cmd_channel_read)
 
+    channel_search = channel_sub.add_parser(
+        "search",
+        parents=[common],
+        help="search stored messages in a channel by keyword, newest first",
+    )
+    channel_search.add_argument("channel", metavar="NAME", help="channel to search")
+    channel_search.add_argument("query", metavar="TEXT", help="text to search for")
+    channel_search.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_CHANNEL_LIMIT,
+        metavar="N",
+        help="show the newest N matches (default 20)",
+    )
+    channel_search.set_defaults(func=cmd_channel_search)
+
     channel_edit = channel_sub.add_parser(
         "edit",
         parents=[common],
@@ -8330,6 +8346,51 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_channel_search(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    query = str(getattr(args, "query", "") or "")
+    if not query.strip():
+        print("error: search text must not be empty", file=sys.stderr)
+        return 2
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    blocked = load_blocked_set(config.blocklist_path)
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    if blocked is None:
+        # The block-list failed closed: hide everything, like the
+        # timeline does, instead of showing messages we cannot vet.
+        messages = []
+    else:
+        messages = app.search(
+            name,
+            query,
+            limit=int(getattr(args, "limit", DEFAULT_CHANNEL_LIMIT)),
+            exclude_authors=blocked,
+        )
+    # Search results stay newest first, like `tan search`: the most
+    # recent match is the one the reader usually wants.
+    if json_output:
+        _emit(
+            {
+                "channel": name,
+                "query": query.strip(),
+                "messages": messages,
+                "count": len(messages),
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not messages:
+        print(f"No messages in #{name} matching {query.strip()!r}.")
+        return _EXIT_OK
+    _print_channel_messages(messages, json_output=False, channel=name)
+    return _EXIT_OK
+
+
 def cmd_channel_edit(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
@@ -8427,6 +8488,8 @@ def cmd_channel_edits(args: argparse.Namespace) -> int:
         for line in str(edit.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
+
+
 def cmd_channel_sync(args: argparse.Namespace) -> int:
     config = _make_config(args)
     identity = load_or_create_identity(config.identity_path)
