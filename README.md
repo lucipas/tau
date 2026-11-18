@@ -406,6 +406,7 @@ Global options may appear before or after the command:
 | `tau channel list` | List joined channels with cached message counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
+| `tau channel search NAME TEXT` | Search stored messages in a channel by keyword, newest first |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
 
 Useful flags:

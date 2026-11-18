@@ -612,6 +612,55 @@ def channel_history(
     return messages
 
 
+def search_channel_messages(
+    conn: sqlite3.Connection,
+    channel: str,
+    query: str,
+    *,
+    limit: int = DEFAULT_CHANNEL_LIMIT,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Search stored messages in *channel* by keyword, newest first.
+
+    The match is a case-insensitive substring search over the stored
+    message text, with ``casefold`` on both sides, so it folds Unicode
+    case (``Ä`` matches ``ä``) — the same promise ``tan search`` makes.
+    The match runs in Python rather than as a SQL ``LIKE``: SQLite's
+    ``LIKE`` folds ASCII case only, so a ``LIKE`` query would miss
+    exactly the Unicode matches this promises.  The scan is over one
+    channel's stored messages only, which the store prunes to a small
+    cap, and it reads only the local store: it makes no network
+    requests.
+
+    *exclude_authors* hides messages from those authors, the same way
+    history hides them; an empty query raises :class:`ChannelError`.
+    """
+    if not isinstance(query, str) or not query.strip():
+        raise ChannelError("search text must not be empty")
+    name = clean_channel_name(channel)
+    count = max(1, min(int(limit), MAX_CHANNEL_HISTORY))
+    needle = query.strip().casefold()
+    clauses = ["channel = ?"]
+    params: List[Any] = [name]
+    excluded = [author for author in (exclude_authors or []) if author]
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(f"author NOT IN ({placeholders})")
+        params.extend(excluded)
+    rows = conn.execute(
+        f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at DESC, hash DESC",
+        params,
+    ).fetchall()
+    matches = [
+        _row_to_message(row)
+        for row in rows
+        if needle in str(row["text"]).casefold()
+    ]
+    return matches[:count]
+
+
 def join_channel(conn: sqlite3.Connection, channel: str) -> Dict[str, Any]:
     """Record membership in *channel*; joining twice is a no-op."""
     name = clean_channel_name(channel)
@@ -794,6 +843,23 @@ class ChannelApp:
         conn = self.connect()
         try:
             return channel_history(conn, channel, limit=limit, before=before)
+        finally:
+            conn.close()
+
+    def search(
+        self,
+        channel: str,
+        query: str,
+        *,
+        limit: int = DEFAULT_CHANNEL_LIMIT,
+        exclude_authors: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Stored messages in *channel* matching *query*, newest first."""
+        conn = self.connect()
+        try:
+            return search_channel_messages(
+                conn, channel, query, limit=limit, exclude_authors=exclude_authors
+            )
         finally:
             conn.close()
 

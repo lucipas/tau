@@ -23,6 +23,7 @@ from tau.channels import (
     join_channel,
     leave_channel,
     list_memberships,
+    search_channel_messages,
     store_message,
     verify_message,
 )
@@ -127,6 +128,51 @@ def test_history_orders_newest_first_and_pages_by_before(identities, tmp_path):
     older = channel_history(conn, "general", limit=2, before=page[-1]["created_at"])
     assert [item["text"] for item in older] == ["one"]
     assert [item["text"] for item in channel_history(conn, "other")] == ["elsewhere"]
+
+
+def test_search_matches_substring_case_insensitively(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "the bridge is up", name="alice", now=1000)
+    create_message(conn, alice, "general", "BRIDGE repairs tonight", name="alice", now=1001)
+    create_message(conn, alice, "general", "Äpfel und Brötchen", name="alice", now=1002)
+    create_message(conn, alice, "general", "unrelated", name="alice", now=1003)
+    create_message(conn, alice, "other", "bridge in another channel", name="alice", now=1004)
+
+    assert [
+        item["text"] for item in search_channel_messages(conn, "general", "bridge")
+    ] == ["BRIDGE repairs tonight", "the bridge is up"]
+    assert [
+        item["text"] for item in search_channel_messages(conn, "general", "äpfel")
+    ] == ["Äpfel und Brötchen"]
+    assert search_channel_messages(conn, "general", "nope") == []
+
+
+def test_search_respects_limit_and_excluded_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "mesh one", name="alice", now=1000)
+    create_message(conn, bob, "general", "mesh two", name="bob", now=1001)
+    create_message(conn, alice, "general", "mesh three", name="alice", now=1002)
+
+    assert [
+        item["text"]
+        for item in search_channel_messages(conn, "general", "mesh", limit=2)
+    ] == ["mesh three", "mesh two"]
+    assert [
+        item["text"]
+        for item in search_channel_messages(
+            conn, "general", "mesh", exclude_authors=[author_of(bob)]
+        )
+    ] == ["mesh three", "mesh one"]
+
+
+def test_search_rejects_empty_query(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "hello", name="alice", now=1000)
+    with pytest.raises(ChannelError, match="must not be empty"):
+        search_channel_messages(conn, "general", "   ")
 
 
 # -- membership --------------------------------------------------------------
@@ -729,6 +775,61 @@ def test_cli_join_send_read_list(tmp_path, capsys):
         assert len(channel_history(conn, "general")) == 1
     finally:
         conn.close()
+
+
+def test_cli_search_finds_matches_newest_first(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    for text in ("the bridge is up", "bridge repairs tonight", "unrelated"):
+        assert (
+            main(
+                [
+                    "channel",
+                    "send",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "general",
+                    text,
+                ]
+            )
+            == 0
+        )
+
+    assert main(["channel", "search", "--data-dir", str(data_dir), "general", "bridge"]) == 0
+    out = capsys.readouterr().out
+    assert "unrelated" not in out
+    assert out.index("bridge repairs tonight") < out.index("the bridge is up")
+
+    assert (
+        main(
+            [
+                "channel",
+                "search",
+                "--json",
+                "--data-dir",
+                str(data_dir),
+                "general",
+                "bridge",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["query"] == "bridge"
+    assert [item["text"] for item in payload["messages"]] == [
+        "bridge repairs tonight",
+        "the bridge is up",
+    ]
+
+    assert main(["channel", "search", "--data-dir", str(data_dir), "general", "nope"]) == 0
+    assert "No messages in #general matching 'nope'." in capsys.readouterr().out
+
+    assert main(["channel", "search", "--data-dir", str(data_dir), "general", "   "]) == 2
+    assert "must not be empty" in capsys.readouterr().err
 
 
 def test_cli_send_without_join_fails(tmp_path, capsys):

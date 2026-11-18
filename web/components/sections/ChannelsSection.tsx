@@ -1,5 +1,5 @@
 // ChannelsSection.tsx — public channels: join / leave, per-channel
-// message history with a composer, and sync. Built on useChannels
+// message history with a composer, search, and sync. Built on useChannels
 // (web/lib/use-channels.ts).
 
 "use client";
@@ -13,9 +13,11 @@ export default function ChannelsSection() {
   const channels = useChannels(30_000);
   const [joinName, setJoinName] = useState("");
   const [text, setText] = useState("");
+  const [searchText, setSearchText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [searching, setSearching] = useState(false);
 
   const selectedChannel = channels.channels.find((c) => c.channel === channels.selected);
 
@@ -60,8 +62,32 @@ export default function ChannelsSection() {
     }
   }
 
+  async function handleSearch(e: React.FormEvent) {
+    e.preventDefault();
+    const query = searchText.trim();
+    if (!query || !channels.selected) return;
+    setSearching(true);
+    setError(null);
+    try {
+      await channels.search(query);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function handleClearSearch() {
+    setSearchText("");
+    channels.clearSearch();
+  }
+
   // History arrives newest-first; show it oldest-first like a chat log.
-  const messages = [...channels.messages].reverse();
+  // Search matches stay newest-first: the most recent match first.
+  const showingSearch = channels.searchResults !== null;
+  const messages = showingSearch
+    ? channels.searchResults!
+    : [...channels.messages].reverse();
 
   return (
     <div className="mx-auto w-full max-w-[600px]">
@@ -164,10 +190,52 @@ export default function ChannelsSection() {
             </div>
           </div>
 
+          <form
+            onSubmit={handleSearch}
+            className="flex gap-2 border-b border-zinc-800 px-3 py-2 sm:px-4"
+          >
+            <input
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              placeholder={`Search #${channels.selected}`}
+              aria-label={`Search #${channels.selected}`}
+              disabled={searching}
+              className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={searching || !searchText.trim()}
+              className="shrink-0 rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+            >
+              {searching ? "…" : "Search"}
+            </button>
+            {channels.searchResults !== null && (
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                className="shrink-0 rounded-full border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-900"
+              >
+                Clear
+              </button>
+            )}
+          </form>
+          {channels.searchResults !== null && (
+            <p className="border-b border-zinc-800 px-4 py-2 text-xs text-zinc-500">
+              {channels.searchResults.length} match
+              {channels.searchResults.length === 1 ? "" : "es"} for &ldquo;
+              {channels.searchQuery}&rdquo; — newest first.
+            </p>
+          )}
+
           <div className="px-3 py-2 sm:px-4">
-            {messages.length === 0 && (
+            {messages.length === 0 && !showingSearch && (
               <p className="py-6 text-center text-sm text-zinc-500">
                 No messages in this channel yet — say hello.
+              </p>
+            )}
+            {messages.length === 0 && showingSearch && (
+              <p className="py-6 text-center text-sm text-zinc-500">
+                No messages in this channel match &ldquo;{channels.searchQuery}&rdquo;.
               </p>
             )}
             {messages.map((m) => (

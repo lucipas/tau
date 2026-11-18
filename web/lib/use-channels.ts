@@ -2,8 +2,10 @@
 //
 // Provides:
 //   useChannels() — joined channels, per-channel message history,
-//                   join/leave/send/sync. History is newest-first from
-//                   /api/channels/messages (default 20, max 50).
+//                   join/leave/send/sync/search. History is newest-first from
+//                   /api/channels/messages (default 20, max 50); search
+//                   matches come from /api/channels/search and replace the
+//                   history view until cleared.
 // New channel messages also arrive as `channel-message` live events on
 // /ws; this hook polls the open channel on an interval (default 30s) and
 // after every mutation, so it stays correct when the socket is down.
@@ -16,6 +18,7 @@ import {
   getChannels,
   joinChannel,
   leaveChannel,
+  searchChannelMessages,
   sendChannelMessage,
   syncChannels,
 } from "./api";
@@ -27,6 +30,12 @@ export interface UseChannelsResult {
   selected: string | null;
   select: (channel: string | null) => void;
   messages: ChannelMessage[];
+  /** Search matches for the selected channel, or null when not searching. */
+  searchResults: ChannelMessage[] | null;
+  /** The query behind `searchResults`, or null when not searching. */
+  searchQuery: string | null;
+  search: (query: string) => Promise<void>;
+  clearSearch: () => void;
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
@@ -40,6 +49,8 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
+  const [searchResults, setSearchResults] = useState<ChannelMessage[] | null>(null);
+  const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -81,14 +92,45 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
 
   const select = useCallback((channel: string | null) => {
     setSelected(channel);
+    // A search belongs to the channel it ran in; switching channels
+    // drops it rather than showing stale matches under a new name.
+    setSearchResults(null);
+    setSearchQuery(null);
     void refreshMessages(channel);
   }, [refreshMessages]);
+
+  const search = useCallback(async (query: string) => {
+    if (!selected) throw new Error("no channel selected");
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setSearchResults(null);
+      setSearchQuery(null);
+      return;
+    }
+    try {
+      const results = await searchChannelMessages(selected, trimmed);
+      setSearchResults(results);
+      setSearchQuery(trimmed);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [selected]);
+
+  const clearSearch = useCallback(() => {
+    setSearchResults(null);
+    setSearchQuery(null);
+  }, []);
 
   return {
     channels,
     selected,
     select,
     messages,
+    searchResults,
+    searchQuery,
+    search,
+    clearSearch,
     loading,
     error,
     refresh,
@@ -104,6 +146,8 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       if (selected === channel) {
         setSelected(null);
         setMessages([]);
+        setSearchResults(null);
+        setSearchQuery(null);
       }
     },
     send: async (text) => {

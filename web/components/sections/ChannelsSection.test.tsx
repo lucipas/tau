@@ -9,6 +9,27 @@ let calls: string[] = [];
 
 beforeEach(() => {
   const router = mockFetch((url) => {
+    if (url.includes("/api/channels/search")) {
+      return {
+        channel: "mesh-general",
+        query: "hello",
+        messages: [
+          {
+            v: 1,
+            hash: "m1".padEnd(64, "0"),
+            channel: "mesh-general",
+            author: "a".repeat(32),
+            key: "a".repeat(32),
+            name: "alice",
+            text: "hello channel",
+            created_at: 1000,
+            received_at: 1000,
+            sig: "s",
+          },
+        ],
+        count: 1,
+      };
+    }
     if (url.includes("/api/channels/messages")) {
       return {
         channel: "mesh-general",
@@ -78,5 +99,23 @@ describe("ChannelsSection", () => {
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
+  });
+
+  it("searches the selected channel and clears back to history", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    await screen.findByText("hello channel");
+    fireEvent.change(screen.getByLabelText("Search #mesh-general"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    await waitFor(() =>
+      expect(calls).toContain(
+        "GET /api/channels/search?channel=mesh-general&q=hello&limit=20",
+      ),
+    );
+    expect(await screen.findByText(/1 match for/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(await screen.findByText("hello channel")).toBeTruthy();
   });
 });

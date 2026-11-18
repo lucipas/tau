@@ -946,6 +946,18 @@ export async function getChannelMessages(channel: string, limit = 20): Promise<C
   return data.messages;
 }
 
+/** Stored messages in a channel matching a keyword, newest first. */
+export async function searchChannelMessages(
+  channel: string,
+  q: string,
+  limit = 20,
+): Promise<ChannelMessage[]> {
+  const data = await get<{ channel: string; query: string; messages: ChannelMessage[]; count: number }>(
+    `/api/channels/search${query({ channel, q, limit })}`,
+  );
+  return data.messages;
+}
+
 export async function joinChannel(channel: string): Promise<Channel> {
   return post("/api/channels/join", { channel });
 }
