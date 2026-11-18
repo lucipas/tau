@@ -27,6 +27,7 @@ PEERS_FILE_NAME = "peers.json"
 MAILBOX_FILE_NAME = "mailbox.json"
 INBOX_FILE_NAME = "inbox.json"
 GROUPS_FILE_NAME = "groups.json"
+BROADCASTS_FILE_NAME = "broadcasts.json"
 MESSAGES_FILE_NAME = "messages.json"
 SOCIAL_DB_FILE_NAME = "tan.sqlite3"
 CHANNELS_DB_FILE_NAME = "channels.sqlite3"
@@ -78,6 +79,7 @@ class TauConfig:
     mailbox_path: Path
     inbox_path: Path
     groups_path: Path
+    broadcasts_path: Path
     node_file: Path
     social_db_path: Path
     channels_db_path: Path
@@ -134,6 +136,7 @@ class TauConfig:
             mailbox_path=base / MAILBOX_FILE_NAME,
             inbox_path=base / INBOX_FILE_NAME,
             groups_path=base / GROUPS_FILE_NAME,
+            broadcasts_path=base / BROADCASTS_FILE_NAME,
             node_file=base / NODE_FILE_NAME,
             social_db_path=base / SOCIAL_DB_FILE_NAME,
             channels_db_path=base / CHANNELS_DB_FILE_NAME,

@@ -122,6 +122,7 @@ from .group_invites import (
     parse_invite_link,
     revoke_invites,
 )
+from .broadcasts import BroadcastStore
 from .groups import GroupStore, pinned_group, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
@@ -2444,6 +2445,182 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N pinned messages (default 30)",
     )
     group_pinned.set_defaults(func=cmd_group_pinned)
+
+    # A broadcast list is a named set of peers for one-to-many DMs: each
+    # send fans out as an ordinary DM per member, so recipients never
+    # see each other or the list — the middle ground between a group
+    # (shared context) and repeating `tau send --to` by hand.
+    broadcast = subparsers.add_parser(
+        "broadcast",
+        parents=[common],
+        help="send one message to many peers as private DMs",
+    )
+    broadcast.set_defaults(func=cmd_broadcast_list)
+    broadcast_sub = broadcast.add_subparsers(
+        dest="broadcast_command", metavar="BROADCAST_COMMAND"
+    )
+
+    broadcast_create = broadcast_sub.add_parser(
+        "create",
+        parents=[common],
+        help="save a named list of peers to message together",
+    )
+    broadcast_create.add_argument(
+        "broadcast_name", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_create.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a member peer (repeatable; yourself is the sender, not a member)",
+    )
+    broadcast_create.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_create.set_defaults(func=cmd_broadcast_create)
+
+    broadcast_list = broadcast_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list saved broadcast lists",
+    )
+    broadcast_list.set_defaults(func=cmd_broadcast_list)
+
+    broadcast_show = broadcast_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show one broadcast list and its members",
+    )
+    broadcast_show.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_show.set_defaults(func=cmd_broadcast_show)
+
+    broadcast_add_member = broadcast_sub.add_parser(
+        "add-member",
+        parents=[common],
+        help="add peers to a broadcast list",
+    )
+    broadcast_add_member.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_add_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to add (repeatable)",
+    )
+    broadcast_add_member.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_add_member.set_defaults(func=cmd_broadcast_add_member)
+
+    broadcast_remove_member = broadcast_sub.add_parser(
+        "remove-member",
+        parents=[common],
+        help="remove peers from a broadcast list",
+    )
+    broadcast_remove_member.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_remove_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to remove (repeatable)",
+    )
+    broadcast_remove_member.set_defaults(func=cmd_broadcast_remove_member)
+
+    broadcast_delete = broadcast_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="delete a broadcast list (frees capacity when the list cap is reached)",
+    )
+    broadcast_delete.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_delete.set_defaults(func=cmd_broadcast_delete)
+
+    # `tau broadcast send` shares `tau send`'s delivery flags: a
+    # broadcast is a fan-out of ordinary DMs, so every flag means what
+    # it means for a one-to-one send.  There is no --reply-to: a
+    # broadcast is never a reply.
+    broadcast_send = broadcast_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a message to every member of a broadcast list, as a private DM each",
+    )
+    broadcast_send.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_send.add_argument(
+        "message", nargs="?", help="message text (reads stdin when omitted)"
+    )
+    broadcast_send.add_argument("--file", type=Path, help="read the message from a file")
+    broadcast_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    broadcast_send.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    broadcast_send.add_argument(
+        "--kind",
+        default=None,
+        metavar="SLUG",
+        help="tag the message with a kind (default chat); receivers can"
+        " filter their inbox by kind",
+    )
+    broadcast_send.add_argument(
+        "--location",
+        default=None,
+        metavar='"LAT,LON [PLACE]"',
+        help="pin a place on the message (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park"); without message text the '
+        "place name (or the coordinates) becomes the text, and the "
+        "message is tagged location unless --kind says otherwise",
+    )
+    broadcast_send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from the receiver's inbox "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
+    broadcast_send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
+    broadcast_send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    broadcast_send.set_defaults(func=cmd_broadcast_send)
 
     tan = subparsers.add_parser(
         "tan",
@@ -14747,6 +14924,224 @@ def cmd_group_send_file(args: argparse.Namespace) -> int:
                 f"failed for {name}: {result.get('error') or 'unknown error'}"
             )
     return exit_code
+
+
+def _describe_broadcast(
+    broadcast: Dict[str, Any], registry: PeerRegistry
+) -> Dict[str, Any]:
+    """A broadcast list record with member display names for output."""
+    members = []
+    for member_hash in broadcast["members"]:
+        peer = registry.get(member_hash)
+        members.append(
+            {
+                "hash": member_hash,
+                "name": peer.display_name if peer is not None else member_hash[:8],
+            }
+        )
+    return {
+        "name": broadcast["name"],
+        "members": members,
+        "created_at": broadcast["created_at"],
+    }
+
+
+def cmd_broadcast_create(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        members: List[str] = []
+        for target in getattr(args, "peer", []):
+            peer = node.resolve_peer(
+                target,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+            if peer.hexhash == own_hash:
+                raise NodeError(
+                    "cannot add yourself to a broadcast list;"
+                    " you are the sender, not a member"
+                )
+            if peer.hexhash not in members:
+                members.append(peer.hexhash)
+        if not members:
+            raise NodeError("a broadcast list needs at least one peer")
+        store = BroadcastStore(config.broadcasts_path)
+        try:
+            broadcast = store.create(args.broadcast_name, members)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    finally:
+        node.stop()
+
+    described = _describe_broadcast(broadcast, node.registry)
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    print(f"created broadcast list {broadcast['name']}")
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members get a private DM each — they never see the list.")
+    return _EXIT_OK
+
+
+def cmd_broadcast_list(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    registry = PeerRegistry(config.peers_path)
+    lists = [_describe_broadcast(entry, registry) for entry in store.list_broadcasts()]
+    if _json_mode(args):
+        _emit({"broadcasts": lists, "count": len(lists)}, True)
+        return _EXIT_OK
+    if not lists:
+        print("No broadcast lists yet — create one with `tau broadcast create NAME --peer ...`.")
+        return _EXIT_OK
+    for entry in lists:
+        names = ", ".join(member["name"] for member in entry["members"])
+        print(f"{entry['name']} ({len(entry['members'])} members) — {names}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_show(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_broadcast(broadcast, PeerRegistry(config.peers_path))
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    print(f"{described['name']} ({len(described['members'])} members)")
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    return _EXIT_OK
+
+
+def _change_broadcast_members(args: argparse.Namespace, *, adding: bool) -> int:
+    """Add peers to, or remove peers from, a broadcast list.
+
+    Adding resolves each peer (with discovery, like ``tau group
+    add-member``), so a mistyped or unknown peer is refused before the
+    list changes.  Removing only needs the hash already in the list:
+    an offline member may have left the registry, and resolving it
+    would wait out the whole discover timeout.
+    """
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    members = list(broadcast["members"])
+    if adding:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            own_hash = node.destination_hexhash
+            resolved: List[str] = []
+            for target in getattr(args, "peer", []):
+                peer = node.resolve_peer(
+                    target,
+                    timeout=float(getattr(args, "discover_timeout", 10.0)),
+                )
+                if peer.hexhash == own_hash:
+                    raise NodeError(
+                        "cannot add yourself to a broadcast list;"
+                        " you are the sender, not a member"
+                    )
+                if peer.hexhash in members:
+                    raise NodeError(
+                        f"{peer.display_name} is already on"
+                        f" broadcast list {broadcast['name']!r}"
+                    )
+                if peer.hexhash not in resolved:
+                    resolved.append(peer.hexhash)
+            try:
+                updated = store.add_members(broadcast["name"], resolved)
+            except ValueError as exc:
+                raise NodeError(str(exc)) from exc
+        finally:
+            node.stop()
+    else:
+        registry = PeerRegistry(config.peers_path)
+        resolved = []
+        for target in getattr(args, "peer", []):
+            fast = _roster_hash(target, members)
+            if fast is not None:
+                resolved.append(fast)
+                continue
+            peer = registry.resolve(target)
+            if peer is None:
+                raise NodeError(f"unknown peer: {target!r}")
+            if peer.hexhash not in members:
+                raise NodeError(
+                    f"{peer.display_name} is not on"
+                    f" broadcast list {broadcast['name']!r}"
+                )
+            resolved.append(peer.hexhash)
+        try:
+            updated = store.remove_members(broadcast["name"], resolved)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    described = _describe_broadcast(updated, PeerRegistry(config.peers_path))
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    names = ", ".join(member["name"] for member in described["members"])
+    print(f"{described['name']} ({len(described['members'])} members) — {names}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_add_member(args: argparse.Namespace) -> int:
+    return _change_broadcast_members(args, adding=True)
+
+
+def cmd_broadcast_remove_member(args: argparse.Namespace) -> int:
+    return _change_broadcast_members(args, adding=False)
+
+
+def cmd_broadcast_delete(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not store.delete(broadcast["name"]):
+        raise NodeError(f"unknown broadcast list: {args.broadcast!r}")
+    if _json_mode(args):
+        _emit({"deleted": broadcast["name"]}, True)
+        return _EXIT_OK
+    print(f"deleted broadcast list {broadcast['name']}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_send(args: argparse.Namespace) -> int:
+    """Send a message to every member of a broadcast list, as a private DM each.
+
+    Delivery reuses :func:`cmd_send` wholesale: each member gets their
+    own send, sent record and store-and-forward envelope, so an offline
+    member queues exactly like a one-to-one DM and no list metadata
+    ever reaches a recipient.
+    """
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not broadcast["members"]:
+        # Unreachable through the store (it refuses empty lists), but
+        # a hand-edited broadcasts.json must not send to nobody silently.
+        raise NodeError(f"broadcast list {broadcast['name']!r} has no members")
+    # `cmd_send` reads its text from `args.message` and its targets from
+    # `args.to`; hand it the list's members and let it own delivery,
+    # queueing, and output.
+    args.to = list(broadcast["members"])
+    return cmd_send(args)
 
 
 def cmd_note(args: argparse.Namespace) -> int:
