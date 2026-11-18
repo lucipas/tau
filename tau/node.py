@@ -2513,6 +2513,12 @@ class TauNode:
                     record["location"] = message["location"]
                 if message.get("beacon") is not None:
                     record["beacon"] = message["beacon"]
+                if message.get("poll_options") is not None:
+                    record["poll_options"] = message["poll_options"]
+                if message.get("poll_vote") is not None:
+                    record["poll_vote"] = message["poll_vote"]
+                if message.get("poll_close") is not None:
+                    record["poll_close"] = message["poll_close"]
                 log.info(
                     "Message from %s (%s): %s",
                     caller_name,
@@ -3915,6 +3921,38 @@ class TauNode:
                     target_id = str(local["id"])
             else:
                 stored = None
+            # A group creator may retract any member's message
+            # (moderation).  The creator is verified against the
+            # pinned roster for the group id in the signed context —
+            # never against a claim in the payload — and a missing
+            # roster fails closed below, exactly as for membership.
+            # The signed context names the message's author, so the
+            # creator's own hash must differ: an author retracting
+            # their own message is not a moderator retract.
+            moderator = False
+            if has_group_context:
+                pinned = pinned_group(self.groups, group_id)
+                moderator = (
+                    pinned is not None
+                    and (pinned.get("creator") or "") == caller_hash
+                    and caller_hash != target_author
+                )
+            try:
+                own_hash = self.destination_hexhash
+            except NodeError:  # pragma: no cover - a started node has one
+                own_hash = ""
+            if stored is None and moderator and target_author == own_hash:
+                # The author's own copy of their group send is a
+                # sent record (direction "out", no member
+                # destination, the shared time in leg_sent_at),
+                # so the received-copy lookup above never finds
+                # it — resolve it by its shared send time.
+                sent = self.inbox.find_sent_group_message(
+                    group_id, target_sent_at
+                )
+                if sent is not None:
+                    stored = sent
+                    target_id = str(sent["id"])
             if stored is None:
                 # A group-context marker is keyed by the group, so a
                 # caller the pinned roster does not name must not
@@ -3934,26 +3972,44 @@ class TauNode:
                             "not_a_member",
                             "sender is not a group member",
                         )
+                    # A caller retracting someone else's message must
+                    # be the group's verified creator (see moderator
+                    # above): without a pinned roster there is nothing
+                    # to verify against, so fail closed instead of
+                    # recording a marker that could never suppress the
+                    # message — and a member who is neither the author
+                    # nor the creator must not write one either, or
+                    # their marker would sit confirmed in the bounded
+                    # store while suppressing nothing.
+                    if caller_hash != target_author and not moderator:
+                        return response_error(
+                            "not_sender",
+                            "only the message's sender or the group's "
+                            "creator can retract it",
+                        )
                 # No stored copy to check the sender against — the message
                 # may already be deleted or never have arrived.  Record the
                 # marker anyway: the retract is authenticated, and a copy
                 # arriving later (a relayed copy, or one that outlives the
                 # seen cache) must still lose to it.  The key carries the
-                # caller's own hash, so a sender can only ever suppress
-                # their own messages this way.  If the marker cannot be
-                # persisted the retract is not confirmed.  A group
+                # author's hash — the caller's own for an author retract,
+                # the named author for a moderator retract — so a sender
+                # can only ever suppress their own messages, and a
+                # creator only ever their own group's.  If the marker
+                # cannot be persisted the retract is not confirmed.  A group
                 # retract also records the group-context marker, so a
                 # copy arriving later under its own leg id still loses
                 # to it even though no per-leg id can name it.
                 try:
-                    self._record_retraction(caller_hash, retract["target"])
+                    marker_sender = target_author if moderator else caller_hash
+                    self._record_retraction(marker_sender, retract["target"])
                     if has_group_context:
                         # Confirmed only when a pinned roster names the
                         # caller: a marker for a group with no roster
                         # goes in the unknown pool, so a flood of such
                         # retracts cannot evict confirmed markers.
                         self.mailbox.record_group_retraction(
-                            caller_hash,
+                            marker_sender,
                             group_id,
                             target_sent_at,
                             confirmed=pinned is not None,
@@ -3976,9 +4032,35 @@ class TauNode:
             # Only a received record counts: an outgoing record also has the
             # caller's hash in ``destination`` (the recipient), so without the
             # direction check a recipient could delete the sender's own copy.
-            if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
+            # A group creator may also retract a member's message: a
+            # received copy from the named author, or this node's own
+            # sent record when the creator retracts a message this node
+            # authored (its direction is "out" and it carries no member
+            # destination — the shared send time identifies it).
+            is_author = (
+                stored.get("direction") == "in"
+                and stored.get("destination") == caller_hash
+            )
+            is_moderated = (
+                moderator
+                and stored.get("kind") == "group"
+                and stored.get("group") == group_id
+                and (
+                    (
+                        stored.get("direction") == "in"
+                        and stored.get("destination") == target_author
+                    )
+                    or (
+                        stored.get("direction") == "out"
+                        and target_author == own_hash
+                    )
+                )
+            )
+            if not (is_author or is_moderated):
                 return response_error(
-                    "not_sender", "only the message's sender can retract it"
+                    "not_sender",
+                    "only the message's sender or the group's creator "
+                    "can retract it",
                 )
             if stored.get("kind") == "file":
                 # A saved file lives on disk; Inbox.delete drops only the
@@ -4015,10 +4097,15 @@ class TauNode:
             # retract also records the group-context marker, so a copy
             # arriving later under another leg id still loses to it.
             try:
-                self._record_retraction(caller_hash, target_id, confirmed=True)
+                # The marker is keyed by the message's author, never
+                # by the caller: a moderator retract records it under
+                # the named author, or a copy arriving later would
+                # never match it (delivery checks the author's hash).
+                marker_sender = target_author if moderator else caller_hash
+                self._record_retraction(marker_sender, target_id, confirmed=True)
                 if has_group_context:
                     self.mailbox.record_group_retraction(
-                        caller_hash,
+                        marker_sender,
                         group_id,
                         target_sent_at,
                         confirmed=True,
@@ -4041,7 +4128,9 @@ class TauNode:
             # stale between here and the delete.
             try:
                 removed = self.inbox.delete_authorized(
-                    target_id, direction="in", destination=caller_hash
+                    target_id,
+                    direction=str(stored.get("direction") or "in"),
+                    destination=str(stored.get("destination") or ""),
                 )
             except InboxError as exc:
                 return response_error(
@@ -4055,6 +4144,22 @@ class TauNode:
                     received_at=received_at,
                     deleted=False,
                     group_retract=has_group_context,
+                )
+            if is_moderated and stored.get("direction") == "out":
+                # The retracted message is this node's own send: its
+                # queued legs would still deliver it to members who
+                # were offline, so cancel them and record the
+                # sent-retraction marker, exactly as the sender-side
+                # group retract does.  A copy already held by a relay
+                # still loses to the group marker recorded above.
+                for entry in self.mailbox.outbox_list():
+                    if (
+                        entry.group_id == group_id
+                        and entry.wire_sent_at == float(target_sent_at)
+                    ):
+                        self.mailbox.remove_outbox(entry.id)
+                self.mailbox.record_sent_group_retraction(
+                    group_id, float(target_sent_at)
                 )
             # The inbox record is gone; a serving console keeps its own
             # copy of the message, so tell it to drop that too — otherwise
@@ -5086,6 +5191,9 @@ class TauNode:
                 location=fresh.location,
                 beacon=fresh.beacon,
                 kind=getattr(fresh, "kind", None),
+                poll_options=fresh.poll_options,
+                poll_vote=fresh.poll_vote,
+                poll_close=fresh.poll_close,
             )
         # A replacement can still land after the fresh read: abort the
         # send instead of delivering the superseded version — the
@@ -6273,6 +6381,9 @@ class TauNode:
         kind: Optional[str] = None,
         location: Optional[Dict[str, Any]] = None,
         beacon: Optional[Dict[str, Any]] = None,
+        poll_options: Optional[List[str]] = None,
+        poll_vote: Optional[Dict[str, Any]] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
@@ -6292,6 +6403,18 @@ class TauNode:
         queueing and sealed relay copies alike, so the receiver can
         tell a live update from a one-off pin; a beacon without a pin
         is rejected, since an update that renders nowhere is noise.
+
+        ``poll_options`` makes this send a poll, exactly like a group
+        poll: the text is the question and the options ride alongside
+        it (validated with the Tan poll rules — 2-8 distinct, short,
+        normalised choices).  ``poll_vote`` casts a vote for one option
+        of the poll its target names, and ``poll_close`` closes that
+        poll; both ride the same way, through queueing and the queued
+        re-send.  At most one of the three may be set.  A poll, vote
+        or close is recorded with the wire send time under
+        ``leg_sent_at`` (the record's own ``sent_at`` is the local
+        record time), so the tally can name the poll by the
+        (author, sent_at) identity the wire carries.
 
         ``expires_at`` is an optional sender-set expiry (epoch seconds):
         it travels in the message payload and inside sealed relay
@@ -6329,6 +6452,49 @@ class TauNode:
             )
         if cleaned_beacon is not None and cleaned_location is None:
             raise NodeError("a beacon update must carry a location pin")
+        if sum(
+            field is not None
+            for field in (poll_options, poll_vote, poll_close)
+        ) > 1:
+            raise NodeError(
+                "a message can carry only one of poll_options, "
+                "poll_vote, poll_close"
+            )
+        cleaned_options: Optional[List[str]] = None
+        if poll_options is not None:
+            try:
+                cleaned_options = clean_poll_options(poll_options)
+            except PostError as exc:
+                raise NodeError(str(exc)) from exc
+        cleaned_vote: Optional[Dict[str, Any]] = None
+        if poll_vote is not None:
+            try:
+                cleaned_vote = clean_group_poll_vote(poll_vote)
+            except ProtocolError as exc:
+                raise NodeError(f"invalid poll vote: {exc}") from exc
+        cleaned_close: Optional[Dict[str, Any]] = None
+        if poll_close is not None:
+            try:
+                cleaned_close = clean_group_poll_target(poll_close)
+            except ProtocolError as exc:
+                raise NodeError(f"invalid poll close: {exc}") from exc
+        # One send time for the wire and the records: the sent record
+        # carries it under leg_sent_at (see the docstring), and a
+        # queued copy re-sends with the same time, so the poll's
+        # identity is the same on both ends.
+        wire_sent_at = time.time()
+        # The poll fields the sent record carries, plus the shared
+        # wire time; empty for a plain message, so ordinary records
+        # gain no new field.
+        poll_record: Dict[str, Any] = {}
+        if cleaned_options is not None:
+            poll_record["poll_options"] = cleaned_options
+        if cleaned_vote is not None:
+            poll_record["poll_vote"] = cleaned_vote
+        if cleaned_close is not None:
+            poll_record["poll_close"] = cleaned_close
+        if poll_record:
+            poll_record["leg_sent_at"] = wire_sent_at
         if cleaned_location is not None and kind is None:
             # A pin without an explicit kind is a location message, so
             # the receiver can filter on it; an explicit kind wins.
@@ -6381,11 +6547,15 @@ class TauNode:
         payload = encode_message(
             normalized,
             message_id=message_id,
+            sent_at=wire_sent_at,
             kind=clean_kind,
             expires_at=expires_at,
             in_reply_to=reply_to,
             location=cleaned_location,
             beacon=cleaned_beacon,
+            poll_options=cleaned_options,
+            poll_vote=cleaned_vote,
+            poll_close=cleaned_close,
         )
         peer: Optional[Peer] = None
         try:
@@ -6420,6 +6590,10 @@ class TauNode:
                         beacon=cleaned_beacon,
                         kind=clean_kind,
                         send_after=send_after,
+                        sent_at=wire_sent_at,
+                        poll_options=cleaned_options,
+                        poll_vote=cleaned_vote,
+                        poll_close=cleaned_close,
                     )
                 except MailboxError:
                     # Nothing was queued: forget the sent record made
@@ -6458,6 +6632,7 @@ class TauNode:
                             if cleaned_beacon is not None
                             else {}
                         ),
+                        **poll_record,
                     }
                 )
                 self.mailbox.record_sent(
@@ -6526,6 +6701,7 @@ class TauNode:
                         if cleaned_beacon is not None
                         else {}
                     ),
+                    **poll_record,
                 }
             )
             if self.registry.get(peer.destination_hash) is None:
@@ -6569,6 +6745,10 @@ class TauNode:
                 location=cleaned_location,
                 beacon=cleaned_beacon,
                 kind=clean_kind,
+                sent_at=wire_sent_at,
+                poll_options=cleaned_options,
+                poll_vote=cleaned_vote,
+                poll_close=cleaned_close,
                 # A scheduled send to an undiscovered peer queues here:
                 # the not-before time must survive the fallback, or the
                 # message would go out as soon as the peer is heard from.
@@ -6596,6 +6776,7 @@ class TauNode:
                         if cleaned_beacon is not None
                         else {}
                     ),
+                    **poll_record,
                 }
             )
             self.mailbox.record_sent(
@@ -8404,6 +8585,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         target_sent_at: Optional[float] = None,
+        target_author: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Fan a retraction of a group message out to every member.
 
@@ -8415,6 +8597,13 @@ class TauNode:
         carries the signed group context (group, author, shared send
         time), so each member resolves its own copy even though legs
         carry different wire ids (see :meth:`_handle_retract`).
+
+        ``target_author`` names the message's author: it defaults to
+        this node (an author retracting their own message).  A group
+        creator retracting a member's message passes that member's
+        hash instead, so receivers can resolve the author's copy —
+        and the creator's fan-out reaches the author too, whose sent
+        record the retract deletes (see :meth:`_handle_retract`).
 
         A leg still queued in the outbox when the retract runs is
         cancelled first, so an offline member never receives a message
@@ -8458,7 +8647,7 @@ class TauNode:
         payload_bytes, retract_id, _sent_at = self._signed_retraction_payload(
             target_id,
             group=group["id"],
-            target_author=own_hash,
+            target_author=target_author or own_hash,
             target_sent_at=float(target_sent_at),
         )
         results: List[Dict[str, Any]] = []

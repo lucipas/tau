@@ -33,6 +33,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/deny-join deny ``{"group": "<name>", "peer": "<hash>"}``
     POST /api/groups/vote vote on a group poll ``{"group": "...", "poll": "<wire id>", "option": <1-based number or exact text>}``
     POST /api/groups/close-poll close a group poll you created ``{"group": "...", "poll": "<wire id>"}``
+    POST /api/dm/vote vote on a DM poll ``{"to": "...", "poll": "<wire id>", "option": <1-based number or exact text>}``
+    POST /api/dm/close-poll close a DM poll you created ``{"to": "...", "poll": "<wire id>"}``
     POST /api/groups/leave leave ``{"group": "..."}`` — members only;
                            a group this node created uses delete instead
     POST /api/groups/rejoin rejoin a left group ``{"group": "<32-char id>"}``
@@ -164,6 +166,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/react  react to a stored channel message (``{"channel", "target", "reaction"}``; an empty ``reaction`` clears yours)
+    POST /api/channels/send  send a message to a joined channel (``{\"channel\", \"text\", \"reply_to\"?}``)
+    POST /api/channels/edit  edit your own message (``{"channel", "target", "text"}``)
     POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/pages       cached personal mesh pages, plus this node's own
     POST /api/pages/fetch fetch a peer's page over RNS (``{"peer": "<name or hash>"}``)
@@ -235,6 +240,7 @@ from .muted import (
     muted_peers_for,
     save_muted,
 )
+from .quiet_hours import quiet_hours_active
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
@@ -250,6 +256,7 @@ from .config import (
     DISAPPEARING_FILE_NAME,
     MESSAGES_FILE_NAME,
     MUTED_FILE_NAME,
+    QUIET_HOURS_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
     set_node_setting,
@@ -259,9 +266,12 @@ from .group_invites import list_join_requests
 from .groups import GroupStore, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
+    attach_dm_poll_tallies,
     attach_group_poll_tallies,
     clean_poll_options,
+    dm_poll_tally,
     group_poll_tally,
+    is_dm_poll,
     is_group_poll,
     poll_identity,
 )
@@ -3861,8 +3871,18 @@ class WebBridge:
     def channel_messages(
         self, channel: str, *, limit: int = 20
     ) -> List[Dict[str, Any]]:
-        """Stored messages for *channel*, newest first, minus blocked authors."""
-        from .channels import channel_history, clean_channel_name
+        """Stored messages for *channel*, newest first, minus blocked authors.
+
+        Each message carries a ``reactions`` summary — ``[{reaction,
+        count, reactors}]`` grouped by token — so the console renders
+        counts without re-fetching.
+        """
+        from .channels import (
+            channel_history,
+            clean_channel_name,
+            reactions_for_messages,
+            summarize_reactions,
+        )
 
         name = clean_channel_name(channel)
         # One snapshot for every console surface: the node's cached
@@ -3873,15 +3893,26 @@ class WebBridge:
         conn = self._channel_conn()
         try:
             messages = channel_history(conn, name, limit=limit)
+            grouped = reactions_for_messages(
+                conn,
+                name,
+                [str(item.get("hash", "")) for item in messages],
+                exclude_authors=sorted(blocked),
+            )
         finally:
             conn.close()
         if exclude_all:
             return []
-        return [
+        visible = [
             message
             for message in messages
             if str(message.get("author", "")) not in blocked
         ]
+        for message in visible:
+            message["reactions"] = summarize_reactions(
+                grouped.get(str(message.get("hash", "")), [])
+            )
+        return visible
 
     def channel_search(
         self, channel: str, query: str, *, limit: int = 20
@@ -3918,14 +3949,46 @@ class WebBridge:
         left = self._local_channel_app().leave(channel)
         return {"channel": clean_channel_name(channel), "left": left}
 
-    def channel_send(self, channel: str, text: str) -> Dict[str, Any]:
-        """Send *text* to a joined channel, gossiping it to peers."""
+    def channel_send(
+        self, channel: str, text: str, *, reply_to: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Send *text* to a joined channel, gossiping it to peers.
+
+        ``reply_to`` is a parent message's hash or unique hex prefix
+        in the same channel.
+        """
         app = self._channel_app()
         if app is None:
             raise WebBridgeError(
                 "public channels are not enabled; run serve --channels"
             )
-        return app.send(channel, text, publish=True)
+        return app.send(channel, text, publish=True, reply_to=reply_to)
+
+    def channel_edit(
+        self, channel: str, target: str, text: str
+    ) -> Dict[str, Any]:
+        """Edit your own message in a joined channel, gossiping it to peers."""
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        return app.edit(channel, target, text, publish=True)
+
+    def channel_react(
+        self, channel: str, target: str, reaction: str
+    ) -> Dict[str, Any]:
+        """React to a stored channel message, gossiping it to peers.
+
+        An empty *reaction* clears this node's reaction to the
+        message.
+        """
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        return app.react(channel, target, reaction, publish=True)
 
     def channel_sync(
         self, channel: Optional[str] = None, *, limit: int = 20
@@ -4747,6 +4810,9 @@ class WebBridge:
         expires_at: Optional[float] = None,
         send_after: Optional[float] = None,
         reply_to: Optional[str] = None,
+        poll_options: Optional[List[str]] = None,
+        poll_vote: Optional[Dict[str, Any]] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Send a DM from the console.
 
@@ -4755,6 +4821,12 @@ class WebBridge:
         console append was still in flight: the wire send already
         succeeded, so the response still reports that, but there is no
         record to show — the message no longer exists anywhere.
+
+        ``poll_options`` makes this send a poll, exactly like a group
+        poll: the text is the question and the options ride alongside
+        it.  ``poll_vote`` and ``poll_close`` are the same send for a
+        vote and a close (used by :meth:`send_dm_poll_vote` and
+        :meth:`close_dm_poll`); at most one of the three may be set.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
@@ -4798,6 +4870,22 @@ class WebBridge:
         # normalises again before sending, so this cannot change delivery.
         text = normalize_message(text)
 
+        cleaned_options: Optional[List[str]] = None
+        if poll_options is not None:
+            if not isinstance(poll_options, list):
+                raise ValueError("poll_options must be a list of options")
+            try:
+                cleaned_options = clean_poll_options(list(poll_options))
+            except PostError as exc:
+                raise ValueError(str(exc)) from exc
+        if sum(
+            field is not None
+            for field in (poll_options, poll_vote, poll_close)
+        ) > 1:
+            raise ValueError(
+                "a message can carry only one of poll_options, "
+                "poll_vote, poll_close"
+            )
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
         in_reply_to = self._resolve_console_reply(peer.hexhash, reply_to)
         # The send lock is NOT held across the network send: queueing
@@ -4814,6 +4902,9 @@ class WebBridge:
             in_reply_to=in_reply_to,
             expires_at=expires_at,
             send_after=send_after,
+            poll_options=cleaned_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
         )
         queued = bool(response.get("queued"))
         # Record the effective expiry (explicit or per-conversation
@@ -4843,6 +4934,9 @@ class WebBridge:
                 # construction: a failed direct send queues instead.
                 delivered_via="direct" if not queued else None,
                 in_reply_to=in_reply_to,
+                poll_options=cleaned_options,
+                poll_vote=poll_vote,
+                poll_close=poll_close,
             )
             if message is None:
                 # The send was retracted while its console record was
@@ -5241,6 +5335,136 @@ class WebBridge:
             "closed the poll",
             poll_close={"author": identity[0], "sent_at": identity[1]},
         )
+
+    def _resolve_dm_poll_record(
+        self, peer_hash: str, ref: Any
+    ) -> Dict[str, Any]:
+        """Resolve a console poll reference to its inbox poll record.
+
+        *ref* is a wire id or unique prefix, as shown by
+        ``tau messages`` or carried on the console entry.
+        Only a poll resolves — a vote or close record never does.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise ValueError("no inbox available")
+        ref = str(ref or "").strip()
+        if not ref:
+            raise ValueError("poll reference is required")
+        matches = [
+            item
+            for item in inbox.find_prefix(ref, peer=peer_hash)
+            if is_dm_poll(item)
+        ]
+        exact = [m for m in matches if str(m["id"]) == ref]
+        if not exact:
+            folded = ref.lower()
+            exact = [m for m in matches if str(m["id"]).lower() == folded]
+        if exact:
+            matches = exact
+        if len(matches) > 1:
+            raise ValueError(
+                f"{len(matches)} polls with this peer match {ref!r};"
+                " use a longer prefix"
+            )
+        if not matches:
+            raise ValueError(f"no poll {ref!r} with this peer")
+        return matches[0]
+
+    def send_dm_poll_vote(
+        self,
+        target: str,
+        poll_ref: Any,
+        option: Any,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Vote on a DM poll from the console.
+
+        ``poll_ref`` is a wire id or unique prefix of the poll;
+        ``option`` is a 1-based option number or the exact option
+        text.  The vote is a DM like any other, so an offline peer
+        still gets it from the outbox; the tally refreshes on the
+        next snapshot read.  A closed poll refuses the vote, like
+        the CLI does.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer is required")
+        peer = self.node.resolve_peer(target.strip(), timeout=10.0)
+        poll = self._resolve_dm_poll_record(peer.hexhash, poll_ref)
+        inbox = getattr(self.node, "inbox", None)
+        history = (
+            inbox.list_messages(
+                limit=None, peer=peer.hexhash, direction=None
+            )
+            if inbox is not None
+            else []
+        )
+        own_hash = getattr(self.node, "destination_hexhash", None)
+        tally = dm_poll_tally(history, poll, own_hash=own_hash)
+        if tally["closed"]:
+            raise ValueError("this poll is closed")
+        options = tally["options"]
+        choice = str(option).strip() if option is not None else ""
+        index: Optional[int] = None
+        if choice.isdigit():
+            index = int(choice) - 1
+        else:
+            for position, text in enumerate(options):
+                if text == choice:
+                    index = position
+                    break
+        if index is None or not 0 <= index < len(options):
+            raise ValueError(
+                "option must be a number 1-"
+                f"{len(options)} or one of: {', '.join(options)}"
+            )
+        identity = poll_identity(poll, own_hash)
+        if identity is None:
+            raise ValueError("this poll has no usable identity")
+        message, response = self.send_message(
+            peer.hexhash,
+            f"voted: {options[index]}",
+            poll_vote={
+                "target": {"author": identity[0], "sent_at": identity[1]},
+                "option": index,
+            },
+        )
+        return ([message] if message is not None else []), response
+
+    def close_dm_poll(
+        self, target: str, poll_ref: Any
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Close a DM poll this node created, from the console.
+
+        Only the poll's creator may close it; closing freezes the
+        tally, like the CLI does.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer is required")
+        peer = self.node.resolve_peer(target.strip(), timeout=10.0)
+        poll = self._resolve_dm_poll_record(peer.hexhash, poll_ref)
+        own_hash = getattr(self.node, "destination_hexhash", None)
+        identity = poll_identity(poll, own_hash)
+        if identity is None:
+            raise ValueError("this poll has no usable identity")
+        if own_hash is None or identity[0] != own_hash.lower():
+            raise ValueError("only the poll's creator can close it")
+        inbox = getattr(self.node, "inbox", None)
+        history = (
+            inbox.list_messages(
+                limit=None, peer=peer.hexhash, direction=None
+            )
+            if inbox is not None
+            else []
+        )
+        tally = dm_poll_tally(history, poll, own_hash=own_hash)
+        if tally["closed"]:
+            raise ValueError("this poll is already closed")
+        message, response = self.send_message(
+            peer.hexhash,
+            "closed the poll",
+            poll_close={"author": identity[0], "sent_at": identity[1]},
+        )
+        return ([message] if message is not None else []), response
 
     def send_file(
         self,
@@ -7994,6 +8218,17 @@ class WebBridge:
             return None
         return data_dir / MUTED_FILE_NAME
 
+    def _quiet_hours_path(self) -> Optional[Path]:
+        """This node's quiet-hours path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "quiet_hours_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / QUIET_HOURS_FILE_NAME
+
     def _muted_sets(self) -> "tuple[FrozenSet[str], FrozenSet[str]]":
         """Muted (peers, groups), failing open on a corrupt file.
 
@@ -8741,6 +8976,38 @@ class WebBridge:
                 if isinstance(item.get("group"), str) and item.get("group")
             }
         )
+        # DM polls: the same enrichment, keyed by the peer instead of
+        # the group — a DM entry's peer is its conversation partner.
+        dm_poll_records = self._dm_poll_records(
+            {
+                str(item.get("peer") or item.get("destination"))
+                for item in items
+                if not item.get("group")
+                and (item.get("peer") or item.get("destination"))
+            }
+        )
+
+        def _with_dm_poll(item: Dict[str, Any]) -> Dict[str, Any]:
+            if item.get("group"):
+                return item
+            peer = item.get("peer") or item.get("destination")
+            wire_id = item.get("wire_id")
+            if not isinstance(peer, str) or not peer:
+                return item
+            if not isinstance(wire_id, str) or not wire_id:
+                return item
+            record = dm_poll_records.get((peer, wire_id))
+            if record is None:
+                return item
+            if record.get("poll_options") is not None:
+                item["poll_options"] = list(record["poll_options"])
+                if "poll" in record:
+                    item["poll"] = record["poll"]
+            if record.get("poll_vote") is not None:
+                item["poll_vote"] = dict(record["poll_vote"])
+            if record.get("poll_close") is not None:
+                item["poll_close"] = dict(record["poll_close"])
+            return item
 
         def _with_group_poll(item: Dict[str, Any]) -> Dict[str, Any]:
             group = item.get("group")
@@ -8763,10 +9030,12 @@ class WebBridge:
             return item
 
         return [
-            _with_group_poll(
-                self._with_inbox_pinned(
-                    self._with_inbox_reactions(dict(item), by_target, rosters),
-                    pinned_ids,
+            _with_dm_poll(
+                _with_group_poll(
+                    self._with_inbox_pinned(
+                        self._with_inbox_reactions(dict(item), by_target, rosters),
+                        pinned_ids,
+                    )
                 )
             )
             for item in items
@@ -9010,6 +9279,19 @@ class WebBridge:
                 by_target.setdefault(target, []).append(entry)
         return by_target
 
+    def _own_hash(self) -> Optional[str]:
+        """This node's destination hash, or ``None`` when unavailable.
+
+        The read path serves stored history even when the node never
+        started, and ``destination_hexhash`` raises on an unstarted
+        node — ``getattr``'s default does not catch a property that
+        raises — so the lookup is guarded here.
+        """
+        try:
+            return getattr(self.node, "destination_hexhash", None)
+        except Exception:
+            return None
+
     def _group_poll_records(
         self, group_ids: Collection[str]
     ) -> Dict[Tuple[str, str], Dict[str, Any]]:
@@ -9030,7 +9312,7 @@ class WebBridge:
             )
         except Exception:  # pragma: no cover - defensive
             return {}
-        own_hash = getattr(self.node, "destination_hexhash", None)
+        own_hash = self._own_hash()
         attach_group_poll_tallies(history, own_hash=own_hash)
         by_wire: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for record in history:
@@ -9045,6 +9327,46 @@ class WebBridge:
             for wire_id in ids:
                 if isinstance(wire_id, str) and wire_id:
                     by_wire[(group, wire_id)] = record
+        return by_wire
+
+    def _dm_poll_records(
+        self, peer_hashes: Collection[str]
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Poll/vote/close inbox records for these peers, by wire id.
+
+        One reload serves the whole listing, like
+        :meth:`_group_poll_records`: each record carries its derived
+        ``poll`` tally when it is a poll.  The key is the peer plus
+        the record's wire id, so both an inbound copy and the outbound
+        record resolve to the same poll.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None or not peer_hashes:
+            return {}
+        history: List[Dict[str, Any]] = []
+        for peer_hash in sorted(peer_hashes):
+            try:
+                history.extend(
+                    inbox.list_messages(
+                        limit=None, peer=peer_hash, direction=None
+                    )
+                )
+            except Exception:  # pragma: no cover - defensive
+                continue
+        own_hash = self._own_hash()
+        attach_dm_poll_tallies(history, own_hash=own_hash)
+        by_wire: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for record in history:
+            if (
+                record.get("poll_options") is None
+                and record.get("poll_vote") is None
+                and record.get("poll_close") is None
+            ):
+                continue
+            peer = str(record.get("destination") or "")
+            wire_id = record.get("id")
+            if peer and isinstance(wire_id, str) and wire_id:
+                by_wire[(peer, wire_id)] = record
         return by_wire
 
     def _with_inbox_reactions(
@@ -9257,7 +9579,9 @@ class WebBridge:
         ignored group's posts never light a badge either, so they are
         excluded too; the members' direct messages still count.  A
         muted conversation never lights a badge either, by the same
-        per-side rule as archived and ignored.  A renamed group's
+        per-side rule as archived and ignored.  Quiet hours silence
+        every conversation at once, like a mute on the whole node, so
+        no badge lights while the window is active.  A renamed group's
         posts count under its current id, so the badge on the group
         covers its whole history.
         """
@@ -9277,6 +9601,9 @@ class WebBridge:
                             )
                         )
                         | muted_groups,
+                        # Quiet hours silence every conversation at
+                        # once, like a mute on the whole node.
+                        quiet=quiet_hours_active(self._quiet_hours_path()),
                     )
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not read inbox unread counts", exc_info=True)
@@ -11024,6 +11351,50 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path in ("/api/dm/vote", "/api/dm/close-poll"):
+                target = body.get("to")
+                poll_ref = body.get("poll")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'to' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(poll_ref, str) or not poll_ref.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'poll' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/dm/vote":
+                        messages, response = self.bridge.send_dm_poll_vote(
+                            target.strip(), poll_ref.strip(), body.get("option")
+                        )
+                    else:
+                        messages, response = self.bridge.close_dm_poll(
+                            target.strip(), poll_ref.strip()
+                        )
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                except MailboxError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(
+                    {
+                        "ok": bool(response.get("ok", True)),
+                        "messages": messages,
+                        "response": response,
+                    },
+                    head_only,
+                )
+                return
             if path == "/api/outbox/retry":
                 self._handle_outbox_retry(body, head_only)
                 return
@@ -11852,6 +12223,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/channels/send":
                 channel = body.get("channel")
                 text = body.get("text")
+                reply_to = body.get("reply_to")
                 if not isinstance(channel, str) or not channel.strip():
                     self._send_json(
                         {"error": {"message": "field 'channel' is required"}},
@@ -11866,8 +12238,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                if reply_to is not None and not isinstance(reply_to, str):
+                    self._send_json(
+                        {"error": {"message": "field 'reply_to' must be a string"}},
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
-                    message = self.bridge.channel_send(channel, text)
+                    message = self.bridge.channel_send(channel, text, reply_to=reply_to)
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
@@ -11875,6 +12254,81 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/react":
+                channel = body.get("channel")
+                target = body.get("target")
+                reaction = body.get("reaction")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(reaction, str):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'reaction' is required "
+                                "(empty clears yours)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    record = self.bridge.channel_react(channel, target, reaction)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "reaction": record}, head_only)
+                return
+            if path == "/api/channels/edit":
+                channel = body.get("channel")
+                target = body.get("target")
+                text = body.get("text")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    edit = self.bridge.channel_edit(channel, target, text)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "edit": edit}, head_only)
                 return
             if path == "/api/channels/sync":
                 channel = body.get("channel")
@@ -12162,6 +12616,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 expires_at=expires_at,
                 send_after=send_after,
                 reply_to=reply_to,
+                poll_options=body.get("poll_options"),
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)

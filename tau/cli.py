@@ -88,6 +88,7 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .drafts import DraftStore
 from .muted import (
     MutedError,
     expand_muted_groups,
@@ -97,6 +98,15 @@ from .muted import (
     muted_lock,
     muted_peers_for,
     save_muted,
+)
+from .quiet_hours import (
+    QuietHours,
+    QuietHoursError,
+    format_time,
+    load_quiet_hours,
+    quiet_hours_active,
+    quiet_hours_lock,
+    save_quiet_hours,
 )
 from .dm_requests import (
     DmRequestsError,
@@ -122,12 +132,18 @@ from .group_invites import (
     parse_invite_link,
     revoke_invites,
 )
-from .groups import GroupStore, pinned_rosters, visible_reactions
+from .broadcasts import BroadcastStore
+from .groups import GroupStore, pinned_group, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
+    attach_dm_poll_tallies,
     attach_group_poll_tallies,
     clean_poll_options,
+    dm_poll_tally,
     group_poll_tally,
+    is_dm_poll,
+    is_dm_poll_close,
+    is_dm_poll_vote,
     is_group_poll,
     is_group_poll_close,
     is_group_poll_vote,
@@ -305,12 +321,16 @@ from .tangents.tan import (
 )
 from .channels import (
     DEFAULT_CHANNEL_LIMIT,
+    MAX_FEED_EDITS,
     ChannelApp,
     ChannelError,
     clean_channel_name,
+    create_edit as create_channel_edit,
     create_message as create_channel_message,
+    create_reaction as create_channel_reaction,
     init_db as init_channel_db,
     is_member as is_channel_member,
+    reply_parent as channel_reply_parent,
 )
 
 log = logging.getLogger(__name__)
@@ -376,8 +396,6 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
         dest="json_output",
         help="emit machine readable JSON",
     )
-
-
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     _add_common_options(common)
@@ -593,6 +611,13 @@ def build_parser() -> argparse.ArgumentParser:
         "message is tagged location unless --kind says otherwise",
     )
     send.add_argument(
+        "--poll-options",
+        nargs="+",
+        default=None,
+        metavar="OPTION",
+        help="post the message as a poll question with 2-8 options",
+    )
+    send.add_argument(
         "--wait",
         type=float,
         default=None,
@@ -708,6 +733,118 @@ def build_parser() -> argparse.ArgumentParser:
     note.add_argument("--file", type=Path, help="read the note from a file")
     note.set_defaults(func=cmd_note)
 
+    # A draft is an unsent message parked for one peer or group: saved
+    # locally with `draft save`, sent later with `draft send`.  Like a
+    # Tan draft, it never leaves the machine until it is sent.
+    draft = subparsers.add_parser(
+        "draft",
+        parents=[common],
+        help="save an unsent DM or group message to send later",
+    )
+    draft_sub = draft.add_subparsers(dest="draft_command", metavar="DRAFT_COMMAND")
+
+    draft_save = draft_sub.add_parser(
+        "save",
+        parents=[common],
+        help="save a message as a draft for a peer or a group",
+    )
+    draft_save_target = draft_save.add_mutually_exclusive_group(required=True)
+    draft_save_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_save_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: draft for the group instead of a peer",
+    )
+    draft_save.add_argument(
+        "message", nargs="?", help="draft text (reads stdin when omitted)"
+    )
+    draft_save.set_defaults(func=cmd_draft_save)
+
+    draft_list = draft_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list saved message drafts",
+    )
+    draft_list.set_defaults(func=cmd_draft_list)
+
+    draft_show = draft_sub.add_parser(
+        "show",
+        parents=[common],
+        help="print a saved draft's full text",
+    )
+    draft_show_target = draft_show.add_mutually_exclusive_group(required=True)
+    draft_show_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_show_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id",
+    )
+    draft_show.set_defaults(func=cmd_draft_show)
+
+    draft_delete = draft_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="discard a saved draft",
+    )
+    draft_delete_target = draft_delete.add_mutually_exclusive_group(required=True)
+    draft_delete_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_delete_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id",
+    )
+    draft_delete.set_defaults(func=cmd_draft_delete)
+
+    draft_send = draft_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a saved draft (and delete it once queued)",
+    )
+    draft_send_target = draft_send.add_mutually_exclusive_group(required=True)
+    draft_send_target.add_argument(
+        "--to",
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    draft_send_target.add_argument(
+        "--group",
+        metavar="NAME|ID",
+        help="group name or id: send the draft into the group",
+    )
+    draft_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    draft_send.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    draft_send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    draft_send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    draft_send.set_defaults(func=cmd_draft_send)
+
     react = subparsers.add_parser(
         "react",
         parents=[common],
@@ -819,7 +956,8 @@ def build_parser() -> argparse.ArgumentParser:
     retract = subparsers.add_parser(
         "retract",
         parents=[common],
-        help="retract a sent message from the recipient's inbox",
+        help="retract a sent message from the recipient's inbox "
+        "(a group creator may also retract a member's message)",
     )
     retract.add_argument(
         "message",
@@ -835,6 +973,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     retract.set_defaults(func=cmd_retract)
+
+    vote = subparsers.add_parser(
+        "vote",
+        parents=[common],
+        help="vote on a DM poll (option number or exact option text)",
+    )
+    vote.add_argument(
+        "--to",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    vote.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message id or unique prefix (see `tau messages`)",
+    )
+    vote.add_argument(
+        "option",
+        metavar="OPTION",
+        help="option number (1-based) or the exact option text",
+    )
+    vote.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    vote.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the vote when the peer is offline",
+    )
+    vote.set_defaults(func=cmd_vote)
+
+    close_poll = subparsers.add_parser(
+        "close-poll",
+        parents=[common],
+        help="close a DM poll you created (freezes the tally)",
+    )
+    close_poll.add_argument(
+        "--to",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    close_poll.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message id or unique prefix (see `tau messages`)",
+    )
+    close_poll.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    close_poll.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the close when the peer is offline",
+    )
+    close_poll.set_defaults(func=cmd_close_poll)
 
     edit = subparsers.add_parser(
         "edit",
@@ -1585,7 +1776,60 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="unmute this conversation instead",
     )
+    mute.add_argument(
+        "--for",
+        dest="for_duration",
+        default=None,
+        metavar="DURATION",
+        help="mute only for this long, e.g. 30s, 5m, 2h or 7d (at most 30d); "
+        "afterwards the conversation counts as unread again",
+    )
     mute.set_defaults(func=cmd_mute)
+
+    quiet_hours = subparsers.add_parser(
+        "quiet-hours",
+        parents=[common],
+        help="silence the unread badge every day during a set window",
+    )
+    quiet_hours_sub = quiet_hours.add_subparsers(
+        dest="quiet_hours_command", metavar="QUIET_HOURS_COMMAND"
+    )
+    quiet_hours_set = quiet_hours_sub.add_parser(
+        "set",
+        parents=[common],
+        help="set the daily quiet-hours window",
+    )
+    quiet_hours_set.add_argument(
+        "--start",
+        required=True,
+        metavar="HH:MM",
+        help="when quiet hours start each day, e.g. 22:00",
+    )
+    quiet_hours_set.add_argument(
+        "--end",
+        required=True,
+        metavar="HH:MM",
+        help="when quiet hours end each day, e.g. 07:00 "
+        "(earlier than the start means overnight)",
+    )
+    quiet_hours_set.set_defaults(func=cmd_quiet_hours_set)
+
+    quiet_hours_off = quiet_hours_sub.add_parser(
+        "off",
+        parents=[common],
+        help="turn quiet hours off, keeping the window",
+    )
+    quiet_hours_off.set_defaults(func=cmd_quiet_hours_off)
+
+    quiet_hours_status = quiet_hours_sub.add_parser(
+        "status",
+        parents=[common],
+        help="show the quiet-hours window and whether it is quiet now",
+    )
+    quiet_hours_status.set_defaults(func=cmd_quiet_hours_status)
+
+    # No subcommand shows the status, like `tau mute` with no target lists.
+    quiet_hours.set_defaults(func=cmd_quiet_hours_status)
 
     away = subparsers.add_parser(
         "away",
@@ -2443,6 +2687,182 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N pinned messages (default 30)",
     )
     group_pinned.set_defaults(func=cmd_group_pinned)
+
+    # A broadcast list is a named set of peers for one-to-many DMs: each
+    # send fans out as an ordinary DM per member, so recipients never
+    # see each other or the list — the middle ground between a group
+    # (shared context) and repeating `tau send --to` by hand.
+    broadcast = subparsers.add_parser(
+        "broadcast",
+        parents=[common],
+        help="send one message to many peers as private DMs",
+    )
+    broadcast.set_defaults(func=cmd_broadcast_list)
+    broadcast_sub = broadcast.add_subparsers(
+        dest="broadcast_command", metavar="BROADCAST_COMMAND"
+    )
+
+    broadcast_create = broadcast_sub.add_parser(
+        "create",
+        parents=[common],
+        help="save a named list of peers to message together",
+    )
+    broadcast_create.add_argument(
+        "broadcast_name", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_create.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a member peer (repeatable; yourself is the sender, not a member)",
+    )
+    broadcast_create.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_create.set_defaults(func=cmd_broadcast_create)
+
+    broadcast_list = broadcast_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list saved broadcast lists",
+    )
+    broadcast_list.set_defaults(func=cmd_broadcast_list)
+
+    broadcast_show = broadcast_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show one broadcast list and its members",
+    )
+    broadcast_show.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_show.set_defaults(func=cmd_broadcast_show)
+
+    broadcast_add_member = broadcast_sub.add_parser(
+        "add-member",
+        parents=[common],
+        help="add peers to a broadcast list",
+    )
+    broadcast_add_member.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_add_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to add (repeatable)",
+    )
+    broadcast_add_member.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_add_member.set_defaults(func=cmd_broadcast_add_member)
+
+    broadcast_remove_member = broadcast_sub.add_parser(
+        "remove-member",
+        parents=[common],
+        help="remove peers from a broadcast list",
+    )
+    broadcast_remove_member.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_remove_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to remove (repeatable)",
+    )
+    broadcast_remove_member.set_defaults(func=cmd_broadcast_remove_member)
+
+    broadcast_delete = broadcast_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="delete a broadcast list (frees capacity when the list cap is reached)",
+    )
+    broadcast_delete.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_delete.set_defaults(func=cmd_broadcast_delete)
+
+    # `tau broadcast send` shares `tau send`'s delivery flags: a
+    # broadcast is a fan-out of ordinary DMs, so every flag means what
+    # it means for a one-to-one send.  There is no --reply-to: a
+    # broadcast is never a reply.
+    broadcast_send = broadcast_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a message to every member of a broadcast list, as a private DM each",
+    )
+    broadcast_send.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_send.add_argument(
+        "message", nargs="?", help="message text (reads stdin when omitted)"
+    )
+    broadcast_send.add_argument("--file", type=Path, help="read the message from a file")
+    broadcast_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    broadcast_send.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    broadcast_send.add_argument(
+        "--kind",
+        default=None,
+        metavar="SLUG",
+        help="tag the message with a kind (default chat); receivers can"
+        " filter their inbox by kind",
+    )
+    broadcast_send.add_argument(
+        "--location",
+        default=None,
+        metavar='"LAT,LON [PLACE]"',
+        help="pin a place on the message (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park"); without message text the '
+        "place name (or the coordinates) becomes the text, and the "
+        "message is tagged location unless --kind says otherwise",
+    )
+    broadcast_send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from the receiver's inbox "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
+    broadcast_send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
+    broadcast_send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    broadcast_send.set_defaults(func=cmd_broadcast_send)
 
     tan = subparsers.add_parser(
         "tan",
@@ -3469,6 +3889,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_send.add_argument("--file", type=Path, help="read the message text from a file")
     channel_send.add_argument(
+        "--reply-to",
+        default=None,
+        metavar="HASH|PREFIX",
+        help="reply to this message instead of posting standalone (message hash or unique hash prefix)",
+    )
+    channel_send.add_argument(
         "--to",
         action="append",
         default=None,
@@ -3483,6 +3909,45 @@ def build_parser() -> argparse.ArgumentParser:
     channel_send.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     channel_send.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     channel_send.set_defaults(func=cmd_channel_send)
+
+    channel_react = channel_sub.add_parser(
+        "react",
+        parents=[common],
+        help="react to a stored channel message (one reaction per reactor; empty clears yours)",
+    )
+    channel_react.add_argument("channel", metavar="NAME", help="channel to react in")
+    channel_react.add_argument(
+        "target",
+        metavar="HASH",
+        help="message hash or unique hex prefix (at least 8 characters)",
+    )
+    channel_react.add_argument(
+        "reaction",
+        nargs="?",
+        default=None,
+        metavar="EMOJI",
+        help="emoji or short token (omit with --clear to retract yours)",
+    )
+    channel_react.add_argument(
+        "--clear",
+        action="store_true",
+        help="retract your reaction to the message",
+    )
+    channel_react.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_react.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_react.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_react.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_react.set_defaults(func=cmd_channel_react)
 
     channel_read = channel_sub.add_parser(
         "read",
@@ -3515,6 +3980,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_search.set_defaults(func=cmd_channel_search)
 
+    channel_edit = channel_sub.add_parser(
+        "edit",
+        parents=[common],
+        help="edit your own message in a joined channel",
+    )
+    channel_edit.add_argument("channel", metavar="NAME", help="channel to edit in")
+    channel_edit.add_argument(
+        "target",
+        metavar="DIGEST|PREFIX",
+        help="message to edit (full digest, or a hex prefix of at least 4 characters)",
+    )
+    channel_edit.add_argument(
+        "text", nargs="?", help="replacement text (reads stdin when omitted)"
+    )
+    channel_edit.add_argument("--file", type=Path, help="read the replacement text from a file")
+    channel_edit.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_edit.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_edit.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_edit.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_edit.set_defaults(func=cmd_channel_edit)
+
+    channel_edits = channel_sub.add_parser(
+        "edits",
+        parents=[common],
+        help="list edit notices for a channel, newest first",
+    )
+    channel_edits.add_argument("channel", metavar="NAME", help="channel to list edits for")
+    channel_edits.add_argument(
+        "--limit",
+        type=int,
+        default=MAX_FEED_EDITS,
+        metavar="N",
+        help="show the newest N edits (default 50)",
+    )
+    channel_edits.set_defaults(func=cmd_channel_edits)
+
     channel_sync = channel_sub.add_parser(
         "sync",
         parents=[common],
@@ -3540,6 +4051,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_sync.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     channel_sync.set_defaults(func=cmd_channel_sync)
+
+    channel_retract = channel_sub.add_parser(
+        "retract",
+        parents=[common],
+        help="retract one of your own messages from a channel",
+    )
+    channel_retract.add_argument(
+        "channel", metavar="NAME", help="channel the message is in"
+    )
+    channel_retract.add_argument(
+        "digest",
+        metavar="DIGEST|PREFIX",
+        help="message hash or unique prefix (shown by `tau channel read`)",
+    )
+    channel_retract.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="gossip only to these peers (repeatable)",
+    )
+    channel_retract.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="retract locally without gossiping it to peers",
+    )
+    channel_retract.add_argument(
+        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
+    )
+    channel_retract.add_argument(
+        "--timeout", type=float, default=15.0, metavar="SECONDS"
+    )
+    channel_retract.set_defaults(func=cmd_channel_retract)
+
+    channel_retractions = channel_sub.add_parser(
+        "retractions",
+        parents=[common],
+        help="list stored retract notices for a channel",
+    )
+    channel_retractions.add_argument(
+        "channel", metavar="NAME", help="channel to list"
+    )
+    channel_retractions.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_CHANNEL_LIMIT,
+        metavar="N",
+        help="show the newest N notices (default 20)",
+    )
+    channel_retractions.set_defaults(func=cmd_channel_retractions)
 
     bundle = subparsers.add_parser(
         "bundle",
@@ -4684,6 +5245,7 @@ def _publish_local_channel_message(
     *,
     channel: str,
     text: Optional[str] = None,
+    reply_to: Optional[str] = None,
     to: Optional[List[str]] = None,
     ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
@@ -4702,7 +5264,7 @@ def _publish_local_channel_message(
         if not is_channel_member(conn, name):
             raise ChannelError(f"not a member of channel {name!r}; join it first")
         message = create_channel_message(
-            conn, node.identity, name, text, name=node.name
+            conn, node.identity, name, text, name=node.name, reply_to=reply_to
         )
     finally:
         conn.close()
@@ -4710,6 +5272,95 @@ def _publish_local_channel_message(
         message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
     )
     return {"message": message, "published": published}
+
+
+def _publish_local_channel_reaction(
+    node: TauNode,
+    *,
+    channel: str,
+    target: str,
+    reaction: str,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    name = clean_channel_name(channel)
+    conn = publisher.connect()
+    try:
+        if not is_channel_member(conn, name):
+            raise ChannelError(f"not a member of channel {name!r}; join it first")
+        record = create_channel_reaction(
+            conn, node.identity, name, target, reaction, name=node.name
+        )
+    finally:
+        conn.close()
+    published = publisher.publish_reaction(
+        record, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
+    return {"reaction": record, "published": published}
+
+
+def _publish_local_channel_edit(
+    node: TauNode,
+    *,
+    channel: str,
+    target: str,
+    text: Optional[str] = None,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    if text is None:
+        raise ChannelError("nothing to publish")
+    name = clean_channel_name(channel)
+    conn = publisher.connect()
+    try:
+        if not is_channel_member(conn, name):
+            raise ChannelError(f"not a member of channel {name!r}; join it first")
+        notice = create_channel_edit(conn, node.identity, name, target, text)
+    finally:
+        conn.close()
+    published = publisher.publish_edit(
+        notice, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
+    return {"edit": notice, "published": published}
+
+
+def _publish_local_channel_retraction(
+    node: TauNode,
+    *,
+    channel: str,
+    digest: str,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    name = clean_channel_name(channel)
+    return publisher.retract(
+        name,
+        digest,
+        publish=True,
+        targets=targets,
+        ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)),
+    )
 
 
 def _publish_local_post(
@@ -4725,14 +5376,58 @@ def _publish_local_post(
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
+    reaction_target: Optional[str] = None,
+    reaction: Optional[str] = None,
+    channel_edit: Optional[Dict[str, Any]] = None,
+    retract_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if channel is not None:
-        # A channel send rides the same local publish socket as a Tan
+    if channel_edit is not None:
+        # A channel edit rides the same local publish socket as a Tan
         # post; route it before the Tan-only handling below.
+        return _publish_local_channel_edit(
+            node,
+            channel=str(channel_edit.get("channel", "")),
+            target=str(channel_edit.get("target", "")),
+            text=channel_edit.get("text"),
+            to=to,
+            ttl=ttl,
+            timeout=timeout,
+        )
+    if retract_digest is not None:
+        # A channel retract rides the same local publish socket as a
+        # channel send; route it before the Tan-only handling below.
+        if channel is None:
+            raise ChannelError("a channel is required to retract a message")
+        return _publish_local_channel_retraction(
+            node,
+            channel=channel,
+            digest=retract_digest,
+            to=to,
+            ttl=ttl,
+            timeout=timeout,
+        )
+    if channel is not None:
+        if reaction_target is not None:
+            # A channel reaction rides the same local publish socket
+            # as a Tan post; route it before the Tan-only handling.
+            return _publish_local_channel_reaction(
+                node,
+                channel=channel,
+                target=reaction_target,
+                reaction=reaction if reaction is not None else "",
+                to=to,
+                ttl=ttl,
+                timeout=timeout,
+            )
+        # A channel send rides the same local publish socket as a Tan
+        # post; route it before the Tan-only handling below.  The
+        # channel reply target rides along: it is a channel message
+        # hash, not a Tan post hash, so it must not reach create_post.
         return _publish_local_channel_message(
             node,
             channel=channel,
             text=text,
+            reply_to=reply_to,
             to=to,
             ttl=ttl,
             timeout=timeout,
@@ -7331,12 +8026,19 @@ def cmd_tan_sync(args: argparse.Namespace) -> int:
         for error in summary["errors"]:
             print(f"  {short_hash(error['peer'])}: {error['error']}")
     return _EXIT_OK
-
-
 def _print_channel_messages(
-    messages: List[Dict[str, Any]], *, json_output: bool, channel: str
+    messages: List[Dict[str, Any]],
+    *,
+    json_output: bool,
+    channel: str,
+    reactions: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> None:
+    from .channels import summarize_reactions
+
     if json_output:
+        if reactions:
+            for message in messages:
+                message["reactions"] = reactions.get(str(message.get("hash", "")), [])
         _emit({"channel": channel, "messages": messages, "count": len(messages)}, True)
         return
     if not messages:
@@ -7345,9 +8047,33 @@ def _print_channel_messages(
     for message in messages:
         name = message.get("name") or "anonymous"
         author = short_hash(str(message.get("author", "")))
-        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}):")
+        edited = " (edited)" if message.get("edited") else ""
+        digest = short_hash(str(message.get("hash", "")))
+        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}){edited} [{digest}]:")
+        if message.get("reply_to"):
+            parent = message.get("reply_parent")
+            if parent:
+                parent_text = str(parent.get("text", "")).splitlines()
+                excerpt = parent_text[0] if parent_text else ""
+                print(
+                    f"  ↩ replying to {parent.get('name') or 'anonymous'}: {excerpt}"
+                )
+            else:
+                print(
+                    "  ↩ replying to "
+                    f"{short_hash(str(message['reply_to']))} "
+                    "(message not stored yet)"
+                )
         for line in str(message.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        summary = summarize_reactions(
+            (reactions or {}).get(str(message.get("hash", "")), [])
+        )
+        if summary:
+            joined = "  ".join(
+                f"{item['reaction']}×{item['count']}" for item in summary
+            )
+            print(f"  {joined}")
 
 
 def cmd_channel_join(args: argparse.Namespace) -> int:
@@ -7421,7 +8147,9 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
     if getattr(args, "no_publish", False):
         app = ChannelApp(config, _tan_identity(config), name=config.name)
         try:
-            message = app.send(name, text)
+            message = app.send(
+                name, text, reply_to=getattr(args, "reply_to", None)
+            )
         except ChannelError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -7437,6 +8165,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 config.data_dir,
                 channel=name,
                 text=text,
+                reply_to=getattr(args, "reply_to", None),
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
@@ -7455,6 +8184,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                     node,
                     channel=name,
                     text=text,
+                    reply_to=getattr(args, "reply_to", None),
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
@@ -7467,6 +8197,92 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         _emit({"message": message, "published": published}, True)
     else:
         print(f"sent to #{name} {short_hash(message['hash'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_react(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "clear", False):
+        if getattr(args, "reaction", None):
+            print("error: --clear takes no reaction", file=sys.stderr)
+            return 2
+        token = ""
+    else:
+        token = getattr(args, "reaction", None)
+        if token is None:
+            print("error: a reaction is required (or --clear to retract yours)", file=sys.stderr)
+            return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            record = app.react(name, args.target, token)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel=name,
+                reaction_target=args.target,
+                reaction=token,
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            record, published = result["reaction"], result["published"]
+        else:
+            try:
+                app = ChannelApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                app.attach(node)
+                result = _publish_local_channel_reaction(
+                    node,
+                    channel=name,
+                    target=args.target,
+                    reaction=token,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                record, published = result["reaction"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"reaction": record, "published": published}, True)
+    else:
+        if token:
+            print(
+                f"reacted {token} to {short_hash(record['target'])} in #{name}"
+            )
+        else:
+            print(f"retracted your reaction to {short_hash(record['target'])} in #{name}")
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -7493,15 +8309,40 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
         # The block-list failed closed: hide everything, like the
         # timeline does, instead of showing messages we cannot vet.
         messages = []
+        reactions: Dict[str, List[Dict[str, Any]]] = {}
     else:
         messages = [
             message
             for message in messages
             if str(message.get("author", "")) not in blocked
         ]
+        reactions = app.reactions(
+            name, [str(message.get("hash", "")) for message in messages]
+        )
     # History comes newest first; reading is oldest first.
     messages = list(reversed(messages))
-    _print_channel_messages(messages, json_output=json_output, channel=name)
+    # Resolve each reply's parent from the local store so the reader
+    # sees who and what is being answered.  A parent from a blocked
+    # author stays hidden, like a blocked message itself; a parent
+    # that has not arrived yet simply has no quote.
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        for message in messages:
+            if not message.get("reply_to"):
+                continue
+            parent = channel_reply_parent(conn, message)
+            if parent is None:
+                continue
+            if blocked is not None and str(parent.get("author", "")) in blocked:
+                continue
+            message["reply_parent"] = {
+                "hash": parent["hash"],
+                "name": parent.get("name", ""),
+                "text": parent.get("text", ""),
+            }
+    finally:
+        conn.close()
+    _print_channel_messages(messages, json_output=json_output, channel=name, reactions=reactions)
     return _EXIT_OK
 
 
@@ -7547,6 +8388,105 @@ def cmd_channel_search(args: argparse.Namespace) -> int:
         print(f"No messages in #{name} matching {query.strip()!r}.")
         return _EXIT_OK
     _print_channel_messages(messages, json_output=False, channel=name)
+    return _EXIT_OK
+
+
+def cmd_channel_edit(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            notice = app.edit(name, args.target, text)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel_edit={
+                    "channel": name,
+                    "target": args.target,
+                    "text": text,
+                },
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            notice, published = result["edit"], result["published"]
+        else:
+            try:
+                app = ChannelApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                app.attach(node)
+                result = _publish_local_channel_edit(
+                    node,
+                    channel=name,
+                    target=args.target,
+                    text=text,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                notice, published = result["edit"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"edit": notice, "published": published}, True)
+    else:
+        print(f"edited #{name} {short_hash(notice['target'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_edits(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    edits = app.edits(name, limit=int(getattr(args, "limit", MAX_FEED_EDITS)))
+    if json_output:
+        _emit({"channel": name, "edits": edits, "count": len(edits)}, True)
+        return _EXIT_OK
+    if not edits:
+        print(f"No stored edits in #{name}.")
+        return _EXIT_OK
+    for edit in edits:
+        author = short_hash(str(edit.get("author", "")))
+        target = short_hash(str(edit.get("target", "")))
+        print(f"[{_stamp(edit.get('created_at'))}] {target} by {author}:")
+        for line in str(edit.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
     return _EXIT_OK
 
 
@@ -7602,13 +8542,119 @@ def cmd_channel_sync(args: argparse.Namespace) -> int:
             print("No channels joined yet — join one with `tau channel join <name>`.")
             return _EXIT_OK
         for name, summary in summaries.items():
-            print(
+            line = (
                 f"#{name}: synced {summary['stored']} new message(s) "
                 f"from {summary['peers']} peer(s); "
                 f"{summary['duplicates']} duplicate(s)"
             )
+            reactions = summary.get("reactions_stored", 0)
+            if reactions:
+                noun = "reaction" if reactions == 1 else "reactions"
+                line += f"; {reactions} new {noun}"
+            if summary.get("edited"):
+                line += f"; {summary['edited']} edit(s) applied"
+            if summary.get("retracted"):
+                line += f"; {summary['retracted']} retraction(s)"
+            print(line)
             for error in summary["errors"]:
                 print(f"  {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_retract(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        if getattr(args, "no_publish", False):
+            app = ChannelApp(config, _tan_identity(config), name=config.name)
+            result = app.retract(name, args.digest)
+            notice, published = result["retraction"], result["published"]
+        else:
+            node = TauNode(config, name=config.name)
+            try:
+                node.start(exclusive=True)
+            except InstanceAlreadyRunning:
+                from .local_publish import publish_running
+
+                result = publish_running(
+                    config.data_dir,
+                    retract_digest=args.digest,
+                    channel=name,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                notice, published = result["retraction"], result["published"]
+            else:
+                try:
+                    app = ChannelApp(
+                        config,
+                        node.identity,
+                        name=config.name,
+                        request_timeout=float(getattr(args, "timeout", 15.0)),
+                    )
+                    app.attach(node)
+                    result = app.retract(
+                        name,
+                        args.digest,
+                        publish=True,
+                        targets=(
+                            [node.resolve_peer(target) for target in args.to]
+                            if getattr(args, "to", None)
+                            else None
+                        ),
+                        ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    )
+                    notice, published = result["retraction"], result["published"]
+                finally:
+                    node.stop()
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if json_output:
+        _emit({"channel": name, "retraction": notice, "published": published}, True)
+    else:
+        print(f"retracted {short_hash(notice['hash'])} from #{name}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_retractions(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    notices = app.retractions(name, limit=int(getattr(args, "limit", DEFAULT_CHANNEL_LIMIT)))
+    if json_output:
+        _emit({"channel": name, "retractions": notices, "count": len(notices)}, True)
+        return _EXIT_OK
+    if not notices:
+        print(f"No retractions recorded in #{name}.")
+        return _EXIT_OK
+    for notice in notices:
+        print(
+            f"[{_stamp(notice.get('created_at'))}] "
+            f"{short_hash(str(notice.get('author', '')))} retracted "
+            f"{short_hash(str(notice.get('hash', '')))}"
+        )
     return _EXIT_OK
 
 
@@ -9870,6 +10916,9 @@ def _send_local_message(
     location: Optional[Dict[str, Any]] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Send one DM on the running node, for the local send server.
 
@@ -9898,6 +10947,9 @@ def _send_local_message(
         kind=kind,
         location=location,
         send_after=send_after,
+        poll_options=poll_options,
+        poll_vote=poll_vote,
+        poll_close=poll_close,
     )
     result = _finalize_send_result(
         response, target=target, expires_at=expires_at, queued_before=queued_before
@@ -10014,6 +11066,7 @@ def _retract_group_local_message(
     timeout: float = 20.0,
     leg_timeout: Optional[float] = None,
     discover_timeout: Optional[float] = None,
+    target_author: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retract a group message on the running node, for the local send server.
 
@@ -10022,7 +11075,9 @@ def _retract_group_local_message(
     wait on the socket is unbounded for a fan-out, so the operation
     timeout cannot travel as ``timeout`` — send_running swallows that
     keyword as the reply wait.  An older client sends no leg timeout
-    and the default bound applies.
+    and the default bound applies.  ``target_author`` names the
+    message's author for a moderator retract; an author retract (and
+    an older client) omits it and the fan-out stamps this node.
     """
     return node.send_group_retraction(
         group,
@@ -10030,6 +11085,7 @@ def _retract_group_local_message(
         timeout=float(leg_timeout if leg_timeout is not None else timeout),
         discover_timeout=discover_timeout,
         target_sent_at=target_sent_at,
+        target_author=target_author,
     )
 
 
@@ -10241,6 +11297,9 @@ def _send_via_local_node(
     wait: float = 0.0,
     send_after: Optional[float] = None,
     location: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
     timeout = float(getattr(args, "timeout", 20.0))
@@ -10287,6 +11346,9 @@ def _send_via_local_node(
                     kind=kind,
                     location=location,
                     send_after=send_after,
+                    poll_options=poll_options,
+                    poll_vote=poll_vote,
+                    poll_close=poll_close,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 log.debug(
@@ -10347,6 +11409,9 @@ def _send_via_running_node(
     wait: float = 0.0,
     send_after: Optional[float] = None,
     location: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Send through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -10378,6 +11443,9 @@ def _send_via_running_node(
                 location=location,
                 wait=wait,
                 send_after=send_after,
+                poll_options=poll_options,
+                poll_vote=poll_vote,
+                poll_close=poll_close,
             )
         except LocalIPCUnavailable as exc:
             raise NodeError(
@@ -10448,6 +11516,7 @@ def _retract_group_via_running_node(
     *,
     timeout: float,
     discover_timeout: Optional[float],
+    target_author: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retract a group message through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -10462,6 +11531,7 @@ def _retract_group_via_running_node(
             group=group_id,
             message_id=message_id,
             target_sent_at=target_sent_at,
+            target_author=target_author,
             leg_timeout=timeout,
             discover_timeout=discover_timeout,
         )
@@ -10820,6 +11890,13 @@ def cmd_send(args: argparse.Namespace) -> int:
     if wait_given and getattr(args, "no_queue", False):
         print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
         return 2
+    poll_options = None
+    if getattr(args, "poll_options", None):
+        try:
+            poll_options = clean_poll_options(list(args.poll_options))
+        except PostError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     # Validate the pin before reading the message, so an invalid
     # --location fails at once instead of blocking on stdin.
     location = _location_from_args(args)
@@ -10881,12 +11958,14 @@ def cmd_send(args: argparse.Namespace) -> int:
         results = _send_via_running_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after, location=location,
+            poll_options=poll_options,
         )
     else:
         log.info("sending via a local one-shot node")
         results = _send_via_local_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after, location=location,
+            poll_options=poll_options,
         )
 
     failed = [result for result in results if not result.get("ok", True)]
@@ -11582,10 +12661,69 @@ def _attach_group_poll_tallies(
             entry["poll"] = match["poll"]
 
 
+def _attach_dm_poll_tallies(
+    inbox: Inbox,
+    entries: List[Dict[str, Any]],
+    own_hash: Optional[str],
+) -> None:
+    """Attach a ``poll`` tally to each DM-poll record in *entries*.
+
+    The tally derives from the conversation's full stored history —
+    votes a filter left out of *entries* (read votes under
+    ``--unread``, say) still count — so the history is re-read per
+    peer involved.  Entries are the copies
+    :meth:`Inbox.list_messages` returns, so attaching here never
+    touches the stored records.
+    """
+    peer_hashes = {
+        str(entry.get("destination"))
+        for entry in entries
+        if entry.get("kind") != "group" and entry.get("destination")
+    }
+    if not peer_hashes:
+        return
+    history: List[Dict[str, Any]] = []
+    for peer_hash in sorted(peer_hashes):
+        history.extend(
+            inbox.list_messages(limit=None, peer=peer_hash, direction=None)
+        )
+    attach_dm_poll_tallies(history, own_hash=own_hash)
+    by_id = {
+        (str(item.get("destination")), str(item.get("id"))): item
+        for item in history
+    }
+    for entry in entries:
+        if not is_dm_poll(entry):
+            continue
+        match = by_id.get(
+            (str(entry.get("destination")), str(entry.get("id")))
+        )
+        if match is not None and "poll" in match:
+            entry["poll"] = match["poll"]
+
+
 def _own_destination_hash(config: TauConfig) -> Optional[str]:
     """This node's destination hash, or ``None`` without an identity."""
     identity = load_identity(config.identity_path)
     return destination_hash(identity).hex() if identity is not None else None
+
+
+def _is_group_creator(config: TauConfig, target: Dict[str, Any]) -> bool:
+    """True when this node created the group *target* belongs to.
+
+    The creator is read from the pinned roster for the message's
+    group — the same record the receive path verifies a moderator
+    retract against — so a stale local copy cannot grant moderation
+    this node does not have.
+    """
+    group_id = target.get("group") or ""
+    if not group_id:
+        return False
+    own_hash = _own_destination_hash(config)
+    if own_hash is None:
+        return False
+    pinned = pinned_group(GroupStore(config.groups_path), str(group_id))
+    return pinned is not None and (pinned.get("creator") or "") == own_hash
 
 
 def _quote_line(
@@ -11773,7 +12911,7 @@ def _print_message_entry(
                 print(f"  live beacon · update {beacon['seq']} · expired")
     poll = entry.get("poll")
     if isinstance(poll, dict) and poll.get("options"):
-        # A group poll renders its tally under the question, like a
+        # A group or DM poll renders its tally under the question, like a
         # Tan poll: one line per option with its vote count, plus the
         # total and the closed state.  Votes and closes themselves are
         # never printed as messages (see cmd_messages).
@@ -11810,6 +12948,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
         muted_groups_for(config.muted_path),
         GroupStore(config.groups_path).list_groups(),
     )
+    # Quiet hours silence every conversation at once, like a mute on
+    # the whole node: the count and listing paths below read it
+    # through `quiet`, so the badge and the markers agree.
+    quiet = quiet_hours_active(config.quiet_hours_path)
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
@@ -11830,6 +12972,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
         counts = inbox.unread_counts(
             exclude_dm_from=muted_peers,
             exclude_group=muted_groups,
+            quiet=quiet,
         )
         per_peer = counts["per_peer"]
         per_group = counts["per_group"]
@@ -11845,7 +12988,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
             else:
                 here = sum(
                     1
-                    for entry in inbox.list_messages(peer=peer_hash, group=group_ids)
+                    for entry in inbox.list_messages(
+                        peer=peer_hash, group=group_ids, quiet=quiet
+                    )
                     if entry.get("unread")
                     and entry.get("destination") not in blocked
                 )
@@ -11927,6 +13072,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
         unread = inbox.unread_counts(
             exclude_dm_from=muted_peers,
             exclude_group=muted_groups,
+            quiet=quiet,
         )["per_peer"].get(peer_hash, 0)
         if _json_mode(args):
             _emit(
@@ -11961,6 +13107,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
         kind=kind,
         exclude_dm_from=muted_peers,
         exclude_group=muted_groups,
+        quiet=quiet,
     )
     # A stored reaction from a non-member must never be displayed on
     # a group message, even when the authorization recheck or its
@@ -12058,6 +13205,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
     _attach_group_poll_tallies(
         inbox, entries, _own_destination_hash(config)
     )
+    _attach_dm_poll_tallies(
+        inbox, entries, _own_destination_hash(config)
+    )
     shown = entries if limit is None else entries[:limit]
     omitted = entries[len(shown):]
     # Unread mail the window omitted: reported, never silently cleared.
@@ -12097,6 +13247,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             for entry in shown
             if not is_group_poll_vote(entry)
             and not is_group_poll_close(entry)
+            and not is_dm_poll_vote(entry)
+            and not is_dm_poll_close(entry)
         ]
         for entry in printable:
             _print_message_entry(
@@ -12331,6 +13483,7 @@ def cmd_pinned(args: argparse.Namespace) -> int:
     else:
         own_hash = _own_destination_hash(config)
         _attach_group_poll_tallies(inbox, shown, own_hash)
+        _attach_dm_poll_tallies(inbox, shown, own_hash)
         for entry in shown:
             _print_message_entry(
                 inbox, registry, entry, blocked=blocked, own_hash=own_hash
@@ -12760,17 +13913,37 @@ def cmd_mute(args: argparse.Namespace) -> int:
     if getattr(args, "off", False) and args.peer is None and args.group is None:
         print("error: --off needs a --peer or --group to unmute", file=sys.stderr)
         return _EXIT_ERROR
+    for_duration = getattr(args, "for_duration", None)
+    if for_duration is not None and args.peer is None and args.group is None:
+        print("error: --for needs a --peer or --group to mute", file=sys.stderr)
+        return _EXIT_ERROR
+    if getattr(args, "off", False) and for_duration is not None:
+        print("error: --off and --for cannot be combined", file=sys.stderr)
+        return _EXIT_ERROR
     if args.peer is None and args.group is None:
         # No target lists what is muted, mirroring `tau archived`.
         muted = load_muted(config.muted_path)
+        now = time.time()
         if _json_mode(args):
-            _emit(
-                {
-                    "peers": sorted(muted.peers),
-                    "groups": sorted(muted.groups),
-                },
-                True,
-            )
+            payload: Dict[str, Any] = {
+                "peers": sorted(muted.peers),
+                "groups": sorted(muted.groups),
+            }
+            peer_until = {
+                key: until
+                for key, until in sorted(muted.peer_until.items())
+                if key in muted.peers
+            }
+            if peer_until:
+                payload["peer_until"] = peer_until
+            group_until = {
+                key: until
+                for key, until in sorted(muted.group_until.items())
+                if key in muted.groups
+            }
+            if group_until:
+                payload["group_until"] = group_until
+            _emit(payload, True)
             return _EXIT_OK
         registry = PeerRegistry(config.peers_path)
         store = GroupStore(config.groups_path)
@@ -12780,14 +13953,26 @@ def cmd_mute(args: argparse.Namespace) -> int:
         for destination in sorted(muted.peers):
             peer = registry.get(destination)
             name = peer.display_name if peer is not None else "unknown"
-            print(f"{name} ({short_hash(destination)})")
+            until = muted.muted_until_peer(destination, now=now)
+            suffix = (
+                f" — muted for {_ago(until - now)} more"
+                if until is not None
+                else ""
+            )
+            print(f"{name} ({short_hash(destination)}){suffix}")
         for group_id in sorted(muted.groups):
             try:
                 group = store.find(group_id)
                 label = f"group {group['name']} ({short_hash(group_id)})"
             except (ValueError, KeyError):
                 label = f"group {short_hash(group_id)}"
-            print(label)
+            until = muted.muted_until_group(group_id, now=now)
+            suffix = (
+                f" — muted for {_ago(until - now)} more"
+                if until is not None
+                else ""
+            )
+            print(f"{label}{suffix}")
         return _EXIT_OK
     if args.group is not None:
         store = GroupStore(config.groups_path)
@@ -12805,6 +13990,15 @@ def cmd_mute(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else "unknown"
         label = f"conversation with {name} ({short_hash(key)})"
         is_group = False
+    seconds = None
+    until = None
+    if for_duration is not None:
+        try:
+            seconds = _parse_duration(for_duration, flag="--for")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        until = time.time() + seconds
     # Reload inside the lock: two mute commands racing must not
     # discard each other's change to a different conversation.
     with muted_lock(config.muted_path):
@@ -12815,20 +14009,31 @@ def cmd_mute(args: argparse.Namespace) -> int:
             return _EXIT_ERROR
         if is_group:
             previous = muted.is_muted_group_lineage(lineage)
+            previous_until = muted.muted_until_group_lineage(lineage)
             if getattr(args, "off", False):
-                muted = muted.without_group_lineage(lineage)
+                updated = muted.without_group_lineage(lineage)
             else:
-                muted = muted.with_group_lineage(lineage)
+                updated = muted.with_group_lineage(lineage, until=until)
         else:
             previous = muted.is_muted_peer(key)
+            previous_until = muted.muted_until_peer(key)
             if getattr(args, "off", False):
-                muted = muted.without_peer(key)
+                updated = muted.without_peer(key)
             else:
-                muted = muted.with_peer(key)
-        changed = previous != (not getattr(args, "off", False))
+                updated = muted.with_peer(key, until=until)
+        # Compare whole objects: re-muting with a different expiry is
+        # a change even when the conversation was already muted.
+        changed = updated != muted
         if changed:
-            save_muted(config.muted_path, muted)
+            save_muted(config.muted_path, updated)
     current = not getattr(args, "off", False)
+    # The expiry of the state just saved: a plain re-mute clears a
+    # timed mute back to indefinite, so read it off `updated`, not
+    # off the previous state.
+    if is_group:
+        effective_until = updated.muted_until_group_lineage(lineage)
+    else:
+        effective_until = updated.muted_until_peer(key)
     if _json_mode(args):
         _emit(
             {
@@ -12836,6 +14041,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
                 "group": is_group,
                 "muted": current,
                 "changed": changed,
+                "until": effective_until,
             },
             True,
         )
@@ -12845,13 +14051,121 @@ def cmd_mute(args: argparse.Namespace) -> int:
             print(f"Unmuted {label}: its messages count as unread again.")
         else:
             print(f"{label} was not muted.")
-    elif previous:
-        print(f"{label} is already muted.")
+    elif previous and not changed:
+        if previous_until is not None:
+            print(
+                f"{label} is already muted for "
+                f"{_ago(previous_until - time.time())} more; pass --for to "
+                "change it, or --off to unmute."
+            )
+        else:
+            print(f"{label} is already muted.")
+    elif seconds is not None:
+        print(
+            f"Muted {label} for {_describe_duration(seconds)}: its messages "
+            "still arrive, but never light the unread badge until then."
+        )
     else:
         print(
             f"Muted {label}: its messages still arrive, but never light "
             "the unread badge."
         )
+    return _EXIT_OK
+
+
+def _quiet_hours_payload(
+    quiet_hours: Optional[QuietHours], now: Optional[float] = None
+) -> Dict[str, Any]:
+    """A quiet-hours window as JSON: the window, and whether it is quiet now."""
+    now = time.time() if now is None else now
+    if quiet_hours is None:
+        return {
+            "enabled": False,
+            "start": None,
+            "end": None,
+            "quiet_now": False,
+            "quiet_minutes_left": None,
+        }
+    remaining = quiet_hours.minutes_until_end(now)
+    return {
+        "enabled": quiet_hours.enabled,
+        "start": format_time(quiet_hours.start),
+        "end": format_time(quiet_hours.end),
+        "quiet_now": quiet_hours.is_quiet(now),
+        "quiet_minutes_left": remaining,
+    }
+
+
+def _quiet_hours_line(
+    quiet_hours: QuietHours, now: Optional[float] = None
+) -> str:
+    """One human-readable line for a quiet-hours window."""
+    now = time.time() if now is None else now
+    window = f"{format_time(quiet_hours.start)}–{format_time(quiet_hours.end)}"
+    if not quiet_hours.enabled:
+        return f"Quiet hours {window} are off."
+    remaining = quiet_hours.minutes_until_end(now)
+    if remaining is not None:
+        return (
+            f"Quiet hours {window} — quiet now, "
+            f"{_ago(remaining * 60)} left."
+        )
+    return f"Quiet hours {window} — not quiet now."
+
+
+def cmd_quiet_hours_set(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        window = QuietHours.from_dict(
+            {"start": args.start, "end": args.end}
+        )
+    except QuietHoursError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    # Reload inside the lock: a corrupt file fails loudly instead of
+    # being silently overwritten, like the mute command.
+    with quiet_hours_lock(config.quiet_hours_path):
+        try:
+            load_quiet_hours(config.quiet_hours_path)
+        except QuietHoursError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        save_quiet_hours(config.quiet_hours_path, window)
+    if _json_mode(args):
+        _emit(_quiet_hours_payload(window), True)
+        return _EXIT_OK
+    print(f"Quiet hours set: {format_time(window.start)}–{format_time(window.end)} every day.")
+    if window.is_quiet():
+        print("It is quiet now — the unread badge stays dark until the window ends.")
+    return _EXIT_OK
+
+
+def cmd_quiet_hours_off(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    path = Path(config.quiet_hours_path)
+    if not path.exists():
+        if _json_mode(args):
+            _emit(_quiet_hours_payload(None), True)
+            return _EXIT_OK
+        print("No quiet hours set.")
+        return _EXIT_OK
+    with quiet_hours_lock(config.quiet_hours_path):
+        try:
+            current = load_quiet_hours(config.quiet_hours_path)
+        except QuietHoursError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        updated = QuietHours(
+            enabled=False, start=current.start, end=current.end
+        )
+        save_quiet_hours(config.quiet_hours_path, updated)
+    if _json_mode(args):
+        _emit(_quiet_hours_payload(updated), True)
+        return _EXIT_OK
+    print(
+        f"Quiet hours off (window {format_time(updated.start)}–"
+        f"{format_time(updated.end)} kept)."
+    )
     return _EXIT_OK
 
 
@@ -12885,6 +14199,27 @@ def cmd_away_on(args: argparse.Namespace) -> int:
         "Away reply on: the first DM from each peer gets one reply:\n"
         f"{state.message}"
     )
+    return _EXIT_OK
+
+
+def cmd_quiet_hours_status(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    path = Path(config.quiet_hours_path)
+    if not path.exists():
+        if _json_mode(args):
+            _emit(_quiet_hours_payload(None), True)
+            return _EXIT_OK
+        print("No quiet hours set.")
+        return _EXIT_OK
+    try:
+        current = load_quiet_hours(config.quiet_hours_path)
+    except QuietHoursError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    if _json_mode(args):
+        _emit(_quiet_hours_payload(current), True)
+        return _EXIT_OK
+    print(_quiet_hours_line(current))
     return _EXIT_OK
 
 
@@ -14570,6 +15905,245 @@ def _group_poll_history(
     return inbox.list_messages(limit=None, group=group_id, direction=None)
 
 
+def _resolve_dm_poll(
+    inbox: Inbox, ref: str, peer_hash: str
+) -> Dict[str, Any]:
+    """Resolve ``tau vote`` / ``close-poll`` to one stored DM poll.
+
+    Same scoping as :func:`_resolve_group_poll` but for a DM
+    conversation: the reference (a message id or unique prefix, as
+    shown by ``tau messages``) must match exactly one stored poll
+    record with this peer.  A vote or close record never resolves
+    — only the poll itself can be voted on or closed.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("poll must not be empty")
+    matches = [
+        item
+        for item in inbox.find_prefix(ref, peer=peer_hash)
+        if is_dm_poll(item)
+    ]
+    exact = [m for m in matches if str(m["id"]) == ref]
+    if not exact:
+        folded = ref.lower()
+        exact = [m for m in matches if str(m["id"]).lower() == folded]
+    if exact:
+        matches = exact
+    if len(matches) > 1:
+        raise NodeError(
+            f"{len(matches)} polls with this peer match {ref!r};"
+            " use a longer prefix"
+        )
+    if not matches:
+        raise NodeError(
+            f"no poll {ref!r} with this peer;"
+            " votes name a poll from this conversation's history"
+        )
+    return matches[0]
+
+
+def _dm_poll_history(inbox: Inbox, peer_hash: str) -> List[Dict[str, Any]]:
+    """This conversation's stored messages, for tallying one of its polls."""
+    return inbox.list_messages(limit=None, peer=peer_hash, direction=None)
+
+
+def _send_dm_poll_message(
+    args: argparse.Namespace,
+    config: TauConfig,
+    peer: str,
+    text: str,
+    *,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Send one DM poll vote or close, like ``cmd_send``.
+
+    Votes and closes carry no expiry, schedule, quote, or wait —
+    the same two routes as a plain DM send (the serving node, else
+    a one-shot local node) with the poll payload attached.
+    """
+    if _send_routes_via_running_node(config):
+        results = _send_via_running_node(
+            args,
+            config,
+            text,
+            [peer],
+            expires_at=None,
+            reply_ids={},
+            wait=0.0,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+    else:
+        results = _send_via_local_node(
+            args,
+            config,
+            text,
+            [peer],
+            expires_at=None,
+            reply_ids={},
+            wait=0.0,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+    return {"results": results}
+
+
+def _report_dm_poll_send(
+    args: argparse.Namespace,
+    response: Dict[str, Any],
+    summary: str,
+) -> int:
+    """Report a DM poll vote/close send, like ``cmd_send`` does."""
+    results = response.get("results") or []
+    # A direct delivery keeps no "delivered" key — the single-recipient
+    # send shape carries "ok" instead (see _finalize_send_result) — so
+    # delivered is "ok" and not queued and not explicitly undelivered,
+    # the same rule cmd_send reports by.
+    failed = [
+        result
+        for result in results
+        if not result.get("ok", True) or result.get("delivered") is False
+    ]
+    if _json_mode(args):
+        _emit(response, True)
+        return _EXIT_ERROR if failed else _EXIT_OK
+    print(summary)
+    for result in results:
+        name = result.get("target") or (result.get("to") or "")[:8]
+        if result.get("queued"):
+            print(f"queued for {name} — they are unreachable right now")
+        elif result.get("ok", True) and result.get("delivered") is not False:
+            print(f"delivered to {name}")
+        else:
+            print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+    return _EXIT_ERROR if failed else _EXIT_OK
+
+
+def cmd_vote(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.to, direction=None
+        )
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        poll = _resolve_dm_poll(inbox, args.poll, peer_hash)
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    history = _dm_poll_history(inbox, peer_hash)
+    own_hash = _own_destination_hash(config)
+    tally = dm_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is closed", file=sys.stderr)
+        return 2
+    options = tally["options"]
+    choice = str(args.option).strip()
+    index: Optional[int] = None
+    if choice.isdigit():
+        index = int(choice) - 1
+    else:
+        for position, option in enumerate(options):
+            if option == choice:
+                index = position
+                break
+    if index is None or not 0 <= index < len(options):
+        print(
+            "error: option must be a number 1-"
+            f"{len(options)} or one of: {', '.join(options)}",
+            file=sys.stderr,
+        )
+        return 2
+    identity = poll_identity(poll, own_hash)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        response = _send_dm_poll_message(
+            args,
+            config,
+            args.to,
+            f"voted: {options[index]}",
+            poll_vote={
+                "target": {"author": identity[0], "sent_at": identity[1]},
+                "option": index,
+            },
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    summary = (
+        f"voted for {options[index]!r} on {poll.get('text')!r}"
+        f" with {name}"
+    )
+    return _report_dm_poll_send(args, response, summary)
+
+
+def cmd_close_poll(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.to, direction=None
+        )
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        poll = _resolve_dm_poll(inbox, args.poll, peer_hash)
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    own_hash = _own_destination_hash(config)
+    identity = poll_identity(poll, own_hash)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    if own_hash is None or identity[0] != own_hash.lower():
+        print(
+            "error: only the poll's creator can close it",
+            file=sys.stderr,
+        )
+        return 2
+    history = _dm_poll_history(inbox, peer_hash)
+    tally = dm_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is already closed", file=sys.stderr)
+        return 2
+    try:
+        response = _send_dm_poll_message(
+            args,
+            config,
+            args.to,
+            "closed the poll",
+            poll_close={"author": identity[0], "sent_at": identity[1]},
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    summary = f"closed the poll {poll.get('text')!r} with {name}"
+    return _report_dm_poll_send(args, response, summary)
+
+
 def cmd_group_poll(args: argparse.Namespace) -> int:
     config = _make_config(args)
     try:
@@ -14785,6 +16359,224 @@ def cmd_group_send_file(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _describe_broadcast(
+    broadcast: Dict[str, Any], registry: PeerRegistry
+) -> Dict[str, Any]:
+    """A broadcast list record with member display names for output."""
+    members = []
+    for member_hash in broadcast["members"]:
+        peer = registry.get(member_hash)
+        members.append(
+            {
+                "hash": member_hash,
+                "name": peer.display_name if peer is not None else member_hash[:8],
+            }
+        )
+    return {
+        "name": broadcast["name"],
+        "members": members,
+        "created_at": broadcast["created_at"],
+    }
+
+
+def cmd_broadcast_create(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        members: List[str] = []
+        for target in getattr(args, "peer", []):
+            peer = node.resolve_peer(
+                target,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+            if peer.hexhash == own_hash:
+                raise NodeError(
+                    "cannot add yourself to a broadcast list;"
+                    " you are the sender, not a member"
+                )
+            if peer.hexhash not in members:
+                members.append(peer.hexhash)
+        if not members:
+            raise NodeError("a broadcast list needs at least one peer")
+        store = BroadcastStore(config.broadcasts_path)
+        try:
+            broadcast = store.create(args.broadcast_name, members)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    finally:
+        node.stop()
+
+    described = _describe_broadcast(broadcast, node.registry)
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    print(f"created broadcast list {broadcast['name']}")
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members get a private DM each — they never see the list.")
+    return _EXIT_OK
+
+
+def cmd_broadcast_list(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    registry = PeerRegistry(config.peers_path)
+    lists = [_describe_broadcast(entry, registry) for entry in store.list_broadcasts()]
+    if _json_mode(args):
+        _emit({"broadcasts": lists, "count": len(lists)}, True)
+        return _EXIT_OK
+    if not lists:
+        print("No broadcast lists yet — create one with `tau broadcast create NAME --peer ...`.")
+        return _EXIT_OK
+    for entry in lists:
+        names = ", ".join(member["name"] for member in entry["members"])
+        print(f"{entry['name']} ({len(entry['members'])} members) — {names}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_show(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_broadcast(broadcast, PeerRegistry(config.peers_path))
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    print(f"{described['name']} ({len(described['members'])} members)")
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    return _EXIT_OK
+
+
+def _change_broadcast_members(args: argparse.Namespace, *, adding: bool) -> int:
+    """Add peers to, or remove peers from, a broadcast list.
+
+    Adding resolves each peer (with discovery, like ``tau group
+    add-member``), so a mistyped or unknown peer is refused before the
+    list changes.  Removing only needs the hash already in the list:
+    an offline member may have left the registry, and resolving it
+    would wait out the whole discover timeout.
+    """
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    members = list(broadcast["members"])
+    if adding:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            own_hash = node.destination_hexhash
+            resolved: List[str] = []
+            for target in getattr(args, "peer", []):
+                peer = node.resolve_peer(
+                    target,
+                    timeout=float(getattr(args, "discover_timeout", 10.0)),
+                )
+                if peer.hexhash == own_hash:
+                    raise NodeError(
+                        "cannot add yourself to a broadcast list;"
+                        " you are the sender, not a member"
+                    )
+                if peer.hexhash in members:
+                    raise NodeError(
+                        f"{peer.display_name} is already on"
+                        f" broadcast list {broadcast['name']!r}"
+                    )
+                if peer.hexhash not in resolved:
+                    resolved.append(peer.hexhash)
+            try:
+                updated = store.add_members(broadcast["name"], resolved)
+            except ValueError as exc:
+                raise NodeError(str(exc)) from exc
+        finally:
+            node.stop()
+    else:
+        registry = PeerRegistry(config.peers_path)
+        resolved = []
+        for target in getattr(args, "peer", []):
+            fast = _roster_hash(target, members)
+            if fast is not None:
+                resolved.append(fast)
+                continue
+            peer = registry.resolve(target)
+            if peer is None:
+                raise NodeError(f"unknown peer: {target!r}")
+            if peer.hexhash not in members:
+                raise NodeError(
+                    f"{peer.display_name} is not on"
+                    f" broadcast list {broadcast['name']!r}"
+                )
+            resolved.append(peer.hexhash)
+        try:
+            updated = store.remove_members(broadcast["name"], resolved)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    described = _describe_broadcast(updated, PeerRegistry(config.peers_path))
+    if _json_mode(args):
+        _emit({"broadcast": described}, True)
+        return _EXIT_OK
+    names = ", ".join(member["name"] for member in described["members"])
+    print(f"{described['name']} ({len(described['members'])} members) — {names}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_add_member(args: argparse.Namespace) -> int:
+    return _change_broadcast_members(args, adding=True)
+
+
+def cmd_broadcast_remove_member(args: argparse.Namespace) -> int:
+    return _change_broadcast_members(args, adding=False)
+
+
+def cmd_broadcast_delete(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not store.delete(broadcast["name"]):
+        raise NodeError(f"unknown broadcast list: {args.broadcast!r}")
+    if _json_mode(args):
+        _emit({"deleted": broadcast["name"]}, True)
+        return _EXIT_OK
+    print(f"deleted broadcast list {broadcast['name']}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_send(args: argparse.Namespace) -> int:
+    """Send a message to every member of a broadcast list, as a private DM each.
+
+    Delivery reuses :func:`cmd_send` wholesale: each member gets their
+    own send, sent record and store-and-forward envelope, so an offline
+    member queues exactly like a one-to-one DM and no list metadata
+    ever reaches a recipient.
+    """
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not broadcast["members"]:
+        # Unreachable through the store (it refuses empty lists), but
+        # a hand-edited broadcasts.json must not send to nobody silently.
+        raise NodeError(f"broadcast list {broadcast['name']!r} has no members")
+    # `cmd_send` reads its text from `args.message` and its targets from
+    # `args.to`; hand it the list's members and let it own delivery,
+    # queueing, and output.
+    args.to = list(broadcast["members"])
+    return cmd_send(args)
+
+
 def cmd_note(args: argparse.Namespace) -> int:
     """Save a private note to self in the local inbox.
 
@@ -14811,6 +16603,176 @@ def cmd_note(args: argparse.Namespace) -> int:
         print(f"note saved #{_safe_id_prefix(str(entry['id']))} [note]")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+    return _EXIT_OK
+
+
+def _resolve_draft_target(
+    config: TauConfig, args: argparse.Namespace
+) -> Tuple[str, str, str]:
+    """Resolve a draft command's ``--to``/``--group`` to ``(kind, id, name)``.
+
+    Peers resolve through the local registry only — a draft is local
+    state for someone this node already knows, so there is no reason to
+    start a node and discover.  Groups resolve through the group store.
+    """
+    if getattr(args, "group", None):
+        try:
+            group = GroupStore(config.groups_path).find(args.group)
+        except ValueError:
+            raise NodeError(f"unknown group: {args.group!r}") from None
+        return "group", str(group["id"]), str(group["name"])
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = _resolve_sent_peer(registry, args.to)
+    identity = load_identity(config.identity_path)
+    if identity is not None and peer_hash == destination_hash(identity).hex():
+        raise NodeError(
+            "cannot draft a message to yourself — save a note instead"
+        )
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    return "peer", peer_hash, name
+
+
+def _describe_draft(
+    draft: Dict[str, Any], config: TauConfig
+) -> Dict[str, Any]:
+    """A draft plus its conversation's display name, for output."""
+    if draft["kind"] == "group":
+        group = GroupStore(config.groups_path).get(str(draft["target"]))
+        name = str(group["name"]) if group is not None else short_hash(draft["target"])
+    else:
+        peer = PeerRegistry(config.peers_path).get(str(draft["target"]))
+        name = peer.display_name if peer is not None else short_hash(draft["target"])
+    return {
+        "kind": draft["kind"],
+        "target": draft["target"],
+        "target_name": name,
+        "text": draft["text"],
+        "updated_at": draft["updated_at"],
+    }
+
+
+def _draft_preview(text: str) -> str:
+    """First line of a draft, truncated for a list row."""
+    first = text.splitlines()[0] if text.splitlines() else ""
+    return first if len(first) <= 60 else first[:57] + "…"
+
+
+def cmd_draft_save(args: argparse.Namespace) -> int:
+    """Save a message as a draft for a peer or a group.
+
+    Local-only: the text is validated like a send but never queued or
+    transmitted.  Saving again overwrites the conversation's draft.
+    """
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    text = _read_message(args)
+    try:
+        draft = DraftStore(config.drafts_path).save(kind, target, text)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_draft(draft, config)
+    if _json_mode(args):
+        _emit({"draft": described}, True)
+    else:
+        print(f"draft saved for {name}")
+        for line in described["text"].splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_draft_list(args: argparse.Namespace) -> int:
+    """List saved message drafts, oldest first."""
+    config = _make_config(args)
+    drafts = [
+        _describe_draft(draft, config)
+        for draft in DraftStore(config.drafts_path).list_drafts()
+    ]
+    if _json_mode(args):
+        _emit({"drafts": drafts, "count": len(drafts)}, True)
+        return _EXIT_OK
+    if not drafts:
+        print("No drafts yet — save one with `tau draft save --to PEER \"text\"`.")
+        return _EXIT_OK
+    for draft in drafts:
+        where = "group " if draft["kind"] == "group" else ""
+        age = _ago(time.time() - float(draft["updated_at"]))
+        print(
+            f"{where}{draft['target_name']} ({draft['target'][:8]}) — "
+            f"{_draft_preview(str(draft['text']))} [{age} ago]"
+        )
+    return _EXIT_OK
+
+
+def cmd_draft_show(args: argparse.Namespace) -> int:
+    """Print a saved draft's full text."""
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    draft = DraftStore(config.drafts_path).get(kind, target)
+    if draft is None:
+        raise NodeError(f"no draft for {name}")
+    if _json_mode(args):
+        _emit({"draft": _describe_draft(draft, config)}, True)
+    else:
+        print(draft["text"])
+    return _EXIT_OK
+
+
+def cmd_draft_delete(args: argparse.Namespace) -> int:
+    """Discard a saved draft."""
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    if not DraftStore(config.drafts_path).delete(kind, target):
+        raise NodeError(f"no draft for {name}")
+    if _json_mode(args):
+        _emit(
+            {"deleted": {"kind": kind, "target": target, "target_name": name}},
+            True,
+        )
+    else:
+        print(f"deleted draft for {name}")
+    return _EXIT_OK
+
+
+def cmd_draft_send(args: argparse.Namespace) -> int:
+    """Send a saved draft through the normal send path.
+
+    The draft is deleted once the message is queued or delivered — a
+    failed send keeps it, so nothing is lost to a transient failure.
+    Delivery reuses :func:`cmd_send` wholesale for a peer target, or
+    :func:`cmd_group_send` for a group target, exactly like a forward.
+    """
+    config = _make_config(args)
+    kind, target, name = _resolve_draft_target(config, args)
+    store = DraftStore(config.drafts_path)
+    draft = store.get(kind, target)
+    if draft is None:
+        raise NodeError(f"no draft for {name}")
+    # `cmd_send`/`cmd_group_send` read their text from `args.message`;
+    # hand them the draft text and let them own delivery, queueing, and
+    # output.  The remaining flags come from this subcommand's parser.
+    args.message = str(draft["text"])
+    args.file = None
+    args.location = None
+    args.kind = None
+    args.delay = None
+    args.expire = None
+    args.reply_to = None
+    if kind == "group":
+        args.group = target
+        code = cmd_group_send(args)
+    else:
+        args.to = [target]
+        code = cmd_send(args)
+    if code != _EXIT_OK:
+        print(
+            f"draft for {name} kept — the send failed",
+            file=sys.stderr,
+        )
+        return code
+    store.delete(kind, target)
+    if not _json_mode(args):
+        print(f"sent draft to {name}")
     return _EXIT_OK
 
 
@@ -15052,11 +17014,15 @@ def _retract_group_message(
     registry: PeerRegistry,
     target: Dict[str, Any],
 ) -> int:
-    """Retract a sent group message, fanning out to every member.
+    """Retract a group message, fanning out to every member.
 
-    Queued legs are cancelled by the fan-out (see
+    An author retracts their own sent message; a group creator may
+    also retract a member's message (moderation — see
+    :func:`cmd_retract`), in which case the fan-out carries that
+    member as the target author and reaches the author too.  Queued
+    legs are cancelled by the fan-out (see
     :meth:`tau.node.TauNode.send_group_retraction`), so a member whose
-    leg never left never receives the message.  The local sent copy is
+    leg never left never receives the message.  The local copy is
     dropped only when every member received the retract: a partial
     fan-out keeps it, so the user can retry the members still holding
     the message — re-sending is idempotent, and a member who already
@@ -15065,12 +17031,23 @@ def _retract_group_message(
     group_id = target.get("group") or ""
     if not group_id:
         raise NodeError("that group message has no group to retract from")
+    moderating = target.get("direction") == "in"
     leg_sent_at = target.get("leg_sent_at")
+    if leg_sent_at is None and moderating:
+        # A received copy carries the legs' shared send time as its
+        # sent_at (the author's send time); a sent record carries it
+        # as leg_sent_at instead.
+        leg_sent_at = target.get("sent_at")
     if leg_sent_at is None:
         raise NodeError(
             "that group message was sent before group retracts landed; "
             "it carries no leg send time, so it cannot be retracted"
         )
+    # The author of the message being retracted: this node for an
+    # author retract, the sender of the received copy for a moderator
+    # retract.  Receivers resolve their copy — and key the durable
+    # marker — by this hash (see TauNode._handle_retract).
+    target_author = target.get("destination") or None
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
     via_running_node = _send_routes_via_running_node(config)
@@ -15087,6 +17064,7 @@ def _retract_group_message(
                 float(leg_sent_at),
                 timeout=timeout,
                 discover_timeout=discover_timeout,
+                target_author=target_author,
             )
         except NodeError as exc:
             # Retracts ride the live link only in v1 — there is no
@@ -15107,6 +17085,7 @@ def _retract_group_message(
                     timeout=timeout,
                     discover_timeout=discover_timeout,
                     target_sent_at=float(leg_sent_at),
+                    target_author=target_author,
                 )
             except NodeError as exc:
                 # Retracts ride the live link only in v1 — there is no
@@ -15121,6 +17100,16 @@ def _retract_group_message(
 
     results = response.get("results") or []
     failed = [r for r in results if not r.get("delivered")]
+    if moderating:
+        author_peer = registry.get(target_author or "")
+        author_name = (
+            author_peer.display_name
+            if author_peer is not None
+            else short_hash(target_author or "")
+        )
+        message_label = f"{author_name}'s group message"
+    else:
+        message_label = "your group message"
     if _json_mode(args):
         _emit(
             {
@@ -15141,7 +17130,7 @@ def _retract_group_message(
             if result.get("delivered"):
                 if result.get("deleted"):
                     print(
-                        f"retracted your group message "
+                        f"retracted {message_label} "
                         f"{_safe_id_prefix(str(target['id']))} from {name}'s inbox"
                     )
                 else:
@@ -15407,10 +17396,16 @@ def cmd_retract(args: argparse.Namespace) -> int:
     if not target.get("id"):
         raise NodeError("that message has no id to retract")
     if target.get("direction") != "out":
-        raise NodeError(
-            "that message was not sent by this node;"
-            " only your own sent messages can be retracted"
-        )
+        # A group creator may retract a member's message (moderation):
+        # a received group message is retractable when this node
+        # created the group.  Anything else still needs a sent copy.
+        if target.get("kind") != "group" or not _is_group_creator(
+            config, target
+        ):
+            raise NodeError(
+                "that message was not sent by this node;"
+                " only your own sent messages can be retracted"
+            )
     if target.get("kind") == "group":
         return _retract_group_message(args, config, inbox, registry, target)
     recipient = target.get("destination") or ""

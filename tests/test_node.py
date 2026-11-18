@@ -129,6 +129,138 @@ def test_send_message_sends_location_on_the_wire(tmp_path, monkeypatch):
     assert parse_message(sent["payload"])["kind"] == "chat"
 
 
+def test_send_message_sends_poll_options_on_the_wire(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    sent = {}
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    node.send_message("alice", "which day?", poll_options=["Saturday", "Sunday"])
+    parsed = parse_message(sent["payload"])
+    assert parsed["poll_options"] == ["Saturday", "Sunday"]
+    assert parsed["poll_vote"] is None
+    assert parsed["poll_close"] is None
+    # The sender's own record carries the options and the shared wire
+    # time, so the tally can resolve the poll it sent.
+    stored = node.inbox.list_messages(direction="out")
+    assert len(stored) == 1
+    assert stored[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert stored[0]["leg_sent_at"] == parsed["sent_at"]
+
+
+def test_send_message_rejects_bad_poll_options(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_message("alice", "which day?", poll_options=["only one"])
+    with pytest.raises(NodeError):
+        node.send_message(
+            "alice", "which day?", poll_options=["Saturday", "saturday"]
+        )
+    with pytest.raises(NodeError):
+        node.send_message(
+            "alice",
+            "which day?",
+            poll_options=["Saturday", "Sunday"],
+            poll_vote={
+                "target": {"author": "ab" * 16, "sent_at": 1.0},
+                "option": 0,
+            },
+        )
+
+
+def test_send_message_vote_carries_target_and_option(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    sent = {}
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    target = {"author": "ab" * 16, "sent_at": 1000.0}
+    node.send_message(
+        "alice", "voted: Saturday", poll_vote={"target": target, "option": 0}
+    )
+    parsed = parse_message(sent["payload"])
+    assert parsed["poll_vote"] == {"target": target, "option": 0}
+    stored = node.inbox.list_messages(direction="out")
+    assert stored[0]["poll_vote"] == {"target": target, "option": 0}
+    assert stored[0]["leg_sent_at"] == parsed["sent_at"]
+
+
+def test_send_message_queues_poll_for_offline_peer(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: None)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no path to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_message(
+        "alice", "which day?", poll_options=["Saturday", "Sunday"]
+    )
+
+    assert response["queued"] is True
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.poll_options == ["Saturday", "Sunday"]
+    # The retry re-sends the same poll payload, and the sent record
+    # keeps the options and the shared wire time.
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout, **kwargs):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(peer, entry, 1.0) is True
+    assert parse_message(sent["payload"])["poll_options"] == [
+        "Saturday",
+        "Sunday",
+    ]
+    stored = node.inbox.list_messages(direction="out")
+    assert stored and stored[0]["poll_options"] == ["Saturday", "Sunday"]
+
+
+def test_incoming_dm_poll_stores_poll_fields(tmp_path):
+    from tau.protocol import decode, encode_message
+
+    node, _, alice_identity, alice = _typing_node(tmp_path)
+    response = node._handle_message(
+        "/tau/message",
+        encode_message(
+            "which day?",
+            message_id="m-poll",
+            poll_options=["Saturday", "Sunday"],
+        ),
+        b"req-poll",
+        alice_identity,
+        1000.0,
+    )
+    assert decode(response)["ok"] is True
+    stored = node.inbox.list_messages(peer=alice.hexhash)
+    assert len(stored) == 1
+    assert stored[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert stored[0].get("poll_vote") is None
+    assert stored[0].get("poll_close") is None
+
+
 def test_send_message_rejects_invalid_location(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(NodeError):
@@ -1229,6 +1361,41 @@ def test_send_group_retraction_fans_out_one_signed_payload(tmp_path, monkeypatch
     assert payload["target_author"] == node.destination.hexhash
     assert payload["target_sent_at"] == 100.0
     assert payload["id"] == response["id"]
+    assert node.identity.validate(
+        base64.b64decode(payload["sig"]),
+        retract_unsigned_bytes(calls[0][2]),
+    )
+
+
+def test_send_group_retraction_stamps_target_author(tmp_path, monkeypatch):
+    # A moderator retract names the message's author in the signed
+    # group context, so receivers resolve the author's copy (and key
+    # the durable marker by the author) instead of the creator's.
+    import base64
+
+    from tau.protocol import REQUEST_RETRACT, parse_retract, retract_unsigned_bytes
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append((peer_arg, path, payload))
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_retraction(
+        "crew", "leg-1", target_sent_at=100.0, target_author=alice.hexhash
+    )
+
+    assert response["ok"] is True
+    assert len(calls) == 2
+    assert calls[0][2] == calls[1][2]
+    payload = parse_retract(calls[0][2])
+    assert payload["target_author"] == alice.hexhash
+    assert payload["target_author"] != node.destination.hexhash
+    assert payload["group"] == group["id"]
+    assert payload["target_sent_at"] == 100.0
     assert node.identity.validate(
         base64.b64decode(payload["sig"]),
         retract_unsigned_bytes(calls[0][2]),

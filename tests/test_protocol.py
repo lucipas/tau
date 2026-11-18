@@ -923,6 +923,85 @@ def test_group_poll_rejects_two_poll_fields():
         )
 
 
+def test_dm_poll_roundtrip():
+    data = encode_message(
+        "which day?",
+        message_id="b" * 32,
+        poll_options=["Saturday", "Sunday"],
+    )
+    parsed = parse_message(data)
+    assert parsed["text"] == "which day?"
+    assert parsed["poll_options"] == ["Saturday", "Sunday"]
+    assert parsed["poll_vote"] is None
+    assert parsed["poll_close"] is None
+
+
+def test_dm_poll_vote_and_close_roundtrip():
+    target = {"author": "ab" * 16, "sent_at": 1234.5}
+    vote_data = encode_message(
+        "voted: Saturday",
+        message_id="c" * 32,
+        poll_vote={"target": target, "option": 0},
+    )
+    parsed = parse_message(vote_data)
+    assert parsed["poll_vote"] == {"target": target, "option": 0}
+    assert parsed["poll_options"] is None
+    close_data = encode_message(
+        "closed the poll",
+        message_id="d" * 32,
+        poll_close=target,
+    )
+    assert parse_message(close_data)["poll_close"] == target
+
+
+def test_dm_poll_rejects_two_poll_fields():
+    with pytest.raises(ProtocolError):
+        encode_message(
+            "which day?",
+            poll_options=["Saturday", "Sunday"],
+            poll_vote={
+                "target": {"author": "ab" * 16, "sent_at": 1.0},
+                "option": 0,
+            },
+        )
+
+
+def test_dm_poll_rejects_bad_options_and_votes():
+    with pytest.raises(ProtocolError):
+        encode_message("which day?", poll_options=["only one"])
+    with pytest.raises(ProtocolError):
+        encode_message("which day?", poll_options=["ok", 7])
+    with pytest.raises(ProtocolError):
+        encode_message(
+            "voted",
+            poll_vote={"target": {"author": "ab" * 16, "sent_at": 1.0}},
+        )
+
+
+def test_dm_poll_parse_drops_contradictory_fields():
+    # A message carrying more than one poll field reads as plain chat,
+    # like a group message: the sender cannot have meant both.
+    raw = encode(
+        {
+            "type": "message",
+            "v": 1,
+            "text": "which day?",
+            "kind": "chat",
+            "sent_at": 1000.0,
+            "poll_options": ["Saturday", "Sunday"],
+            "poll_vote": {
+                "target": {"author": "ab" * 16, "sent_at": 1000.0},
+                "option": 0,
+            },
+        }
+    )
+    parsed = parse_message(raw)
+    assert parsed["poll_options"] is None
+    assert parsed["poll_vote"] is None
+    assert parsed["poll_close"] is None
+    assert parsed["text"] == "which day?"
+
+
 def test_group_poll_rejects_bad_options_and_votes():
     with pytest.raises(ProtocolError):
         encode_group_message(
