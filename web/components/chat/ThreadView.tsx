@@ -33,8 +33,7 @@ export interface ThreadViewProps {
   onForward: (message: ChatMessage, target: string) => void;
   onReact: (message: ChatMessage, reaction: string) => void;
   onClearReaction: (message: ChatMessage) => void;
-  /** Group-only: DM polls have no vote endpoint, so pass undefined for DMs
-   *  and the bubble disables voting. */
+  /** Voting/closing a poll; undefined disables voting in the bubble. */
   onVotePoll?: (message: ChatMessage, option: number) => void;
   onClosePoll?: (message: ChatMessage) => void;
   onSend: (text: string, opts: ComposerSendOptions) => Promise<void> | void;
@@ -152,7 +151,7 @@ export default function ThreadView({
         onCancelReply={() => onReplyToChange?.(null)}
         editing={editing}
         onCancelEdit={() => onEditingChange?.(null)}
-        allowPoll={conversation.kind === "group"}
+        allowPoll
         onSend={onSend}
         onSendFile={onSendFile}
       />

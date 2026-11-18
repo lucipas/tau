@@ -816,6 +816,167 @@ def test_cli_messages_sent_shows_read_state(tmp_path, capsys):
     assert by_id["msg-3"]["text"] == "still waiting"
 
 
+def _group_send_fixture(tmp_path, *, evict_leg=None):
+    """A group send to three members, plus one DM, in a fresh data dir.
+
+    Alice read her leg, Bobby's leg was delivered, Carol's is still
+    queued.  ``evict_leg`` names a leg whose sent record is missing
+    (evicted past MAX_SENT): the fold still names the send, with that
+    leg unknown.  Returns the data dir and the member hashes.
+    """
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    alice = b"\xaa" * 16
+    bobby = b"\xbb" * 16
+    carol = b"\xcc" * 16
+    registry.upsert(alice, b"\x11" * 64, name="alice")
+    registry.upsert(bobby, b"\x22" * 64, name="bobby")
+    registry.upsert(carol, b"\x33" * 64, name="carol")
+    registry.save()
+    box = Mailbox(config.mailbox_path)
+    legs = {"leg-alice": alice, "leg-bobby": bobby, "leg-carol": carol}
+    for leg_id, member in legs.items():
+        if leg_id == evict_leg:
+            continue
+        box.record_sent(leg_id, to=member, text="hi group", sent_at=100.0)
+    box.record_read("leg-alice", 150.0, reader_hash=alice.hex())
+    box.record_delivered("leg-bobby", now=200.0)
+    box.enqueue(to=carol, text="hi group", message_id="leg-carol")
+    # A plain DM alongside, so the fold does not disturb DM rows.
+    box.record_sent("dm-1", to=alice, text="hi alice", sent_at=50.0)
+    box.record_delivered("dm-1", now=60.0)
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "hi group",
+            "sent_at": 100.0,
+            "received_at": 100.0,
+            "id": "leg-alice",
+            "kind": "group",
+            "group": "dd" * 16,
+            "group_name": "team",
+            "direction": "out",
+            "leg_ids": ["leg-alice", "leg-bobby", "leg-carol"],
+        }
+    )
+    return data_dir, alice, bobby, carol
+
+
+def test_cli_messages_sent_folds_group_legs(tmp_path, capsys):
+    from tau import cli
+
+    data_dir, alice, _bobby, _carol = _group_send_fixture(tmp_path)
+    code = cli.main(["messages", "--sent", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2  # one DM row + one folded group row
+    fold = next(
+        entry for entry in payload["messages"] if entry.get("group") == "dd" * 16
+    )
+    assert fold["group_name"] == "team"
+    assert fold["text"] == "hi group"
+    assert fold["state"] == "partial"
+    by_to = {leg["to"]: leg for leg in fold["legs"]}
+    assert by_to[alice.hex()]["state"] == "read"
+    assert by_to[alice.hex()]["read_at"] == 150.0
+    assert by_to[alice.hex()]["to_name"] == "alice"
+    assert by_to[(b"\xbb" * 16).hex()]["state"] == "delivered"
+    assert by_to[(b"\xcc" * 16).hex()]["state"] == "queued"
+    dm = next(entry for entry in payload["messages"] if entry["id"] == "dm-1")
+    assert dm["state"] == "delivered"
+    assert dm["to_name"] == "alice"
+
+    code = cli.main(["messages", "--sent", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "to team — seen by alice · delivered to bobby · queued for carol" in out
+    assert out.count("hi group") == 1  # the text is printed once, not per leg
+    assert "to alice — delivered" in out
+
+
+def test_cli_messages_sent_fold_counts_an_evicted_leg_unknown(tmp_path, capsys):
+    from tau import cli
+
+    data_dir, _alice, _bobby, _carol = _group_send_fixture(
+        tmp_path, evict_leg="leg-carol"
+    )
+    code = cli.main(["messages", "--sent", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    fold = next(
+        entry for entry in payload["messages"] if entry.get("group") == "dd" * 16
+    )
+    by_id = {leg["id"]: leg for leg in fold["legs"]}
+    assert by_id["leg-carol"]["state"] == "unknown"
+    assert by_id["leg-carol"]["to"] is None
+    assert fold["state"] == "partial"
+
+    code = cli.main(["messages", "--sent", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "1 unknown" in capsys.readouterr().out
+
+
+def test_cli_messages_sent_fold_peer_filter(tmp_path, capsys):
+    from tau import cli
+
+    data_dir, alice, _bobby, _carol = _group_send_fixture(tmp_path)
+    # A member of the group keeps the whole fold.
+    code = cli.main(
+        ["messages", "--sent", "--peer", "alice", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2  # the DM to alice + the fold she belongs to
+    assert any(entry.get("group") == "dd" * 16 for entry in payload["messages"])
+    # A hash that is no leg of the send hides the fold.
+    code = cli.main(
+        [
+            "messages",
+            "--sent",
+            "--peer",
+            "ee" * 16,
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+
+
+def test_group_message_is_unreceipted_for_the_sweep(tmp_path):
+    """A read group message is owed a receipt to its author.
+
+    The serving node's mail sweep groups unreceipted reads by
+    ``destination`` — for a group message that is the author — so the
+    leg's read receipt reaches the author exactly like a DM's.
+    """
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "bb" * 16,
+            "text": "hi group",
+            "sent_at": 1.0,
+            "received_at": 2.0,
+            "id": "leg-1",
+            "kind": "group",
+            "group": "dd" * 16,
+            "group_name": "team",
+        }
+    )
+    assert inbox.read_unreceipted() == []
+    assert inbox.mark_read(["leg-1"], at=10.0) == ["leg-1"]
+    pending = inbox.read_unreceipted()
+    assert [entry["id"] for entry in pending] == ["leg-1"]
+    assert pending[0]["destination"] == "bb" * 16
+
+
 def test_cli_messages_lists_without_receipts_when_opted_out(
     tmp_path, capsys, monkeypatch
 ):
