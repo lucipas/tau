@@ -17,7 +17,21 @@ beforeEach(() => {
     if (url.includes("/api/channels/messages")) {
       return {
         channel: "mesh-general",
+        // Newest first, as the API serves them: the reply, then its parent.
         messages: [
+          {
+            v: 1,
+            hash: "m2".padEnd(64, "0"),
+            channel: "mesh-general",
+            author: "b".repeat(32),
+            key: "b".repeat(32),
+            name: "bob",
+            text: "count me in",
+            created_at: 1001,
+            received_at: 1001,
+            sig: "s",
+            reply_to: "m1".padEnd(64, "0"),
+          },
           {
             v: 1,
             hash: "m1".padEnd(64, "0"),
@@ -90,6 +104,31 @@ describe("ChannelsSection", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+  });
+
+  it("shows a reply with its quoted parent", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByText("count me in")).toBeTruthy();
+    expect(await screen.findByText("↩ alice: hello channel")).toBeTruthy();
+  });
+
+  it("reply button arms the composer for that message", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    await screen.findByText("hello channel");
+    fireEvent.click(screen.getByRole("button", { name: "Reply to alice" }));
+    expect(await screen.findByText(/Replying to/)).toBeTruthy();
+    expect(screen.getByText("alice", { selector: "span.font-semibold" })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
+      target: { value: "count me in" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+    // The banner clears once the reply is sent.
+    await waitFor(() =>
+      expect(screen.queryByText(/Replying to/)).toBeNull(),
+    );
   });
 
   it("sync pulls history for the selected channel", async () => {

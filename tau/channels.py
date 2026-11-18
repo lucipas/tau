@@ -93,6 +93,14 @@ message.  A tombstone is remembered even when the message is not
 held yet, so a message that arrives later from another peer is
 refused instead of re-appearing.
 
+A reply is an ordinary message with an optional ``reply_to`` digest
+naming the parent message in the same channel.  The digest is part
+of the signed body when present, so a relay cannot re-point a reply
+at another message; messages without one verify exactly as before.
+A reply whose parent has not arrived yet still stores and verifies —
+readers resolve the parent locally and show its digest until the
+parent lands.
+
 Membership is local-only and never gossiped: joining records the
 name in the local store, leaving drops it (cached messages stay
 until the node stops serving them — a leave is about what *you*
@@ -184,7 +192,9 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 # Fields covered by the message hash.  The channel is part of the
 # signed body, so a relay cannot move a message into another room
-# without breaking the hash.
+# without breaking the hash.  ``reply_to`` is covered too, when a
+# message has one — _canonical_body adds it — so a reply cannot be
+# re-pointed at another message either.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
 
 # Fields covered by an edit notice's hash.  The target digest pins
@@ -219,6 +229,7 @@ _MESSAGE_COLUMNS = (
     "created_at",
     "received_at",
     "sig",
+    "reply_to",
 )
 
 
@@ -274,6 +285,12 @@ def _require_timestamp(value: Any, field: str) -> float:
 
 def _canonical_body(message: Dict[str, Any]) -> bytes:
     body = {field: message[field] for field in HASH_FIELDS}
+    reply_to = message.get("reply_to")
+    if reply_to:
+        # Covered by the hash when present, so a reply cannot be
+        # re-pointed; absent for plain messages, whose hashes — and
+        # verification — are unchanged.
+        body["reply_to"] = reply_to
     return json.dumps(
         body,
         ensure_ascii=False,
@@ -368,6 +385,12 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
     if now is not None and created_at > float(now) + 86400.0:
         raise ChannelError("channel message timestamp is too far in the future")
 
+    raw_reply_to = mesg.get("reply_to", "")
+    if raw_reply_to in (None, ""):
+        reply_to = ""
+    else:
+        reply_to = _require_hex(raw_reply_to, HASH_HEX_LENGTH, "reply_to")
+
     message = {
         "v": CHANNEL_VERSION,
         "channel": channel,
@@ -376,6 +399,7 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
         "name": name,
         "text": text,
         "created_at": created_at,
+        "reply_to": reply_to,
     }
     _check_wire_size(message)
     return message
@@ -411,7 +435,7 @@ def verify_message(
 
 def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
     """Return the public, canonical representation of a message."""
-    return {
+    canonical = {
         "v": message["v"],
         "channel": message["channel"],
         "author": message["author"],
@@ -422,6 +446,12 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
         "hash": message["hash"],
         "sig": message["sig"],
     }
+    reply_to = message.get("reply_to")
+    if reply_to:
+        # Plain messages keep the old wire shape: the field appears
+        # only on replies, matching how the hash treats it.
+        canonical["reply_to"] = reply_to
+    return canonical
 
 
 # -- edit notices ------------------------------------------------------------
@@ -943,7 +973,8 @@ CREATE TABLE IF NOT EXISTS messages (
     text TEXT NOT NULL,
     created_at REAL NOT NULL,
     received_at REAL NOT NULL,
-    sig TEXT NOT NULL
+    sig TEXT NOT NULL,
+    reply_to TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS messages_channel_created
@@ -999,6 +1030,15 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
+    # Stores written before replies existed have no reply_to column:
+    # add it in place so an old database keeps its history.
+    columns = [
+        row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    ]
+    if "reply_to" not in columns:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''"
+        )
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('version', ?)",
         (str(CHANNEL_VERSION),),
@@ -1022,6 +1062,22 @@ def get_message(conn: sqlite3.Connection, digest: str) -> Optional[Dict[str, Any
     """Return a stored message by hash, or ``None``."""
     row = _fetch_message(conn, digest)
     return _row_to_message(row) if row is not None else None
+
+
+def reply_parent(
+    conn: sqlite3.Connection, message: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """The stored parent of a reply, or ``None``.
+
+    ``None`` covers both cases a reader must handle the same way: a
+    plain message (no ``reply_to``) and a reply whose parent has not
+    arrived yet.  The caller shows the digest when the parent is
+    missing, so a reply never blocks on history it does not have.
+    """
+    target = message.get("reply_to")
+    if not target:
+        return None
+    return get_message(conn, target)
 
 
 # -- retract notices: storage ------------------------------------------------
@@ -1223,7 +1279,8 @@ def store_message(
         with conn:
             conn.execute(
                 "INSERT INTO messages(v, hash, channel, author, key, name, text, "
-                "created_at, received_at, sig) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, received_at, sig, reply_to) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     CHANNEL_VERSION,
                     digest,
@@ -1235,6 +1292,7 @@ def store_message(
                     message["created_at"],
                     timestamp,
                     message["sig"],
+                    message.get("reply_to", ""),
                 ),
             )
             _prune_store(conn, message["channel"])
@@ -1314,8 +1372,14 @@ def create_message(
     *,
     name: str = "anonymous",
     now: Optional[float] = None,
+    reply_to: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create, sign and store a message owned by *identity*."""
+    """Create, sign and store a message owned by *identity*.
+
+    ``reply_to`` is a parent message's hash or unique hex prefix; it
+    must already be stored in this channel, and it is covered by the
+    new message's hash.
+    """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
     body = {
@@ -1327,6 +1391,8 @@ def create_message(
         "text": normalize_message(text),
         "created_at": timestamp,
     }
+    if reply_to is not None:
+        body["reply_to"] = resolve_message_digest(conn, body["channel"], reply_to)
     digest = hash_message(body)
     mesg = dict(body)
     mesg["hash"] = digest
@@ -1612,11 +1678,13 @@ class ChannelApp:
         publish: bool = False,
         targets: Optional[Sequence[Any]] = None,
         ttl: int = MAX_GOSSIP_TTL,
+        reply_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a message in a joined channel, gossiping it when asked.
 
         Sending requires membership: a channel you have not joined is
-        not yours to post in.
+        not yours to post in.  ``reply_to`` is a parent message's hash
+        or unique hex prefix in the same channel.
         """
         name = clean_channel_name(channel)
         conn = self.connect()
@@ -1626,7 +1694,7 @@ class ChannelApp:
                     f"not a member of channel {name!r}; join it first"
                 )
             message = create_message(
-                conn, self.identity, name, text, name=self.name
+                conn, self.identity, name, text, name=self.name, reply_to=reply_to
             )
         finally:
             conn.close()

@@ -17,6 +17,7 @@ import {
   pageFileUrl,
   reactToMessage,
   closeDmPoll,
+  sendChannelMessage,
   sendMessage,
   tanMediaUrl,
   voteDmPoll,
@@ -99,6 +100,24 @@ describe("GET endpoints", () => {
 });
 
 describe("POST endpoints", () => {
+  it("sends a channel message without reply_to when standalone", async () => {
+    nextJson = { ok: true, message: {} };
+    await sendChannelMessage("mesh-general", "hello");
+    expect(captured[0].url).toBe("/api/channels/send");
+    expect(bodyOf(0)).toEqual({ channel: "mesh-general", text: "hello" });
+  });
+
+  it("sends a channel reply with reply_to", async () => {
+    nextJson = { ok: true, message: {} };
+    await sendChannelMessage("mesh-general", "count me in", "m1".padEnd(64, "0"));
+    expect(captured[0].url).toBe("/api/channels/send");
+    expect(bodyOf(0)).toEqual({
+      channel: "mesh-general",
+      text: "count me in",
+      reply_to: "m1".padEnd(64, "0"),
+    });
+  });
+
   it("sends a DM with reply / expiry / delay / poll options", async () => {
     nextJson = { ok: true, message: {}, response: {} };
     await sendMessage(

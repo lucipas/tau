@@ -164,7 +164,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/channels/messages  stored messages for a channel (``?channel=<name>&limit=20``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
-    POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/send  send a message to a joined channel (``{\"channel\", \"text\", \"reply_to\"?}``)
     POST /api/channels/edit  edit your own message (``{"channel", "target", "text"}``)
     POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/pages       cached personal mesh pages, plus this node's own
@@ -3901,14 +3901,20 @@ class WebBridge:
         left = self._local_channel_app().leave(channel)
         return {"channel": clean_channel_name(channel), "left": left}
 
-    def channel_send(self, channel: str, text: str) -> Dict[str, Any]:
-        """Send *text* to a joined channel, gossiping it to peers."""
+    def channel_send(
+        self, channel: str, text: str, *, reply_to: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Send *text* to a joined channel, gossiping it to peers.
+
+        ``reply_to`` is a parent message's hash or unique hex prefix
+        in the same channel.
+        """
         app = self._channel_app()
         if app is None:
             raise WebBridgeError(
                 "public channels are not enabled; run serve --channels"
             )
-        return app.send(channel, text, publish=True)
+        return app.send(channel, text, publish=True, reply_to=reply_to)
 
     def channel_edit(
         self, channel: str, target: str, text: str
@@ -12121,6 +12127,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/channels/send":
                 channel = body.get("channel")
                 text = body.get("text")
+                reply_to = body.get("reply_to")
                 if not isinstance(channel, str) or not channel.strip():
                     self._send_json(
                         {"error": {"message": "field 'channel' is required"}},
@@ -12135,8 +12142,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                if reply_to is not None and not isinstance(reply_to, str):
+                    self._send_json(
+                        {"error": {"message": "field 'reply_to' must be a string"}},
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
-                    message = self.bridge.channel_send(channel, text)
+                    message = self.bridge.channel_send(channel, text, reply_to=reply_to)
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
