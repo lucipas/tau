@@ -416,7 +416,7 @@ Global options may appear before or after the command:
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message counts |
-| `tau channel send NAME TEXT` | Send a signed message to a joined channel |
+| `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--expire 30s` makes it a disappearing message, purged from members' stores after the duration; a per-channel default from `tau disappearing --channel` fills the expiry in when no `--expire` is passed) |
 | `tau channel edit NAME DIGEST NEW-TEXT` | Edit your own channel message (digest or hex prefix) |
 | `tau channel edits NAME` | List edit notices for a channel, newest first |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
@@ -671,10 +671,19 @@ expiry travels inside the encrypted payload — and inside the signed
 sealed envelope for relayed mail, so a holder cannot extend it — the
 receiver shows the deadline and purges the message once it passes, and
 a queued copy (and any sealed copy deposited from it) expires on the
-same schedule. The web console composer has the same picker. Honest
+same schedule. The web console composer has the same picker.
+`tau group send` takes the same `--expire`, and `tau channel send
+--expire 1h` does the same for a channel message — the expiry rides
+the message as an unsigned field, so an older node still verifies and
+shows it (it just never purges it), while a current node drops it on
+receipt once expired and purges it from its store. `tau disappearing
+[--peer PEER | --group GROUP | --channel NAME] [DURATION | --off]`
+sets a standing default (at most 7d) for one conversation, filled in
+whenever a send passes no explicit `--expire`; the console Settings
+page edits the same defaults. Honest
 caveat: expiry is cooperative — a modified client can keep copies, so
-this is hygiene, not a guarantee. Tan posts are public signed chains
-and never expire; tombstones already cover their removal.
+this is hygiene, not a guarantee. Tan posts take the same `--expire`
+on `tau tan post` (at most 7d); tombstones already cover their removal.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

@@ -356,6 +356,7 @@ export interface DmRequest {
 export interface DisappearingDefaults {
   peers: Record<string, number>;
   groups: Record<string, number>;
+  channels: Record<string, number>;
 }
 
 export interface MutedConversations {
@@ -624,6 +625,8 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Unix timestamp after which honest nodes purge this message, when set. */
+  expires_at?: number;
   /** Present when the author edited this message; the text shown is the latest edit. */
   edited?: boolean;
   edited_at?: number;

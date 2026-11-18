@@ -118,10 +118,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import RNS
 
 from .blocklist import load_blocklist
+from .disappearing import channel_default_for
 from .identity import load_public_key
 from .protocol import (
     APP_NAME,
     ASPECT,
+    MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     MAX_REQUEST_BYTES,
     ProtocolError,
@@ -187,6 +189,15 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # without breaking the hash.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
 
+# A channel message's expiry is deliberately NOT one of the hash
+# fields: ``expires_at`` rides as an unsigned advisory field, so an
+# older node verifies, stores and serves an expiring message exactly
+# like any other (it just never expires it) and there is no interop
+# break.  Honest nodes enforce it; a modified peer can keep a copy,
+# the same as with a DM — disappearing is a hygiene preference, not
+# a security boundary.  The cap mirrors ``tau send --expire``.
+MAX_CHANNEL_EXPIRE_SECONDS = MAX_MAIL_TTL
+
 # Fields covered by an edit notice's hash.  The target digest pins
 # the notice to one message, so it cannot be replayed onto another.
 EDIT_HASH_FIELDS = (
@@ -217,6 +228,7 @@ _MESSAGE_COLUMNS = (
     "name",
     "text",
     "created_at",
+    "expires_at",
     "received_at",
     "sig",
 )
@@ -368,6 +380,19 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
     if now is not None and created_at > float(now) + 86400.0:
         raise ChannelError("channel message timestamp is too far in the future")
 
+    # An expiry is advisory and unsigned (see MAX_CHANNEL_EXPIRE_SECONDS):
+    # validate its shape and range, but never let it into the hash.
+    raw_expires_at = mesg.get("expires_at")
+    expires_at = None
+    if raw_expires_at is not None:
+        expires_at = _require_timestamp(raw_expires_at, "expires_at")
+        if expires_at <= created_at:
+            raise ChannelError("channel message expires_at must be after created_at")
+        if expires_at > created_at + MAX_CHANNEL_EXPIRE_SECONDS:
+            raise ChannelError(
+                "channel message expires_at is more than 30d after created_at"
+            )
+
     message = {
         "v": CHANNEL_VERSION,
         "channel": channel,
@@ -376,6 +401,7 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
         "name": name,
         "text": text,
         "created_at": created_at,
+        "expires_at": expires_at,
     }
     _check_wire_size(message)
     return message
@@ -411,7 +437,7 @@ def verify_message(
 
 def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
     """Return the public, canonical representation of a message."""
-    return {
+    canonical = {
         "v": message["v"],
         "channel": message["channel"],
         "author": message["author"],
@@ -422,6 +448,11 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
         "hash": message["hash"],
         "sig": message["sig"],
     }
+    # The expiry is part of the public message when set; a message
+    # without one keeps the exact shape older readers expect.
+    if message.get("expires_at") is not None:
+        canonical["expires_at"] = message["expires_at"]
+    return canonical
 
 
 # -- edit notices ------------------------------------------------------------
@@ -942,6 +973,7 @@ CREATE TABLE IF NOT EXISTS messages (
     name TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL,
     created_at REAL NOT NULL,
+    expires_at REAL,
     received_at REAL NOT NULL,
     sig TEXT NOT NULL
 );
@@ -999,6 +1031,14 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
+    # A store created before expiring messages has no expires_at
+    # column: CREATE TABLE IF NOT EXISTS leaves it alone, so add
+    # the column in place rather than rebuilding the store.
+    columns = [
+        row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    ]
+    if "expires_at" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN expires_at REAL")
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('version', ?)",
         (str(CHANNEL_VERSION),),
@@ -1211,6 +1251,14 @@ def store_message(
         message["sig"] = _require_hex(mesg.get("sig"), SIG_HEX_LENGTH, "sig")
 
     digest = message["hash"]
+    if (
+        message.get("expires_at") is not None
+        and message["expires_at"] <= timestamp
+    ):
+        # Already expired on arrival — a slow gossip, or a sender
+        # whose clock ran ahead: never store it, like an expired DM.
+        log.info("Dropping expired channel message %s", digest)
+        return _canonical_message(message), False
     if _retraction_for(conn, digest, message["author"]) is not None:
         # A retract notice arrived before the message did: the
         # tombstone stands, and the message is refused, not stored.
@@ -1223,7 +1271,8 @@ def store_message(
         with conn:
             conn.execute(
                 "INSERT INTO messages(v, hash, channel, author, key, name, text, "
-                "created_at, received_at, sig) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, expires_at, received_at, sig) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     CHANNEL_VERSION,
                     digest,
@@ -1233,11 +1282,20 @@ def store_message(
                     message["name"],
                     message["text"],
                     message["created_at"],
+                    message.get("expires_at"),
                     timestamp,
                     message["sig"],
                 ),
             )
             _prune_store(conn, message["channel"])
+            # Expired rows are invisible to history either way, but
+            # dropping them here keeps the store bounded on a node
+            # that receives far more than it reads.
+            conn.execute(
+                "DELETE FROM messages "
+                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (timestamp,),
+            )
     except sqlite3.IntegrityError:
         # Another thread or process inserted the same message first.
         existing = _fetch_message(conn, digest)
@@ -1314,9 +1372,12 @@ def create_message(
     *,
     name: str = "anonymous",
     now: Optional[float] = None,
+    expires_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a message owned by *identity*."""
     timestamp = round(float(now if now is not None else time.time()), 3)
+    if expires_at is not None and float(expires_at) <= timestamp:
+        raise ChannelError("channel message expiry must be in the future")
     author = _author_from_identity(identity)
     body = {
         "v": CHANNEL_VERSION,
@@ -1327,6 +1388,11 @@ def create_message(
         "text": normalize_message(text),
         "created_at": timestamp,
     }
+    if expires_at is not None:
+        # Unsigned advisory field (see MAX_CHANNEL_EXPIRE_SECONDS):
+        # it rides the message but never enters the hash, so older
+        # nodes verify the message exactly as before.
+        body["expires_at"] = float(expires_at)
     digest = hash_message(body)
     mesg = dict(body)
     mesg["hash"] = digest
@@ -1370,6 +1436,10 @@ def channel_history_page(
     count = max(1, min(int(limit), MAX_CHANNEL_HISTORY))
     clauses = ["channel = ?"]
     params: List[Any] = [name]
+    # An expired message is gone from history even before the store
+    # purges it: a node that only reads must never show one.
+    clauses.append("(expires_at IS NULL OR expires_at > ?)")
+    params.append(time.time())
     if before is not None:
         stamp = _require_timestamp(before, "before")
         if before_hash is not None:
@@ -1612,13 +1682,24 @@ class ChannelApp:
         publish: bool = False,
         targets: Optional[Sequence[Any]] = None,
         ttl: int = MAX_GOSSIP_TTL,
+        expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Create a message in a joined channel, gossiping it when asked.
 
         Sending requires membership: a channel you have not joined is
-        not yours to post in.
+        not yours to post in.  An explicit *expires_at* wins; without
+        one, a per-channel disappearing default fills the expiry in,
+        exactly like a DM or group send — a corrupt defaults file
+        fails open with a warning inside ``channel_default_for``,
+        so a send never breaks over it.
         """
         name = clean_channel_name(channel)
+        if expires_at is None:
+            default = channel_default_for(
+                getattr(self.config, "disappearing_path", None), name
+            )
+            if default is not None:
+                expires_at = time.time() + default
         conn = self.connect()
         try:
             if not is_member(conn, name):
@@ -1626,7 +1707,12 @@ class ChannelApp:
                     f"not a member of channel {name!r}; join it first"
                 )
             message = create_message(
-                conn, self.identity, name, text, name=self.name
+                conn,
+                self.identity,
+                name,
+                text,
+                name=self.name,
+                expires_at=expires_at,
             )
         finally:
             conn.close()

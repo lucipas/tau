@@ -17,7 +17,9 @@ import {
   pageFileUrl,
   reactToMessage,
   closeDmPoll,
+  sendChannelMessage,
   sendMessage,
+  setDisappearingDefault,
   tanMediaUrl,
   voteDmPoll,
   voteTanPoll,
@@ -153,6 +155,24 @@ describe("POST endpoints", () => {
     nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, total: 0, revision: 1 } };
     await markRead();
     expect(bodyOf(0)).toEqual({});
+  });
+
+  it("sets a disappearing default for a channel by name", async () => {
+    nextJson = { ok: true };
+    await setDisappearingDefault({ channel: "general" }, 300);
+    expect(captured[0].url).toBe("/api/messages/disappearing");
+    expect(bodyOf(0)).toEqual({ channel: "general", seconds: 300 });
+    await setDisappearingDefault({ channel: "general" }, null);
+    expect(bodyOf(1)).toEqual({ channel: "general", seconds: null });
+  });
+
+  it("sends a channel message with an optional expiry", async () => {
+    nextJson = { ok: true, message: {} };
+    await sendChannelMessage("general", "ephemeral");
+    expect(captured[0].url).toBe("/api/channels/send");
+    expect(bodyOf(0)).toEqual({ channel: "general", text: "ephemeral" });
+    await sendChannelMessage("general", "ephemeral", 3600);
+    expect(bodyOf(1)).toEqual({ channel: "general", text: "ephemeral", expires_in: 3600 });
   });
 
   it("fetches Tan media with the author in the body", async () => {

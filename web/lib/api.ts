@@ -548,9 +548,9 @@ export async function getDisappearingDefaults(): Promise<DisappearingDefaults> {
   return get("/api/messages/disappearing");
 }
 
-/** Set a disappearing default (seconds; null clears it) for one peer or group. */
+/** Set a disappearing default (seconds; null clears it) for one peer, group or channel. */
 export async function setDisappearingDefault(
-  target: { peer: string } | { group: string },
+  target: { peer: string } | { group: string } | { channel: string },
   seconds: number | null,
 ): Promise<unknown> {
   return post("/api/messages/disappearing", { ...target, seconds });
@@ -969,8 +969,16 @@ export async function leaveChannel(channel: string): Promise<{ channel: string; 
   return post("/api/channels/leave", { channel });
 }
 
-export async function sendChannelMessage(channel: string, text: string): Promise<ChannelMessage> {
-  return post("/api/channels/send", { channel, text });
+export async function sendChannelMessage(
+  channel: string,
+  text: string,
+  expiresIn?: number,
+): Promise<ChannelMessage> {
+  return post("/api/channels/send", {
+    channel,
+    text,
+    ...(expiresIn !== undefined ? { expires_in: expiresIn } : {}),
+  });
 }
 
 export async function editChannelMessage(

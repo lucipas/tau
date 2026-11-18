@@ -1,7 +1,8 @@
 // SettingsSection.tsx — node settings: file acceptance / read receipts,
-// rename the node, announce, and per-peer / per-group disappearing-message
-// defaults. Built on api.ts getSettings / updateSetting / renameNode /
-// announce / getDisappearingDefaults / setDisappearingDefault.
+// rename the node, announce, and per-peer / per-group / per-channel
+// disappearing-message defaults. Built on api.ts getSettings /
+// updateSetting / renameNode / announce / getDisappearingDefaults /
+// setDisappearingDefault / getChannels.
 
 "use client";
 
@@ -9,13 +10,14 @@ import { useEffect, useState } from "react";
 import { useTauContext } from "@/components/chrome/TauContext";
 import {
   announce,
+  getChannels,
   getDisappearingDefaults,
   getSettings,
   renameNode,
   setDisappearingDefault,
   updateSetting,
 } from "@/lib/api";
-import type { NodeSettings } from "@/lib/types";
+import type { Channel, NodeSettings } from "@/lib/types";
 
 const EXPIRY_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "No disappearing default", seconds: null },
@@ -44,15 +46,21 @@ export default function SettingsSection() {
   const [name, setName] = useState("");
   const [nameSeeded, setNameSeeded] = useState(false);
   const [disappearing, setDisappearing] = useState<Record<string, number>>({});
+  const [channels, setChannels] = useState<Channel[]>([]);
   const [ddTarget, setDdTarget] = useState("");
   const [ddSeconds, setDdSeconds] = useState<string>("");
 
   useEffect(() => {
     void (async () => {
       try {
-        const [s, dd] = await Promise.all([getSettings(), getDisappearingDefaults()]);
+        const [s, dd, ch] = await Promise.all([
+          getSettings(),
+          getDisappearingDefaults(),
+          getChannels(),
+        ]);
         setSettings(s);
-        setDisappearing({ ...dd.peers, ...dd.groups });
+        setDisappearing({ ...dd.peers, ...dd.groups, ...dd.channels });
+        setChannels(ch);
         setError(null);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -237,17 +245,21 @@ export default function SettingsSection() {
           className="mt-3 flex flex-wrap gap-2"
           onSubmit={(e) => {
             e.preventDefault();
-            if (!ddTarget) return setError("Pick a peer or group first.");
+            if (!ddTarget) return setError("Pick a peer, group or channel first.");
             const seconds = ddSeconds === "" ? null : Number(ddSeconds);
             const [kind, key] = ddTarget.split(":", 2);
             void run(
               async () => {
                 await setDisappearingDefault(
-                  kind === "group" ? { group: key } : { peer: key },
+                  kind === "group"
+                    ? { group: key }
+                    : kind === "channel"
+                      ? { channel: key }
+                      : { peer: key },
                   seconds,
                 );
                 const dd = await getDisappearingDefaults();
-                setDisappearing({ ...dd.peers, ...dd.groups });
+                setDisappearing({ ...dd.peers, ...dd.groups, ...dd.channels });
               },
               seconds === null
                 ? "Disappearing default cleared."
@@ -258,10 +270,10 @@ export default function SettingsSection() {
           <select
             value={ddTarget}
             onChange={(e) => setDdTarget(e.target.value)}
-            aria-label="Peer or group"
+            aria-label="Peer, group or channel"
             className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none"
           >
-            <option value="">Pick a peer or group…</option>
+            <option value="">Pick a peer, group or channel…</option>
             {peers.map((p) => (
               <option key={p.destination} value={`peer:${p.destination}`}>
                 {p.alias || p.name}
@@ -270,6 +282,11 @@ export default function SettingsSection() {
             {groups.map((g) => (
               <option key={g.id} value={`group:${g.id}`}>
                 Group: {g.name}
+              </option>
+            ))}
+            {channels.map((c) => (
+              <option key={c.channel} value={`channel:${c.channel}`}>
+                Channel: #{c.channel}
               </option>
             ))}
           </select>
@@ -300,7 +317,14 @@ export default function SettingsSection() {
           {Object.entries(disappearing).map(([key, seconds]) => {
             const peer = peers.find((p) => p.destination === key);
             const group = groups.find((g) => g.id === key);
-            const label = peer ? peer.alias || peer.name : group ? `Group: ${group.name}` : key;
+            const channel = channels.find((c) => c.channel === key);
+            const label = peer
+              ? peer.alias || peer.name
+              : group
+                ? `Group: ${group.name}`
+                : channel
+                  ? `Channel: #${channel.channel}`
+                  : key;
             const option = EXPIRY_OPTIONS.find((o) => o.seconds === seconds);
             return (
               <li
