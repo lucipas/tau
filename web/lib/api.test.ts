@@ -10,14 +10,17 @@ import {
   fetchTanMedia,
   fileUrl,
   getChannelMessages,
+  getChannelPins,
   getMessages,
   getTanThread,
   getTanTimeline,
   markRead,
   pageFileUrl,
+  pinChannelMessage,
   reactToMessage,
   sendMessage,
   tanMediaUrl,
+  unpinChannelMessage,
   voteTanPoll,
   wsUrl,
 } from "./api";
@@ -94,6 +97,12 @@ describe("GET endpoints", () => {
     await getChannelMessages("my channel", 5);
     expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
   });
+
+  it("fetches channel pins", async () => {
+    nextJson = { channel: "general", pins: [], count: 0 };
+    await getChannelPins("my channel");
+    expect(captured[0].url).toBe("/api/channels/pins?channel=my%20channel");
+  });
 });
 
 describe("POST endpoints", () => {
@@ -148,6 +157,16 @@ describe("POST endpoints", () => {
     await fetchTanMedia("a".repeat(64), "b".repeat(32));
     expect(captured[0].url).toBe(`/api/tan/media/${"a".repeat(64)}/fetch`);
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
+  });
+
+  it("pins and unpins a channel message by hash", async () => {
+    nextJson = { ok: true };
+    await pinChannelMessage("general", "a".repeat(64));
+    expect(captured[0].url).toBe("/api/channels/pin");
+    expect(bodyOf(0)).toEqual({ channel: "general", hash: "a".repeat(64) });
+    await unpinChannelMessage("general", "a".repeat(64));
+    expect(captured[1].url).toBe("/api/channels/unpin");
+    expect(bodyOf(1)).toEqual({ channel: "general", hash: "a".repeat(64) });
   });
 });
 

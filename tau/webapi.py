@@ -160,9 +160,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/import   import an export document (every entry verified)
     GET  /api/channels     joined channels, most recently joined first
     GET  /api/channels/messages  stored messages for a channel (``?channel=<name>&limit=20``)
+    GET  /api/channels/pins  pinned messages for a channel (``?channel=<name>``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/pin  pin a stored message (``{"channel": "<name>", "hash": "<64 hex>"}``)
+    POST /api/channels/unpin  drop a pin (``{"channel": "<name>", "hash": "<64 hex>"}``)
     POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/pages       cached personal mesh pages, plus this node's own
     POST /api/pages/fetch fetch a peer's page over RNS (``{"peer": "<name or hash>"}``)
@@ -3885,6 +3888,40 @@ class WebBridge:
     def channel_join(self, channel: str) -> Dict[str, Any]:
         """Join *channel*, recording membership locally."""
         return self._local_channel_app().join(channel)
+
+    def channel_pin(self, channel: str, digest: str) -> Dict[str, Any]:
+        """Pin a stored message in *channel*; pins survive pruning."""
+        return self._local_channel_app().pin(channel, digest)
+
+    def channel_unpin(self, channel: str, digest: str) -> Dict[str, Any]:
+        """Drop the pin on a message in *channel*."""
+        from .channels import clean_channel_name
+
+        unpinned = self._local_channel_app().unpin(channel, digest)
+        return {
+            "channel": clean_channel_name(channel),
+            "hash": digest,
+            "unpinned": unpinned,
+        }
+
+    def channel_pins(self, channel: str) -> List[Dict[str, Any]]:
+        """Pinned messages for *channel*, newest pin first, minus blocked authors."""
+        from .channels import clean_channel_name, list_pins
+
+        name = clean_channel_name(channel)
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._channel_conn()
+        try:
+            pins = list_pins(conn, name, exclude_authors=sorted(blocked))
+        finally:
+            conn.close()
+        if exclude_all:
+            return []
+        return pins
 
     def channel_leave(self, channel: str) -> Dict[str, Any]:
         """Leave *channel*; cached messages are kept."""
@@ -10356,6 +10393,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path == "/api/channels/pins":
+                channel = query.get("channel", [None])[0]
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "query 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    pins = self.bridge.channel_pins(channel)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(
+                    {"channel": channel, "pins": pins, "count": len(pins)},
+                    head_only,
+                )
+                return
             if path == "/api/pages":
                 self._send_json(self.bridge.page_list(), head_only)
                 return
@@ -11783,6 +11839,36 @@ class _WebHandler(BaseHTTPRequestHandler):
                         result = self.bridge.channel_join(channel)
                     else:
                         result = self.bridge.channel_leave(channel)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
+                return
+            if path in ("/api/channels/pin", "/api/channels/unpin"):
+                channel = body.get("channel")
+                digest = body.get("hash")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(digest, str) or not digest.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'hash' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/channels/pin":
+                        result = self.bridge.channel_pin(channel, digest)
+                    else:
+                        result = self.bridge.channel_unpin(channel, digest)
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return

@@ -8,24 +8,30 @@ import { mockFetch } from "./test-utils";
 let calls: string[] = [];
 
 beforeEach(() => {
+  const message = {
+    v: 1,
+    hash: "m1".padEnd(64, "0"),
+    channel: "mesh-general",
+    author: "a".repeat(32),
+    key: "a".repeat(32),
+    name: "alice",
+    text: "hello channel",
+    created_at: 1000,
+    received_at: 1000,
+    sig: "s",
+  };
   const router = mockFetch((url) => {
     if (url.includes("/api/channels/messages")) {
       return {
         channel: "mesh-general",
-        messages: [
-          {
-            v: 1,
-            hash: "m1".padEnd(64, "0"),
-            channel: "mesh-general",
-            author: "a".repeat(32),
-            key: "a".repeat(32),
-            name: "alice",
-            text: "hello channel",
-            created_at: 1000,
-            received_at: 1000,
-            sig: "s",
-          },
-        ],
+        messages: [message],
+        count: 1,
+      };
+    }
+    if (url.includes("/api/channels/pins")) {
+      return {
+        channel: "mesh-general",
+        pins: [{ ...message, pinned_at: 1500 }],
         count: 1,
       };
     }
@@ -49,7 +55,8 @@ describe("ChannelsSection", () => {
     render(<ChannelsSection />);
     expect(await screen.findByRole("button", { name: "#mesh-general" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "#mesh-general" }));
-    expect(await screen.findByText("hello channel")).toBeTruthy();
+    // The message shows twice: once in the pinned strip, once in history.
+    expect((await screen.findAllByText("hello channel")).length).toBe(2);
   });
 
   it("joins a new channel by name", async () => {
@@ -65,7 +72,7 @@ describe("ChannelsSection", () => {
   it("sends a message to the selected channel", async () => {
     render(<ChannelsSection />);
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
-    await screen.findByText("hello channel");
+    await screen.findAllByText("hello channel");
     fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
       target: { value: "hi all" },
     });
@@ -78,5 +85,26 @@ describe("ChannelsSection", () => {
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
+  });
+
+  it("shows pins in a strip and unpins from it", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    // The pinned message shows in the strip and in history.
+    await screen.findByRole("button", { name: "Unpin pinned message from alice" });
+    expect(screen.getAllByText("hello channel").length).toBe(2);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unpin pinned message from alice" }),
+    );
+    await waitFor(() => expect(calls).toContain("POST /api/channels/unpin"));
+  });
+
+  it("marks a pinned message Pinned in history", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    const button = await screen.findByRole("button", {
+      name: "Unpin message from alice",
+    });
+    expect(button.textContent).toBe("Pinned");
   });
 });

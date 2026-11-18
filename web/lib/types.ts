@@ -624,6 +624,8 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Present on pins: when this node pinned the message. */
+  pinned_at?: number;
 }
 
 // ---------------------------------------------------------------- pages --

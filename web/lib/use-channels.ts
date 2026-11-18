@@ -13,11 +13,14 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   getChannelMessages,
+  getChannelPins,
   getChannels,
   joinChannel,
   leaveChannel,
+  pinChannelMessage,
   sendChannelMessage,
   syncChannels,
+  unpinChannelMessage,
 } from "./api";
 import type { Channel, ChannelMessage } from "./types";
 
@@ -27,6 +30,8 @@ export interface UseChannelsResult {
   selected: string | null;
   select: (channel: string | null) => void;
   messages: ChannelMessage[];
+  /** Pinned messages for the selected channel, newest pin first. */
+  pins: ChannelMessage[];
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
@@ -34,12 +39,15 @@ export interface UseChannelsResult {
   leave: (channel: string) => Promise<void>;
   send: (text: string) => Promise<ChannelMessage>;
   sync: (channel?: string) => Promise<void>;
+  pin: (hash: string) => Promise<void>;
+  unpin: (hash: string) => Promise<void>;
 }
 
 export function useChannels(pollMs = 30_000): UseChannelsResult {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
+  const [pins, setPins] = useState<ChannelMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -55,10 +63,12 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
   const refreshMessages = useCallback(async (channel: string | null) => {
     if (!channel) {
       setMessages([]);
+      setPins([]);
       return;
     }
     try {
       setMessages(await getChannelMessages(channel));
+      setPins(await getChannelPins(channel));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -89,6 +99,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     selected,
     select,
     messages,
+    pins,
     loading,
     error,
     refresh,
@@ -104,6 +115,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       if (selected === channel) {
         setSelected(null);
         setMessages([]);
+        setPins([]);
       }
     },
     send: async (text) => {
@@ -114,6 +126,16 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     },
     sync: async (channel) => {
       await syncChannels(channel ?? selected ?? undefined);
+      await refreshMessages(selected);
+    },
+    pin: async (hash) => {
+      if (!selected) throw new Error("no channel selected");
+      await pinChannelMessage(selected, hash);
+      await refreshMessages(selected);
+    },
+    unpin: async (hash) => {
+      if (!selected) throw new Error("no channel selected");
+      await unpinChannelMessage(selected, hash);
       await refreshMessages(selected);
     },
   };
