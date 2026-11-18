@@ -4172,6 +4172,228 @@ def test_retract_refuses_group_message_from_non_author(tmp_path):
     assert len(node.inbox.list_messages()) == 1
 
 
+def test_retract_moderator_deletes_member_group_message(tmp_path):
+    # Group moderation (#517): the group's creator may retract a
+    # member's message.  The creator is verified against the pinned
+    # roster, and the marker is recorded under the message's author,
+    # so a copy arriving later still loses to it.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    members = ["ab" * 16, author_hash, creator_hash]
+    group = _pinned_group(node, members=members, creator=creator_hash)
+    _seed_group_copy(
+        node, group=group, author=author_hash, sent_at=100.0, message_id="local-leg-9"
+    )
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            creator,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=author_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=creator,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert response["group_retract"] is True
+    assert node.inbox.list_messages() == []
+    assert node.mailbox.is_group_retracted(author_hash, group, 100.0) is True
+
+
+def test_retract_refuses_non_creator_moderator_group_message(tmp_path):
+    # A member who is neither the author nor the creator cannot
+    # retract another member's message, even with the group context
+    # naming the author: the copy stays and no marker is recorded.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    other = RNS.Identity()
+    other_hash = destination_hash(other).hex()
+    members = ["ab" * 16, author_hash, creator_hash, other_hash]
+    group = _pinned_group(node, members=members, creator=creator_hash)
+    _seed_group_copy(
+        node, group=group, author=author_hash, sent_at=100.0, message_id="local-leg-9"
+    )
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            other,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=author_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=other,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert len(node.inbox.list_messages()) == 1
+    assert node.mailbox.is_group_retracted(author_hash, group, 100.0) is False
+
+
+def test_retract_moderator_records_marker_for_missing_copy(tmp_path):
+    # No copy held yet: the creator's retract still records the
+    # marker under the author, and a copy arriving later loses to it.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    members = ["ab" * 16, author_hash, creator_hash]
+    group = _pinned_group(node, members=members, creator=creator_hash)
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            creator,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=author_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=creator,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is False
+    assert node.mailbox.is_group_retracted(author_hash, group, 100.0) is True
+
+    late = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="late-leg-5",
+            group_id=group,
+            group_name="crew",
+            creator=creator_hash,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert late["ok"] is True
+    assert late["duplicate"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_retract_moderator_deletes_author_sent_copy(tmp_path):
+    # The creator's fan-out reaches the author too: their sent record
+    # is deleted, its queued legs are cancelled, and the marker is
+    # recorded under the author.
+    node = make_node(tmp_path)
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    node.destination = SimpleNamespace(hexhash=author_hash, hash=b"\x00" * 16)
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    third = RNS.Identity()
+    third_hash = destination_hash(third).hex()
+    members = [author_hash, creator_hash, third_hash]
+    group = _pinned_group(node, members=members, creator=creator_hash)
+    node.inbox.append(
+        {
+            "from": "author",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "leg_ids": ["m-10", "m-11"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.enqueue(
+        to=bytes.fromhex(third_hash),
+        text="crew hello",
+        message_id="m-11",
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": creator_hash,
+            "members": list(members),
+        },
+        sent_at=100.0,
+    )
+    assert node.mailbox.get_outbox("m-11") is not None
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            creator,
+            "creator-leg-1",
+            "retract-1",
+            group=group,
+            target_author=author_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=creator,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert node.inbox.list_messages(direction="out") == []
+    assert node.mailbox.get_outbox("m-11") is None
+    assert node.mailbox.is_sent_group_retracted(group, 100.0) is True
+    assert node.mailbox.is_group_retracted(author_hash, group, 100.0) is True
+
+
+def test_retract_moderator_without_roster_fails_closed(tmp_path):
+    # A creator claim the receiver cannot verify — no pinned roster
+    # for the group — fails closed instead of recording a marker
+    # that could never suppress the message.
+    from tau.protocol import derive_group_id
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    members = ["ab" * 16, author_hash, creator_hash]
+    group = derive_group_id(creator_hash, "crew", members)
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            creator,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=author_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=creator,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert node.mailbox.is_group_retracted(author_hash, group, 100.0) is False
+
+
 def test_retract_refuses_group_message_from_non_member(tmp_path):
     # The author left the group after the message arrived: the roster
     # no longer names them, so the retract fails closed — exactly as

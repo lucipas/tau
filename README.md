@@ -369,6 +369,11 @@ Global options may appear before or after the command:
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau messages prune --older-than 90d` | Delete stored messages older than a cutoff (`--peer`, `--group`, `--dry-run`) |
 | `tau note TEXT` | Save a private note to self in the local inbox (never sent; list with `tau messages --kind note`) |
+| `tau draft save --to PEER TEXT` | Save an unsent message as a draft for a peer (`--group NAME` drafts for a group instead; one draft per conversation, saving again overwrites; local-only, never sent until `draft send`) |
+| `tau draft list` | List saved message drafts with a text preview |
+| `tau draft show --to PEER` | Print a saved draft's full text (`--group NAME` for a group draft) |
+| `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft) |
+| `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -451,6 +456,10 @@ tau messages --kind ping
 
 # See what is waiting on offline peers
 tau outbox
+
+# Broadcast lists: one message, many private DMs (no shared group)
+tau broadcast create team --peer alice --peer bob
+tau broadcast send team "meet at noon"
 
 # Read back messages this node received (newest first)
 tau messages
@@ -771,6 +780,19 @@ stays until every member received it, so the retract can be
 retried. Messages sent before group retracts landed carry no shared
 send time and cannot be retracted. The web console cannot retract
 group messages yet — that is a follow-up.
+
+A group creator may also retract a member's message: `tau retract
+<message-id>` on a received group message works when this node
+created the group, and fans the retract out to every member —
+including the author, whose own sent copy is deleted and whose
+queued legs are cancelled. Receivers accept the retract only from
+the group's creator, verified against the pinned roster for the
+group id in the signed context, and the durable marker is recorded
+under the message's author, so a copy arriving later still loses to
+it. A non-creator member retracting another member's message is
+still refused with `not_sender`, and a creator claim the receiver
+cannot verify (no pinned roster for the group) fails closed the
+same way.
 
 Retracts are delivered live in v1, like reactions: the peer must be
 online. A DM still queued in the outbox is cancelled with
