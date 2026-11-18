@@ -453,6 +453,10 @@ tau messages --kind ping
 # See what is waiting on offline peers
 tau outbox
 
+# Broadcast lists: one message, many private DMs (no shared group)
+tau broadcast create team --peer alice --peer bob
+tau broadcast send team "meet at noon"
+
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
@@ -772,6 +776,19 @@ stays until every member received it, so the retract can be
 retried. Messages sent before group retracts landed carry no shared
 send time and cannot be retracted. The web console cannot retract
 group messages yet — that is a follow-up.
+
+A group creator may also retract a member's message: `tau retract
+<message-id>` on a received group message works when this node
+created the group, and fans the retract out to every member —
+including the author, whose own sent copy is deleted and whose
+queued legs are cancelled. Receivers accept the retract only from
+the group's creator, verified against the pinned roster for the
+group id in the signed context, and the durable marker is recorded
+under the message's author, so a copy arriving later still loses to
+it. A non-creator member retracting another member's message is
+still refused with `not_sender`, and a creator claim the receiver
+cannot verify (no pinned roster for the group) fails closed the
+same way.
 
 Retracts are delivered live in v1, like reactions: the peer must be
 online. A DM still queued in the outbox is cancelled with

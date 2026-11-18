@@ -1,111 +1,61 @@
+// use-pages.ts — personal mesh pages for the Pages tab.
+//
+// Provides:
+//   usePages() — cached peer pages plus this node's own page
+//                (GET /api/pages), and fetch-a-peer's-page over RNS
+//                (POST /api/pages/fetch). Page files are downloaded via
+//                /api/pages/<author>/files/<sha256> (see pageFileUrl in api.ts).
+
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { fetchPage, getPages } from "./api";
+import type { MeshPage } from "./types";
 
-import { apiGet, apiPost } from "./api";
-import type { MeshPage, PageFetchResponse, PagesResponse } from "./types";
-
-function errorMessage(caught: unknown): string {
-  return caught instanceof Error ? caught.message : "request failed";
+export interface UsePagesResult {
+  pages: MeshPage[];
+  mine: MeshPage | null;
+  count: number;
+  loading: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+  /** Fetch one peer's page over RNS; returns the page or null. */
+  fetch: (peer: string) => Promise<MeshPage | null>;
 }
 
-export function usePages() {
+export function usePages(): UsePagesResult {
   const [pages, setPages] = useState<MeshPage[]>([]);
   const [mine, setMine] = useState<MeshPage | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [count, setCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [fetching, setFetching] = useState(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
-  const [fetchNote, setFetchNote] = useState<string | null>(null);
-  const selectedRef = useRef<string | null>(null);
-  useEffect(() => {
-    selectedRef.current = selected;
-  }, [selected]);
-  // A newer refresh supersedes an older one, so a slow list never
-  // overwrites a page selection that already happened.
-  const generationRef = useRef(0);
 
-  const load = useCallback(async () => {
-    const generation = ++generationRef.current;
+  const refresh = useCallback(async () => {
     try {
-      const response = await apiGet<PagesResponse>("/api/pages");
-      if (generation !== generationRef.current) return;
-      setPages(response.pages);
-      setMine(response.mine);
+      const data = await getPages();
+      setPages(data.pages);
+      setMine(data.mine);
+      setCount(data.count);
       setError(null);
-      const current = selectedRef.current;
-      const known =
-        response.pages.some((page) => page.author === current) ||
-        response.mine?.author === current;
-      if (!known) {
-        // First load, or the selected page went away: open the
-        // newest cached page, or the own page when nothing has
-        // been fetched yet.
-        setSelected(
-          response.pages[0]?.author ?? response.mine?.author ?? null,
-        );
-      }
-    } catch (caught) {
-      if (generation !== generationRef.current) return;
-      setError(errorMessage(caught));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (generation === generationRef.current) setLoading(false);
+      setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    void refresh();
+  }, [refresh]);
 
-  const fetchPage = useCallback(
+  const fetch = useCallback(
     async (peer: string) => {
-      setFetching(true);
-      setFetchError(null);
-      setFetchNote(null);
-      try {
-        const response = await apiPost<PageFetchResponse>("/api/pages/fetch", {
-          peer,
-        });
-        if (response.page === null) {
-          setFetchNote("that peer publishes no page");
-          return null;
-        }
-        await load();
-        setSelected(response.page.author);
-        return response.page;
-      } catch (caught) {
-        setFetchError(errorMessage(caught));
-        return null;
-      } finally {
-        setFetching(false);
-      }
+      const data = await fetchPage(peer);
+      if (data.page) await refresh();
+      return data.page;
     },
-    [load],
+    [refresh],
   );
 
-  const select = useCallback((author: string | null) => {
-    setSelected(author);
-  }, []);
-
-  // The own page is selectable by author too, even though it lives
-  // outside the cached list.
-  const selectedPage =
-    pages.find((page) => page.author === selected) ??
-    (mine !== null && mine.author === selected ? mine : null);
-
-  return {
-    pages,
-    mine,
-    selected,
-    selectedPage,
-    loading,
-    error,
-    fetching,
-    fetchError,
-    fetchNote,
-    refresh: load,
-    select,
-    fetchPage,
-  };
+  return { pages, mine, count, loading, error, refresh, fetch };
 }
