@@ -17,14 +17,21 @@ from tau.channels import (
     channel_history_page,
     clean_channel_name,
     create_message,
+    create_retraction,
     get_message,
+    get_retraction,
+    hash_retraction,
     init_db,
     is_member,
     join_channel,
     leave_channel,
     list_memberships,
+    list_retractions,
+    resolve_message_digest,
     store_message,
+    store_retraction,
     verify_message,
+    verify_retraction,
 )
 from tau.cli import main
 from tau.config import TauConfig
@@ -839,3 +846,485 @@ def test_cli_channel_send_without_name_flag_keeps_node_name(tmp_path, capsys):
     capsys.readouterr()
     assert main(["id", "--data-dir", str(data_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["name"] == "alice"
+
+
+# -- retract notices -----------------------------------------------------------
+
+
+def test_create_retraction_signs_and_deletes(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(
+        conn, alice, "general", "take this back", name="alice", now=1000
+    )
+    notice = create_retraction(conn, alice, "general", message["hash"], now=1001)
+    assert notice["kind"] == "channel-retract"
+    assert notice["hash"] == message["hash"]
+    assert notice["author"] == author_of(alice)
+    assert verify_retraction(notice)["hash"] == message["hash"]
+    assert get_message(conn, message["hash"]) is None
+    assert channel_history(conn, "general") == []
+    assert get_retraction(conn, message["hash"], author_of(alice)) is not None
+    assert list_retractions(conn, "general")[0]["hash"] == message["hash"]
+
+
+def test_create_retraction_rejects_others_message(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, bob, "general", "not yours", name="bob", now=1000)
+    with pytest.raises(ChannelError):
+        create_retraction(conn, alice, "general", message["hash"])
+    assert get_message(conn, message["hash"]) is not None
+
+
+def test_create_retraction_rejects_unknown_digest(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    with pytest.raises(ChannelError):
+        create_retraction(conn, alice, "general", "00" * 32)
+
+
+def test_create_retraction_is_idempotent(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, alice, "general", "twice", name="alice", now=1000)
+    first = create_retraction(conn, alice, "general", message["hash"], now=1001)
+    second = create_retraction(conn, alice, "general", message["hash"], now=1002)
+    assert first["hash"] == second["hash"]
+    assert len(list_retractions(conn, "general")) == 1
+
+
+def test_verify_retraction_rejects_tampered_notice(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, alice, "general", "hello", name="alice", now=1000)
+    notice = create_retraction(conn, alice, "general", message["hash"], now=1001)
+    with pytest.raises(ChannelError):
+        verify_retraction(dict(notice, sig="00" * 64))
+    with pytest.raises(ChannelError):
+        verify_retraction(dict(notice, hash="11" * 32))
+    with pytest.raises(ChannelError):
+        verify_retraction(dict(notice, kind="channel-message"))
+
+
+def test_store_retraction_applies_to_held_message(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi", name="bob", now=1000)
+    notice = create_retraction(source, bob, "general", message["hash"], now=1001)
+    assert get_message(source, message["hash"]) is None
+
+    target = init_db(tmp_path / "target.sqlite3")
+    _, is_new = store_message(target, message)
+    assert is_new
+    _, is_new, applied = store_retraction(target, notice)
+    assert is_new and applied
+    assert get_message(target, message["hash"]) is None
+    assert channel_history(target, "general") == []
+
+
+def test_store_retraction_from_non_author_does_not_delete(identities, tmp_path):
+    # A notice signed by alice naming bob's message: the signature is
+    # valid (alice signed it as herself), so it stores — but it must
+    # never delete bob's message, or anyone could censor anyone.
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, bob, "general", "mine", name="bob", now=1000)
+    body = {
+        "v": 1,
+        "kind": "channel-retract",
+        "channel": "general",
+        "hash": message["hash"],
+        "author": author_of(alice),
+        "key": alice.get_public_key().hex(),
+        "created_at": 1001.0,
+    }
+    forged = dict(body)
+    forged["sig"] = alice.sign(bytes.fromhex(hash_retraction(body))).hex()
+    _, is_new, applied = store_retraction(conn, forged)
+    assert is_new and not applied
+    assert get_message(conn, message["hash"]) is not None
+    assert [item["text"] for item in channel_history(conn, "general")] == ["mine"]
+
+
+def test_pending_retraction_blocks_later_message(identities, tmp_path):
+    # The tombstone arrives before the message does: the message is
+    # refused when it finally shows up from another peer.
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "late", name="bob", now=1000)
+    notice = create_retraction(source, bob, "general", message["hash"], now=1001)
+
+    target = init_db(tmp_path / "target.sqlite3")
+    _, is_new, applied = store_retraction(target, notice)
+    assert is_new and not applied
+    _, was_new = store_message(target, message)
+    assert not was_new
+    assert channel_history(target, "general") == []
+
+
+def test_history_page_excludes_retracted_message(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, bob, "general", "keep me", name="bob", now=1000)
+    drop = create_message(conn, bob, "general", "drop me", name="bob", now=1001)
+    create_retraction(conn, bob, "general", drop["hash"], now=1002)
+    page, has_more = channel_history_page(conn, "general", limit=20)
+    assert [item["text"] for item in page] == ["keep me"]
+    assert has_more is False
+
+
+def test_resolve_message_digest_prefix(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, alice, "general", "hello", name="alice", now=1000)
+    assert (
+        resolve_message_digest(conn, "general", message["hash"][:8])
+        == message["hash"]
+    )
+    assert resolve_message_digest(conn, "general", message["hash"]) == message["hash"]
+    with pytest.raises(ChannelError):
+        resolve_message_digest(conn, "general", "abc")
+    with pytest.raises(ChannelError):
+        resolve_message_digest(conn, "general", "zzzz")
+    with pytest.raises(ChannelError):
+        resolve_message_digest(conn, "general", "00" * 32)
+
+
+def test_resolve_message_digest_rejects_ambiguous_prefix(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    # Two rows sharing a 4-hex prefix: the resolver must refuse to guess.
+    conn.execute(
+        "INSERT INTO messages(v, hash, channel, author, key, name, text, "
+        "created_at, received_at, sig) VALUES(1, ?, 'general', ?, ?, '', "
+        "'one', 1000, 1000, ?)",
+        ("abcd" + "00" * 30, author_of(alice), alice.get_public_key().hex(), "00" * 64),
+    )
+    conn.execute(
+        "INSERT INTO messages(v, hash, channel, author, key, name, text, "
+        "created_at, received_at, sig) VALUES(1, ?, 'general', ?, ?, '', "
+        "'two', 1001, 1001, ?)",
+        ("abcd" + "11" * 30, author_of(alice), alice.get_public_key().hex(), "00" * 64),
+    )
+    conn.commit()
+    with pytest.raises(ChannelError):
+        resolve_message_digest(conn, "general", "abcd")
+    assert resolve_message_digest(conn, "general", "abcd00") == "abcd" + "00" * 30
+
+
+def test_handle_feed_includes_retractions_and_excludes_message(
+    identities, tmp_path
+):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        create_message(conn, bob, "general", "keep", name="bob", now=1000)
+        drop = create_message(conn, bob, "general", "drop", name="bob", now=1001)
+        create_retraction(conn, bob, "general", drop["hash"], now=1002)
+    finally:
+        conn.close()
+
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert [item["text"] for item in payload["messages"]] == ["keep"]
+    assert len(payload["retractions"]) == 1
+    assert payload["retractions"][0]["hash"] == drop["hash"]
+
+
+def test_handle_post_accepts_retraction(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi all", name="bob", now=1000)
+    notice = create_retraction(source, bob, "general", message["hash"], now=1001)
+
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        store_message(conn, message)
+    finally:
+        conn.close()
+
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"retraction": notice, "ttl": 0}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert payload["retraction"] is True
+    assert payload["applied"] is True
+    conn = app.connect()
+    try:
+        assert get_message(conn, message["hash"]) is None
+    finally:
+        conn.close()
+
+
+def test_handle_post_rejects_tampered_retraction(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi all", name="bob", now=1000)
+    notice = create_retraction(source, bob, "general", message["hash"], now=1001)
+
+    app = _make_app(identities, tmp_path)
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"retraction": dict(notice, sig="00" * 64), "ttl": 0}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is False
+
+
+def test_handle_post_rejects_message_and_retraction_together(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi all", name="bob", now=1000)
+    notice = create_retraction(source, bob, "general", message["hash"], now=1001)
+
+    app = _make_app(identities, tmp_path)
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"message": message, "retraction": notice, "ttl": 0}),
+        b"id",
+        None,
+        time.time(),
+    )
+    assert decode(response)["ok"] is False
+
+
+def test_sync_applies_retractions_from_feed(identities, tmp_path):
+    alice, bob = identities
+    bob_config = TauConfig.resolve(data_dir=tmp_path / "bob", name="bob")
+    source = ChannelApp(bob_config, bob, name="bob", gossip=False)
+    source.join("general")
+    source.send("general", "keep me", publish=False)
+    drop = source.send("general", "drop me", publish=False)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(author_of(bob)),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+
+    class _FeedNode(_FakeNode):
+        def request(self, peer, path, payload, *, timeout=20.0):
+            assert path == CHANNEL_FEED_PATH
+            return decode(
+                source._handle_feed(path, payload, b"id", None, time.time())
+            )
+
+    node = _FeedNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, "general", limit=20)
+    assert summary["stored"] == 2
+    assert summary["retracted"] == 0
+    assert [item["text"] for item in app.history("general")] == [
+        "drop me",
+        "keep me",
+    ]
+
+    source.retract("general", drop["hash"])
+    summary = app.sync(node, "general", limit=20)
+    assert summary["retracted"] == 1
+    assert summary["errors"] == []
+    assert [item["text"] for item in app.history("general")] == ["keep me"]
+
+
+def test_cli_channel_retract_and_retractions(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "take back",
+            ]
+        )
+        == 0
+    )
+
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    out = capsys.readouterr().out
+    assert "hello" in out and "take back" in out
+
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        messages = channel_history(conn, "general")
+    finally:
+        conn.close()
+    target = [item for item in messages if item["text"] == "take back"][0]
+    assert target["hash"][:8] in out
+
+    assert (
+        main(
+            [
+                "channel",
+                "retract",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                target["hash"][:8],
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "retracted" in out
+
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    out = capsys.readouterr().out
+    assert "take back" not in out
+    assert "hello" in out
+
+    assert (
+        main(["channel", "retractions", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    out = capsys.readouterr().out
+    assert target["hash"][:8] in out
+
+
+def test_cli_channel_retract_json(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        digest = channel_history(conn, "general")[0]["hash"]
+    finally:
+        conn.close()
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "channel",
+                "retract",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                digest,
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["retraction"]["hash"] == digest
+    assert payload["retraction"]["kind"] == "channel-retract"
+    assert payload["published"] is None
+
+
+def test_cli_channel_retract_rejects_unknown_and_others(tmp_path, capsys):
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello",
+            ]
+        )
+        == 0
+    )
+    # Unknown digest.
+    assert (
+        main(
+            [
+                "channel",
+                "retract",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "00" * 32,
+            ]
+        )
+        == 2
+    )
+    # Someone else's message, stored directly in this node's database.
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        other = create_message(conn, bob, "general", "not yours", name="bob", now=1000)
+    finally:
+        conn.close()
+    assert (
+        main(
+            [
+                "channel",
+                "retract",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                other["hash"][:8],
+            ]
+        )
+        == 2
+    )
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        assert get_message(conn, other["hash"]) is not None
+    finally:
+        conn.close()
