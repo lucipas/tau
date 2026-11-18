@@ -99,6 +99,14 @@ from .muted import (
     muted_peers_for,
     save_muted,
 )
+from .pinned import (
+    PinnedError,
+    clean_pinned_target,
+    load_pinned,
+    load_pinned_set,
+    pinned_lock,
+    save_pinned,
+)
 from .quiet_hours import (
     QuietHours,
     QuietHoursError,
@@ -1658,6 +1666,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unarchive.add_argument("peer", help="peer name, destination hash or hash prefix")
     unarchive.set_defaults(func=cmd_unarchive)
+
+    pin_conversation = subparsers.add_parser(
+        "pin-conversation",
+        parents=[common],
+        help="pin a conversation so it stays at the top of the conversation list",
+    )
+    pin_target = pin_conversation.add_mutually_exclusive_group(required=True)
+    pin_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    pin_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    pin_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name (must be joined)",
+    )
+    pin_conversation.set_defaults(func=cmd_pin_conversation)
+
+    unpin_conversation = subparsers.add_parser(
+        "unpin-conversation",
+        parents=[common],
+        help="remove the pin from a conversation",
+    )
+    unpin_target = unpin_conversation.add_mutually_exclusive_group(required=True)
+    unpin_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    unpin_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    unpin_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name",
+    )
+    unpin_conversation.set_defaults(func=cmd_unpin_conversation)
+
+    pinned_conversations = subparsers.add_parser(
+        "pinned-conversations",
+        parents=[common],
+        help="list pinned conversations, newest pin first",
+    )
+    pinned_conversations.set_defaults(func=cmd_pinned_conversations)
 
     disappearing = subparsers.add_parser(
         "disappearing",
@@ -4188,6 +4249,7 @@ def _print_peer_table(
     now: Optional[float] = None,
     safety_numbers: Optional[Dict[str, str]] = None,
     lookalikes: Optional[Dict[str, Peer]] = None,
+    pinned: Optional[Set[str]] = None,
 ) -> None:
     """Print the peers table, flagging possible lookalikes.
 
@@ -4195,6 +4257,8 @@ def _print_peer_table(
     peer or saved contact it may be impersonating (see
     :meth:`PeerRegistry.lookalike_for`); a flagged peer is rendered
     with the collision in its name cell and a warning below the table.
+    *pinned* names the destination hashes pinned to the top of the
+    list, shown with a 📌 in the name cell.
     """
     rows = list(peers)
     if not rows:
@@ -4210,6 +4274,8 @@ def _print_peer_table(
         collided = lookalikes.get(peer.hexhash) if lookalikes else None
         if collided is not None:
             name = f"{name} ⚠ lookalike of {collided.display_name}"
+        if pinned is not None and peer.hexhash in pinned:
+            name = f"📌 {name}"
         table.append(
             (
                 peer.hexhash,
@@ -7819,6 +7885,10 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
     json_output = _json_mode(args)
     app = ChannelApp(config, _tan_identity(config), name=config.name)
     memberships = app.memberships()
+    pinned = load_pinned_set(config.pinned_path, "channel")
+    for membership in memberships:
+        membership["pinned"] = membership["channel"] in pinned
+    memberships = sorted(memberships, key=lambda m: not m["pinned"])
     if json_output:
         _emit({"channels": memberships, "count": len(memberships)}, True)
         return _EXIT_OK
@@ -7828,9 +7898,11 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
     for membership in memberships:
         count = membership["messages"]
         noun = "message" if count == 1 else "messages"
+        pinned_suffix = " [pinned]" if membership["pinned"] else ""
         print(
             f"#{membership['channel']} — {count} cached {noun}, "
             f"joined {_ago(time.time() - membership['joined_at'])} ago"
+            f"{pinned_suffix}"
         )
     return _EXIT_OK
 
@@ -8977,6 +9049,10 @@ def cmd_peers(args: argparse.Namespace) -> int:
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
     peers = registry.all(max_age=max_age)
+    # Pinned conversations stay at the top; the registry order is kept
+    # within each half, so the sort is stable.
+    pinned = load_pinned_set(config.pinned_path, "peer")
+    peers = sorted(peers, key=lambda peer: peer.hexhash not in pinned)
     safety_numbers: Optional[Dict[str, str]] = None
     if getattr(args, "safety_number", False):
         identity = load_identity(config.identity_path)
@@ -8997,6 +9073,7 @@ def cmd_peers(args: argparse.Namespace) -> int:
             entry["lookalike_of"] = (
                 collided.display_name if collided is not None else None
             )
+            entry["pinned"] = entry["destination"] in pinned
         if safety_numbers is not None:
             for entry in payload:
                 entry["safety_number"] = safety_numbers[entry["destination"]]
@@ -9006,6 +9083,7 @@ def cmd_peers(args: argparse.Namespace) -> int:
             peers,
             safety_numbers=safety_numbers,
             lookalikes=_lookalike_map(registry, peers),
+            pinned=pinned,
         )
     return _EXIT_OK
 
@@ -13270,6 +13348,166 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _resolve_pin_target(
+    config: TauConfig, args: argparse.Namespace
+) -> Tuple[str, List[str], str]:
+    """Resolve a pin command's --peer/--group/--channel to (kind, keys, label).
+
+    A group resolves to its whole rename lineage, like a mute: the
+    pin follows the conversation across a rename.  A channel must be
+    joined — pinning a channel this node never joined is a typo, not
+    a pin.  Unpinning a channel needs no membership: a pin for a
+    channel left since stays removable.
+    """
+    if getattr(args, "group", None):
+        try:
+            group = GroupStore(config.groups_path).find(args.group)
+        except ValueError:
+            raise NodeError(f"unknown group: {args.group!r}") from None
+        lineage = sorted(group_lineage(group))
+        label = f"group {group['name']} ({short_hash(group['id'])})"
+        return "group", lineage, label
+    if getattr(args, "channel", None):
+        try:
+            name = clean_channel_name(args.channel)
+        except ChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        return "channel", [name], f"channel #{name}"
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    destination = _resolve_inbox_peer(inbox, registry, args.peer)
+    peer = registry.get(destination)
+    name = peer.display_name if peer is not None else "unknown"
+    return (
+        "peer",
+        [destination],
+        f"conversation with {name} ({short_hash(destination)})",
+    )
+
+
+def _edit_pinned(
+    config: TauConfig,
+    kind: str,
+    keys: List[str],
+    *,
+    pin: bool,
+) -> Tuple[bool, PinnedList]:
+    """Pin or unpin every key in *keys*, reloading inside the lock.
+
+    Returns (changed, new list): pinning an already-pinned
+    conversation — or unpinning an unpinned one — is a no-op, not an
+    error, mirroring the archive commands.
+    """
+    with pinned_lock(config.pinned_path):
+        try:
+            pinned = load_pinned(config.pinned_path)
+        except PinnedError as exc:
+            raise NodeError(str(exc)) from exc
+        updated = pinned
+        changed = False
+        for key in keys:
+            already = updated.is_pinned(kind, key)
+            if pin and not already:
+                updated = updated.with_pinned(kind, key)
+                changed = True
+            elif not pin and already:
+                updated = updated.without(kind, key)
+                changed = True
+        if changed:
+            save_pinned(config.pinned_path, updated)
+    return changed, updated
+
+
+def cmd_pin_conversation(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    kind, keys, label = _resolve_pin_target(config, args)
+    if kind == "channel":
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        conn = app.connect()
+        try:
+            if not is_channel_member(conn, keys[0]):
+                raise NodeError(
+                    f"not a member of channel {keys[0]!r}; join it first"
+                )
+        finally:
+            conn.close()
+    try:
+        changed, _ = _edit_pinned(config, kind, keys, pin=True)
+    except PinnedError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit(
+            {"kind": kind, "target": keys[0], "pinned": True, "changed": changed},
+            True,
+        )
+        return _EXIT_OK
+    if changed:
+        print(f"Pinned {label} — it now stays at the top of the list.")
+    else:
+        print(f"{label} is already pinned.")
+    return _EXIT_OK
+
+
+def cmd_unpin_conversation(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    kind, keys, label = _resolve_pin_target(config, args)
+    changed, _ = _edit_pinned(config, kind, keys, pin=False)
+    if _json_mode(args):
+        _emit(
+            {"kind": kind, "target": keys[0], "pinned": False, "changed": changed},
+            True,
+        )
+        return _EXIT_OK
+    if changed:
+        print(f"Unpinned {label}.")
+    else:
+        print(f"{label} was not pinned.")
+    return _EXIT_OK
+
+
+def cmd_pinned_conversations(args: argparse.Namespace) -> int:
+    """List pinned conversations, newest pin first."""
+    config = _make_config(args)
+    try:
+        pinned = load_pinned(config.pinned_path)
+    except PinnedError as exc:
+        raise NodeError(str(exc)) from exc
+    registry = PeerRegistry(config.peers_path)
+    store = GroupStore(config.groups_path)
+
+    def describe(entry) -> Dict[str, Any]:
+        if entry.kind == "peer":
+            peer = registry.get(entry.target)
+            name = peer.display_name if peer is not None else "unknown"
+            label = f"{name} ({short_hash(entry.target)})"
+        elif entry.kind == "group":
+            try:
+                group = store.find(entry.target)
+                label = f"group {group['name']} ({short_hash(entry.target)})"
+            except ValueError:
+                label = f"group {short_hash(entry.target)}"
+        else:
+            label = f"channel #{entry.target}"
+        return {
+            "kind": entry.kind,
+            "target": entry.target,
+            "label": label,
+            "pinned_at": entry.pinned_at,
+        }
+
+    entries = [describe(entry) for entry in pinned.entries]
+    if _json_mode(args):
+        _emit({"pinned": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No pinned conversations — pin one with `tau pin-conversation`.")
+        return _EXIT_OK
+    for entry in entries:
+        age = _ago(time.time() - float(entry["pinned_at"]))
+        print(f"{entry['label']} — pinned {age} ago")
+    return _EXIT_OK
+
+
 def cmd_mute(args: argparse.Namespace) -> int:
     config = _make_config(args)
     if getattr(args, "off", False) and args.peer is None and args.group is None:
@@ -13984,9 +14222,19 @@ def cmd_group_list(args: argparse.Namespace) -> int:
     store = GroupStore(config.groups_path)
     registry = PeerRegistry(config.peers_path)
     ignored = load_ignored_group_ids(config.ignored_groups_path)
-    groups = [_describe_group(group, registry) for group in store.list_groups()]
+    records = store.list_groups()
+    # A group reads as pinned when any id in its rename lineage is
+    # pinned, like a mute — the pin follows the conversation, not the id.
+    pinned_ids = load_pinned_set(config.pinned_path, "group")
+    pinned = {
+        record["id"]: bool(group_lineage(record) & pinned_ids)
+        for record in records
+    }
+    groups = [_describe_group(group, registry) for group in records]
     for group in groups:
         group["ignored"] = group["id"] in ignored
+        group["pinned"] = pinned.get(group["id"], False)
+    groups = sorted(groups, key=lambda group: not group["pinned"])
     if _json_mode(args):
         _emit({"groups": groups, "count": len(groups)}, True)
         return _EXIT_OK
@@ -13996,7 +14244,8 @@ def cmd_group_list(args: argparse.Namespace) -> int:
     for group in groups:
         names = ", ".join(member["name"] for member in group["members"])
         ignored_suffix = " [ignored]" if group["ignored"] else ""
-        print(f"{group['name']} ({group['id'][:8]}) — {names}{ignored_suffix}")
+        pinned_suffix = " [pinned]" if group["pinned"] else ""
+        print(f"{group['name']} ({group['id'][:8]}) — {names}{ignored_suffix}{pinned_suffix}")
         if group.get("topic"):
             print(f"  topic: {group['topic']}")
     return _EXIT_OK

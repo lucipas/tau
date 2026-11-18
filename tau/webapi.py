@@ -21,6 +21,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/conversations/archived archived DM conversations
     POST /api/conversations/archive archive ``{"target": "<name, hash or prefix>"}``
     POST /api/conversations/unarchive unarchive ``{"target": "<name, hash or prefix>"}``
+    GET  /api/conversations/pinned pinned conversations, newest pin first
+    POST /api/conversations/pin pin/unpin ``{"peer"|"group"|"channel": "...", "pinned": true}``
     GET  /api/groups       known group DMs with their member lists
     POST /api/groups       create ``{"name": "...", "members": ["<hash>", ...]}``
     POST /api/groups/delete delete ``{"group": "<id | prefix | name>"}``
@@ -234,6 +236,13 @@ from .muted import (
     muted_peers_for,
     save_muted,
 )
+from .pinned import (
+    PinnedError,
+    load_pinned,
+    load_pinned_set,
+    pinned_lock,
+    save_pinned,
+)
 from .quiet_hours import quiet_hours_active
 from .dm_requests import (
     DmRequestsError,
@@ -250,6 +259,7 @@ from .config import (
     DISAPPEARING_FILE_NAME,
     MESSAGES_FILE_NAME,
     MUTED_FILE_NAME,
+    PINNED_FILE_NAME,
     QUIET_HOURS_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
@@ -1192,6 +1202,8 @@ class WebBridge:
         self._disappearing_lock = threading.Lock()
         # Serializes mute/unmute read-modify-write cycles the same way.
         self._muted_lock = threading.Lock()
+        # Serializes pin/unpin read-modify-write cycles the same way.
+        self._pinned_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -3856,8 +3868,13 @@ class WebBridge:
         )
 
     def channel_list(self) -> List[Dict[str, Any]]:
-        """Joined channels, most recently joined first."""
-        return self._local_channel_app().memberships()
+        """Joined channels, most recently joined first, pinned first."""
+        memberships = self._local_channel_app().memberships()
+        pinned = load_pinned_set(self._pinned_path(), "channel")
+        for membership in memberships:
+            membership["pinned"] = membership.get("channel") in pinned
+        memberships.sort(key=lambda item: not item["pinned"])
+        return memberships
 
     def channel_messages(
         self, channel: str, *, limit: int = 20
@@ -7515,6 +7532,12 @@ class WebBridge:
             if row is not None:
                 item["reachable"] = row["reachable"]
                 item["live_hops"] = row["hops"]
+        # Pinned conversations stay at the top; the registry order is
+        # kept within each half, so the sort is stable.
+        pinned = load_pinned_set(self._pinned_path(), "peer")
+        for item in items:
+            item["pinned"] = item.get("destination") in pinned
+        items.sort(key=lambda item: not item["pinned"])
         return items
 
     def mesh(self) -> List[Dict[str, Any]]:
@@ -7971,6 +7994,17 @@ class WebBridge:
             return None
         return data_dir / MUTED_FILE_NAME
 
+    def _pinned_path(self) -> Optional[Path]:
+        """This node's pinned-conversation path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "pinned_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / PINNED_FILE_NAME
+
     def _quiet_hours_path(self) -> Optional[Path]:
         """This node's quiet-hours path, or ``None`` for a dataless node."""
         config = getattr(self.node, "config", None)
@@ -8205,15 +8239,144 @@ class WebBridge:
             )
         return {"archived": described, "count": len(described)}
 
+    def pinned_conversations(self) -> Dict[str, Any]:
+        """Pinned conversations, newest pin first, for the console load.
+
+        Mirrors the stored file: one entry per pin (kind, target,
+        display label, pinned_at).  A corrupt file is a 503 — the
+        owner repairs or removes it before the console shows pins,
+        the same as the mute list.  The list endpoints stay usable
+        with a corrupt file (they fail open to unpinned), so only
+        this explicit listing is gated.
+        """
+        path = self._pinned_path()
+        if path is None:
+            return {"pinned": [], "count": 0}
+        try:
+            pinned = load_pinned(path)
+        except PinnedError as exc:
+            raise WebBridgeError(
+                "pinned-conversation list on disk is unusable; fix or remove it "
+                f"before editing ({exc})"
+            ) from exc
+        described = []
+        for entry in pinned.entries:
+            if entry.kind == "peer":
+                peer = self.node.registry.get(entry.target)
+                name = peer.display_name if peer is not None else ""
+                label = f"{name} ({entry.target[:8]})" if name else entry.target[:8]
+            elif entry.kind == "group":
+                try:
+                    group = self.node.groups.find(entry.target)
+                    label = f"group {group['name']} ({entry.target[:8]})"
+                except ValueError:
+                    label = f"group {entry.target[:8]}"
+            else:
+                label = f"channel #{entry.target}"
+            described.append(
+                {
+                    "kind": entry.kind,
+                    "target": entry.target,
+                    "label": label,
+                    "pinned_at": entry.pinned_at,
+                }
+            )
+        return {"pinned": described, "count": len(described)}
+
+    def set_pinned(
+        self,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+        channel: Optional[str] = None,
+        pinned: bool = True,
+    ) -> Dict[str, Any]:
+        """Pin or unpin one conversation.
+
+        Exactly one of *peer* (registry name, hash or prefix), *group*
+        (id, prefix or name) or *channel* (name, must be joined)
+        names the conversation; *pinned* is the new state.  Mirrors
+        ``tau pin-conversation``: a group pin covers the whole rename
+        lineage, the list is reloaded inside the lock so two writes
+        racing cannot discard each other's conversation, and a
+        corrupt file is a 503.  Pinning is display state only, so no
+        unread counts change and nothing is published.
+        """
+        given = [value for value in (peer, group, channel) if value is not None]
+        if len(given) != 1:
+            raise ValueError(
+                "exactly one of 'peer', 'group' or 'channel' is required"
+            )
+        if group is not None:
+            if not isinstance(group, str) or not group.strip():
+                raise ValueError("field 'group' is required")
+            record = self.node.groups.find(group.strip())
+            keys = sorted(group_lineage(record))
+            kind = "group"
+            label = f"group {record['name']} ({record['id'][:8]})"
+        elif channel is not None:
+            if not isinstance(channel, str) or not channel.strip():
+                raise ValueError("field 'channel' is required")
+            from .channels import clean_channel_name
+
+            name = clean_channel_name(channel.strip())
+            memberships = self._local_channel_app().memberships()
+            if not any(item.get("channel") == name for item in memberships):
+                raise ValueError(f"not a member of channel {name!r}; join it first")
+            keys = [name]
+            kind = "channel"
+            label = f"channel #{name}"
+        else:
+            if not isinstance(peer, str) or not peer.strip():
+                raise ValueError("field 'peer' is required")
+            key = self._resolve_block_target(peer.strip())
+            keys = [key]
+            kind = "peer"
+            record = self.node.registry.get(key)
+            label = record.display_name if record is not None else key[:8]
+        path = self._pinned_path()
+        if path is None:
+            raise WebBridgeError("this node has no pinned-conversation path")
+        with self._pinned_lock, pinned_lock(path):
+            try:
+                current = load_pinned(path)
+            except PinnedError as exc:
+                raise WebBridgeError(
+                    "pinned-conversation list on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+            updated = current
+            changed = False
+            for key in keys:
+                previous = updated.is_pinned(kind, key)
+                if pinned and not previous:
+                    updated = updated.with_pinned(kind, key)
+                    changed = True
+                elif not pinned and previous:
+                    updated = updated.without(kind, key)
+                    changed = True
+            if changed:
+                save_pinned(path, updated)
+        return {
+            "kind": kind,
+            "target": keys[0],
+            "label": label,
+            "pinned": pinned,
+            "changed": changed,
+        }
+
     def groups(self) -> List[Dict[str, Any]]:
         try:
             ignored = load_ignored_group_ids(
                 getattr(self.node.config, "ignored_groups_path", None)
             )
-            return [
-                self._describe_group(group, ignored)
+            pinned = load_pinned_set(self._pinned_path(), "group")
+            described = [
+                self._describe_group(group, ignored, pinned)
                 for group in self.node.groups.list_groups()
             ]
+            described.sort(key=lambda item: not item["pinned"])
+            return described
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read group store", exc_info=True)
             return []
@@ -8222,6 +8385,7 @@ class WebBridge:
         self,
         group: Dict[str, Any],
         ignored_ids: FrozenSet[str] = frozenset(),
+        pinned_ids: Optional[FrozenSet[str]] = None,
     ) -> Dict[str, Any]:
         members = []
         for member_hash in group["members"]:
@@ -8236,12 +8400,18 @@ class WebBridge:
                     ),
                 }
             )
+        if pinned_ids is None:
+            pinned_ids = load_pinned_set(self._pinned_path(), "group")
         return {
             "id": group["id"],
             "name": group["name"],
             "members": members,
             "created_at": group["created_at"],
             "topic": group.get("topic", ""),
+            # A group reads as pinned when any id in its rename
+            # lineage is pinned, like a mute — the pin follows the
+            # conversation across a rename.
+            "pinned": bool(group_lineage(group) & pinned_ids),
             # The console only offers member changes on groups this
             # node created; the store refuses anyone else.  A learned
             # group only claims its creator in the message, so it never
@@ -9870,6 +10040,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(result, head_only)
                 return
+            if path == "/api/conversations/pinned":
+                try:
+                    result = self.bridge.pinned_conversations()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
             if path == "/api/messages/disappearing":
                 # The full map names every locally configured conversation,
                 # including peers absent from the registry, so it goes
@@ -10620,6 +10798,34 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "archive": result}, head_only)
+                return
+            if path == "/api/conversations/pin":
+                # ``pinned`` defaults to true: posting a target pins
+                # it; posting ``"pinned": false`` unpins it.
+                pinned = body.get("pinned", True)
+                if not isinstance(pinned, bool):
+                    self._send_json(
+                        {"error": {"message": "field 'pinned' must be a boolean"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.set_pinned(
+                        peer=body.get("peer"),
+                        group=body.get("group"),
+                        channel=body.get("channel"),
+                        pinned=pinned,
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, PeerError) as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "pin": result}, head_only)
                 return
             if path == "/api/messages/disappearing":
                 try:

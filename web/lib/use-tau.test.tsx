@@ -237,6 +237,33 @@ describe("buildConversations", () => {
     expect(list[0].kind).toBe("group");
     expect(list[0].lastMessage).toBeNull();
   });
+
+  it("pinned conversations sort first, then by recency", () => {
+    const messages = [
+      makeMessage({ id: 1, peer: alice.destination, peer_name: "alice", sent_at: 1000 }),
+      makeMessage({ id: 2, peer: bob.destination, peer_name: "bob", sent_at: 2000 }),
+      makeMessage({ id: 3, peer: alice.destination, peer_name: "alice", sent_at: 1500, group: group.id, group_name: "crew" }),
+    ];
+    const pinnedAlice = { ...alice, pinned: true };
+    const list = buildConversations(messages, [pinnedAlice, bob], [group], null);
+    expect(list.map((c) => c.kind + ":" + c.key)).toEqual([
+      `dm:${alice.destination}`,
+      `dm:${bob.destination}`,
+      `group:${group.id}`,
+    ]);
+    expect(list[0].pinned).toBe(true);
+    expect(list[1].pinned).toBe(false);
+
+    // A pinned group jumps the newer DM too.
+    const pinnedGroup = { ...group, pinned: true };
+    const list2 = buildConversations(messages, [alice, bob], [pinnedGroup], null);
+    expect(list2.map((c) => c.kind + ":" + c.key)).toEqual([
+      `group:${group.id}`,
+      `dm:${bob.destination}`,
+      `dm:${alice.destination}`,
+    ]);
+    expect(list2[0].pinned).toBe(true);
+  });
 });
 
 describe("buildTraffic", () => {

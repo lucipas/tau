@@ -129,7 +129,9 @@ unread badge next to each peer and the unread total in the tab title.
 Opening a peer in the console clears its badge; read receipts to the sender
 are a separate feature and do not exist yet. A single conversation can be
 muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
-`tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
+pinned to the top of the list with `tau pin-conversation --peer alice`
+(`--group NAME` pins a group, `--channel NAME` a joined channel),
+and `tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
 every night instead — while the window is active every conversation counts
 as unread 0, and the counts come back when it ends.
 
@@ -374,6 +376,9 @@ Global options may appear before or after the command:
 | `tau draft show --to PEER` | Print a saved draft's full text (`--group NAME` for a group draft) |
 | `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft) |
 | `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group) |
+| `tau pin-conversation --peer PEER` | Pin a conversation so it stays at the top of the conversation list (`--group NAME` pins a group, `--channel NAME` a joined channel; local-only, idempotent) |
+| `tau unpin-conversation --peer PEER` | Remove the pin from a conversation (`--group NAME` / `--channel NAME` for a group or channel pin) |
+| `tau pinned-conversations` | List pinned conversations, newest pin first |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |

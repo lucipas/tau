@@ -17,6 +17,7 @@ import {
   joinChannel,
   leaveChannel,
   sendChannelMessage,
+  setPinnedConversation,
   syncChannels,
 } from "./api";
 import type { Channel, ChannelMessage } from "./types";
@@ -32,6 +33,7 @@ export interface UseChannelsResult {
   refresh: () => Promise<void>;
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
+  pin: (channel: string, pinned?: boolean) => Promise<void>;
   send: (text: string) => Promise<ChannelMessage>;
   sync: (channel?: string) => Promise<void>;
 }
@@ -105,6 +107,10 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
         setSelected(null);
         setMessages([]);
       }
+    },
+    pin: async (channel, pinned = true) => {
+      await setPinnedConversation({ channel }, pinned);
+      await refreshChannels();
     },
     send: async (text) => {
       if (!selected) throw new Error("no channel selected");

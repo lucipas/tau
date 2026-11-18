@@ -6136,6 +6136,198 @@ def test_muted_conversations_rejects_corrupt_file(node, tmp_path):
         bridge.stop()
 
 
+def test_pinned_conversations_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert status == 200
+        assert payload == {"pinned": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 200
+        assert payload["pin"]["target"] == PEER_HASH
+        assert payload["pin"]["kind"] == "peer"
+        assert payload["pin"]["pinned"] is True
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload["count"] == 1
+        assert payload["pinned"][0]["kind"] == "peer"
+        assert payload["pinned"][0]["target"] == PEER_HASH
+        assert payload["pinned"][0]["label"].startswith("alice")
+
+        # Pinning again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert payload["pin"]["changed"] is False
+
+        # A group pin is keyed by group id, resolved by name.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew"},
+        )
+        assert status == 200
+        assert payload["pin"]["kind"] == "group"
+        assert payload["pin"]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload["count"] == 2
+        # Newest pin first.
+        assert payload["pinned"][0]["kind"] == "group"
+        assert payload["pinned"][1]["kind"] == "peer"
+
+        # Unpinning restores the empty list.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice", "pinned": False},
+        )
+        assert status == 200
+        assert payload["pin"]["pinned"] is False
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew", "pinned": False},
+        )
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload == {"pinned": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_pinned_conversations_endpoint_rejects_bad_input(node, tmp_path):
+    from tau import cli
+    from tau.config import TauConfig
+
+    # The channel case resolves membership through the channel app,
+    # which needs an identity on disk first.
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"peer": "alice", "group": "crew"},
+            {"peer": "alice", "pinned": "yes"},
+            {"peer": "nobody"},
+            {"peer": "  "},
+            {"group": "nobody"},
+            {"channel": "general"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/conversations/pin", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_pinned_conversations_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "pinned.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert status == 503
+        # The list endpoints fail open: a corrupt file never hides or
+        # reorders the console, it just reads every conversation as
+        # unpinned.
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"][0]["pinned"] is False
+    finally:
+        bridge.stop()
+
+
+def test_list_endpoints_carry_pinned_flag(node, tmp_path):
+    from tau import cli
+    from tau.channels import init_db as init_channel_db
+    from tau.channels import join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        join_channel(conn, "random")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"][0]["pinned"] is False
+        status, _, payload = _json(bridge, "/api/groups")
+        assert status == 200
+        assert payload["groups"][0]["pinned"] is False
+        status, _, payload = _json(bridge, "/api/channels")
+        assert status == 200
+        assert [item["channel"] for item in payload["channels"]] == [
+            "random",
+            "general",
+        ]
+        assert [item["pinned"] for item in payload["channels"]] == [False, False]
+
+        # Pinning the older channel pulls it to the front everywhere.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew"},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"channel": "general"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/peers")
+        assert payload["peers"][0]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/groups")
+        assert payload["groups"][0]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/channels")
+        assert [item["channel"] for item in payload["channels"]] == [
+            "general",
+            "random",
+        ]
+        assert [item["pinned"] for item in payload["channels"]] == [True, False]
+    finally:
+        bridge.stop()
+
+
 def test_tan_mute_via_api(tmp_path):
     import RNS
 
