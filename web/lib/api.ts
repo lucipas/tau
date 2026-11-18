@@ -341,6 +341,39 @@ export async function setGroupTopic(group: string, topic?: string, clear = false
   return post("/api/groups/topic", clear ? { group, clear: true } : { group, topic });
 }
 
+/** An invite link for a group this node created, with its stored state. */
+export interface GroupInviteStatus {
+  group: Group;
+  mode: "open" | "closed";
+  generation: number;
+  link: string | null;
+}
+
+export async function getGroupInviteStatus(group: string): Promise<GroupInviteStatus> {
+  return get(`/api/groups/invite${query({ group })}`);
+}
+
+export async function mintGroupInvite(
+  group: string,
+  mode?: "open" | "closed",
+): Promise<GroupInviteStatus> {
+  return post("/api/groups/invite", mode === undefined ? { group } : { group, mode });
+}
+
+export async function revokeGroupInvites(group: string): Promise<{ group: Group; generation: number }> {
+  return post("/api/groups/invite/revoke", { group });
+}
+
+export interface GroupJoinResult {
+  status: "added" | "already_member" | "pending" | "queued";
+  /** The joined group when added, the group name when queued. */
+  group: Group | string;
+}
+
+export async function joinGroupViaLink(link: string): Promise<GroupJoinResult> {
+  return post("/api/groups/join", { link });
+}
+
 /** Voting/closing a group poll returns the sent vote/close legs + node response. */
 export interface GroupPollActionResult {
   ok: boolean;
