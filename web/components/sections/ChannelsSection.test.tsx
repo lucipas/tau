@@ -9,6 +9,21 @@ let calls: string[] = [];
 
 beforeEach(() => {
   const router = mockFetch((url) => {
+    if (url.includes("/api/channels/topic")) {
+      return {
+        channel: "mesh-general",
+        topic: {
+          v: 1,
+          hash: "t1".padEnd(64, "0"),
+          channel: "mesh-general",
+          author: "a".repeat(32),
+          key: "a".repeat(32),
+          topic: "monthly mesh meetup",
+          updated_at: 1000,
+          sig: "s",
+        },
+      };
+    }
     if (url.includes("/api/channels/messages")) {
       return {
         channel: "mesh-general",
@@ -78,5 +93,25 @@ describe("ChannelsSection", () => {
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
+  });
+
+  it("shows the channel topic and saves an edited one", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByText("monthly mesh meetup")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit topic" }));
+    fireEvent.change(screen.getByLabelText("Channel topic"), {
+      target: { value: "weekly mesh meetup" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls).toContain("POST /api/channels/topic"));
+  });
+
+  it("clears the channel topic", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    await screen.findByText("monthly mesh meetup");
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    await waitFor(() => expect(calls).toContain("POST /api/channels/topic"));
   });
 });

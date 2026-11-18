@@ -626,6 +626,17 @@ export interface ChannelMessage {
   sig: string;
 }
 
+export interface ChannelTopic {
+  v: number;
+  hash: string;
+  channel: string;
+  author: string;
+  key: string;
+  topic: string;
+  updated_at: number;
+  sig: string;
+}
+
 // ---------------------------------------------------------------- pages --
 
 export interface PageFile {

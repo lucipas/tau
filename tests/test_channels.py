@@ -17,14 +17,18 @@ from tau.channels import (
     channel_history_page,
     clean_channel_name,
     create_message,
+    create_topic,
     get_message,
+    get_topic,
     init_db,
     is_member,
     join_channel,
     leave_channel,
     list_memberships,
     store_message,
+    store_topic,
     verify_message,
+    verify_topic,
 )
 from tau.cli import main
 from tau.config import TauConfig
@@ -112,6 +116,229 @@ def test_duplicate_message_is_idempotent(identities, tmp_path):
     assert is_new is False
     assert record["hash"] == message["hash"]
     assert len(channel_history(conn, "general")) == 1
+
+
+# -- topics ------------------------------------------------------------------
+
+
+def test_create_topic_signs_and_verifies(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    topic = create_topic(conn, alice, "general", "monthly mesh meetup", now=1000)
+
+    assert topic["channel"] == "general"
+    assert topic["author"] == author_of(alice)
+    assert verify_topic(topic)["hash"] == topic["hash"]
+    assert get_topic(conn, "general")["topic"] == "monthly mesh meetup"
+
+
+def test_topic_newest_wins_and_stale_clear_is_ignored(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_topic(conn, alice, "general", "first plan", now=1000)
+
+    # Envelopes are built on a scratch store so store_topic's own
+    # verdict is what the test sees — create_topic would apply the
+    # envelope to the main store first and mask it.
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+
+    # An older topic never overwrites a newer one.
+    record, changed = store_topic(
+        conn, create_topic(scratch, bob, "general", "stale plan", now=999)
+    )
+    assert record["topic"] == "first plan"
+    assert changed is False
+    assert get_topic(conn, "general")["topic"] == "first plan"
+
+    # A newer topic wins, whoever wrote it.
+    record, changed = store_topic(
+        conn, create_topic(scratch, bob, "general", "new plan", now=1001)
+    )
+    assert record["topic"] == "new plan"
+    assert changed is True
+    assert get_topic(conn, "general")["topic"] == "new plan"
+
+    # An empty topic clears, but a stale clear must not wipe a
+    # newer topic: the stored topic stands, unchanged.
+    record, changed = store_topic(
+        conn, create_topic(scratch, alice, "general", "", now=1000)
+    )
+    assert record is not None
+    assert record["topic"] == "new plan"
+    assert changed is False
+    assert get_topic(conn, "general")["topic"] == "new plan"
+
+    record, changed = store_topic(
+        conn, create_topic(scratch, alice, "general", "", now=1002)
+    )
+    assert record is None
+    assert changed is True
+    assert get_topic(conn, "general") is None
+
+
+def test_topic_rejects_overlong_and_unnormalised(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    with pytest.raises(ChannelError, match="longer than 140"):
+        create_topic(conn, alice, "general", "x" * 141, now=1000)
+    with pytest.raises(ChannelError, match="not normalised"):
+        create_topic(conn, alice, "general", "two  spaces", now=1000)
+    with pytest.raises(ChannelError, match="not normalised"):
+        create_topic(conn, alice, "general", "line\nbreak", now=1000)
+
+
+def test_verify_topic_rejects_tampered(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    topic = create_topic(conn, alice, "general", "monthly mesh meetup", now=1000)
+
+    with pytest.raises(ChannelError):
+        verify_topic(dict(topic, topic="forged"))
+    with pytest.raises(ChannelError):
+        verify_topic(dict(topic, channel="other-room"))
+    with pytest.raises(ChannelError):
+        store_topic(conn, dict(topic, topic="forged"))
+
+
+def test_handle_post_stores_topic_and_answers(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    topic = create_topic(source, bob, "general", "bob's room", now=1000)
+
+    app = _make_app(identities, tmp_path)
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"topic": topic, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert payload["updated"] is True
+    assert payload["topic"] == "general"
+    assert app.topic("general")["topic"] == "bob's room"
+
+    # A second copy is a duplicate, not an error.
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"topic": topic, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    assert decode(response)["updated"] is False
+
+
+def test_handle_post_refuses_blocked_topic_author(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    topic = create_topic(source, bob, "general", "bob's room", now=1000)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({topic["author"]})))
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"topic": topic, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_admitted"
+    assert app.topic("general") is None
+
+
+def test_handle_feed_includes_topic(identities, tmp_path):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        create_topic(conn, bob, "general", "bob's room", now=1000)
+    finally:
+        conn.close()
+
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert payload["topic"]["topic"] == "bob's room"
+
+    # A topic from a blocked author is not served.
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({payload["topic"]["author"]})))
+    blocked_app = ChannelApp(config, alice, name="alice", gossip=False)
+    payload = decode(
+        blocked_app._handle_feed(
+            CHANNEL_FEED_PATH,
+            encode({"channel": "general", "limit": 20}),
+            b"id",
+            None,
+            time.time(),
+        )
+    )
+    assert payload["topic"] is None
+
+
+def test_sync_pulls_topic_without_messages(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    topic = create_topic(source, bob, "general", "bob's room", now=1000)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(topic["author"]),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+
+    class _TopicNode:
+        def __init__(self, peer, topic):
+            self.registry = _FakeRegistry(peer)
+            self.topic = topic
+
+        def request(self, peer, path, payload, *, timeout=20.0):
+            assert path == CHANNEL_FEED_PATH
+            return {"ok": True, "messages": [], "has_more": False, "topic": self.topic}
+
+    node = _TopicNode(peer, topic)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, "general", limit=20)
+    assert summary["topic_updated"] is True
+    assert summary["stored"] == 0
+    assert summary["errors"] == []
+    assert app.topic("general")["topic"] == "bob's room"
+
+    # A second sync is a no-op for the topic.
+    summary = app.sync(node, "general", limit=20)
+    assert summary["topic_updated"] is False
+
+
+def test_set_topic_requires_membership(identities, tmp_path):
+    alice, _ = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    with pytest.raises(ChannelError, match="not a member"):
+        app.set_topic("general", "hello", publish=False)
+    app.join("general")
+    result = app.set_topic("general", "hello", publish=False)
+    assert result["topic"]["topic"] == "hello"
+    assert result["cleared"] is False
+    assert app.topic("general")["topic"] == "hello"
+    result = app.set_topic("general", "", publish=False)
+    assert result["cleared"] is True
+    assert app.topic("general") is None
 
 
 def test_history_orders_newest_first_and_pages_by_before(identities, tmp_path):
@@ -729,6 +956,91 @@ def test_cli_join_send_read_list(tmp_path, capsys):
         assert len(channel_history(conn, "general")) == 1
     finally:
         conn.close()
+
+
+def test_cli_channel_topic_round_trip(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+
+    # No topic yet.
+    assert main(["channel", "topic", "--data-dir", str(data_dir), "general"]) == 0
+    assert "has no topic set" in capsys.readouterr().out
+
+    assert (
+        main(
+            [
+                "channel",
+                "topic",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "monthly mesh meetup",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "topic of #general: monthly mesh meetup" in out
+
+    assert main(["channel", "topic", "--data-dir", str(data_dir), "general"]) == 0
+    assert "#general: monthly mesh meetup" in capsys.readouterr().out
+
+    assert (
+        main(
+            [
+                "channel",
+                "topic",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--clear",
+                "general",
+            ]
+        )
+        == 0
+    )
+    assert "cleared the topic of #general" in capsys.readouterr().out
+    assert main(["channel", "topic", "--data-dir", str(data_dir), "general"]) == 0
+    assert "has no topic set" in capsys.readouterr().out
+
+    # Setting a topic needs membership, like sending.
+    assert (
+        main(
+            [
+                "channel",
+                "topic",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "other-room",
+                "hello",
+            ]
+        )
+        == 2
+    )
+    assert "not a member" in capsys.readouterr().err
+
+    # --clear and topic text do not mix.
+    assert (
+        main(
+            [
+                "channel",
+                "topic",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--clear",
+                "general",
+                "oops",
+            ]
+        )
+        == 2
+    )
+    assert "--clear cannot be combined" in capsys.readouterr().err
 
 
 def test_cli_send_without_join_fails(tmp_path, capsys):

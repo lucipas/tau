@@ -16,6 +16,9 @@ export default function ChannelsSection() {
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [editingTopic, setEditingTopic] = useState(false);
+  const [topicText, setTopicText] = useState("");
+  const [savingTopic, setSavingTopic] = useState(false);
 
   const selectedChannel = channels.channels.find((c) => c.channel === channels.selected);
 
@@ -57,6 +60,36 @@ export default function ChannelsSection() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handleSaveTopic(e: React.FormEvent) {
+    e.preventDefault();
+    const body = topicText.trim();
+    if (!body || !channels.selected) return;
+    setSavingTopic(true);
+    setError(null);
+    try {
+      await channels.setTopic(body);
+      setEditingTopic(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingTopic(false);
+    }
+  }
+
+  async function handleClearTopic() {
+    if (!channels.selected) return;
+    setSavingTopic(true);
+    setError(null);
+    try {
+      await channels.clearTopic();
+      setEditingTopic(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingTopic(false);
     }
   }
 
@@ -162,6 +195,69 @@ export default function ChannelsSection() {
                 Leave
               </button>
             </div>
+          </div>
+
+          <div className="border-b border-zinc-800 px-3 py-2 sm:px-4">
+            {editingTopic ? (
+              <form onSubmit={handleSaveTopic} className="flex gap-2">
+                <input
+                  value={topicText}
+                  onChange={(e) => setTopicText(e.target.value)}
+                  placeholder="What is this channel about? (max 140 characters)"
+                  aria-label="Channel topic"
+                  maxLength={140}
+                  disabled={savingTopic}
+                  className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={savingTopic || !topicText.trim()}
+                  className="shrink-0 rounded-full bg-cyan-500 px-3 py-1.5 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                >
+                  {savingTopic ? "…" : "Save"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditingTopic(false)}
+                  disabled={savingTopic}
+                  className="shrink-0 rounded-full border border-zinc-700 px-3 py-1.5 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </form>
+            ) : (
+              <div className="flex items-center justify-between gap-2">
+                <p className="min-w-0 truncate text-sm text-zinc-400">
+                  {channels.topic ? (
+                    <span title={channels.topic.topic}>{channels.topic.topic}</span>
+                  ) : (
+                    <span className="italic text-zinc-500">No topic set.</span>
+                  )}
+                </p>
+                <div className="flex shrink-0 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTopicText(channels.topic?.topic ?? "");
+                      setEditingTopic(true);
+                    }}
+                    className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900"
+                  >
+                    {channels.topic ? "Edit topic" : "Set topic"}
+                  </button>
+                  {channels.topic && (
+                    <button
+                      type="button"
+                      onClick={() => void handleClearTopic()}
+                      disabled={savingTopic}
+                      className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="px-3 py-2 sm:px-4">
