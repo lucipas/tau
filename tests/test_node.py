@@ -1235,6 +1235,41 @@ def test_send_group_retraction_fans_out_one_signed_payload(tmp_path, monkeypatch
     )
 
 
+def test_send_group_retraction_stamps_target_author(tmp_path, monkeypatch):
+    # A moderator retract names the message's author in the signed
+    # group context, so receivers resolve the author's copy (and key
+    # the durable marker by the author) instead of the creator's.
+    import base64
+
+    from tau.protocol import REQUEST_RETRACT, parse_retract, retract_unsigned_bytes
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append((peer_arg, path, payload))
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_retraction(
+        "crew", "leg-1", target_sent_at=100.0, target_author=alice.hexhash
+    )
+
+    assert response["ok"] is True
+    assert len(calls) == 2
+    assert calls[0][2] == calls[1][2]
+    payload = parse_retract(calls[0][2])
+    assert payload["target_author"] == alice.hexhash
+    assert payload["target_author"] != node.destination.hexhash
+    assert payload["group"] == group["id"]
+    assert payload["target_sent_at"] == 100.0
+    assert node.identity.validate(
+        base64.b64decode(payload["sig"]),
+        retract_unsigned_bytes(calls[0][2]),
+    )
+
+
 def test_send_group_retraction_reports_failed_leg(tmp_path, monkeypatch):
     node, _, alice, bob = _group_reaction_node(tmp_path)
 
