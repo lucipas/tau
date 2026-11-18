@@ -99,6 +99,15 @@ from .muted import (
     muted_peers_for,
     save_muted,
 )
+from .quiet_hours import (
+    QuietHours,
+    QuietHoursError,
+    format_time,
+    load_quiet_hours,
+    quiet_hours_active,
+    quiet_hours_lock,
+    save_quiet_hours,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request,
@@ -1709,6 +1718,51 @@ def build_parser() -> argparse.ArgumentParser:
         "afterwards the conversation counts as unread again",
     )
     mute.set_defaults(func=cmd_mute)
+
+    quiet_hours = subparsers.add_parser(
+        "quiet-hours",
+        parents=[common],
+        help="silence the unread badge every day during a set window",
+    )
+    quiet_hours_sub = quiet_hours.add_subparsers(
+        dest="quiet_hours_command", metavar="QUIET_HOURS_COMMAND"
+    )
+    quiet_hours_set = quiet_hours_sub.add_parser(
+        "set",
+        parents=[common],
+        help="set the daily quiet-hours window",
+    )
+    quiet_hours_set.add_argument(
+        "--start",
+        required=True,
+        metavar="HH:MM",
+        help="when quiet hours start each day, e.g. 22:00",
+    )
+    quiet_hours_set.add_argument(
+        "--end",
+        required=True,
+        metavar="HH:MM",
+        help="when quiet hours end each day, e.g. 07:00 "
+        "(earlier than the start means overnight)",
+    )
+    quiet_hours_set.set_defaults(func=cmd_quiet_hours_set)
+
+    quiet_hours_off = quiet_hours_sub.add_parser(
+        "off",
+        parents=[common],
+        help="turn quiet hours off, keeping the window",
+    )
+    quiet_hours_off.set_defaults(func=cmd_quiet_hours_off)
+
+    quiet_hours_status = quiet_hours_sub.add_parser(
+        "status",
+        parents=[common],
+        help="show the quiet-hours window and whether it is quiet now",
+    )
+    quiet_hours_status.set_defaults(func=cmd_quiet_hours_status)
+
+    # No subcommand shows the status, like `tau mute` with no target lists.
+    quiet_hours.set_defaults(func=cmd_quiet_hours_status)
 
     away = subparsers.add_parser(
         "away",
@@ -12072,6 +12126,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
         muted_groups_for(config.muted_path),
         GroupStore(config.groups_path).list_groups(),
     )
+    # Quiet hours silence every conversation at once, like a mute on
+    # the whole node: the count and listing paths below read it
+    # through `quiet`, so the badge and the markers agree.
+    quiet = quiet_hours_active(config.quiet_hours_path)
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
@@ -12092,6 +12150,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
         counts = inbox.unread_counts(
             exclude_dm_from=muted_peers,
             exclude_group=muted_groups,
+            quiet=quiet,
         )
         per_peer = counts["per_peer"]
         per_group = counts["per_group"]
@@ -12107,7 +12166,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
             else:
                 here = sum(
                     1
-                    for entry in inbox.list_messages(peer=peer_hash, group=group_ids)
+                    for entry in inbox.list_messages(
+                        peer=peer_hash, group=group_ids, quiet=quiet
+                    )
                     if entry.get("unread")
                     and entry.get("destination") not in blocked
                 )
@@ -12189,6 +12250,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
         unread = inbox.unread_counts(
             exclude_dm_from=muted_peers,
             exclude_group=muted_groups,
+            quiet=quiet,
         )["per_peer"].get(peer_hash, 0)
         if _json_mode(args):
             _emit(
@@ -12223,6 +12285,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
         kind=kind,
         exclude_dm_from=muted_peers,
         exclude_group=muted_groups,
+        quiet=quiet,
     )
     # A stored reaction from a non-member must never be displayed on
     # a group message, even when the authorization recheck or its
@@ -13182,6 +13245,102 @@ def cmd_mute(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _quiet_hours_payload(
+    quiet_hours: Optional[QuietHours], now: Optional[float] = None
+) -> Dict[str, Any]:
+    """A quiet-hours window as JSON: the window, and whether it is quiet now."""
+    now = time.time() if now is None else now
+    if quiet_hours is None:
+        return {
+            "enabled": False,
+            "start": None,
+            "end": None,
+            "quiet_now": False,
+            "quiet_minutes_left": None,
+        }
+    remaining = quiet_hours.minutes_until_end(now)
+    return {
+        "enabled": quiet_hours.enabled,
+        "start": format_time(quiet_hours.start),
+        "end": format_time(quiet_hours.end),
+        "quiet_now": quiet_hours.is_quiet(now),
+        "quiet_minutes_left": remaining,
+    }
+
+
+def _quiet_hours_line(
+    quiet_hours: QuietHours, now: Optional[float] = None
+) -> str:
+    """One human-readable line for a quiet-hours window."""
+    now = time.time() if now is None else now
+    window = f"{format_time(quiet_hours.start)}–{format_time(quiet_hours.end)}"
+    if not quiet_hours.enabled:
+        return f"Quiet hours {window} are off."
+    remaining = quiet_hours.minutes_until_end(now)
+    if remaining is not None:
+        return (
+            f"Quiet hours {window} — quiet now, "
+            f"{_ago(remaining * 60)} left."
+        )
+    return f"Quiet hours {window} — not quiet now."
+
+
+def cmd_quiet_hours_set(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        window = QuietHours.from_dict(
+            {"start": args.start, "end": args.end}
+        )
+    except QuietHoursError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    # Reload inside the lock: a corrupt file fails loudly instead of
+    # being silently overwritten, like the mute command.
+    with quiet_hours_lock(config.quiet_hours_path):
+        try:
+            load_quiet_hours(config.quiet_hours_path)
+        except QuietHoursError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        save_quiet_hours(config.quiet_hours_path, window)
+    if _json_mode(args):
+        _emit(_quiet_hours_payload(window), True)
+        return _EXIT_OK
+    print(f"Quiet hours set: {format_time(window.start)}–{format_time(window.end)} every day.")
+    if window.is_quiet():
+        print("It is quiet now — the unread badge stays dark until the window ends.")
+    return _EXIT_OK
+
+
+def cmd_quiet_hours_off(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    path = Path(config.quiet_hours_path)
+    if not path.exists():
+        if _json_mode(args):
+            _emit(_quiet_hours_payload(None), True)
+            return _EXIT_OK
+        print("No quiet hours set.")
+        return _EXIT_OK
+    with quiet_hours_lock(config.quiet_hours_path):
+        try:
+            current = load_quiet_hours(config.quiet_hours_path)
+        except QuietHoursError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        updated = QuietHours(
+            enabled=False, start=current.start, end=current.end
+        )
+        save_quiet_hours(config.quiet_hours_path, updated)
+    if _json_mode(args):
+        _emit(_quiet_hours_payload(updated), True)
+        return _EXIT_OK
+    print(
+        f"Quiet hours off (window {format_time(updated.start)}–"
+        f"{format_time(updated.end)} kept)."
+    )
+    return _EXIT_OK
+
+
 def cmd_away_on(args: argparse.Namespace) -> int:
     config = _make_config(args)
     # Reload inside the lock: two away commands racing must not
@@ -13212,6 +13371,27 @@ def cmd_away_on(args: argparse.Namespace) -> int:
         "Away reply on: the first DM from each peer gets one reply:\n"
         f"{state.message}"
     )
+    return _EXIT_OK
+
+
+def cmd_quiet_hours_status(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    path = Path(config.quiet_hours_path)
+    if not path.exists():
+        if _json_mode(args):
+            _emit(_quiet_hours_payload(None), True)
+            return _EXIT_OK
+        print("No quiet hours set.")
+        return _EXIT_OK
+    try:
+        current = load_quiet_hours(config.quiet_hours_path)
+    except QuietHoursError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    if _json_mode(args):
+        _emit(_quiet_hours_payload(current), True)
+        return _EXIT_OK
+    print(_quiet_hours_line(current))
     return _EXIT_OK
 
 

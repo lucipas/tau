@@ -51,6 +51,7 @@ Global options may appear before or after the command:
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
 | `tau messages delete ID` | Delete one stored direct message from the local inbox (full id or unique prefix) |
 | `tau messages unread PEER` | Mark a conversation unread again so it shows in the unread view (newest message only; `--all` for the whole conversation) |
+| `tau quiet-hours set --start 22:00 --end 07:00` | Silence the unread badge every day between two local times (an end earlier than the start means overnight; `tau quiet-hours off` turns it off keeping the window, `tau quiet-hours status` shows the window and whether it is quiet now; while quiet, every conversation counts as unread 0 and no message carries the unread marker — read cursors are untouched, so the counts come back when the window ends) |
 | `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
