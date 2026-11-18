@@ -16,6 +16,10 @@ export default function ChannelsSection() {
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  // The message being answered, if any: the composer sends with its hash.
+  const [replyTo, setReplyTo] = useState<{ hash: string; name: string } | null>(
+    null,
+  );
 
   const selectedChannel = channels.channels.find((c) => c.channel === channels.selected);
 
@@ -39,8 +43,9 @@ export default function ChannelsSection() {
     setSending(true);
     setError(null);
     try {
-      await channels.send(body);
+      await channels.send(body, replyTo?.hash);
       setText("");
+      setReplyTo(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -62,6 +67,9 @@ export default function ChannelsSection() {
 
   // History arrives newest-first; show it oldest-first like a chat log.
   const messages = [...channels.messages].reverse();
+  // Replies quote their parent from the loaded page; a parent that
+  // has not arrived yet shows its short digest instead.
+  const byHash = new Map(channels.messages.map((m) => [m.hash, m]));
 
   return (
     <div className="mx-auto w-full max-w-[600px]">
@@ -170,7 +178,9 @@ export default function ChannelsSection() {
                 No messages in this channel yet — say hello.
               </p>
             )}
-            {messages.map((m) => (
+            {messages.map((m) => {
+              const parent = m.reply_to ? byHash.get(m.reply_to) : undefined;
+              return (
               <div key={m.hash} className="flex gap-3 border-b border-zinc-800/60 py-3">
                 <Avatar name={m.name} seed={m.author} size="sm" />
                 <div className="min-w-0 flex-1">
@@ -182,18 +192,52 @@ export default function ChannelsSection() {
                       · {formatRelative(m.created_at)}
                     </span>
                   </p>
+                  {m.reply_to && (
+                    <p className="mt-0.5 truncate border-l-2 border-zinc-700 pl-2 text-xs text-zinc-500">
+                      ↩{" "}
+                      {parent
+                        ? `${parent.name || shortHash(parent.author)}: ${parent.text.split("\n")[0]}`
+                        : `replying to ${shortHash(m.reply_to)}`}
+                    </p>
+                  )}
                   <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
                     {m.text}
                   </p>
+                  <button
+                    type="button"
+                    aria-label={`Reply to ${m.name || shortHash(m.author)}`}
+                    onClick={() =>
+                      setReplyTo({ hash: m.hash, name: m.name || shortHash(m.author) })
+                    }
+                    className="mt-1 text-xs font-semibold text-zinc-500 hover:text-cyan-400"
+                  >
+                    Reply
+                  </button>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
 
           <form
             onSubmit={handleSend}
             className="sticky bottom-0 border-t border-zinc-800 bg-zinc-950 px-3 py-2"
           >
+            {replyTo && (
+              <p className="mb-2 flex items-center justify-between text-xs text-zinc-400">
+                <span className="truncate">
+                  Replying to <span className="font-semibold text-zinc-200">{replyTo.name}</span>
+                </span>
+                <button
+                  type="button"
+                  aria-label="Cancel reply"
+                  onClick={() => setReplyTo(null)}
+                  className="ml-2 shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs text-zinc-400 hover:bg-zinc-900"
+                >
+                  ✕ Cancel
+                </button>
+              </p>
+            )}
             <div className="flex gap-2">
               <input
                 value={text}

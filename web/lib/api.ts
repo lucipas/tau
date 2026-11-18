@@ -954,8 +954,15 @@ export async function leaveChannel(channel: string): Promise<{ channel: string; 
   return post("/api/channels/leave", { channel });
 }
 
-export async function sendChannelMessage(channel: string, text: string): Promise<ChannelMessage> {
-  return post("/api/channels/send", { channel, text });
+export async function sendChannelMessage(
+  channel: string,
+  text: string,
+  replyTo?: string,
+): Promise<ChannelMessage> {
+  return post(
+    "/api/channels/send",
+    replyTo ? { channel, text, reply_to: replyTo } : { channel, text },
+  );
 }
 
 /** Pull missing history for one channel, or every joined channel when omitted. */

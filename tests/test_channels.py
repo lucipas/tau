@@ -18,11 +18,14 @@ from tau.channels import (
     clean_channel_name,
     create_message,
     get_message,
+    hash_message,
     init_db,
     is_member,
     join_channel,
     leave_channel,
     list_memberships,
+    reply_parent,
+    resolve_message_digest,
     store_message,
     verify_message,
 )
@@ -127,6 +130,179 @@ def test_history_orders_newest_first_and_pages_by_before(identities, tmp_path):
     older = channel_history(conn, "general", limit=2, before=page[-1]["created_at"])
     assert [item["text"] for item in older] == ["one"]
     assert [item["text"] for item in channel_history(conn, "other")] == ["elsewhere"]
+
+
+# -- replies -----------------------------------------------------------------
+
+
+def test_reply_is_part_of_the_signed_body(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+    reply = create_message(
+        conn, alice, "general", "see you there", name="alice", now=1001,
+        reply_to=parent["hash"],
+    )
+
+    assert reply["reply_to"] == parent["hash"]
+    assert verify_message(reply)["hash"] == reply["hash"]
+    assert "reply_to" not in create_message(
+        conn, alice, "general", "plain", name="alice", now=1002
+    )
+
+    # A relay cannot re-point a reply at another message: the digest
+    # is covered by the hash, so a changed target fails verification.
+    other = create_message(conn, alice, "general", "other", name="alice", now=1003)
+    with pytest.raises(ChannelError):
+        verify_message(dict(reply, reply_to=other["hash"]))
+    with pytest.raises(ChannelError):
+        verify_message({k: v for k, v in reply.items() if k != "reply_to"})
+
+
+def test_reply_without_a_parent_field_still_verifies(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, alice, "general", "hello mesh", name="alice", now=1000)
+
+    # A message written before replies existed carries no reply_to at
+    # all; it must still verify exactly as before.
+    legacy = {k: v for k, v in message.items() if k != "reply_to"}
+    assert verify_message(legacy)["hash"] == message["hash"]
+
+
+def test_create_reply_requires_a_stored_parent(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+    elsewhere = create_message(conn, alice, "other", "elsewhere", name="alice", now=1001)
+
+    with pytest.raises(ChannelError, match="no stored message"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to="f" * 64)
+    with pytest.raises(ChannelError, match="no stored message"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to="abc12345")
+    with pytest.raises(ChannelError, match="at least 8"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to="abc")
+    with pytest.raises(ChannelError, match="hash or hex prefix"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to="not-hex!!")
+    # A parent in another channel is not a parent in this one.
+    with pytest.raises(ChannelError, match="no stored message"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to=elsewhere["hash"])
+
+
+def test_reply_resolves_a_unique_prefix(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+
+    reply = create_message(
+        conn, alice, "general", "see you there", name="alice", now=1001,
+        reply_to=parent["hash"][:12],
+    )
+    assert reply["reply_to"] == parent["hash"]
+    assert resolve_message_digest(conn, "general", parent["hash"]) == parent["hash"]
+
+
+def test_reply_parent_resolves_from_the_store(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+    reply = create_message(
+        conn, alice, "general", "see you there", name="alice", now=1001,
+        reply_to=parent["hash"],
+    )
+    plain = create_message(conn, alice, "general", "plain", name="alice", now=1002)
+
+    assert reply_parent(conn, reply)["hash"] == parent["hash"]
+    assert reply_parent(conn, reply)["text"] == "meet at the park"
+    assert reply_parent(conn, plain) is None
+
+    # A reply whose parent has not arrived yet still stores and
+    # verifies; the parent simply resolves to nothing until it lands.
+    body = {
+        "v": 1,
+        "channel": "general",
+        "author": parent["author"],
+        "key": alice.get_public_key().hex(),
+        "name": "alice",
+        "text": "early reply",
+        "created_at": 1003.0,
+        "reply_to": "a" * 64,
+    }
+    digest = hash_message(body)
+    signed = dict(body, hash=digest, sig=alice.sign(bytes.fromhex(digest)).hex())
+    record, is_new = store_message(conn, signed)
+    assert is_new is True
+    assert record["reply_to"] == "a" * 64
+    assert reply_parent(conn, record) is None
+
+
+def test_old_database_gains_a_reply_column(identities, tmp_path):
+    import sqlite3
+
+    alice, _ = identities
+    path = tmp_path / "channels.sqlite3"
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE messages ("
+        "v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "channel TEXT NOT NULL, author TEXT NOT NULL, key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, "
+        "created_at REAL NOT NULL, received_at REAL NOT NULL, sig TEXT NOT NULL)"
+    )
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE memberships (channel TEXT PRIMARY KEY, joined_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+        ]
+        assert "reply_to" in columns
+        parent = create_message(conn, alice, "general", "old db", name="alice", now=1000)
+        reply = create_message(
+            conn, alice, "general", "still works", name="alice", now=1001,
+            reply_to=parent["hash"],
+        )
+        assert reply["reply_to"] == parent["hash"]
+        assert get_message(conn, reply["hash"])["reply_to"] == parent["hash"]
+    finally:
+        conn.close()
+
+
+def test_feed_serves_replies_with_their_parent_digest(identities, tmp_path):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        parent = create_message(conn, bob, "general", "one", name="bob", now=1000)
+        create_message(
+            conn, alice, "general", "two", name="alice", now=1001,
+            reply_to=parent["hash"],
+        )
+    finally:
+        conn.close()
+
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert [item["text"] for item in payload["messages"]] == ["two", "one"]
+    assert payload["messages"][0]["reply_to"] == parent["hash"]
+    assert "reply_to" not in payload["messages"][1]
 
 
 # -- membership --------------------------------------------------------------
@@ -729,6 +905,80 @@ def test_cli_join_send_read_list(tmp_path, capsys):
         assert len(channel_history(conn, "general")) == 1
     finally:
         conn.close()
+
+
+def test_cli_channel_reply_round_trip(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "meet at the park",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "sent to #general" in out
+
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        parent = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+
+    # A unique prefix is enough to name the parent.
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--reply-to",
+                parent["hash"][:12],
+                "general",
+                "see you there",
+            ]
+        )
+        == 0
+    )
+    assert "sent to #general" in capsys.readouterr().out
+
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    out = capsys.readouterr().out
+    assert "meet at the park" in out
+    assert "see you there" in out
+    assert "↩ replying to alice: meet at the park" in out
+
+    # An unknown parent is an error, not a dangling reply.
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--reply-to",
+                "f" * 64,
+                "general",
+                "dangling",
+            ]
+        )
+        == 2
+    )
+    assert "no stored message" in capsys.readouterr().err
 
 
 def test_cli_send_without_join_fails(tmp_path, capsys):

@@ -4970,6 +4970,82 @@ def test_channels_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channels_send_reply_via_api(tmp_path):
+    import RNS
+
+    from tau import cli
+    from tau.channels import (
+        ChannelApp,
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        parent = create_message(
+            conn, bob, "general", "meet at the park", name="bob", now=1000
+        )
+    finally:
+        conn.close()
+    node.channel_app = ChannelApp(node.config, node.identity, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "see you there",
+                "reply_to": parent["hash"],
+            },
+        )
+        assert status == 200
+        assert payload["message"]["reply_to"] == parent["hash"]
+
+        # An unknown parent is a 400, not a dangling reply.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "dangling", "reply_to": "f" * 64},
+        )
+        assert status == 400
+        assert "no stored message" in payload["error"]["message"]
+
+        # A non-string reply_to is a 400 too.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "bad", "reply_to": 123},
+        )
+        assert status == 400
+
+        # The messages list carries the reply with its parent digest.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == [
+            "see you there",
+            "meet at the park",
+        ]
+        assert payload["messages"][0]["reply_to"] == parent["hash"]
+        assert "reply_to" not in payload["messages"][1]
+    finally:
+        bridge.stop()
+
+
 def test_pages_via_api(tmp_path):
     from types import SimpleNamespace
 

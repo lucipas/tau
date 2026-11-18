@@ -304,6 +304,7 @@ from .channels import (
     create_message as create_channel_message,
     init_db as init_channel_db,
     is_member as is_channel_member,
+    reply_parent as channel_reply_parent,
 )
 
 log = logging.getLogger(__name__)
@@ -3427,6 +3428,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_send.add_argument("--file", type=Path, help="read the message text from a file")
     channel_send.add_argument(
+        "--reply-to",
+        default=None,
+        metavar="HASH|PREFIX",
+        help="reply to this message instead of posting standalone (message hash or unique hash prefix)",
+    )
+    channel_send.add_argument(
         "--to",
         action="append",
         default=None,
@@ -4626,6 +4633,7 @@ def _publish_local_channel_message(
     *,
     channel: str,
     text: Optional[str] = None,
+    reply_to: Optional[str] = None,
     to: Optional[List[str]] = None,
     ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
@@ -4644,7 +4652,7 @@ def _publish_local_channel_message(
         if not is_channel_member(conn, name):
             raise ChannelError(f"not a member of channel {name!r}; join it first")
         message = create_channel_message(
-            conn, node.identity, name, text, name=node.name
+            conn, node.identity, name, text, name=node.name, reply_to=reply_to
         )
     finally:
         conn.close()
@@ -4670,11 +4678,14 @@ def _publish_local_post(
 ) -> Dict[str, Any]:
     if channel is not None:
         # A channel send rides the same local publish socket as a Tan
-        # post; route it before the Tan-only handling below.
+        # post; route it before the Tan-only handling below.  The
+        # channel reply target rides along: it is a channel message
+        # hash, not a Tan post hash, so it must not reach create_post.
         return _publish_local_channel_message(
             node,
             channel=channel,
             text=text,
+            reply_to=reply_to,
             to=to,
             ttl=ttl,
             timeout=timeout,
@@ -7288,6 +7299,20 @@ def _print_channel_messages(
         name = message.get("name") or "anonymous"
         author = short_hash(str(message.get("author", "")))
         print(f"[{_stamp(message.get('created_at'))}] {name} ({author}):")
+        if message.get("reply_to"):
+            parent = message.get("reply_parent")
+            if parent:
+                parent_text = str(parent.get("text", "")).splitlines()
+                excerpt = parent_text[0] if parent_text else ""
+                print(
+                    f"  ↩ replying to {parent.get('name') or 'anonymous'}: {excerpt}"
+                )
+            else:
+                print(
+                    "  ↩ replying to "
+                    f"{short_hash(str(message['reply_to']))} "
+                    "(message not stored yet)"
+                )
         for line in str(message.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
 
@@ -7363,7 +7388,9 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
     if getattr(args, "no_publish", False):
         app = ChannelApp(config, _tan_identity(config), name=config.name)
         try:
-            message = app.send(name, text)
+            message = app.send(
+                name, text, reply_to=getattr(args, "reply_to", None)
+            )
         except ChannelError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -7379,6 +7406,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 config.data_dir,
                 channel=name,
                 text=text,
+                reply_to=getattr(args, "reply_to", None),
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
@@ -7397,6 +7425,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                     node,
                     channel=name,
                     text=text,
+                    reply_to=getattr(args, "reply_to", None),
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
@@ -7443,6 +7472,27 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
         ]
     # History comes newest first; reading is oldest first.
     messages = list(reversed(messages))
+    # Resolve each reply's parent from the local store so the reader
+    # sees who and what is being answered.  A parent from a blocked
+    # author stays hidden, like a blocked message itself; a parent
+    # that has not arrived yet simply has no quote.
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        for message in messages:
+            if not message.get("reply_to"):
+                continue
+            parent = channel_reply_parent(conn, message)
+            if parent is None:
+                continue
+            if blocked is not None and str(parent.get("author", "")) in blocked:
+                continue
+            message["reply_parent"] = {
+                "hash": parent["hash"],
+                "name": parent.get("name", ""),
+                "text": parent.get("text", ""),
+            }
+    finally:
+        conn.close()
     _print_channel_messages(messages, json_output=json_output, channel=name)
     return _EXIT_OK
 

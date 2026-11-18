@@ -32,7 +32,7 @@ export interface UseChannelsResult {
   refresh: () => Promise<void>;
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
-  send: (text: string) => Promise<ChannelMessage>;
+  send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
   sync: (channel?: string) => Promise<void>;
 }
 
@@ -106,9 +106,9 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
         setMessages([]);
       }
     },
-    send: async (text) => {
+    send: async (text, replyTo) => {
       if (!selected) throw new Error("no channel selected");
-      const sent = await sendChannelMessage(selected, text);
+      const sent = await sendChannelMessage(selected, text, replyTo);
       await refreshMessages(selected);
       return sent;
     },

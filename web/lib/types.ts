@@ -624,6 +624,8 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Digest of the parent message when this message is a reply. */
+  reply_to?: string;
 }
 
 // ---------------------------------------------------------------- pages --

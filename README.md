@@ -404,7 +404,7 @@ Global options may appear before or after the command:
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message counts |
-| `tau channel send NAME TEXT` | Send a signed message to a joined channel |
+| `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message) |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
 
