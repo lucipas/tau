@@ -39,6 +39,7 @@ IGNORED_GROUPS_FILE_NAME = "ignored-groups.json"
 ARCHIVED_FILE_NAME = "archived.json"
 DISAPPEARING_FILE_NAME = "disappearing.json"
 MUTED_FILE_NAME = "muted.json"
+AWAY_FILE_NAME = "away.json"
 DM_REQUESTS_FILE_NAME = "dm-requests.json"
 INVITES_FILE_NAME = "invites.json"
 JOIN_REQUESTS_FILE_NAME = "join-requests.json"
@@ -89,6 +90,7 @@ class TauConfig:
     archived_path: Path
     disappearing_path: Path
     muted_path: Path
+    away_path: Path
     dm_requests_path: Path
     invites_path: Path
     join_requests_path: Path
@@ -145,6 +147,7 @@ class TauConfig:
             archived_path=base / ARCHIVED_FILE_NAME,
             disappearing_path=base / DISAPPEARING_FILE_NAME,
             muted_path=base / MUTED_FILE_NAME,
+            away_path=base / AWAY_FILE_NAME,
             dm_requests_path=base / DM_REQUESTS_FILE_NAME,
             invites_path=base / INVITES_FILE_NAME,
             join_requests_path=base / JOIN_REQUESTS_FILE_NAME,

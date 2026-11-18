@@ -46,6 +46,7 @@ from typing import Dict, List, Tuple
 from . import __version__
 from .config import (
     ARCHIVED_FILE_NAME,
+    AWAY_FILE_NAME,
     CHANNELS_DB_FILE_NAME,
     DISAPPEARING_FILE_NAME,
     DM_REQUESTS_FILE_NAME,
@@ -84,6 +85,7 @@ BACKUP_FILES = (
     ARCHIVED_FILE_NAME,
     DISAPPEARING_FILE_NAME,
     MUTED_FILE_NAME,
+    AWAY_FILE_NAME,
     DM_REQUESTS_FILE_NAME,
     SCHEDULED_POSTS_FILE_NAME,
     "groups.json",

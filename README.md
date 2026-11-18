@@ -772,6 +772,19 @@ retried. Messages sent before group retracts landed carry no shared
 send time and cannot be retracted. The web console cannot retract
 group messages yet — that is a follow-up.
 
+A group creator may also retract a member's message: `tau retract
+<message-id>` on a received group message works when this node
+created the group, and fans the retract out to every member —
+including the author, whose own sent copy is deleted and whose
+queued legs are cancelled. Receivers accept the retract only from
+the group's creator, verified against the pinned roster for the
+group id in the signed context, and the durable marker is recorded
+under the message's author, so a copy arriving later still loses to
+it. A non-creator member retracting another member's message is
+still refused with `not_sender`, and a creator claim the receiver
+cannot verify (no pinned roster for the group) fails closed the
+same way.
+
 Retracts are delivered live in v1, like reactions: the peer must be
 online. A DM still queued in the outbox is cancelled with
 `tau outbox cancel` instead; a queued group leg is cancelled by the
