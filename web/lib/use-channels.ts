@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  editChannelMessage,
   getChannelMessages,
   getChannels,
   joinChannel,
@@ -33,6 +34,8 @@ export interface UseChannelsResult {
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
   send: (text: string) => Promise<ChannelMessage>;
+  /** Edit your own message in the selected channel, then refresh. */
+  edit: (target: string, text: string) => Promise<void>;
   sync: (channel?: string) => Promise<void>;
 }
 
@@ -111,6 +114,11 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       const sent = await sendChannelMessage(selected, text);
       await refreshMessages(selected);
       return sent;
+    },
+    edit: async (target, text) => {
+      if (!selected) throw new Error("no channel selected");
+      await editChannelMessage(selected, target, text);
+      await refreshMessages(selected);
     },
     sync: async (channel) => {
       await syncChannels(channel ?? selected ?? undefined);

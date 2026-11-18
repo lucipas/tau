@@ -163,6 +163,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/edit  edit your own message (``{"channel", "target", "text"}``)
     POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/pages       cached personal mesh pages, plus this node's own
     POST /api/pages/fetch fetch a peer's page over RNS (``{"peer": "<name or hash>"}``)
@@ -3901,6 +3902,17 @@ class WebBridge:
                 "public channels are not enabled; run serve --channels"
             )
         return app.send(channel, text, publish=True)
+
+    def channel_edit(
+        self, channel: str, target: str, text: str
+    ) -> Dict[str, Any]:
+        """Edit your own message in a joined channel, gossiping it to peers."""
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        return app.edit(channel, target, text, publish=True)
 
     def channel_sync(
         self, channel: Optional[str] = None, *, limit: int = 20
@@ -11817,6 +11829,41 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/edit":
+                channel = body.get("channel")
+                target = body.get("target")
+                text = body.get("text")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    edit = self.bridge.channel_edit(channel, target, text)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "edit": edit}, head_only)
                 return
             if path == "/api/channels/sync":
                 channel = body.get("channel")

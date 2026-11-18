@@ -298,9 +298,11 @@ from .tangents.tan import (
 )
 from .channels import (
     DEFAULT_CHANNEL_LIMIT,
+    MAX_FEED_EDITS,
     ChannelApp,
     ChannelError,
     clean_channel_name,
+    create_edit as create_channel_edit,
     create_message as create_channel_message,
     init_db as init_channel_db,
     is_member as is_channel_member,
@@ -3457,6 +3459,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_read.set_defaults(func=cmd_channel_read)
 
+    channel_edit = channel_sub.add_parser(
+        "edit",
+        parents=[common],
+        help="edit your own message in a joined channel",
+    )
+    channel_edit.add_argument("channel", metavar="NAME", help="channel to edit in")
+    channel_edit.add_argument(
+        "target",
+        metavar="DIGEST|PREFIX",
+        help="message to edit (full digest, or a hex prefix of at least 4 characters)",
+    )
+    channel_edit.add_argument(
+        "text", nargs="?", help="replacement text (reads stdin when omitted)"
+    )
+    channel_edit.add_argument("--file", type=Path, help="read the replacement text from a file")
+    channel_edit.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_edit.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_edit.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_edit.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_edit.set_defaults(func=cmd_channel_edit)
+
+    channel_edits = channel_sub.add_parser(
+        "edits",
+        parents=[common],
+        help="list edit notices for a channel, newest first",
+    )
+    channel_edits.add_argument("channel", metavar="NAME", help="channel to list edits for")
+    channel_edits.add_argument(
+        "--limit",
+        type=int,
+        default=MAX_FEED_EDITS,
+        metavar="N",
+        help="show the newest N edits (default 50)",
+    )
+    channel_edits.set_defaults(func=cmd_channel_edits)
+
     channel_sync = channel_sub.add_parser(
         "sync",
         parents=[common],
@@ -4654,6 +4702,38 @@ def _publish_local_channel_message(
     return {"message": message, "published": published}
 
 
+def _publish_local_channel_edit(
+    node: TauNode,
+    *,
+    channel: str,
+    target: str,
+    text: Optional[str] = None,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    if text is None:
+        raise ChannelError("nothing to publish")
+    name = clean_channel_name(channel)
+    conn = publisher.connect()
+    try:
+        if not is_channel_member(conn, name):
+            raise ChannelError(f"not a member of channel {name!r}; join it first")
+        notice = create_channel_edit(conn, node.identity, name, target, text)
+    finally:
+        conn.close()
+    published = publisher.publish_edit(
+        notice, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
+    return {"edit": notice, "published": published}
+
+
 def _publish_local_post(
     node: TauNode,
     *,
@@ -4667,7 +4747,20 @@ def _publish_local_post(
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
+    channel_edit: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    if channel_edit is not None:
+        # A channel edit rides the same local publish socket as a Tan
+        # post; route it before the Tan-only handling below.
+        return _publish_local_channel_edit(
+            node,
+            channel=str(channel_edit.get("channel", "")),
+            target=str(channel_edit.get("target", "")),
+            text=channel_edit.get("text"),
+            to=to,
+            ttl=ttl,
+            timeout=timeout,
+        )
     if channel is not None:
         # A channel send rides the same local publish socket as a Tan
         # post; route it before the Tan-only handling below.
@@ -7287,7 +7380,8 @@ def _print_channel_messages(
     for message in messages:
         name = message.get("name") or "anonymous"
         author = short_hash(str(message.get("author", "")))
-        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}):")
+        edited = " (edited)" if message.get("edited") else ""
+        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}){edited}:")
         for line in str(message.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
 
@@ -7447,6 +7541,105 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_channel_edit(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            notice = app.edit(name, args.target, text)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel_edit={
+                    "channel": name,
+                    "target": args.target,
+                    "text": text,
+                },
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            notice, published = result["edit"], result["published"]
+        else:
+            try:
+                app = ChannelApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                app.attach(node)
+                result = _publish_local_channel_edit(
+                    node,
+                    channel=name,
+                    target=args.target,
+                    text=text,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                notice, published = result["edit"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"edit": notice, "published": published}, True)
+    else:
+        print(f"edited #{name} {short_hash(notice['target'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_edits(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    edits = app.edits(name, limit=int(getattr(args, "limit", MAX_FEED_EDITS)))
+    if json_output:
+        _emit({"channel": name, "edits": edits, "count": len(edits)}, True)
+        return _EXIT_OK
+    if not edits:
+        print(f"No stored edits in #{name}.")
+        return _EXIT_OK
+    for edit in edits:
+        author = short_hash(str(edit.get("author", "")))
+        target = short_hash(str(edit.get("target", "")))
+        print(f"[{_stamp(edit.get('created_at'))}] {target} by {author}:")
+        for line in str(edit.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
 def cmd_channel_sync(args: argparse.Namespace) -> int:
     config = _make_config(args)
     identity = load_or_create_identity(config.identity_path)
@@ -7499,11 +7692,14 @@ def cmd_channel_sync(args: argparse.Namespace) -> int:
             print("No channels joined yet — join one with `tau channel join <name>`.")
             return _EXIT_OK
         for name, summary in summaries.items():
-            print(
+            line = (
                 f"#{name}: synced {summary['stored']} new message(s) "
                 f"from {summary['peers']} peer(s); "
                 f"{summary['duplicates']} duplicate(s)"
             )
+            if summary.get("edited"):
+                line += f"; {summary['edited']} edit(s) applied"
+            print(line)
             for error in summary["errors"]:
                 print(f"  {short_hash(error['peer'])}: {error['error']}")
     return _EXIT_OK

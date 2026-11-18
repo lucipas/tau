@@ -958,6 +958,19 @@ export async function sendChannelMessage(channel: string, text: string): Promise
   return post("/api/channels/send", { channel, text });
 }
 
+export async function editChannelMessage(
+  channel: string,
+  target: string,
+  text: string,
+): Promise<{ hash: string }> {
+  const data = await post<{ edit: { hash: string } }>("/api/channels/edit", {
+    channel,
+    target,
+    text,
+  });
+  return data.edit;
+}
+
 /** Pull missing history for one channel, or every joined channel when omitted. */
 export async function syncChannels(channel?: string, limit = 20): Promise<unknown> {
   return post("/api/channels/sync", channel ? { channel, limit } : { limit });
