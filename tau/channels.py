@@ -365,6 +365,16 @@ CREATE TABLE IF NOT EXISTS memberships (
     channel TEXT PRIMARY KEY,
     joined_at REAL NOT NULL
 );
+
+-- Last-read cursor per joined channel: the newest message the owner
+-- has marked read, as (created_at, hash).  Unread is everything newer
+-- than the cursor; with no cursor yet, everything received since
+-- joining.  Local-only, never gossiped; leaving drops the cursor.
+CREATE TABLE IF NOT EXISTS read_cursors (
+    channel TEXT PRIMARY KEY,
+    last_read_hash TEXT NOT NULL,
+    last_read_at REAL NOT NULL
+);
 """
 
 
@@ -635,6 +645,9 @@ def leave_channel(conn: sqlite3.Connection, channel: str) -> bool:
         cursor = conn.execute(
             "DELETE FROM memberships WHERE channel = ?", (name,)
         )
+        # Leaving drops the read cursor too: a rejoin starts fresh,
+        # so old cached history is not resurrected as unread.
+        conn.execute("DELETE FROM read_cursors WHERE channel = ?", (name,))
     return cursor.rowcount > 0
 
 
@@ -662,6 +675,99 @@ def list_memberships(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def mark_channel_read(
+    conn: sqlite3.Connection,
+    channel: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Advance *channel*'s read cursor to its newest stored message.
+
+    Requires membership: marking a channel you have not joined is an
+    error, so a typo never silently clears a badge.  Returns the
+    cursor plus how many messages it cleared; with no stored messages
+    there is nothing to mark and the cursor is left alone.
+    *exclude_authors* keeps the cleared count honest — the same
+    authors :func:`channel_unread_counts` excludes from the badge.
+    """
+    name = clean_channel_name(channel)
+    row = conn.execute(
+        "SELECT channel, joined_at FROM memberships WHERE channel = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        raise ChannelError(f"not a member of #{name} — join it first")
+    newest = conn.execute(
+        "SELECT hash, created_at FROM messages WHERE channel = ? "
+        "ORDER BY created_at DESC, hash DESC LIMIT 1",
+        (name,),
+    ).fetchone()
+    cleared = channel_unread_counts(conn, exclude_authors=exclude_authors).get(
+        name, 0
+    )
+    if newest is None:
+        return {"channel": name, "hash": None, "created_at": None, "cleared": 0}
+    with conn:
+        conn.execute(
+            "INSERT INTO read_cursors(channel, last_read_hash, last_read_at) "
+            "VALUES(?, ?, ?) "
+            "ON CONFLICT(channel) DO UPDATE SET "
+            "last_read_hash = excluded.last_read_hash, "
+            "last_read_at = excluded.last_read_at",
+            (name, newest["hash"], newest["created_at"]),
+        )
+    return {
+        "channel": name,
+        "hash": newest["hash"],
+        "created_at": newest["created_at"],
+        "cleared": cleared,
+    }
+
+
+def channel_unread_counts(
+    conn: sqlite3.Connection,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> Dict[str, int]:
+    """Unread message counts per joined channel.
+
+    A message counts when it is newer than the channel's read cursor
+    — strictly newer by ``(created_at, hash)``, the same order history
+    pages in, so a late-arriving message created before the cursor
+    does not re-light the badge.  With no cursor yet, messages
+    received since joining count: history synced at join time is
+    unread, but cached messages from before a rejoin are not.
+    Authors in *exclude_authors* never count (own messages, blocked
+    authors); pass nothing to count every stored message.
+    """
+    excluded = [author for author in (exclude_authors or []) if author]
+    author_clause = ""
+    params: List[Any] = []
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        author_clause = f" AND msg.author NOT IN ({placeholders})"
+        params.extend(excluded)
+    rows = conn.execute(
+        "SELECT m.channel AS channel, "
+        "COUNT(msg.hash) AS unread "
+        "FROM memberships m "
+        "LEFT JOIN read_cursors c ON c.channel = m.channel "
+        "LEFT JOIN messages msg ON msg.channel = m.channel "
+        "AND ((c.last_read_at IS NULL AND msg.received_at > m.joined_at) "
+        "OR (c.last_read_at IS NOT NULL "
+        "AND (msg.created_at > c.last_read_at "
+        "OR (msg.created_at = c.last_read_at AND msg.hash > c.last_read_hash))))"
+        f"{author_clause} "
+        "GROUP BY m.channel",
+        params,
+    ).fetchall()
+    # Like the inbox counts, a channel with nothing unread gets no
+    # entry — the console only badges channels that have one.
+    return {
+        row["channel"]: int(row["unread"]) for row in rows if int(row["unread"]) > 0
+    }
 
 
 # -- application layer -------------------------------------------------------
@@ -774,6 +880,44 @@ class ChannelApp:
             return leave_channel(conn, channel)
         finally:
             conn.close()
+
+    def mark_read(self, channel: str) -> Dict[str, Any]:
+        """Advance *channel*'s read cursor to its newest message."""
+        conn = self.connect()
+        try:
+            return mark_channel_read(
+                conn, channel, exclude_authors=self._unread_excluded()
+            )
+        finally:
+            conn.close()
+
+    def unread_counts(self) -> Dict[str, int]:
+        """Unread message counts per joined channel.
+
+        Own messages never count, and neither do blocked authors; a
+        block-list that cannot be read fails closed to all zeroes
+        rather than lighting badges for messages the reader hides.
+        """
+        excluded = self._unread_excluded()
+        if excluded is None:
+            # Fail closed: no badge at all, not even a zero entry.
+            return {}
+        conn = self.connect()
+        try:
+            return channel_unread_counts(conn, exclude_authors=excluded)
+        finally:
+            conn.close()
+
+    def _unread_excluded(self) -> Optional[List[str]]:
+        """Authors excluded from unread counts, or ``None`` fail-closed.
+
+        The node's own author hash plus the blocked list; ``None``
+        when the block-list cannot be trusted.
+        """
+        blocked = self._blocked_authors()
+        if blocked is None:
+            return None
+        return [self.author, *blocked]
 
     def memberships(self) -> List[Dict[str, Any]]:
         """Joined channels, most recently joined first."""

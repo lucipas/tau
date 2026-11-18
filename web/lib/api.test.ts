@@ -138,9 +138,17 @@ describe("POST endpoints", () => {
   });
 
   it("marks read with an empty body when no conversation is given", async () => {
-    nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, total: 0, revision: 1 } };
+    nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1 } };
     await markRead();
     expect(bodyOf(0)).toEqual({});
+  });
+
+  it("marks a channel read by name", async () => {
+    nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 2 } };
+    const unread = await markRead({ channel: "mesh-general" });
+    expect(captured[0].url).toBe("/api/messages/read");
+    expect(bodyOf(0)).toEqual({ channel: "mesh-general" });
+    expect(unread.total).toBe(0);
   });
 
   it("fetches Tan media with the author in the body", async () => {

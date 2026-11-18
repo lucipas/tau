@@ -52,6 +52,7 @@ export interface SnapshotCounts {
 export interface UnreadCounts {
   per_peer: Record<string, number>;
   per_group: Record<string, number>;
+  per_channel: Record<string, number>;
   total: number;
   revision: number;
 }
@@ -611,6 +612,8 @@ export interface TanVerifyReport {
 export interface Channel {
   channel: string;
   joined_at: number;
+  /** Messages newer than the last-read cursor; always present from /api/channels. */
+  unread: number;
 }
 
 export interface ChannelMessage {

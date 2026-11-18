@@ -6,6 +6,7 @@
 
 import { useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
+import UnreadChip from "@/components/chrome/UnreadChip";
 import { formatRelative, shortHash } from "@/lib/format";
 import { useChannels } from "@/lib/use-channels";
 
@@ -117,6 +118,7 @@ export default function ChannelsSection() {
               }`}
             >
               #{c.channel}
+              <UnreadChip count={c.unread} className="ml-1" />
             </button>
           ))}
         </div>

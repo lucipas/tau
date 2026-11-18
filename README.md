@@ -408,9 +408,10 @@ Global options may appear before or after the command:
 | `tau tan rules` | Show or change which remote entries get committed |
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
-| `tau channel list` | List joined channels with cached message counts |
+| `tau channel list` | List joined channels with cached message and unread counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
+| `tau channel mark-read NAME` | Clear a channel's unread badge |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
 
 Useful flags:

@@ -31,7 +31,7 @@ beforeEach(() => {
     }
     if (url.includes("/api/channels")) {
       return {
-        channels: [{ channel: "mesh-general", joined_at: 900 }],
+        channels: [{ channel: "mesh-general", joined_at: 900, unread: 3 }],
         count: 1,
       };
     }
@@ -47,14 +47,25 @@ afterEach(() => {
 describe("ChannelsSection", () => {
   it("lists joined channels and their messages", async () => {
     render(<ChannelsSection />);
-    expect(await screen.findByRole("button", { name: "#mesh-general" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByRole("button", { name: /#mesh-general/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByText("hello channel")).toBeTruthy();
+  });
+
+  it("shows an unread badge on a channel with unread messages", async () => {
+    render(<ChannelsSection />);
+    expect(await screen.findByLabelText("3 unread")).toBeTruthy();
+  });
+
+  it("marks a channel read when it is opened", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    await waitFor(() => expect(calls).toContain("POST /api/messages/read"));
   });
 
   it("joins a new channel by name", async () => {
     render(<ChannelsSection />);
-    await screen.findByRole("button", { name: "#mesh-general" });
+    await screen.findByRole("button", { name: /#mesh-general/ });
     fireEvent.change(screen.getByLabelText("Channel name to join"), {
       target: { value: "mesh-radio" },
     });
@@ -64,7 +75,7 @@ describe("ChannelsSection", () => {
 
   it("sends a message to the selected channel", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     await screen.findByText("hello channel");
     fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
       target: { value: "hi all" },
@@ -75,7 +86,7 @@ describe("ChannelsSection", () => {
 
   it("sync pulls history for the selected channel", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
   });

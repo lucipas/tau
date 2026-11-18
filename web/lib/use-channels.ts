@@ -16,6 +16,7 @@ import {
   getChannels,
   joinChannel,
   leaveChannel,
+  markRead,
   sendChannelMessage,
   syncChannels,
 } from "./api";
@@ -79,10 +80,22 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     return undefined;
   }, [refresh, pollMs]);
 
-  const select = useCallback((channel: string | null) => {
-    setSelected(channel);
-    void refreshMessages(channel);
-  }, [refreshMessages]);
+  const select = useCallback(
+    (channel: string | null) => {
+      setSelected(channel);
+      void refreshMessages(channel);
+      if (channel) {
+        // Opening a channel clears its badge; refresh the list so
+        // the cleared count shows without waiting for the next poll.
+        // A failed mark (e.g. the channel was just left in another
+        // tab) must not break opening it.
+        void markRead({ channel })
+          .then(() => refreshChannels())
+          .catch(() => undefined);
+      }
+    },
+    [refreshMessages, refreshChannels],
+  );
 
   return {
     channels,
@@ -114,6 +127,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     },
     sync: async (channel) => {
       await syncChannels(channel ?? selected ?? undefined);
+      await refreshChannels();
       await refreshMessages(selected);
     },
   };

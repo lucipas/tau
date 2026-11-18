@@ -158,7 +158,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/media/<sha256> bytes of a cached Tan image
     POST /api/tan/media/<sha256>/fetch fetch a Tan image from its author
     POST /api/tan/import   import an export document (every entry verified)
-    GET  /api/channels     joined channels, most recently joined first
+    GET  /api/channels     joined channels, most recently joined first, with unread counts
     GET  /api/channels/messages  stored messages for a channel (``?channel=<name>&limit=20``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
@@ -2228,8 +2228,17 @@ class WebBridge:
         return record
 
     def record_channel_message(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Fan a channel message out to SSE subscribers."""
+        """Fan a channel message out to SSE subscribers.
+
+        A message from someone else can light a channel badge, so the
+        fresh unread counts go out on the same beat; own messages
+        never count, so the counts are unchanged for those.
+        """
         self.bus.publish({"type": "channel-message", "message": dict(record)})
+        try:
+            self.bus.publish({"type": "unread", "unread": self.unread()})
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not re-publish unread counts", exc_info=True)
         return record
 
     # -- Tan social feed ---------------------------------------------------
@@ -3854,8 +3863,13 @@ class WebBridge:
         )
 
     def channel_list(self) -> List[Dict[str, Any]]:
-        """Joined channels, most recently joined first."""
-        return self._local_channel_app().memberships()
+        """Joined channels, most recently joined first, with unread counts."""
+        app = self._local_channel_app()
+        memberships = app.memberships()
+        unread = app.unread_counts()
+        for membership in memberships:
+            membership["unread"] = unread.get(membership["channel"], 0)
+        return memberships
 
     def channel_messages(
         self, channel: str, *, limit: int = 20
@@ -9238,7 +9252,12 @@ class WebBridge:
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
-            counts: Dict[str, Any] = {"per_peer": {}, "per_group": {}, "total": 0}
+            counts: Dict[str, Any] = {
+                "per_peer": {},
+                "per_group": {},
+                "per_channel": {},
+                "total": 0,
+            }
             if inbox is not None:
                 try:
                     muted_peers, muted_groups = self._muted_sets()
@@ -9257,7 +9276,26 @@ class WebBridge:
                     log.debug("Could not read inbox unread counts", exc_info=True)
                 else:
                     counts = self._fold_group_counts(counts)
+            # Channels carry their own counts, outside the inbox: a
+            # node always has a channel store, even without an inbox.
+            counts["per_channel"] = self._channel_unread_counts()
+            counts["total"] = int(counts.get("total", 0)) + sum(
+                counts["per_channel"].values()
+            )
             return self._stamp_unread(counts)
+
+    def _channel_unread_counts(self) -> Dict[str, int]:
+        """Per-channel unread counts, or ``{}`` when unreadable.
+
+        A missing identity or an unreadable block-list fails closed
+        to no channel counts rather than breaking the whole unread
+        snapshot for the console.
+        """
+        try:
+            return self._local_channel_app().unread_counts()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read channel unread counts", exc_info=True)
+            return {}
 
     def _readable_group_lineage(
         self, group_id: str, ignored: FrozenSet[str]
@@ -9278,7 +9316,11 @@ class WebBridge:
         ]
 
     def mark_read(
-        self, peer: Optional[str] = None, *, group: Optional[str] = None
+        self,
+        peer: Optional[str] = None,
+        *,
+        group: Optional[str] = None,
+        channel: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Advance the inbox read cursor for one conversation, or all.
 
@@ -9290,29 +9332,58 @@ class WebBridge:
         mark advances the whole rename lineage, so opening a renamed
         group clears its older posts too — except an ignored
         predecessor, whose read state stays frozen until it is
-        unignored.  Read state never leaves this node.
+        unignored.  ``channel`` names a joined channel instead, and
+        advances its read cursor to the newest stored message; a
+        channel you have not joined is an error.  Read state never
+        leaves this node.
         """
         inbox = getattr(self.node, "inbox", None)
         with self._unread_lock:
-            counts: Dict[str, Any] = {"per_peer": {}, "per_group": {}, "total": 0}
+            counts: Dict[str, Any] = {
+                "per_peer": {},
+                "per_group": {},
+                "per_channel": {},
+                "total": 0,
+            }
+            if channel is not None:
+                from .channels import ChannelError, clean_channel_name
+
+                name = clean_channel_name(channel)
+                try:
+                    self._local_channel_app().mark_read(name)
+                except ChannelError as exc:
+                    raise WebBridgeError(str(exc)) from exc
             if inbox is not None:
                 muted_peers, muted_groups = self._muted_sets()
                 ignored = load_ignored_group_ids(
                     getattr(self.node.config, "ignored_groups_path", None)
                 )
-                counts = inbox.mark_read(
-                    peer=peer,
-                    group=(
-                        self._readable_group_lineage(group, ignored)
-                        if group is not None
-                        else None
-                    ),
-                    exclude_dm_from=self._archived_set() | muted_peers,
-                    exclude_group=ignored | muted_groups,
-                )
+                if channel is None:
+                    counts = inbox.mark_read(
+                        peer=peer,
+                        group=(
+                            self._readable_group_lineage(group, ignored)
+                            if group is not None
+                            else None
+                        ),
+                        exclude_dm_from=self._archived_set() | muted_peers,
+                        exclude_group=ignored | muted_groups,
+                    )
+                else:
+                    # A channel mark clears only that channel: read the
+                    # inbox counts without moving any cursor, so the
+                    # response still carries the DM/group badges.
+                    counts = inbox.unread_counts(
+                        exclude_dm_from=self._archived_set() | muted_peers,
+                        exclude_group=ignored | muted_groups,
+                    )
                 counts = self._fold_group_counts(counts)
+            counts["per_channel"] = self._channel_unread_counts()
+            counts["total"] = int(counts.get("total", 0)) + sum(
+                counts["per_channel"].values()
+            )
             stamped = self._stamp_unread(counts)
-        if inbox is not None:
+        if inbox is not None or channel is not None:
             self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 
@@ -9363,7 +9434,14 @@ class WebBridge:
             if moved is None:
                 target = group if group is not None else peer
                 raise ValueError(f"no stored messages in {target!r}")
-            stamped = self._stamp_unread(self._fold_group_counts(moved))
+            moved = self._fold_group_counts(moved)
+            # Same shape as unread()/mark_read(): channel counts ride
+            # along so every unread payload has per_channel.
+            moved["per_channel"] = self._channel_unread_counts()
+            moved["total"] = int(moved.get("total", 0)) + sum(
+                moved["per_channel"].values()
+            )
+            stamped = self._stamp_unread(moved)
         self.bus.publish({"type": "unread", "unread": stamped})
         return stamped
 
@@ -10479,21 +10557,54 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
-                if peer is not None and group is not None:
+                channel = body.get("channel")
+                if channel is not None and (
+                    not isinstance(channel, str) or not channel.strip()
+                ):
                     self._send_json(
                         {
                             "error": {
-                                "message": "pass 'peer' or 'group', not both"
+                                "message": "field 'channel' must be a channel name"
                             }
                         },
                         head_only,
                         400,
                     )
                     return
-                counts = self.bridge.mark_read(
-                    peer.strip() if isinstance(peer, str) else None,
-                    group=group.strip() if isinstance(group, str) else None,
-                )
+                targets = [
+                    field
+                    for field in (peer, group, channel)
+                    if field is not None
+                ]
+                if len(targets) > 1:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "pass 'peer', 'group' or 'channel', "
+                                "not more than one"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    counts = self.bridge.mark_read(
+                        peer.strip() if isinstance(peer, str) else None,
+                        group=group.strip() if isinstance(group, str) else None,
+                        channel=(
+                            channel.strip()
+                            if isinstance(channel, str)
+                            else None
+                        ),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}},
+                        head_only,
+                        400,
+                    )
+                    return
                 self._send_json({"ok": True, "unread": counts}, head_only)
                 return
             if path == "/api/messages/unread":

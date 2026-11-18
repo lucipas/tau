@@ -552,7 +552,9 @@ export interface PeerActions {
   archive: (target: string) => Promise<unknown>;
   unarchive: (target: string) => Promise<unknown>;
   mute: (target: { peer: string } | { group: string }, muted?: boolean) => Promise<unknown>;
-  markRead: (target?: { peer: string } | { group: string } | Record<string, never>) => Promise<UnreadCounts>;
+  markRead: (
+    target?: { peer: string } | { group: string } | { channel: string } | Record<string, never>,
+  ) => Promise<UnreadCounts>;
   markUnread: (target: { peer: string } | { group: string }, all?: boolean) => Promise<UnreadCounts>;
 }
 
