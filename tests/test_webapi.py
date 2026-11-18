@@ -11263,6 +11263,122 @@ def test_tan_post_via_api_accepts_expires_in(tmp_path):
         bridge.stop()
 
 
+def test_tan_post_via_api_accepts_image(tmp_path):
+    import base64
+    import hashlib
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        parent = create_post(conn, identity, "parent", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "with a picture", "image": data_url},
+        )
+        assert status == 200
+        post = payload["post"]
+        assert post["kind"] == "post"
+        assert post["image"] == {
+            "sha256": hashlib.sha256(png).hexdigest(),
+            "size": len(png),
+            "mime": "image/png",
+            "name": "image.png",
+        }
+
+        # The bytes land in the media store, so the console (and peers)
+        # can fetch them by digest right away.
+        digest = hashlib.sha256(png).hexdigest()
+        status, headers, body = _request(bridge, f"/api/tan/media/{digest}")
+        assert status == 200
+        assert body == png
+        assert headers["Content-Type"] == "image/png"
+
+        # A JPEG upload is detected from its bytes, not the declared type.
+        jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "mislabeled",
+                "image": "data:image/png;base64,"
+                + base64.b64encode(jpeg).decode("ascii"),
+            },
+        )
+        assert status == 200
+        assert payload["post"]["image"]["mime"] == "image/jpeg"
+        assert payload["post"]["image"]["name"] == "image.jpg"
+
+        # Bad uploads are 400s, not crashes — and queue nothing.
+        oversized = b"\x89PNG\r\n\x1a\n" + b"\x00" * (2 * 1024 * 1024)
+        for body, fragment in [
+            ({"text": "x", "image": "not a data url"}, "data URL"),
+            ({"text": "x", "image": "data:image/png;base64,!!!"}, "base64"),
+            (
+                {"text": "x", "image": "data:text/plain;base64,aGVsbG8="},
+                "JPEG, PNG, GIF or WebP",
+            ),
+            ({"text": "x", "image": 42}, "data URL"),
+            (
+                {
+                    "text": "x",
+                    "image": "data:image/png;base64,"
+                    + base64.b64encode(oversized).decode("ascii"),
+                },
+                "byte limit",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/posts", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+
+        # A reply cannot carry an image — same rule as the CLI.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "reply with pic",
+                "reply_to": parent["hash"][:16],
+                "image": data_url,
+            },
+        )
+        assert status == 400
+        assert "not a reply" in payload["error"]["message"]
+
+        # Only the two good posts were stored.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "mislabeled",
+            "with a picture",
+            "parent",
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_tan_quote_via_api(tmp_path):
     import RNS
 

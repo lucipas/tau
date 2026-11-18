@@ -802,6 +802,8 @@ export interface PublishTanOptions {
   replyTo?: string;
   /** Post lifetime in seconds (0 < n <= 7 days). */
   expiresIn?: number;
+  /** Image to attach, as a base64 data URL (top-level posts only). */
+  image?: { dataUrl: string };
 }
 
 export async function publishTanPost(
@@ -812,6 +814,20 @@ export async function publishTanPost(
     text,
     reply_to: opts.replyTo,
     expires_in: opts.expiresIn,
+    image: opts.image?.dataUrl,
+  });
+}
+
+/** Largest image a Tan post may carry, in bytes (mirrors MAX_IMAGE_BYTES). */
+export const TAN_MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+
+/** Read a picked file as a base64 data URL for upload. */
+export function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("Could not read the image file."));
+    reader.readAsDataURL(file);
   });
 }
 
