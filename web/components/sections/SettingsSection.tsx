@@ -1,7 +1,8 @@
 // SettingsSection.tsx — node settings: file acceptance / read receipts,
-// rename the node, announce, and per-peer / per-group disappearing-message
-// defaults. Built on api.ts getSettings / updateSetting / renameNode /
-// announce / getDisappearingDefaults / setDisappearingDefault.
+// rename the node, announce, quiet hours, and per-peer / per-group
+// disappearing-message defaults. Built on api.ts getSettings /
+// updateSetting / renameNode / announce / getQuietHours / setQuietHours /
+// getDisappearingDefaults / setDisappearingDefault.
 
 "use client";
 
@@ -10,12 +11,14 @@ import { useTauContext } from "@/components/chrome/TauContext";
 import {
   announce,
   getDisappearingDefaults,
+  getQuietHours,
   getSettings,
   renameNode,
   setDisappearingDefault,
+  setQuietHours,
   updateSetting,
 } from "@/lib/api";
-import type { NodeSettings } from "@/lib/types";
+import type { NodeSettings, QuietHoursSettings } from "@/lib/types";
 
 const EXPIRY_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "No disappearing default", seconds: null },
@@ -43,6 +46,11 @@ export default function SettingsSection() {
   const [notice, setNotice] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [nameSeeded, setNameSeeded] = useState(false);
+  const [quietHours, setQuietHoursState] = useState<QuietHoursSettings | null>(null);
+  const [qhStart, setQhStart] = useState("22:00");
+  const [qhEnd, setQhEnd] = useState("07:00");
+  const [qhEnabled, setQhEnabled] = useState(false);
+  const [qhSeeded, setQhSeeded] = useState(false);
   const [disappearing, setDisappearing] = useState<Record<string, number>>({});
   const [ddTarget, setDdTarget] = useState("");
   const [ddSeconds, setDdSeconds] = useState<string>("");
@@ -50,9 +58,14 @@ export default function SettingsSection() {
   useEffect(() => {
     void (async () => {
       try {
-        const [s, dd] = await Promise.all([getSettings(), getDisappearingDefaults()]);
+        const [s, dd, qh] = await Promise.all([
+          getSettings(),
+          getDisappearingDefaults(),
+          getQuietHours(),
+        ]);
         setSettings(s);
         setDisappearing({ ...dd.peers, ...dd.groups });
+        setQuietHoursState(qh);
         setError(null);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -65,6 +78,13 @@ export default function SettingsSection() {
   if (tau?.node && !nameSeeded) {
     setNameSeeded(true);
     setName(tau.node.name);
+  }
+
+  if (quietHours && !qhSeeded) {
+    setQhSeeded(true);
+    setQhStart(quietHours.start);
+    setQhEnd(quietHours.end);
+    setQhEnabled(quietHours.enabled);
   }
 
   async function run(fn: () => Promise<unknown>, okMsg: string) {
@@ -224,6 +244,87 @@ export default function SettingsSection() {
               </span>
             </label>
           </div>
+        )}
+      </section>
+
+      <section className="border-b border-zinc-800 px-3 py-4 sm:px-4" aria-label="Quiet hours">
+        <h2 className="text-sm font-bold text-zinc-100">Quiet hours</h2>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+          A daily do-not-disturb window: while it is quiet, unread badges stay dark
+          and no message carries the unread marker. The counts come back when the
+          window ends.
+        </p>
+        {loading && <p className="py-3 text-sm text-zinc-500">Loading quiet hours…</p>}
+        {quietHours && (
+          <>
+            <p className="mt-2 text-sm text-zinc-300" role="status">
+              {quietHours.active
+                ? `Quiet now until ${quietHours.end}.`
+                : quietHours.enabled
+                  ? `On ${quietHours.start}–${quietHours.end} every day.`
+                  : "Off — badges light as messages arrive."}
+            </p>
+            <form
+              className="mt-3 flex flex-wrap items-center gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (qhStart === qhEnd)
+                  return setError("Quiet hours start and end must differ.");
+                void run(
+                  async () => {
+                    const { quiet_hours } = await setQuietHours({
+                      enabled: qhEnabled,
+                      start: qhStart,
+                      end: qhEnd,
+                    });
+                    setQuietHoursState(quiet_hours);
+                  },
+                  qhEnabled
+                    ? `Quiet hours on ${qhStart}–${qhEnd} every day.`
+                    : "Quiet hours turned off.",
+                );
+              }}
+            >
+              <label className="flex items-center gap-2 text-sm text-zinc-200">
+                <input
+                  type="checkbox"
+                  checked={qhEnabled}
+                  disabled={busy}
+                  onChange={(e) => setQhEnabled(e.target.checked)}
+                />
+                Enable quiet hours
+              </label>
+              <label className="flex items-center gap-2 text-sm text-zinc-200">
+                From
+                <input
+                  type="time"
+                  value={qhStart}
+                  disabled={busy}
+                  onChange={(e) => setQhStart(e.target.value)}
+                  aria-label="Quiet hours start"
+                  className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500 disabled:opacity-50"
+                />
+              </label>
+              <label className="flex items-center gap-2 text-sm text-zinc-200">
+                To
+                <input
+                  type="time"
+                  value={qhEnd}
+                  disabled={busy}
+                  onChange={(e) => setQhEnd(e.target.value)}
+                  aria-label="Quiet hours end"
+                  className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500 disabled:opacity-50"
+                />
+              </label>
+              <button
+                type="submit"
+                disabled={busy}
+                className="rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+              >
+                Save quiet hours
+              </button>
+            </form>
+          </>
         )}
       </section>
 

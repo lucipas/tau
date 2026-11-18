@@ -11,6 +11,7 @@ import {
   fileUrl,
   getChannelMessages,
   getMessages,
+  getQuietHours,
   getTanThread,
   getTanTimeline,
   markRead,
@@ -20,6 +21,7 @@ import {
   closeDmPoll,
   sendChannelMessage,
   sendMessage,
+  setQuietHours,
   tanMediaUrl,
   voteDmPoll,
   voteTanPoll,
@@ -110,6 +112,18 @@ describe("GET endpoints", () => {
       reaction: "👍",
     });
   });
+
+  it("fetches the quiet-hours window", async () => {
+    nextJson = {
+      enabled: false,
+      start: "22:00",
+      end: "07:00",
+      active: false,
+      minutes_until_end: null,
+    };
+    await getQuietHours();
+    expect(captured[0].url).toBe("/api/settings/quiet-hours");
+  });
 });
 
 describe("POST endpoints", () => {
@@ -192,6 +206,16 @@ describe("POST endpoints", () => {
     await fetchTanMedia("a".repeat(64), "b".repeat(32));
     expect(captured[0].url).toBe(`/api/tan/media/${"a".repeat(64)}/fetch`);
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
+  });
+
+  it("sets quiet hours with only the changed fields", async () => {
+    nextJson = { ok: true, quiet_hours: {} };
+    await setQuietHours({ enabled: true, start: "23:00", end: "06:30" });
+    expect(captured[0].url).toBe("/api/settings/quiet-hours");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ enabled: true, start: "23:00", end: "06:30" });
+    await setQuietHours({ enabled: false });
+    expect(bodyOf(1)).toEqual({ enabled: false });
   });
 });
 

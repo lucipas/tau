@@ -38,6 +38,7 @@ import type {
   Peer,
   PeerInfo,
   PingResult,
+  QuietHoursSettings,
   SafetyNumberResult,
   ScheduledTanPost,
   SendResult,
@@ -554,6 +555,20 @@ export async function setDisappearingDefault(
   seconds: number | null,
 ): Promise<unknown> {
   return post("/api/messages/disappearing", { ...target, seconds });
+}
+
+/** The quiet-hours window, plus whether it is quiet right now. */
+export async function getQuietHours(): Promise<QuietHoursSettings> {
+  return get("/api/settings/quiet-hours");
+}
+
+/** Set the quiet-hours window; omitted fields keep their stored value. */
+export async function setQuietHours(patch: {
+  enabled?: boolean;
+  start?: string;
+  end?: string;
+}): Promise<{ ok: boolean; quiet_hours: QuietHoursSettings }> {
+  return post("/api/settings/quiet-hours", patch);
 }
 
 export async function getMutedConversations(): Promise<MutedConversations> {

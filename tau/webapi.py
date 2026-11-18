@@ -87,6 +87,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages/mute mute ``{"peer": "<name or hash>"}`` or
                            ``{"group": "<id | prefix | name>"}``
                            (``"muted": false`` unmutes)
+    GET  /api/settings/quiet-hours quiet-hours window (``enabled``,
+                           ``start``/``end`` HH:MM) plus whether it is
+                           quiet now and minutes until the window ends
+    POST /api/settings/quiet-hours set the window ``{"enabled": true,
+                           "start": "22:00", "end": "07:00"}``;
+                           omitted fields keep their stored value
     GET  /api/messages/requests list DMs held for review from peers
                            outside the allow-list
     POST /api/messages/requests/accept accept ``{"id": "<request id>"}``:
@@ -239,7 +245,14 @@ from .muted import (
     muted_peers_for,
     save_muted,
 )
-from .quiet_hours import quiet_hours_active
+from .quiet_hours import (
+    QuietHours,
+    QuietHoursError,
+    load_quiet_hours,
+    quiet_hours_active,
+    quiet_hours_lock,
+    save_quiet_hours,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
@@ -1200,6 +1213,8 @@ class WebBridge:
         self._disappearing_lock = threading.Lock()
         # Serializes mute/unmute read-modify-write cycles the same way.
         self._muted_lock = threading.Lock()
+        # Serializes quiet-hours read-modify-write cycles the same way.
+        self._quiet_hours_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -8204,6 +8219,89 @@ class WebBridge:
             return None
         return data_dir / QUIET_HOURS_FILE_NAME
 
+    def quiet_hours(self) -> Dict[str, Any]:
+        """This node's quiet-hours window, for the console load.
+
+        The stored window (``enabled``, ``start`` and ``end`` as HH:MM),
+        plus whether it is quiet right now and how many minutes remain.
+        A missing file means off, with the default 22:00–07:00 window
+        kept as the start/end.  A corrupt file is a 503 — the owner
+        repairs or removes it before the console shows the window, the
+        same as the disappearing defaults.
+        """
+        path = self._quiet_hours_path()
+        if path is None:
+            window = QuietHours()
+        else:
+            try:
+                window = load_quiet_hours(path)
+            except QuietHoursError as exc:
+                raise WebBridgeError(
+                    "quiet hours on disk are unusable; fix or remove them "
+                    f"before editing ({exc})"
+                ) from exc
+        return {
+            **window.to_dict(),
+            "active": window.is_quiet(),
+            "minutes_until_end": window.minutes_until_end(),
+        }
+
+    def set_quiet_hours(
+        self,
+        *,
+        enabled: Optional[Any] = None,
+        start: Optional[Any] = None,
+        end: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Set the quiet-hours window (or turn it off) and return it.
+
+        Any of *enabled*, *start* and *end* may be omitted, in which
+        case the stored value is kept — turning the window off keeps
+        the start/end, so turning it back on restores the same window,
+        like ``tau quiet-hours off``.  At least one field is required.
+        Mirrors the CLI setters: the window is reloaded inside the
+        lock so a corrupt file fails loudly instead of being silently
+        overwritten, a bad time is a :class:`ValueError`, and a corrupt
+        file is a 503.
+        """
+        if enabled is None and start is None and end is None:
+            raise ValueError(
+                "at least one of 'enabled', 'start' or 'end' is required"
+            )
+        path = self._quiet_hours_path()
+        if path is None:
+            raise WebBridgeError("this node has no quiet-hours path")
+        with self._quiet_hours_lock, quiet_hours_lock(path):
+            try:
+                current = load_quiet_hours(path)
+            except QuietHoursError as exc:
+                raise WebBridgeError(
+                    "quiet hours on disk are unusable; fix or remove them "
+                    f"before editing ({exc})"
+                ) from exc
+            stored = current.to_dict()
+            try:
+                updated = QuietHours.from_dict(
+                    {
+                        "enabled": stored["enabled"]
+                        if enabled is None
+                        else enabled,
+                        "start": stored["start"] if start is None else start,
+                        "end": stored["end"] if end is None else end,
+                    }
+                )
+            except QuietHoursError as exc:
+                raise ValueError(str(exc)) from exc
+            changed = updated != current
+            if changed:
+                save_quiet_hours(path, updated)
+        return {
+            **updated.to_dict(),
+            "active": updated.is_quiet(),
+            "minutes_until_end": updated.minutes_until_end(),
+            "changed": changed,
+        }
+
     def _muted_sets(self) -> "tuple[FrozenSet[str], FrozenSet[str]]":
         """Muted (peers, groups), failing open on a corrupt file.
 
@@ -10285,6 +10383,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                         {"error": {"message": str(exc)}}, head_only, 503
                     )
                 return
+            if path == "/api/settings/quiet-hours":
+                try:
+                    self._send_json(self.bridge.quiet_hours(), head_only)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                return
             if path == "/api/backup":
                 # The archive holds the node identity and peers.json —
                 # which now stores private peer notes — so it goes only
@@ -10990,6 +11096,27 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/settings":
                 self._handle_settings(body, head_only)
+                return
+            if path == "/api/settings/quiet-hours":
+                try:
+                    result = self.bridge.set_quiet_hours(
+                        enabled=body.get("enabled"),
+                        start=body.get("start"),
+                        end=body.get("end"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json(
+                    {"ok": True, "quiet_hours": result}, head_only
+                )
                 return
             if path == "/api/groups":
                 try:
