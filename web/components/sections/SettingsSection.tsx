@@ -1,7 +1,8 @@
 // SettingsSection.tsx — node settings: file acceptance / read receipts,
-// rename the node, announce, and per-peer / per-group disappearing-message
-// defaults. Built on api.ts getSettings / updateSetting / renameNode /
-// announce / getDisappearingDefaults / setDisappearingDefault.
+// rename the node, announce, your public profile, and per-peer / per-group
+// disappearing-message defaults. Built on api.ts getSettings /
+// updateSetting / renameNode / announce / getOwnProfile / setOwnProfile /
+// getDisappearingDefaults / setDisappearingDefault.
 
 "use client";
 
@@ -10,12 +11,14 @@ import { useTauContext } from "@/components/chrome/TauContext";
 import {
   announce,
   getDisappearingDefaults,
+  getOwnProfile,
   getSettings,
   renameNode,
   setDisappearingDefault,
+  setOwnProfile,
   updateSetting,
 } from "@/lib/api";
-import type { NodeSettings } from "@/lib/types";
+import type { NodeSettings, OwnProfile } from "@/lib/types";
 
 const EXPIRY_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "No disappearing default", seconds: null },
@@ -43,6 +46,12 @@ export default function SettingsSection() {
   const [notice, setNotice] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [nameSeeded, setNameSeeded] = useState(false);
+  const [profile, setProfile] = useState<OwnProfile | null>(null);
+  const [profileName, setProfileName] = useState("");
+  const [profileBio, setProfileBio] = useState("");
+  const [profileAvatar, setProfileAvatar] = useState("");
+  const [profileLinks, setProfileLinks] = useState("");
+  const [profileSeeded, setProfileSeeded] = useState(false);
   const [disappearing, setDisappearing] = useState<Record<string, number>>({});
   const [ddTarget, setDdTarget] = useState("");
   const [ddSeconds, setDdSeconds] = useState<string>("");
@@ -50,9 +59,14 @@ export default function SettingsSection() {
   useEffect(() => {
     void (async () => {
       try {
-        const [s, dd] = await Promise.all([getSettings(), getDisappearingDefaults()]);
+        const [s, dd, p] = await Promise.all([
+          getSettings(),
+          getDisappearingDefaults(),
+          getOwnProfile(),
+        ]);
         setSettings(s);
         setDisappearing({ ...dd.peers, ...dd.groups });
+        setProfile(p);
         setError(null);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -65,6 +79,14 @@ export default function SettingsSection() {
   if (tau?.node && !nameSeeded) {
     setNameSeeded(true);
     setName(tau.node.name);
+  }
+
+  if (profile && !profileSeeded) {
+    setProfileSeeded(true);
+    setProfileName(profile.name);
+    setProfileBio(profile.bio);
+    setProfileAvatar(profile.avatar ?? "");
+    setProfileLinks(profile.links.join("\n"));
   }
 
   async function run(fn: () => Promise<unknown>, okMsg: string) {
@@ -91,7 +113,8 @@ export default function SettingsSection() {
           <span className="mr-2 text-cyan-400">τ</span>Settings
         </h1>
         <p className="mt-0.5 text-xs text-zinc-500">
-          This node&apos;s name, what it accepts, and how long messages live.
+          This node&apos;s name, what it accepts, the profile peers see, and how long
+          messages live.
         </p>
       </header>
 
@@ -224,6 +247,108 @@ export default function SettingsSection() {
               </span>
             </label>
           </div>
+        )}
+      </section>
+
+      <section className="border-b border-zinc-800 px-3 py-4 sm:px-4" aria-label="Your profile">
+        <h2 className="text-sm font-bold text-zinc-100">Your profile</h2>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+          The signed public card peers see — display name, bio, avatar and links.
+          Saving publishes a new version, which reaches peers at the next announce.
+        </p>
+        {loading && <p className="py-3 text-sm text-zinc-500">Loading profile…</p>}
+        {profile && (
+          <p className="mt-2 text-xs text-zinc-500">
+            {profile.published
+              ? `Published as version ${profile.version}.`
+              : "Not published yet — peers see the node name."}
+          </p>
+        )}
+        {profile && (
+          <form
+            className="mt-3 flex flex-col gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const links = profileLinks
+                .split("\n")
+                .map((line) => line.trim())
+                .filter((line) => line.length > 0);
+              void run(
+                async () => {
+                  const { profile: saved } = await setOwnProfile({
+                    name: profileName.trim(),
+                    bio: profileBio,
+                    avatar: profileAvatar.trim(),
+                    links,
+                  });
+                  setProfile(saved);
+                  setProfileName(saved.name);
+                  setProfileBio(saved.bio);
+                  setProfileAvatar(saved.avatar ?? "");
+                  setProfileLinks(saved.links.join("\n"));
+                },
+                "Profile saved.",
+              );
+            }}
+          >
+            <label className="sr-only" htmlFor="profile-name">
+              Profile display name
+            </label>
+            <input
+              id="profile-name"
+              value={profileName}
+              onChange={(e) => setProfileName(e.target.value)}
+              placeholder="Display name"
+              disabled={busy}
+              aria-label="Profile display name"
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <label className="sr-only" htmlFor="profile-bio">
+              Profile bio
+            </label>
+            <input
+              id="profile-bio"
+              value={profileBio}
+              onChange={(e) => setProfileBio(e.target.value)}
+              placeholder="Short bio (at most 280 characters)"
+              maxLength={280}
+              disabled={busy}
+              aria-label="Profile bio"
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <label className="sr-only" htmlFor="profile-avatar">
+              Profile avatar hash
+            </label>
+            <input
+              id="profile-avatar"
+              value={profileAvatar}
+              onChange={(e) => setProfileAvatar(e.target.value)}
+              placeholder="Avatar media hash — 32 or 64 hex characters (optional)"
+              disabled={busy}
+              aria-label="Profile avatar hash"
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 font-mono text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <label className="sr-only" htmlFor="profile-links">
+              Profile links
+            </label>
+            <textarea
+              id="profile-links"
+              value={profileLinks}
+              onChange={(e) => setProfileLinks(e.target.value)}
+              placeholder={"Links — one https:// URL per line (up to 3)"}
+              rows={3}
+              disabled={busy}
+              aria-label="Profile links"
+              className="min-w-0 rounded-2xl border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={busy}
+              className="self-start rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+            >
+              Save profile
+            </button>
+          </form>
         )}
       </section>
 

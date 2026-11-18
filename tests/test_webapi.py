@@ -3314,6 +3314,171 @@ def test_api_groups_ignore_with_corrupt_list_is_500(bridge, node, tmp_path):
         assert "ignored-groups" in payload["error"]["message"]
 
 
+def test_own_profile_endpoints(node, tmp_path):
+    from tau.identity import save_identity
+    from tau.profile import load_local_profile
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    save_identity(RNS.Identity(), node.config.identity_path)
+    try:
+        # A fresh node has nothing published: the node-name default.
+        status, _, payload = _json(bridge, "/api/profile")
+        assert status == 200
+        assert payload == {
+            "author": None,
+            "name": "tester",
+            "bio": "",
+            "avatar": None,
+            "links": [],
+            "version": 0,
+            "created_at": None,
+            "published": False,
+        }
+
+        # Publishing a name and bio signs version 1 and writes it.
+        status, _, payload = _json(
+            bridge,
+            "/api/profile",
+            method="POST",
+            body={"name": "Tester Two", "bio": "mesh enjoyer"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        profile = payload["profile"]
+        assert profile["name"] == "Tester Two"
+        assert profile["bio"] == "mesh enjoyer"
+        assert profile["avatar"] is None
+        assert profile["links"] == []
+        assert profile["version"] == 1
+        assert profile["published"] is True
+        assert profile["changed"] is True
+        assert profile["author"] is not None
+        stored = load_local_profile(tmp_path / "profile.json")
+        assert stored is not None
+        assert stored["version"] == 1
+        assert stored["name"] == "Tester Two"
+
+        # A no-op save publishes nothing and leaves the version alone.
+        status, _, payload = _json(
+            bridge,
+            "/api/profile",
+            method="POST",
+            body={"name": "Tester Two", "bio": "mesh enjoyer"},
+        )
+        assert payload["profile"]["changed"] is False
+        assert payload["profile"]["version"] == 1
+
+        # Omitted fields keep their stored value; links and avatar set.
+        avatar = "ab" * 32
+        status, _, payload = _json(
+            bridge,
+            "/api/profile",
+            method="POST",
+            body={"links": ["https://example.org"], "avatar": avatar},
+        )
+        assert payload["profile"]["version"] == 2
+        assert payload["profile"]["name"] == "Tester Two"
+        assert payload["profile"]["bio"] == "mesh enjoyer"
+        assert payload["profile"]["links"] == ["https://example.org"]
+        assert payload["profile"]["avatar"] == avatar
+
+        # Clearing the bio and links keeps the name and avatar.
+        status, _, payload = _json(
+            bridge,
+            "/api/profile",
+            method="POST",
+            body={"bio": "", "links": []},
+        )
+        assert payload["profile"]["version"] == 3
+        assert payload["profile"]["bio"] == ""
+        assert payload["profile"]["links"] == []
+        assert payload["profile"]["name"] == "Tester Two"
+        assert payload["profile"]["avatar"] == avatar
+    finally:
+        bridge.stop()
+
+
+def test_own_profile_endpoint_rejects_bad_input(node, tmp_path):
+    from tau.identity import save_identity
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    save_identity(RNS.Identity(), node.config.identity_path)
+    try:
+        for body in (
+            {},
+            {"name": 42},
+            {"bio": "x" * 281},
+            {"bio": 42},
+            {"avatar": "not-a-hash"},
+            {"avatar": 42},
+            {"links": ["not-a-url"]},
+            {
+                "links": [
+                    "https://a.example",
+                    "https://b.example",
+                    "https://c.example",
+                    "https://d.example",
+                ]
+            },
+            {"links": "https://example.org"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/profile", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_own_profile_corrupt_file_reads_as_unpublished(node, tmp_path):
+    from tau.identity import save_identity
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    save_identity(RNS.Identity(), node.config.identity_path)
+    try:
+        # A corrupt profile reads as no profile (like the CLI), never
+        # as a crash; a save overwrites it with version 1.
+        (tmp_path / "profile.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(bridge, "/api/profile")
+        assert status == 200
+        assert payload["published"] is False
+        status, _, payload = _json(
+            bridge, "/api/profile", method="POST", body={"name": "Tester Two"}
+        )
+        assert status == 200
+        assert payload["profile"]["version"] == 1
+        assert payload["profile"]["changed"] is True
+    finally:
+        bridge.stop()
+
+
+def test_own_profile_without_identity(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(
+            bridge, "/api/profile", method="POST", body={"name": "Tester"}
+        )
+        assert status == 503
+        assert "identity" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_own_profile_without_data_dir(bridge):
+    # A dataless node has no profile path: edits are refused, but the
+    # read still answers the unpublished default instead of failing.
+    status, _, payload = _json(bridge, "/api/profile")
+    assert status == 200
+    assert payload["published"] is False
+    assert payload["name"] == ""
+    status, _, payload = _json(
+        bridge, "/api/profile", method="POST", body={"name": "Tester"}
+    )
+    assert status == 503
+    assert "profile path" in payload["error"]["message"]
+
+
 def _inbound_record(node, **overrides):
     """A received DM, appended to the node inbox first — the order the
     node itself uses before it hands the record to the bridge."""

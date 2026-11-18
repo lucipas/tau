@@ -34,6 +34,7 @@ import type {
   NodeSettings,
   Outbox,
   OutboxRetryResult,
+  OwnProfile,
   PageList,
   Peer,
   PeerInfo,
@@ -554,6 +555,21 @@ export async function setDisappearingDefault(
   seconds: number | null,
 ): Promise<unknown> {
   return post("/api/messages/disappearing", { ...target, seconds });
+}
+
+/** This node's published public profile (or the node-name default). */
+export async function getOwnProfile(): Promise<OwnProfile> {
+  return get("/api/profile");
+}
+
+/** Publish a new profile version; omitted fields keep their stored value. */
+export async function setOwnProfile(patch: {
+  name?: string;
+  bio?: string;
+  avatar?: string | null;
+  links?: string[];
+}): Promise<{ ok: boolean; profile: OwnProfile & { changed: boolean } }> {
+  return post("/api/profile", patch);
 }
 
 export async function getMutedConversations(): Promise<MutedConversations> {

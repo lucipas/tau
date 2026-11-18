@@ -117,6 +117,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/allowlist/set-enabled turn enforcement ``{"enabled": true}`` on/off
     POST /api/announce     announce this node immediately
     POST /api/id/rename    rename this node (live name + re-announce)
+    GET  /api/profile      this node's published public profile
+                           (display name, bio, avatar, links, version)
+    POST /api/profile      publish a new version of it
+                           (``{"name": ..., "bio": ..., "avatar": ...,
+                           "links": [...]}``; omitted fields keep their
+                           stored value)
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
     GET  /api/tan/tags     tags in stored posts, most-used first
@@ -256,6 +262,7 @@ from .config import (
     DISAPPEARING_FILE_NAME,
     MESSAGES_FILE_NAME,
     MUTED_FILE_NAME,
+    PROFILE_FILE_NAME,
     QUIET_HOURS_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
@@ -286,7 +293,16 @@ from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError, safety_number
-from .profile import public_profile
+from .profile import (
+    ProfileError,
+    build_profile,
+    clean_bio,
+    clean_links,
+    load_local_profile,
+    public_profile,
+    resolve_avatar,
+    save_local_profile,
+)
 from .protocol import (
     MAX_FILE_BYTES,
     MAX_MAIL_TTL,
@@ -1201,6 +1217,9 @@ class WebBridge:
         self._disappearing_lock = threading.Lock()
         # Serializes mute/unmute read-modify-write cycles the same way.
         self._muted_lock = threading.Lock()
+        # Serializes profile read-modify-write cycles the same way, so
+        # concurrent console saves cannot publish two versions at once.
+        self._profile_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -8229,6 +8248,140 @@ class WebBridge:
             return None
         return data_dir / QUIET_HOURS_FILE_NAME
 
+    def _profile_path(self) -> Optional[Path]:
+        """This node's local-profile path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "profile_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / PROFILE_FILE_NAME
+
+    def own_profile(self) -> Dict[str, Any]:
+        """This node's published public profile, for the console load.
+
+        The display view of the signed document (name, bio, avatar,
+        links, version) plus ``published``.  Nothing published yet
+        reads as the node-name default with ``published`` False and
+        version 0, so the console can seed its form from one shape —
+        the same default ``tau profile set`` starts from.
+        """
+        path = self._profile_path()
+        doc = load_local_profile(path) if path is not None else None
+        if doc is not None:
+            return {**public_profile(doc), "published": True}
+        config = getattr(self.node, "config", None)
+        return {
+            "author": None,
+            "name": getattr(config, "name", None) or "",
+            "bio": "",
+            "avatar": None,
+            "links": [],
+            "version": 0,
+            "created_at": None,
+            "published": False,
+        }
+
+    def set_own_profile(
+        self,
+        *,
+        name: Optional[Any] = None,
+        bio: Optional[Any] = None,
+        avatar: Optional[Any] = None,
+        links: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Publish a new version of this node's public profile and return it.
+
+        Any of *name*, *bio*, *avatar* and *links* may be omitted, in
+        which case the stored value is kept — a small change does not
+        wipe the rest of the card, like ``tau profile set``.  At least
+        one field is required.  An empty bio clears it, an empty links
+        list clears the links, and an empty avatar clears it; a blank
+        name keeps the stored name (a profile always carries one).
+        The avatar is a 32/64-character hex hash, as the CLI's
+        ``--avatar FILE|HASH`` accepts for a hash.  A no-op save — every
+        given field already equal to the stored value — publishes
+        nothing and leaves the version untouched.  Otherwise the new
+        version is written to the data directory and the serving node
+        reloads it at once, so it rides the next announce without a
+        restart.  A bad field is a :class:`ValueError`.
+        """
+        if name is None and bio is None and avatar is None and links is None:
+            raise ValueError(
+                "at least one of 'name', 'bio', 'avatar' or 'links' "
+                "is required"
+            )
+        path = self._profile_path()
+        if path is None:
+            raise WebBridgeError("this node has no profile path")
+        config = getattr(self.node, "config", None)
+        identity_path = getattr(config, "identity_path", None)
+        if identity_path is None:
+            raise WebBridgeError("this node has no identity path")
+        from .identity import load_identity
+
+        identity = load_identity(identity_path)
+        if identity is None:
+            raise WebBridgeError(
+                "no identity; run `tau init` first"
+            )
+        with self._profile_lock:
+            current = load_local_profile(path)
+            if name is not None and not isinstance(name, str):
+                raise ValueError("'name' must be a string")
+            if name is None or not name.strip():
+                new_name = (
+                    current["name"]
+                    if current is not None
+                    else (getattr(config, "name", None) or "")
+                )
+            else:
+                new_name = name
+            if current is not None:
+                new_bio = current["bio"] if bio is None else bio
+                new_avatar = current["avatar"] if avatar is None else avatar
+                new_links = current["links"] if links is None else links
+            else:
+                new_bio = "" if bio is None else bio
+                new_avatar = None if avatar is None else avatar
+                new_links = [] if links is None else links
+            if isinstance(new_avatar, str) and not new_avatar.strip():
+                new_avatar = None
+            try:
+                new_bio = clean_bio(new_bio)
+                new_links = clean_links(new_links)
+                new_avatar = (
+                    resolve_avatar(new_avatar)
+                    if new_avatar is not None
+                    else None
+                )
+            except ProfileError as exc:
+                raise ValueError(str(exc)) from exc
+            if (
+                current is not None
+                and new_name == current["name"]
+                and new_bio == current["bio"]
+                and new_avatar == current["avatar"]
+                and new_links == current["links"]
+            ):
+                return {**public_profile(current), "published": True, "changed": False}
+            version = current["version"] + 1 if current is not None else 1
+            doc = build_profile(
+                identity,
+                name=new_name,
+                bio=new_bio,
+                avatar=new_avatar,
+                links=new_links,
+                version=version,
+            )
+            save_local_profile(path, doc)
+            refresh = getattr(self.node, "refresh_local_profile", None)
+            if refresh is not None:
+                refresh()
+        return {**public_profile(doc), "published": True, "changed": True}
+
     def _muted_sets(self) -> "tuple[FrozenSet[str], FrozenSet[str]]":
         """Muted (peers, groups), failing open on a corrupt file.
 
@@ -10310,6 +10463,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                         {"error": {"message": str(exc)}}, head_only, 503
                     )
                 return
+            if path == "/api/profile":
+                try:
+                    self._send_json(self.bridge.own_profile(), head_only)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                return
             if path == "/api/backup":
                 # The archive holds the node identity and peers.json —
                 # which now stores private peer notes — so it goes only
@@ -11048,6 +11209,26 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/settings":
                 self._handle_settings(body, head_only)
+                return
+            if path == "/api/profile":
+                try:
+                    result = self.bridge.set_own_profile(
+                        name=body.get("name"),
+                        bio=body.get("bio"),
+                        avatar=body.get("avatar"),
+                        links=body.get("links"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "profile": result}, head_only)
                 return
             if path == "/api/groups":
                 try:
