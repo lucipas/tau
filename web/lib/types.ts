@@ -626,6 +626,21 @@ export interface ChannelMessage {
   sig: string;
 }
 
+export interface ScheduledChannelMessage {
+  id: string;
+  channel: string;
+  text: string;
+  publish_at: number;
+  created_at: number;
+  to: string[];
+  ttl: number;
+  message_hash: string | null;
+  attempts: number;
+  next_attempt_at: number | null;
+  paused_at: number | null;
+  [key: string]: unknown;
+}
+
 // ---------------------------------------------------------------- pages --
 
 export interface PageFile {

@@ -12,14 +12,17 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  cancelScheduledChannelMessage,
   getChannelMessages,
+  getChannelScheduled,
   getChannels,
   joinChannel,
   leaveChannel,
+  scheduleChannelMessage,
   sendChannelMessage,
   syncChannels,
 } from "./api";
-import type { Channel, ChannelMessage } from "./types";
+import type { Channel, ChannelMessage, ScheduledChannelMessage } from "./types";
 
 export interface UseChannelsResult {
   channels: Channel[];
@@ -27,12 +30,16 @@ export interface UseChannelsResult {
   selected: string | null;
   select: (channel: string | null) => void;
   messages: ChannelMessage[];
+  /** Queued channel messages for the selected channel (soonest first). */
+  scheduled: ScheduledChannelMessage[];
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
   send: (text: string) => Promise<ChannelMessage>;
+  schedule: (text: string, sendIn: number) => Promise<ScheduledChannelMessage>;
+  cancelScheduled: (id: string) => Promise<void>;
   sync: (channel?: string) => Promise<void>;
 }
 
@@ -40,6 +47,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
+  const [scheduled, setScheduled] = useState<ScheduledChannelMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -55,10 +63,16 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
   const refreshMessages = useCallback(async (channel: string | null) => {
     if (!channel) {
       setMessages([]);
+      setScheduled([]);
       return;
     }
     try {
       setMessages(await getChannelMessages(channel));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      setScheduled(await getChannelScheduled(channel));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -89,6 +103,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     selected,
     select,
     messages,
+    scheduled,
     loading,
     error,
     refresh,
@@ -104,6 +119,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       if (selected === channel) {
         setSelected(null);
         setMessages([]);
+        setScheduled([]);
       }
     },
     send: async (text) => {
@@ -111,6 +127,16 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       const sent = await sendChannelMessage(selected, text);
       await refreshMessages(selected);
       return sent;
+    },
+    schedule: async (text, sendIn) => {
+      if (!selected) throw new Error("no channel selected");
+      const entry = await scheduleChannelMessage(selected, text, sendIn);
+      await refreshMessages(selected);
+      return entry;
+    },
+    cancelScheduled: async (id) => {
+      await cancelScheduledChannelMessage(id);
+      await refreshMessages(selected);
     },
     sync: async (channel) => {
       await syncChannels(channel ?? selected ?? undefined);

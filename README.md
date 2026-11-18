@@ -410,6 +410,9 @@ Global options may appear before or after the command:
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel |
+| `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
+| `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
+| `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
 

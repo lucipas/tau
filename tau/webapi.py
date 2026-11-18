@@ -163,6 +163,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/schedule  schedule a channel message for later
+    GET  /api/channels/scheduled  queued channel messages, soonest first
+    POST /api/channels/cancel-scheduled  cancel a queued channel message
     POST /api/channels/sync  pull missing history (``{"channel": "<name>"}`` optional)
     GET  /api/pages       cached personal mesh pages, plus this node's own
     POST /api/pages/fetch fetch a peer's page over RNS (``{"peer": "<name or hash>"}``)
@@ -3901,6 +3904,81 @@ class WebBridge:
                 "public channels are not enabled; run serve --channels"
             )
         return app.send(channel, text, publish=True)
+
+    def channel_schedule(
+        self, channel: str, text: str, *, send_in: float
+    ) -> Dict[str, Any]:
+        """Queue a channel message for later, like ``tau channel send --delay``.
+
+        Scheduling needs no attached channel app — the queue file is
+        the same one the CLI writes, and the serving node publishes due
+        entries when it has an app.  Membership is checked up front so
+        a message for a channel never joined is refused here, not on
+        every publish pass.
+        """
+        from .channels import clean_channel_name, is_member
+        from .scheduled_channel import schedule_channel_message
+
+        name = clean_channel_name(channel)
+        conn = self._channel_conn()
+        try:
+            member = is_member(conn, name)
+        finally:
+            conn.close()
+        if not member:
+            raise ValueError(f"not a member of channel {name!r}; join it first")
+        config = self.node.config
+        entry = schedule_channel_message(
+            config.scheduled_channel_messages_path,
+            channel=name,
+            text=text,
+            publish_at=time.time() + float(send_in),
+            name=getattr(self.node, "name", None),
+        )
+        return entry.to_dict()
+
+    def channel_scheduled_messages(
+        self, channel: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Queued channel messages, soonest first (the CLI's ``channel scheduled``)."""
+        from .channels import clean_channel_name
+        from .scheduled_channel import load_scheduled_channel_messages
+
+        queue = load_scheduled_channel_messages(
+            self.node.config.scheduled_channel_messages_path
+        )
+        entries = queue.messages
+        if channel is not None:
+            name = clean_channel_name(channel)
+            entries = tuple(entry for entry in entries if entry.channel == name)
+        return [entry.to_dict() for entry in entries]
+
+    def channel_cancel_scheduled_message(self, prefix: str) -> Dict[str, Any]:
+        """Drop one queued channel message, like ``tau channel cancel-scheduled``.
+
+        When a publish attempt already stored the signed message locally,
+        the stored copy is removed too — dropping only the queue entry
+        would leave it in the local channel history.  Returns the
+        cancelled entry and whether a stored message was removed.
+        """
+        from .scheduled_channel import cancel_scheduled_channel_message
+
+        deleted_local = False
+
+        def _delete_stored(entry: Any) -> None:
+            nonlocal deleted_local
+            if entry.message_hash is None:
+                return
+            app = self._local_channel_app()
+            if app.delete_message(entry.message_hash):
+                deleted_local = True
+
+        entry = cancel_scheduled_channel_message(
+            self.node.config.scheduled_channel_messages_path,
+            prefix,
+            on_cancel=_delete_stored,
+        )
+        return {"cancelled": entry.to_dict(), "deleted_local": deleted_local}
 
     def channel_sync(
         self, channel: Optional[str] = None, *, limit: int = 20
@@ -10356,6 +10434,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path == "/api/channels/scheduled":
+                channel = query.get("channel", [None])[0]
+                try:
+                    scheduled = self.bridge.channel_scheduled_messages(channel)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to load scheduled channel messages")
+                    self._send_json(
+                        {"error": {"message": "could not load scheduled messages"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {"scheduled": scheduled, "count": len(scheduled)}, head_only
+                )
+                return
             if path == "/api/pages":
                 self._send_json(self.bridge.page_list(), head_only)
                 return
@@ -11817,6 +11914,73 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/schedule":
+                channel = body.get("channel")
+                text = body.get("text")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                send_in = body.get("send_in")
+                if (
+                    not isinstance(send_in, (int, float))
+                    or isinstance(send_in, bool)
+                    or not _valid_schedule_in(send_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'send_in' must be a number of "
+                                "seconds (0 < send_in <= 604800)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    scheduled = self.bridge.channel_schedule(
+                        channel, text, send_in=float(send_in)
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "scheduled": scheduled}, head_only)
+                return
+            if path == "/api/channels/cancel-scheduled":
+                target = body.get("id") or body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.channel_cancel_scheduled_message(
+                        target.strip()
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
                 return
             if path == "/api/channels/sync":
                 channel = body.get("channel")

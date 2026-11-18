@@ -9,6 +9,26 @@ let calls: string[] = [];
 
 beforeEach(() => {
   const router = mockFetch((url) => {
+    if (url.includes("/api/channels/scheduled")) {
+      return {
+        scheduled: [
+          {
+            id: "ab12cd34ef56ab78",
+            channel: "mesh-general",
+            text: "morning hello",
+            publish_at: Math.floor(Date.now() / 1000) + 300,
+            created_at: 1000,
+            to: [],
+            ttl: 3,
+            message_hash: null,
+            attempts: 0,
+            next_attempt_at: 0,
+            paused_at: 0,
+          },
+        ],
+        count: 1,
+      };
+    }
     if (url.includes("/api/channels/messages")) {
       return {
         channel: "mesh-general",
@@ -78,5 +98,33 @@ describe("ChannelsSection", () => {
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
+  });
+
+  it("shows scheduled messages for the selected channel with cancel", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByText("morning hello")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/channels/cancel-scheduled"),
+    );
+  });
+
+  it("schedules a message when Send later is picked", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    await screen.findByText("hello channel");
+    fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
+      target: { value: "later hello" },
+    });
+    fireEvent.change(screen.getByLabelText("Send later"), {
+      target: { value: "300" },
+    });
+    expect(screen.getByRole("button", { name: "Schedule" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Schedule" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/channels/schedule"),
+    );
   });
 });

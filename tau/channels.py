@@ -404,6 +404,23 @@ def get_message(conn: sqlite3.Connection, digest: str) -> Optional[Dict[str, Any
     return _row_to_message(row) if row is not None else None
 
 
+def delete_message(conn: sqlite3.Connection, digest: str) -> bool:
+    """Drop one stored message by hash; returns whether one was removed.
+
+    Local-only: peers that already received a copy keep theirs, the
+    same way a Tan delete leaves copies peers already hold.  Used
+    when a scheduled message is cancelled after a publish attempt
+    already stored its signed copy — dropping only the queue entry
+    would leave the message in the local channel history.
+    """
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM messages WHERE hash = ?",
+            (digest,),
+        )
+    return cursor.rowcount > 0
+
+
 def store_message(
     conn: sqlite3.Connection,
     mesg: Dict[str, Any],
@@ -794,6 +811,30 @@ class ChannelApp:
         conn = self.connect()
         try:
             return channel_history(conn, channel, limit=limit, before=before)
+        finally:
+            conn.close()
+
+    def get_message(self, message_hash: str) -> Optional[Dict[str, Any]]:
+        """Return a stored message by hash, or ``None``.
+
+        The scheduled-message publisher re-fetches the signed message
+        it created on an earlier pass, so a retry re-sends the same
+        message instead of signing a second copy for the same text.
+        """
+        conn = self.connect()
+        try:
+            return get_message(conn, message_hash)
+        finally:
+            conn.close()
+
+    def delete_message(self, message_hash: str) -> bool:
+        """Drop one stored message by hash; returns whether one was removed.
+
+        Local-only: peers that already received a copy keep theirs.
+        """
+        conn = self.connect()
+        try:
+            return delete_message(conn, message_hash)
         finally:
             conn.close()
 

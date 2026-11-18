@@ -5,17 +5,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  cancelScheduledChannelMessage,
   clearReaction,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
   getChannelMessages,
+  getChannelScheduled,
   getMessages,
   getTanThread,
   getTanTimeline,
   markRead,
   pageFileUrl,
   reactToMessage,
+  scheduleChannelMessage,
   sendMessage,
   tanMediaUrl,
   voteTanPoll,
@@ -94,6 +97,14 @@ describe("GET endpoints", () => {
     await getChannelMessages("my channel", 5);
     expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
   });
+
+  it("lists scheduled channel messages, optionally filtered", async () => {
+    nextJson = { scheduled: [], count: 0 };
+    await getChannelScheduled("my channel");
+    expect(captured[0].url).toBe("/api/channels/scheduled?channel=my%20channel");
+    await getChannelScheduled();
+    expect(captured[1].url).toBe("/api/channels/scheduled");
+  });
 });
 
 describe("POST endpoints", () => {
@@ -135,6 +146,22 @@ describe("POST endpoints", () => {
     await voteTanPoll("posthash", 2);
     expect(captured[0].url).toBe("/api/tan/vote");
     expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
+  });
+
+  it("schedules a channel message with send_in seconds", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleChannelMessage("general", "later", 300);
+    expect(captured[0].url).toBe("/api/channels/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ channel: "general", text: "later", send_in: 300 });
+  });
+
+  it("cancels a scheduled channel message by id", async () => {
+    nextJson = { ok: true };
+    await cancelScheduledChannelMessage("abc123");
+    expect(captured[0].url).toBe("/api/channels/cancel-scheduled");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: "abc123" });
   });
 
   it("marks read with an empty body when no conversation is given", async () => {

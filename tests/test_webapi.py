@@ -17908,3 +17908,132 @@ def test_other_endpoints_keep_the_json_body_cap(bridge):
     )
     assert status == 400
     assert "too large" in payload["error"]["message"]
+
+
+def test_channel_schedule_via_api(tmp_path):
+    from tau.channels import init_db as init_channel_db, join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+
+    # No channel app attached: scheduling writes the queue file, like the
+    # CLI, and the serving node publishes due entries later.
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={"channel": "general", "text": "hello later", "send_in": 3600},
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["channel"] == "general"
+        assert scheduled["text"] == "hello later"
+        assert abs(scheduled["publish_at"] - (time.time() + 3600)) < 5
+
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={"channel": "general", "text": "sooner", "send_in": 60},
+        )
+        assert status == 200
+
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert status == 200
+        assert payload["count"] == 2
+        # Soonest first: the 60-second message precedes the hour-out one.
+        assert [item["text"] for item in payload["scheduled"]] == [
+            "sooner",
+            "hello later",
+        ]
+
+        # The channel filter narrows the list.
+        status, _, payload = _json(bridge, "/api/channels/scheduled?channel=other")
+        assert status == 200
+        assert payload["count"] == 0
+
+        # Cancelling by id prefix drops only that entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/cancel-scheduled",
+            method="POST",
+            body={"id": scheduled["id"][:8]},
+        )
+        assert status == 200
+        assert payload["cancelled"]["id"] == scheduled["id"]
+        assert payload["deleted_local"] is False
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["text"] == "sooner"
+
+        # Cancelling an unknown id is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/cancel-scheduled",
+            method="POST",
+            body={"id": "zz" * 8},
+        )
+        assert status == 400
+        assert "no scheduled channel message" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_channel_schedule_rejects_bad_requests(tmp_path):
+    from tau.channels import init_db as init_channel_db, join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        for body, fragment in [
+            ({"channel": "general", "text": "  ", "send_in": 60}, "text"),
+            ({"channel": "general", "text": "hello"}, "send_in"),
+            ({"channel": "general", "text": "hello", "send_in": 0}, "send_in"),
+            ({"channel": "general", "text": "hello", "send_in": 604801}, "send_in"),
+            ({"channel": "  ", "text": "hello", "send_in": 60}, "channel"),
+            ({"text": "hello", "send_in": 60}, "channel"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/channels/schedule", method="POST", body=body
+            )
+            assert status == 400
+            assert fragment in payload["error"]["message"]
+
+        # A channel never joined is refused, not queued for a publish
+        # pass that would fail every attempt.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={"channel": "other", "text": "hello", "send_in": 60},
+        )
+        assert status == 400
+        assert "not a member of channel 'other'" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge, "/api/channels/cancel-scheduled", method="POST", body={}
+        )
+        assert status == 400
+        assert "id" in payload["error"]["message"]
+    finally:
+        bridge.stop()

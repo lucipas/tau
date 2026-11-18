@@ -39,6 +39,7 @@ import type {
   PeerInfo,
   PingResult,
   SafetyNumberResult,
+  ScheduledChannelMessage,
   ScheduledTanPost,
   SendResult,
   Snapshot,
@@ -956,6 +957,25 @@ export async function leaveChannel(channel: string): Promise<{ channel: string; 
 
 export async function sendChannelMessage(channel: string, text: string): Promise<ChannelMessage> {
   return post("/api/channels/send", { channel, text });
+}
+
+export async function getChannelScheduled(channel?: string): Promise<ScheduledChannelMessage[]> {
+  const data = await get<{ scheduled: ScheduledChannelMessage[]; count: number }>(
+    `/api/channels/scheduled${query({ channel })}`,
+  );
+  return data.scheduled;
+}
+
+export async function scheduleChannelMessage(
+  channel: string,
+  text: string,
+  sendIn: number,
+): Promise<ScheduledChannelMessage> {
+  return post("/api/channels/schedule", { channel, text, send_in: sendIn });
+}
+
+export async function cancelScheduledChannelMessage(id: string): Promise<unknown> {
+  return post("/api/channels/cancel-scheduled", { id });
 }
 
 /** Pull missing history for one channel, or every joined channel when omitted. */
