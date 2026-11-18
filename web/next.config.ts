@@ -1,11 +1,10 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // The Python bridge serves the exported files from web/out, so the console
-  // is same-origin in production and needs no Node server at runtime.
+  // Static export: the tau bridge serves web/out from the same origin.
   output: "export",
+  // No server components that need runtime data; keep the export portable.
   trailingSlash: true,
-  images: { unoptimized: true },
 };
 
 export default nextConfig;

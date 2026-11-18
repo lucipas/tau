@@ -1,386 +1,34 @@
-export type Direction = "in" | "out";
+// types.ts — TypeScript shapes for the tau web bridge (tau/webapi.py).
+//
+// Every type here is derived from the bridge's JSON: `WebBridge.snapshot`,
+// `Peer.local_dict`, `_clean_stored_message`, the Tan store annotations in
+// `tau/tangents/tan.py`, channel rows in `tau/channels.py`, page/profile
+// display views in `tau/pages.py` / `tau/profile.py`, and the mailbox entry
+// dicts in `tau/mailbox.py`. Timestamps are unix seconds (floats).
+// Fields the bridge only sometimes sends are optional; fields it never
+// documents are typed loosely (`unknown` / index signatures) rather than
+// guessed.
 
-export interface MessageReaction {
-  // Reactor's destination hash.
-  reactor: string;
-  // Reactor's display name at reaction time.
-  name: string;
-  // One emoji or short text token; never an image.
-  reaction: string;
+export interface ApiErrorBody {
+  error?: { message?: string; code?: string; queued?: number };
+  message?: string;
 }
 
-export interface GroupPollVoter {
-  // Voter's destination hash.
-  author: string;
-  // Voter's display name at vote time.
-  name: string;
-  // Index into the poll's options.
-  option: number;
-  // Unix time the vote was sent.
-  voted_at: number;
-}
+// ---------------------------------------------------------------- node ---
 
-export interface GroupPollTally {
-  // The poll's options, in order.
-  options: string[];
-  // Standing votes per option.
-  counts: number[];
-  // Total standing voters.
-  total: number;
-  // True once the poll's creator closed it.
-  closed: boolean;
-  // One record per standing vote, newest vote first.
-  voters: GroupPollVoter[];
-  // This node's standing vote, an option index, or null.
-  my_vote: number | null;
-}
-
-export interface TauMessage {
-  id: number;
-  direction: Direction;
-  peer: string | null;
-  peer_name: string;
-  text: string;
-  sent_at: number;
-  received_at: number;
-  status: string;
-  rtt_ms?: number;
-  // Unix time the recipient read this outbound message, when known.
-  read_at?: number;
-  // Unix time the message text was last edited, when it has been.
-  edited_at?: number;
-  // Outbox entry id, present while the message is queued for delivery.
-  mail_id?: string;
-  // Group DM context, present on group messages (inbound, and
-  // outbound legs recorded per member on a console group send).
-  group?: string;
-  group_name?: string;
-  // Sender-set expiry (epoch seconds). Absent when the message never
-  // expires; the console purges it once the deadline passes.
-  expires_at?: number;
-  // Scheduled send time (epoch seconds), set by `tau send --delay` or
-  // the console's send-later picker. Present only while the message is
-  // queued for a future send; the console shows "sends in …" until then.
-  send_after?: number;
-  // Reticulum wire id: how replies name this message, and how
-  // reactions are matched to it.
-  wire_id?: string;
-  // Latest reaction per reactor, oldest first.
-  reactions?: MessageReaction[];
-  // Pinned in the node inbox (`tau pin`): a local-only flag, never sent.
-  // Absent reads as unpinned, the same way an absent `reactions` reads
-  // as no reactions.
-  pinned?: boolean;
-  // Short hash of this message's text, for checking a reply's quoted
-  // excerpt against it; see resolveQuote in message-feed.tsx.
-  excerpt_hash?: string;
-  // Previous excerpt hashes, kept when the message is edited so
-  // replies that quoted it before the edit still resolve.
-  excerpt_hashes?: string[];
-  // Quoted message reference: wire id + short excerpt hash of the text
-  // the sender quoted. The quote is rendered from local history only;
-  // see resolveQuote in message-feed.tsx. A group reply may also carry
-  // the quoted message's logical reference — the group, its author's
-  // destination hash, and the send time every leg shares — so a member
-  // who holds a different leg id can still resolve it.
-  in_reply_to?:
-    | {
-        id: string;
-        excerpt: string | null;
-        group?: string;
-        author?: string;
-        sent_at?: number;
-      }
-    | null;
-  // File metadata, present on file entries: the name, size and
-  // SHA-256 of the file this message carried. Received files can be
-  // downloaded from GET /api/files/<sender>/<name>.
-  file?: { name: string; size: number; sha256: string };
-  // Static location pin, present on location messages: decimal
-  // degrees plus an optional place name. The feed renders it with
-  // an open-in-maps link; a live beacon is a later step.
-  location?: { lat: number; lon: number; name?: string };
-  // Group poll context, present on group poll entries: the question
-  // is the message text, `poll_options` the choices, and `poll` the
-  // tally derived from the group's stored votes. A vote or close
-  // entry carries only its marker (`poll_vote` / `poll_close`) and
-  // the feed hides it — the tally on the poll is the display.
-  poll_options?: string[];
-  poll?: GroupPollTally;
-  poll_vote?: {
-    target: { author: string; sent_at: number };
-    option: number;
-  };
-  poll_close?: { author: string; sent_at: number };
-}
-
-export interface TauGroupMember {
-  hash: string;
-  name: string;
-}
-
-export interface TauGroup {
-  id: string;
-  name: string;
-  members: TauGroupMember[];
-  created_at: number;
-  // Absent on snapshots from an older bridge; only groups this node
-  // created offer member changes in the console.
-  created_by_me?: boolean;
-  // False when the bridge will refuse a leave — a group this node
-  // created, under this identity or an earlier one — so the sidebar
-  // never offers a leave that always fails. Absent on snapshots from
-  // an older bridge, which the sidebar treats as leavable.
-  can_leave?: boolean;
-  // The group's topic, as set with `tau group topic` or from the
-  // console; empty when none is set. Absent on snapshots from an older
-  // bridge.
-  topic?: string;
-  // True when the group's messages are ignored (muted) locally.
-  // Absent on snapshots from an older bridge.
-  ignored?: boolean;
-}
-
-export interface GroupsResponse {
-  groups: TauGroup[];
-  count: number;
-}
-
-export interface CreateGroupResponse {
-  ok: boolean;
-  group: TauGroup;
-}
-
-export interface DeleteGroupResponse {
-  ok: boolean;
-  deleted: { id: string; name: string };
-}
-
-export interface ChangeGroupMembersResponse {
-  ok: boolean;
-  group: TauGroup;
-  previous_id: string;
-}
-
-export interface RenameGroupResponse {
-  ok: boolean;
-  group: TauGroup;
-  previous_id: string;
-}
-
-export interface SetGroupTopicResponse {
-  ok: boolean;
-  group: TauGroup;
-}
-
-export interface LeftGroup {
-  id: string;
-  left_at: number;
-}
-
-export interface IgnoredGroupEntry {
-  id: string;
-  // Empty when the group record is gone and only the ignored id
-  // survives.
-  name: string;
-}
-
-export interface LeftGroupsResponse {
-  left: LeftGroup[];
-  ignored: IgnoredGroupEntry[];
-}
-
-export interface LeaveGroupResponse {
-  ok: boolean;
-  id: string;
-  name: string;
-  also_left?: string[];
-}
-
-export interface RejoinGroupResponse {
-  ok: boolean;
-  rejoined: string;
-}
-
-export interface IgnoreGroupResponse {
-  ok: boolean;
-  group: string;
-  name: string;
-  ignored: boolean;
-  changed: boolean;
-}
-
-export interface UnignoreGroupResponse {
-  ok: boolean;
-  group: string;
-  name: string;
-  ignored: boolean;
-  changed: boolean;
-}
-
-export interface PeerProfile {
-  author: string;
-  name: string;
-  bio: string;
-  avatar: string | null;
-  links: string[];
-  version: number;
-  created_at: number;
-}
-
-export interface Peer {
-  destination: string;
-  name: string;
-  last_seen: number;
-  age: number;
-  hops: number;
-  protocol: number;
-  // The peer's signed public profile (display name, bio, avatar
-  // hash, links), when one has been fetched — null otherwise.
-  profile?: PeerProfile | null;
-  // Local-only label for this peer, set with `tau peers alias` or from
-  // the console. Never sent to peers.
-  alias?: string | null;
-  // Private note about this peer, set with `tau peers note` or from
-  // the console. Never sent to peers — and only ever served to a
-  // loopback console, never to a remote one.
-  note?: string | null;
-  // LXMF delivery destination hash, derived from the peer's public key.
-  lxmf?: string | null;
-  // Local trust state, shown only to this node's owner (never sent to peers).
-  verified?: boolean;
-  verified_at?: number | null;
-  key_change_at?: number | null;
-  // Display name of the verified peer or saved contact this unverified
-  // peer may be impersonating (same announced name), or null.
-  lookalike_of?: string | null;
-  // When a verified peer last changed its announced name, with the name
-  // it carried before the change — a rename warning until re-verified.
-  name_change_at?: number | null;
-  previous_name?: string | null;
-  // True when the peer is on this node's block-list: their DMs are
-  // dropped and their Tan posts hidden.
-  blocked?: boolean;
-  // Live reachability from the serving node's Reticulum path table
-  // (see GET /api/mesh): true when a path is known right now, with
-  // the current hop count. Absent when the console predates the
-  // mesh endpoint or the snapshot failed — then the row falls back
-  // to the registry's announce-time hop count with no dot.
-  reachable?: boolean;
-  live_hops?: number | null;
-}
-
-export interface BlockPeerResult {
-  peer: { destination: string; name: string };
-  blocked: boolean;
-  changed: boolean;
-}
-
-export interface BlockPeerResponse {
-  ok: boolean;
-  block: BlockPeerResult;
-}
-
-export interface ArchivedConversation {
-  destination: string;
-  name: string;
-  messages: number;
-}
-
-export interface ArchivedConversationsResponse {
-  archived: ArchivedConversation[];
-  count: number;
-}
-
-export interface ArchiveConversationResult {
-  destination: string;
-  name: string;
-  archived: boolean;
-  changed: boolean;
-}
-
-export interface ArchiveConversationResponse {
-  ok: boolean;
-  archive: ArchiveConversationResult;
-}
-
-// Per-conversation disappearing-message defaults: peer destination
-// hashes and group ids, each mapped to its default lifetime in seconds.
-export interface DisappearingDefaults {
-  peers: Record<string, number>;
-  groups: Record<string, number>;
-}
-
-export interface DisappearingDefaultsResponse {
-  peers: Record<string, number>;
-  groups: Record<string, number>;
-}
-
-export interface DisappearingResult {
-  target: string;
-  group: boolean;
-  disappearing_seconds: number | null;
-  changed: boolean;
-}
-
-export interface DisappearingResponse {
-  ok: boolean;
-  disappearing: DisappearingResult;
-}
-
-// Muted conversations: peer destination hashes and group ids, each
-// listed once. A muted conversation still lists its messages, but
-// never counts as unread.
-export interface MutedConversations {
-  peers: string[];
-  groups: string[];
-}
-
-export interface MutedConversationsResponse {
-  peers: string[];
-  groups: string[];
-}
-
-export interface MuteResult {
-  target: string;
-  group: boolean;
-  muted: boolean;
-  changed: boolean;
-  // The unread counts after the change, when it changed anything.
-  unread?: UnreadCounts | null;
-}
-
-export interface MuteResponse {
-  ok: boolean;
-  mute: MuteResult;
-}
-
-export interface InterfaceInfo {
+export interface NodeInterface {
   name: string;
   online: boolean;
 }
 
-// Mailbox counters from TauNode.info(): what the store-and-forward
-// layer is holding for this node and for other peers.
 export interface MailboxCounts {
   outbox: number;
   held: number;
   seen: number;
   sent: number;
   receipts: number;
-}
-
-// LXMF store-and-forward state from TauNode.info().
-export interface LxmfInfo {
-  enabled: boolean;
-  delivery: string | null;
-}
-
-// Tan store state from the snapshot: whether Tan is enabled and how
-// many posts this node has cached locally.
-export interface SocialInfo {
-  enabled: boolean;
-  posts: number;
+  retracted: number;
+  sent_retracted: number;
 }
 
 export interface NodeInfo {
@@ -391,95 +39,99 @@ export interface NodeInfo {
   rns_version: string;
   uptime: number;
   peers: number;
-  interfaces: InterfaceInfo[];
-  // Absent on snapshots from an older bridge; the panel hides the
-  // store rows instead of guessing.
-  mailbox?: MailboxCounts;
-  lxmf?: LxmfInfo;
+  mailbox: MailboxCounts;
+  interfaces: NodeInterface[];
+  lxmf: { enabled: boolean; delivery: string | null; propagation: string | null };
 }
 
-export interface Counts {
+export interface SnapshotCounts {
   messages: number;
   peers: number;
 }
 
-// Per-conversation unread counts from the node inbox: how many
-// received DMs sit after each sender's read cursor, and how many
-// received group posts sit after each group's read cursor. Read state
-// is local to the node; the console only displays and clears it.
 export interface UnreadCounts {
   per_peer: Record<string, number>;
   per_group: Record<string, number>;
   total: number;
-  // Stamped by the node; a count with an older revision than one
-  // already applied is stale and is ignored.
-  revision?: number;
-}
-
-// Mail whose unread count a change restored, not new arrivals: an
-// unmute or unignore in another console restores mail that arrived
-// while the conversation was hidden. `target` is the bare peer hash
-// or group id the console holds its badges under, and `unread` is
-// the restored count for that conversation. A console with the
-// conversation open holds that count instead of auto-reading it.
-export interface RestoredUnread {
-  target: string;
-  unread: number;
-}
-
-export interface MarkReadResponse {
-  ok: boolean;
-  unread: UnreadCounts;
-}
-
-export interface MarkUnreadResponse {
-  ok: boolean;
-  unread: UnreadCounts;
-}
-
-export interface BridgeInfo {
-  version: string;
-  web: boolean;
-  url: string;
-  // True when this console may read and write private peer notes
-  // (loopback clients only). Absent on snapshots from an older bridge.
-  notes_editable?: boolean;
+  revision: number;
 }
 
 export interface Snapshot {
   node: NodeInfo;
   peers: Peer[];
-  groups: TauGroup[];
-  messages: TauMessage[];
-  counts: Counts;
+  groups: Group[];
+  messages: ChatMessage[];
+  counts: SnapshotCounts;
   unread: UnreadCounts;
-  bridge: BridgeInfo;
-  // Absent on snapshots from an older bridge.
-  social?: SocialInfo;
+  bridge: {
+    version: string;
+    web: boolean;
+    url: string;
+    notes_editable: boolean;
+  };
+  social: { enabled: boolean; posts: number };
 }
 
-export interface PeersResponse {
-  peers: Peer[];
-  count: number;
-}
+// ---------------------------------------------------------------- peers --
 
-export interface ForgetPeerResponse {
-  ok: boolean;
-  peer: Peer;
-}
-
-export interface PingResult {
-  ok: boolean;
-  peer: Peer;
-  server?: string;
-  rtt_ms: number | null;
-}
-
-export interface RenameResponse {
-  ok: boolean;
+export interface PeerProfile {
+  author: string;
   name: string;
-  previous_name: string;
-  changed: boolean;
+  bio: string;
+  avatar: string;
+  links: string[];
+  version: number;
+  created_at: number;
+}
+
+export interface Peer {
+  /** 32-char lowercase hex destination hash. */
+  destination: string;
+  name: string;
+  last_seen: number;
+  /** Seconds since the peer was last seen, rounded to 0.1. */
+  age: number;
+  hops: number | null;
+  protocol: number | null;
+  /** LXMF delivery hash, or null. */
+  lxmf: string | null;
+  /** Owner-only local alias ("" when none). */
+  alias: string;
+  /** Private note; only present for loopback clients. */
+  note?: string;
+  verified: boolean;
+  verified_at: number | null;
+  key_change_at: number | null;
+  name_change_at: number | null;
+  previous_name: string | null;
+  /** Display name of the verified peer / saved contact this unverified
+   *  peer may be impersonating, or null. Added by the bridge. */
+  lookalike_of: string | null;
+  blocked: boolean;
+  profile: PeerProfile | null;
+  /** Live path-table reachability (from /api/mesh, merged into /api/peers). */
+  reachable?: boolean;
+  live_hops?: number | null;
+}
+
+export interface MeshRow {
+  destination: string;
+  name: string;
+  hops: number | null;
+  has_path: boolean;
+  reachable: boolean;
+  last_seen: number;
+  verified: boolean;
+}
+
+export interface HeardRow {
+  /** Shape is whatever the node's foreign-announce record carries:
+   *  destination hash, name and last-seen at minimum. Kept loose —
+   *  the bridge returns the stored records verbatim. */
+  destination?: string;
+  name?: string;
+  last_seen?: number;
+  [key: string]: unknown;
 }
 
 export interface PeerInfo {
@@ -492,104 +144,232 @@ export interface PeerInfo {
   lxmf_enabled?: boolean;
 }
 
-export interface PeerInfoResult {
+export interface PingResult {
+  /** Shape returned by WebBridge.ping. */
   ok: boolean;
-  peer: Peer;
-  info: PeerInfo;
+  /** Peer's public_dict (destination, name, last_seen, age, hops...). */
+  peer: {
+    destination: string;
+    name: string;
+    last_seen: number;
+    age: number;
+    hops: number | null;
+    protocol: number | null;
+    lxmf: string | null;
+  };
+  server?: unknown;
+  rtt_ms: number | null;
 }
 
 export interface SafetyNumberResult {
   peer: string;
   name: string;
-  // Pairwise safety number: compare it with the peer over another
-  // channel; showing it records nothing.
   safety_number: string;
 }
 
-export interface SafetyNumberResponse {
-  ok: boolean;
-  safety_number: SafetyNumberResult;
-}
-
-export interface PeerVerifyResult {
+export interface VerifyResult {
   peer: string;
   name: string;
-  // Pairwise safety number: compare it with the peer over another
-  // channel; if it matches, the recorded key is theirs.
   safety_number: string;
   verified_at: number | null;
   reverified: boolean;
   fingerprint_changed: boolean;
 }
 
-export interface VerifyPeerResponse {
-  ok: boolean;
-  verify: PeerVerifyResult;
+export interface BlockResult {
+  peer: { destination: string; name: string };
+  blocked: boolean;
+  changed: boolean;
 }
 
-export interface VerifyState {
-  pending?: boolean;
-  // Number shown for comparison; present before the owner confirms
-  // it matches. Nothing is recorded while only this is set.
-  safetyNumber?: string;
-  result?: PeerVerifyResult;
-  error?: string;
+export interface ArchiveResult {
+  destination: string;
+  name: string;
+  archived: boolean;
+  changed: boolean;
 }
 
-export interface SendResponse {
-  ok: boolean;
-  // Null when the send went out but was retracted before the console
-  // record landed: the send succeeded, there is just no record to show.
-  message: TauMessage | null;
-  response: Record<string, unknown>;
+// --------------------------------------------------------------- groups --
+
+export interface GroupMember {
+  hash: string;
+  name: string;
 }
 
-// POST /api/react: the reaction token echoed back, or cleared when the
-// caller retracted their reaction. `id` is the reaction's wire id.
-export interface ReactResponse {
-  ok: boolean;
-  target: string;
+export interface Group {
+  id: string;
+  name: string;
+  members: GroupMember[];
+  created_at: number;
+  topic: string;
+  created_by_me: boolean;
+  can_leave: boolean;
+  ignored: boolean;
+}
+
+export interface GroupChangeResult {
+  group: Group;
+  previous_id: string;
+}
+
+export interface LeftGroup {
+  id: string;
+  left_at?: number;
+  [key: string]: unknown;
+}
+
+export interface LeftGroups {
+  left: LeftGroup[];
+  ignored: { id: string; name: string }[];
+}
+
+export interface JoinRequest {
+  group: string;
+  peer: string;
+  peer_name: string;
+  group_id: string;
+  created_at?: number;
+  [key: string]: unknown;
+}
+
+export interface GroupPollTally {
+  options: string[];
+  counts: number[];
+  total: number;
+  closed: boolean;
+  voters: { author: string; name: string; option: number; voted_at: number }[];
+  my_vote: number | null;
+}
+
+// ------------------------------------------------------------- messages --
+
+export interface MessageReaction {
+  reactor: string;
+  name: string;
   reaction: string;
-  cleared: boolean;
-  id: string | null;
 }
 
-// One typing event, as it arrives on the live stream.
-export interface TypingEvent {
-  conversation: string;
-  peer: string;
+export interface StoredFile {
   name: string;
-  state: "start" | "stop";
-  group: string | null;
+  size: number;
+  sha256: string;
+}
+
+export interface ReplyRef {
+  /** Wire id of the quoted message. */
+  wire_id?: string;
+  /** Console message id of the quoted message, when resolvable. */
+  id?: number;
+  excerpt?: string;
+  excerpt_hash?: string;
+  peer_name?: string;
+  [key: string]: unknown;
+}
+
+export interface LocationPin {
+  latitude: number;
+  longitude: number;
+  label?: string;
+  [key: string]: unknown;
+}
+
+export interface LiveBeacon {
+  latitude: number;
+  longitude: number;
+  expires_at?: number;
+  [key: string]: unknown;
+}
+
+export interface GroupPollVote {
+  poll: string;
+  option: number;
+  [key: string]: unknown;
+}
+
+export interface GroupPollClose {
+  poll: string;
+  [key: string]: unknown;
+}
+
+export type MessageStatus =
+  | "queued"
+  | "sent"
+  | "delivered"
+  | "read"
+  | "failed"
+  | string;
+
+export interface ChatMessage {
+  id: number;
+  direction: "in" | "out";
+  /** Destination hash of the other side (null for some system entries). */
+  peer: string | null;
+  peer_name: string;
+  text: string;
+  sent_at: number;
   received_at: number;
+  status: MessageStatus;
+  expires_at?: number;
+  /** Unix time the message is scheduled to send (still queued). */
+  send_after?: number;
+  rtt_ms?: number;
+  read_at?: number;
+  edited_at?: number;
+  mail_id?: string;
+  group?: string;
+  group_name?: string;
+  wire_id?: string;
+  delivered_via?: "direct" | "lxmf";
+  reactions: MessageReaction[];
+  in_reply_to?: ReplyRef;
+  location?: LocationPin;
+  beacon?: LiveBeacon;
+  /** Group poll question carried on the message itself. */
+  poll_options?: string[];
+  poll_vote?: GroupPollVote;
+  poll_close?: GroupPollClose;
+  /** Group poll tally, attached by the bridge from the node inbox. */
+  poll?: GroupPollTally;
+  file?: StoredFile;
+  excerpt_hash?: string;
+  excerpt_hashes?: string[];
+  /** True when the node inbox has this message pinned. */
+  pinned?: boolean;
 }
 
-// One peer currently typing in a conversation, as the console holds it.
-export interface TypingEntry {
-  peer: string;
+export interface SendResult {
+  ok: boolean;
+  message: ChatMessage;
+  /** Node send response (delivery/queue detail); shape varies by transport. */
+  response: Record<string, unknown>;
+}
+
+export interface DmRequest {
+  id: string;
+  sender: string;
+  sender_name: string;
+  text?: string;
+  received_at?: number;
+  [key: string]: unknown;
+}
+
+export interface DisappearingDefaults {
+  peers: Record<string, number>;
+  groups: Record<string, number>;
+}
+
+export interface MutedConversations {
+  peers: string[];
+  groups: string[];
+}
+
+// --------------------------------------------------------------- outbox --
+
+export interface OutboxGroup {
+  id: string;
   name: string;
-  receivedAt: number;
-}
-
-export interface SendGroupResponse {
-  ok: boolean;
-  messages: TauMessage[];
-  response: Record<string, unknown>;
-}
-
-export interface SendFileResponse {
-  ok: boolean;
-  // Null when the file send went out but was retracted before the
-  // console record landed: the transfer succeeded, there is just no
-  // record to show.
-  message: TauMessage | null;
-  response: Record<string, unknown>;
-}
-
-export interface SendGroupFileResponse {
-  ok: boolean;
-  messages: TauMessage[];
-  response: Record<string, unknown>;
+  creator: string;
+  members: string[];
 }
 
 export interface OutboxEntry {
@@ -597,134 +377,43 @@ export interface OutboxEntry {
   to: string;
   to_name: string;
   text: string;
+  kind: string;
   created_at: number;
   expires_at: number;
   attempts: number;
   last_attempt_at: number | null;
   last_error: string | null;
-  held_by: string[];
-  // Scheduled send time (epoch seconds), or null for a message queued
-  // because the peer is offline rather than scheduled for later.
+  next_attempt_at: number | null;
+  /** Held-by map (peer hash -> count) in the mailbox dict; the bridge
+   *  re-sorts it into a list for the console. */
+  held_by: string[] | Record<string, number>;
+  message_expires_at: number | null;
   send_after: number | null;
+  sent_at: number | null;
+  edited_at: number | null;
+  group?: OutboxGroup;
+  read_at?: number | null;
 }
 
-export interface OutboxResponse {
+export interface Outbox {
   outbox: OutboxEntry[];
   count: number;
   held_for_others: number;
 }
 
-export interface CancelOutboxResponse {
-  ok: boolean;
-  cancelled: OutboxEntry;
-}
-
-export interface NodeSettings {
-  accept_files: boolean;
-  send_read_receipts: boolean;
-}
-
-export interface UpdateSettingsResponse {
-  ok: boolean;
-  settings: NodeSettings;
-}
-
-export interface DoctorCheck {
-  name: string;
-  status: "ok" | "warn" | "fail";
-  detail: string;
-}
-
-export interface DoctorResponse {
-  ok: boolean;
-  checks: DoctorCheck[];
-}
-
-export interface DeleteMessageResponse {
-  ok: boolean;
-  deleted: { id: number; wire_id?: string | null };
-}
-
-export interface EditMessageResponse {
-  ok: boolean;
-  // Whether the peer applied the edit; false (peer had no copy, or a
-  // newer edit already landed) is not an error, and the local copy is
-  // left alone in that case.
-  edited: boolean;
-  // The updated console entry, when it is in this console's history.
-  message?: TauMessage | null;
-  // Every updated leg of a group edit: one entry per leg, so the
-  // whole group send swaps in at once. A DM edit carries only
-  // `message`, so this is absent there.
-  messages?: TauMessage[];
-  // The edit's own wire id, when the peer answered one.
-  id?: string | null;
-}
-
-export interface RetractMessageResponse {
-  ok: boolean;
-  retracted: { id: number; wire_id?: string | null };
-  // Every console id removed by a group retract: one per leg. A DM
-  // retract removes only `retracted.id`, so this is absent there.
-  retracted_ids?: number[];
-  // Whether the peer had a copy to delete; false is not an error.
-  // For a group retract, whether every member the retract reached
-  // deleted their copy.
-  deleted: boolean;
-  // The retract's own wire id, when the peer answered one.
-  id?: string | null;
-  // Per-member results of a group retract, as the node reports them.
-  results?: GroupMemberResult[];
-  // Queued legs the group retract cancelled, by outbox id.
-  cancelled_queued?: string[];
-  // The group a group retract fanned out to.
-  group?: string;
-}
-
-// One leg of a group fan-out, as the node reports it.
-export interface GroupMemberResult {
+export interface HeldEnvelope {
+  id: string;
   to: string;
-  to_name?: string;
-  delivered?: boolean;
-  deleted?: boolean;
-  queued?: boolean;
-  ok?: boolean;
-  error?: string;
-  id?: string | null;
-  rtt?: number | null;
+  to_name: string;
+  from: string;
+  from_name: string;
+  stored_at: number;
+  expires_at: number;
+  blob_bytes: number;
+  note?: string;
 }
 
-// POST /api/messages/forward: the forwarded copy, as recorded by the
-// bridge's send path, plus the node's send response. The copy is null
-// when it was retracted before the console record landed.
-export interface ForwardMessageResponse {
-  ok: boolean;
-  message: TauMessage | null;
-  response: Record<string, unknown>;
-}
-
-export interface ForwardGroupMessageResponse {
-  ok: boolean;
-  // One outbound entry per member, like a group send.
-  messages: TauMessage[];
-  response: Record<string, unknown>;
-}
-
-// POST /api/messages/pin: the pinned console id and wire id, plus
-// whether the pin already existed (a re-pin is a no-op, not an error).
-export interface PinMessageResponse {
-  ok: boolean;
-  pinned: { id: number; wire_id: string; already_pinned: boolean };
-}
-
-// POST /api/messages/unpin: the unpinned console id and wire id, plus
-// whether a pin was actually removed.
-export interface UnpinMessageResponse {
-  ok: boolean;
-  unpinned: { id: number; wire_id: string; was_pinned: boolean };
-}
-
-export interface RetryOutboxResponse {
+export interface OutboxRetryResult {
   ok: boolean;
   delivered: number;
   deposited: number;
@@ -736,246 +425,112 @@ export interface RetryOutboxResponse {
   target_still_queued?: boolean;
 }
 
-export interface HeldMailEntry {
-  id: string;
-  to: string;
-  to_name: string;
-  from: string;
-  from_name: string;
-  stored_at: number;
-  expires_at: number;
-  blob_bytes: number;
+// ------------------------------------------------------------- settings --
+
+export interface NodeSettings {
+  accept_files: boolean;
+  send_read_receipts: boolean;
 }
 
-export interface HeldMailResponse {
-  held: HeldMailEntry[];
-  count: number;
-}
-
-export interface DropHeldResponse {
-  ok: boolean;
-  dropped: HeldMailEntry & { note: string };
-}
-
-// A DM held for review from a peer outside the allow-list, as
-// `GET /api/messages/requests` returns it.
-export interface DmRequestEntry {
-  id: string;
-  sender: string;
-  sender_name: string;
-  text: string;
-  kind: string;
-  sent_at: number;
-  received_at: number;
-  request_expires_at: number;
-  expires_at?: number;
-  in_reply_to?: { id: string; excerpt?: string } | null;
-  // Static location pin the held message carried, like the quote
-  // above: rendered with the message once the request is accepted.
-  location?: { lat: number; lon: number; name?: string };
-}
-
-export interface DmRequestsResponse {
-  requests: DmRequestEntry[];
-  count: number;
-}
-
-export interface AcceptDmRequestResponse {
-  accepted: DmRequestEntry;
-  delivered: boolean;
-  allowlisted: boolean;
-  skipped: string | null;
-  unread?: UnreadCounts;
-}
-
-export interface DeclineDmRequestResponse {
-  declined: DmRequestEntry;
-  blocked: boolean;
-}
-
-// A pending group join request, as `GET /api/groups/join-requests`
-// returns it: the group by name (the stable handle across roster
-// changes), the requester's hash and display name, and the time the
-// request arrived.
-export interface JoinRequestEntry {
-  group: string;
-  group_id: string;
-  peer: string;
-  peer_name: string;
-  requested_at: number;
-  expires_at: number;
-}
-
-export interface JoinRequestsResponse {
-  requests: JoinRequestEntry[];
-  count: number;
-}
-
-export interface DecideJoinRequestResponse {
-  ok: boolean;
-  status: string;
-  group: {
-    id: string;
-    name: string;
-    members: string[];
-    creator: string;
-  };
-}
-
-export interface AllowlistEntry {
-  destination: string;
-  name: string;
-}
-
-export interface AllowlistResponse {
+export interface AllowList {
   enabled: boolean;
-  entries: AllowlistEntry[];
+  entries: { destination: string; name: string }[];
 }
 
-export interface ApiErrorBody {
-  // A refusal the console can act on carries a machine-readable code
-  // (e.g. "queued_mail" from /api/peers/forget, with the queued count).
-  error?: { message?: string; code?: string; queued?: number };
-}
-
-// Sneakernet bundle: a signed JSON file carrying sealed mail (and
-// optionally Tan posts) between nodes with no live path between them.
-export interface BundleSkipped {
-  id: string;
-  reason: string;
-}
-
-export interface BundleSummary {
-  mail: number;
-  tan: number;
-  skipped: BundleSkipped[];
-  bytes: number;
-}
-
-export interface BundleExportResponse {
-  ok: boolean;
-  // The server's serialised bundle text, verbatim: the bundle is
-  // signed, so the console downloads this string as-is instead of
-  // parsing and re-stringifying it (a client round trip can rewrite
-  // a number the signature covers, e.g. 1700000000.0 to 1700000000).
-  bundle: string;
-  summary: BundleSummary;
-}
-
-export interface BundleImportError {
-  id: string;
-  error: string;
-}
-
-// Tan import errors name the post by its hash, not a mail id.
-export interface BundleTanError {
-  hash: string;
-  error: string;
-}
-
-export interface BundleTanReport {
-  imported: number;
-  present: number;
-  skipped: number;
-  errors: BundleTanError[];
-}
-
-export interface BundleImportReport {
-  imported: number;
-  present: number;
-  skipped: number;
-  tan: BundleTanReport | null;
-  errors: BundleImportError[];
-}
-
-export interface BundleImportResponse {
-  ok: boolean;
-  import: BundleImportReport;
-}
-
-
-export interface TanReplyParent {
-  hash: string;
-  author: string;
+export interface DoctorCheck {
   name: string;
-  text: string;
-  deleted: boolean;
-  // True when the parent is from a blocked author: its text is blanked.
-  blocked?: boolean;
-  muted?: boolean;
+  ok?: boolean;
+  status?: string;
+  message?: string;
+  detail?: string;
+  [key: string]: unknown;
 }
 
-export interface TanPoll {
-  // Option texts in poll order.
+export interface DoctorReport {
+  ok: boolean;
+  checks: DoctorCheck[];
+}
+
+// ------------------------------------------------------------------ Tan --
+
+export type TanKind =
+  | "post"
+  | "reply"
+  | "like"
+  | "unlike"
+  | "repost"
+  | "quote"
+  | "poll"
+  | "vote"
+  | "delete"
+  | "edit"
+  | string;
+
+export interface TanPollTally {
   options: string[];
-  // Vote count per option, in option order.
   counts: number[];
-  // Total number of standing votes.
   total: number;
-  // Index of the viewer's own standing vote, or null when they have
-  // not voted.
+  closed: boolean;
+  /** Index of the viewer's own standing vote, or null. */
   voted: number | null;
 }
 
 export interface TanImage {
   sha256: string;
-  size: number;
-  mime: string;
+  size?: number;
+  mime?: string;
+  [key: string]: unknown;
+}
+
+export interface TanParentSummary {
+  hash: string;
+  author: string;
   name: string;
+  text: string;
+  deleted?: boolean;
+  expired?: boolean;
+  muted?: boolean;
+  hidden?: boolean;
+  [key: string]: unknown;
 }
 
 export interface TanPost {
   v: number;
+  /** 64-char hex sha256 — the post's id. */
+  hash: string;
   author: string;
+  /** Author's destination hash (same as `author`). */
   key: string;
   name: string;
   text: string;
   created_at: number;
   prev: string;
-  hash: string;
   sig: string;
-  kind?: string;
-  target?: string;
-  // Image attachment, signed with the post: hash, size, mime and
-  // name only — the bytes are fetched on demand, never gossiped.
-  image?: TanImage;
-  reply_to?: TanReplyParent | null;
-  repost_of?: TanReplyParent | null;
-  quoted?: TanReplyParent | null;
-  likes?: number;
-  liked?: boolean;
-  reposts?: number;
-  reposted?: boolean;
-  quotes?: number;
-  own?: boolean;
-  // Poll tally, attached to poll entries by the server; absent on
-  // non-poll posts and on views that do not annotate polls.
-  poll?: TanPoll;
+  kind: TanKind;
+  /** Hash of the post this entry targets (reply parent / quote original /
+   *  poll / liked post), "" when none. */
+  target: string;
+  expires_at: number | null;
+  options?: string[];
+  image?: TanImage | null;
+  // --- annotations added by the bridge (tau/tangents/tan.py) ---
+  likes: number;
+  liked: boolean;
+  own: boolean;
+  /** Standing quote count. */
+  quotes: number;
+  /** Reply count (when annotated). */
+  replies?: number;
+  /** This post's own text is a reply: parent summary, or null. */
+  reply_to?: TanParentSummary | null;
+  /** This post quotes another: the quoted original, or null. */
+  quoted?: TanParentSummary | null;
+  poll?: TanPollTally;
   saved?: boolean;
-  saved_at?: number;
   pinned?: boolean;
-  pinned_at?: number;
-  deleted?: boolean;
-  // Epoch seconds after which the post disappears from display
-  // surfaces; absent when the post never expires.
-  expires_at?: number;
-  // Thread entries carry their depth (the root is 0); timeline entries
-  // have no depth.
-  depth?: number;
-}
-
-export interface TanFollow {
-  author: string;
-  name: string;
-  added_at: number;
-  posts?: number;
-  seq?: number;
-  last_post?: number;
-}
-
-export interface MessagesSearchResponse {
-  messages: TauMessage[];
-  count: number;
+  /** Repost wrapper: the reposted original, when the entry is a repost. */
+  reposted?: TanPost | null;
+  [key: string]: unknown;
 }
 
 export interface TanTag {
@@ -983,66 +538,14 @@ export interface TanTag {
   count: number;
 }
 
-export interface TanTagsResponse {
-  tags: TanTag[];
-  count: number;
-}
-
-export interface TanTimelineResponse {
-  posts: TanPost[];
-  count: number;
-}
-
-export interface TanSavedResponse {
-  posts: TanPost[];
-  count: number;
-  next_offset: number | null;
-}
-
-export interface TanHiddenResponse {
-  posts: TanPost[];
-  count: number;
-  next_offset: number | null;
-}
-
-export interface TanPinnedResponse {
-  posts: TanPost[];
-  count: number;
-  next_offset: number | null;
-}
-
-export interface TanFollowingResponse {
-  following: TanFollow[];
-  count: number;
-}
-
 export interface TanAuthor {
   author: string;
   name: string;
   posts: number;
-  last_post: number;
-  followed: boolean;
-}
-
-export interface TanAuthorsResponse {
-  authors: TanAuthor[];
-  count: number;
-  // How many authors the directory holds behind the returned page.
-  total: number;
-}
-
-export interface TanSuggestion {
-  author: string;
-  name: string;
-  posts: number;
-  likes: number;
-  reason: string;
-  last_post: number;
-}
-
-export interface TanSuggestResponse {
-  suggestions: TanSuggestion[];
-  count: number;
+  followers?: number;
+  following?: boolean;
+  last_post_at?: number;
+  [key: string]: unknown;
 }
 
 export interface TanLiker {
@@ -1051,24 +554,10 @@ export interface TanLiker {
   liked_at: number;
 }
 
-export interface TanLikesResponse {
-  target: string;
-  likers: TanLiker[];
-  count: number;
-  total: number;
-}
-
 export interface TanReposter {
   author: string;
   name: string;
   reposted_at: number;
-}
-
-export interface TanRepostersResponse {
-  target: string;
-  reposters: TanReposter[];
-  count: number;
-  total: number;
 }
 
 export interface TanQuoter {
@@ -1079,85 +568,17 @@ export interface TanQuoter {
   quoted_at: number;
 }
 
-export interface TanQuotesResponse {
+export interface TanReactors {
   target: string;
-  quoters: TanQuoter[];
+  likers?: TanLiker[];
+  reposters?: TanReposter[];
+  quoters?: TanQuoter[];
   count: number;
   total: number;
+  deleted?: boolean;
 }
 
-export interface TanMutedAuthor {
-  author: string;
-  name: string;
-  muted_at: number;
-  posts?: number;
-  seq?: number;
-  last_post?: number;
-}
-
-export interface TanMutedKeyword {
-  keyword: string;
-  display: string;
-  added_at: number;
-}
-
-export interface TanMutedResponse {
-  muted: TanMutedAuthor[];
-  count: number;
-}
-
-export interface TanMutedKeywordsResponse {
-  muted_keywords: TanMutedKeyword[];
-  count: number;
-}
-
-export interface TanFollowedTag {
-  tag: string;
-  display: string;
-  added_at: number;
-}
-
-export interface TanFollowedTagsResponse {
-  followed_tags: TanFollowedTag[];
-  count: number;
-}
-
-export interface TanMutedTag {
-  tag: string;
-  display: string;
-  added_at: number;
-}
-
-export interface TanMutedTagsResponse {
-  muted_tags: TanMutedTag[];
-  count: number;
-}
-
-export interface TanPostResponse {
-  ok: boolean;
-  post: TanPost;
-}
-
-// The response to creating a poll: the same shape as a post response,
-// but the created entry rides under `poll`, matching the API.
-export interface TanPollResponse {
-  ok: boolean;
-  poll: TanPost;
-}
-
-// The response to sharing a Tan post with a peer or a group: the sent
-// copy (peer) or one entry per leg (group), plus the node's send
-// response — mirroring the forward endpoint's shape.
-export interface TanShareResponse {
-  ok: boolean;
-  message?: TauMessage | null;
-  messages?: TauMessage[];
-  response: Record<string, unknown>;
-}
-
-// One queued Tan post, waiting for its publish time — the shape of
-// `tau.scheduled_posts.ScheduledPost.to_dict()`.
-export interface TanScheduledPost {
+export interface ScheduledTanPost {
   id: string;
   text: string;
   reply_to: string | null;
@@ -1167,134 +588,25 @@ export interface TanScheduledPost {
   created_at: number;
   post_hash: string | null;
   attempts: number;
-  next_attempt_at: number;
-  paused_at: number;
-  pending_peers: string[];
-  // Seconds after publishing before the post disappears; 0 (or
-  // absent on older entries) means it never expires.
+  next_attempt_at: number | null;
+  paused_at: number | null;
   expires_in?: number;
-}
-
-export interface TanScheduleResponse {
-  ok: boolean;
-  scheduled: TanScheduledPost;
-}
-
-export interface TanScheduledResponse {
-  scheduled: TanScheduledPost[];
-  count: number;
-}
-
-export interface TanCancelScheduledResponse {
-  ok: boolean;
-  cancelled: TanScheduledPost;
-  deleted_local: boolean;
-}
-
-export interface TanSyncResponse {
-  ok: boolean;
-  sync: {
-    peers: number;
-    authors: number;
-    stored: number;
-    duplicates: number;
-    errors: Array<{ peer: string; author: string; error: string }>;
-  };
+  [key: string]: unknown;
 }
 
 export interface TanRules {
-  default: "allow" | "deny";
-  allow_authors: string[];
-  block_authors: string[];
-  allow_followed: boolean;
-  // null means every kind is displayed; a list names the kinds shown.
-  // Display-only: every kind from an admitted author is still stored.
-  kinds: string[] | null;
-}
-
-export interface TanRulesResponse {
-  rules: TanRules;
-  available_kinds: string[];
-}
-
-export interface TanRulesUpdateResponse {
-  ok: boolean;
-  rules: TanRules;
-}
-
-export interface TanVerifyProblem {
-  hash: string;
-  author: string;
-  problem: string;
+  /** Shape is the ruleset's to_dict(): kinds allow/deny lists and
+   *  limits. Kept open — the UI reads known keys defensively. */
+  default_allow?: boolean;
+  [key: string]: unknown;
 }
 
 export interface TanVerifyReport {
-  entries: number;
-  authors: number;
-  unlinked: number;
-  problems: TanVerifyProblem[];
-  ok: boolean;
+  ok?: boolean;
+  [key: string]: unknown;
 }
 
-
-export interface MessagesResponse {
-  messages: TauMessage[];
-}
-
-export interface MessagesExportDocument {
-  format: string;
-  version: number;
-  exported_at: number;
-  messages: Array<Record<string, unknown>>;
-}
-
-export interface MessagesImportError {
-  id: string | null;
-  error: string;
-}
-
-export interface MessagesImportResult {
-  imported: number;
-  present: number;
-  skipped: number;
-  errors: MessagesImportError[];
-  // Fresh unread counts, present only when the import stored something.
-  unread?: UnreadCounts;
-}
-
-export interface MessagesImportResponse {
-  ok: boolean;
-  import: MessagesImportResult;
-}
-
-export interface TanExportDocument {
-  format: string;
-  version: number;
-  exported_at: number;
-  authors: string[];
-  entries: Array<Record<string, unknown>>;
-}
-
-export interface TanImportError {
-  hash: string;
-  error: string;
-}
-
-export interface TanImportResult {
-  imported: number;
-  present: number;
-  skipped: number;
-  errors: TanImportError[];
-}
-
-export interface TanImportResponse {
-  ok: boolean;
-  import: TanImportResult;
-}
-
-// Public channels: open topic rooms anyone can join (see
-// `tau/channels.py`). The API returns messages newest first; the
-// console reverses them for display.
+// ------------------------------------------------------------- channels --
 
 export interface Channel {
   channel: string;
@@ -1314,73 +626,51 @@ export interface ChannelMessage {
   sig: string;
 }
 
-export interface ChannelsResponse {
-  channels: Channel[];
-  count: number;
-}
+// ---------------------------------------------------------------- pages --
 
-export interface ChannelMessagesResponse {
-  channel: string;
-  messages: ChannelMessage[];
-  count: number;
-}
-
-export interface ChannelJoinResponse {
-  ok: boolean;
-  channel: string;
-  joined_at: number;
-}
-
-export interface ChannelLeaveResponse {
-  ok: boolean;
-  channel: string;
-  left: boolean;
-}
-
-export interface ChannelSendResponse {
-  ok: boolean;
-  message: ChannelMessage;
-}
-
-export interface ChannelSyncSummary {
-  channel: string;
-  peers: number;
-  stored: number;
-  duplicates: number;
-  skipped: number;
-  errors: { peer: string; error: string }[];
-}
-
-export interface ChannelSyncResponse {
-  ok: boolean;
-  sync: ChannelSyncSummary;
-}
-
-// A personal mesh page, as the console renders it: the signed
-// document minus its key and signature (public by design, but the
-// console only needs the page itself).
-export interface MeshPageFile {
+export interface PageFile {
   name: string;
   sha256: string;
-  size: number;
+  size?: number;
+  mime?: string;
+  [key: string]: unknown;
 }
 
 export interface MeshPage {
   author: string;
   title: string;
   markdown: string;
-  files: MeshPageFile[];
+  files: PageFile[];
   version: number;
   updated_at: number;
 }
 
-export interface PagesResponse {
+export interface PageList {
   pages: MeshPage[];
   mine: MeshPage | null;
   count: number;
 }
 
-export interface PageFetchResponse {
-  ok: boolean;
-  page: MeshPage | null;
+// ------------------------------------------------------- live events -----
+
+/** One frame from /ws, or one SSE event from /api/events. */
+export type LiveEvent =
+  | { type: "snapshot"; snapshot: Snapshot }
+  | { type: "message"; message: ChatMessage; unread: UnreadCounts }
+  | { type: "message_updated"; message: ChatMessage }
+  | { type: "message_deleted"; message_id: number }
+  | { type: "peer"; peer: Peer }
+  | { type: "post"; post: TanPost }
+  | { type: "channel-message"; message: ChannelMessage }
+  | { type: "unread"; unread: UnreadCounts; restored?: unknown[] }
+  | { type: "typing"; peer?: string; group?: string; state?: string; name?: string }
+  | { type: "status"; action: string }
+  | { type: string; [key: string]: unknown };
+
+export interface TypingState {
+  peer?: string;
+  group?: string;
+  name?: string;
+  state: "start" | "stop";
+  at: number;
 }

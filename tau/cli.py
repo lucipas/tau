@@ -37,6 +37,13 @@ from .archive import (
     load_archived_set,
     save_archive,
 )
+from .away import (
+    AwayError,
+    AwayState,
+    away_lock,
+    load_away,
+    save_away,
+)
 from .backup import create_backup, restore_backup
 from .blocklist import (
     BlockListError,
@@ -1580,6 +1587,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="unmute this conversation instead",
     )
     mute.set_defaults(func=cmd_mute)
+
+    away = subparsers.add_parser(
+        "away",
+        parents=[common],
+        help="set an away message that auto-replies to DMs while you are away",
+    )
+    away_sub = away.add_subparsers(dest="away_command", metavar="AWAY_COMMAND")
+    away_sub.required = True
+
+    away_on = away_sub.add_parser(
+        "on",
+        parents=[common],
+        help="turn the away reply on, optionally with a custom message",
+    )
+    away_on.add_argument(
+        "--message",
+        metavar="TEXT",
+        help="custom away message (default: \"I'm away right now. "
+        "I'll reply when I'm back.\")",
+    )
+    away_on.set_defaults(func=cmd_away_on)
+
+    away_off = away_sub.add_parser(
+        "off",
+        parents=[common],
+        help="turn the away reply off",
+    )
+    away_off.set_defaults(func=cmd_away_off)
+
+    away_status = away_sub.add_parser(
+        "status",
+        parents=[common],
+        help="show whether the away reply is on and what it says",
+    )
+    away_status.set_defaults(func=cmd_away_status)
 
     beacon = subparsers.add_parser(
         "beacon",
@@ -12777,6 +12819,92 @@ def cmd_mute(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_away_on(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    # Reload inside the lock: two away commands racing must not
+    # discard each other's change.
+    with away_lock(config.away_path):
+        try:
+            load_away(config.away_path)
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        try:
+            state = AwayState.on(getattr(args, "message", None))
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        save_away(config.away_path, state)
+    if _json_mode(args):
+        _emit(
+            {
+                "enabled": True,
+                "message": state.message,
+                "since": state.since,
+            },
+            True,
+        )
+        return _EXIT_OK
+    print(
+        "Away reply on: the first DM from each peer gets one reply:\n"
+        f"{state.message}"
+    )
+    return _EXIT_OK
+
+
+def cmd_away_off(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    with away_lock(config.away_path):
+        try:
+            current = load_away(config.away_path)
+        except AwayError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        was_on = current.enabled
+        if was_on:
+            save_away(config.away_path, current.off())
+    if _json_mode(args):
+        _emit(
+            {"enabled": False, "message": current.message},
+            True,
+        )
+        return _EXIT_OK
+    if was_on:
+        print("Away reply off.")
+    else:
+        print("Away reply is already off.")
+    return _EXIT_OK
+
+
+def cmd_away_status(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        state = load_away(config.away_path)
+    except AwayError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    if _json_mode(args):
+        _emit(
+            {
+                "enabled": state.enabled,
+                "message": state.message,
+                "since": state.since,
+                "replied_to": sorted(state.replied_to),
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not state.enabled:
+        print("Away reply is off.")
+    else:
+        print(f"Away reply is on:\n{state.message}")
+        if state.replied_to:
+            print(
+                f"{len(state.replied_to)} peer(s) answered in this away period."
+            )
+    return _EXIT_OK
+
+
 def _beacon_target(config: TauConfig, args: argparse.Namespace) -> Tuple[str, bool, str]:
     """Resolve a beacon stop/update target locally: hash, group?, label.
 
@@ -16336,45 +16464,132 @@ def _cmd_messages_sent(
     registry: PeerRegistry,
     limit: Optional[int],
 ) -> int:
-    """List messages this node sent, with their read state."""
+    """List messages this node sent, with their read state.
+
+    A group send folds into one row: its legs share one send, so the
+    author sees who has read it — ``seen by Alice, Bob · delivered to
+    Carol · queued for Dave`` — instead of one identical row per
+    member.  The fold is keyed on the sender's own group inbox record
+    (``leg_ids``); a leg whose sent record was evicted counts as
+    unknown, and a send whose inbox record is gone (retracted,
+    deleted) keeps today's per-leg rows.
+    """
     mailbox = Mailbox(config.mailbox_path)
+    inbox = Inbox(config.inbox_path)
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_sent_peer(registry, args.peer)
     entries = mailbox.sent_list()
-    if peer_hash is not None:
-        entries = [entry for entry in entries if entry.get("to") == peer_hash]
-    entries.reverse()  # newest first
-    if limit is not None:
-        entries = entries[: max(0, limit)]
     queued_ids = {entry.id for entry in mailbox.outbox_list()}
+    sent_by_id = {entry["id"]: entry for entry in entries}
+    fold_by_leg: Dict[str, Dict[str, Any]] = {}
+    for record in inbox.list_messages(
+        direction="out", kind="group", limit=None
+    ):
+        leg_ids = record.get("leg_ids")
+        if not isinstance(leg_ids, list):
+            continue
+        for leg_id in leg_ids:
+            if isinstance(leg_id, str) and leg_id:
+                fold_by_leg.setdefault(leg_id, record)
+
+    def leg_state(entry: Dict[str, Any]) -> str:
+        read_at = entry.get("read_at")
+        # ``delivered_at`` is set only once a delivery was confirmed.
+        # Records from before it was tracked have no such key and count
+        # as delivered.
+        delivered_at = entry.get("delivered_at", entry.get("sent_at"))
+        if entry["id"] in queued_ids:
+            return "queued"
+        if read_at is not None:
+            return "read"
+        if delivered_at is not None:
+            return "delivered"
+        # Cancelled or expired before any delivery was confirmed.
+        return "unknown"
 
     def describe(entry: Dict[str, Any]) -> Dict[str, Any]:
         peer = registry.get(entry.get("to") or "")
-        read_at = entry.get("read_at")
-        # ``delivered_at`` is set only once a delivery was confirmed.  Records
-        # from before it was tracked have no such key and count as delivered.
-        delivered_at = entry.get("delivered_at", entry.get("sent_at"))
-        if entry["id"] in queued_ids:
-            state = "queued"
-        elif read_at is not None:
-            state = "read"
-        elif delivered_at is not None:
-            state = "delivered"
-        else:
-            # Cancelled or expired before any delivery was confirmed.
-            state = "unknown"
         return {
             "id": entry["id"],
             "to": entry.get("to"),
             "to_name": peer.display_name if peer is not None else "",
             "text": entry.get("text", ""),
             "sent_at": entry.get("sent_at"),
-            "read_at": read_at,
-            "state": state,
+            "read_at": entry.get("read_at"),
+            "state": leg_state(entry),
         }
 
-    described = [describe(entry) for entry in entries]
+    def describe_group(record: Dict[str, Any]) -> Dict[str, Any]:
+        legs = []
+        for leg_id in record.get("leg_ids") or []:
+            sent = sent_by_id.get(leg_id)
+            if sent is None:
+                # The sent record was evicted (see MAX_SENT): the leg
+                # went out, but who it went to is no longer known, so
+                # it counts as unknown without a name.
+                legs.append(
+                    {
+                        "id": leg_id,
+                        "to": None,
+                        "to_name": "",
+                        "state": "unknown",
+                        "read_at": None,
+                    }
+                )
+                continue
+            legs.append(describe(sent))
+        states = {leg["state"] for leg in legs}
+        if states == {"read"}:
+            state = "read"
+        elif states <= {"read", "delivered"}:
+            state = "delivered"
+        elif states == {"queued"}:
+            state = "queued"
+        else:
+            state = "partial"
+        return {
+            "id": record.get("id"),
+            "group": record.get("group"),
+            "group_name": record.get("group_name") or "group",
+            "text": record.get("text", ""),
+            "sent_at": record.get("sent_at"),
+            "state": state,
+            "legs": legs,
+        }
+
+    # Walk the sent records oldest first, as before: a group send's
+    # legs share one send time, so they sit together and the fold
+    # takes the first leg's place.  A fold with no leg left in the
+    # sent records (all evicted) never appears — exactly like the
+    # per-leg rows it replaces.
+    described: List[Dict[str, Any]] = []
+    folded: Set[str] = set()
+    for entry in entries:
+        record = fold_by_leg.get(entry["id"])
+        if record is not None:
+            key = str(record.get("id")) + str(record.get("sent_at"))
+            if key in folded:
+                continue
+            folded.add(key)
+            described.append(describe_group(record))
+        else:
+            described.append(describe(entry))
+    described.reverse()  # newest first
+    if peer_hash is not None:
+        described = [
+            entry
+            for entry in described
+            if (
+                entry.get("to") == peer_hash
+                if "group" not in entry
+                else any(
+                    leg.get("to") == peer_hash for leg in entry.get("legs") or []
+                )
+            )
+        ]
+    if limit is not None:
+        described = described[: max(0, limit)]
     if _json_mode(args):
         _emit({"messages": described, "count": len(described)}, True)
         return _EXIT_OK
@@ -16382,13 +16597,44 @@ def _cmd_messages_sent(
         print("No messages sent yet.")
         return _EXIT_OK
     for entry in described:
-        name = entry["to_name"] or short_hash(entry["to"] or "")
         when = _format_message_time(float(entry.get("sent_at") or 0))
-        if entry["state"] == "read":
-            state = f"read {_format_message_time(float(entry['read_at'] or 0))}"
+        if "group" in entry:
+            seen = [
+                leg["to_name"] or short_hash(leg["to"] or "")
+                for leg in entry.get("legs") or []
+                if leg["state"] == "read"
+            ]
+            delivered = [
+                leg["to_name"] or short_hash(leg["to"] or "")
+                for leg in entry.get("legs") or []
+                if leg["state"] == "delivered"
+            ]
+            queued = [
+                leg["to_name"] or short_hash(leg["to"] or "")
+                for leg in entry.get("legs") or []
+                if leg["state"] == "queued"
+            ]
+            unknown = sum(
+                1 for leg in entry.get("legs") or [] if leg["state"] == "unknown"
+            )
+            parts = []
+            if seen:
+                parts.append("seen by " + ", ".join(seen))
+            if delivered:
+                parts.append("delivered to " + ", ".join(delivered))
+            if queued:
+                parts.append("queued for " + ", ".join(queued))
+            if unknown:
+                parts.append(f"{unknown} unknown")
+            state = " · ".join(parts) or "unknown"
+            print(f"[{when}] to {entry.get('group_name')} — {state}")
         else:
-            state = entry["state"]
-        print(f"[{when}] to {name} — {state}")
+            name = entry["to_name"] or short_hash(entry["to"] or "")
+            if entry["state"] == "read":
+                state = f"read {_format_message_time(float(entry['read_at'] or 0))}"
+            else:
+                state = entry["state"]
+            print(f"[{when}] to {name} — {state}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK

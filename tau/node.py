@@ -38,6 +38,12 @@ from .beacons import (
     load_beacons,
     save_beacons,
 )
+from .away import (
+    AwayError,
+    away_lock,
+    load_away,
+    save_away,
+)
 from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import (
     TauConfig,
@@ -1322,6 +1328,7 @@ class TauNode:
                 self.on_message(record)
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_message callback failed", exc_info=True)
+        self._maybe_send_away_reply(caller_hash)
 
     def _wait_for_lxmf_deliveries(self) -> None:
         """Wait for in-flight LXMF deliveries, bounded so stop never hangs.
@@ -2276,6 +2283,121 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record sent message", exc_info=True)
 
+    def _maybe_send_away_reply(self, caller_hash: str) -> None:
+        """Queue one away reply for *caller_hash*, once per away period.
+
+        Runs after a DM is stored, on either receive path — never
+        inside a mailbox transaction, and never blocking on delivery:
+        the reply goes straight into the outbox and the serving sweep
+        delivers it (a flush is kicked off, since a peer that just
+        delivered to us is reachable right now).  Only an established
+        peer gets one: a peer outside the registry is a stranger the
+        outbox sweep cannot reach anyway (it visits registry peers),
+        and a stranger must not learn the owner is away.  Group
+        messages, DM requests and blocked peers never reach here —
+        groups have their own handler, requests are held before
+        storage, and blocked senders are dropped before storage.
+
+        The once-per-peer check, the enqueue and the mark run under
+        the away lock, so a direct copy and an LXMF copy racing each
+        other still queue exactly one reply.  Any failure is logged
+        and swallowed: a missed auto-reply must never break delivery
+        of the message that triggered it.
+        """
+        if not caller_hash:
+            return
+        away_path = getattr(self.config, "away_path", None)
+        if away_path is None:
+            return
+        peer = self.registry.get(caller_hash)
+        if peer is None:
+            return
+        try:
+            with away_lock(away_path):
+                try:
+                    state = load_away(away_path)
+                except AwayError as exc:
+                    log.warning(
+                        "Away state at %s is unusable (%s); "
+                        "sending no auto-reply",
+                        away_path,
+                        exc,
+                    )
+                    return
+                if not state.enabled:
+                    return
+                if caller_hash in state.replied_to:
+                    return
+                text = state.message
+                expires_at = None
+                default = peer_default_for(
+                    getattr(self.config, "disappearing_path", None),
+                    caller_hash,
+                )
+                if default is not None:
+                    # A per-conversation disappearing default fills in
+                    # the expiry the reply did not pass, exactly like a
+                    # manual send to this peer.
+                    expires_at = time.time() + default
+                message_id = generate_message_id()
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=peer.destination_hash,
+                        text=text,
+                        to_name=peer.display_name,
+                        message_id=message_id,
+                        expires_at=expires_at,
+                        kind="chat",
+                    )
+                except MailboxError:
+                    # Nothing was queued: do not mark the peer replied,
+                    # so their next message retries the reply.
+                    log.warning(
+                        "Could not queue away reply to %s", caller_hash,
+                        exc_info=True,
+                    )
+                    return
+                self._record_sent(
+                    {
+                        **(
+                            {"expires_at": expires_at}
+                            if expires_at is not None
+                            else {}
+                        ),
+                        "from": self.name,
+                        "destination": peer.hexhash,
+                        "text": text,
+                        "kind": "chat",
+                        "sent_at": time.time(),
+                        "received_at": time.time(),
+                        "id": message_id,
+                        "direction": "out",
+                    }
+                )
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=peer.destination_hash,
+                    text=text,
+                    sent_at=entry.created_at,
+                )
+                save_away(away_path, state.with_replied(caller_hash))
+                log.info(
+                    "Queued away reply %s to %s",
+                    entry.id,
+                    peer.destination_hash.hex(),
+                )
+        except Exception:  # pragma: no cover - defensive
+            log.warning(
+                "Could not send away reply to %s", caller_hash, exc_info=True
+            )
+            return
+        threading.Thread(
+            target=self.flush_outbox,
+            kwargs={"timeout": _MAIL_REQUEST_TIMEOUT, "max_peers": 5},
+            name="tau-mail-flush",
+            daemon=True,
+        ).start()
+
     def _handle_message(
         self,
         path: str,
@@ -2408,6 +2530,10 @@ class TauNode:
             # A message from a peer ends their typing: they sent what
             # they were composing.
             self._clear_typing(caller_hash, caller_hash)
+        if stored_record is not None and caller_hash:
+            # A stored DM is the only trigger: duplicates, expired and
+            # retracted copies never stored, so they never answer.
+            self._maybe_send_away_reply(caller_hash)
 
         return response_ok(
             echo=message["text"],
