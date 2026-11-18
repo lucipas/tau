@@ -1578,6 +1578,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="unmute this conversation instead",
     )
+    mute.add_argument(
+        "--for",
+        dest="for_duration",
+        default=None,
+        metavar="DURATION",
+        help="mute only for this long, e.g. 30s, 5m, 2h or 7d (at most 30d); "
+        "afterwards the conversation counts as unread again",
+    )
     mute.set_defaults(func=cmd_mute)
 
     beacon = subparsers.add_parser(
@@ -12657,17 +12665,37 @@ def cmd_mute(args: argparse.Namespace) -> int:
     if getattr(args, "off", False) and args.peer is None and args.group is None:
         print("error: --off needs a --peer or --group to unmute", file=sys.stderr)
         return _EXIT_ERROR
+    for_duration = getattr(args, "for_duration", None)
+    if for_duration is not None and args.peer is None and args.group is None:
+        print("error: --for needs a --peer or --group to mute", file=sys.stderr)
+        return _EXIT_ERROR
+    if getattr(args, "off", False) and for_duration is not None:
+        print("error: --off and --for cannot be combined", file=sys.stderr)
+        return _EXIT_ERROR
     if args.peer is None and args.group is None:
         # No target lists what is muted, mirroring `tau archived`.
         muted = load_muted(config.muted_path)
+        now = time.time()
         if _json_mode(args):
-            _emit(
-                {
-                    "peers": sorted(muted.peers),
-                    "groups": sorted(muted.groups),
-                },
-                True,
-            )
+            payload: Dict[str, Any] = {
+                "peers": sorted(muted.peers),
+                "groups": sorted(muted.groups),
+            }
+            peer_until = {
+                key: until
+                for key, until in sorted(muted.peer_until.items())
+                if key in muted.peers
+            }
+            if peer_until:
+                payload["peer_until"] = peer_until
+            group_until = {
+                key: until
+                for key, until in sorted(muted.group_until.items())
+                if key in muted.groups
+            }
+            if group_until:
+                payload["group_until"] = group_until
+            _emit(payload, True)
             return _EXIT_OK
         registry = PeerRegistry(config.peers_path)
         store = GroupStore(config.groups_path)
@@ -12677,14 +12705,26 @@ def cmd_mute(args: argparse.Namespace) -> int:
         for destination in sorted(muted.peers):
             peer = registry.get(destination)
             name = peer.display_name if peer is not None else "unknown"
-            print(f"{name} ({short_hash(destination)})")
+            until = muted.muted_until_peer(destination, now=now)
+            suffix = (
+                f" — muted for {_ago(until - now)} more"
+                if until is not None
+                else ""
+            )
+            print(f"{name} ({short_hash(destination)}){suffix}")
         for group_id in sorted(muted.groups):
             try:
                 group = store.find(group_id)
                 label = f"group {group['name']} ({short_hash(group_id)})"
             except (ValueError, KeyError):
                 label = f"group {short_hash(group_id)}"
-            print(label)
+            until = muted.muted_until_group(group_id, now=now)
+            suffix = (
+                f" — muted for {_ago(until - now)} more"
+                if until is not None
+                else ""
+            )
+            print(f"{label}{suffix}")
         return _EXIT_OK
     if args.group is not None:
         store = GroupStore(config.groups_path)
@@ -12702,6 +12742,15 @@ def cmd_mute(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else "unknown"
         label = f"conversation with {name} ({short_hash(key)})"
         is_group = False
+    seconds = None
+    until = None
+    if for_duration is not None:
+        try:
+            seconds = _parse_duration(for_duration, flag="--for")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        until = time.time() + seconds
     # Reload inside the lock: two mute commands racing must not
     # discard each other's change to a different conversation.
     with muted_lock(config.muted_path):
@@ -12712,20 +12761,31 @@ def cmd_mute(args: argparse.Namespace) -> int:
             return _EXIT_ERROR
         if is_group:
             previous = muted.is_muted_group_lineage(lineage)
+            previous_until = muted.muted_until_group_lineage(lineage)
             if getattr(args, "off", False):
-                muted = muted.without_group_lineage(lineage)
+                updated = muted.without_group_lineage(lineage)
             else:
-                muted = muted.with_group_lineage(lineage)
+                updated = muted.with_group_lineage(lineage, until=until)
         else:
             previous = muted.is_muted_peer(key)
+            previous_until = muted.muted_until_peer(key)
             if getattr(args, "off", False):
-                muted = muted.without_peer(key)
+                updated = muted.without_peer(key)
             else:
-                muted = muted.with_peer(key)
-        changed = previous != (not getattr(args, "off", False))
+                updated = muted.with_peer(key, until=until)
+        # Compare whole objects: re-muting with a different expiry is
+        # a change even when the conversation was already muted.
+        changed = updated != muted
         if changed:
-            save_muted(config.muted_path, muted)
+            save_muted(config.muted_path, updated)
     current = not getattr(args, "off", False)
+    # The expiry of the state just saved: a plain re-mute clears a
+    # timed mute back to indefinite, so read it off `updated`, not
+    # off the previous state.
+    if is_group:
+        effective_until = updated.muted_until_group_lineage(lineage)
+    else:
+        effective_until = updated.muted_until_peer(key)
     if _json_mode(args):
         _emit(
             {
@@ -12733,6 +12793,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
                 "group": is_group,
                 "muted": current,
                 "changed": changed,
+                "until": effective_until,
             },
             True,
         )
@@ -12742,8 +12803,20 @@ def cmd_mute(args: argparse.Namespace) -> int:
             print(f"Unmuted {label}: its messages count as unread again.")
         else:
             print(f"{label} was not muted.")
-    elif previous:
-        print(f"{label} is already muted.")
+    elif previous and not changed:
+        if previous_until is not None:
+            print(
+                f"{label} is already muted for "
+                f"{_ago(previous_until - time.time())} more; pass --for to "
+                "change it, or --off to unmute."
+            )
+        else:
+            print(f"{label} is already muted.")
+    elif seconds is not None:
+        print(
+            f"Muted {label} for {_describe_duration(seconds)}: its messages "
+            "still arrive, but never light the unread badge until then."
+        )
     else:
         print(
             f"Muted {label}: its messages still arrive, but never light "
