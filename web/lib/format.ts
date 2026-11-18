@@ -1,94 +1,147 @@
-export function shortHash(hash: string | null | undefined, size = 10): string {
-  if (!hash) return "unknown";
-  if (hash.length <= size + 2) return hash;
-  return `${hash.slice(0, size)}…${hash.slice(-4)}`;
+// format.ts — time / bytes / address formatting helpers for the console.
+//
+// All timestamps from the bridge are unix seconds (floats). All of these
+// helpers are pure and safe to call with null/undefined input.
+
+/** Short destination hash: first 8 hex chars, e.g. "a1b2c3d4". */
+export function shortHash(hash: string | null | undefined, length = 8): string {
+  if (!hash) return "";
+  return hash.slice(0, length);
 }
 
-export function formatTime(timestamp: number): string {
-  if (!timestamp) return "--:--:--";
-  return new Date(timestamp * 1000).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
+/** Display name for a peer: alias > name > short hash. */
+export function displayName(
+  peer: { alias?: string | null; name?: string | null; destination?: string | null } | null | undefined,
+): string {
+  if (!peer) return "unknown";
+  if (peer.alias) return peer.alias;
+  if (peer.name && peer.name !== "unknown") return peer.name;
+  return shortHash(peer.destination);
 }
 
-export function formatDateTime(timestamp: number): string {
-  if (!timestamp) return "unknown";
-  return new Date(timestamp * 1000).toLocaleString([], {
+/** "a1b2c3d4…" style truncated hash for tight UI spots. */
+export function truncatedHash(hash: string | null | undefined): string {
+  if (!hash) return "";
+  return hash.length > 12 ? `${hash.slice(0, 8)}…` : hash;
+}
+
+function pad(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+/** "14:32" local time for a unix-seconds timestamp. */
+export function formatTime(ts: number | null | undefined): string {
+  if (ts == null || !Number.isFinite(ts)) return "";
+  const d = new Date(ts * 1000);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** "Nov 17" local date for a unix-seconds timestamp. */
+export function formatDate(ts: number | null | undefined): string {
+  if (ts == null || !Number.isFinite(ts)) return "";
+  return new Date(ts * 1000).toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
   });
 }
 
-export function formatAge(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return "unknown";
-  if (seconds < 5) return "just now";
-  if (seconds < 60) return `${Math.floor(seconds)}s ago`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
+/** "Nov 17, 14:32" — full local date + time. */
+export function formatDateTime(ts: number | null | undefined): string {
+  if (ts == null || !Number.isFinite(ts)) return "";
+  return `${formatDate(ts)}, ${formatTime(ts)}`;
 }
 
-export function formatUptime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "0s";
-  const total = Math.floor(seconds);
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const secs = total % 60;
-  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
-  if (minutes > 0) return `${minutes}m ${String(secs).padStart(2, "0")}s`;
-  return `${secs}s`;
+/**
+ * Relative time against `now` (unix seconds; defaults to Date.now()).
+ * "just now" < 60s, "5m" < 1h, "3h" < 24h, "2d" < 7d, otherwise a date.
+ * Future timestamps clamp to "just now".
+ */
+export function formatRelative(
+  ts: number | null | undefined,
+  now: number = Date.now() / 1000,
+): string {
+  if (ts == null || !Number.isFinite(ts)) return "";
+  const diff = Math.max(0, now - ts);
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+  if (diff < 7 * 86400) return `${Math.floor(diff / 86400)}d`;
+  return formatDate(ts);
 }
 
-export function formatRtt(rtt: number | null | undefined): string {
-  if (rtt === null || rtt === undefined) return "no reply";
-  if (rtt < 1) return `${rtt.toFixed(2)} ms`;
-  return `${rtt.toFixed(1)} ms`;
+/** "in 5m" / "in 2h" / "in 3d" for a future unix-seconds timestamp. */
+export function formatCountdown(
+  ts: number | null | undefined,
+  now: number = Date.now() / 1000,
+): string {
+  if (ts == null || !Number.isFinite(ts)) return "";
+  const diff = ts - now;
+  if (diff <= 0) return "now";
+  if (diff < 60) return `in ${Math.floor(diff)}s`;
+  if (diff < 3600) return `in ${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `in ${Math.floor(diff / 3600)}h`;
+  return `in ${Math.floor(diff / 86400)}d`;
 }
 
-/** "12.4 KB" / "3.2 MB" for a file size in bytes. */
-export function formatFileSize(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "unknown size";
+/** "1.5 KiB" / "10 MiB" / "823 B" — binary units, one decimal. */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes)) return "";
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  const units = ["KiB", "MiB", "GiB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
 }
 
-/** "disappears in 5m" for a sender-set expiry, or null when it never expires. */
-export function formatExpiresIn(expiresAt: number | null | undefined): string | null {
-  if (!expiresAt) return null;
-  const seconds = Math.floor(expiresAt - Date.now() / 1000);
-  if (seconds <= 0) return "expired";
-  if (seconds < 60) return `disappears in ${seconds}s`;
-  if (seconds < 3600) return `disappears in ${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `disappears in ${Math.floor(seconds / 3600)}h`;
-  return `disappears in ${Math.floor(seconds / 86400)}d`;
+/** "1.2k" / "3.4M" compact count for likes, followers, etc. */
+export function formatCount(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "0";
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
 }
 
-/** "sends in 5m" for a scheduled send time, or null when unscheduled or due. */
-export function formatSendsIn(sendAfter: number | null | undefined): string | null {
-  if (!sendAfter) return null;
-  const seconds = Math.floor(sendAfter - Date.now() / 1000);
-  if (seconds <= 0) return null;
-  if (seconds < 60) return `sends in ${seconds}s`;
-  if (seconds < 3600) return `sends in ${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `sends in ${Math.floor(seconds / 3600)}h`;
-  return `sends in ${Math.floor(seconds / 86400)}d`;
+/** "5s" / "2m" / "1h" / "3d" for a duration in seconds. */
+export function formatDuration(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds)) return "";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
 }
 
-export function peerLabel(name: string, hash: string): string {
-  return `${name || "unknown"} · ${shortHash(hash, 8)}`;
+/** "2m ago" style age for a peer's last-seen, from the bridge's `age` field. */
+export function formatAge(ageSeconds: number | null | undefined): string {
+  if (ageSeconds == null || !Number.isFinite(ageSeconds)) return "";
+  return `${formatDuration(ageSeconds)} ago`;
 }
 
-/** Lowercase a Tan tag the way the server does: Python `str.casefold` maps
- * ß to ss and final sigma ς to σ, which JavaScript `toLowerCase` leaves
- * alone. A tag clicked in post text must match the sidebar's canonical
- * form — #Straße becomes "strasse" on both sides. */
-export function casefoldTag(tag: string): string {
-  return tag.toLowerCase().replace(/ß/g, "ss").replace(/ς/g, "σ");
+/** Expiry label for a disappearing message / post: "expires in 2h". */
+export function formatExpiry(
+  expiresAt: number | null | undefined,
+  now: number = Date.now() / 1000,
+): string {
+  if (expiresAt == null || !Number.isFinite(expiresAt)) return "";
+  if (expiresAt <= now) return "expired";
+  return `expires ${formatCountdown(expiresAt, now)}`;
+}
+
+/** Extract #tags from post/message text, lowercased, deduped, in order. */
+export function extractTags(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const seen = new Set<string>();
+  for (const match of text.matchAll(/#([A-Za-z0-9_]+)/g)) {
+    seen.add(match[1].toLowerCase());
+  }
+  return [...seen];
+}
+
+/** Extract @mentions from post/message text, in order. */
+export function extractMentions(text: string | null | undefined): string[] {
+  if (!text) return [];
+  return [...text.matchAll(/@([A-Za-z0-9_]+)/g)].map((m) => m[1]);
 }
