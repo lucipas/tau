@@ -69,6 +69,7 @@ from .group_invites import (
     resolve_join_request,
     verify_invite_link,
 )
+from .broadcasts import BroadcastStore
 from .groups import GroupStore, pinned_group
 from .group_polls import PostError, clean_poll_options
 from .identity import (
@@ -622,6 +623,11 @@ class TauNode:
         self.mailbox = Mailbox(config.mailbox_path)
         self.inbox = Inbox(config.inbox_path)
         self.groups = GroupStore(getattr(config, "groups_path", None))
+        # Broadcast lists: named peer sets for one-to-many DMs, local
+        # state like groups — the console lists and sends them, and the
+        # store reloads from disk on list so a CLI-created list shows
+        # up without restarting the server.
+        self.broadcasts = BroadcastStore(getattr(config, "broadcasts_path", None))
         # Public profiles: the local one this node publishes (reloaded
         # from disk on every announce, so a one-shot `tau profile set`
         # reaches peers without a restart) and the received ones, keyed

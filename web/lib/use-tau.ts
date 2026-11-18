@@ -27,8 +27,11 @@ import {
   archiveConversation,
   blockPeer,
   cancelOutbox,
+  createBroadcast,
+  deleteBroadcast,
   dropHeldMail,
   forgetPeer,
+  getBroadcasts,
   getDmRequests,
   getHeldMail,
   getOutbox,
@@ -39,6 +42,7 @@ import {
   markUnread,
   pingPeer,
   retryOutbox,
+  sendBroadcast,
   setMuted,
   setPeerAlias,
   setPeerNote,
@@ -48,6 +52,8 @@ import {
   wsUrl,
 } from "./api";
 import type {
+  BroadcastList,
+  BroadcastSendResponse,
   ChatMessage,
   DmRequest,
   Group,
@@ -482,6 +488,61 @@ export function useOutbox(pollMs = 15000): UseOutboxResult {
     [refresh],
   );
   return { outbox, held, loading, error, refresh, cancel, retry, dropHeld };
+}
+
+// -------------------------------------------------------------- broadcasts
+
+export interface UseBroadcastsResult {
+  broadcasts: BroadcastList[];
+  loading: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+  create: (name: string, members: string[]) => Promise<void>;
+  remove: (name: string) => Promise<void>;
+  send: (name: string, text: string) => Promise<BroadcastSendResponse>;
+}
+
+/** Named peer sets for one-to-many DMs; a send fans out per member. */
+export function useBroadcasts(): UseBroadcastsResult {
+  const [broadcasts, setBroadcasts] = useState<BroadcastList[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setBroadcasts(await getBroadcasts());
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const create = useCallback(
+    async (name: string, members: string[]) => {
+      await createBroadcast(name, members);
+      await refresh();
+    },
+    [refresh],
+  );
+  const remove = useCallback(
+    async (name: string) => {
+      await deleteBroadcast(name);
+      await refresh();
+    },
+    [refresh],
+  );
+  const send = useCallback(async (name: string, text: string) => {
+    const result = await sendBroadcast(name, text);
+    await refresh();
+    return result;
+  }, [refresh]);
+  return { broadcasts, loading, error, refresh, create, remove, send };
 }
 
 // ----------------------------------------------------------------- traffic

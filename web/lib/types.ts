@@ -223,6 +223,39 @@ export interface LeftGroups {
   ignored: { id: string; name: string }[];
 }
 
+// ---------------------------------------------------------- broadcasts --
+// A broadcast list is a named set of peers for one-to-many DMs: a send
+// fans out as one ordinary DM per member, so recipients never see each
+// other or the list. Lists are local-only, like groups, but carry no
+// shared context and no protocol of their own.
+
+export interface BroadcastMember {
+  hash: string;
+  name: string;
+}
+
+export interface BroadcastList {
+  name: string;
+  members: BroadcastMember[];
+  created_at: number;
+}
+
+export interface BroadcastSendResult {
+  hash: string;
+  name: string;
+  status: "delivered" | "queued" | "failed";
+  error?: string;
+}
+
+export interface BroadcastSendResponse {
+  ok: boolean;
+  name: string;
+  results: BroadcastSendResult[];
+  delivered: number;
+  queued: number;
+  failed: number;
+}
+
 export interface JoinRequest {
   group: string;
   peer: string;

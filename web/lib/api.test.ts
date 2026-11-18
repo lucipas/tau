@@ -6,9 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   clearReaction,
+  createBroadcast,
+  deleteBroadcast,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
+  getBroadcasts,
   getChannelMessages,
   getMessages,
   getTanThread,
@@ -17,6 +20,7 @@ import {
   pageFileUrl,
   reactToMessage,
   closeDmPoll,
+  sendBroadcast,
   sendChannelMessage,
   sendMessage,
   tanMediaUrl,
@@ -179,6 +183,34 @@ describe("POST endpoints", () => {
     await fetchTanMedia("a".repeat(64), "b".repeat(32));
     expect(captured[0].url).toBe(`/api/tan/media/${"a".repeat(64)}/fetch`);
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
+  });
+
+  it("lists broadcast lists from /api/broadcasts", async () => {
+    nextJson = { broadcasts: [], count: 0 };
+    const lists = await getBroadcasts();
+    expect(captured[0].url).toBe("/api/broadcasts");
+    expect(lists).toEqual([]);
+  });
+
+  it("creates a broadcast list with name and member hashes", async () => {
+    nextJson = { ok: true, broadcast: { name: "team", members: [], created_at: 1 } };
+    await createBroadcast("team", ["a".repeat(32)]);
+    expect(captured[0].url).toBe("/api/broadcasts");
+    expect(bodyOf(0)).toEqual({ name: "team", members: ["a".repeat(32)] });
+  });
+
+  it("deletes a broadcast list by name", async () => {
+    nextJson = { ok: true, name: "team" };
+    await deleteBroadcast("team");
+    expect(captured[0].url).toBe("/api/broadcasts/delete");
+    expect(bodyOf(0)).toEqual({ broadcast: "team" });
+  });
+
+  it("sends a broadcast with list name and text", async () => {
+    nextJson = { ok: true, name: "team", results: [], delivered: 0, queued: 0, failed: 0 };
+    await sendBroadcast("team", "meet at noon");
+    expect(captured[0].url).toBe("/api/broadcasts/send");
+    expect(bodyOf(0)).toEqual({ broadcast: "team", text: "meet at noon" });
   });
 });
 
