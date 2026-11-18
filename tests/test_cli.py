@@ -6946,6 +6946,275 @@ def _seed_group_poll_conversation(tmp_path, *, close=False):
     return data_dir, group
 
 
+def _seed_dm_poll_conversation(tmp_path, *, close=False):
+    """A DM with alice: one poll from her, one vote, maybe a close."""
+    from tau.peers import PeerRegistry
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    peer_identity = RNS.Identity()
+    peer_hash = destination_hash(peer_identity).hex()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "which day?",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "p" * 32,
+            "kind": "chat",
+            "direction": "in",
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "voted: Saturday",
+            "sent_at": 1002.0,
+            "received_at": 1003.0,
+            "id": "v" * 32,
+            "kind": "chat",
+            "direction": "in",
+            "poll_vote": {
+                "target": {"author": peer_hash, "sent_at": 1000.0},
+                "option": 0,
+            },
+        }
+    )
+    if close:
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": peer_hash,
+                "text": "closed the poll",
+                "sent_at": 1004.0,
+                "received_at": 1005.0,
+                "id": "c" * 31 + "1",
+                "kind": "chat",
+                "direction": "in",
+                "poll_close": {"author": peer_hash, "sent_at": 1000.0},
+            }
+        )
+    return data_dir, peer_hash
+
+
+def test_parser_dm_poll_vote_close_poll():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["send", "--to", "alice", "which day?", "--poll-options", "Saturday", "Sunday"]
+    )
+    assert args.func is cli.cmd_send
+    assert args.poll_options == ["Saturday", "Sunday"]
+    args = parser.parse_args(["vote", "--to", "alice", "pppp", "2"])
+    assert args.func is cli.cmd_vote
+    assert args.poll == "pppp"
+    assert args.option == "2"
+    args = parser.parse_args(["close-poll", "--to", "alice", "pppp"])
+    assert args.func is cli.cmd_close_poll
+
+
+def test_resolve_dm_poll(tmp_path):
+    data_dir, peer_hash = _seed_dm_poll_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    poll = cli._resolve_dm_poll(inbox, "pppp", peer_hash)
+    assert poll["text"] == "which day?"
+    # A vote record never resolves as the poll itself.
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_dm_poll(inbox, "vvvv", peer_hash)
+    # A plain message in the DM is not a poll either.
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_dm_poll(inbox, "zzzz", peer_hash)
+
+
+def test_dm_send_posts_poll_options(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            "alice",
+            "which day?",
+            "--poll-options",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert node.send_kwargs[0]["poll_vote"] is None
+    assert "which day?" in capsys.readouterr().out
+
+
+def test_dm_send_rejects_one_option(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            "alice",
+            "which day?",
+            "--poll-options",
+            "Saturday",
+        ]
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_dm_vote_sends_target_and_option(tmp_path, capsys, monkeypatch):
+    data_dir, peer_hash = _seed_dm_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["vote", "--data-dir", str(data_dir), "--to", "alice", "pppp", "2"]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_vote"] == {
+        "target": {"author": peer_hash, "sent_at": 1000.0},
+        "option": 1,
+    }
+    assert "voted for 'Sunday'" in capsys.readouterr().out
+
+
+def test_dm_vote_accepts_option_text(tmp_path, capsys, monkeypatch):
+    data_dir, peer_hash = _seed_dm_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["vote", "--data-dir", str(data_dir), "--to", "alice", "pppp", "Saturday"]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert node.send_kwargs[0]["poll_vote"]["option"] == 0
+
+
+def test_dm_vote_rejects_closed_poll_and_bad_option(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _ = _seed_dm_poll_conversation(tmp_path / "closed", close=True)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["vote", "--data-dir", str(data_dir), "--to", "alice", "pppp", "1"]
+    )
+    assert code == 2
+    assert "this poll is closed" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+    data_dir, _ = _seed_dm_poll_conversation(tmp_path / "open")
+    code = cli.main(
+        ["vote", "--data-dir", str(data_dir), "--to", "alice", "pppp", "3"]
+    )
+    assert code == 2
+    assert "option must be a number 1-2" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_dm_close_poll_requires_creator(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_dm_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["close-poll", "--data-dir", str(data_dir), "--to", "alice", "pppp"]
+    )
+    assert code == 2
+    assert "only the poll's creator can close it" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_dm_close_poll_happy_path(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    own_hash = _id_destination(data_dir, capsys)
+    from tau.peers import PeerRegistry
+
+    peer_identity = RNS.Identity()
+    peer_hash = destination_hash(peer_identity).hex()
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": peer_hash,
+            "text": "which day?",
+            "sent_at": 1001.0,
+            "received_at": 1001.0,
+            "id": "p" * 32,
+            "kind": "chat",
+            "direction": "out",
+            "leg_sent_at": 1000.0,
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["close-poll", "--data-dir", str(data_dir), "--to", "alice", "pppp"]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert node.send_kwargs[0]["poll_close"] == {
+        "author": own_hash,
+        "sent_at": 1000.0,
+    }
+    assert "closed the poll" in capsys.readouterr().out
+
+
+def test_dm_messages_renders_poll_tally_and_hides_votes(tmp_path, capsys):
+    data_dir, _ = _seed_dm_poll_conversation(tmp_path)
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "which day?" in out
+    assert "1. Saturday — 1 vote(s)" in out
+    assert "2. Sunday — 0 vote(s)" in out
+    assert "1 voter(s) total" in out
+    # The vote itself is not a chat message.
+    assert "voted: Saturday" not in out
+
+
 def test_parser_group_poll_vote_close_poll():
     parser = cli.build_parser()
     args = parser.parse_args(
@@ -8604,6 +8873,7 @@ def test_retract_sends_group_retract_and_deletes_the_local_copy(
             timeout=20.0,
             discover_timeout=None,
             target_sent_at=None,
+            target_author=None,
         ):
             self.sent.append((group, message_id, target_sent_at))
             return {
@@ -8648,6 +8918,131 @@ def test_retract_sends_group_retract_and_deletes_the_local_copy(
     assert mailbox.is_sent_retracted("m-10") is False
 
 
+def _seed_moderator_group(tmp_path, *, creator_is_local: bool):
+    """A data dir with an identity, a group, and one received message.
+
+    Returns (data_dir, group_id, author_hash).  When
+    *creator_is_local* the local identity created the group, so it
+    may moderate; otherwise another peer did, so it may not.
+    """
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "bob",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = load_identity(config.identity_path)
+    own_hash = destination_hash(identity).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author)
+    third = RNS.Identity()
+    third_hash = destination_hash(third)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(author_hash, author.get_public_key(), name="alice", now=100.0)
+    registry.upsert(third_hash, third.get_public_key(), name="carol", now=100.0)
+    registry.save()
+    creator_hash = own_hash if creator_is_local else author_hash.hex()
+    members = sorted([own_hash, author_hash.hex(), third_hash.hex()])
+    group_id = derive_group_id(creator_hash, "crew", members)
+    store = GroupStore(config.groups_path)
+    assert (
+        store.create("crew", members, created_by=creator_hash) is not None
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": author_hash.hex(),
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "m-20",
+            "direction": "in",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+        }
+    )
+    return data_dir, group_id, author_hash
+
+
+def test_retract_moderator_group_message(tmp_path, capsys, monkeypatch):
+    data_dir, group_id, author_hash = _seed_moderator_group(
+        tmp_path, creator_is_local=True
+    )
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+
+    class _ModeratorNode(_FakeRetractNode):
+        def send_group_retraction(
+            self,
+            group,
+            message_id,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+            target_author=None,
+        ):
+            self.sent.append(
+                (group, message_id, target_sent_at, target_author)
+            )
+            return {
+                "ok": True,
+                "group": group,
+                "target": message_id,
+                "id": "r-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": author_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "deleted": True,
+                        "id": "r-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _ModeratorNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-20"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "retracted alice's group message" in out
+    node = _FakeRetractNode.instances[0]
+    assert node.started is False
+    # The fan-out named the message's author, not this node.
+    assert node.sent == [(group_id, "m-20", 100.0, author_hash.hex())]
+    # The local received copy is gone.
+    assert Inbox(config.inbox_path).list_messages() == []
+
+
+def test_retract_refuses_group_message_from_non_creator(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _, _ = _seed_moderator_group(tmp_path, creator_is_local=False)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-20"])
+    assert code == cli._EXIT_ERROR
+    assert "not sent by this node" in capsys.readouterr().err
+    assert _FakeRetractNode.instances == []
+
+
 def test_retract_keeps_group_copy_when_a_member_is_unreachable(
     tmp_path, capsys, monkeypatch
 ):
@@ -8683,6 +9078,7 @@ def test_retract_keeps_group_copy_when_a_member_is_unreachable(
             timeout=20.0,
             discover_timeout=None,
             target_sent_at=None,
+            target_author=None,
         ):
             return {
                 "ok": False,

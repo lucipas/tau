@@ -9,10 +9,29 @@ let calls: string[] = [];
 
 beforeEach(() => {
   const router = mockFetch((url) => {
+    if (url.includes("/api/status")) {
+      // This node is alice: the fixture message below is hers, so
+      // the Edit button shows for it and for nothing else.
+      return { node: { destination: "a".repeat(32) } };
+    }
     if (url.includes("/api/channels/messages")) {
       return {
         channel: "mesh-general",
+        // Newest first, as the API serves them: the reply, then its parent.
         messages: [
+          {
+            v: 1,
+            hash: "m2".padEnd(64, "0"),
+            channel: "mesh-general",
+            author: "b".repeat(32),
+            key: "b".repeat(32),
+            name: "bob",
+            text: "count me in",
+            created_at: 1001,
+            received_at: 1001,
+            sig: "s",
+            reply_to: "m1".padEnd(64, "0"),
+          },
           {
             v: 1,
             hash: "m1".padEnd(64, "0"),
@@ -25,8 +44,22 @@ beforeEach(() => {
             received_at: 1000,
             sig: "s",
           },
+          {
+            v: 1,
+            hash: "m2".padEnd(64, "0"),
+            channel: "mesh-general",
+            author: "b".repeat(32),
+            key: "b".repeat(32),
+            name: "bob",
+            text: "hello, fixed",
+            created_at: 1001,
+            received_at: 1001,
+            sig: "s",
+            edited: true,
+            edited_at: 1002,
+          },
         ],
-        count: 1,
+        count: 2,
       };
     }
     if (url.includes("/api/channels")) {
@@ -73,20 +106,68 @@ describe("ChannelsSection", () => {
     await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
   });
 
+  it("shows a reply with its quoted parent", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByText("count me in")).toBeTruthy();
+    expect(await screen.findByText("↩ alice: hello channel")).toBeTruthy();
+  });
+
+  it("reply button arms the composer for that message", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    await screen.findByText("hello channel");
+    fireEvent.click(screen.getByRole("button", { name: "Reply to alice" }));
+    expect(await screen.findByText(/Replying to/)).toBeTruthy();
+    expect(screen.getByText("alice", { selector: "span.font-semibold" })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
+      target: { value: "count me in" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+    // The banner clears once the reply is sent.
+    await waitFor(() =>
+      expect(screen.queryByText(/Replying to/)).toBeNull(),
+    );
+  });
+
   it("sync pulls history for the selected channel", async () => {
     render(<ChannelsSection />);
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
   });
-});
+
+  it("marks edited messages", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByText("hello, fixed")).toBeTruthy();
+    expect(screen.getByText(/edited/)).toBeTruthy();
+    // Only alice's own message gets an Edit button; bob's does not.
+    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(1);
+  });
+
+  it("edits your own message from the console", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Edit message"), {
+      target: { value: "hello channel, fixed" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/channels/edit"),
+    );
+  });
 
   it("reacts to a message from the quick-react row", async () => {
     render(<ChannelsSection />);
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
     await screen.findByText("hello channel");
+    // The fixture lists three messages, so every one renders a
+    // quick-react row: react to the first message's row.
     fireEvent.click(
-      screen.getByRole("button", { name: "React 👍 to this message" }),
+      screen.getAllByRole("button", { name: "React 👍 to this message" })[0],
     );
     await waitFor(() => expect(calls).toContain("POST /api/channels/react"));
   });
@@ -130,3 +211,4 @@ describe("ChannelsSection", () => {
     expect(await screen.findByRole("button", { name: "React 👍 (2)" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "React 🎉 (1)" })).toBeTruthy();
   });
+});
