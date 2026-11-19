@@ -883,6 +883,23 @@ CREATE TABLE IF NOT EXISTS drafts (
 """
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+    """Column names of *table* right now — a fresh read, not a snapshot.
+
+    Migrations run while other threads may be migrating the same file,
+    so a column set read once at the start of :func:`init_db` can go
+    stale mid-migration: a thread that snapshots after ``kind`` lands
+    but before ``target`` would conclude the pair is done and return
+    without it.  Every migration decision below re-reads, so a column
+    is only skipped when it is really there; the check-then-ALTER gap
+    that remains is the one :func:`_add_column` already tolerates.
+    """
+    return {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
 def _add_column(
     conn: sqlite3.Connection, table: str, column: str, column_type: str
 ) -> None:
@@ -931,58 +948,55 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         except OSError:  # pragma: no cover - best effort
             pass
     conn.executescript(_SCHEMA)
-    columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(posts)").fetchall()
-    }
+    columns = _table_columns(conn, "posts")
     if columns and "v" not in columns:  # migrate an early scaffold database
         _add_column(conn, "posts", "v", "INTEGER NOT NULL DEFAULT 1")
-    if columns and "kind" not in columns:  # migrate a pre-reactions database
+    if columns and "kind" not in _table_columns(conn, "posts"):
+        # migrate a pre-reactions database; kind and target are checked
+        # separately — a concurrent migration may have added one but
+        # not the other yet (see _table_columns).
         _add_column(conn, "posts", "kind", "TEXT NOT NULL DEFAULT 'post'")
+    if columns and "target" not in _table_columns(conn, "posts"):
         _add_column(conn, "posts", "target", "TEXT NOT NULL DEFAULT ''")
-    if columns and "expires_at" not in columns:  # migrate a pre-expiry database
+    if columns and "expires_at" not in _table_columns(conn, "posts"):
+        # migrate a pre-expiry database
         _add_column(conn, "posts", "expires_at", "REAL")
-    if columns and "options" not in columns:  # migrate a pre-polls database
-        # A poll's options live in one JSON column on its own entry, so
-        # the migration is a single ALTER, not a new table.
+    if columns and "options" not in _table_columns(conn, "posts"):
+        # migrate a pre-polls database: a poll's options live in one
+        # JSON column on its own entry, so the migration is a single
+        # ALTER, not a new table.
         _add_column(conn, "posts", "options", "TEXT")
-    if columns and "image" not in columns:  # migrate a pre-media database
-        # A post's image attachment lives in one JSON column on its
-        # own entry, like a poll's options.
+    if columns and "image" not in _table_columns(conn, "posts"):
+        # migrate a pre-media database: a post's image attachment lives
+        # in one JSON column on its own entry, like a poll's options.
         _add_column(conn, "posts", "image", "TEXT")
-    draft_columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
-    }
+    draft_columns = _table_columns(conn, "drafts")
     if draft_columns and "post_hash" not in draft_columns:
         # migrate a pre-retry database: drafts could not remember
         # the signed post a partial publish had already created
         _add_draft_column(conn, "post_hash", "TEXT")
-    if draft_columns and "pending_peers" not in draft_columns:
+    if draft_columns and "pending_peers" not in _table_columns(conn, "drafts"):
         _add_draft_column(conn, "pending_peers", "TEXT")
-    if draft_columns and "claimed_at" not in draft_columns:
+    if draft_columns and "claimed_at" not in _table_columns(conn, "drafts"):
         # migrate a pre-claim database: drafts could not be claimed,
         # so two concurrent publish-draft runs could sign two posts
         _add_draft_column(conn, "claimed_at", "REAL")
-    if draft_columns and "claim_token" not in draft_columns:
+    if draft_columns and "claim_token" not in _table_columns(conn, "drafts"):
         # the claim's owner token, so only the publisher that won
         # the claim can refresh or release it
         _add_draft_column(conn, "claim_token", "TEXT")
-    purged_columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(purged_posts)").fetchall()
-    }
+    purged_columns = _table_columns(conn, "purged_posts")
     if purged_columns and "linked" not in purged_columns:
         # migrate a pre-provenance database: purge records made
         # before the linked flag existed cannot prove a chain
         # position, so they bridge nothing — the column defaults to 0.
         _add_column(conn, "purged_posts", "linked", "INTEGER NOT NULL DEFAULT 0")
-    if purged_columns and "target" not in purged_columns:
+    if purged_columns and "target" not in _table_columns(conn, "purged_posts"):
         # migrate a pre-target database: records made before the
         # target was carried cannot name the deleted original, so an
         # edit record stays unbacked until it is re-recorded.
         _add_column(conn, "purged_posts", "target", "TEXT NOT NULL DEFAULT ''")
-    if purged_columns and "restored" not in purged_columns:
+    if purged_columns and "restored" not in _table_columns(conn, "purged_posts"):
         # migrate a pre-provenance database: records made before the
         # restored flag existed were all made locally, so they count
         # as verified — the column defaults to 0.
