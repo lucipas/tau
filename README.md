@@ -130,10 +130,15 @@ Opening a peer in the console clears its badge; read receipts to the sender
 are a separate feature and do not exist yet. A single conversation can be
 muted with `tau mute --peer alice` (or for a while with `--for 1h`), and a
 channel with `tau mute --channel general` — muted conversations still
-receive messages, they just never light the badge. `tau quiet-hours set
+receive messages, they just never light the badge — and pinned to the top
+of the list with `tau pin-conversation --peer alice` (`--group NAME` pins
+a group, `--channel NAME` a joined channel). `tau quiet-hours set
 --start 22:00 --end 07:00` silences the whole badge
 every night instead — while the window is active every conversation counts
-as unread 0, and the counts come back when it ends.
+as unread 0, and the counts come back when it ends. The Chat tab has a
+search box above the conversation list: it searches stored DM and group
+messages by keyword (`/api/messages/search`) and opening a result jumps
+to that conversation.
 
 The same bridge is the local integration point for scripts:
 
@@ -374,11 +379,14 @@ Global options may appear before or after the command:
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau messages prune --older-than 90d` | Delete stored messages older than a cutoff (`--peer`, `--group`, `--dry-run`) |
 | `tau note TEXT` | Save a private note to self in the local inbox (never sent; list with `tau messages --kind note`) |
-| `tau draft save --to PEER TEXT` | Save an unsent message as a draft for a peer (`--group NAME` drafts for a group instead; one draft per conversation, saving again overwrites; local-only, never sent until `draft send`) |
+| `tau draft save --to PEER TEXT` | Save an unsent message as a draft for a peer (`--group NAME` drafts for a group, `--channel NAME` for a joined channel; one draft per conversation, saving again overwrites; local-only, never sent until `draft send`) |
 | `tau draft list` | List saved message drafts with a text preview |
-| `tau draft show --to PEER` | Print a saved draft's full text (`--group NAME` for a group draft) |
-| `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft) |
-| `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group) |
+| `tau draft show --to PEER` | Print a saved draft's full text (`--group NAME` for a group draft, `--channel NAME` for a channel draft) |
+| `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft, `--channel NAME` for a channel draft) |
+| `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group, `--channel NAME` into a channel) |
+| `tau pin-conversation --peer PEER` | Pin a conversation so it stays at the top of the conversation list (`--group NAME` pins a group, `--channel NAME` a joined channel; local-only, idempotent) |
+| `tau unpin-conversation --peer PEER` | Remove the pin from a conversation (`--group NAME` / `--channel NAME` for a group or channel pin) |
+| `tau pinned-conversations` | List pinned conversations, newest pin first |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -418,7 +426,7 @@ Global options may appear before or after the command:
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message and unread counts |
-| `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message) |
+| `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message; `--expire 30s` makes it a disappearing message, purged from members' stores after the duration; a per-channel default from `tau disappearing --channel` fills the expiry in when no `--expire` is passed) |
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
 | `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
 | `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
@@ -482,6 +490,8 @@ tau outbox
 # Broadcast lists: one message, many private DMs (no shared group)
 tau broadcast create team --peer alice --peer bob
 tau broadcast send team "meet at noon"
+# The web console has the same lists: Chat → Broadcasts, for
+# creating a list, sending to it, and deleting it.
 
 # Read back messages this node received (newest first)
 tau messages
@@ -686,10 +696,19 @@ expiry travels inside the encrypted payload — and inside the signed
 sealed envelope for relayed mail, so a holder cannot extend it — the
 receiver shows the deadline and purges the message once it passes, and
 a queued copy (and any sealed copy deposited from it) expires on the
-same schedule. The web console composer has the same picker. Honest
+same schedule. The web console composer has the same picker.
+`tau group send` takes the same `--expire`, and `tau channel send
+--expire 1h` does the same for a channel message — the expiry rides
+the message as an unsigned field, so an older node still verifies and
+shows it (it just never purges it), while a current node drops it on
+receipt once expired and purges it from its store. `tau disappearing
+[--peer PEER | --group GROUP | --channel NAME] [DURATION | --off]`
+sets a standing default (at most 7d) for one conversation, filled in
+whenever a send passes no explicit `--expire`; the console Settings
+page edits the same defaults. Honest
 caveat: expiry is cooperative — a modified client can keep copies, so
-this is hygiene, not a guarantee. Tan posts are public signed chains
-and never expire; tombstones already cover their removal.
+this is hygiene, not a guarantee. Tan posts take the same `--expire`
+on `tau tan post` (at most 7d); tombstones already cover their removal.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

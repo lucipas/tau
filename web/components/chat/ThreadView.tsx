@@ -38,6 +38,10 @@ export interface ThreadViewProps {
   onClosePoll?: (message: ChatMessage) => void;
   onSend: (text: string, opts: ComposerSendOptions) => Promise<void> | void;
   onSendFile: (file: File, opts: Omit<ComposerSendOptions, "pollOptions">) => Promise<void> | void;
+  /** A saved draft to load into the composer (set when its conversation opens). */
+  draftSeed?: { key: string; text: string } | null;
+  /** Park the composer's text as a draft for this conversation. */
+  onSaveDraft?: (text: string) => Promise<void> | void;
   onBack: () => void;
   onOpenPeerPanel?: () => void;
 }
@@ -59,6 +63,8 @@ export default function ThreadView({
   onClosePoll,
   onSend,
   onSendFile,
+  draftSeed,
+  onSaveDraft,
   onBack,
   onOpenPeerPanel,
 }: ThreadViewProps) {
@@ -152,6 +158,8 @@ export default function ThreadView({
         editing={editing}
         onCancelEdit={() => onEditingChange?.(null)}
         allowPoll
+        draftSeed={draftSeed}
+        onSaveDraft={onSaveDraft}
         onSend={onSend}
         onSendFile={onSendFile}
       />

@@ -164,8 +164,9 @@ beforeEach(() => {
         channels: [
           { channel: "mesh-general", joined_at: 900, unread: 3 },
           { channel: "quiet-net", joined_at: 800, unread: 0, muted: true },
+          { channel: "mesh-radio", joined_at: 800, pinned: true, unread: 0 },
         ],
-        count: 2,
+        count: 3,
       };
     }
     return { ok: true };
@@ -261,6 +262,22 @@ describe("ChannelsSection", () => {
     fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
+  });
+
+  it("marks a pinned channel and pins the selected one", async () => {
+    render(<ChannelsSection />);
+    expect(await screen.findByRole("button", { name: "📌 #mesh-radio" })).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+    await waitFor(() => expect(calls).toContain("POST /api/conversations/pin"));
+  });
+
+  it("offers Unpin for a pinned selected channel", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "📌 #mesh-radio" }));
+    expect(screen.getByRole("button", { name: "Unpin" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Unpin" }));
+    await waitFor(() => expect(calls).toContain("POST /api/conversations/pin"));
   });
 
   it("shows scheduled messages for the selected channel with cancel", async () => {

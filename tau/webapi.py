@@ -21,6 +21,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/conversations/archived archived DM conversations
     POST /api/conversations/archive archive ``{"target": "<name, hash or prefix>"}``
     POST /api/conversations/unarchive unarchive ``{"target": "<name, hash or prefix>"}``
+    GET  /api/conversations/pinned pinned conversations, newest pin first
+    POST /api/conversations/pin pin/unpin ``{"peer"|"group"|"channel": "...", "pinned": true}``
     GET  /api/groups       known group DMs with their member lists
     POST /api/groups       create ``{"name": "...", "members": ["<hash>", ...]}``
     POST /api/groups/delete delete ``{"group": "<id | prefix | name>"}``
@@ -31,6 +33,10 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/groups/join-requests pending join requests for groups this node created
     POST /api/groups/approve-join approve ``{"group": "<name>", "peer": "<hash>"}``
     POST /api/groups/deny-join deny ``{"group": "<name>", "peer": "<hash>"}``
+    GET  /api/groups/invite the stored invite state for a group this node created (mode, generation, last minted link)
+    POST /api/groups/invite mint an invite link ``{"group": "...", "mode": "open"|"closed"}`` (mode optional; defaults to the stored mode, or "open")
+    POST /api/groups/invite/revoke invalidate every invite minted for a group ``{"group": "..."}``
+    POST /api/groups/join join a group with an invite link ``{"link": "tau://invite/..."}``
     POST /api/groups/vote vote on a group poll ``{"group": "...", "poll": "<wire id>", "option": <1-based number or exact text>}``
     POST /api/groups/close-poll close a group poll you created ``{"group": "...", "poll": "<wire id>"}``
     POST /api/dm/vote vote on a DM poll ``{"to": "...", "poll": "<wire id>", "option": <1-based number or exact text>}``
@@ -41,6 +47,11 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/ignore ignore ``{"group": "..."}``
     POST /api/groups/unignore unignore ``{"group": "..."}``
     GET  /api/groups/left   groups this node has left, plus ignored groups
+    GET  /api/broadcasts   saved broadcast lists with their member lists
+    POST /api/broadcasts   create ``{"name": "...", "members": ["<hash>", ...]}``
+    POST /api/broadcasts/delete delete ``{"broadcast": "<name>"}``
+    POST /api/broadcasts/send send ``{"broadcast": "<name>", "text": "..."}`` —
+                           one DM per member, per-member results in reply
     GET  /api/messages     recent inbound/outbound messages
                            (``?pinned=1`` lists pinned messages only,
                            across the whole console log)
@@ -51,7 +62,9 @@ script) can read what arrives from the mesh and send messages back:
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
                            (one outbound entry per member; ``"reply_to"``,
                            ``"expires_in"`` and ``"send_in"`` work for DM and group sends;
-                           ``"poll_options"`` posts the text as a poll question)
+                           ``"poll_options"`` posts the text as a poll question;
+                           ``"location": {"lat": .., "lon": .., "name": ..}`` pins a place —
+                           a pin without text reads as the place name or the coordinates)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -66,6 +79,14 @@ script) can read what arrives from the mesh and send messages back:
                            or retract ``{"target": "<wire id>", "clear": true}``
     POST /api/typing       typing ``{"peer": "<hash>", "state": "start"|"stop"}``
                            or ``{"group": "<id>", "state": "start"|"stop"}``
+    GET  /api/beacons      live beacons this node is sharing, active first
+    POST /api/beacons/start start a live beacon ``{"peer": "<name or hash>", "lat": ..,
+                           "lon": .., "name": "..", "duration_seconds": 3600,
+                           "coarse": false}`` (or ``"group"`` for a group);
+                           the browser feeds fresh positions afterwards
+    POST /api/beacons/stop stop a live beacon ``{"id": "<beacon id>"}``
+    POST /api/beacons/position feed a beacon a fresh position
+                           ``{"id": "<beacon id>", "lat": .., "lon": .., "name": ".."}``
     POST /api/messages/delete delete ``{"id": <console message id>}`` from
                            the console history (and the node inbox, when the
                            message carries a wire id)
@@ -83,11 +104,27 @@ script) can read what arrives from the mesh and send messages back:
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
+    GET  /api/drafts       saved message drafts (``tau draft save``)
+    POST /api/drafts       save a message draft ``{"kind": "peer"|"group",
+                           "target": "<hash>", "text": "..."}``
+    POST /api/drafts/delete discard a message draft ``{"kind", "target"}``
     GET  /api/messages/muted muted DM conversations, groups and channels
     POST /api/messages/mute mute ``{"peer": "<name or hash>"}``,
                            ``{"group": "<id | prefix | name>"}`` or
                            ``{"channel": "<name>"}``
                            (``"muted": false`` unmutes)
+    GET  /api/settings/away-message away auto-reply (``enabled``,
+                           ``message``, ``since``) plus how many peers
+                           have received a reply this period
+    POST /api/settings/away-message set the reply ``{"enabled": true,
+                           "message": "..."}``; omitted fields keep
+                           their stored value
+    GET  /api/settings/quiet-hours quiet-hours window (``enabled``,
+                           ``start``/``end`` HH:MM) plus whether it is
+                           quiet now and minutes until the window ends
+    POST /api/settings/quiet-hours set the window ``{"enabled": true,
+                           "start": "22:00", "end": "07:00"}``;
+                           omitted fields keep their stored value
     GET  /api/messages/requests list DMs held for review from peers
                            outside the allow-list
     POST /api/messages/requests/accept accept ``{"id": "<request id>"}``:
@@ -118,6 +155,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/allowlist/set-enabled turn enforcement ``{"enabled": true}`` on/off
     POST /api/announce     announce this node immediately
     POST /api/id/rename    rename this node (live name + re-announce)
+    GET  /api/profile      this node's published public profile
+                           (display name, bio, avatar, links, version)
+    POST /api/profile      publish a new version of it
+                           (``{"name": ..., "bio": ..., "avatar": ...,
+                           "links": [...]}``; omitted fields keep their
+                           stored value)
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
     GET  /api/tan/tags     tags in stored posts, most-used first
@@ -129,7 +172,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
-    POST /api/tan/posts    publish a Tan post
+    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
     POST /api/tan/schedule schedule a Tan post for later
     GET  /api/tan/scheduled queued Tan posts, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
@@ -167,7 +210,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/channels/pins  pinned messages for a channel (``?channel=<name>``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
-    POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?}``)
+    POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?}``; ``expires_in`` seconds, at most 30d)
     POST /api/channels/schedule  schedule a channel message for later
     GET  /api/channels/scheduled  queued channel messages, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message
@@ -241,6 +284,7 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .drafts import DRAFT_KINDS, DraftStore
 from .muted import (
     MutedError,
     expand_muted_groups,
@@ -252,7 +296,21 @@ from .muted import (
     muted_peers_for,
     save_muted,
 )
-from .quiet_hours import quiet_hours_active
+from .pinned import (
+    PinnedError,
+    load_pinned,
+    load_pinned_set,
+    pinned_lock,
+    save_pinned,
+)
+from .quiet_hours import (
+    QuietHours,
+    QuietHoursError,
+    load_quiet_hours,
+    quiet_hours_active,
+    quiet_hours_lock,
+    save_quiet_hours,
+)
 from .dm_requests import (
     DmRequestsError,
     accept_dm_request as accept_held_dm_request,
@@ -260,14 +318,28 @@ from .dm_requests import (
     decline_dm_request as decline_held_dm_request,
     list_dm_requests,
 )
+from .away import AwayError, AwayState, away_lock, load_away, save_away
 from .backup import BackupError, create_backup
+from .beacons import (
+    BEACON_DEFAULT_DURATION,
+    BEACON_MAX_DURATION,
+    Beacon,
+    BeaconsError,
+    beacons_lock,
+    load_beacons,
+    save_beacons,
+)
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
     ARCHIVED_FILE_NAME,
+    AWAY_FILE_NAME,
     DISAPPEARING_FILE_NAME,
+    DRAFTS_FILE_NAME,
     MESSAGES_FILE_NAME,
     MUTED_FILE_NAME,
+    PINNED_FILE_NAME,
+    PROFILE_FILE_NAME,
     QUIET_HOURS_FILE_NAME,
     accept_files_enabled,
     send_read_receipts_enabled,
@@ -284,7 +356,15 @@ from .channel_polls import (
     poll_identity as channel_poll_identity,
     resolve_channel_poll,
 )
-from .group_invites import list_join_requests
+from .group_invites import (
+    JOIN_REQUEST_KIND,
+    InviteError,
+    invite_status,
+    list_join_requests,
+    mint_invite,
+    parse_invite_link,
+    revoke_invites,
+)
 from .groups import GroupStore, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
@@ -308,7 +388,16 @@ from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError, safety_number
-from .profile import public_profile
+from .profile import (
+    ProfileError,
+    build_profile,
+    clean_bio,
+    clean_links,
+    load_local_profile,
+    public_profile,
+    resolve_avatar,
+    save_local_profile,
+)
 from .protocol import (
     MAX_FILE_BYTES,
     MAX_MAIL_TTL,
@@ -322,12 +411,13 @@ from .protocol import (
     clean_location,
     clean_reaction,
     excerpt_hash,
+    location_default_text,
     normalize_message,
     sanitize_file_name,
     sanitize_name,
     short_hash,
 )
-from .util import atomic_write_json, read_json
+from .util import atomic_write_json, ensure_dir, read_json
 
 log = logging.getLogger(__name__)
 
@@ -1184,6 +1274,26 @@ class WebBridge:
 
         node.on_typing = _on_typing
 
+        # Beacon updates arrive on the same node callback pattern:
+        # chain any callback the node already has, then record the
+        # update in the console history like any other sent message
+        # (see :meth:`record_beacon_update`).  The callback runs in
+        # the mail loop for later updates as well as for the first
+        # one, so the sender's thread shows every update, not just
+        # the one the start call sent.
+        previous_on_beacon_update = getattr(node, "on_beacon_update", None)
+
+        def _on_beacon_update(
+            beacon: Beacon, result: Dict[str, Any]
+        ) -> None:
+            try:
+                if callable(previous_on_beacon_update):
+                    previous_on_beacon_update(beacon, result)
+            finally:
+                self.record_beacon_update(beacon, result)
+
+        node.on_beacon_update = _on_beacon_update
+
         # Edits arrive on the same node callback pattern: chain any edit
         # callback the node already has, then update the console history
         # entry the edit targets.
@@ -1223,6 +1333,15 @@ class WebBridge:
         self._disappearing_lock = threading.Lock()
         # Serializes mute/unmute read-modify-write cycles the same way.
         self._muted_lock = threading.Lock()
+        # Serializes profile read-modify-write cycles the same way, so
+        # concurrent console saves cannot publish two versions at once.
+        self._profile_lock = threading.Lock()
+        # Serializes away-message read-modify-write cycles the same way.
+        self._away_lock = threading.Lock()
+        # Serializes pin/unpin read-modify-write cycles the same way.
+        self._pinned_lock = threading.Lock()
+        # Serializes quiet-hours read-modify-write cycles the same way.
+        self._quiet_hours_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -1767,6 +1886,7 @@ class WebBridge:
             poll_options=record.get("poll_options"),
             poll_vote=record.get("poll_vote"),
             poll_close=record.get("poll_close"),
+            location=record.get("location"),
             reject_removed_wire_id=True,
         )
         if message is None:
@@ -1775,6 +1895,24 @@ class WebBridge:
             # landed, and appending now would resurrect it after a
             # successful retraction.
             return None
+        # A location pin and a live-beacon marker ride on the entry
+        # so the feed can render the pin with its map link and tell
+        # a live update from a one-off pin; a malformed value drops
+        # instead of the entry (the message is still readable).
+        # The append itself carries neither (see
+        # :meth:`_append_message`), so they are attached here and
+        # saved, like the reaction overlay below.
+        attached = False
+        location = clean_location(record.get("location"))
+        if location is not None and message.get("location") != location:
+            message["location"] = location
+            attached = True
+        marker = clean_beacon(record.get("beacon"))
+        if marker is not None and message.get("beacon") != marker:
+            message["beacon"] = marker
+            attached = True
+        if attached:
+            self._save_messages()
         # An edit that overtook this callback was buffered by record_edit;
         # apply it now so the appended entry shows the current text.
         if isinstance(wire_id, str) and peer_hash:
@@ -3321,10 +3459,22 @@ class WebBridge:
         *,
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
+        image: Optional[str] = None,
     ) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        if image is not None and reply_to is not None:
+            raise ValueError(
+                "an image can only be attached to a top-level post, not a reply"
+            )
+        image_attachment: Optional[Dict[str, Any]] = None
+        if image is not None:
+            from .tangents.tan import image_attachment_from_data_url
+
+            image_attachment = image_attachment_from_data_url(
+                image, Path(self._tan_db_path()).parent
+            )
         if reply_to is not None:
             conn = self._tan_conn()
             try:
@@ -3337,7 +3487,11 @@ class WebBridge:
         if expires_in is not None:
             expires_at = time.time() + float(expires_in)
         return app.create_post(
-            text, reply_to=reply_to, publish=True, expires_at=expires_at
+            text,
+            reply_to=reply_to,
+            publish=True,
+            expires_at=expires_at,
+            image=image_attachment,
         )
 
     def tan_schedule_post(
@@ -3896,7 +4050,7 @@ class WebBridge:
         )
 
     def channel_list(self) -> List[Dict[str, Any]]:
-        """Joined channels, most recently joined first, with unread counts.
+        """Joined channels, most recently joined first, pinned first, with unread counts.
 
         A muted channel carries ``muted: True`` and an unread count
         of 0 — the count path already excludes it — so the console
@@ -3904,11 +4058,14 @@ class WebBridge:
         """
         app = self._local_channel_app()
         memberships = app.memberships()
+        pinned = load_pinned_set(self._pinned_path(), "channel")
         unread = app.unread_counts()
         muted = self._muted_channels()
         for membership in memberships:
+            membership["pinned"] = membership.get("channel") in pinned
             membership["unread"] = unread.get(membership["channel"], 0)
             membership["muted"] = membership["channel"] in muted
+        memberships.sort(key=lambda item: not item["pinned"])
         return memberships
 
     def channel_messages(
@@ -4067,19 +4224,33 @@ class WebBridge:
         return {"channel": clean_channel_name(channel), "left": left}
 
     def channel_send(
-        self, channel: str, text: str, *, reply_to: Optional[str] = None
+        self,
+        channel: str,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        expires_in: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send *text* to a joined channel, gossiping it to peers.
 
         ``reply_to`` is a parent message's hash or unique hex prefix
         in the same channel.
+
+        *expires_in* is an optional disappearing lifetime in seconds;
+        without one, a per-channel disappearing default fills the
+        expiry in, exactly like the CLI's ``tau channel send``.
         """
         app = self._channel_app()
         if app is None:
             raise WebBridgeError(
                 "public channels are not enabled; run serve --channels"
             )
-        return app.send(channel, text, publish=True, reply_to=reply_to)
+        expires_at = None
+        if expires_in is not None:
+            expires_at = time.time() + float(expires_in)
+        return app.send(
+            channel, text, publish=True, reply_to=reply_to, expires_at=expires_at
+        )
 
     def channel_edit(
         self, channel: str, target: str, text: str
@@ -4802,6 +4973,181 @@ class WebBridge:
         """
         return self.node.deny_join_request(group, peer)
 
+    def _resolve_invite_group(self, group: str) -> Tuple[Dict[str, Any], str]:
+        """Find a group and check this node created it.
+
+        Returns the group record and this node's destination hash.
+        Raises ``ValueError`` for an unknown group or a non-creator
+        caller — the same rule the CLI enforces for minting invites.
+        """
+        if not isinstance(group, str) or not group.strip():
+            raise ValueError("field 'group' is required")
+        found = self.node.groups.find(group.strip())
+        own_hash = self.node.destination_hexhash
+        if not found.get("local") or found.get("creator") != own_hash:
+            raise ValueError(
+                "only the creator can manage invite links for a group"
+            )
+        return found, own_hash
+
+    def group_invite_status(self, group: str) -> Dict[str, Any]:
+        """The invite state for a group this node created.
+
+        Returns the described group plus the stored mode, the
+        generation, and the last minted link (``None`` when nothing
+        was minted yet).  Creator-only: the link is a shareable
+        secret the creator hands out.  Raises ``ValueError`` for an
+        unknown group or a non-creator caller.
+        """
+        found, _own_hash = self._resolve_invite_group(group)
+        status = invite_status(
+            self.node.config.invites_path, group_name=found["name"]
+        )
+        return {
+            "group": self._describe_group(found),
+            "mode": status["mode"] if status is not None else "open",
+            "generation": status["generation"] if status is not None else 0,
+            "link": status["link"] if status is not None else None,
+        }
+
+    def mint_group_invite(
+        self, group: str, mode: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Mint (or re-mint) an invite link for a group this node created.
+
+        Mirrors ``tau group invite``: *mode* is ``"open"`` or
+        ``"closed"`` and defaults to the stored mode, or ``"open"``
+        when nothing was minted yet.  Minting never invalidates
+        older tokens; only :meth:`revoke_group_invites` does.
+        Raises ``ValueError`` for an unknown group, a non-creator
+        caller, a bad mode, or a missing local identity.
+        """
+        from .identity import destination_hash, load_identity
+
+        found, own_hash = self._resolve_invite_group(group)
+        config = self.node.config
+        if mode is not None and (not isinstance(mode, str) or not mode.strip()):
+            raise ValueError("field 'mode' must be 'open' or 'closed'")
+        identity = load_identity(config.identity_path)
+        if identity is None:
+            raise ValueError(
+                f"no identity at {config.identity_path}; run `tau init` first"
+            )
+        if destination_hash(identity).hex() != own_hash:
+            raise ValueError("local identity does not match this node")
+        stored = invite_status(config.invites_path, group_name=found["name"])
+        try:
+            link = mint_invite(
+                config.invites_path,
+                identity,
+                group_name=found["name"],
+                creator_hash=own_hash,
+                mode=(
+                    mode.strip()
+                    if mode is not None
+                    else (stored["mode"] if stored is not None else "open")
+                ),
+            )
+        except InviteError as exc:
+            raise ValueError(str(exc)) from exc
+        status = invite_status(config.invites_path, group_name=found["name"])
+        return {
+            "group": self._describe_group(found),
+            "link": link,
+            "mode": status["mode"] if status is not None else "open",
+            "generation": status["generation"] if status is not None else 0,
+        }
+
+    def revoke_group_invites(self, group: str) -> Dict[str, Any]:
+        """Invalidate every invite minted for a group this node created.
+
+        Mirrors ``tau group invite --revoke``: bumps the stored
+        generation, so every token minted so far stops verifying,
+        and drops the stored link.  Raises ``ValueError`` for an
+        unknown group or a non-creator caller.
+        """
+        found, _own_hash = self._resolve_invite_group(group)
+        generation = revoke_invites(
+            self.node.config.invites_path, group_name=found["name"]
+        )
+        return {"group": self._describe_group(found), "generation": generation}
+
+    def join_group_via_link(
+        self, link: str, *, timeout: float = 20.0
+    ) -> Dict[str, Any]:
+        """Join a group with an invite link, from the console.
+
+        Mirrors ``tau group join``: the link is sent as a
+        ``group-join-request`` DM to the creator named in the token.
+        An open group adds this node at once (the roster is pinned
+        locally from the reply), a closed group leaves the request
+        pending, and an unreachable creator leaves the request queued
+        for the store-and-forward path to decide when it arrives.
+        Returns ``{"status": ..., "group": ...}`` where status is
+        ``added``, ``already_member``, ``pending`` or ``queued``.
+        Raises ``ValueError`` for a malformed link, a failed request,
+        or an unexpected reply; send failures surface as
+        ``NodeError``/``MailboxError`` for the route handler.
+        """
+        if not isinstance(link, str) or not link.strip():
+            raise ValueError("field 'link' is required")
+        try:
+            token = parse_invite_link(link.strip())
+        except InviteError as exc:
+            raise ValueError(str(exc)) from exc
+        mailbox = getattr(self.node, "mailbox", None)
+        queued_before = (
+            {entry.id for entry in mailbox.outbox_list()}
+            if mailbox is not None
+            else set()
+        )
+        response = self.node.send_message(
+            token["creator"],
+            link.strip(),
+            timeout=timeout,
+            kind=JOIN_REQUEST_KIND,
+        )
+        if not isinstance(response, dict):
+            raise ValueError(f"unexpected join reply: {response!r}")
+        # A "queued" claim only counts with a fresh local outbox id —
+        # the same guard ``tau send`` applies, so a peer cannot fake
+        # a queued delivery with an arbitrary id.
+        if response.get("queued") and (
+            isinstance(response.get("id"), str)
+            and response["id"] not in queued_before
+        ):
+            return {"status": "queued", "group": token["group"]}
+        if not response.get("ok"):
+            error = response.get("error") or {}
+            message = (
+                error.get("message")
+                if isinstance(error, dict) and error.get("message")
+                else "join request failed"
+            )
+            raise ValueError(f"join request failed: {message}")
+        status = response.get("status")
+        group = (
+            response.get("group")
+            if isinstance(response.get("group"), dict)
+            else {}
+        )
+        if status in ("added", "already_member") and group.get("id"):
+            pinned = self.node.groups.record(
+                group["id"],
+                group.get("name", ""),
+                list(group.get("members", [])),
+                creator=group.get("creator", ""),
+                sender=group.get("creator", ""),
+                sent_at=time.time(),
+            )
+            described = (
+                self._describe_group(pinned) if pinned is not None else group
+            )
+            return {"status": status, "group": described}
+        if status == "pending" and group.get("id"):
+            return {"status": "pending", "group": group}
+        raise ValueError(f"unexpected join reply: {response!r}")
+
     def accept_dm_request(self, ref: str) -> Dict[str, Any]:
         """Accept one held DM request: allow-list the sender, deliver the message.
 
@@ -5100,6 +5446,7 @@ class WebBridge:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Send a DM from the console.
 
@@ -5114,11 +5461,27 @@ class WebBridge:
         it.  ``poll_vote`` and ``poll_close`` are the same send for a
         vote and a close (used by :meth:`send_dm_poll_vote` and
         :meth:`close_dm_poll`); at most one of the three may be set.
+
+        ``location`` pins a place on the message (``{"lat": ..,
+        "lon": .., "name": ..}``); a pin sent without its own text
+        reads as the place name (or the coordinates), exactly like
+        the CLI's ``--location``.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
+        cleaned_location: Optional[Dict[str, Any]] = None
+        if location is not None:
+            cleaned_location = clean_location(location)
+            if cleaned_location is None:
+                raise ValueError(
+                    "location must have a latitude -90..90 and a "
+                    "longitude -180..180"
+                )
         if not isinstance(text, str) or not text.strip():
-            raise ValueError("message text is required")
+            if cleaned_location is not None:
+                text = location_default_text(cleaned_location)
+            else:
+                raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
         if expires_at is not None:
@@ -5192,6 +5555,7 @@ class WebBridge:
             poll_options=cleaned_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            location=cleaned_location,
         )
         queued = bool(response.get("queued"))
         # Record the effective expiry (explicit or per-conversation
@@ -5224,6 +5588,7 @@ class WebBridge:
                 poll_options=cleaned_options,
                 poll_vote=poll_vote,
                 poll_close=poll_close,
+                location=cleaned_location,
             )
             if message is None:
                 # The send was retracted while its console record was
@@ -5283,6 +5648,7 @@ class WebBridge:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a message to every member of a group from the console.
 
@@ -5311,6 +5677,11 @@ class WebBridge:
         :meth:`close_group_poll`); at most one of the three may be
         set.
 
+        ``location`` pins a place on every leg (``{"lat": ..,
+        "lon": .., "name": ..}``); a pin sent without its own text
+        reads as the place name (or the coordinates), exactly like
+        the CLI's ``--location``.
+
         The group is resolved by id, id prefix, or exact name through
         ``GroupStore.find`` (unknown or ambiguous queries raise
         ``ValueError``).  One outbound feed entry is recorded per leg,
@@ -5328,8 +5699,19 @@ class WebBridge:
         """
         if not isinstance(group, str) or not group.strip():
             raise ValueError("target group is required")
+        cleaned_location: Optional[Dict[str, Any]] = None
+        if location is not None:
+            cleaned_location = clean_location(location)
+            if cleaned_location is None:
+                raise ValueError(
+                    "location must have a latitude -90..90 and a "
+                    "longitude -180..180"
+                )
         if not isinstance(text, str) or not text.strip():
-            raise ValueError("message text is required")
+            if cleaned_location is not None:
+                text = location_default_text(cleaned_location)
+            else:
+                raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
         if expires_at is not None:
@@ -5401,6 +5783,7 @@ class WebBridge:
             poll_options=cleaned_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            location=cleaned_location,
         )
         # Every leg shares one wire send time (the node's send_group_
         # message returns it): record that on each outbound entry, not
@@ -5455,6 +5838,7 @@ class WebBridge:
                     poll_options=cleaned_options,
                     poll_vote=poll_vote,
                     poll_close=poll_close,
+                    location=cleaned_location,
                 )
                 if message is None:
                     # This leg was retracted while its console record
@@ -5492,6 +5876,267 @@ class WebBridge:
                 self._publish_message_updated(message)
             messages.append(message)
         return messages, response
+
+    # -- live location beacons ------------------------------------------
+
+    def _beacons_path(self) -> Optional[Path]:
+        """This node's beacons path, or ``None`` for a dataless node."""
+        path = getattr(self.node.config, "beacons_path", None)
+        return Path(path) if path is not None else None
+
+    def _beacon_position_path(self, beacon_id: str) -> Optional[Path]:
+        """Where this beacon's browser-fed position file lives.
+
+        One file per beacon under ``beacon-positions/`` next to
+        ``beacons.json``: the serving node's mail loop re-reads it
+        on every tick, so the browser's geolocation moves the beacon
+        without the bridge touching the beacon store each time.  A
+        beacon the CLI started with its own ``--location-file`` keeps
+        that file instead — the console never writes into a file
+        another writer owns (see :meth:`update_beacon_position`).
+        """
+        base = self._beacons_path()
+        if base is None:
+            return None
+        return base.parent / "beacon-positions" / f"{beacon_id}.json"
+
+    @staticmethod
+    def _beacon_summary(
+        beacon: Beacon, now: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """A beacon as JSON: its schedule, position and live state."""
+        now = time.time() if now is None else now
+        summary = beacon.to_dict()
+        summary["active"] = beacon.is_active(now)
+        summary["expires_in_seconds"] = max(0.0, beacon.expires_at - now)
+        return summary
+
+    def list_beacons(self) -> Dict[str, Any]:
+        """Every beacon this node owns, active first, with live state."""
+        path = self._beacons_path()
+        if path is None:
+            return {"beacons": [], "count": 0}
+        with beacons_lock(path):
+            stored = load_beacons(path)
+            now = time.time()
+            summaries = [
+                self._beacon_summary(beacon, now)
+                for beacon in sorted(
+                    stored.beacons.values(),
+                    key=lambda b: (not b.is_active(now), b.started_at),
+                )
+            ]
+        return {"beacons": summaries, "count": len(summaries)}
+
+    def start_beacon(
+        self,
+        target: str,
+        location: Dict[str, Any],
+        *,
+        group: bool = False,
+        coarse: bool = False,
+        duration: float = BEACON_DEFAULT_DURATION,
+    ) -> Dict[str, Any]:
+        """Start a live beacon from the console and send its first update.
+
+        Mirrors ``tau beacon start`` (see :func:`tau.cli._beacon_start_local`):
+        the beacon is stored, its first update goes out at once, and
+        later updates go out from the mail loop.  The browser feeds
+        fresh positions afterwards through :meth:`update_beacon_position`,
+        which writes the position file the tick re-reads — so the
+        beacon follows the sender instead of repeating its start
+        position.  ``duration`` is seconds (60s..8h, default 1h).
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer or group is required")
+        cleaned = clean_location(location)
+        if cleaned is None:
+            raise ValueError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(duration)
+        ):
+            raise ValueError("duration_seconds must be a number")
+        duration = float(duration)
+        if not 60.0 <= duration <= BEACON_MAX_DURATION:
+            raise ValueError(
+                "duration_seconds must be between 60 and "
+                f"{int(BEACON_MAX_DURATION)}"
+            )
+        beacon = self.node.start_beacon(
+            target.strip(),
+            cleaned,
+            group=bool(group),
+            coarse=bool(coarse),
+            duration=duration,
+        )
+        # The position file is written before the first update, so
+        # the update already reads through it; a failure here only
+        # logs — the beacon still runs from its start position, and
+        # the next position feed attaches the file then.
+        position_path = self._beacon_position_path(beacon.id)
+        if position_path is not None:
+            try:
+                ensure_dir(position_path.parent)
+                atomic_write_json(position_path, cleaned, mode=0o600)
+                beacon.location_file = str(position_path)
+                path = self._beacons_path()
+                if path is not None:
+                    with beacons_lock(path):
+                        stored = load_beacons(path)
+                        current = stored.get(beacon.id)
+                        if current is not None:
+                            current.location_file = str(position_path)
+                            save_beacons(path, stored)
+            except (OSError, BeaconsError) as exc:
+                log.warning(
+                    "Could not attach a position file to beacon %s: %s",
+                    beacon.id,
+                    exc,
+                )
+        update = self.node.send_beacon_update(beacon)
+        return {"beacon": self._beacon_summary(beacon), "update": update}
+
+    def stop_beacon(self, beacon_id: str) -> Dict[str, Any]:
+        """Stop a live beacon by id.
+
+        An unknown id, or a beacon already stopped or expired,
+        raises ``ValueError``: a stop the caller cannot see taking
+        effect must not read as a success.
+        """
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            raise ValueError("field 'id' is required")
+        path = self._beacons_path()
+        if path is None:
+            raise ValueError(f"unknown beacon: {beacon_id.strip()!r}")
+        beacon_id = beacon_id.strip()
+        with beacons_lock(path):
+            stored = load_beacons(path)
+            stopped = stored.stop_by_id(beacon_id)
+            if stopped is None:
+                raise ValueError(f"unknown beacon: {beacon_id!r}")
+            save_beacons(path, stored)
+        # A console-fed position file is stale once the beacon stops;
+        # drop it.  A CLI beacon's own --location-file is never
+        # under beacon-positions/, so it is left alone.
+        position_path = self._beacon_position_path(beacon_id)
+        if position_path is not None and position_path.is_file():
+            try:
+                position_path.unlink()
+            except OSError:
+                pass
+        return {"beacon": self._beacon_summary(stopped)}
+
+    def update_beacon_position(
+        self, beacon_id: str, location: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Feed a running beacon a fresh position from the browser.
+
+        Writes the beacon's position file (creating the console's
+        own one when the beacon has none yet), so the next mail-loop
+        tick sends the new position.  A beacon whose position comes
+        from another writer's file is refused: the console must not
+        clobber a GPS writer it does not own.
+        """
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            raise ValueError("field 'id' is required")
+        cleaned = clean_location(location)
+        if cleaned is None:
+            raise ValueError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
+        path = self._beacons_path()
+        if path is None:
+            raise ValueError(f"unknown beacon: {beacon_id.strip()!r}")
+        beacon_id = beacon_id.strip()
+        position_path = self._beacon_position_path(beacon_id)
+        if position_path is None:
+            raise ValueError("this node has no beacons store")
+        with beacons_lock(path):
+            stored = load_beacons(path)
+            beacon = stored.get(beacon_id)
+            if beacon is None:
+                raise ValueError(f"unknown beacon: {beacon_id!r}")
+            if not beacon.is_active():
+                raise ValueError("beacon is not running")
+            owned = (
+                beacon.location_file is None
+                or Path(beacon.location_file) == position_path
+            )
+            if not owned:
+                raise ValueError(
+                    "this beacon's position comes from another writer"
+                )
+            ensure_dir(position_path.parent)
+            atomic_write_json(position_path, cleaned, mode=0o600)
+            beacon.location = cleaned
+            beacon.location_file = str(position_path)
+            save_beacons(path, stored)
+        return {"beacon": self._beacon_summary(beacon)}
+
+    def record_beacon_update(
+        self, beacon: Beacon, result: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Record one beacon update in the console history.
+
+        Called from the node's ``on_beacon_update`` callback, so the
+        first update and every mail-loop tick alike land in the
+        sender's thread as a live location entry — one entry per
+        update, not one per leg, so a group beacon does not spam the
+        thread once per member.  The entry carries the pin and the
+        beacon marker, so the feed renders it with its map link and
+        live countdown, exactly like a received update.
+        """
+        try:
+            location = beacon.current_location()
+        except BeaconsError as exc:
+            log.warning("Beacon update has no valid position: %s", exc)
+            return None
+        marker = beacon.wire_marker(beacon.updates_sent)
+        text = location_default_text(location)
+        is_group = beacon.target_kind == "group"
+        legs = result.get("results") if isinstance(result, dict) else None
+        if is_group and isinstance(legs, list):
+            queued = all(bool(leg.get("queued")) for leg in legs) if legs else False
+            delivered = any(bool(leg.get("delivered")) for leg in legs)
+            status = "queued" if queued else "delivered" if delivered else "failed"
+            sent_at = result.get("sent_at")
+            if not isinstance(sent_at, (int, float)) or isinstance(
+                sent_at, bool
+            ):
+                sent_at = time.time()
+        else:
+            status = "queued" if result.get("queued") else "delivered"
+            sent_at = time.time()
+        wire_id = result.get("id") if isinstance(result.get("id"), str) else None
+        with self._send_lock:
+            message = self._append_message(
+                direction="out",
+                peer=None if is_group else beacon.target,
+                peer_name=beacon.target_name
+                or short_hash(beacon.target),
+                text=text,
+                sent_at=float(sent_at),
+                received_at=time.time(),
+                status=status,
+                group=beacon.target if is_group else None,
+                group_name=beacon.target_name if is_group else None,
+                wire_id=wire_id if not is_group else None,
+            )
+            if message is None:
+                return None
+            # The append carries no pin or marker (see
+            # :meth:`_append_message`), so they are attached here
+            # and saved, like the reaction overlay in
+            # :meth:`record_inbound`.
+            message["location"] = location
+            message["beacon"] = marker
+            self._save_messages()
+        self.bus.publish({"type": "message", "message": message})
+        return message
 
     def _resolve_group_poll_record(
         self, group_id: str, ref: Any
@@ -8049,6 +8694,12 @@ class WebBridge:
             if row is not None:
                 item["reachable"] = row["reachable"]
                 item["live_hops"] = row["hops"]
+        # Pinned conversations stay at the top; the registry order is
+        # kept within each half, so the sort is stable.
+        pinned = load_pinned_set(self._pinned_path(), "peer")
+        for item in items:
+            item["pinned"] = item.get("destination") in pinned
+        items.sort(key=lambda item: not item["pinned"])
         return items
 
     def mesh(self) -> List[Dict[str, Any]]:
@@ -8406,14 +9057,15 @@ class WebBridge:
     def disappearing_defaults(self) -> Dict[str, Any]:
         """All per-conversation disappearing defaults, for the console load.
 
-        Mirrors the stored file: peer destination hashes and group ids,
-        each mapped to its default lifetime in seconds.  A corrupt file
-        is a 503 — the owner repairs or removes it before the console
-        shows defaults, the same as the archive list.
+        Mirrors the stored file: peer destination hashes, group ids
+        and channel names, each mapped to its default lifetime in
+        seconds.  A corrupt file is a 503 — the owner repairs or
+        removes it before the console shows defaults, the same as
+        the archive list.
         """
         path = self._disappearing_path()
         if path is None:
-            return {"peers": {}, "groups": {}}
+            return {"peers": {}, "groups": {}, "channels": {}}
         try:
             defaults = load_disappearing_defaults(path)
         except DisappearingError as exc:
@@ -8421,39 +9073,57 @@ class WebBridge:
                 "disappearing defaults on disk are unusable; fix or remove them "
                 f"before editing ({exc})"
             ) from exc
-        return {"peers": dict(defaults.peers), "groups": dict(defaults.groups)}
+        return {
+            "peers": dict(defaults.peers),
+            "groups": dict(defaults.groups),
+            "channels": dict(defaults.channels),
+        }
 
     def set_disappearing_default(
         self,
         *,
         peer: Optional[str] = None,
         group: Optional[str] = None,
+        channel: Optional[str] = None,
         seconds: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Set or clear one conversation's disappearing default.
 
-        Exactly one of *peer* (registry name, hash or prefix) or *group*
-        (id, prefix or name) names the conversation; *seconds* is the
-        default lifetime, or ``None`` to clear it.  Mirrors
-        ``tau disappearing``: the list is reloaded inside the lock so
+        Exactly one of *peer* (registry name, hash or prefix), *group*
+        (id, prefix or name) or *channel* (name) names the conversation;
+        *seconds* is the default lifetime, or ``None`` to clear it.
+        Mirrors ``tau disappearing``: the list is reloaded inside the lock so
         two writes racing cannot discard each other's conversation, a
         bad duration is a :class:`ValueError`, and a corrupt file is a
         503.  The node picks the default up on the next send — every
         read reloads the file, so there is no cached copy to refresh.
         """
-        if (peer is None) == (group is None):
-            raise ValueError("exactly one of 'peer' or 'group' is required")
+        provided = [value for value in (peer, group, channel) if value is not None]
+        if len(provided) != 1:
+            raise ValueError(
+                "exactly one of 'peer', 'group' or 'channel' is required"
+            )
         if group is not None:
             if not isinstance(group, str) or not group.strip():
                 raise ValueError("field 'group' is required")
             record = self.node.groups.find(group.strip())
             key = record["id"]
             is_group = True
+            is_channel = False
+        elif channel is not None:
+            if not isinstance(channel, str) or not channel.strip():
+                raise ValueError("field 'channel' is required")
+            from .channels import clean_channel_name
+
+            key = clean_channel_name(channel.strip())
+            is_group = False
+            is_channel = True
         else:
             if not isinstance(peer, str) or not peer.strip():
                 raise ValueError("field 'peer' is required")
             key = self._resolve_block_target(peer.strip())
             is_group = False
+            is_channel = False
         path = self._disappearing_path()
         if path is None:
             raise WebBridgeError("this node has no disappearing-defaults path")
@@ -8473,6 +9143,13 @@ class WebBridge:
                         if seconds is None
                         else current.with_group(key, seconds)
                     )
+                elif is_channel:
+                    previous = current.channel_default(key)
+                    updated = (
+                        current.without_channel(key)
+                        if seconds is None
+                        else current.with_channel(key, seconds)
+                    )
                 else:
                     previous = current.peer_default(key)
                     updated = (
@@ -8490,9 +9167,87 @@ class WebBridge:
         return {
             "target": key,
             "group": is_group,
+            "channel": is_channel,
             "disappearing_seconds": seconds,
             "changed": changed,
         }
+
+    def _drafts_path(self) -> Optional[Path]:
+        """This node's message-drafts path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "drafts_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / DRAFTS_FILE_NAME
+
+    def list_drafts(self) -> Dict[str, Any]:
+        """Saved message drafts, oldest first, with a best-effort name.
+
+        The console resolves a draft's conversation from its own lists,
+        but a draft for a peer with no messages yet is in none of them,
+        so the name is resolved here too: the peer's registry name, the
+        group name, or ``None`` when neither is known.  A dataless node
+        has no drafts file and answers empty instead of failing the
+        console poll.
+        """
+        path = self._drafts_path()
+        if path is None:
+            return {"drafts": [], "count": 0}
+        store = DraftStore(path)
+        names: Dict[str, str] = {}
+        for peer in self.peers():
+            destination = peer.get("destination")
+            if isinstance(destination, str):
+                names[destination] = str(peer.get("name") or destination)
+        for record in self._group_records():
+            group_id = record.get("id")
+            if isinstance(group_id, str):
+                names[group_id] = str(record.get("name") or group_id)
+        drafts = []
+        for draft in store.list_drafts():
+            entry = dict(draft)
+            entry["name"] = names.get(draft["target"])
+            drafts.append(entry)
+        return {"drafts": drafts, "count": len(drafts)}
+
+    def save_draft(self, *, kind: Any, target: Any, text: Any) -> Dict[str, Any]:
+        """Save (or overwrite) the draft for one conversation.
+
+        *kind* is ``"peer"`` or ``"group"`` and *target* is the peer
+        destination hash or group id — the console passes the
+        conversation key straight through, so no name resolution runs
+        here.  A bad kind, target or text is a :class:`ValueError`; a
+        failed write and a dataless node are :class:`WebBridgeError`.
+        """
+        path = self._drafts_path()
+        if path is None:
+            raise WebBridgeError("this node has no drafts path")
+        if not isinstance(kind, str) or not isinstance(target, str):
+            raise ValueError("fields 'kind' and 'target' are required")
+        if kind not in DRAFT_KINDS:
+            raise ValueError(f"unknown draft target kind: {kind!r}")
+        if not isinstance(text, str):
+            raise ValueError("field 'text' is required")
+        store = DraftStore(path)
+        try:
+            return store.save(kind, target, text)
+        except OSError as exc:
+            raise WebBridgeError(f"could not save the draft ({exc})") from exc
+
+    def delete_draft(self, *, kind: Any, target: Any) -> Dict[str, Any]:
+        """Discard the draft for one conversation; ``deleted`` says if one was there."""
+        path = self._drafts_path()
+        if path is None:
+            raise WebBridgeError("this node has no drafts path")
+        if not isinstance(kind, str) or not isinstance(target, str):
+            raise ValueError("fields 'kind' and 'target' are required")
+        if kind not in DRAFT_KINDS:
+            raise ValueError(f"unknown draft target kind: {kind!r}")
+        store = DraftStore(path)
+        return {"deleted": store.delete(kind, target)}
 
     def _muted_path(self) -> Optional[Path]:
         """This node's muted-conversations path, or ``None`` for a dataless node."""
@@ -8505,6 +9260,17 @@ class WebBridge:
             return None
         return data_dir / MUTED_FILE_NAME
 
+    def _pinned_path(self) -> Optional[Path]:
+        """This node's pinned-conversation path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "pinned_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / PINNED_FILE_NAME
+
     def _quiet_hours_path(self) -> Optional[Path]:
         """This node's quiet-hours path, or ``None`` for a dataless node."""
         config = getattr(self.node, "config", None)
@@ -8515,6 +9281,322 @@ class WebBridge:
         if data_dir is None:
             return None
         return data_dir / QUIET_HOURS_FILE_NAME
+
+    def _profile_path(self) -> Optional[Path]:
+        """This node's local-profile path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "profile_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / PROFILE_FILE_NAME
+
+    def own_profile(self) -> Dict[str, Any]:
+        """This node's published public profile, for the console load.
+
+        The display view of the signed document (name, bio, avatar,
+        links, version) plus ``published``.  Nothing published yet
+        reads as the node-name default with ``published`` False and
+        version 0, so the console can seed its form from one shape —
+        the same default ``tau profile set`` starts from.
+        """
+        path = self._profile_path()
+        doc = load_local_profile(path) if path is not None else None
+        if doc is not None:
+            return {**public_profile(doc), "published": True}
+        config = getattr(self.node, "config", None)
+        return {
+            "author": None,
+            "name": getattr(config, "name", None) or "",
+            "bio": "",
+            "avatar": None,
+            "links": [],
+            "version": 0,
+            "created_at": None,
+            "published": False,
+        }
+
+    def set_own_profile(
+        self,
+        *,
+        name: Optional[Any] = None,
+        bio: Optional[Any] = None,
+        avatar: Optional[Any] = None,
+        links: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Publish a new version of this node's public profile and return it.
+
+        Any of *name*, *bio*, *avatar* and *links* may be omitted, in
+        which case the stored value is kept — a small change does not
+        wipe the rest of the card, like ``tau profile set``.  At least
+        one field is required.  An empty bio clears it, an empty links
+        list clears the links, and an empty avatar clears it; a blank
+        name keeps the stored name (a profile always carries one).
+        The avatar is a 32/64-character hex hash, as the CLI's
+        ``--avatar FILE|HASH`` accepts for a hash.  A no-op save — every
+        given field already equal to the stored value — publishes
+        nothing and leaves the version untouched.  Otherwise the new
+        version is written to the data directory and the serving node
+        reloads it at once, so it rides the next announce without a
+        restart.  A bad field is a :class:`ValueError`.
+        """
+        if name is None and bio is None and avatar is None and links is None:
+            raise ValueError(
+                "at least one of 'name', 'bio', 'avatar' or 'links' "
+                "is required"
+            )
+        path = self._profile_path()
+        if path is None:
+            raise WebBridgeError("this node has no profile path")
+        config = getattr(self.node, "config", None)
+        identity_path = getattr(config, "identity_path", None)
+        if identity_path is None:
+            raise WebBridgeError("this node has no identity path")
+        from .identity import load_identity
+
+        identity = load_identity(identity_path)
+        if identity is None:
+            raise WebBridgeError(
+                "no identity; run `tau init` first"
+            )
+        with self._profile_lock:
+            current = load_local_profile(path)
+            if name is not None and not isinstance(name, str):
+                raise ValueError("'name' must be a string")
+            if name is None or not name.strip():
+                new_name = (
+                    current["name"]
+                    if current is not None
+                    else (getattr(config, "name", None) or "")
+                )
+            else:
+                new_name = name
+            if current is not None:
+                new_bio = current["bio"] if bio is None else bio
+                new_avatar = current["avatar"] if avatar is None else avatar
+                new_links = current["links"] if links is None else links
+            else:
+                new_bio = "" if bio is None else bio
+                new_avatar = None if avatar is None else avatar
+                new_links = [] if links is None else links
+            if isinstance(new_avatar, str) and not new_avatar.strip():
+                new_avatar = None
+            try:
+                new_bio = clean_bio(new_bio)
+                new_links = clean_links(new_links)
+                new_avatar = (
+                    resolve_avatar(new_avatar)
+                    if new_avatar is not None
+                    else None
+                )
+            except ProfileError as exc:
+                raise ValueError(str(exc)) from exc
+            if (
+                current is not None
+                and new_name == current["name"]
+                and new_bio == current["bio"]
+                and new_avatar == current["avatar"]
+                and new_links == current["links"]
+            ):
+                return {**public_profile(current), "published": True, "changed": False}
+            version = current["version"] + 1 if current is not None else 1
+            doc = build_profile(
+                identity,
+                name=new_name,
+                bio=new_bio,
+                avatar=new_avatar,
+                links=new_links,
+                version=version,
+            )
+            save_local_profile(path, doc)
+            refresh = getattr(self.node, "refresh_local_profile", None)
+            if refresh is not None:
+                refresh()
+        return {**public_profile(doc), "published": True, "changed": True}
+
+    def _away_path(self) -> Optional[Path]:
+        """This node's away-message path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "away_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / AWAY_FILE_NAME
+
+    def away_message(self) -> Dict[str, Any]:
+        """This node's away auto-reply, for the console load.
+
+        The stored state (``enabled``, ``message`` and ``since``),
+        plus how many peers have already received a reply in this
+        away period.  A missing file means off, with the default
+        message kept.  A corrupt file is a 503 — the owner repairs
+        or removes it before the console shows the reply, the same
+        as the quiet-hours window.
+        """
+        path = self._away_path()
+        if path is None:
+            state = AwayState()
+        else:
+            try:
+                state = load_away(path)
+            except AwayError as exc:
+                raise WebBridgeError(
+                    "away message on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+        return {
+            **state.to_dict(),
+            "replied_count": len(state.replied_to),
+        }
+
+    def set_away_message(
+        self,
+        *,
+        enabled: Optional[Any] = None,
+        message: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Set the away auto-reply (or turn it off) and return it.
+
+        Either of *enabled* and *message* may be omitted, in which
+        case the stored value is kept — turning the reply off keeps
+        the message, so turning it back on restores the same text,
+        like ``tau away off``.  At least one field is required.
+        Turning it on, or changing the message while it is on, starts
+        a fresh away period (the per-peer replied list resets and
+        ``since`` restarts), like ``tau away on``; a no-op save — on
+        already, same message — leaves the current period untouched.
+        Mirrors the CLI setters: the state is reloaded inside the
+        lock so a corrupt file fails loudly instead of being silently
+        overwritten, a bad message is a :class:`ValueError`, and a
+        corrupt file is a 503.
+        """
+        if enabled is None and message is None:
+            raise ValueError(
+                "at least one of 'enabled' or 'message' is required"
+            )
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError("'enabled' must be a boolean")
+        path = self._away_path()
+        if path is None:
+            raise WebBridgeError("this node has no away-message path")
+        with self._away_lock, away_lock(path):
+            try:
+                current = load_away(path)
+            except AwayError as exc:
+                raise WebBridgeError(
+                    "away message on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+            new_enabled = current.enabled if enabled is None else enabled
+            if message is None:
+                new_message = current.message
+            else:
+                try:
+                    new_message = AwayState.on(message).message
+                except AwayError as exc:
+                    raise ValueError(str(exc)) from exc
+            if new_enabled:
+                if current.enabled and new_message == current.message:
+                    updated = current
+                else:
+                    updated = AwayState.on(new_message)
+            else:
+                updated = AwayState(enabled=False, message=new_message)
+            changed = updated != current
+            if changed:
+                save_away(path, updated)
+        return {
+            **updated.to_dict(),
+            "replied_count": len(updated.replied_to),
+            "changed": changed,
+        }
+
+    def quiet_hours(self) -> Dict[str, Any]:
+        """This node's quiet-hours window, for the console load.
+
+        The stored window (``enabled``, ``start`` and ``end`` as HH:MM),
+        plus whether it is quiet right now and how many minutes remain.
+        A missing file means off, with the default 22:00–07:00 window
+        kept as the start/end.  A corrupt file is a 503 — the owner
+        repairs or removes it before the console shows the window, the
+        same as the disappearing defaults.
+        """
+        path = self._quiet_hours_path()
+        if path is None:
+            window = QuietHours()
+        else:
+            try:
+                window = load_quiet_hours(path)
+            except QuietHoursError as exc:
+                raise WebBridgeError(
+                    "quiet hours on disk are unusable; fix or remove them "
+                    f"before editing ({exc})"
+                ) from exc
+        return {
+            **window.to_dict(),
+            "active": window.is_quiet(),
+            "minutes_until_end": window.minutes_until_end(),
+        }
+
+    def set_quiet_hours(
+        self,
+        *,
+        enabled: Optional[Any] = None,
+        start: Optional[Any] = None,
+        end: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Set the quiet-hours window (or turn it off) and return it.
+
+        Any of *enabled*, *start* and *end* may be omitted, in which
+        case the stored value is kept — turning the window off keeps
+        the start/end, so turning it back on restores the same window,
+        like ``tau quiet-hours off``.  At least one field is required.
+        Mirrors the CLI setters: the window is reloaded inside the
+        lock so a corrupt file fails loudly instead of being silently
+        overwritten, a bad time is a :class:`ValueError`, and a corrupt
+        file is a 503.
+        """
+        if enabled is None and start is None and end is None:
+            raise ValueError(
+                "at least one of 'enabled', 'start' or 'end' is required"
+            )
+        path = self._quiet_hours_path()
+        if path is None:
+            raise WebBridgeError("this node has no quiet-hours path")
+        with self._quiet_hours_lock, quiet_hours_lock(path):
+            try:
+                current = load_quiet_hours(path)
+            except QuietHoursError as exc:
+                raise WebBridgeError(
+                    "quiet hours on disk are unusable; fix or remove them "
+                    f"before editing ({exc})"
+                ) from exc
+            stored = current.to_dict()
+            try:
+                updated = QuietHours.from_dict(
+                    {
+                        "enabled": stored["enabled"]
+                        if enabled is None
+                        else enabled,
+                        "start": stored["start"] if start is None else start,
+                        "end": stored["end"] if end is None else end,
+                    }
+                )
+            except QuietHoursError as exc:
+                raise ValueError(str(exc)) from exc
+            changed = updated != current
+            if changed:
+                save_quiet_hours(path, updated)
+        return {
+            **updated.to_dict(),
+            "active": updated.is_quiet(),
+            "minutes_until_end": updated.minutes_until_end(),
+            "changed": changed,
+        }
 
     def _muted_sets(self) -> "tuple[FrozenSet[str], FrozenSet[str]]":
         """Muted (peers, groups), failing open on a corrupt file.
@@ -8781,15 +9863,144 @@ class WebBridge:
             )
         return {"archived": described, "count": len(described)}
 
+    def pinned_conversations(self) -> Dict[str, Any]:
+        """Pinned conversations, newest pin first, for the console load.
+
+        Mirrors the stored file: one entry per pin (kind, target,
+        display label, pinned_at).  A corrupt file is a 503 — the
+        owner repairs or removes it before the console shows pins,
+        the same as the mute list.  The list endpoints stay usable
+        with a corrupt file (they fail open to unpinned), so only
+        this explicit listing is gated.
+        """
+        path = self._pinned_path()
+        if path is None:
+            return {"pinned": [], "count": 0}
+        try:
+            pinned = load_pinned(path)
+        except PinnedError as exc:
+            raise WebBridgeError(
+                "pinned-conversation list on disk is unusable; fix or remove it "
+                f"before editing ({exc})"
+            ) from exc
+        described = []
+        for entry in pinned.entries:
+            if entry.kind == "peer":
+                peer = self.node.registry.get(entry.target)
+                name = peer.display_name if peer is not None else ""
+                label = f"{name} ({entry.target[:8]})" if name else entry.target[:8]
+            elif entry.kind == "group":
+                try:
+                    group = self.node.groups.find(entry.target)
+                    label = f"group {group['name']} ({entry.target[:8]})"
+                except ValueError:
+                    label = f"group {entry.target[:8]}"
+            else:
+                label = f"channel #{entry.target}"
+            described.append(
+                {
+                    "kind": entry.kind,
+                    "target": entry.target,
+                    "label": label,
+                    "pinned_at": entry.pinned_at,
+                }
+            )
+        return {"pinned": described, "count": len(described)}
+
+    def set_pinned(
+        self,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+        channel: Optional[str] = None,
+        pinned: bool = True,
+    ) -> Dict[str, Any]:
+        """Pin or unpin one conversation.
+
+        Exactly one of *peer* (registry name, hash or prefix), *group*
+        (id, prefix or name) or *channel* (name, must be joined)
+        names the conversation; *pinned* is the new state.  Mirrors
+        ``tau pin-conversation``: a group pin covers the whole rename
+        lineage, the list is reloaded inside the lock so two writes
+        racing cannot discard each other's conversation, and a
+        corrupt file is a 503.  Pinning is display state only, so no
+        unread counts change and nothing is published.
+        """
+        given = [value for value in (peer, group, channel) if value is not None]
+        if len(given) != 1:
+            raise ValueError(
+                "exactly one of 'peer', 'group' or 'channel' is required"
+            )
+        if group is not None:
+            if not isinstance(group, str) or not group.strip():
+                raise ValueError("field 'group' is required")
+            record = self.node.groups.find(group.strip())
+            keys = sorted(group_lineage(record))
+            kind = "group"
+            label = f"group {record['name']} ({record['id'][:8]})"
+        elif channel is not None:
+            if not isinstance(channel, str) or not channel.strip():
+                raise ValueError("field 'channel' is required")
+            from .channels import clean_channel_name
+
+            name = clean_channel_name(channel.strip())
+            memberships = self._local_channel_app().memberships()
+            if not any(item.get("channel") == name for item in memberships):
+                raise ValueError(f"not a member of channel {name!r}; join it first")
+            keys = [name]
+            kind = "channel"
+            label = f"channel #{name}"
+        else:
+            if not isinstance(peer, str) or not peer.strip():
+                raise ValueError("field 'peer' is required")
+            key = self._resolve_block_target(peer.strip())
+            keys = [key]
+            kind = "peer"
+            record = self.node.registry.get(key)
+            label = record.display_name if record is not None else key[:8]
+        path = self._pinned_path()
+        if path is None:
+            raise WebBridgeError("this node has no pinned-conversation path")
+        with self._pinned_lock, pinned_lock(path):
+            try:
+                current = load_pinned(path)
+            except PinnedError as exc:
+                raise WebBridgeError(
+                    "pinned-conversation list on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+            updated = current
+            changed = False
+            for key in keys:
+                previous = updated.is_pinned(kind, key)
+                if pinned and not previous:
+                    updated = updated.with_pinned(kind, key)
+                    changed = True
+                elif not pinned and previous:
+                    updated = updated.without(kind, key)
+                    changed = True
+            if changed:
+                save_pinned(path, updated)
+        return {
+            "kind": kind,
+            "target": keys[0],
+            "label": label,
+            "pinned": pinned,
+            "changed": changed,
+        }
+
     def groups(self) -> List[Dict[str, Any]]:
         try:
             ignored = load_ignored_group_ids(
                 getattr(self.node.config, "ignored_groups_path", None)
             )
-            return [
-                self._describe_group(group, ignored)
+            pinned = load_pinned_set(self._pinned_path(), "group")
+            described = [
+                self._describe_group(group, ignored, pinned)
                 for group in self.node.groups.list_groups()
             ]
+            described.sort(key=lambda item: not item["pinned"])
+            return described
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read group store", exc_info=True)
             return []
@@ -8798,6 +10009,7 @@ class WebBridge:
         self,
         group: Dict[str, Any],
         ignored_ids: FrozenSet[str] = frozenset(),
+        pinned_ids: Optional[FrozenSet[str]] = None,
     ) -> Dict[str, Any]:
         members = []
         for member_hash in group["members"]:
@@ -8812,12 +10024,18 @@ class WebBridge:
                     ),
                 }
             )
+        if pinned_ids is None:
+            pinned_ids = load_pinned_set(self._pinned_path(), "group")
         return {
             "id": group["id"],
             "name": group["name"],
             "members": members,
             "created_at": group["created_at"],
             "topic": group.get("topic", ""),
+            # A group reads as pinned when any id in its rename
+            # lineage is pinned, like a mute — the pin follows the
+            # conversation across a rename.
+            "pinned": bool(group_lineage(group) & pinned_ids),
             # The console only offers member changes on groups this
             # node created; the store refuses anyone else.  A learned
             # group only claims its creator in the message, so it never
@@ -8878,6 +10096,150 @@ class WebBridge:
         if not self.node.groups.delete(group["id"]):
             raise ValueError(f"unknown group: {query.strip()!r}")
         return {"id": group["id"], "name": group["name"]}
+
+    # -- broadcast lists -------------------------------------------------
+    # CLI-only until now (`tau broadcast`); the console lists, creates,
+    # sends and deletes them.  Lists never travel on the wire: a send
+    # fans out as one ordinary DM per member through send_message, so
+    # an offline member queues exactly like a one-to-one DM and no
+    # list metadata ever reaches a recipient.
+
+    def _describe_broadcast(self, broadcast: Dict[str, Any]) -> Dict[str, Any]:
+        members = []
+        for member_hash in broadcast["members"]:
+            peer = self.node.registry.get(member_hash)
+            members.append(
+                {
+                    "hash": member_hash,
+                    "name": (
+                        peer.display_name
+                        if peer is not None
+                        else member_hash[:8]
+                    ),
+                }
+            )
+        return {
+            "name": broadcast["name"],
+            "members": members,
+            "created_at": broadcast["created_at"],
+        }
+
+    def list_broadcasts(self) -> List[Dict[str, Any]]:
+        try:
+            return [
+                self._describe_broadcast(broadcast)
+                for broadcast in self.node.broadcasts.list_broadcasts()
+            ]
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read broadcast store", exc_info=True)
+            return []
+
+    def create_broadcast(
+        self, name: Any, members: Any
+    ) -> Dict[str, Any]:
+        """Create a broadcast list from the console, mirroring ``tau broadcast create``.
+
+        Members are peer hashes from the console's picker; like group
+        creation, each must already be in the registry — an unknown
+        hash would leave a DM that can never be sent — and this node
+        is the sender, never a member.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'name' is required")
+        if not isinstance(members, list) or not members:
+            raise ValueError("field 'members' must be a non-empty list")
+        cleaned: List[str] = []
+        for member in members:
+            if not isinstance(member, str) or not member.strip():
+                raise ValueError("field 'members' must contain peer hashes")
+            cleaned.append(member.strip().lower())
+        own_hash = self.node.destination_hexhash
+        for member in cleaned:
+            if member == own_hash:
+                raise ValueError(
+                    "cannot add yourself to a broadcast list;"
+                    " you are the sender, not a member"
+                )
+            peer = self.node.registry.get(member)
+            if peer is None or peer.destination_hash.hex() != member:
+                raise ValueError(f"unknown peer: {member}")
+        broadcast = self.node.broadcasts.create(name.strip(), cleaned)
+        return self._describe_broadcast(broadcast)
+
+    def delete_broadcast(self, name: str) -> Dict[str, Any]:
+        """Delete a broadcast list from the console, mirroring ``tau broadcast delete``."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'broadcast' is required")
+        broadcast = self.node.broadcasts.find(name.strip())
+        if not self.node.broadcasts.delete(broadcast["name"]):
+            raise ValueError(f"unknown broadcast list: {name.strip()!r}")
+        return {"name": broadcast["name"]}
+
+    def send_broadcast(
+        self,
+        name: str,
+        text: str,
+        *,
+        timeout: float = 20.0,
+    ) -> Dict[str, Any]:
+        """Send a broadcast from the console: one DM per member.
+
+        The text is validated once, up front, so a bad send never
+        reaches the first member before failing on the second.  Each
+        member is then sent independently: a member whose peer cannot
+        be resolved or whose send fails is reported as ``failed`` with
+        the reason, and the rest still go out — a partial fan-out is
+        visible in the response, never silent.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'broadcast' is required")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("message text is required")
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(
+                f"message is longer than {MAX_MESSAGE_CHARS} characters"
+            )
+        broadcast = self.node.broadcasts.find(name.strip())
+        results = []
+        for member_hash in broadcast["members"]:
+            peer = self.node.registry.get(member_hash)
+            display = (
+                peer.display_name if peer is not None else member_hash[:8]
+            )
+            try:
+                _, response = self.send_message(
+                    member_hash, text, timeout=timeout
+                )
+            except Exception as exc:  # one bad member must not stop the rest
+                results.append(
+                    {
+                        "hash": member_hash,
+                        "name": display,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "hash": member_hash,
+                    "name": display,
+                    "status": "queued" if response.get("queued") else "delivered",
+                }
+            )
+        return {
+            "name": broadcast["name"],
+            "results": results,
+            "delivered": sum(
+                1 for result in results if result["status"] == "delivered"
+            ),
+            "queued": sum(
+                1 for result in results if result["status"] == "queued"
+            ),
+            "failed": sum(
+                1 for result in results if result["status"] == "failed"
+            ),
+        }
 
     def leave_group(self, query: str) -> Dict[str, Any]:
         """Leave a known group from the console, mirroring ``tau group leave``.
@@ -10158,6 +11520,7 @@ class WebBridge:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
         save: bool = True,
         reject_removed_wire_id: bool = False,
     ) -> Optional[Dict[str, Any]]:
@@ -10240,6 +11603,14 @@ class WebBridge:
                 message["poll_vote"] = dict(poll_vote)
             if poll_close is not None:
                 message["poll_close"] = dict(poll_close)
+            # A location pin rides on the console entry so the feed
+            # can render it; a malformed pin drops instead of the
+            # entry, like a malformed poll field above.
+            cleaned_location = (
+                clean_location(location) if location is not None else None
+            )
+            if cleaned_location is not None:
+                message["location"] = cleaned_location
             self._next_message_id += 1
             self._messages.append(message)
         # A bulk caller (import mirroring) passes save=False and saves
@@ -10553,11 +11924,37 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/groups/left":
                 self._send_json(self.bridge.left_groups(), head_only)
                 return
+            if path == "/api/broadcasts":
+                broadcasts = self.bridge.list_broadcasts()
+                self._send_json(
+                    {"broadcasts": broadcasts, "count": len(broadcasts)},
+                    head_only,
+                )
+                return
             if path == "/api/groups/join-requests":
                 requests = self.bridge.join_requests()
                 self._send_json(
                     {"requests": requests, "count": len(requests)}, head_only
                 )
+                return
+            if path == "/api/groups/invite":
+                target = query.get("group")
+                if not target or not target[0].strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    status = self.bridge.group_invite_status(target[0].strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(status, head_only)
                 return
             if path == "/api/messages":
                 pinned_only = query.get("pinned") == ["1"]
@@ -10589,9 +11986,30 @@ class _WebHandler(BaseHTTPRequestHandler):
                     {"requests": requests, "count": len(requests)}, head_only
                 )
                 return
+            if path == "/api/beacons":
+                try:
+                    beacons = self.bridge.list_beacons()
+                except BeaconsError as exc:
+                    # A damaged beacons file is a server fault, not a
+                    # bad request: answer with its message instead of
+                    # a 500 traceback on every console poll.
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                self._send_json(beacons, head_only)
+                return
             if path == "/api/conversations/archived":
                 try:
                     result = self.bridge.archived_conversations()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
+            if path == "/api/conversations/pinned":
+                try:
+                    result = self.bridge.pinned_conversations()
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
@@ -10630,6 +12048,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                     result = self.bridge.muted_conversations(
                         visible_only=visible_only
                     )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
+            if path == "/api/drafts":
+                try:
+                    result = self.bridge.list_drafts()
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
@@ -10698,6 +12124,30 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 try:
                     self._send_json(self.bridge.settings(), head_only)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                return
+            if path == "/api/profile":
+                try:
+                    self._send_json(self.bridge.own_profile(), head_only)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                return
+            if path == "/api/settings/away-message":
+                try:
+                    self._send_json(self.bridge.away_message(), head_only)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                return
+            if path == "/api/settings/quiet-hours":
+                try:
+                    self._send_json(self.bridge.quiet_hours(), head_only)
                 except WebBridgeError as exc:
                     self._send_json(
                         {"error": {"message": str(exc)}}, head_only, 503
@@ -11242,12 +12692,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_bundle_import(head_only)
                 return
-            # A file send carries base64 bytes and an import carries a whole
-            # message history or a whole signed chain, so each gets a larger
-            # body cap than a chat message or a single action.
-            if path == "/api/send-file":
-                limit = MAX_FILE_BODY_BYTES
-            elif path == "/api/groups/send-file":
+            # A file send carries base64 bytes, a Tan post may carry a
+            # base64 image, and an import carries a whole message history
+            # or a whole signed chain, so each gets a larger body cap than
+            # a chat message or a single action.
+            if path in ("/api/send-file", "/api/groups/send-file", "/api/tan/posts"):
                 limit = MAX_FILE_BODY_BYTES
             elif path in ("/api/messages/import", "/api/tan/import"):
                 limit = MAX_IMPORT_BYTES
@@ -11268,6 +12717,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/typing":
                 self._handle_typing(body, head_only)
+                return
+            if path == "/api/beacons/start":
+                self._handle_beacon_start(body, head_only)
+                return
+            if path == "/api/beacons/stop":
+                self._handle_beacon_stop(body, head_only)
+                return
+            if path == "/api/beacons/position":
+                self._handle_beacon_position(body, head_only)
                 return
             if path == "/api/messages/delete":
                 self._handle_delete_message(body, head_only)
@@ -11471,11 +12929,40 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "archive": result}, head_only)
                 return
+            if path == "/api/conversations/pin":
+                # ``pinned`` defaults to true: posting a target pins
+                # it; posting ``"pinned": false`` unpins it.
+                pinned = body.get("pinned", True)
+                if not isinstance(pinned, bool):
+                    self._send_json(
+                        {"error": {"message": "field 'pinned' must be a boolean"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.set_pinned(
+                        peer=body.get("peer"),
+                        group=body.get("group"),
+                        channel=body.get("channel"),
+                        pinned=pinned,
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, PeerError) as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "pin": result}, head_only)
+                return
             if path == "/api/messages/disappearing":
                 try:
                     result = self.bridge.set_disappearing_default(
                         peer=body.get("peer"),
                         group=body.get("group"),
+                        channel=body.get("channel"),
                         seconds=body.get("seconds"),
                     )
                 except WebBridgeError as exc:
@@ -11487,6 +12974,39 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "disappearing": result}, head_only)
+                return
+            if path == "/api/drafts":
+                try:
+                    draft = self.bridge.save_draft(
+                        kind=body.get("kind"),
+                        target=body.get("target"),
+                        text=body.get("text"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "draft": draft}, head_only)
+                return
+            if path == "/api/drafts/delete":
+                try:
+                    result = self.bridge.delete_draft(
+                        kind=body.get("kind"),
+                        target=body.get("target"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, **result}, head_only)
                 return
             if path == "/api/messages/mute":
                 # ``muted`` defaults to true: posting a target mutes
@@ -11533,6 +13053,67 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 self._handle_settings(body, head_only)
                 return
+            if path == "/api/profile":
+                try:
+                    result = self.bridge.set_own_profile(
+                        name=body.get("name"),
+                        bio=body.get("bio"),
+                        avatar=body.get("avatar"),
+                        links=body.get("links"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "profile": result}, head_only)
+                return
+            if path == "/api/settings/away-message":
+                try:
+                    result = self.bridge.set_away_message(
+                        enabled=body.get("enabled"),
+                        message=body.get("message"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json(
+                    {"ok": True, "away_message": result}, head_only
+                )
+                return
+            if path == "/api/settings/quiet-hours":
+                try:
+                    result = self.bridge.set_quiet_hours(
+                        enabled=body.get("enabled"),
+                        start=body.get("start"),
+                        end=body.get("end"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json(
+                    {"ok": True, "quiet_hours": result}, head_only
+                )
+                return
             if path == "/api/groups":
                 try:
                     group = self.bridge.create_group(
@@ -11564,6 +13145,76 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "deleted": deleted}, head_only)
+                return
+            if path == "/api/broadcasts":
+                try:
+                    broadcast = self.bridge.create_broadcast(
+                        body.get("name"), body.get("members")
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "broadcast": broadcast}, head_only)
+                return
+            if path == "/api/broadcasts/delete":
+                target = body.get("broadcast")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'broadcast' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    deleted = self.bridge.delete_broadcast(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **deleted}, head_only)
+                return
+            if path == "/api/broadcasts/send":
+                target = body.get("broadcast")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'broadcast' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if not isinstance(text, str):
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                timeout = body.get("timeout")
+                if timeout is None:
+                    timeout = 20.0
+                if (
+                    not isinstance(timeout, (int, float))
+                    or isinstance(timeout, bool)
+                ):
+                    timeout = 20.0
+                timeout = max(1.0, min(float(timeout), 120.0))
+                try:
+                    result = self.bridge.send_broadcast(
+                        target.strip(), text, timeout=timeout
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
                 return
             if path == "/api/groups/leave":
                 target = body.get("group")
@@ -11713,6 +13364,68 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **decided}, head_only)
+                return
+            if path == "/api/groups/invite":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    minted = self.bridge.mint_group_invite(
+                        target.strip(), body.get("mode")
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **minted}, head_only)
+                return
+            if path == "/api/groups/invite/revoke":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    revoked = self.bridge.revoke_group_invites(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **revoked}, head_only)
+                return
+            if path == "/api/groups/join":
+                link = body.get("link")
+                if not isinstance(link, str) or not link.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'link' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    joined = self.bridge.join_group_via_link(link.strip())
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                except MailboxError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **joined}, head_only)
                 return
             if path == "/api/groups/rename":
                 target = body.get("group")
@@ -12161,6 +13874,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                image = body.get("image")
+                if image is not None and not isinstance(image, str):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'image' must be a base64 data URL"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
                     post = self.bridge.tan_post(
                         text,
@@ -12168,6 +13893,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else None
                         ),
+                        image=image,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -12759,8 +14485,34 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                expires_in = body.get("expires_in")
+                if expires_in is not None and (
+                    not isinstance(expires_in, (int, float))
+                    or isinstance(expires_in, bool)
+                    or not _valid_expires_in(expires_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'expires_in' must be a number of "
+                                "seconds (0 < expires_in <= 2592000)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
-                    message = self.bridge.channel_send(channel, text, reply_to=reply_to)
+                    message = self.bridge.channel_send(
+                        channel,
+                        text,
+                        reply_to=reply_to,
+                        expires_in=(
+                            float(expires_in)
+                            if expires_in is not None
+                            else None
+                        ),
+                    )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
@@ -13246,6 +14998,10 @@ class _WebHandler(BaseHTTPRequestHandler):
                 {"error": {"message": "field 'to' is required"}}, head_only, 400
             )
             return
+        if text is None and body.get("location") is not None:
+            # A pin without its own text: the bridge defaults it to
+            # the place name (or the coordinates), like the CLI.
+            text = ""
         if not isinstance(text, str):
             self._send_json(
                 {"error": {"message": "field 'text' is required"}}, head_only, 400
@@ -13322,6 +15078,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 send_after=send_after,
                 reply_to=reply_to,
                 poll_options=body.get("poll_options"),
+                location=body.get("location"),
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -13373,6 +15130,10 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
+        if text is None and body.get("location") is not None:
+            # A pin without its own text: the bridge defaults it to
+            # the place name (or the coordinates), like the CLI.
+            text = ""
         if not isinstance(text, str):
             self._send_json(
                 {"error": {"message": "field 'text' is required"}}, head_only, 400
@@ -13451,6 +15212,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 send_after=send_after,
                 reply_to=reply_to,
                 poll_options=body.get("poll_options"),
+                location=body.get("location"),
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown
@@ -13686,6 +15448,109 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
             return
         self._send_json(result, head_only)
+
+    def _handle_beacon_start(self, body: Dict[str, Any], head_only: bool) -> None:
+        peer = body.get("peer")
+        group = body.get("group")
+        if peer is not None and group is not None:
+            self._send_json(
+                {"error": {"message": "pass 'peer' or 'group', not both"}},
+                head_only,
+                400,
+            )
+            return
+        if peer is None and group is None:
+            self._send_json(
+                {"error": {"message": "pass 'peer' or 'group'"}},
+                head_only,
+                400,
+            )
+            return
+        target = peer if peer is not None else group
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'peer'/'group' is required"}},
+                head_only,
+                400,
+            )
+            return
+        coarse = body.get("coarse", False)
+        if not isinstance(coarse, bool):
+            self._send_json(
+                {"error": {"message": "field 'coarse' must be true or false"}},
+                head_only,
+                400,
+            )
+            return
+        location: Dict[str, Any] = {"lat": body.get("lat"), "lon": body.get("lon")}
+        if isinstance(body.get("name"), str):
+            location["name"] = body["name"]
+        try:
+            started = self.bridge.start_beacon(
+                target.strip(),
+                location,
+                group=group is not None,
+                coarse=coarse,
+                duration=body.get("duration_seconds", BEACON_DEFAULT_DURATION),
+            )
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except (BeaconsError, MailboxError, OSError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, **started}, head_only)
+
+    def _handle_beacon_stop(self, body: Dict[str, Any], head_only: bool) -> None:
+        beacon_id = body.get("id")
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            self._send_json(
+                {"error": {"message": "field 'id' is required"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            stopped = self.bridge.stop_beacon(beacon_id.strip())
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except (BeaconsError, OSError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, **stopped}, head_only)
+
+    def _handle_beacon_position(
+        self, body: Dict[str, Any], head_only: bool
+    ) -> None:
+        beacon_id = body.get("id")
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            self._send_json(
+                {"error": {"message": "field 'id' is required"}},
+                head_only,
+                400,
+            )
+            return
+        location: Dict[str, Any] = {"lat": body.get("lat"), "lon": body.get("lon")}
+        if isinstance(body.get("name"), str):
+            location["name"] = body["name"]
+        try:
+            updated = self.bridge.update_beacon_position(
+                beacon_id.strip(), location
+            )
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except (BeaconsError, OSError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, **updated}, head_only)
 
     def _handle_bundle_export(self, body: Dict[str, Any], head_only: bool) -> None:
         include_tan = body.get("include_tan", False)

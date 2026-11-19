@@ -339,7 +339,7 @@ export default function ChannelsSection() {
                   : "border-zinc-700 text-zinc-300 hover:bg-zinc-900"
               }`}
             >
-              #{c.channel}
+              {c.pinned ? "📌 " : ""}#{c.channel}
               {c.muted && (
                 <span title="Muted" aria-label="Muted channel">
                   🔇{" "}
@@ -382,6 +382,13 @@ export default function ChannelsSection() {
                 className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
               >
                 {muting ? "…" : selectedChannel?.muted ? "Unmute" : "Mute"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void channels.pinConversation(channels.selected!, !selectedChannel?.pinned)}
+                className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+              >
+                {selectedChannel?.pinned ? "Unpin" : "Pin"}
               </button>
               <button
                 type="button"

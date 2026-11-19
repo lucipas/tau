@@ -1,15 +1,22 @@
 // PeerPanel.tsx — right-sidebar detail for the open conversation.
 //
-// DM: peer info, ping, safety number + verify flow (the safety number is
+// DM: peer info, public profile, ping, safety number + verify flow (the safety number is
 // shown first; verification happens only after a separate "Numbers match"
 // confirm — never automatically), block/unblock, forget, alias, note,
-// archive, mute, disappearing default, mark unread/read.
+// archive, mute, pin, disappearing default, mark unread/read.
 // Group: members, topic, mute, mark unread/read, leave.
 
 "use client";
 
 import { useEffect, useState } from "react";
-import { leaveGroup, setDisappearingDefault } from "@/lib/api";
+import {
+  getGroupInviteStatus,
+  leaveGroup,
+  mintGroupInvite,
+  revokeGroupInvites,
+  setDisappearingDefault,
+  type GroupInviteStatus,
+} from "@/lib/api";
 import { formatAge, formatDateTime, truncatedHash } from "@/lib/format";
 import { useNow } from "@/lib/use-now";
 import { usePeerActions, type Conversation } from "@/lib/use-tau";
@@ -75,9 +82,15 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
   const [confirmForget, setConfirmForget] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
   const [disappearing, setDisappearing] = useState<number | null>(null);
+  const [invite, setInvite] = useState<GroupInviteStatus | null>(null);
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const peer: Peer | undefined = conversation?.peer;
   const isGroup = conversation?.kind === "group";
+  const groupId = isGroup ? conversation.key : null;
+  const groupCreatedByMe = Boolean(isGroup && conversation.group?.created_by_me);
 
   useEffect(() => {
     setAlias(peer?.alias ?? "");
@@ -89,6 +102,26 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
     setConfirmForget(false);
     setConfirmLeave(false);
   }, [peer?.destination, peer?.alias, peer?.note, peer?.verified]);
+
+  // The invite link is creator-managed: only fetch it for groups this
+  // node created, and refresh it after every mint/revoke.
+  useEffect(() => {
+    setInvite(null);
+    setConfirmRevoke(false);
+    setCopied(false);
+    if (!groupCreatedByMe || !groupId) return;
+    let cancelled = false;
+    void getGroupInviteStatus(groupId)
+      .then((status) => {
+        if (!cancelled) setInvite(status);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [groupId, groupCreatedByMe]);
 
   if (!conversation) {
     return (
@@ -108,6 +141,39 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function runInvite(fn: () => Promise<GroupInviteStatus>) {
+    setInviteBusy(true);
+    setError(null);
+    try {
+      setInvite(await fn());
+      await tau.refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+
+  async function handleRevokeInvite() {
+    if (!groupId) return;
+    setConfirmRevoke(false);
+    await runInvite(async () => {
+      await revokeGroupInvites(groupId);
+      return getGroupInviteStatus(groupId);
+    });
+  }
+
+  async function copyInviteLink() {
+    if (!invite?.link) return;
+    try {
+      await navigator.clipboard.writeText(invite.link);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError("Copy failed — select the link text manually.");
     }
   }
 
@@ -139,6 +205,47 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
       </div>
 
       {peer && (
+        <div className="mt-3 rounded-xl border border-zinc-800 p-3">
+          <h3 className="text-sm font-bold text-zinc-100">Public profile</h3>
+          {peer.profile ? (
+            <div className="mt-2 flex items-start gap-3">
+              <Avatar name={peer.profile.name} seed={peer.profile.author} size="lg" />
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold text-zinc-100">
+                  {peer.profile.name || peer.name}
+                </p>
+                {peer.profile.bio && (
+                  <p className="mt-1 whitespace-pre-wrap break-words text-sm text-zinc-300">
+                    {peer.profile.bio}
+                  </p>
+                )}
+                {peer.profile.links.length > 0 && (
+                  <ul className="mt-2 flex flex-col gap-1">
+                    {peer.profile.links.map((link) => (
+                      <li key={link}>
+                        <a
+                          href={link}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="break-all text-sm text-cyan-400 hover:underline"
+                        >
+                          {link}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          ) : (
+            <p className="mt-1 text-xs leading-snug text-zinc-500">
+              This peer hasn&apos;t shared a public profile.
+            </p>
+          )}
+        </div>
+      )}
+
+      {peer && (
         <div>
           <Row label="Last seen">{peer.last_seen ? formatAge(peer.age) : "never"}</Row>
           <Row label="Hops">{peer.hops ?? "—"}</Row>
@@ -160,6 +267,72 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
               </li>
             ))}
           </ul>
+        </div>
+      )}
+      {isGroup && conversation.group?.created_by_me && (
+        <div className="mt-3 rounded-xl border border-zinc-800 p-3">
+          <h3 className="text-sm font-bold text-zinc-100">Invite link</h3>
+          <p className="mt-1 text-xs leading-snug text-zinc-500">
+            Anyone with the link can ask to join. Open groups add them at once; closed groups leave
+            a request for you to approve.
+          </p>
+          {invite?.link ? (
+            <>
+              <p
+                className="mt-2 break-all rounded-lg bg-zinc-900 px-3 py-2 font-mono text-xs text-zinc-100"
+                aria-label="Invite link"
+              >
+                {invite.link}
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <ActionButton disabled={inviteBusy} onClick={() => void copyInviteLink()}>
+                  {copied ? "Copied" : "Copy link"}
+                </ActionButton>
+                <ActionButton
+                  disabled={inviteBusy}
+                  onClick={() => void runInvite(() => mintGroupInvite(conversation.key))}
+                >
+                  New link
+                </ActionButton>
+                {confirmRevoke ? (
+                  <ActionButton danger disabled={inviteBusy} onClick={() => void handleRevokeInvite()}>
+                    Confirm revoke?
+                  </ActionButton>
+                ) : (
+                  <ActionButton danger onClick={() => setConfirmRevoke(true)}>
+                    Revoke
+                  </ActionButton>
+                )}
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-zinc-500">Mode:</span>
+                {(["open", "closed"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    disabled={inviteBusy || invite.mode === mode}
+                    onClick={() => void runInvite(() => mintGroupInvite(conversation.key, mode))}
+                    className={`rounded-full border px-2.5 py-1 text-xs font-semibold disabled:opacity-40 ${
+                      invite.mode === mode
+                        ? "border-cyan-500 text-cyan-300"
+                        : "border-zinc-700 text-zinc-200 hover:bg-zinc-800"
+                    }`}
+                  >
+                    {mode === "open" ? "Open — joins at once" : "Closed — approve first"}
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div className="mt-2">
+              <ActionButton
+                disabled={inviteBusy}
+                onClick={() => void runInvite(() => mintGroupInvite(conversation.key))}
+              >
+                Create invite link
+              </ActionButton>
+            </div>
+          )}
         </div>
       )}
 
@@ -319,6 +492,9 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
       </div>
 
       <div className="mt-3 flex flex-wrap gap-2">
+        <ActionButton disabled={busy === "pin"} onClick={() => void run("pin", () => actions.pin(target, !conversation.pinned))}>
+          {conversation.pinned ? "Unpin" : "Pin"}
+        </ActionButton>
         <ActionButton disabled={busy === "mute"} onClick={() => void run("mute", () => actions.mute(target, !conversation.muted))}>
           {conversation.muted ? "Unmute" : "Mute"}
         </ActionButton>

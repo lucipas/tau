@@ -21,7 +21,16 @@ import RNS
 
 from tau import cli
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
+from tau.away import DEFAULT_AWAY_MESSAGE
 from tau.backup import MANIFEST_NAME, restore_backup
+from tau.beacons import (
+    BEACON_DEFAULT_DURATION,
+    BEACON_UPDATE_INTERVAL,
+    BeaconsError,
+    beacons_lock,
+    load_beacons,
+    save_beacons,
+)
 from tau.blocklist import BlockList, load_blocklist, save_blocklist
 from tau.config import TauConfig
 from tau.groups import GroupStore
@@ -30,6 +39,7 @@ from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.node import NodeError
 from tau.peers import AmbiguousPeer, Peer, PeerError
+from tau.protocol import location_default_text
 from tau.webapi import (
     SUBSCRIBER_QUEUE_SIZE,
     PeerForgetBlocked,
@@ -172,10 +182,12 @@ class FakeNode:
             social_db_path=data_dir / "social.db",
             tan_rules_path=data_dir / "tan-rules.json",
             dm_requests_path=data_dir / "dm-requests.json",
+            invites_path=data_dir / "invites.json",
             join_requests_path=data_dir / "join-requests.json",
             allowlist_path=data_dir / "allowlist.json",
             blocklist_path=data_dir / "blocklist.json",
             ignored_groups_path=data_dir / "ignored-groups.json",
+            beacons_path=data_dir / "beacons.json",
         )
         self._allowlist = AllowList()
         self._allowlist_lock = threading.RLock()
@@ -198,6 +210,10 @@ class FakeNode:
         )
         self.sent = []
         self.group_sent = []
+        self.last_location = None
+        self.last_beacon = None
+        self.last_group_location = None
+        self.last_group_beacon = None
         self.group_reactions = []
         self.typing = []
         self.group_typing = []
@@ -335,6 +351,9 @@ class FakeNode:
         in_reply_to=None,
         expires_at=None,
         send_after=None,
+        kind=None,
+        location=None,
+        beacon=None,
         poll_options=None,
         poll_vote=None,
         poll_close=None,
@@ -342,6 +361,9 @@ class FakeNode:
         self.sent.append((peer.name, text, in_reply_to))
         self.last_expires_at = expires_at
         self.last_send_after = send_after
+        self.last_kind = kind
+        self.last_location = location
+        self.last_beacon = beacon
         self.last_poll_options = poll_options
         self.last_poll_vote = poll_vote
         self.last_poll_close = poll_close
@@ -358,12 +380,16 @@ class FakeNode:
     def send_group_message(
         self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
         expires_at=None, send_after=None, in_reply_to=None,
+        kind=None, location=None, beacon=None,
         poll_options=None, poll_vote=None, poll_close=None,
     ):
         self.group_sent.append((group["name"], text))
         self.last_group_expires_at = expires_at
         self.last_group_send_after = send_after
         self.last_group_in_reply_to = in_reply_to
+        self.last_group_kind = kind
+        self.last_group_location = location
+        self.last_group_beacon = beacon
         self.last_group_poll_options = poll_options
         self.last_group_poll_vote = poll_vote
         self.last_group_poll_close = poll_close
@@ -413,6 +439,103 @@ class FakeNode:
             "sent_at": 1000.0,
             "results": results,
         }
+
+    def start_beacon(
+        self,
+        target,
+        location,
+        *,
+        group=False,
+        coarse=False,
+        duration=BEACON_DEFAULT_DURATION,
+        interval=BEACON_UPDATE_INTERVAL,
+        location_file=None,
+        timeout=20.0,
+        discover_timeout=None,
+        now=None,
+    ):
+        """Test stand-in for TauNode.start_beacon: same store, no network."""
+        import time as _time
+
+        now = _time.time() if now is None else now
+        if group:
+            self.groups.list_groups()
+            record = self.groups.find(target)
+            if record is None:
+                raise NodeError(f"unknown group: {target!r}")
+            target_hash = record["id"]
+            target_kind = "group"
+            target_name = record["name"]
+        else:
+            peer = self.resolve_peer(
+                target,
+                timeout=discover_timeout
+                if discover_timeout is not None
+                else min(timeout, 10.0),
+            )
+            target_hash = peer.hexhash
+            target_kind = "dm"
+            target_name = peer.display_name
+        try:
+            with beacons_lock(self.config.beacons_path):
+                beacons = load_beacons(self.config.beacons_path)
+                beacon = beacons.start(
+                    target=target_hash,
+                    target_kind=target_kind,
+                    target_name=target_name,
+                    location=location,
+                    coarse=coarse,
+                    duration=duration,
+                    interval=interval,
+                    location_file=location_file,
+                    now=now,
+                )
+                save_beacons(self.config.beacons_path, beacons)
+        except BeaconsError as exc:
+            raise NodeError(str(exc)) from exc
+        return beacon
+
+    def send_beacon_update(self, beacon, *, now=None):
+        """Test stand-in for TauNode.send_beacon_update: same sends, no network."""
+        import time as _time
+
+        now = _time.time() if now is None else now
+        try:
+            location = beacon.current_location()
+        except BeaconsError as exc:
+            raise NodeError(str(exc)) from exc
+        seq = beacon.updates_sent + 1
+        marker = beacon.wire_marker(seq)
+        text = location_default_text(location)
+        if beacon.target_kind == "group":
+            self.groups.list_groups()
+            record = self.groups.find(beacon.target)
+            if record is None:
+                raise NodeError(f"unknown group: {beacon.target!r}")
+            result = self.send_group_message(
+                record, text, location=location, beacon=marker, kind="location"
+            )
+        else:
+            peer = self.resolve_peer(beacon.target)
+            result = self.send_message(
+                peer, text, location=location, beacon=marker, kind="location"
+            )
+        beacon.updates_sent = seq
+        beacon.next_update_at = now + beacon.interval
+        try:
+            with beacons_lock(self.config.beacons_path):
+                stored = load_beacons(self.config.beacons_path)
+                current = stored.get(beacon.id)
+                if current is not None:
+                    current.updates_sent = seq
+                    current.next_update_at = beacon.next_update_at
+                    save_beacons(self.config.beacons_path, stored)
+        except BeaconsError:  # pragma: no cover - disk failure
+            pass
+        callback = getattr(self, "on_beacon_update", None)
+        if callable(callback):
+            callback(beacon, result)
+        return result
 
     def approve_join_request(self, group, peer):
         """Test stand-in for TauNode.approve_join_request."""
@@ -2333,6 +2456,247 @@ def test_api_groups_create_is_idempotent(bridge, node, tmp_path):
     assert listed["count"] == 1
 
 
+def test_api_broadcasts_list_empty(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    status, _, payload = _json(bridge, "/api/broadcasts")
+    assert status == 200
+    assert payload == {"broadcasts": [], "count": 0}
+
+
+def test_api_broadcasts_create_and_list(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    broadcast = payload["broadcast"]
+    assert broadcast["name"] == "team"
+    assert broadcast["members"] == [{"hash": PEER_HASH, "name": "alice"}]
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert listed["count"] == 1
+    assert listed["broadcasts"][0]["name"] == "team"
+
+
+def test_api_broadcasts_create_rejects_bad_input(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    cases = [
+        ({}, "field 'name' is required"),
+        ({"name": "  ", "members": [PEER_HASH]}, "field 'name' is required"),
+        ({"name": "team"}, "field 'members' must be a non-empty list"),
+        ({"name": "team", "members": []}, "field 'members' must be a non-empty list"),
+        ({"name": "team", "members": ["not-a-hash"]}, "unknown peer"),
+        ({"name": "team", "members": [OTHER_HASH]}, "unknown peer"),
+        (
+            {"name": "team", "members": [node.destination_hexhash]},
+            "cannot add yourself",
+        ),
+    ]
+    for body, message in cases:
+        status, _, payload = _json(
+            bridge, "/api/broadcasts", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert listed["count"] == 0
+
+
+def test_api_broadcasts_create_duplicate_name_is_rejected(
+    bridge, node, tmp_path
+):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "Team", "members": [PEER_HASH]},
+    )
+    assert status == 400
+    assert "already exists" in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert listed["count"] == 1
+
+
+def test_api_broadcasts_delete_removes_list(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/delete",
+        method="POST",
+        body={"broadcast": "team"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["name"] == "team"
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert listed["count"] == 0
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/delete",
+        method="POST",
+        body={"broadcast": "team"},
+    )
+    assert status == 400
+    assert "unknown broadcast list" in payload["error"]["message"]
+
+
+def test_api_broadcasts_send_fans_out_to_members(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/send",
+        method="POST",
+        body={"broadcast": "team", "text": "meet at noon"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["name"] == "team"
+    assert payload["delivered"] == 1
+    assert payload["queued"] == 0
+    assert payload["failed"] == 0
+    assert payload["results"] == [
+        {"hash": PEER_HASH, "name": "alice", "status": "delivered"}
+    ]
+    assert node.sent == [("alice", "meet at noon", None)]
+
+
+def test_api_broadcasts_send_reports_partial_failure(
+    bridge, node, tmp_path
+):
+    from tau.broadcasts import BroadcastStore
+    from tau.peers import Peer
+
+    # A second registry peer the fake node cannot resolve: its send
+    # fails, but the first member still gets the message.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex(OTHER_HASH),
+            name="bob",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH, OTHER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/send",
+        method="POST",
+        body={"broadcast": "team", "text": "meet at noon"},
+    )
+    assert status == 200
+    assert payload["delivered"] == 1
+    assert payload["failed"] == 1
+    assert payload["results"][0]["status"] == "delivered"
+    assert payload["results"][1] == {
+        "hash": OTHER_HASH,
+        "name": "bob",
+        "status": "failed",
+        "error": f"unknown peer: {OTHER_HASH}",
+    }
+    assert node.sent == [("alice", "meet at noon", None)]
+
+
+def test_api_broadcasts_send_reports_queued_member(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    real_send = node.send_message
+
+    def queued_send(peer, text, **kwargs):
+        real_send(peer, text, **kwargs)
+        return {"ok": True, "queued": True, "id": "ab" * 16}
+
+    node.send_message = queued_send
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/broadcasts/send",
+            method="POST",
+            body={"broadcast": "team", "text": "meet at noon"},
+        )
+    finally:
+        node.send_message = real_send
+    assert status == 200
+    assert payload["delivered"] == 0
+    assert payload["queued"] == 1
+    assert payload["failed"] == 0
+    assert payload["results"][0]["status"] == "queued"
+
+
+def test_api_broadcasts_send_rejects_bad_input(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    cases = [
+        ({"text": "hi"}, "field 'broadcast' is required"),
+        ({"broadcast": "  ", "text": "hi"}, "field 'broadcast' is required"),
+        ({"broadcast": "team"}, "field 'text' is required"),
+        ({"broadcast": "team", "text": "  "}, "message text is required"),
+        ({"broadcast": "nope", "text": "hi"}, "unknown broadcast list"),
+    ]
+    for body, message in cases:
+        status, _, payload = _json(
+            bridge, "/api/broadcasts/send", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+    assert node.sent == []
+
+
 def test_api_groups_create_rejects_unknown_member(bridge, node, tmp_path):
     from tau.groups import GroupStore
 
@@ -3319,6 +3683,171 @@ def test_api_groups_ignore_with_corrupt_list_is_500(bridge, node, tmp_path):
         )
         assert status == 500
         assert "ignored-groups" in payload["error"]["message"]
+
+
+def test_own_profile_endpoints(node, tmp_path):
+    from tau.identity import save_identity
+    from tau.profile import load_local_profile
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    save_identity(RNS.Identity(), node.config.identity_path)
+    try:
+        # A fresh node has nothing published: the node-name default.
+        status, _, payload = _json(bridge, "/api/profile")
+        assert status == 200
+        assert payload == {
+            "author": None,
+            "name": "tester",
+            "bio": "",
+            "avatar": None,
+            "links": [],
+            "version": 0,
+            "created_at": None,
+            "published": False,
+        }
+
+        # Publishing a name and bio signs version 1 and writes it.
+        status, _, payload = _json(
+            bridge,
+            "/api/profile",
+            method="POST",
+            body={"name": "Tester Two", "bio": "mesh enjoyer"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        profile = payload["profile"]
+        assert profile["name"] == "Tester Two"
+        assert profile["bio"] == "mesh enjoyer"
+        assert profile["avatar"] is None
+        assert profile["links"] == []
+        assert profile["version"] == 1
+        assert profile["published"] is True
+        assert profile["changed"] is True
+        assert profile["author"] is not None
+        stored = load_local_profile(tmp_path / "profile.json")
+        assert stored is not None
+        assert stored["version"] == 1
+        assert stored["name"] == "Tester Two"
+
+        # A no-op save publishes nothing and leaves the version alone.
+        status, _, payload = _json(
+            bridge,
+            "/api/profile",
+            method="POST",
+            body={"name": "Tester Two", "bio": "mesh enjoyer"},
+        )
+        assert payload["profile"]["changed"] is False
+        assert payload["profile"]["version"] == 1
+
+        # Omitted fields keep their stored value; links and avatar set.
+        avatar = "ab" * 32
+        status, _, payload = _json(
+            bridge,
+            "/api/profile",
+            method="POST",
+            body={"links": ["https://example.org"], "avatar": avatar},
+        )
+        assert payload["profile"]["version"] == 2
+        assert payload["profile"]["name"] == "Tester Two"
+        assert payload["profile"]["bio"] == "mesh enjoyer"
+        assert payload["profile"]["links"] == ["https://example.org"]
+        assert payload["profile"]["avatar"] == avatar
+
+        # Clearing the bio and links keeps the name and avatar.
+        status, _, payload = _json(
+            bridge,
+            "/api/profile",
+            method="POST",
+            body={"bio": "", "links": []},
+        )
+        assert payload["profile"]["version"] == 3
+        assert payload["profile"]["bio"] == ""
+        assert payload["profile"]["links"] == []
+        assert payload["profile"]["name"] == "Tester Two"
+        assert payload["profile"]["avatar"] == avatar
+    finally:
+        bridge.stop()
+
+
+def test_own_profile_endpoint_rejects_bad_input(node, tmp_path):
+    from tau.identity import save_identity
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    save_identity(RNS.Identity(), node.config.identity_path)
+    try:
+        for body in (
+            {},
+            {"name": 42},
+            {"bio": "x" * 281},
+            {"bio": 42},
+            {"avatar": "not-a-hash"},
+            {"avatar": 42},
+            {"links": ["not-a-url"]},
+            {
+                "links": [
+                    "https://a.example",
+                    "https://b.example",
+                    "https://c.example",
+                    "https://d.example",
+                ]
+            },
+            {"links": "https://example.org"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/profile", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_own_profile_corrupt_file_reads_as_unpublished(node, tmp_path):
+    from tau.identity import save_identity
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    save_identity(RNS.Identity(), node.config.identity_path)
+    try:
+        # A corrupt profile reads as no profile (like the CLI), never
+        # as a crash; a save overwrites it with version 1.
+        (tmp_path / "profile.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(bridge, "/api/profile")
+        assert status == 200
+        assert payload["published"] is False
+        status, _, payload = _json(
+            bridge, "/api/profile", method="POST", body={"name": "Tester Two"}
+        )
+        assert status == 200
+        assert payload["profile"]["version"] == 1
+        assert payload["profile"]["changed"] is True
+    finally:
+        bridge.stop()
+
+
+def test_own_profile_without_identity(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(
+            bridge, "/api/profile", method="POST", body={"name": "Tester"}
+        )
+        assert status == 503
+        assert "identity" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_own_profile_without_data_dir(bridge):
+    # A dataless node has no profile path: edits are refused, but the
+    # read still answers the unpublished default instead of failing.
+    status, _, payload = _json(bridge, "/api/profile")
+    assert status == 200
+    assert payload["published"] is False
+    assert payload["name"] == ""
+    status, _, payload = _json(
+        bridge, "/api/profile", method="POST", body={"name": "Tester"}
+    )
+    assert status == 503
+    assert "profile path" in payload["error"]["message"]
 
 
 def _inbound_record(node, **overrides):
@@ -5570,6 +6099,72 @@ def test_channel_mute_suppresses_unread_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_send_with_expiry_via_api(tmp_path):
+    from tau.channels import ChannelApp, join_channel
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    # Attach a real channel app so sends work; its node points at the
+    # fake so gossip has nowhere to go (delivered 0, no raise).
+    app = ChannelApp(node.config, node.identity, name="tester", gossip=False)
+    app.node = node
+    node.channel_app = app
+    app.join("general")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "ephemeral", "expires_in": 3600},
+        )
+        assert status == 200
+        expires_at = payload["message"]["expires_at"]
+        assert expires_at - time.time() == pytest.approx(3600, abs=5)
+
+        # The stored message carries the expiry into history.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert payload["messages"][0]["expires_at"] == expires_at
+
+        # A bad expires_in is a 400 before the bridge is touched.
+        for bad in (0, -5, "1h", True, 31 * 24 * 3600):
+            status, _, payload = _json(
+                bridge,
+                "/api/channels/send",
+                method="POST",
+                body={"channel": "general", "text": "nope", "expires_in": bad},
+            )
+            assert status == 400, bad
+            assert "error" in payload
+
+        # Without expires_in, a channel default fills the expiry in.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"channel": "general", "seconds": 300},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "defaulted"},
+        )
+        assert status == 200
+        assert payload["message"]["expires_at"] - time.time() == pytest.approx(
+            300, abs=5
+        )
+    finally:
+        bridge.stop()
+
+
 def test_pages_via_api(tmp_path):
     from types import SimpleNamespace
 
@@ -6357,7 +6952,7 @@ def test_disappearing_defaults_endpoints(node, tmp_path):
     try:
         status, _, payload = _json(bridge, "/api/messages/disappearing")
         assert status == 200
-        assert payload == {"peers": {}, "groups": {}}
+        assert payload == {"peers": {}, "groups": {}, "channels": {}}
 
         status, _, payload = _json(
             bridge,
@@ -6369,11 +6964,40 @@ def test_disappearing_defaults_endpoints(node, tmp_path):
         assert payload["disappearing"] == {
             "target": PEER_HASH,
             "group": False,
+            "channel": False,
             "disappearing_seconds": 3600,
             "changed": True,
         }
         status, _, payload = _json(bridge, "/api/messages/disappearing")
-        assert payload == {"peers": {PEER_HASH: 3600.0}, "groups": {}}
+        assert payload == {"peers": {PEER_HASH: 3600.0}, "groups": {}, "channels": {}}
+
+        # A channel default is keyed by channel name, no lookup needed.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"channel": "general", "seconds": 600},
+        )
+        assert status == 200
+        assert payload["disappearing"]["channel"] is True
+        assert payload["disappearing"]["group"] is False
+        assert payload["disappearing"]["target"] == "general"
+        assert payload["disappearing"]["disappearing_seconds"] == 600
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert payload["channels"] == {"general": 600.0}
+
+        # Clearing a channel default removes the entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"channel": "general", "seconds": None},
+        )
+        assert status == 200
+        assert payload["disappearing"]["disappearing_seconds"] is None
+        assert payload["disappearing"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert payload["channels"] == {}
 
         # A group default is keyed by group id, resolved by name.
         status, _, payload = _json(
@@ -6418,6 +7042,8 @@ def test_disappearing_defaults_endpoint_rejects_bad_input(node, tmp_path):
         for body in (
             {},
             {"peer": "alice", "group": "crew", "seconds": 60},
+            {"peer": "alice", "channel": "general", "seconds": 60},
+            {"group": "crew", "channel": "general", "seconds": 60},
             {"peer": "alice", "seconds": 0},
             {"peer": "alice", "seconds": -5},
             {"peer": "alice", "seconds": 31 * 24 * 3600},
@@ -6426,6 +7052,8 @@ def test_disappearing_defaults_endpoint_rejects_bad_input(node, tmp_path):
             {"peer": "nobody", "seconds": 60},
             {"peer": "  ", "seconds": 60},
             {"group": "nobody", "seconds": 60},
+            {"channel": "bad name!", "seconds": 60},
+            {"channel": "general", "seconds": 8 * 24 * 3600},
         ):
             status, _, payload = _json(
                 bridge, "/api/messages/disappearing", method="POST", body=body
@@ -6467,7 +7095,412 @@ def test_disappearing_defaults_without_data_dir(bridge):
     assert status == 503
     status, _, payload = _json(bridge, "/api/messages/disappearing")
     assert status == 200
-    assert payload == {"peers": {}, "groups": {}}
+    assert payload == {"peers": {}, "groups": {}, "channels": {}}
+
+
+def test_quiet_hours_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A fresh node has no window: off, with the default times kept.
+        status, _, payload = _json(bridge, "/api/settings/quiet-hours")
+        assert status == 200
+        assert payload == {
+            "enabled": False,
+            "start": "22:00",
+            "end": "07:00",
+            "active": False,
+            "minutes_until_end": None,
+        }
+
+        # A window covering right now reports active, with minutes left.
+        now = time.localtime()
+        current = now.tm_hour * 60 + now.tm_min
+        start = (current - 60) % (24 * 60)
+        end = (current + 60) % (24 * 60)
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/quiet-hours",
+            method="POST",
+            body={
+                "enabled": True,
+                "start": f"{start // 60:02d}:{start % 60:02d}",
+                "end": f"{end // 60:02d}:{end % 60:02d}",
+            },
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["quiet_hours"]["enabled"] is True
+        assert payload["quiet_hours"]["active"] is True
+        assert payload["quiet_hours"]["minutes_until_end"] is not None
+        assert 0 < payload["quiet_hours"]["minutes_until_end"] <= 120
+        assert payload["quiet_hours"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/settings/quiet-hours")
+        assert payload["enabled"] is True
+        assert payload["active"] is True
+
+        # Turning it off keeps the start/end, so turning it back on
+        # restores the same window; the no-op set reports unchanged.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/quiet-hours",
+            method="POST",
+            body={"enabled": False},
+        )
+        assert status == 200
+        assert payload["quiet_hours"]["enabled"] is False
+        assert payload["quiet_hours"]["active"] is False
+        assert payload["quiet_hours"]["minutes_until_end"] is None
+        assert payload["quiet_hours"]["start"] == (
+            f"{start // 60:02d}:{start % 60:02d}"
+        )
+        assert payload["quiet_hours"]["end"] == f"{end // 60:02d}:{end % 60:02d}"
+        assert payload["quiet_hours"]["changed"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/quiet-hours",
+            method="POST",
+            body={"enabled": False},
+        )
+        assert payload["quiet_hours"]["changed"] is False
+    finally:
+        bridge.stop()
+
+
+def test_quiet_hours_endpoint_rejects_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"enabled": "yes"},
+            {"start": "25:00", "end": "07:00"},
+            {"start": "22:00", "end": "7am"},
+            {"start": "22:00", "end": "22:00"},
+            {"start": 2200, "end": "07:00"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/settings/quiet-hours", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_quiet_hours_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "quiet_hours.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/quiet-hours",
+            method="POST",
+            body={"enabled": True, "start": "22:00", "end": "07:00"},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/settings/quiet-hours")
+        assert status == 503
+    finally:
+        bridge.stop()
+
+
+def test_quiet_hours_without_data_dir(bridge):
+    # A dataless node has no quiet-hours path: edits are refused, but
+    # the read still answers the default off window instead of failing
+    # the console poll.
+    status, _, payload = _json(
+        bridge,
+        "/api/settings/quiet-hours",
+        method="POST",
+        body={"enabled": True, "start": "22:00", "end": "07:00"},
+    )
+    assert status == 503
+    status, _, payload = _json(bridge, "/api/settings/quiet-hours")
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["active"] is False
+
+
+def test_away_message_endpoints(node, tmp_path):
+    from tau.away import AwayState, save_away
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A fresh node has no away file: off, with the default message kept.
+        status, _, payload = _json(bridge, "/api/settings/away-message")
+        assert status == 200
+        assert payload == {
+            "enabled": False,
+            "message": DEFAULT_AWAY_MESSAGE,
+            "since": None,
+            "replied_to": [],
+            "replied_count": 0,
+        }
+
+        # Turning it on with a custom message starts a fresh period.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": True, "message": "back on Monday"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["away_message"]["enabled"] is True
+        assert payload["away_message"]["message"] == "back on Monday"
+        assert payload["away_message"]["since"] is not None
+        assert payload["away_message"]["replied_count"] == 0
+        assert payload["away_message"]["changed"] is True
+
+        # A peer that already got a reply shows in the count.
+        save_away(
+            tmp_path / "away.json",
+            AwayState.on("back on Monday").with_replied(PEER_HASH),
+        )
+        status, _, payload = _json(bridge, "/api/settings/away-message")
+        assert payload["replied_count"] == 1
+        assert payload["replied_to"] == [PEER_HASH]
+
+        # A no-op save — on already, same message — leaves the period
+        # (and its replied list) untouched.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": True, "message": "back on Monday"},
+        )
+        assert payload["away_message"]["changed"] is False
+        status, _, payload = _json(bridge, "/api/settings/away-message")
+        assert payload["replied_count"] == 1
+
+        # Changing the message while on starts a fresh period.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"message": "back Tuesday instead"},
+        )
+        assert payload["away_message"]["message"] == "back Tuesday instead"
+        assert payload["away_message"]["replied_count"] == 0
+        assert payload["away_message"]["changed"] is True
+
+        # Turning it off keeps the message, so turning it back on
+        # restores the same text; the no-op set reports unchanged.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": False},
+        )
+        assert status == 200
+        assert payload["away_message"]["enabled"] is False
+        assert payload["away_message"]["message"] == "back Tuesday instead"
+        assert payload["away_message"]["changed"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": False},
+        )
+        assert payload["away_message"]["changed"] is False
+    finally:
+        bridge.stop()
+
+
+def test_away_message_endpoint_rejects_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"enabled": "yes"},
+            {"enabled": True, "message": ""},
+            {"enabled": True, "message": "   "},
+            {"enabled": True, "message": 42},
+            {"enabled": True, "message": "x" * 2001},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/settings/away-message", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_away_message_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "away.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": True},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/settings/away-message")
+        assert status == 503
+    finally:
+        bridge.stop()
+
+
+def test_away_message_without_data_dir(bridge):
+    # A dataless node has no away-message path: edits are refused, but
+    # the read still answers the default off state instead of failing
+    # the console poll.
+    status, _, payload = _json(
+        bridge,
+        "/api/settings/away-message",
+        method="POST",
+        body={"enabled": True},
+    )
+    assert status == 503
+    status, _, payload = _json(bridge, "/api/settings/away-message")
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["message"] == DEFAULT_AWAY_MESSAGE
+
+
+def test_drafts_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert status == 200
+        assert payload == {"drafts": [], "count": 0}
+
+        # Save a peer draft; the list resolves the peer's registry name.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "peer", "target": PEER_HASH, "text": "hello alice"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["draft"]["kind"] == "peer"
+        assert payload["draft"]["target"] == PEER_HASH
+        assert payload["draft"]["text"] == "hello alice"
+
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 1
+        assert payload["drafts"][0]["name"] == "alice"
+
+        # A group draft is keyed by group id and resolves the group name.
+        group_id = node.groups.list_groups()[0]["id"]
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "group", "target": group_id, "text": "hello crew"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 2
+        assert {d["kind"] for d in payload["drafts"]} == {"peer", "group"}
+        group_entry = [d for d in payload["drafts"] if d["kind"] == "group"][0]
+        assert group_entry["name"] == "crew"
+
+        # A draft for an unknown target still lists, with no name.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "peer", "target": OTHER_HASH, "text": "stranger"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 3
+        stranger = [d for d in payload["drafts"] if d["target"] == OTHER_HASH][0]
+        assert stranger["name"] is None
+
+        # Saving again overwrites the text (and re-sorts newest last).
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "peer", "target": PEER_HASH, "text": "hello again"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 3
+        peer_entry = [d for d in payload["drafts"] if d["target"] == PEER_HASH][0]
+        assert peer_entry["text"] == "hello again"
+
+        # Deleting removes the draft; deleting again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts/delete",
+            method="POST",
+            body={"kind": "peer", "target": PEER_HASH},
+        )
+        assert status == 200
+        assert payload == {"ok": True, "deleted": True}
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts/delete",
+            method="POST",
+            body={"kind": "peer", "target": PEER_HASH},
+        )
+        assert payload == {"ok": True, "deleted": False}
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 2
+    finally:
+        bridge.stop()
+
+
+def test_drafts_endpoints_reject_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"kind": "peer", "target": PEER_HASH},
+            {"kind": "peer", "text": "hi"},
+            {"kind": "bogus", "target": PEER_HASH, "text": "hi"},
+            {"kind": "peer", "target": "not-a-hash", "text": "hi"},
+            {"kind": "peer", "target": PEER_HASH, "text": "   "},
+            {"kind": "peer", "target": PEER_HASH, "text": 42},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/drafts", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+        for body in (
+            {},
+            {"kind": "peer"},
+            {"target": PEER_HASH},
+            {"kind": "bogus", "target": "general"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/drafts/delete", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_drafts_endpoints_without_data_dir(bridge):
+    # A dataless node has no drafts path: edits are refused, but the
+    # list still answers empty instead of failing the console poll.
+    status, _, payload = _json(bridge, "/api/drafts")
+    assert status == 200
+    assert payload == {"drafts": [], "count": 0}
+    status, _, payload = _json(
+        bridge,
+        "/api/drafts",
+        method="POST",
+        body={"kind": "peer", "target": PEER_HASH, "text": "hi"},
+    )
+    assert status == 503
+    status, _, payload = _json(
+        bridge,
+        "/api/drafts/delete",
+        method="POST",
+        body={"kind": "peer", "target": PEER_HASH},
+    )
+    assert status == 503
 
 
 def test_muted_conversations_endpoints(node, tmp_path):
@@ -6718,6 +7751,198 @@ def test_muted_conversations_rejects_corrupt_file(node, tmp_path):
         # The counts fail open: a corrupt file never hides the badge,
         # it just counts the conversation as unmuted.
         assert bridge.unread()["total"] == 1
+    finally:
+        bridge.stop()
+
+
+def test_pinned_conversations_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert status == 200
+        assert payload == {"pinned": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 200
+        assert payload["pin"]["target"] == PEER_HASH
+        assert payload["pin"]["kind"] == "peer"
+        assert payload["pin"]["pinned"] is True
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload["count"] == 1
+        assert payload["pinned"][0]["kind"] == "peer"
+        assert payload["pinned"][0]["target"] == PEER_HASH
+        assert payload["pinned"][0]["label"].startswith("alice")
+
+        # Pinning again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert payload["pin"]["changed"] is False
+
+        # A group pin is keyed by group id, resolved by name.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew"},
+        )
+        assert status == 200
+        assert payload["pin"]["kind"] == "group"
+        assert payload["pin"]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload["count"] == 2
+        # Newest pin first.
+        assert payload["pinned"][0]["kind"] == "group"
+        assert payload["pinned"][1]["kind"] == "peer"
+
+        # Unpinning restores the empty list.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice", "pinned": False},
+        )
+        assert status == 200
+        assert payload["pin"]["pinned"] is False
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew", "pinned": False},
+        )
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload == {"pinned": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_pinned_conversations_endpoint_rejects_bad_input(node, tmp_path):
+    from tau import cli
+    from tau.config import TauConfig
+
+    # The channel case resolves membership through the channel app,
+    # which needs an identity on disk first.
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"peer": "alice", "group": "crew"},
+            {"peer": "alice", "pinned": "yes"},
+            {"peer": "nobody"},
+            {"peer": "  "},
+            {"group": "nobody"},
+            {"channel": "general"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/conversations/pin", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_pinned_conversations_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "pinned.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert status == 503
+        # The list endpoints fail open: a corrupt file never hides or
+        # reorders the console, it just reads every conversation as
+        # unpinned.
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"][0]["pinned"] is False
+    finally:
+        bridge.stop()
+
+
+def test_list_endpoints_carry_pinned_flag(node, tmp_path):
+    from tau import cli
+    from tau.channels import init_db as init_channel_db
+    from tau.channels import join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        join_channel(conn, "random")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"][0]["pinned"] is False
+        status, _, payload = _json(bridge, "/api/groups")
+        assert status == 200
+        assert payload["groups"][0]["pinned"] is False
+        status, _, payload = _json(bridge, "/api/channels")
+        assert status == 200
+        assert [item["channel"] for item in payload["channels"]] == [
+            "random",
+            "general",
+        ]
+        assert [item["pinned"] for item in payload["channels"]] == [False, False]
+
+        # Pinning the older channel pulls it to the front everywhere.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew"},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"channel": "general"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/peers")
+        assert payload["peers"][0]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/groups")
+        assert payload["groups"][0]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/channels")
+        assert [item["channel"] for item in payload["channels"]] == [
+            "general",
+            "random",
+        ]
+        assert [item["pinned"] for item in payload["channels"]] == [True, False]
     finally:
         bridge.stop()
 
@@ -11737,6 +12962,122 @@ def test_tan_post_via_api_accepts_expires_in(tmp_path):
         bridge.stop()
 
 
+def test_tan_post_via_api_accepts_image(tmp_path):
+    import base64
+    import hashlib
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        parent = create_post(conn, identity, "parent", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "with a picture", "image": data_url},
+        )
+        assert status == 200
+        post = payload["post"]
+        assert post["kind"] == "post"
+        assert post["image"] == {
+            "sha256": hashlib.sha256(png).hexdigest(),
+            "size": len(png),
+            "mime": "image/png",
+            "name": "image.png",
+        }
+
+        # The bytes land in the media store, so the console (and peers)
+        # can fetch them by digest right away.
+        digest = hashlib.sha256(png).hexdigest()
+        status, headers, body = _request(bridge, f"/api/tan/media/{digest}")
+        assert status == 200
+        assert body == png
+        assert headers["Content-Type"] == "image/png"
+
+        # A JPEG upload is detected from its bytes, not the declared type.
+        jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "mislabeled",
+                "image": "data:image/png;base64,"
+                + base64.b64encode(jpeg).decode("ascii"),
+            },
+        )
+        assert status == 200
+        assert payload["post"]["image"]["mime"] == "image/jpeg"
+        assert payload["post"]["image"]["name"] == "image.jpg"
+
+        # Bad uploads are 400s, not crashes — and queue nothing.
+        oversized = b"\x89PNG\r\n\x1a\n" + b"\x00" * (2 * 1024 * 1024)
+        for body, fragment in [
+            ({"text": "x", "image": "not a data url"}, "data URL"),
+            ({"text": "x", "image": "data:image/png;base64,!!!"}, "base64"),
+            (
+                {"text": "x", "image": "data:text/plain;base64,aGVsbG8="},
+                "JPEG, PNG, GIF or WebP",
+            ),
+            ({"text": "x", "image": 42}, "data URL"),
+            (
+                {
+                    "text": "x",
+                    "image": "data:image/png;base64,"
+                    + base64.b64encode(oversized).decode("ascii"),
+                },
+                "byte limit",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/posts", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+
+        # A reply cannot carry an image — same rule as the CLI.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={
+                "text": "reply with pic",
+                "reply_to": parent["hash"][:16],
+                "image": data_url,
+            },
+        )
+        assert status == 400
+        assert "not a reply" in payload["error"]["message"]
+
+        # Only the two good posts were stored.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "mislabeled",
+            "with a picture",
+            "parent",
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_tan_quote_via_api(tmp_path):
     import RNS
 
@@ -13274,6 +14615,313 @@ def test_typing_event_reaches_the_bus(bridge, node):
     assert event["state"] == "start"
 
 
+# ------------------------------------------------------------------ beacons
+
+BEACON_PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+BEACON_PIN_2 = {"lat": 34.06, "lon": -83.87}
+
+
+def _start_beacon(bridge, **body):
+    return _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", **BEACON_PIN, **body},
+    )
+
+
+def test_beacons_endpoint_lists_active_beacons(bridge, node):
+    status, _, payload = _json(bridge, "/api/beacons")
+    assert status == 200
+    assert payload == {"beacons": [], "count": 0}
+
+    status, _, started = _start_beacon(bridge, duration_seconds=900)
+    assert status == 200
+    beacon = started["beacon"]
+    assert beacon["target"] == PEER_HASH
+    assert beacon["target_kind"] == "dm"
+    assert beacon["active"] is True
+    assert beacon["updates_sent"] == 1
+
+    status, _, payload = _json(bridge, "/api/beacons")
+    assert status == 200
+    assert payload["count"] == 1
+    assert payload["beacons"][0]["id"] == beacon["id"]
+
+
+def test_beacon_start_sends_first_update_and_records_it(bridge, node, tmp_path):
+    status, _, payload = _start_beacon(bridge, duration_seconds=900)
+    assert status == 200
+    beacon = payload["beacon"]
+    # The first update goes out at once, as a location message with
+    # the beacon marker — and the sender's thread shows it.
+    assert node.sent[0][1] == "Rock Springs Park"
+    assert node.last_location == BEACON_PIN
+    assert node.last_beacon == {
+        "id": beacon["id"],
+        "expires_at": beacon["expires_at"],
+        "seq": 1,
+    }
+    assert node.last_kind == "location"
+    # The browser feeds positions through a file the mail loop
+    # re-reads; it starts life holding the start position.
+    position_file = tmp_path / "beacon-positions" / f"{beacon['id']}.json"
+    assert position_file.is_file()
+    assert json.loads(position_file.read_text(encoding="utf-8")) == BEACON_PIN
+    status, _, listed = _json(bridge, "/api/messages")
+    entries = [m for m in listed["messages"] if m.get("beacon")]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["direction"] == "out"
+    assert entry["peer"] == PEER_HASH
+    assert entry["location"] == BEACON_PIN
+    assert entry["beacon"] == {
+        "id": beacon["id"],
+        "expires_at": beacon["expires_at"],
+        "seq": 1,
+    }
+
+
+def test_beacon_start_records_one_entry_for_a_group(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "group": group_id,
+            "lat": 34.05,
+            "lon": -83.88,
+            "duration_seconds": 900,
+        },
+    )
+    assert status == 200
+    beacon = payload["beacon"]
+    assert beacon["target_kind"] == "group"
+    assert node.last_group_location == {"lat": 34.05, "lon": -83.88}
+    assert node.last_group_beacon["id"] == beacon["id"]
+    # One entry for the update, not one per leg: a group beacon
+    # must not spam the sender's thread once per member.
+    status, _, listed = _json(bridge, "/api/messages")
+    entries = [m for m in listed["messages"] if m.get("beacon")]
+    assert len(entries) == 1
+    assert entries[0]["group"] == group_id
+    assert entries[0]["peer"] is None
+    assert entries[0]["sent_at"] == 1000.0
+
+
+def test_beacon_start_rejects_bad_requests(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", "lat": 91.0, "lon": -83.88},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", "lat": 34.05, "lon": -83.88, "duration_seconds": 30},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "peer": "alice",
+            "lat": 34.05,
+            "lon": -83.88,
+            "duration_seconds": 99999,
+        },
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"lat": 34.05, "lon": -83.88},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", "group": "ab" * 16, "lat": 34.05, "lon": -83.88},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", "lat": 34.05, "lon": -83.88, "coarse": "yes"},
+    )
+    assert status == 400
+    assert node.sent == []
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "nobody", "lat": 34.05, "lon": -83.88},
+    )
+    assert status == 502
+
+
+def test_beacon_position_feeds_the_beacon(bridge, node, tmp_path):
+    _, _, started = _start_beacon(bridge, duration_seconds=900)
+    beacon_id = started["beacon"]["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": beacon_id, **BEACON_PIN_2},
+    )
+    assert status == 200
+    assert payload["beacon"]["location"] == BEACON_PIN_2
+    position_file = tmp_path / "beacon-positions" / f"{beacon_id}.json"
+    assert json.loads(position_file.read_text(encoding="utf-8")) == BEACON_PIN_2
+    # The next tick sends the fed position, not the start one.
+    beacon = load_beacons(node.config.beacons_path).get(beacon_id)
+    node.send_beacon_update(beacon)
+    assert node.last_location == BEACON_PIN_2
+    assert node.last_beacon["seq"] == 2
+
+
+def test_beacon_position_rejects_unknown_stopped_and_bad(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": "00" * 8, "lat": 34.05, "lon": -83.88},
+    )
+    assert status == 400
+    _, _, started = _start_beacon(bridge, duration_seconds=900)
+    beacon_id = started["beacon"]["id"]
+    status, _, payload = _json(
+        bridge, "/api/beacons/stop", method="POST", body={"id": beacon_id}
+    )
+    assert status == 200
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": beacon_id, "lat": 34.05, "lon": -83.88},
+    )
+    assert status == 400
+    assert "not running" in payload["error"]["message"]
+    _, _, started = _start_beacon(bridge, duration_seconds=900)
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": started["beacon"]["id"], "lat": 91.0, "lon": -83.88},
+    )
+    assert status == 400
+
+
+def test_beacon_position_refuses_a_foreign_position_file(bridge, node, tmp_path):
+    # A beacon the CLI started with its own --location-file keeps
+    # that file: the console must not clobber a GPS writer it
+    # does not own.
+    foreign = tmp_path / "gps.json"
+    foreign.write_text(
+        json.dumps({"lat": 34.05, "lon": -83.88}), encoding="utf-8"
+    )
+    beacon = node.start_beacon(
+        "alice",
+        dict(BEACON_PIN),
+        location_file=str(foreign),
+        duration=900.0,
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": beacon.id, "lat": 34.06, "lon": -83.87},
+    )
+    assert status == 400
+    assert "another writer" in payload["error"]["message"]
+    assert json.loads(foreign.read_text(encoding="utf-8")) == {
+        "lat": 34.05,
+        "lon": -83.88,
+    }
+
+
+def test_beacon_stop_stops_and_drops_the_position_file(bridge, node, tmp_path):
+    _, _, started = _start_beacon(bridge, duration_seconds=900)
+    beacon_id = started["beacon"]["id"]
+    position_file = tmp_path / "beacon-positions" / f"{beacon_id}.json"
+    assert position_file.is_file()
+    status, _, payload = _json(
+        bridge, "/api/beacons/stop", method="POST", body={"id": beacon_id}
+    )
+    assert status == 200
+    assert payload["beacon"]["stopped"] is True
+    assert payload["beacon"]["active"] is False
+    assert not position_file.exists()
+    # Stopping again is a no-op the API reports, not a silent ok.
+    status, _, payload = _json(
+        bridge, "/api/beacons/stop", method="POST", body={"id": beacon_id}
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge, "/api/beacons/stop", method="POST", body={"id": "00" * 8}
+    )
+    assert status == 400
+    status, _, payload = _json(bridge, "/api/beacons/stop", method="POST", body={})
+    assert status == 400
+
+
+def test_record_inbound_attaches_location_and_beacon(bridge):
+    message = bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "Rock Springs Park",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "00" * 16,
+            "location": dict(BEACON_PIN),
+            "beacon": {"id": "aa" * 8, "expires_at": 4600.0, "seq": 3},
+        }
+    )
+    assert message is not None
+    assert message["location"] == BEACON_PIN
+    assert message["beacon"] == {"id": "aa" * 8, "expires_at": 4600.0, "seq": 3}
+    # A malformed marker drops instead of the message.
+    message = bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "Rock Springs Park",
+            "sent_at": 1002.0,
+            "received_at": 1003.0,
+            "id": "11" * 16,
+            "location": dict(BEACON_PIN),
+            "beacon": {"id": "not-a-beacon"},
+        }
+    )
+    assert message is not None
+    assert message["location"] == BEACON_PIN
+    assert "beacon" not in message
+
+
+def test_beacon_update_event_reaches_the_bus(bridge, node):
+    # The bridge chains the node's on_beacon_update callback, so a
+    # mail-loop tick lands in the console history as a live event.
+    beacon = node.start_beacon("alice", dict(BEACON_PIN), duration=900.0)
+    subscriber = bridge.bus.subscribe()
+    try:
+        node.on_beacon_update(beacon, {"id": "00" * 16, "queued": False})
+        event = subscriber.get(timeout=5)
+    finally:
+        bridge.bus.unsubscribe(subscriber)
+    assert event["type"] == "message"
+    assert event["message"]["beacon"]["id"] == beacon.id
+    assert event["message"]["location"] == BEACON_PIN
+
+
 def test_react_endpoint_fans_out_to_group_members(bridge, node):
     group_id = node.groups.list_groups()[0]["id"]
     bridge.record_inbound(
@@ -13735,6 +15383,95 @@ def test_dm_send_with_poll_options_posts_poll(bridge, node):
     assert node.last_poll_close is None
 
 
+PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def test_dm_send_with_location_pins_place(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "meet here", "location": dict(PIN)},
+    )
+    assert status == 200
+    assert node.last_location == PIN
+    assert payload["message"]["location"] == PIN
+    assert payload["message"]["text"] == "meet here"
+
+
+def test_dm_send_location_without_text_defaults_to_place_name(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "location": dict(PIN)},
+    )
+    assert status == 200
+    assert node.sent[-1][1] == "Rock Springs Park"
+    assert payload["message"]["text"] == "Rock Springs Park"
+    assert payload["message"]["location"] == PIN
+
+
+def test_dm_send_location_without_text_or_name_defaults_to_coordinates(
+    bridge, node
+):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "location": {"lat": 34.05, "lon": -83.88}},
+    )
+    assert status == 200
+    assert node.sent[-1][1] == "📍 34.05, -83.88"
+    assert payload["message"]["location"] == {"lat": 34.05, "lon": -83.88}
+
+
+def test_dm_send_with_bad_location_is_400(bridge, node):
+    for bad in ({"lat": 91, "lon": 0}, {"lat": 34.05}, "34.05,-83.88"):
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            body={"to": "alice", "text": "meet here", "location": bad},
+        )
+        assert status == 400
+        assert "latitude" in payload["error"]["message"]
+    assert node.sent == []
+
+
+def test_group_send_with_location_pins_place(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "meet here", "location": dict(PIN)},
+    )
+    assert status == 200
+    assert node.last_group_location == PIN
+    assert payload["messages"]
+    assert all(m["location"] == PIN for m in payload["messages"])
+
+
+def test_inbound_location_pin_is_recorded(bridge, node):
+    pin = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "meet here",
+        "kind": "chat",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-pin",
+        "location": dict(PIN),
+    }
+    node.inbox.append(dict(pin))
+    bridge.record_inbound(dict(pin), publish=False)
+    entry = next(
+        entry for entry in bridge.messages() if entry.get("wire_id") == "wire-pin"
+    )
+    assert entry["location"] == PIN
+    assert entry["text"] == "meet here"
+
+
 def test_dm_poll_vote_endpoint_votes_by_number_and_text(bridge, node):
     _seed_dm_poll(node, bridge)
     status, _, payload = _json(
@@ -14140,6 +15877,232 @@ def test_deny_join_request_endpoint_refuses_peer(bridge, node):
     _, _, listed = _json(bridge, "/api/groups/join-requests")
     assert listed == {"requests": [], "count": 0}
     assert node.group_sent == []
+
+
+def _seed_own_identity(node):
+    """Make the fixture node's disk identity its real identity.
+
+    The bridge mints with the identity loaded from disk, and the
+    token's creator must be this node's destination hash — so the
+    fixture's hash follows the identity, and groups it creates are
+    created by that hash.
+    """
+    from tau.identity import destination_hash, save_identity
+
+    save_identity(node.identity, node.config.identity_path)
+    node.destination_hexhash = destination_hash(node.identity).hex()
+    return node.destination_hexhash
+
+
+def _own_group(node, name="team"):
+    own_hash = _seed_own_identity(node)
+    node.groups.create(name, [PEER_HASH, own_hash], created_by=own_hash)
+    return own_hash
+
+
+def test_group_invite_status_endpoint_reports_no_link_before_mint(bridge, node):
+    _own_group(node)
+    status, _, payload = _json(bridge, "/api/groups/invite?group=team")
+    assert status == 200
+    assert payload["group"]["name"] == "team"
+    assert payload["mode"] == "open"
+    assert payload["generation"] == 0
+    assert payload["link"] is None
+    # A group this node did not create is not its link to manage.
+    status, _, payload = _json(bridge, "/api/groups/invite?group=crew")
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/groups/invite?group=nope")
+    assert status == 400
+    assert "unknown group" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/groups/invite")
+    assert status == 400
+    assert "field 'group'" in payload["error"]["message"]
+
+
+def test_group_invite_endpoint_mints_a_verifiable_link(bridge, node):
+    from tau.group_invites import (
+        load_invites,
+        parse_invite_link,
+        verify_invite_link,
+    )
+
+    own_hash = _own_group(node)
+    status, _, payload = _json(
+        bridge, "/api/groups/invite", method="POST", body={"group": "team"}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["mode"] == "open"
+    assert payload["generation"] == 0
+    link = payload["link"]
+    assert link.startswith("tau://invite/")
+    token = parse_invite_link(link)
+    assert token["creator"] == own_hash
+    assert token["group"] == "team"
+    assert (
+        verify_invite_link(
+            link,
+            identity=node.identity,
+            invites=load_invites(node.config.invites_path),
+        )["mode"]
+        == "open"
+    )
+    # Minting again with a mode switches the stored mode without
+    # bumping the generation.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/invite",
+        method="POST",
+        body={"group": "team", "mode": "closed"},
+    )
+    assert status == 200
+    assert payload["mode"] == "closed"
+    assert payload["generation"] == 0
+    assert (
+        verify_invite_link(
+            payload["link"],
+            identity=node.identity,
+            invites=load_invites(node.config.invites_path),
+        )["mode"]
+        == "closed"
+    )
+    # The status endpoint now shows the current link.
+    _, _, listed = _json(bridge, "/api/groups/invite?group=team")
+    assert listed["link"] == payload["link"]
+    assert listed["mode"] == "closed"
+    # Bad mode and non-creator groups are refused.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/invite",
+        method="POST",
+        body={"group": "team", "mode": "wide-open"},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/invite",
+        method="POST",
+        body={"group": "crew"},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/groups/invite", method="POST", body={})
+    assert status == 400
+    assert "field 'group'" in payload["error"]["message"]
+
+
+def test_group_invite_revoke_endpoint_drops_link(bridge, node):
+    from tau.group_invites import InviteError, load_invites, verify_invite_link
+
+    _own_group(node)
+    _, _, minted = _json(
+        bridge, "/api/groups/invite", method="POST", body={"group": "team"}
+    )
+    link = minted["link"]
+    status, _, payload = _json(
+        bridge, "/api/groups/invite/revoke", method="POST", body={"group": "team"}
+    )
+    assert status == 200
+    assert payload["generation"] == 1
+    _, _, listed = _json(bridge, "/api/groups/invite?group=team")
+    assert listed["link"] is None
+    assert listed["generation"] == 1
+    with pytest.raises(InviteError):
+        verify_invite_link(
+            link,
+            identity=node.identity,
+            invites=load_invites(node.config.invites_path),
+        )
+    status, _, payload = _json(
+        bridge, "/api/groups/invite/revoke", method="POST", body={"group": "crew"}
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+
+
+def test_group_join_endpoint_joins_from_link(bridge, node, monkeypatch, tmp_path):
+    from tau.group_invites import mint_invite
+    from tau.identity import destination_hash
+    from tau.protocol import derive_group_id
+
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    own_hash = _seed_own_identity(node)
+    link = mint_invite(
+        tmp_path / "invites.json",
+        creator,
+        group_name="remote-crew",
+        creator_hash=creator_hash,
+        mode="open",
+    )
+    members = [creator_hash, own_hash]
+    group_id = derive_group_id(creator_hash, "remote-crew", members)
+    reply_group = {
+        "id": group_id,
+        "name": "remote-crew",
+        "members": members,
+        "creator": creator_hash,
+    }
+    sent = {}
+    replies = {
+        "reply": {"ok": True, "status": "added", "group": dict(reply_group)}
+    }
+
+    def fake_send(target, text, **kwargs):
+        sent["target"] = target
+        sent["text"] = text
+        sent["kind"] = kwargs.get("kind")
+        return dict(replies["reply"])
+
+    monkeypatch.setattr(node, "send_message", fake_send)
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 200
+    assert payload["status"] == "added"
+    assert payload["group"]["id"] == group_id
+    assert own_hash in [member["hash"] for member in payload["group"]["members"]]
+    # The link went to the creator as a join request, and the roster
+    # from the reply is pinned locally.
+    assert sent["target"] == creator_hash
+    assert sent["text"] == link
+    assert sent["kind"] == "group-join-request"
+    assert node.groups.get(group_id) is not None
+    # A closed group's reply leaves the request pending.
+    replies["reply"] = {"ok": True, "status": "pending", "group": dict(reply_group)}
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 200
+    assert payload["status"] == "pending"
+    assert payload["group"]["id"] == group_id
+    # An unreachable creator queues the request.
+    replies["reply"] = {"queued": True, "id": "mail-new-1"}
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 200
+    assert payload["status"] == "queued"
+    assert payload["group"] == "remote-crew"
+    # An error reply and malformed links are refused.
+    replies["reply"] = {
+        "ok": False,
+        "error": {"message": "invite link is not valid"},
+    }
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 400
+    assert "join request failed" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": "garbage"}
+    )
+    assert status == 400
+    assert "not an invite link" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/groups/join", method="POST", body={})
+    assert status == 400
+    assert "field 'link'" in payload["error"]["message"]
 
 
 def test_join_request_endpoints_validate_fields(bridge, node):
