@@ -1,6 +1,6 @@
 """Durable message-draft store: one unsent message per conversation.
 
-A draft is text parked for a single peer or a single group, saved with
+A draft is text parked for a single peer, group, or channel, saved with
 ``tau draft save`` and sent later with ``tau draft send``.  Drafts are
 local-only by construction — there is no wire format for them, so a
 draft never leaves the node and no recipient can learn one exists.
@@ -33,6 +33,7 @@ try:  # Windows only; the lock uses msvcrt there, as identity.py does.
 except ImportError:  # pragma: no cover - POSIX platforms
     msvcrt = None  # type: ignore[assignment]
 
+from .channels import ChannelError, clean_channel_name
 from .protocol import ProtocolError, normalize_message
 from .util import atomic_write_json, read_json
 
@@ -44,7 +45,7 @@ log = logging.getLogger(__name__)
 # `tau draft delete` frees capacity when the cap is reached.
 MAX_DRAFTS = 50
 
-DRAFT_KINDS = ("peer", "group")
+DRAFT_KINDS = ("peer", "group", "channel")
 
 
 def _valid_hash(value: Any) -> Optional[str]:
@@ -58,6 +59,20 @@ def _valid_hash(value: Any) -> Optional[str]:
     return value.lower()
 
 
+def _valid_target(kind: str, value: Any) -> Optional[str]:
+    """The canonical store key for a draft target, or ``None`` when invalid.
+
+    Peers and groups are keyed by their 32-hex id; a channel draft is
+    keyed by the channel name, which is the stable identifier there.
+    """
+    if kind == "channel":
+        try:
+            return clean_channel_name(value)
+        except ChannelError:
+            return None
+    return _valid_hash(value)
+
+
 def _valid_draft(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored draft, or ``None`` when it is unusable."""
     if not isinstance(raw, dict):
@@ -65,7 +80,7 @@ def _valid_draft(raw: Any) -> Optional[Dict[str, Any]]:
     kind = raw.get("kind")
     if kind not in DRAFT_KINDS:
         return None
-    target = _valid_hash(raw.get("target"))
+    target = _valid_target(kind, raw.get("target"))
     if target is None:
         return None
     try:
@@ -191,8 +206,10 @@ class DraftStore:
         """
         if kind not in DRAFT_KINDS:
             raise ValueError(f"unknown draft target kind: {kind!r}")
-        hashed = _valid_hash(target)
-        if hashed is None:
+        key_target = _valid_target(kind, target)
+        if key_target is None:
+            if kind == "channel":
+                raise ValueError("draft target must be a channel name")
             raise ValueError("draft target must be a destination hash")
         try:
             cleaned = normalize_message(text)
@@ -200,12 +217,12 @@ class DraftStore:
             raise ValueError(str(exc)) from exc
         draft = {
             "kind": kind,
-            "target": hashed,
+            "target": key_target,
             "text": cleaned,
             "updated_at": time.time(),
         }
         with self._transaction():
-            key = _draft_key(kind, hashed)
+            key = _draft_key(kind, key_target)
             if key not in self._drafts and len(self._drafts) >= MAX_DRAFTS:
                 raise ValueError(
                     f"draft limit reached ({MAX_DRAFTS} drafts;"
@@ -222,20 +239,20 @@ class DraftStore:
 
     def get(self, kind: str, target: str) -> Optional[Dict[str, Any]]:
         """The draft for a conversation, or ``None`` when there is none."""
-        hashed = _valid_hash(target)
-        if hashed is None or kind not in DRAFT_KINDS:
+        key_target = _valid_target(kind, target)
+        if key_target is None or kind not in DRAFT_KINDS:
             return None
         with self._transaction():
-            draft = self._drafts.get(_draft_key(kind, hashed))
+            draft = self._drafts.get(_draft_key(kind, key_target))
         return dict(draft) if draft is not None else None
 
     def delete(self, kind: str, target: str) -> bool:
         """Delete a draft; ``True`` when one was removed."""
-        hashed = _valid_hash(target)
-        if hashed is None or kind not in DRAFT_KINDS:
+        key_target = _valid_target(kind, target)
+        if key_target is None or kind not in DRAFT_KINDS:
             return False
         with self._transaction():
-            key = _draft_key(kind, hashed)
+            key = _draft_key(kind, key_target)
             if key not in self._drafts:
                 return False
             snapshot = self._snapshot()

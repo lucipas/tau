@@ -749,20 +749,21 @@ def build_parser() -> argparse.ArgumentParser:
     note.add_argument("--file", type=Path, help="read the note from a file")
     note.set_defaults(func=cmd_note)
 
-    # A draft is an unsent message parked for one peer or group: saved
-    # locally with `draft save`, sent later with `draft send`.  Like a
-    # Tan draft, it never leaves the machine until it is sent.
+    # A draft is an unsent message parked for one peer, group, or
+    # channel: saved locally with `draft save`, sent later with
+    # `draft send`.  Like a Tan draft, it never leaves the machine
+    # until it is sent.
     draft = subparsers.add_parser(
         "draft",
         parents=[common],
-        help="save an unsent DM or group message to send later",
+        help="save an unsent DM, group, or channel message to send later",
     )
     draft_sub = draft.add_subparsers(dest="draft_command", metavar="DRAFT_COMMAND")
 
     draft_save = draft_sub.add_parser(
         "save",
         parents=[common],
-        help="save a message as a draft for a peer or a group",
+        help="save a message as a draft for a peer, a group, or a channel",
     )
     draft_save_target = draft_save.add_mutually_exclusive_group(required=True)
     draft_save_target.add_argument(
@@ -774,6 +775,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="NAME|ID",
         help="group name or id: draft for the group instead of a peer",
+    )
+    draft_save_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name: draft for the channel instead of a peer or group",
     )
     draft_save.add_argument(
         "message", nargs="?", help="draft text (reads stdin when omitted)"
@@ -803,6 +809,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|ID",
         help="group name or id",
     )
+    draft_show_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name",
+    )
     draft_show.set_defaults(func=cmd_draft_show)
 
     draft_delete = draft_sub.add_parser(
@@ -821,6 +832,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|ID",
         help="group name or id",
     )
+    draft_delete_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name",
+    )
     draft_delete.set_defaults(func=cmd_draft_delete)
 
     draft_send = draft_sub.add_parser(
@@ -837,7 +853,12 @@ def build_parser() -> argparse.ArgumentParser:
     draft_send_target.add_argument(
         "--group",
         metavar="NAME|ID",
-        help="group name or id: send the draft into the group",
+        help="group name or id: send the draft into a group",
+    )
+    draft_send_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name: send the draft into the channel",
     )
     draft_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
     draft_send.add_argument(
@@ -17515,12 +17536,20 @@ def cmd_note(args: argparse.Namespace) -> int:
 def _resolve_draft_target(
     config: TauConfig, args: argparse.Namespace
 ) -> Tuple[str, str, str]:
-    """Resolve a draft command's ``--to``/``--group`` to ``(kind, id, name)``.
+    """Resolve a draft command's ``--to``/``--group``/``--channel`` to ``(kind, id, name)``.
 
     Peers resolve through the local registry only — a draft is local
     state for someone this node already knows, so there is no reason to
     start a node and discover.  Groups resolve through the group store.
+    Channels need no lookup: the name is the key, so it is cleaned and
+    returned as-is; ``cmd_draft_save`` checks membership separately.
     """
+    if getattr(args, "channel", None):
+        try:
+            name = clean_channel_name(args.channel)
+        except ChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        return "channel", name, name
     if getattr(args, "group", None):
         try:
             group = GroupStore(config.groups_path).find(args.group)
@@ -17546,6 +17575,8 @@ def _describe_draft(
     if draft["kind"] == "group":
         group = GroupStore(config.groups_path).get(str(draft["target"]))
         name = str(group["name"]) if group is not None else short_hash(draft["target"])
+    elif draft["kind"] == "channel":
+        name = str(draft["target"])
     else:
         peer = PeerRegistry(config.peers_path).get(str(draft["target"]))
         name = peer.display_name if peer is not None else short_hash(draft["target"])
@@ -17565,13 +17596,24 @@ def _draft_preview(text: str) -> str:
 
 
 def cmd_draft_save(args: argparse.Namespace) -> int:
-    """Save a message as a draft for a peer or a group.
+    """Save a message as a draft for a peer, a group, or a channel.
 
     Local-only: the text is validated like a send but never queued or
     transmitted.  Saving again overwrites the conversation's draft.
+    A channel draft requires membership, like a group draft requires
+    the group to exist — so a typo'd channel fails here, at save time,
+    instead of silently parking a draft that can never be sent.
     """
     config = _make_config(args)
     kind, target, name = _resolve_draft_target(config, args)
+    if kind == "channel":
+        conn = init_channel_db(config.channels_db_path)
+        try:
+            member = is_channel_member(conn, target)
+        finally:
+            conn.close()
+        if not member:
+            raise NodeError(f"not a member of channel {target!r}; join it first")
     text = _read_message(args)
     try:
         draft = DraftStore(config.drafts_path).save(kind, target, text)
@@ -17601,10 +17643,18 @@ def cmd_draft_list(args: argparse.Namespace) -> int:
         print("No drafts yet — save one with `tau draft save --to PEER \"text\"`.")
         return _EXIT_OK
     for draft in drafts:
-        where = "group " if draft["kind"] == "group" else ""
+        if draft["kind"] == "channel":
+            where = "channel "
+        elif draft["kind"] == "group":
+            where = "group "
+        else:
+            where = ""
+        # A channel draft's target is its name, so the hash prefix
+        # other drafts show would just repeat it.
+        target = "" if draft["kind"] == "channel" else f" ({draft['target'][:8]})"
         age = _ago(time.time() - float(draft["updated_at"]))
         print(
-            f"{where}{draft['target_name']} ({draft['target'][:8]}) — "
+            f"{where}{draft['target_name']}{target} — "
             f"{_draft_preview(str(draft['text']))} [{age} ago]"
         )
     return _EXIT_OK
@@ -17645,8 +17695,10 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
 
     The draft is deleted once the message is queued or delivered — a
     failed send keeps it, so nothing is lost to a transient failure.
-    Delivery reuses :func:`cmd_send` wholesale for a peer target, or
-    :func:`cmd_group_send` for a group target, exactly like a forward.
+    Delivery reuses :func:`cmd_send` wholesale for a peer target,
+    :func:`cmd_group_send` for a group target, or
+    :func:`cmd_channel_send` for a channel target, exactly like a
+    forward.
     """
     config = _make_config(args)
     kind, target, name = _resolve_draft_target(config, args)
@@ -17654,9 +17706,10 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
     draft = store.get(kind, target)
     if draft is None:
         raise NodeError(f"no draft for {name}")
-    # `cmd_send`/`cmd_group_send` read their text from `args.message`;
-    # hand them the draft text and let them own delivery, queueing, and
-    # output.  The remaining flags come from this subcommand's parser.
+    # `cmd_send`/`cmd_group_send`/`cmd_channel_send` read their text
+    # from `args.message`; hand them the draft text and let them own
+    # delivery, queueing, and output.  The remaining flags come from
+    # this subcommand's parser.
     args.message = str(draft["text"])
     args.file = None
     args.location = None
@@ -17667,6 +17720,9 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
     if kind == "group":
         args.group = target
         code = cmd_group_send(args)
+    elif kind == "channel":
+        args.channel = target
+        code = cmd_channel_send(args)
     else:
         args.to = [target]
         code = cmd_send(args)

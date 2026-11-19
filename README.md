@@ -375,11 +375,11 @@ Global options may appear before or after the command:
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau messages prune --older-than 90d` | Delete stored messages older than a cutoff (`--peer`, `--group`, `--dry-run`) |
 | `tau note TEXT` | Save a private note to self in the local inbox (never sent; list with `tau messages --kind note`) |
-| `tau draft save --to PEER TEXT` | Save an unsent message as a draft for a peer (`--group NAME` drafts for a group instead; one draft per conversation, saving again overwrites; local-only, never sent until `draft send`) |
+| `tau draft save --to PEER TEXT` | Save an unsent message as a draft for a peer (`--group NAME` drafts for a group, `--channel NAME` for a joined channel; one draft per conversation, saving again overwrites; local-only, never sent until `draft send`) |
 | `tau draft list` | List saved message drafts with a text preview |
-| `tau draft show --to PEER` | Print a saved draft's full text (`--group NAME` for a group draft) |
-| `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft) |
-| `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group) |
+| `tau draft show --to PEER` | Print a saved draft's full text (`--group NAME` for a group draft, `--channel NAME` for a channel draft) |
+| `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft, `--channel NAME` for a channel draft) |
+| `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group, `--channel NAME` into a channel) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
