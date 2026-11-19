@@ -160,8 +160,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
-    POST /api/tan/schedule schedule a Tan post for later
-    GET  /api/tan/scheduled queued Tan posts, soonest first
+    POST /api/tan/schedule schedule a Tan post — or a poll, with ``"poll_options"`` — for later
+    GET  /api/tan/scheduled queued Tan posts and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
@@ -3434,6 +3434,7 @@ class WebBridge:
     def tan_schedule_post(
         self, text: str, *, reply_to: Optional[str] = None, send_in: float,
         expires_in: float = 0.0,
+        poll_options: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
 
@@ -3441,8 +3442,12 @@ class WebBridge:
         same one the CLI writes, and the serving node publishes due
         entries when it has an app. Only the reply target needs the
         store, resolved the same way :meth:`tan_post` resolves it.
+
+        With *poll_options* the entry is a poll instead: the text is
+        its question, the options ride alongside it, and a reply
+        target is refused — polls are top-level entries.
         """
-        from .scheduled_posts import schedule_post
+        from .scheduled_posts import schedule_poll, schedule_post
         from .tangents.tan import MAX_GOSSIP_TTL, resolve_post
 
         if reply_to is not None:
@@ -3452,6 +3457,19 @@ class WebBridge:
             finally:
                 conn.close()
         config = self.node.config
+        if poll_options is not None:
+            post = schedule_poll(
+                config.scheduled_posts_path,
+                question=text,
+                options=poll_options,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                # Validate against the name the serving app publishes with
+                # (node.name, refreshed at startup), not the configured name.
+                name=getattr(self.node, "name", None),
+                expires_in=float(expires_in),
+            )
+            return post.to_dict()
         post = schedule_post(
             config.scheduled_posts_path,
             text=text,
@@ -13459,6 +13477,40 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                poll_options = body.get("poll_options")
+                if poll_options is not None:
+                    # A poll is a top-level entry: it cannot be a reply,
+                    # and its options are fixed at schedule time.
+                    if reply_to is not None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "a scheduled poll cannot be a reply"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if (
+                        not isinstance(poll_options, list)
+                        or not 2 <= len(poll_options) <= 8
+                        or any(
+                            not isinstance(option, str) or not option.strip()
+                            for option in poll_options
+                        )
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'poll_options' must be a list "
+                                    "of 2-8 non-empty strings"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     scheduled = self.bridge.tan_schedule_post(
                         text,
@@ -13467,6 +13519,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else 0.0
                         ),
+                        poll_options=poll_options,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

@@ -12885,6 +12885,144 @@ def test_tan_schedule_post_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_schedule_poll_via_api(tmp_path):
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "pizza or tacos?",
+                "poll_options": ["Pizza", "Tacos"],
+                "send_in": 3600,
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "poll"
+        assert scheduled["text"] == "pizza or tacos?"
+        assert scheduled["options"] == ["Pizza", "Tacos"]
+        assert abs(scheduled["publish_at"] - (time.time() + 3600)) < 5
+
+        # With an expiry the poll disappears that long after it is
+        # published, and the delay must stay shorter than the expiry.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "vanishing poll?",
+                "poll_options": ["Yes", "No"],
+                "send_in": 60,
+                "expires_in": 3600,
+            },
+        )
+        assert status == 200
+        assert payload["scheduled"]["kind"] == "poll"
+        assert payload["scheduled"]["expires_in"] == 3600
+
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload["count"] == 2
+        assert [item["kind"] for item in payload["scheduled"]] == [
+            "poll",
+            "poll",
+        ]
+
+        # Cancelling a queued poll drops only that entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/cancel-scheduled",
+            method="POST",
+            body={"id": scheduled["id"][:8]},
+        )
+        assert status == 200
+        assert payload["cancelled"]["id"] == scheduled["id"]
+        assert payload["deleted_local"] is False
+    finally:
+        bridge.stop()
+
+
+def test_tan_schedule_poll_rejects_bad_requests(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        for body, fragment in [
+            (
+                {"text": "pick?", "poll_options": ["only one"], "send_in": 60},
+                "poll_options",
+            ),
+            (
+                {
+                    "text": "pick?",
+                    "poll_options": ["a", "b", "c", "d", "e", "f", "g", "h", "i"],
+                    "send_in": 60,
+                },
+                "poll_options",
+            ),
+            (
+                {"text": "pick?", "poll_options": ["Yes", "  "], "send_in": 60},
+                "poll_options",
+            ),
+            (
+                {"text": "pick?", "poll_options": ["Yes", 7], "send_in": 60},
+                "poll_options",
+            ),
+            (
+                {"text": "pick?", "poll_options": "Yes/No", "send_in": 60},
+                "poll_options",
+            ),
+            (
+                {
+                    "text": "pick?",
+                    "poll_options": ["Yes", "No"],
+                    "reply_to": post["hash"][:16],
+                    "send_in": 60,
+                },
+                "cannot be a reply",
+            ),
+            (
+                {
+                    "text": "pick?",
+                    "poll_options": ["Yes", "No"],
+                    "send_in": 3600,
+                    "expires_in": 60,
+                },
+                "shorter than",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/schedule", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+        # Nothing queued by the rejected requests.
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload == {"scheduled": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
 def test_tan_schedule_post_rejects_bad_requests(tmp_path):
     import RNS
 

@@ -660,6 +660,10 @@ export interface ScheduledTanPost {
   next_attempt_at: number | null;
   paused_at: number | null;
   expires_in?: number;
+  /** "post" for a queued post, "poll" for a queued poll question. */
+  kind?: "post" | "poll";
+  /** Fixed poll choices; only present when kind is "poll". */
+  options?: string[];
   [key: string]: unknown;
 }
 

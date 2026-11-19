@@ -718,6 +718,51 @@ def check_post_text_fits(
     )
 
 
+def check_poll_fits(
+    question: str,
+    options: Sequence[str],
+    *,
+    name: Optional[str] = None,
+    expires: bool = False,
+) -> None:
+    """Raise PostError if a poll cannot fit a Tan request once encoded.
+
+    The poll analogue of :func:`check_post_text_fits`: the question and
+    the options ride in one signed entry, so a question that fits alone
+    can still overflow the 8 KiB budget once 8 long options join it.
+    Callers scheduling a poll refuse it up front instead of failing
+    every publish attempt later.  Options are cleaned the same way
+    :func:`create_poll` cleans them, so a poll that passes here is one
+    ``create_poll`` will accept.
+    """
+    try:
+        clean_question = normalize_message(question)
+    except ProtocolError as exc:
+        raise PostError(str(exc)) from exc
+    clean_options = _clean_poll_options(list(options))
+    now = time.time()
+    _check_wire_size(
+        {
+            "v": TAN_VERSION,
+            "author": "0" * AUTHOR_HEX_LENGTH,
+            "key": "0" * KEY_HEX_LENGTH,
+            "name": (
+                sanitize_name(name)
+                if name is not None
+                else "x" * MAX_NAME_LENGTH
+            ),
+            "text": clean_question,
+            "created_at": round(now, 3),
+            "prev": "0" * HASH_HEX_LENGTH,
+            "kind": KIND_POLL,
+            "options": clean_options,
+            "expires_at": (
+                now + MAX_TAN_POST_EXPIRY + 0.123456789 if expires else None
+            ),
+        }
+    )
+
+
 def _identity_from_post(post: Dict[str, Any]) -> RNS.Identity:
     try:
         identity = RNS.Identity(create_keys=False)

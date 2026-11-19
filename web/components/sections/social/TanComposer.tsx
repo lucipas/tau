@@ -4,8 +4,8 @@
 // An attached image is read as a base64 data URL and published with the
 // post (the bridge validates and stores it); replies and polls cannot
 // carry an image, and neither can a scheduled post yet, so the picker
-// is hidden for those and the submit guards them. Max length is a
-// client-side guard only.
+// is hidden for those and the submit guards them. Polls can be
+// scheduled like posts. Max length is a client-side guard only.
 
 "use client";
 
@@ -92,11 +92,20 @@ export default function TanComposer({
       const problem = validatePoll(text, pollOptions);
       if (problem) return setError(problem);
       try {
-        await composer.poll(
-          text.trim(),
-          pollOptions.map((o) => o.trim()).filter(Boolean),
-          expiresIn,
-        );
+        if (sendIn !== undefined) {
+          await composer.schedulePoll(
+            text.trim(),
+            pollOptions.map((o) => o.trim()).filter(Boolean),
+            sendIn,
+            { expiresIn },
+          );
+        } else {
+          await composer.poll(
+            text.trim(),
+            pollOptions.map((o) => o.trim()).filter(Boolean),
+            expiresIn,
+          );
+        }
         reset();
         onPosted?.();
       } catch {

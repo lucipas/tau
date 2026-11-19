@@ -973,6 +973,21 @@ export async function scheduleTanPost(
   });
 }
 
+/** Queue a Tan poll for later: the question plus its fixed options. */
+export async function scheduleTanPoll(
+  question: string,
+  options: string[],
+  sendIn: number,
+  opts: { expiresIn?: number } = {},
+): Promise<ScheduledTanPost> {
+  return post("/api/tan/schedule", {
+    text: question,
+    poll_options: options,
+    send_in: sendIn,
+    expires_in: opts.expiresIn ?? 0,
+  });
+}
+
 export async function cancelScheduledTanPost(id: string): Promise<unknown> {
   return post("/api/tan/cancel-scheduled", { id });
 }

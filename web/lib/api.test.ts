@@ -39,6 +39,7 @@ import {
   closeDmPoll,
   sendBroadcast,
   scheduleChannelMessage,
+  scheduleTanPoll,
   searchChannelMessages,
   sendChannelMessage,
   sendMessage,
@@ -300,6 +301,19 @@ describe("POST endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/schedule");
     expect(captured[0].init?.method).toBe("POST");
     expect(bodyOf(0)).toEqual({ channel: "general", text: "later", send_in: 300 });
+  });
+
+  it("schedules a Tan poll with poll_options and send_in seconds", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleTanPoll("pizza or tacos?", ["Pizza", "Tacos"], 300);
+    expect(captured[0].url).toBe("/api/tan/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      text: "pizza or tacos?",
+      poll_options: ["Pizza", "Tacos"],
+      send_in: 300,
+      expires_in: 0,
+    });
   });
 
   it("cancels a scheduled channel message by id", async () => {

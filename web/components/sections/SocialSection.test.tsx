@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TauContext } from "@/components/chrome/TauContext";
-import type { TanPost } from "@/lib/types";
+import type { ScheduledTanPost, TanPost } from "@/lib/types";
 import SocialSection from "./SocialSection";
 import { validateTanText } from "./social/TanComposer";
 import { fakeTau, mockFetch } from "./test-utils";
@@ -35,9 +35,11 @@ function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): Tan
 
 let calls: string[] = [];
 let timeline: TanPost[] = [];
+let scheduled: ScheduledTanPost[] = [];
 
 beforeEach(() => {
   timeline = [makePost("h1".padEnd(64, "0"), "hello #mesh @bob")];
+  scheduled = [];
   const router = mockFetch((url) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
@@ -48,7 +50,7 @@ beforeEach(() => {
     if (url.includes("/api/tan/saved")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/hidden")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/pinned")) return { posts: [], count: 0, next_offset: null };
-    if (url.includes("/api/tan/scheduled")) return { scheduled: [], count: 0 };
+    if (url.includes("/api/tan/scheduled")) return { scheduled, count: scheduled.length };
     if (url.includes("/api/tan/muted-keywords")) return { muted_keywords: [], count: 0 };
     if (url.includes("/api/tan/muted-tags")) return { muted_tags: [], count: 0 };
     if (url.includes("/api/tan/muted")) return { muted: [], count: 0 };
@@ -162,5 +164,35 @@ describe("SocialSection", () => {
       expect(calls).toContain("GET /api/tan/search?q=mesh&limit=30"),
     );
     expect(await screen.findByText(/1 result for/)).toBeTruthy();
+  });
+
+  it("shows a scheduled poll with its options in the Scheduled tab", async () => {
+    scheduled = [
+      {
+        id: "a".repeat(16),
+        text: "pizza or tacos?",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+        kind: "poll",
+        options: ["Pizza", "Tacos"],
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("pizza or tacos?")).toBeTruthy();
+    expect(screen.getByText("Poll · 2 options")).toBeTruthy();
+    expect(screen.getByText("1. Pizza")).toBeTruthy();
+    expect(screen.getByText("2. Tacos")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Cancel scheduled poll" }),
+    ).toBeTruthy();
   });
 });

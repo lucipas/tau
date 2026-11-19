@@ -268,6 +268,9 @@ tau tan post --to alice "direct delivery"
 tau tan post --delay 8h "good morning, mesh"
 tau tan scheduled
 
+# Schedule a poll the same way — it is asked when the time comes
+tau tan poll --delay 2h "pizza or tacos?" --option Pizza --option Tacos
+
 # Show every cached post, or one author's chain
 tau tan timeline --all
 tau tan timeline --author alice
@@ -398,11 +401,12 @@ Global options may appear before or after the command:
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan post --delay 5m TEXT` | Queue a post to publish in 5 minutes (needs `tau serve --social` running) |
-| `tau tan scheduled` | List Tan posts queued for later publishing |
-| `tau tan cancel-scheduled ID` | Drop a queued Tan post before it publishes |
+| `tau tan scheduled` | List Tan posts and polls queued for later publishing |
+| `tau tan cancel-scheduled ID` | Drop a queued Tan post or poll before it publishes |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan poll TEXT --option A --option B` | Ask a question with options (signed poll entry on your chain) |
+| `tau tan poll TEXT --option A --option B --delay 2h` | Queue a poll to ask in 2 hours (needs `tau serve --social` running) |
 | `tau tan vote POLL OPTION` | Vote for one option of a poll (option number or exact text) |
 | `tau tan results POLL` | Show a poll's question, options and current tally |
 | `tau tan repost POST` | Repost a post to your followers (signed entry on your chain) |
