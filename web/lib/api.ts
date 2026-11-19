@@ -567,7 +567,7 @@ export async function getMutedConversations(): Promise<MutedConversations> {
 }
 
 export async function setMuted(
-  target: { peer: string } | { group: string },
+  target: { peer: string } | { group: string } | { channel: string },
   muted = true,
 ): Promise<unknown> {
   return post("/api/messages/mute", { ...target, muted });

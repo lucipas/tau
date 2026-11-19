@@ -128,8 +128,10 @@ advances the cursor when you read a conversation, and the console shows an
 unread badge next to each peer and the unread total in the tab title.
 Opening a peer in the console clears its badge; read receipts to the sender
 are a separate feature and do not exist yet. A single conversation can be
-muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
-`tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
+muted with `tau mute --peer alice` (or for a while with `--for 1h`), and a
+channel with `tau mute --channel general` — muted conversations still
+receive messages, they just never light the badge. `tau quiet-hours set
+--start 22:00 --end 07:00` silences the whole badge
 every night instead — while the window is active every conversation counts
 as unread 0, and the counts come back when it ends.
 

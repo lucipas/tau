@@ -2,7 +2,7 @@
 //
 // Provides:
 //   useChannels() — joined channels, per-channel message history,
-//                   join/leave/send/sync/search. History is newest-first from
+//                   join/leave/send/sync/search/mute. History is newest-first from
 //                   /api/channels/messages (default 20, max 50); search
 //                   matches come from /api/channels/search and replace the
 //                   history view until cleared.
@@ -32,6 +32,7 @@ import {
   searchChannelMessages,
   sendChannelMessage,
   setChannelTopic,
+  setMuted,
   syncChannels,
   unpinChannelMessage,
   voteChannelPoll,
@@ -61,6 +62,8 @@ export interface UseChannelsResult {
   searchQuery: string | null;
   search: (query: string) => Promise<void>;
   clearSearch: () => void;
+  /** Mute or unmute a channel, then refresh the list. */
+  mute: (channel: string, muted?: boolean) => Promise<void>;
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
@@ -231,6 +234,10 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
         setSearchResults(null);
         setSearchQuery(null);
       }
+    },
+    mute: async (channel, muted = true) => {
+      await setMuted({ channel }, muted);
+      await refreshChannels();
     },
     send: async (text, replyTo) => {
       if (!selected) throw new Error("no channel selected");

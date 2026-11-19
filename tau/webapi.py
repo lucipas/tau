@@ -83,9 +83,10 @@ script) can read what arrives from the mesh and send messages back:
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
-    GET  /api/messages/muted muted DM conversations and groups
-    POST /api/messages/mute mute ``{"peer": "<name or hash>"}`` or
-                           ``{"group": "<id | prefix | name>"}``
+    GET  /api/messages/muted muted DM conversations, groups and channels
+    POST /api/messages/mute mute ``{"peer": "<name or hash>"}``,
+                           ``{"group": "<id | prefix | name>"}`` or
+                           ``{"channel": "<name>"}``
                            (``"muted": false`` unmutes)
     GET  /api/messages/requests list DMs held for review from peers
                            outside the allow-list
@@ -245,6 +246,7 @@ from .muted import (
     expand_muted_groups,
     group_lineage,
     load_muted,
+    muted_channels_for,
     muted_groups_for,
     muted_lock,
     muted_peers_for,
@@ -3894,12 +3896,19 @@ class WebBridge:
         )
 
     def channel_list(self) -> List[Dict[str, Any]]:
-        """Joined channels, most recently joined first, with unread counts."""
+        """Joined channels, most recently joined first, with unread counts.
+
+        A muted channel carries ``muted: True`` and an unread count
+        of 0 — the count path already excludes it — so the console
+        can show the quiet state without a second round-trip.
+        """
         app = self._local_channel_app()
         memberships = app.memberships()
         unread = app.unread_counts()
+        muted = self._muted_channels()
         for membership in memberships:
             membership["unread"] = unread.get(membership["channel"], 0)
+            membership["muted"] = membership["channel"] in muted
         return memberships
 
     def channel_messages(
@@ -8520,6 +8529,10 @@ class WebBridge:
             expand_muted_groups(muted_groups_for(path), self._group_records()),
         )
 
+    def _muted_channels(self) -> FrozenSet[str]:
+        """Muted channels, failing open on a corrupt file."""
+        return muted_channels_for(self._muted_path())
+
     def _group_records(self) -> List[Dict[str, Any]]:
         """Known group records, so mutes follow a group across renames."""
         groups = getattr(self.node, "groups", None)
@@ -8537,19 +8550,24 @@ class WebBridge:
         *,
         peer: Optional[str] = None,
         group: Optional[str] = None,
+        channel: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """The restored-mail entry for one conversation, or ``None``.
 
         *counts* are the fresh unread counts; the entry names the
-        conversation by the bare peer hash or group id the console
-        holds its badges under, with the restored unread count.  A
-        conversation with no unread mail gets no entry, so a change
-        that restores nothing sends an ordinary unread event.
+        conversation by the bare peer hash, group id or channel name
+        the console holds its badges under, with the restored unread
+        count.  A conversation with no unread mail gets no entry, so a
+        change that restores nothing sends an ordinary unread event.
         """
-        if (peer is None) == (group is None):
-            raise ValueError("exactly one of 'peer' or 'group' is required")
-        bucket = counts.get("per_group") if group is not None else counts.get("per_peer")
-        key = group if group is not None else peer
+        if sum(target is not None for target in (peer, group, channel)) != 1:
+            raise ValueError("exactly one of 'peer', 'group' or 'channel' is required")
+        if channel is not None:
+            bucket = counts.get("per_channel")
+            key = channel
+        else:
+            bucket = counts.get("per_group") if group is not None else counts.get("per_peer")
+            key = group if group is not None else peer
         unread_after = int((bucket or {}).get(key, 0))
         if unread_after <= 0:
             return None
@@ -8578,17 +8596,20 @@ class WebBridge:
     def muted_conversations(self, *, visible_only: bool = False) -> Dict[str, Any]:
         """All muted conversations, for the console load.
 
-        Mirrors the stored file: peer destination hashes and group
-        ids, each sorted, with a group's muted rename successors
-        included.  With ``visible_only`` (remote consoles) only the
-        peers and groups the console already lists are returned, so
-        no conversation outside that view is named.  A corrupt file is
-        a 503 — the owner repairs or removes it before the console
-        shows mutes, the same as the disappearing defaults.
+        Mirrors the stored file: peer destination hashes, group ids
+        and channel names, each sorted, with a group's muted rename
+        successors included.  With ``visible_only`` (remote consoles)
+        only the peers and groups the console already lists are
+        returned, so no conversation outside that view is named.
+        Channels are public by design, so their names are not
+        filtered: a muted channel the owner left stays listed until
+        it is unmuted.  A corrupt file is a 503 — the owner repairs
+        or removes it before the console shows mutes, the same as
+        the disappearing defaults.
         """
         path = self._muted_path()
         if path is None:
-            return {"peers": [], "groups": []}
+            return {"peers": [], "groups": [], "channels": []}
         try:
             muted = load_muted(path)
         except MutedError as exc:
@@ -8605,28 +8626,36 @@ class WebBridge:
             for record in records:
                 visible_groups |= group_lineage(record)
             groups &= visible_groups
-        return {"peers": sorted(peers), "groups": sorted(groups)}
+        return {
+            "peers": sorted(peers),
+            "groups": sorted(groups),
+            "channels": sorted(muted.channels),
+        }
 
     def set_muted(
         self,
         *,
         peer: Optional[str] = None,
         group: Optional[str] = None,
+        channel: Optional[str] = None,
         muted: bool = True,
     ) -> Dict[str, Any]:
         """Mute or unmute one conversation.
 
-        Exactly one of *peer* (registry name, hash or prefix) or *group*
-        (id, prefix or name) names the conversation; *muted* is the new
-        state.  Mirrors ``tau mute``: the list is reloaded inside the
-        lock so two writes racing cannot discard each other's
-        conversation, and a corrupt file is a 503.  The unread counts
-        change with the mute, so the new counts are published for other
-        tabs at once.  The read cursor is untouched: unmuting restores
-        counting, including messages that arrived while muted.
+        Exactly one of *peer* (registry name, hash or prefix), *group*
+        (id, prefix or name) or *channel* (name) names the
+        conversation; *muted* is the new state.  Mirrors ``tau mute``:
+        the list is reloaded inside the lock so two writes racing
+        cannot discard each other's conversation, and a corrupt file
+        is a 503.  The unread counts change with the mute, so the new
+        counts are published for other tabs at once.  The read cursor
+        is untouched: unmuting restores counting, including messages
+        that arrived while muted.
         """
-        if (peer is None) == (group is None):
-            raise ValueError("exactly one of 'peer' or 'group' is required")
+        if sum(target is not None for target in (peer, group, channel)) != 1:
+            raise ValueError(
+                "exactly one of 'peer', 'group' or 'channel' is required"
+            )
         if group is not None:
             if not isinstance(group, str) or not group.strip():
                 raise ValueError("field 'group' is required")
@@ -8634,11 +8663,24 @@ class WebBridge:
             key = record["id"]
             lineage = group_lineage(record)
             is_group = True
+            is_channel = False
+        elif channel is not None:
+            from .channels import ChannelError, clean_channel_name
+
+            if not isinstance(channel, str) or not channel.strip():
+                raise ValueError("field 'channel' is required")
+            try:
+                key = clean_channel_name(channel.strip())
+            except ChannelError as exc:
+                raise ValueError(str(exc)) from exc
+            is_group = False
+            is_channel = True
         else:
             if not isinstance(peer, str) or not peer.strip():
                 raise ValueError("field 'peer' is required")
             key = self._resolve_block_target(peer.strip())
             is_group = False
+            is_channel = False
         path = self._muted_path()
         if path is None:
             raise WebBridgeError("this node has no muted-conversations path")
@@ -8658,6 +8700,13 @@ class WebBridge:
                     current.with_group_lineage(lineage)
                     if muted
                     else current.without_group_lineage(lineage)
+                )
+            elif is_channel:
+                previous = current.is_muted_channel(key)
+                updated = (
+                    current.with_channel(key)
+                    if muted
+                    else current.without_channel(key)
                 )
             else:
                 previous = current.is_muted_peer(key)
@@ -8683,7 +8732,8 @@ class WebBridge:
                 entry = self._restored_entry(
                     counts,
                     group=key if is_group else None,
-                    peer=None if is_group else key,
+                    peer=None if (is_group or is_channel) else key,
+                    channel=key if is_channel else None,
                 )
                 if entry is not None:
                     restored.append(entry)
@@ -8691,6 +8741,7 @@ class WebBridge:
         return {
             "target": key,
             "group": is_group,
+            "channel": is_channel,
             "muted": muted,
             "changed": changed,
             # The counts after the change, so the console can hold the
@@ -11452,6 +11503,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     result = self.bridge.set_muted(
                         peer=body.get("peer"),
                         group=body.get("group"),
+                        channel=body.get("channel"),
                         muted=muted,
                     )
                 except WebBridgeError as exc:

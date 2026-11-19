@@ -187,6 +187,7 @@ import RNS
 
 from .blocklist import load_blocklist
 from .identity import load_public_key
+from .muted import muted_channels_for
 from .protocol import (
     APP_NAME,
     ASPECT,
@@ -2565,6 +2566,7 @@ def channel_unread_counts(
     conn: sqlite3.Connection,
     *,
     exclude_authors: Optional[Sequence[str]] = None,
+    exclude_channels: Optional[Sequence[str]] = None,
 ) -> Dict[str, int]:
     """Unread message counts per joined channel.
 
@@ -2575,7 +2577,10 @@ def channel_unread_counts(
     received since joining count: history synced at join time is
     unread, but cached messages from before a rejoin are not.
     Authors in *exclude_authors* never count (own messages, blocked
-    authors); pass nothing to count every stored message.
+    authors); pass nothing to count every stored message.  Channels
+    in *exclude_channels* never count either — a muted channel's
+    badge stays dark — and get no entry at all, like a channel with
+    nothing unread.
     """
     excluded = [author for author in (exclude_authors or []) if author]
     author_clause = ""
@@ -2600,8 +2605,11 @@ def channel_unread_counts(
     ).fetchall()
     # Like the inbox counts, a channel with nothing unread gets no
     # entry — the console only badges channels that have one.
+    muted = set(exclude_channels or [])
     return {
-        row["channel"]: int(row["unread"]) for row in rows if int(row["unread"]) > 0
+        row["channel"]: int(row["unread"])
+        for row in rows
+        if int(row["unread"]) > 0 and row["channel"] not in muted
     }
 
 
@@ -2825,6 +2833,9 @@ class ChannelApp:
         Own messages never count, and neither do blocked authors; a
         block-list that cannot be read fails closed to all zeroes
         rather than lighting badges for messages the reader hides.
+        A muted channel never counts either — its badge stays dark —
+        while a corrupt mutes file fails open, so the channel counts
+        as unmuted rather than breaking the whole read.
         """
         excluded = self._unread_excluded()
         if excluded is None:
@@ -2832,7 +2843,13 @@ class ChannelApp:
             return {}
         conn = self.connect()
         try:
-            return channel_unread_counts(conn, exclude_authors=excluded)
+            return channel_unread_counts(
+                conn,
+                exclude_authors=excluded,
+                exclude_channels=muted_channels_for(
+                    getattr(self.config, "muted_path", None)
+                ),
+            )
         finally:
             conn.close()
 
