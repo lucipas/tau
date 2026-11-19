@@ -290,6 +290,7 @@ from .tangents.tan import (
     follow,
     follow_tag,
     followed_tags,
+    followers,
     following,
     find_post_by_image,
     get_draft,
@@ -3604,6 +3605,13 @@ def build_parser() -> argparse.ArgumentParser:
         "following", parents=[common], help="list followed authors"
     )
     tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_followers = tan_sub.add_parser(
+        "followers",
+        parents=[common],
+        help="list authors who follow you, from stored follow lists",
+    )
+    tan_followers.set_defaults(func=cmd_tan_followers)
 
     tan_publish_follows = tan_sub.add_parser(
         "publish-follows",
@@ -7607,6 +7615,55 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
             print(
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s)"
+            )
+    return _EXIT_OK
+
+
+def cmd_tan_followers(args: argparse.Namespace) -> int:
+    """List the authors who follow this node.
+
+    Followers are derived from the peers' signed follow lists this
+    node has already verified and stored — the same lists the sync
+    depth uses — so this never does network I/O.  A follower whose
+    list was never fetched does not appear yet; fetch it first with
+    ``tau tan follows-of`` or a sync.
+    """
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    own_author = destination_hash(identity).hex()
+    store = FollowListStore(config.follow_lists_path)
+    lists = {
+        doc["author"]: doc["authors"]
+        for doc in store.all()
+        if isinstance(doc, dict)
+        and isinstance(doc.get("author"), str)
+        and isinstance(doc.get("authors"), list)
+    }
+    registry = PeerRegistry(config.peers_path)
+    conn = init_db(config.social_db_path)
+    try:
+        records = followers(conn, lists, own_author, registry=registry)
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"followers": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print(
+                "No followers yet — nobody with a stored follow list "
+                "follows you. Try `tau tan sync` to fetch follow lists."
+            )
+        for record in records:
+            name = record.get("name") or "unknown"
+            followed = "following" if record.get("followed") else ""
+            print(
+                f"{name:<20} {short_hash(record['author']):<10} "
+                f"{record.get('posts', 0)} post(s)  {followed}".rstrip()
             )
     return _EXIT_OK
 

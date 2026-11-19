@@ -5483,6 +5483,45 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_followers_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.follows import FollowListStore, build_follow_list
+    from tau.identity import destination_hash, save_identity
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    bob = RNS.Identity()
+    save_identity(identity, node.config.identity_path)
+    own_author = destination_hash(identity).hex()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, bob, "hello from bob", name="bob", now=1000)
+    finally:
+        conn.close()
+    doc = build_follow_list(bob, authors=[own_author], version=1)
+    store = FollowListStore(node.config.follow_lists_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/followers")
+        assert status == 200
+        assert payload["count"] == 1
+        record = payload["followers"][0]
+        assert record["author"] == destination_hash(bob).hex()
+        assert record["name"] == "bob"
+        assert record["posts"] == 1
+        assert record["followed"] is False
+    finally:
+        bridge.stop()
+
+
 def test_channels_via_api(tmp_path):
     from types import SimpleNamespace
 

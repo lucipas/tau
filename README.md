@@ -291,6 +291,11 @@ tau tan top --author alice
 tau tan follow 5c04c868
 tau tan following
 
+# See who follows you, from the signed follow lists this node has
+# fetched and stored (a follower whose list was never fetched does
+# not appear yet — sync first)
+tau tan followers
+
 # Hide a word or phrase from your local views (whole-word match,
 # case-insensitive; entries keep syncing, so unmuting restores them)
 tau tan mute-keyword crypto
@@ -423,6 +428,7 @@ Global options may appear before or after the command:
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan followers` | List authors who follow you (from stored follow lists) |
 | `tau tan authors` | List every author in the local Tan store |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
