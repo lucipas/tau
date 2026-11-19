@@ -91,6 +91,7 @@ is offline as long as any peer still has that author's posts cached.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -116,6 +117,7 @@ from ..protocol import (
     MAX_NAME_LENGTH,
     MAX_REQUEST_BYTES,
     ProtocolError,
+    clean_location,
     decode,
     encode,
     normalize_message,
@@ -146,6 +148,19 @@ DEFAULT_SUGGEST_LIMIT = 5
 # suggestion score points; one like on the candidate's posts is worth 1.
 SUGGEST_FOLLOWED_WEIGHT = 2
 MAX_FOLLOWS = 512
+# How many hops of the follow graph a Tan sync (and the Following
+# timeline) reaches: 1 = followed authors only, 2 = plus the authors
+# they follow.  Default 2, per issue #467 — the people your friends
+# follow are the authors most likely worth reading next.  Depth 3+
+# is out: the closure grows fast and the marginal author is rarely
+# worth the bandwidth.  A fetch of a followed author's list that
+# fails is recorded, never fatal; at most this many lists are fetched
+# per sync, so one slow peer cannot stall the whole round.
+TAN_SYNC_DEPTH_DEFAULT = 2
+TAN_SYNC_DEPTH_MIN = 1
+TAN_SYNC_DEPTH_MAX = 2
+TAN_SYNC_DEPTH_FETCH_TIMEOUT = 5.0
+MAX_SYNC_DEPTH_FETCHES = 32
 MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_FOLLOWED_TAGS = 256
@@ -267,6 +282,7 @@ _POST_COLUMNS = (
     "target",
     "options",
     "image",
+    "location",
 )
 
 
@@ -324,6 +340,11 @@ def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
         # attachment for another file's hash without breaking the
         # hash, and a post without one hashes exactly as before.
         fields = fields + ("image",)
+    if mesg.get("location") is not None:
+        # A place is signed the same way: a relay cannot move the
+        # post to another place without breaking the hash, and a post
+        # without one hashes exactly as before.
+        fields = fields + ("location",)
     return fields
 
 
@@ -422,6 +443,58 @@ def _decode_image(value: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _clean_location(value: Any) -> Dict[str, Any]:
+    """Validate a Tan post place attachment: ``{lat, lon, name?}``.
+
+    The place rides the signed post, so a malformed one must be
+    rejected here — not dropped — or the hash would no longer cover
+    what the author meant to publish.  Reuses the DM pin validator
+    (:func:`tau.protocol.clean_location`), which also strips a blank
+    name and rejects out-of-range coordinates.
+    """
+    cleaned = clean_location(value)
+    if cleaned is None:
+        raise PostError(
+            "post location must be an object with latitude -90..90 and "
+            "longitude -180..180"
+        )
+    return cleaned
+
+
+def _encode_location(location: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Encode a post's place attachment for the posts table, or None."""
+    if location is None:
+        return None
+    return json.dumps(_clean_location(location), ensure_ascii=False)
+
+
+def _decode_location(value: Any) -> Optional[Dict[str, Any]]:
+    """Decode a stored place attachment: a dict, a JSON string, or None.
+
+    Rows read from the posts table carry the JSON string; normalised
+    entries carry the dict itself.  Anything else decodes to None, so
+    a damaged row never crashes a display surface.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        try:
+            return _clean_location(value)
+        except PostError:
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict):
+            try:
+                return _clean_location(parsed)
+            except PostError:
+                return None
+    return None
+
+
 def _decode_options(value: Any) -> Optional[List[str]]:
     """Decode stored poll options: a list, a JSON string, or None.
 
@@ -500,6 +573,10 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         # The attachment rides with the post entry itself, so an
         # exported or synced post carries its image reference with it.
         canonical["image"] = _decode_image(post.get("image"))
+    if post.get("location") is not None:
+        # The place rides with the post entry itself, so an exported
+        # or synced post carries its place with it.
+        canonical["location"] = _decode_location(post.get("location"))
     return canonical
 
 
@@ -629,10 +706,18 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         image = (
             _clean_image(mesg["image"]) if mesg.get("image") is not None else None
         )
+        location = (
+            _clean_location(mesg["location"])
+            if mesg.get("location") is not None
+            else None
+        )
     else:
         if mesg.get("image") is not None:
             raise PostError("only posts can carry an image")
+        if mesg.get("location") is not None:
+            raise PostError("only posts can carry a location")
         image = None
+        location = None
 
     post = {
         "v": TAN_VERSION,
@@ -647,6 +732,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "expires_at": expires_at,
         "options": options,
         "image": image,
+        "location": location,
     }
     _check_wire_size(post)
     return post
@@ -786,7 +872,8 @@ CREATE TABLE IF NOT EXISTS posts (
     kind TEXT NOT NULL DEFAULT 'post',
     target TEXT NOT NULL DEFAULT '',
     options TEXT,
-    image TEXT
+    image TEXT,
+    location TEXT
 );
 
 CREATE INDEX IF NOT EXISTS posts_author_seq ON posts(author, seq);
@@ -970,6 +1057,10 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         # migrate a pre-media database: a post's image attachment lives
         # in one JSON column on its own entry, like a poll's options.
         _add_column(conn, "posts", "image", "TEXT")
+    if columns and "location" not in columns:  # migrate a pre-location database
+        # A post's place lives in one JSON column on its own entry,
+        # like a post's image attachment.
+        _add_column(conn, "posts", "location", "TEXT")
     draft_columns = _table_columns(conn, "drafts")
     if draft_columns and "post_hash" not in draft_columns:
         # migrate a pre-retry database: drafts could not remember
@@ -1234,6 +1325,69 @@ def store_media(
     if not pinned:
         _prune_media_store(directory, max_total_bytes=max_total_bytes)
     return target
+
+
+def detect_image_mime(data: bytes) -> Optional[str]:
+    """Detect a Tan image's MIME type from its magic bytes, or None.
+
+    The declared type is never trusted — the bytes decide — so a
+    mislabelled upload cannot smuggle another format past the post.
+    """
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def image_attachment_from_data_url(
+    value: Any, data_dir: Union[str, Path]
+) -> Dict[str, Any]:
+    """Decode a base64 data-URL image upload into a Tan attachment dict.
+
+    Validates the same way the CLI's ``_read_image`` does — JPEG, PNG,
+    GIF or WebP by magic bytes, 1 byte .. ``MAX_IMAGE_BYTES`` — then
+    stores the bytes pinned in the local media store, so the author can
+    serve them when a peer asks.  Returns the ``{sha256, size, mime,
+    name}`` descriptor the signed post carries; the bytes themselves
+    never go in the post.  Raises :class:`PostError` on bad input.
+    """
+    if not isinstance(value, str) or not value.startswith("data:"):
+        raise PostError("post image must be a base64 data URL")
+    try:
+        header, encoded = value[5:].split(",", 1)
+    except ValueError as exc:
+        raise PostError("post image must be a base64 data URL") from exc
+    if not header.endswith(";base64"):
+        raise PostError("post image must be a base64 data URL")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise PostError("post image is not valid base64") from exc
+    if len(data) < 1 or len(data) > MAX_IMAGE_BYTES:
+        raise PostError(
+            f"post image of {len(data)} bytes is outside the "
+            f"1..{MAX_IMAGE_BYTES} byte limit"
+        )
+    mime = detect_image_mime(data)
+    if mime is None:
+        raise PostError("post image must be a JPEG, PNG, GIF or WebP file")
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        store_media(data_dir, digest, data, pinned=True)
+    except TanError as exc:
+        raise PostError(str(exc)) from exc
+    ext = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/gif": "gif",
+        "image/webp": "webp",
+    }[mime]
+    return {"sha256": digest, "size": len(data), "mime": mime, "name": f"image.{ext}"}
 
 
 def _prune_media_store(directory: Path, *, max_total_bytes: int) -> None:
@@ -1558,8 +1712,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, expires_at, sig, seq, linked, kind, target, options, image) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, expires_at, sig, seq, linked, kind, target, options, image, location) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -1578,6 +1732,7 @@ def store_post(
                     post.get("target") or "",
                     _encode_options(post.get("options")),
                     _encode_image(post.get("image")),
+                    _encode_location(post.get("location")),
                 ),
             )
             if linked:
@@ -1629,6 +1784,7 @@ def create_post(
     previous: Optional[str] = None,
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a post owned by *identity*.
 
@@ -1638,13 +1794,17 @@ def create_post(
     hash.  It must be after the post's creation time.  When *image*
     is given — ``{sha256, size, mime, name}`` — the attachment is
     signed with the post the same way; the bytes themselves live in
-    the local media store, never in the post.
+    the local media store, never in the post.  When *location* is
+    given — ``{lat, lon, name?}`` — the place is signed with the post
+    the same way, so a relay cannot move the post without breaking
+    the hash.
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
     clean_name = sanitize_name(name)
     clean_text = normalize_message(text)
     clean_image = _clean_image(image) if image is not None else None
+    clean_location = _clean_location(location) if location is not None else None
     if expires_at is not None:
         expires_at = _require_timestamp(expires_at, "expires_at")
         if expires_at <= timestamp:
@@ -1672,6 +1832,8 @@ def create_post(
             body["expires_at"] = expires_at
         if clean_image is not None:
             body["image"] = clean_image
+        if clean_location is not None:
+            body["location"] = clean_location
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -6130,6 +6292,83 @@ def following(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     ]
 
 
+def followers_from_lists(
+    follow_lists: Dict[str, Sequence[str]], own_author: str
+) -> List[str]:
+    """Authors whose stored follow list includes *own_author*, sorted.
+
+    The input maps a list author to the authors on their published,
+    signature-verified follow list — the shape
+    :meth:`TanApp._stored_follow_lists` returns.  Entries that are not
+    well-formed author hashes are skipped, and a list that names its
+    own author does not make that author their own follower.
+    """
+    own = _require_hex(own_author, AUTHOR_HEX_LENGTH, "own_author")
+    followers: Set[str] = set()
+    for list_author, authors in follow_lists.items():
+        if not isinstance(list_author, str) or not isinstance(authors, (list, tuple)):
+            continue
+        try:
+            list_author = _require_hex(list_author, AUTHOR_HEX_LENGTH, "author")
+        except PostError:
+            continue
+        if list_author == own:
+            continue
+        for entry in authors:
+            if isinstance(entry, str) and entry == own:
+                followers.add(list_author)
+                break
+    return sorted(followers)
+
+
+def expand_follow_scope(
+    followed: Sequence[str],
+    follow_lists: Dict[str, Sequence[str]],
+    *,
+    depth: int = TAN_SYNC_DEPTH_MAX,
+    limit: int = MAX_FOLLOWS,
+) -> List[str]:
+    """Authors in scope at a follow-graph depth, in stable order.
+
+    Depth 1 returns the followed authors.  Depth 2 adds every author
+    on a followed author's published follow list — the second hop.
+    Followed authors always come first, in follow order, then the
+    second hop in sorted order, so the result is deterministic and a
+    cap keeps the newest follows instead of the newest strangers.
+    Entries that are not well-formed author hashes are skipped: a
+    stored list is signature-verified, so this is belt and braces
+    against a hand-edited file, not a trust decision.
+    """
+    seen: Set[str] = set()
+    scoped: List[str] = []
+    for author in followed:
+        try:
+            clean = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+        except TanError:
+            continue
+        if clean in seen:
+            continue
+        seen.add(clean)
+        scoped.append(clean)
+    if depth < TAN_SYNC_DEPTH_MAX:
+        return scoped
+    second_hop: Set[str] = set()
+    for author in scoped:
+        for candidate in follow_lists.get(author, []):
+            try:
+                clean = _require_hex(candidate, AUTHOR_HEX_LENGTH, "author")
+            except TanError:
+                continue
+            if clean not in seen:
+                second_hop.add(clean)
+    for author in sorted(second_hop):
+        if len(scoped) >= max(1, int(limit)):
+            break
+        seen.add(author)
+        scoped.append(author)
+    return scoped
+
+
 def suggest_authors(
     conn: sqlite3.Connection,
     *,
@@ -8038,6 +8277,55 @@ def count_authors(
     return int(row[0])
 
 
+def followers(
+    conn: sqlite3.Connection,
+    follow_lists: Dict[str, Sequence[str]],
+    own_author: str,
+    *,
+    registry: Any = None,
+) -> List[Dict[str, Any]]:
+    """One record per author who follows *own_author*.
+
+    A follower is an author whose latest stored, signature-verified
+    follow list names *own_author* (see :func:`followers_from_lists`).
+    Only stored lists are consulted — this never does network I/O, so
+    a follower whose list was never fetched does not appear yet.
+    Each record carries the display name (the peer registry's when it
+    knows the author, else the name on their most recent stored post),
+    the visible-post stats :func:`author_stats_many` returns, and
+    whether the viewer follows them back.  Records come back most
+    recently posting first, then by author hash, so the order is stable.
+    """
+    authors = followers_from_lists(follow_lists, own_author)
+    if not authors:
+        return []
+    stats = author_stats_many(conn, authors)
+    followed = {record["author"] for record in following(conn)}
+    records: List[Dict[str, Any]] = []
+    for author in authors:
+        name = ""
+        if registry is not None and hasattr(registry, "get"):
+            peer = registry.get(author)
+            if peer is not None:
+                name = getattr(peer, "display_name", "") or ""
+        if not name:
+            row = conn.execute(
+                "SELECT name FROM posts WHERE author = ? AND name != '' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (author,),
+            ).fetchone()
+            if row is not None:
+                name = str(row["name"])
+        record = dict(stats[author])
+        record["name"] = name
+        record["followed"] = author in followed
+        records.append(record)
+    records.sort(
+        key=lambda record: (-record["last_post"], record["author"])
+    )
+    return records
+
+
 def _int_or_none(value: Any) -> Optional[int]:
     """Return *value* as an int, or None when it is not integer-shaped.
 
@@ -8448,6 +8736,143 @@ class TanApp:
             author, own_author=self.author, followed=followed
         )
 
+    def _sync_depth(self) -> int:
+        """This node's Tan sync depth (1 or 2), defaulting to 2.
+
+        Read live from ``node.json`` on every call, so a change made
+        on the CLI or in the console applies to the next sync without
+        a restart.  A node without a data directory (tests, embeds)
+        takes the default.
+        """
+        from ..config import tan_sync_depth
+
+        data_dir = getattr(self.config, "data_dir", None)
+        if data_dir is None:
+            return TAN_SYNC_DEPTH_DEFAULT
+        try:
+            return tan_sync_depth(Path(data_dir))
+        except Exception:
+            return TAN_SYNC_DEPTH_DEFAULT
+
+    def _stored_follow_lists(self) -> Dict[str, List[str]]:
+        """Follow lists this node has already verified and stored.
+
+        Prefers the running node's store (it picks up lists fetched
+        since start); falls back to opening the store from the data
+        directory.  Anything missing or unreadable means no second
+        hop is known yet — depth 2 then behaves like depth 1 for
+        those authors, rather than failing the sync.
+        """
+        from ..follows import FollowListStore
+
+        store = getattr(self.node, "follow_list_store", None)
+        docs: List[Dict[str, Any]] = []
+        if store is not None:
+            try:
+                docs = store.all()
+            except Exception:
+                docs = []
+        if not docs:
+            path = getattr(self.config, "follow_lists_path", None)
+            if path is not None:
+                try:
+                    docs = FollowListStore(path).all()
+                except Exception:
+                    docs = []
+        lists: Dict[str, List[str]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            author = doc.get("author")
+            authors = doc.get("authors")
+            if isinstance(author, str) and isinstance(authors, list):
+                lists[author] = [
+                    entry for entry in authors if isinstance(entry, str)
+                ]
+        return lists
+
+    def _fetch_missing_follow_lists(
+        self,
+        lists: Dict[str, List[str]],
+        followed: Sequence[str],
+        *,
+        peers: Optional[Sequence[Any]] = None,
+        errors: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, List[str]]:
+        """Fetch the follow lists depth 2 needs that are not stored yet.
+
+        Only authors whose list is not already stored are asked, only
+        when the peer is known to the registry (no discovery during a
+        sync), and at most ``MAX_SYNC_DEPTH_FETCHES`` fetches per sync.
+        A fetch that fails is recorded in *errors* when given and never
+        raises — the author simply contributes no second hop this round.
+        """
+        node = self.node
+        request_follows = (
+            getattr(node, "request_follows", None) if node is not None else None
+        )
+        if request_follows is None:
+            return lists
+        by_hash = {
+            getattr(peer, "hexhash", ""): peer for peer in (peers or [])
+        }
+        fetched = dict(lists)
+        attempts = 0
+        for author in followed:
+            if author in fetched or attempts >= MAX_SYNC_DEPTH_FETCHES:
+                continue
+            peer = by_hash.get(author)
+            if peer is None:
+                continue
+            attempts += 1
+            try:
+                doc = request_follows(
+                    peer, timeout=TAN_SYNC_DEPTH_FETCH_TIMEOUT
+                )
+            except Exception as exc:
+                if errors is not None:
+                    errors.append(
+                        {
+                            "peer": author,
+                            "author": author,
+                            "error": f"follow list fetch failed: {exc}",
+                        }
+                    )
+                continue
+            if isinstance(doc, dict) and isinstance(doc.get("authors"), list):
+                fetched[author] = [
+                    entry for entry in doc["authors"] if isinstance(entry, str)
+                ]
+        return fetched
+
+    def _scope_authors(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        peers: Optional[Sequence[Any]] = None,
+        fetch: bool = False,
+        errors: Optional[List[Dict[str, str]]] = None,
+    ) -> List[str]:
+        """Authors in scope for sync and the Following timeline.
+
+        Followed authors, plus at depth 2 the authors on their
+        published follow lists.  The display path (``fetch=False``)
+        uses stored lists only, so reading the timeline never does
+        network I/O; sync (``fetch=True``) asks known peers for lists
+        it does not hold yet.  Blocked and muted authors are not
+        filtered here — the sync loop's admission check and the
+        timeline's display rules still exclude them, at every depth.
+        """
+        followed = [record["author"] for record in following(conn)]
+        if self._sync_depth() < TAN_SYNC_DEPTH_MAX:
+            return followed
+        lists = self._stored_follow_lists()
+        if fetch:
+            lists = self._fetch_missing_follow_lists(
+                lists, followed, peers=peers, errors=errors
+            )
+        return expand_follow_scope(followed, lists, depth=self._sync_depth())
+
     # -- lifecycle ---------------------------------------------------------
 
     def attach(self, node: Any) -> None:
@@ -8478,12 +8903,14 @@ class TanApp:
         ttl: int = MAX_GOSSIP_TTL,
         expires_at: Optional[float] = None,
         image: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a post, or a reply when *reply_to* names a parent post.
 
         When *expires_at* is given the post disappears from display
         surfaces once that time passes; see :func:`create_post`.
         A reply cannot carry an image — only a top-level post can.
+        A reply cannot carry a location either, for the same reason.
         """
         conn = self.connect()
         try:
@@ -8504,6 +8931,7 @@ class TanApp:
                     name=self.name,
                     expires_at=expires_at,
                     image=image,
+                    location=location,
                 )
         finally:
             conn.close()
@@ -8552,7 +8980,7 @@ class TanApp:
         conn = self.connect()
         try:
             if authors is None and not include_all:
-                authors = [record["author"] for record in following(conn)]
+                authors = self._scope_authors(conn)
                 authors.append(self.author)
             posts = timeline(
                 conn,
@@ -8730,6 +9158,59 @@ class TanApp:
         finally:
             conn.close()
 
+    def _stored_follow_lists(self) -> Dict[str, List[str]]:
+        """Follow lists this node has already verified and stored.
+
+        Prefers the running node's store (it picks up lists fetched
+        since start); falls back to opening the store from the data
+        directory.  Anything missing or unreadable means no follower
+        is known yet — the caller sees an empty list rather than an
+        error, because a follower whose list was never fetched simply
+        has not been observed.
+        """
+        from ..follows import FollowListStore
+
+        store = getattr(self.node, "follow_list_store", None)
+        docs: List[Dict[str, Any]] = []
+        if store is not None:
+            try:
+                docs = store.all()
+            except Exception:
+                docs = []
+        if not docs:
+            path = getattr(self.config, "follow_lists_path", None)
+            if path is not None:
+                try:
+                    docs = FollowListStore(path).all()
+                except Exception:
+                    docs = []
+        lists: Dict[str, List[str]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            author = doc.get("author")
+            authors = doc.get("authors")
+            if isinstance(author, str) and isinstance(authors, list):
+                lists[author] = [
+                    entry for entry in authors if isinstance(entry, str)
+                ]
+        return lists
+
+    def followers(self) -> List[Dict[str, Any]]:
+        """Authors who follow this node, from stored follow lists.
+
+        See :func:`followers` for the record shape.  Names come from
+        the attached node's peer registry when it knows the author.
+        """
+        conn = self.connect()
+        try:
+            registry = getattr(self.node, "registry", None)
+            return followers(
+                conn, self._stored_follow_lists(), self.author, registry=registry
+            )
+        finally:
+            conn.close()
+
     def sync(
         self,
         node: Any,
@@ -8764,7 +9245,9 @@ class TanApp:
         errors: List[Dict[str, str]] = []
         try:
             if authors is None:
-                authors = [record["author"] for record in following(conn)]
+                authors = self._scope_authors(
+                    conn, peers=peers, fetch=True, errors=errors
+                )
             authors = list(authors)
             if self.author not in authors:
                 authors.append(self.author)

@@ -11,7 +11,8 @@ import RNS
 import pytest
 
 from tau.cli import main
-from tau.config import TauConfig
+from tau.config import TauConfig, set_node_setting
+from tau.follows import FollowListStore, build_follow_list
 from tau.identity import destination_hash, load_identity
 from tau.peers import Peer
 from tau.protocol import APP_NAME, ASPECT, MAX_MESSAGE_CHARS, ProtocolError, decode, encode
@@ -58,12 +59,15 @@ from tau.tangents.tan import (
     draft_claim_held,
     edit_states,
     export_entries,
+    expand_follow_scope,
     extract_tags,
     feed,
     find_post_by_image,
     follow,
     follow_tag,
     followed_tags,
+    followers,
+    followers_from_lists,
     following,
     get_post,
     get_draft,
@@ -276,6 +280,75 @@ def test_find_post_by_image(identities, tmp_path):
     assert found is not None and found["hash"] == post["hash"]
     assert find_post_by_image(conn, "f" * 64) is None
     assert find_post_by_image(conn, "not-a-digest") is None
+
+
+def _location_for() -> dict:
+    return {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def test_create_post_with_location_round_trips(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    location = _location_for()
+    post = create_post(
+        conn, alice, "morning run", name="alice", now=1000, location=location
+    )
+
+    assert post["location"] == location
+    assert verify_post(post)["location"] == location
+    stored = get_post(conn, post["hash"])
+    assert stored is not None and stored["location"] == location
+    assert [entry["location"] for entry in feed(conn, author=post["author"])] == [
+        location
+    ]
+
+
+def test_location_is_signed_with_the_post(identities, tmp_path):
+    alice, _ = identities
+    first = init_db(tmp_path / "a.sqlite3")
+    second = init_db(tmp_path / "b.sqlite3")
+    plain = create_post(first, alice, "same text", name="alice", now=1000)
+    with_location = create_post(
+        second, alice, "same text", name="alice", now=1000, location=_location_for()
+    )
+    assert plain["hash"] != with_location["hash"]
+
+    tampered = dict(
+        with_location, location={**with_location["location"], "lat": 0.0}
+    )
+    with pytest.raises(PostError):
+        verify_post(tampered)
+
+
+def test_location_rejected_when_invalid(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    good = _location_for()
+    bad_locations = [
+        {**good, "lat": 91.0},
+        {**good, "lat": -91.0},
+        {**good, "lon": 181.0},
+        {**good, "lon": -181.0},
+        {**good, "lat": "34.05"},
+        {**good, "lon": True},
+        {"lat": 34.05},
+        {"lon": -83.88},
+        "34.05,-83.88",
+        {**good, "name": "x" * 201},
+    ]
+    for bad in bad_locations:
+        with pytest.raises(PostError):
+            create_post(conn, alice, "x", name="alice", now=1000, location=bad)
+
+
+def test_only_posts_carry_locations(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "parent", name="alice", now=1000)
+    reply = create_reply(conn, alice, post["hash"], "a reply", name="alice", now=1001)
+    crafted = dict(reply, location=_location_for())
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
 
 
 def test_media_store_round_trip_and_prune(tmp_path):
@@ -735,6 +808,83 @@ def test_follow_and_timeline(identities, tmp_path):
     assert unfollow(conn, bob_post["author"]) is True
     assert following(conn) == []
     assert timeline(conn, []) == []
+
+
+def test_followers_from_lists(identities):
+    alice, bob = identities
+    carol = RNS.Identity()
+    own = author_of(alice)
+    lists = {
+        author_of(bob): [own, "not-a-hash", author_of(carol)],
+        author_of(carol): [author_of(carol)],
+        "not-a-hash": [own],
+        own: [own],
+    }
+    assert followers_from_lists(lists, own) == [author_of(bob)]
+
+
+def test_followers_from_lists_ignores_non_list_values(identities):
+    alice, bob = identities
+    own = author_of(alice)
+    lists = {author_of(bob): "not-a-list", "also-bad": 42}
+    assert followers_from_lists(lists, own) == []
+
+
+def test_followers_records(identities, tmp_path):
+    from types import SimpleNamespace
+
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, bob, "from bob", name="bob", now=1000)
+    create_post(conn, carol, "from carol", name="carol", now=1001)
+    follow(conn, author_of(bob), name="bob")
+
+    class StubRegistry:
+        def __init__(self, names):
+            self._names = names
+
+        def get(self, author):
+            name = self._names.get(author)
+            return SimpleNamespace(display_name=name) if name else None
+
+    registry = StubRegistry({author_of(bob): "Bobby"})
+    lists = {
+        author_of(bob): [author_of(alice)],
+        author_of(carol): [author_of(alice)],
+    }
+    records = followers(conn, lists, author_of(alice), registry=registry)
+    # Most recently posting first; the registry name wins over the post name.
+    assert [record["author"] for record in records] == [
+        author_of(carol),
+        author_of(bob),
+    ]
+    assert records[0]["name"] == "carol"
+    assert records[0]["followed"] is False
+    assert records[0]["posts"] == 1
+    assert records[1]["name"] == "Bobby"
+    assert records[1]["followed"] is True
+    assert followers(conn, {}, author_of(alice)) == []
+
+
+def test_tan_app_followers_reads_stored_lists(identities, tmp_path):
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = TanApp(config, alice, name="alice", gossip=False)
+    conn = init_db(config.social_db_path)
+    try:
+        create_post(conn, bob, "from bob", name="bob", now=1000)
+    finally:
+        conn.close()
+    doc = build_follow_list(bob, authors=[author_of(alice)], version=1)
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(doc) is True
+    store.save()
+    records = app.followers()
+    assert [record["author"] for record in records] == [author_of(bob)]
+    assert records[0]["name"] == "bob"
+    assert records[0]["posts"] == 1
+    assert records[0]["followed"] is False
 
 
 def test_suggest_authors_ranks_followed_engagement(identities, tmp_path):
@@ -1350,6 +1500,188 @@ def test_sync_pulls_missing_posts(identities, tmp_path):
         "bob one",
         "bob two",
     ]
+
+
+def test_expand_follow_scope_depth_one_keeps_followed_only():
+    alice, bob = "aa" * 16, "bb" * 16
+    assert expand_follow_scope([alice, bob, alice], {alice: [bob]}, depth=1) == [
+        alice,
+        bob,
+    ]
+
+
+def test_expand_follow_scope_depth_two_adds_second_hop():
+    alice, bob, carol, dave = "aa" * 16, "bb" * 16, "cc" * 16, "dd" * 16
+    scoped = expand_follow_scope(
+        [bob, carol],
+        {bob: [dave, alice], carol: [dave]},
+        depth=2,
+    )
+    # dave is on both followed authors' lists (the second hop, deduped)
+    # and alice is on bob's list too; the hop comes back sorted.
+    assert scoped == [bob, carol, alice, dave]
+
+
+def test_expand_follow_scope_skips_malformed_entries():
+    alice = "aa" * 16
+    scoped = expand_follow_scope(
+        [alice, "not-hex", ""],
+        {alice: ["zz" * 16, "bb" * 16]},
+        depth=2,
+    )
+    assert scoped == [alice, "bb" * 16]
+
+
+def test_expand_follow_scope_caps_the_second_hop():
+    alice = "aa" * 16
+    second = ["%032x" % n for n in range(1, 6)]
+    scoped = expand_follow_scope([alice], {alice: second}, depth=2, limit=3)
+    assert scoped == [alice, *sorted(second)[:2]]
+
+
+def _sync_depth_two_setup(identities, tmp_path):
+    """Alice follows bob; bob's published list names carol; the source
+    holds one post each from bob and carol.  Returns the pieces a sync
+    test needs."""
+    alice, bob = identities
+    carol = RNS.Identity()
+    source = init_db(tmp_path / "source.sqlite3")
+    create_post(source, bob, "bob one", name="bob", now=1000)
+    create_post(source, carol, "carol one", name="carol", now=1001)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = TanApp(config, alice, name="alice", gossip=False)
+    conn = app.connect()
+    try:
+        follow(conn, author_of(bob), name="bob")
+    finally:
+        conn.close()
+    bob_list = build_follow_list(
+        bob, authors=[author_of(carol)], version=1, updated_at=1000.0
+    )
+    peer = Peer(
+        destination_hash=bytes.fromhex(author_of(bob)),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    return alice, bob, carol, source, config, app, bob_list, peer
+
+
+class _FakeNodeWithFollows(_FakeNode):
+    """_FakeNode that can also answer follow-list fetches."""
+
+    def __init__(self, peer, source, *, follow_lists=None, fetch_error=None):
+        super().__init__(peer, source)
+        self.follow_lists = follow_lists or {}
+        self.fetch_error = fetch_error
+        self.fetch_calls = []
+
+    def request_follows(self, peer, *, timeout=5.0):
+        self.fetch_calls.append(getattr(peer, "hexhash", "?"))
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        return self.follow_lists.get(getattr(peer, "hexhash", ""))
+
+
+def test_sync_depth_two_pulls_second_hop_from_stored_list(identities, tmp_path):
+    _, _, carol, source, config, app, bob_list, peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    # Bob's list is already stored, so no fetch happens during sync.
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(bob_list)
+    store.save()
+
+    node = _FakeNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, limit=20)
+    assert summary["stored"] == 2
+    assert summary["errors"] == []
+    assert [
+        post["text"] for post in feed(app.connect(), author=author_of(carol))
+    ] == ["carol one"]
+
+
+def test_sync_depth_one_skips_second_hop(identities, tmp_path):
+    _, _, carol, source, config, app, bob_list, peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(bob_list)
+    store.save()
+    set_node_setting(tmp_path, "tan_sync_depth", 1)
+
+    node = _FakeNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, limit=20)
+    assert summary["stored"] == 1
+    assert summary["errors"] == []
+    assert feed(app.connect(), author=author_of(carol)) == []
+
+
+def test_sync_depth_two_fetches_missing_follow_list(identities, tmp_path):
+    _, bob, carol, source, _, app, bob_list, peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    node = _FakeNodeWithFollows(
+        peer, source, follow_lists={author_of(bob): bob_list}
+    )
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, limit=20)
+    assert summary["stored"] == 2
+    assert summary["errors"] == []
+    assert node.fetch_calls == [author_of(bob)]
+    assert [
+        post["text"] for post in feed(app.connect(), author=author_of(carol))
+    ] == ["carol one"]
+
+
+def test_sync_depth_two_records_failed_follow_list_fetch(identities, tmp_path):
+    from tau.instance_lock import NodeError
+
+    _, _, carol, source, _, app, _, peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    node = _FakeNodeWithFollows(
+        peer, source, fetch_error=NodeError("peer unreachable")
+    )
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, limit=20)
+    # Bob's own post still syncs; only the second hop is lost.
+    assert summary["stored"] == 1
+    assert any(
+        "follow list fetch failed" in error["error"]
+        for error in summary["errors"]
+    )
+    assert feed(app.connect(), author=author_of(carol)) == []
+
+
+def test_timeline_depth_two_shows_second_hop_posts(identities, tmp_path):
+    _, _, carol, _, config, app, bob_list, _peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    # Carol's post is already stored locally (as a sync would leave it);
+    # bob's list is stored, so the timeline can resolve the second hop
+    # without any network fetch.
+    conn = app.connect()
+    try:
+        create_post(conn, carol, "carol one", name="carol", now=1001)
+    finally:
+        conn.close()
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(bob_list)
+    store.save()
+
+    assert [post["text"] for post in app.timeline()] == ["carol one"]
+
+    set_node_setting(tmp_path, "tan_sync_depth", 1)
+    assert app.timeline() == []
 
 
 def test_cli_post_and_timeline(tmp_path):
@@ -9723,6 +10055,43 @@ def test_init_db_migrates_pre_polls_store(identities, tmp_path):
         )
         create_vote(conn, bob, poll["hash"], 0, name="bob", now=1002)
         assert poll_results(conn, poll["hash"])["counts"] == [1, 0]
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_pre_location_store(identities, tmp_path):
+    alice, _ = identities
+    db_path = tmp_path / "tan.sqlite3"
+    conn = init_db(db_path)
+    post = create_post(conn, alice, "legacy row", name="alice", now=1000)
+    conn.execute("ALTER TABLE posts DROP COLUMN location")
+    conn.commit()
+    conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        assert "location" in columns
+        stored = get_post(conn, post["hash"])
+        assert stored is not None
+        assert "location" not in stored
+        assert verify_post(stored)["hash"] == post["hash"]
+        # And a located post works on the migrated store.
+        located = create_post(
+            conn,
+            alice,
+            "from here",
+            name="alice",
+            now=1001,
+            location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+        )
+        assert get_post(conn, located["hash"])["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
     finally:
         conn.close()
 

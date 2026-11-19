@@ -1,8 +1,10 @@
-// SettingsSection.tsx — node settings: file acceptance / read receipts,
-// rename the node, announce, and per-peer / per-group / per-channel
+// SettingsSection.tsx — node settings: file acceptance / read receipts /
+// Tan sync depth, rename the node, announce, your public profile,
+// away message, quiet hours, and per-peer / per-group / per-channel
 // disappearing-message defaults. Built on api.ts getSettings /
-// updateSetting / renameNode / announce / getDisappearingDefaults /
-// setDisappearingDefault / getChannels.
+// updateSetting / renameNode / announce / getOwnProfile / setOwnProfile /
+// getAwayMessage / setAwayMessage / getQuietHours / setQuietHours /
+// getDisappearingDefaults / setDisappearingDefault / getChannels.
 
 "use client";
 
@@ -10,14 +12,20 @@ import { useEffect, useState } from "react";
 import { useTauContext } from "@/components/chrome/TauContext";
 import {
   announce,
+  getAwayMessage,
   getChannels,
   getDisappearingDefaults,
+  getOwnProfile,
+  getQuietHours,
   getSettings,
   renameNode,
+  setAwayMessage,
   setDisappearingDefault,
+  setOwnProfile,
+  setQuietHours,
   updateSetting,
 } from "@/lib/api";
-import type { Channel, NodeSettings } from "@/lib/types";
+import type { AwayMessageSettings, Channel, NodeSettings, OwnProfile, QuietHoursSettings } from "@/lib/types";
 
 const EXPIRY_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "No disappearing default", seconds: null },
@@ -45,6 +53,21 @@ export default function SettingsSection() {
   const [notice, setNotice] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [nameSeeded, setNameSeeded] = useState(false);
+  const [profile, setProfile] = useState<OwnProfile | null>(null);
+  const [profileName, setProfileName] = useState("");
+  const [profileBio, setProfileBio] = useState("");
+  const [profileAvatar, setProfileAvatar] = useState("");
+  const [profileLinks, setProfileLinks] = useState("");
+  const [profileSeeded, setProfileSeeded] = useState(false);
+  const [awayMessage, setAwayMessageState] = useState<AwayMessageSettings | null>(null);
+  const [awayText, setAwayText] = useState("");
+  const [awayEnabled, setAwayEnabled] = useState(false);
+  const [awaySeeded, setAwaySeeded] = useState(false);
+  const [quietHours, setQuietHoursState] = useState<QuietHoursSettings | null>(null);
+  const [qhStart, setQhStart] = useState("22:00");
+  const [qhEnd, setQhEnd] = useState("07:00");
+  const [qhEnabled, setQhEnabled] = useState(false);
+  const [qhSeeded, setQhSeeded] = useState(false);
   const [disappearing, setDisappearing] = useState<Record<string, number>>({});
   const [channels, setChannels] = useState<Channel[]>([]);
   const [ddTarget, setDdTarget] = useState("");
@@ -53,13 +76,19 @@ export default function SettingsSection() {
   useEffect(() => {
     void (async () => {
       try {
-        const [s, dd, ch] = await Promise.all([
+        const [s, dd, p, am, qh, ch] = await Promise.all([
           getSettings(),
           getDisappearingDefaults(),
+          getOwnProfile(),
+          getAwayMessage(),
+          getQuietHours(),
           getChannels(),
         ]);
         setSettings(s);
         setDisappearing({ ...dd.peers, ...dd.groups, ...dd.channels });
+        setProfile(p);
+        setAwayMessageState(am);
+        setQuietHoursState(qh);
         setChannels(ch);
         setError(null);
       } catch (err) {
@@ -73,6 +102,27 @@ export default function SettingsSection() {
   if (tau?.node && !nameSeeded) {
     setNameSeeded(true);
     setName(tau.node.name);
+  }
+
+  if (profile && !profileSeeded) {
+    setProfileSeeded(true);
+    setProfileName(profile.name);
+    setProfileBio(profile.bio);
+    setProfileAvatar(profile.avatar ?? "");
+    setProfileLinks(profile.links.join("\n"));
+  }
+
+  if (awayMessage && !awaySeeded) {
+    setAwaySeeded(true);
+    setAwayText(awayMessage.message);
+    setAwayEnabled(awayMessage.enabled);
+  }
+
+  if (quietHours && !qhSeeded) {
+    setQhSeeded(true);
+    setQhStart(quietHours.start);
+    setQhEnd(quietHours.end);
+    setQhEnabled(quietHours.enabled);
   }
 
   async function run(fn: () => Promise<unknown>, okMsg: string) {
@@ -99,7 +149,8 @@ export default function SettingsSection() {
           <span className="mr-2 text-cyan-400">τ</span>Settings
         </h1>
         <p className="mt-0.5 text-xs text-zinc-500">
-          This node&apos;s name, what it accepts, and how long messages live.
+          This node&apos;s name, what it accepts, the profile peers see, and how long
+          messages live.
         </p>
       </header>
 
@@ -231,7 +282,295 @@ export default function SettingsSection() {
                 </span>
               </span>
             </label>
+            <label className="flex items-start gap-3 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-3">
+              <span className="flex-1">
+                <span className="block text-sm font-semibold text-zinc-100">
+                  Tan sync depth
+                </span>
+                <span className="block text-xs text-zinc-500">
+                  How far into the follow graph a sync reaches. 1 hop pulls followed
+                  authors only; 2 hops also pulls the authors they follow.
+                </span>
+              </span>
+              <select
+                value={String(settings.tan_sync_depth)}
+                disabled={busy}
+                aria-label="Tan sync depth"
+                onChange={(e) =>
+                  void run(
+                    async () => {
+                      setSettings(
+                        await updateSetting("tan_sync_depth", Number(e.target.value)),
+                      );
+                    },
+                    e.target.value === "1"
+                      ? "Tan sync now pulls followed authors only."
+                      : "Tan sync now also pulls the authors they follow.",
+                  )
+                }
+                className="shrink-0 rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-sm text-zinc-100 outline-none"
+              >
+                <option value="1">1 hop — followed only</option>
+                <option value="2">2 hops — plus their follows</option>
+              </select>
+            </label>
           </div>
+        )}
+      </section>
+
+      <section className="border-b border-zinc-800 px-3 py-4 sm:px-4" aria-label="Your profile">
+        <h2 className="text-sm font-bold text-zinc-100">Your profile</h2>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+          The signed public card peers see — display name, bio, avatar and links.
+          Saving publishes a new version, which reaches peers at the next announce.
+        </p>
+        {loading && <p className="py-3 text-sm text-zinc-500">Loading profile…</p>}
+        {profile && (
+          <p className="mt-2 text-xs text-zinc-500">
+            {profile.published
+              ? `Published as version ${profile.version}.`
+              : "Not published yet — peers see the node name."}
+          </p>
+        )}
+        {profile && (
+          <form
+            className="mt-3 flex flex-col gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const links = profileLinks
+                .split("\n")
+                .map((line) => line.trim())
+                .filter((line) => line.length > 0);
+              void run(
+                async () => {
+                  const { profile: saved } = await setOwnProfile({
+                    name: profileName.trim(),
+                    bio: profileBio,
+                    avatar: profileAvatar.trim(),
+                    links,
+                  });
+                  setProfile(saved);
+                  setProfileName(saved.name);
+                  setProfileBio(saved.bio);
+                  setProfileAvatar(saved.avatar ?? "");
+                  setProfileLinks(saved.links.join("\n"));
+                },
+                "Profile saved.",
+              );
+            }}
+          >
+            <label className="sr-only" htmlFor="profile-name">
+              Profile display name
+            </label>
+            <input
+              id="profile-name"
+              value={profileName}
+              onChange={(e) => setProfileName(e.target.value)}
+              placeholder="Display name"
+              disabled={busy}
+              aria-label="Profile display name"
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <label className="sr-only" htmlFor="profile-bio">
+              Profile bio
+            </label>
+            <input
+              id="profile-bio"
+              value={profileBio}
+              onChange={(e) => setProfileBio(e.target.value)}
+              placeholder="Short bio (at most 280 characters)"
+              maxLength={280}
+              disabled={busy}
+              aria-label="Profile bio"
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <label className="sr-only" htmlFor="profile-avatar">
+              Profile avatar hash
+            </label>
+            <input
+              id="profile-avatar"
+              value={profileAvatar}
+              onChange={(e) => setProfileAvatar(e.target.value)}
+              placeholder="Avatar media hash — 32 or 64 hex characters (optional)"
+              disabled={busy}
+              aria-label="Profile avatar hash"
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 font-mono text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <label className="sr-only" htmlFor="profile-links">
+              Profile links
+            </label>
+            <textarea
+              id="profile-links"
+              value={profileLinks}
+              onChange={(e) => setProfileLinks(e.target.value)}
+              placeholder={"Links — one https:// URL per line (up to 3)"}
+              rows={3}
+              disabled={busy}
+              aria-label="Profile links"
+              className="min-w-0 rounded-2xl border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={busy}
+              className="self-start rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+            >
+              Save profile
+            </button>
+          </form>
+        )}
+      </section>
+
+      <section className="border-b border-zinc-800 px-3 py-4 sm:px-4" aria-label="Away message">
+        <h2 className="text-sm font-bold text-zinc-100">Away message</h2>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+          While it is on, the first DM from each peer gets one automatic reply with
+          this message. Turning it on again starts a fresh period, so every peer
+          gets the reply once more.
+        </p>
+        {loading && <p className="py-3 text-sm text-zinc-500">Loading away message…</p>}
+        {awayMessage && (
+          <>
+            <p className="mt-2 text-sm text-zinc-300" role="status">
+              {awayMessage.enabled
+                ? `On — replying: “${awayMessage.message}”`
+                : "Off — DMs arrive as usual."}
+            </p>
+            {awayMessage.enabled && (
+              <p className="mt-1 text-xs text-zinc-500">
+                {awayMessage.replied_count === 1
+                  ? "Replied to 1 peer so far this period."
+                  : `Replied to ${awayMessage.replied_count} peers so far this period.`}
+              </p>
+            )}
+            <form
+              className="mt-3 flex flex-wrap items-center gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const next = awayText.trim();
+                if (awayEnabled && !next)
+                  return setError("The away reply needs a message.");
+                void run(
+                  async () => {
+                    const { away_message } = await setAwayMessage({
+                      enabled: awayEnabled,
+                      message: next || undefined,
+                    });
+                    setAwayMessageState(away_message);
+                    setAwayText(away_message.message);
+                  },
+                  awayEnabled ? "Away reply turned on." : "Away reply turned off.",
+                );
+              }}
+            >
+              <label className="flex items-center gap-2 text-sm text-zinc-200">
+                <input
+                  type="checkbox"
+                  checked={awayEnabled}
+                  disabled={busy}
+                  onChange={(e) => setAwayEnabled(e.target.checked)}
+                />
+                Enable away reply
+              </label>
+              <input
+                id="away-message"
+                type="text"
+                value={awayText}
+                disabled={busy}
+                onChange={(e) => setAwayText(e.target.value)}
+                aria-label="Away reply text"
+                placeholder="Away message"
+                className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+              />
+              <button
+                type="submit"
+                disabled={busy || (awayEnabled && !awayText.trim())}
+                className="rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+              >
+                Save
+              </button>
+            </form>
+          </>
+        )}
+      </section>
+
+      <section className="border-b border-zinc-800 px-3 py-4 sm:px-4" aria-label="Quiet hours">
+        <h2 className="text-sm font-bold text-zinc-100">Quiet hours</h2>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+          A daily do-not-disturb window: while it is quiet, unread badges stay dark
+          and no message carries the unread marker. The counts come back when the
+          window ends.
+        </p>
+        {loading && <p className="py-3 text-sm text-zinc-500">Loading quiet hours…</p>}
+        {quietHours && (
+          <>
+            <p className="mt-2 text-sm text-zinc-300" role="status">
+              {quietHours.active
+                ? `Quiet now until ${quietHours.end}.`
+                : quietHours.enabled
+                  ? `On ${quietHours.start}–${quietHours.end} every day.`
+                  : "Off — badges light as messages arrive."}
+            </p>
+            <form
+              className="mt-3 flex flex-wrap items-center gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (qhStart === qhEnd)
+                  return setError("Quiet hours start and end must differ.");
+                void run(
+                  async () => {
+                    const { quiet_hours } = await setQuietHours({
+                      enabled: qhEnabled,
+                      start: qhStart,
+                      end: qhEnd,
+                    });
+                    setQuietHoursState(quiet_hours);
+                  },
+                  qhEnabled
+                    ? `Quiet hours on ${qhStart}–${qhEnd} every day.`
+                    : "Quiet hours turned off.",
+                );
+              }}
+            >
+              <label className="flex items-center gap-2 text-sm text-zinc-200">
+                <input
+                  type="checkbox"
+                  checked={qhEnabled}
+                  disabled={busy}
+                  onChange={(e) => setQhEnabled(e.target.checked)}
+                />
+                Enable quiet hours
+              </label>
+              <label className="flex items-center gap-2 text-sm text-zinc-200">
+                From
+                <input
+                  type="time"
+                  value={qhStart}
+                  disabled={busy}
+                  onChange={(e) => setQhStart(e.target.value)}
+                  aria-label="Quiet hours start"
+                  className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500 disabled:opacity-50"
+                />
+              </label>
+              <label className="flex items-center gap-2 text-sm text-zinc-200">
+                To
+                <input
+                  type="time"
+                  value={qhEnd}
+                  disabled={busy}
+                  onChange={(e) => setQhEnd(e.target.value)}
+                  aria-label="Quiet hours end"
+                  className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500 disabled:opacity-50"
+                />
+              </label>
+              <button
+                type="submit"
+                disabled={busy}
+                className="rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+              >
+                Save quiet hours
+              </button>
+            </form>
+          </>
         )}
       </section>
 

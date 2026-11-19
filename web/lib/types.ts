@@ -305,17 +305,45 @@ export interface ReplyRef {
 }
 
 export interface LocationPin {
-  latitude: number;
-  longitude: number;
-  label?: string;
+  /** Decimal degrees, -90..90. */
+  lat: number;
+  /** Decimal degrees, -180..180. */
+  lon: number;
+  /** Optional place name, at most 200 characters. */
+  name?: string;
   [key: string]: unknown;
 }
 
 export interface LiveBeacon {
-  latitude: number;
-  longitude: number;
-  expires_at?: number;
+  /** Beacon id (8 random bytes, hex). */
+  id: string;
+  /** Unix time the beacon stops sharing. */
+  expires_at: number;
+  /** Update sequence number, 1-based. */
+  seq: number;
   [key: string]: unknown;
+}
+
+/** A live beacon this node is sharing, as served by GET /api/beacons. */
+export interface Beacon {
+  id: string;
+  /** Destination hash of the DM peer, or the group id. */
+  target: string;
+  target_kind: "dm" | "group";
+  target_name: string;
+  started_at: number;
+  expires_at: number;
+  /** Seconds between updates. */
+  interval: number;
+  coarse: boolean;
+  location: { lat: number; lon: number; name?: string };
+  location_file?: string;
+  next_update_at: number;
+  updates_sent: number;
+  stopped: boolean;
+  /** Still sharing: not stopped and unexpired. */
+  active: boolean;
+  expires_in_seconds: number;
 }
 
 export interface GroupPollVote {
@@ -397,9 +425,48 @@ export interface DisappearingDefaults {
   channels: Record<string, number>;
 }
 
+export interface QuietHoursSettings {
+  enabled: boolean;
+  start: string;
+  end: string;
+  active: boolean;
+  minutes_until_end: number | null;
+}
+
+export interface AwayMessageSettings {
+  enabled: boolean;
+  message: string;
+  since: number | null;
+  replied_to: string[];
+  replied_count: number;
+}
+
 export interface MutedConversations {
   peers: string[];
   groups: string[];
+  channels: string[];
+}
+
+/** One unsent message parked for a peer or a group (``tau draft save``). */
+export interface MessageDraft {
+  kind: "peer" | "group";
+  /** Peer destination hash or group id. */
+  target: string;
+  text: string;
+  updated_at: number;
+  /** Best-effort conversation name from the bridge; null when unknown. */
+  name: string | null;
+}
+
+export interface OwnProfile {
+  author: string | null;
+  name: string;
+  bio: string;
+  avatar: string | null;
+  links: string[];
+  version: number;
+  created_at: number | null;
+  published: boolean;
 }
 
 // --------------------------------------------------------------- outbox --
@@ -469,6 +536,7 @@ export interface OutboxRetryResult {
 export interface NodeSettings {
   accept_files: boolean;
   send_read_receipts: boolean;
+  tan_sync_depth: number;
 }
 
 export interface AllowList {
@@ -521,6 +589,14 @@ export interface TanImage {
   [key: string]: unknown;
 }
 
+/** A place attached to a Tan post: decimal degrees, optional place name. */
+export interface TanLocation {
+  lat: number;
+  lon: number;
+  name?: string;
+  [key: string]: unknown;
+}
+
 export interface TanParentSummary {
   hash: string;
   author: string;
@@ -552,6 +628,7 @@ export interface TanPost {
   expires_at: number | null;
   options?: string[];
   image?: TanImage | null;
+  location?: TanLocation | null;
   // --- annotations added by the bridge (tau/tangents/tan.py) ---
   likes: number;
   liked: boolean;
@@ -667,6 +744,8 @@ export interface Channel {
   pinned?: boolean;
   /** Messages newer than the last-read cursor; always present from /api/channels. */
   unread: number;
+  /** True when the channel is muted: its badge stays dark. */
+  muted?: boolean;
 }
 
 export interface ChannelPollTally {

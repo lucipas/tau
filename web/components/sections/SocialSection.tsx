@@ -26,7 +26,7 @@ import PostCard, { type ReactorKind } from "./social/PostCard";
 import TanComposer from "./social/TanComposer";
 
 type LibraryView = "saved" | "hidden" | "pinned" | "scheduled" | "muted";
-type View = "feed" | "discover" | LibraryView;
+type View = "feed" | "discover" | "followers" | LibraryView;
 
 const FEED_TABS: { id: TanFeedMode; label: string }[] = [
   { id: "following", label: "Following" },
@@ -343,6 +343,18 @@ export default function SocialSection() {
             >
               Discover
             </button>
+            <button
+              type="button"
+              aria-pressed={view === "followers"}
+              onClick={() => setView("followers")}
+              className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
+                view === "followers"
+                  ? "bg-cyan-500 text-zinc-950"
+                  : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
+              }`}
+            >
+              Followers
+            </button>
             {LIBRARY_TABS.map((t) => (
               <button
                 key={t.id}
@@ -451,6 +463,21 @@ export default function SocialSection() {
               }}
               onMuteTag={async (t) => {
                 await lists.muteTag(t);
+              }}
+            />
+          )}
+
+          {view === "followers" && (
+            <FollowersView
+              lists={lists}
+              onFollowAuthor={async (a) => {
+                await feed.follow(a);
+                setNotice("Followed.");
+                void lists.refresh();
+              }}
+              onUnfollowAuthor={async (a) => {
+                await feed.unfollow(a);
+                void lists.refresh();
               }}
             />
           )}
@@ -581,6 +608,42 @@ function ReactorRow({ name, author, at }: { name: string; author: string; at: nu
         {name || shortHash(author)}{" "}
         <span className="font-normal text-zinc-500">· {formatRelative(at)}</span>
       </p>
+    </div>
+  );
+}
+
+function FollowersView({
+  lists,
+  onFollowAuthor,
+  onUnfollowAuthor,
+}: {
+  lists: ReturnType<typeof useTanLists>;
+  onFollowAuthor: (author: string) => Promise<void>;
+  onUnfollowAuthor: (author: string) => Promise<void>;
+}) {
+  // Followers are derived from stored follow lists only, so the list
+  // is empty until a sync has fetched at least one peer's list.
+  const following = new Set(lists.following.map((f) => f.author));
+  return (
+    <div className="px-3 py-4 sm:px-4">
+      <h2 className="text-sm font-bold text-zinc-100">Followers</h2>
+      <p className="py-1 text-xs text-zinc-500">
+        Authors whose published follow list names you, from lists this node has fetched.
+      </p>
+      {lists.followers.length === 0 && (
+        <p className="py-2 text-sm text-zinc-500">
+          No followers yet — sync to fetch follow lists.
+        </p>
+      )}
+      {lists.followers.map((a) => (
+        <AuthorRow
+          key={a.author}
+          author={a}
+          followed={following.has(a.author)}
+          onFollow={() => void onFollowAuthor(a.author)}
+          onUnfollow={() => void onUnfollowAuthor(a.author)}
+        />
+      ))}
     </div>
   );
 }

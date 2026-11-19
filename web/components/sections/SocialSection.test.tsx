@@ -47,6 +47,19 @@ beforeEach(() => {
     if (url.includes("/api/tan/thread")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/tags")) return { tags: [{ tag: "mesh", count: 5 }], count: 1 };
     if (url.includes("/api/tan/following")) return { following: [], count: 0 };
+    if (url.includes("/api/tan/followers"))
+      return {
+        followers: [
+          {
+            author: "b".repeat(64),
+            name: "bob",
+            posts: 2,
+            followed: false,
+            last_post: 1000,
+          },
+        ],
+        count: 1,
+      };
     if (url.includes("/api/tan/suggest")) return { suggestions: [], count: 0 };
     if (url.includes("/api/tan/saved")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/hidden")) return { posts: [], count: 0, next_offset: null };
@@ -93,6 +106,20 @@ describe("SocialSection", () => {
     expect(screen.getByRole("button", { name: "#mesh" })).toBeTruthy();
   });
 
+  it("renders a located post with its place and maps link", async () => {
+    timeline = [
+      makePost("h2".padEnd(64, "0"), "morning run", {
+        location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      }),
+    ];
+    renderSocial();
+    await screen.findByText(/morning run/);
+    const link = screen.getByRole("link", { name: /Rock Springs Park/ });
+    expect(link.getAttribute("href")).toContain("openstreetmap.org");
+    expect(link.getAttribute("href")).toContain("mlat=34.05");
+    expect(link.getAttribute("href")).toContain("mlon=-83.88");
+  });
+
   it("shows like / reply / quote counts on a post", async () => {
     renderSocial();
     await screen.findByText(/hello/);
@@ -119,6 +146,15 @@ describe("SocialSection", () => {
       expect(calls).toContain("GET /api/tan/timeline?limit=30&list=Friends"),
     );
     expect((select as HTMLSelectElement).value).toBe("Friends");
+  });
+
+  it("shows followers with a follow-back button", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Followers" }));
+    await waitFor(() => expect(calls).toContain("GET /api/tan/followers"));
+    expect(await screen.findByText("bob")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Follow" })).toBeTruthy();
   });
 
   it("liking a post posts to /api/tan/like", async () => {

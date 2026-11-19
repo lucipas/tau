@@ -8,9 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildConversations,
   buildTraffic,
+  useBeaconFeed,
+  useBeacons,
   useTau,
 } from "./use-tau";
-import type { ChatMessage, Group, Peer, Snapshot } from "./types";
+import type { Beacon, ChatMessage, Group, Peer, Snapshot } from "./types";
 
 // ------------------------------------------------------------ fake socket --
 
@@ -280,5 +282,115 @@ describe("buildTraffic", () => {
     expect(rows[0].sent).toBe(1);
     expect(rows[0].received).toBe(2);
     expect(rows[0].files).toBe(1);
+  });
+});
+
+describe("useBeacons / useBeaconFeed", () => {
+  function makeBeacon(over: Partial<Beacon> = {}): Beacon {
+    return {
+      id: "aabbccdd",
+      target: "a".repeat(32),
+      target_kind: "dm",
+      target_name: "alice",
+      started_at: 1700000000,
+      expires_at: Date.now() / 1000 + 1800,
+      interval: 300,
+      coarse: false,
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      next_update_at: 1700000300,
+      updates_sent: 1,
+      stopped: false,
+      active: true,
+      expires_in_seconds: 1800,
+      ...over,
+    };
+  }
+
+  let posted: Array<{ url: string; body: unknown }> = [];
+
+  beforeEach(() => {
+    posted = [];
+    fetchImpl = async (url: string) => {
+      if (url.includes("/api/beacons/position")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) } as Response;
+      }
+      if (url.includes("/api/beacons")) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ beacons: [makeBeacon()], count: 1 }),
+        } as Response;
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify(makeSnapshot()) } as Response;
+    };
+    // The stubbed fetch above drops the request body; capture it
+    // through the init instead.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.includes("/api/beacons/position")) {
+          posted.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        }
+        return fetchImpl(url);
+      }),
+    );
+  });
+
+  afterEach(() => {
+    const nav = navigator as unknown as Record<string, unknown>;
+    if ("geolocation" in nav) delete nav.geolocation;
+  });
+
+  it("polls the beacons endpoint and reports the active list", async () => {
+    const { result } = renderHook(() => useBeacons(100000));
+    await waitFor(() => expect(result.current.beacons).toHaveLength(1));
+    expect(result.current.beacons[0].id).toBe("aabbccdd");
+    expect(result.current.loading).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("feeds active beacons from a geolocation watch", async () => {
+    const callbacks: Array<(pos: GeolocationPosition) => void> = [];
+    const watchPosition = vi.fn((cb: (pos: GeolocationPosition) => void) => {
+      callbacks.push(cb);
+      return callbacks.length;
+    });
+    const clearWatch = vi.fn();
+    Object.defineProperty(navigator, "geolocation", {
+      value: { watchPosition, clearWatch },
+      configurable: true,
+    });
+    const { unmount } = renderHook(() => useBeaconFeed());
+    await waitFor(() => expect(watchPosition).toHaveBeenCalled());
+    expect(callbacks).toHaveLength(1);
+    await act(async () => {
+      callbacks[0]({
+        coords: {
+          latitude: 34.06,
+          longitude: -83.87,
+          accuracy: 10,
+          altitude: null,
+          altitudeAccuracy: null,
+          heading: null,
+          speed: null,
+        },
+        timestamp: Date.now(),
+      } as GeolocationPosition);
+    });
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0].url).toBe("/api/beacons/position");
+    expect(posted[0].body).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87 });
+    unmount();
+    expect(clearWatch).toHaveBeenCalledWith(1);
+  });
+
+  it("does nothing without geolocation", async () => {
+    renderHook(() => useBeaconFeed());
+    // Give the beacons poll a chance to land; with no geolocation
+    // there is no watch to start and nothing to post.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(posted).toHaveLength(0);
   });
 });
