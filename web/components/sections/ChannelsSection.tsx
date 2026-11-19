@@ -1,26 +1,84 @@
 // ChannelsSection.tsx — public channels: join / leave, per-channel
-// message history with a composer, and sync. Built on useChannels
+// message history with a composer, search, and sync. Built on useChannels
 // (web/lib/use-channels.ts).
 
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import { formatRelative, shortHash } from "@/lib/format";
+import { getStatus } from "@/lib/api";
 import { useChannels } from "@/lib/use-channels";
 
 export default function ChannelsSection() {
   const channels = useChannels(30_000);
   const [joinName, setJoinName] = useState("");
   const [text, setText] = useState("");
+  const [searchText, setSearchText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [editingTopic, setEditingTopic] = useState(false);
   const [topicText, setTopicText] = useState("");
   const [savingTopic, setSavingTopic] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [reacting, setReacting] = useState<string | null>(null);
+  // The message being answered, if any: the composer sends with its hash.
+  const [replyTo, setReplyTo] = useState<{ hash: string; name: string } | null>(
+    null,
+  );
+
+  // This node's own destination hash, so only its messages get an
+  // Edit button — an edit is author-only on the wire.  Null until
+  // /api/status answers, or when it cannot (edit stays hidden).
+  const [ownHash, setOwnHash] = useState<string | null>(null);
+  const [editingHash, setEditingHash] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    getStatus()
+      .then((snapshot) => {
+        if (live) setOwnHash(snapshot?.node?.destination ?? null);
+      })
+      .catch(() => {
+        // Status unavailable: no edit buttons, reading still works.
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  async function handleSaveEdit(hash: string) {
+    const body = editText.trim();
+    if (!body) return;
+    setSavingEdit(true);
+    setError(null);
+    try {
+      await channels.edit(hash, body);
+      setEditingHash(null);
+      setEditText("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingEdit(false);
+    }
+  }
 
   const selectedChannel = channels.channels.find((c) => c.channel === channels.selected);
+
+  async function handleReact(hash: string, reaction: string) {
+    setReacting(hash);
+    setError(null);
+    try {
+      await channels.react(hash, reaction);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setReacting(null);
+    }
+  }
 
   async function handleJoin(e: React.FormEvent) {
     e.preventDefault();
@@ -42,8 +100,9 @@ export default function ChannelsSection() {
     setSending(true);
     setError(null);
     try {
-      await channels.send(body);
+      await channels.send(body, replyTo?.hash);
       setText("");
+      setReplyTo(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -93,8 +152,55 @@ export default function ChannelsSection() {
     }
   }
 
+  async function handlePin(hash: string) {
+    setError(null);
+    try {
+      await channels.pin(hash);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleUnpin(hash: string) {
+    setError(null);
+    try {
+      await channels.unpin(hash);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleSearch(e: React.FormEvent) {
+    e.preventDefault();
+    const query = searchText.trim();
+    if (!query || !channels.selected) return;
+    setSearching(true);
+    setError(null);
+    try {
+      await channels.search(query);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function handleClearSearch() {
+    setSearchText("");
+    channels.clearSearch();
+  }
+
   // History arrives newest-first; show it oldest-first like a chat log.
-  const messages = [...channels.messages].reverse();
+  // Search matches stay newest-first: the most recent match first.
+  const showingSearch = channels.searchResults !== null;
+  const messages = showingSearch
+    ? channels.searchResults!
+    : [...channels.messages].reverse();
+  // Pins arrive newest pin first and stay in that order up top.
+  const pinnedHashes = new Set(channels.pins.map((p) => p.hash));
+  // Replies quote their parent from the loaded page; a parent that
+  // has not arrived yet shows its short digest instead.
+  const byHash = new Map(channels.messages.map((m) => [m.hash, m]));
 
   return (
     <div className="mx-auto w-full max-w-[600px]">
@@ -252,7 +358,7 @@ export default function ChannelsSection() {
                       disabled={savingTopic}
                       className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
                     >
-                      Clear
+                      Clear topic
                     </button>
                   )}
                 </div>
@@ -260,13 +366,90 @@ export default function ChannelsSection() {
             )}
           </div>
 
+          <form
+            onSubmit={handleSearch}
+            className="flex gap-2 border-b border-zinc-800 px-3 py-2 sm:px-4"
+          >
+            <input
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              placeholder={`Search #${channels.selected}`}
+              aria-label={`Search #${channels.selected}`}
+              disabled={searching}
+              className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+            />
+            <button
+              type="submit"
+              disabled={searching || !searchText.trim()}
+              className="shrink-0 rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+            >
+              {searching ? "…" : "Search"}
+            </button>
+            {channels.searchResults !== null && (
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                className="shrink-0 rounded-full border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-900"
+              >
+                Clear
+              </button>
+            )}
+          </form>
+          {channels.searchResults !== null && (
+            <p className="border-b border-zinc-800 px-4 py-2 text-xs text-zinc-500">
+              {channels.searchResults.length} match
+              {channels.searchResults.length === 1 ? "" : "es"} for &ldquo;
+              {channels.searchQuery}&rdquo; — newest first.
+            </p>
+          )}
+
           <div className="px-3 py-2 sm:px-4">
-            {messages.length === 0 && (
+            {channels.pins.length > 0 && (
+              <div className="mb-2 rounded-lg border border-amber-800/60 bg-amber-950/40 px-3 py-2">
+                <p className="text-xs font-bold uppercase tracking-wide text-amber-400">
+                  Pinned
+                </p>
+                {channels.pins.map((m) => (
+                  <div key={m.hash} className="flex gap-3 border-b border-amber-800/30 py-2 last:border-b-0">
+                    <Avatar name={m.name} seed={m.author} size="sm" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm">
+                        <span className="font-bold text-zinc-100">
+                          {m.name || shortHash(m.author)}
+                        </span>{" "}
+                        <span className="text-xs text-zinc-500">
+                          · {formatRelative(m.created_at)}
+                        </span>
+                      </p>
+                      <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
+                        {m.text}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleUnpin(m.hash)}
+                      aria-label={`Unpin pinned message from ${m.name || shortHash(m.author)}`}
+                      className="h-fit shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs font-semibold text-zinc-300 hover:bg-zinc-900"
+                    >
+                      Unpin
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {messages.length === 0 && !showingSearch && (
               <p className="py-6 text-center text-sm text-zinc-500">
                 No messages in this channel yet — say hello.
               </p>
             )}
-            {messages.map((m) => (
+            {messages.length === 0 && showingSearch && (
+              <p className="py-6 text-center text-sm text-zinc-500">
+                No messages in this channel match &ldquo;{channels.searchQuery}&rdquo;.
+              </p>
+            )}
+            {messages.map((m) => {
+              const parent = m.reply_to ? byHash.get(m.reply_to) : undefined;
+              return (
               <div key={m.hash} className="flex gap-3 border-b border-zinc-800/60 py-3">
                 <Avatar name={m.name} seed={m.author} size="sm" />
                 <div className="min-w-0 flex-1">
@@ -276,20 +459,140 @@ export default function ChannelsSection() {
                     </span>{" "}
                     <span className="text-xs text-zinc-500">
                       · {formatRelative(m.created_at)}
+                      {m.edited ? " · edited" : ""}
                     </span>
+                    {ownHash && m.author === ownHash && editingHash !== m.hash && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingHash(m.hash);
+                          setEditText(m.text);
+                        }}
+                        className="ml-2 text-xs font-semibold text-cyan-400 hover:text-cyan-300"
+                      >
+                        Edit
+                      </button>
+                    )}
                   </p>
-                  <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
-                    {m.text}
-                  </p>
+                  {m.reply_to && (
+                    <p className="mt-0.5 truncate border-l-2 border-zinc-700 pl-2 text-xs text-zinc-500">
+                      ↩{" "}
+                      {parent
+                        ? `${parent.name || shortHash(parent.author)}: ${parent.text.split("\n")[0]}`
+                        : `replying to ${shortHash(m.reply_to)}`}
+                    </p>
+                  )}
+                  {editingHash === m.hash ? (
+                    <div className="mt-1">
+                      <textarea
+                        value={editText}
+                        onChange={(e) => setEditText(e.target.value)}
+                        aria-label="Edit message"
+                        rows={3}
+                        className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500"
+                      />
+                      <div className="mt-1 flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleSaveEdit(m.hash)}
+                          disabled={savingEdit || !editText.trim() || editText === m.text}
+                          className="rounded-full bg-cyan-500 px-3 py-1 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                        >
+                          {savingEdit ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingHash(null);
+                            setEditText("");
+                          }}
+                          className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
+                      {m.text}
+                    </p>
+                  )}
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    {(m.reactions ?? []).map((r) => (
+                      <button
+                        key={r.reaction}
+                        type="button"
+                        title={r.reactors.join(", ")}
+                        aria-label={`React ${r.reaction} (${r.count})`}
+                        onClick={() => void handleReact(m.hash, r.reaction)}
+                        disabled={reacting === m.hash}
+                        className="rounded-full border border-zinc-700 bg-zinc-900 px-2 py-0.5 text-xs text-zinc-200 hover:border-zinc-500 disabled:opacity-50"
+                      >
+                        {r.reaction} {r.count}
+                      </button>
+                    ))}
+                    {["👍", "❤️", "🎉", "🚀", "👀"]
+                      .filter((token) => !(m.reactions ?? []).some((r) => r.reaction === token))
+                      .map((token) => (
+                        <button
+                          key={token}
+                          type="button"
+                          aria-label={`React ${token} to this message`}
+                          onClick={() => void handleReact(m.hash, token)}
+                          disabled={reacting === m.hash}
+                          className="rounded-full border border-transparent px-1.5 py-0.5 text-xs text-zinc-500 hover:border-zinc-700 hover:text-zinc-200 disabled:opacity-50"
+                        >
+                          {token}
+                        </button>
+                      ))}
+                  </div>
+                  <button
+                    type="button"
+                    aria-label={`Reply to ${m.name || shortHash(m.author)}`}
+                    onClick={() =>
+                      setReplyTo({ hash: m.hash, name: m.name || shortHash(m.author) })
+                    }
+                    className="mt-1 text-xs font-semibold text-zinc-500 hover:text-cyan-400"
+                  >
+                    Reply
+                  </button>
                 </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    void (pinnedHashes.has(m.hash)
+                      ? handleUnpin(m.hash)
+                      : handlePin(m.hash))
+                  }
+                  aria-label={`${pinnedHashes.has(m.hash) ? "Unpin" : "Pin"} message from ${m.name || shortHash(m.author)}`}
+                  className="h-fit shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs font-semibold text-zinc-300 hover:bg-zinc-900"
+                >
+                  {pinnedHashes.has(m.hash) ? "Pinned" : "Pin"}
+                </button>
               </div>
-            ))}
+              );
+            })}
           </div>
 
           <form
             onSubmit={handleSend}
             className="sticky bottom-0 border-t border-zinc-800 bg-zinc-950 px-3 py-2"
           >
+            {replyTo && (
+              <p className="mb-2 flex items-center justify-between text-xs text-zinc-400">
+                <span className="truncate">
+                  Replying to <span className="font-semibold text-zinc-200">{replyTo.name}</span>
+                </span>
+                <button
+                  type="button"
+                  aria-label="Cancel reply"
+                  onClick={() => setReplyTo(null)}
+                  className="ml-2 shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs text-zinc-400 hover:bg-zinc-900"
+                >
+                  ✕ Cancel
+                </button>
+              </p>
+            )}
             <div className="flex gap-2">
               <input
                 value={text}

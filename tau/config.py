@@ -38,7 +38,9 @@ BLOCKLIST_FILE_NAME = "blocklist.json"
 IGNORED_GROUPS_FILE_NAME = "ignored-groups.json"
 ARCHIVED_FILE_NAME = "archived.json"
 DISAPPEARING_FILE_NAME = "disappearing.json"
+DRAFTS_FILE_NAME = "drafts.json"
 MUTED_FILE_NAME = "muted.json"
+QUIET_HOURS_FILE_NAME = "quiet_hours.json"
 AWAY_FILE_NAME = "away.json"
 DM_REQUESTS_FILE_NAME = "dm-requests.json"
 INVITES_FILE_NAME = "invites.json"
@@ -89,7 +91,9 @@ class TauConfig:
     ignored_groups_path: Path
     archived_path: Path
     disappearing_path: Path
+    drafts_path: Path
     muted_path: Path
+    quiet_hours_path: Path
     away_path: Path
     dm_requests_path: Path
     invites_path: Path
@@ -146,7 +150,9 @@ class TauConfig:
             ignored_groups_path=base / IGNORED_GROUPS_FILE_NAME,
             archived_path=base / ARCHIVED_FILE_NAME,
             disappearing_path=base / DISAPPEARING_FILE_NAME,
+            drafts_path=base / DRAFTS_FILE_NAME,
             muted_path=base / MUTED_FILE_NAME,
+            quiet_hours_path=base / QUIET_HOURS_FILE_NAME,
             away_path=base / AWAY_FILE_NAME,
             dm_requests_path=base / DM_REQUESTS_FILE_NAME,
             invites_path=base / INVITES_FILE_NAME,

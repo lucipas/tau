@@ -260,13 +260,13 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
             # plain chat rather than dropping the message.
             kind = DEFAULT_MESSAGE_KIND
         record["kind"] = kind
-    if record["kind"] == "group":
-        # A group poll, vote, or close rides on the record itself so
-        # the tally derives from stored history; a malformed field
-        # drops instead of the record — the message still reads as
-        # plain chat.  Only one poll field is ever set (the wire
-        # forbids more); a hand-edited record carrying several keeps
-        # none of them.
+    if record["kind"] in ("group", "chat"):
+        # A group or DM poll, vote, or close rides on the record
+        # itself so the tally derives from stored history; a
+        # malformed field drops instead of the record — the message
+        # still reads as plain chat.  Only one poll field is ever
+        # set (the wire forbids more); a hand-edited record carrying
+        # several keeps none of them.
         poll_options = _clean_group_poll_options_or_none(
             raw.get("poll_options")
         )
@@ -1825,6 +1825,7 @@ class Inbox:
         pinned_only: bool = False,
         exclude_dm_from: Optional[Collection[str]] = None,
         exclude_group: Optional[Collection[str]] = None,
+        quiet: bool = False,
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
@@ -1845,7 +1846,9 @@ class Inbox:
         for them, the same way :meth:`_unread_counts_locked` clears
         their counts — a muted conversation never shows an unread
         marker, while a muted sender's group posts still carry theirs
-        when only the sender is excluded, and vice versa.
+        when only the sender is excluded, and vice versa.  ``quiet``
+        silences every conversation at once (quiet hours): no entry
+        carries the unread marker, whatever the exclusions say.
         Each entry carries ``unread``: whether it arrived after its
         conversation's read cursor, and a ``reactions`` list when the message
         has any — derived from the reaction store, never stored counters.
@@ -1898,6 +1901,10 @@ class Inbox:
             unread = item.get("direction") != "out" and _is_unread(
                 item, cursors.get(_conversation_key(item))
             )
+            # Quiet hours silence every conversation at once: no entry
+            # carries the unread marker, whatever the exclusions say.
+            if quiet:
+                unread = False
             # A muted conversation's entries still list, but carry no
             # unread marker — the same exclusion the counts apply, so
             # the marker and the badge can never disagree.
@@ -1924,6 +1931,7 @@ class Inbox:
         *,
         exclude_dm_from: Optional[Collection[str]] = None,
         exclude_group: Optional[Collection[str]] = None,
+        quiet: bool = False,
     ) -> Dict[str, Any]:
         """Per-conversation unread counts from the in-memory state.
 
@@ -1940,8 +1948,12 @@ class Inbox:
         ``per_group``: the group thread stays visible.
         ``exclude_group`` hides the posts of the named groups instead:
         an ignored group never lights any badge, while its members'
-        direct messages still count.
+        direct messages still count.  ``quiet`` silences every
+        conversation at once (quiet hours): all three totals read 0.
         """
+        if quiet:
+            return {"per_peer": {}, "per_group": {}, "total": 0}
+        per_peer: Dict[str, int] = {}
         per_peer: Dict[str, int] = {}
         per_group: Dict[str, int] = {}
         for entry in self._messages:
@@ -1971,6 +1983,7 @@ class Inbox:
         *,
         exclude_dm_from: Optional[Collection[str]] = None,
         exclude_group: Optional[Collection[str]] = None,
+        quiet: bool = False,
     ) -> Dict[str, Any]:
         """Per-conversation unread counts, reloaded from disk first.
 
@@ -1982,6 +1995,7 @@ class Inbox:
             return self._unread_counts_locked(
                 exclude_dm_from=exclude_dm_from,
                 exclude_group=exclude_group,
+                quiet=quiet,
             )
 
     def mark_read(
