@@ -16,6 +16,7 @@ from tau.channels import (
     ChannelError,
     channel_history,
     channel_history_page,
+    channel_unread_counts,
     clean_channel_name,
     create_message,
     create_topic,
@@ -29,6 +30,7 @@ from tau.channels import (
     leave_channel,
     list_memberships,
     list_pins,
+    mark_channel_read,
     pin_message,
     reactions_for_messages,
     search_channel_messages,
@@ -1525,6 +1527,202 @@ def test_cli_channel_send_without_name_flag_keeps_node_name(tmp_path, capsys):
     capsys.readouterr()
     assert main(["id", "--data-dir", str(data_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["name"] == "alice"
+
+
+# -- read cursors / unread counts --------------------------------------------
+#
+# joined_at is real wall-clock time, so tests that need a deterministic
+# join moment insert the membership row directly instead of joining.
+
+
+def _join_at(conn, channel, joined_at):
+    with conn:
+        conn.execute(
+            "INSERT INTO memberships(channel, joined_at) VALUES(?, ?)",
+            (channel, joined_at),
+        )
+
+
+def _store_from(identities, source_conn, identity, channel, text, now):
+    return create_message(source_conn, identity, channel, text, name="bob", now=now)
+
+
+def test_unread_counts_messages_received_since_join(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    # Received before joining: cached history, not unread.
+    store_message(conn, _store_from(identities, source, bob, "general", "old", 900), now=900)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    store_message(conn, _store_from(identities, source, bob, "general", "two", 1002), now=1002)
+    # Another channel's messages never count here.
+    _join_at(conn, "other", 1000)
+    store_message(conn, _store_from(identities, source, bob, "other", "elsewhere", 1003), now=1003)
+
+    assert channel_unread_counts(conn) == {"general": 2, "other": 1}
+
+
+def test_unread_counts_empty_without_messages(tmp_path):
+    conn = init_db(tmp_path / "channels.sqlite3")
+    _join_at(conn, "general", 1000)
+    assert channel_unread_counts(conn) == {}
+
+
+def test_mark_read_clears_and_new_messages_count_again(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    store_message(conn, _store_from(identities, source, bob, "general", "two", 1002), now=1002)
+
+    marked = mark_channel_read(conn, "general")
+    assert marked["cleared"] == 2
+    assert marked["hash"] is not None
+    assert channel_unread_counts(conn) == {}
+
+    store_message(conn, _store_from(identities, source, bob, "general", "three", 1003), now=1003)
+    assert channel_unread_counts(conn) == {"general": 1}
+    assert mark_channel_read(conn, "general")["cleared"] == 1
+    assert channel_unread_counts(conn) == {}
+
+
+def test_mark_read_requires_membership(tmp_path):
+    conn = init_db(tmp_path / "channels.sqlite3")
+    with pytest.raises(ChannelError, match="not a member"):
+        mark_channel_read(conn, "general")
+
+
+def test_mark_read_with_no_messages_leaves_no_cursor(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+
+    marked = mark_channel_read(conn, "general")
+    assert marked == {
+        "channel": "general",
+        "hash": None,
+        "created_at": None,
+        "cleared": 0,
+    }
+    # No cursor was set, so a message arriving after joining still counts.
+    store_message(conn, _store_from(identities, source, bob, "general", "hi", 1001), now=1001)
+    assert channel_unread_counts(conn) == {"general": 1}
+
+
+def test_late_message_before_cursor_does_not_relight(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    store_message(conn, _store_from(identities, source, bob, "general", "two", 1002), now=1002)
+    mark_channel_read(conn, "general")
+
+    # A gossip straggler created before the cursor but received after it.
+    store_message(conn, _store_from(identities, source, bob, "general", "late", 1001), now=5000)
+    assert channel_unread_counts(conn) == {}
+
+
+def test_leave_drops_cursor_so_rejoin_starts_fresh(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    mark_channel_read(conn, "general")
+    assert leave_channel(conn, "general") is True
+
+    _join_at(conn, "general", 5000)
+    # The cached message predates the rejoin: not unread again.
+    assert channel_unread_counts(conn) == {}
+
+
+def test_app_unread_counts_excludes_own_and_blocked_messages(identities, tmp_path):
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    app.join("general")
+    app.send("general", "my own post", publish=False)
+
+    source = init_db(tmp_path / "source.sqlite3")
+    conn = app.connect()
+    try:
+        # Received now — after the real-time join above — so it counts.
+        store_message(
+            conn,
+            _store_from(identities, source, bob, "general", "hi", 1001),
+            now=time.time(),
+        )
+    finally:
+        conn.close()
+    assert app.unread_counts() == {"general": 1}
+
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({author_of(bob)})))
+    assert app.unread_counts() == {}
+
+    marked = app.mark_read("general")
+    assert marked["cleared"] == 0
+    assert app.unread_counts() == {}
+
+
+def test_cli_channel_list_shows_unread_and_mark_read_clears(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    # Own sends never light the badge.
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert main(["channel", "list", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["channels"][0]["unread"] == 0
+
+    # A peer's message, received after joining, lights it.
+    bob = RNS.Identity()
+    source = init_db(tmp_path / "source.sqlite3")
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        store_message(
+            conn,
+            create_message(source, bob, "general", "hi all", name="bob", now=1000),
+            now=time.time(),
+        )
+    finally:
+        conn.close()
+    capsys.readouterr()
+    assert main(["channel", "list", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "1 unread" in out
+
+    assert main(["channel", "mark-read", "--data-dir", str(data_dir), "general"]) == 0
+    out = capsys.readouterr().out
+    assert "cleared 1 unread message" in out
+    capsys.readouterr()
+    assert main(["channel", "list", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["channels"][0]["unread"] == 0
+
+
+def test_cli_channel_mark_read_requires_membership(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "mark-read", "--data-dir", str(data_dir), "general"]) == 2
+    assert "not a member" in capsys.readouterr().err
 
 
 # -- polls -------------------------------------------------------------------

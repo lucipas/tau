@@ -24,6 +24,7 @@ import {
   getChannels,
   joinChannel,
   leaveChannel,
+  markRead,
   pinChannelMessage,
   postChannelPoll,
   reactToChannelMessage,
@@ -151,15 +152,27 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     return undefined;
   }, [refresh, pollMs]);
 
-  const select = useCallback((channel: string | null) => {
-    setSelected(channel);
-    // A search belongs to the channel it ran in; switching channels
-    // drops it rather than showing stale matches under a new name.
-    setSearchResults(null);
-    setSearchQuery(null);
-    void refreshMessages(channel);
-    void refreshTopic(channel);
-  }, [refreshMessages, refreshTopic]);
+  const select = useCallback(
+    (channel: string | null) => {
+      setSelected(channel);
+      // A search belongs to the channel it ran in; switching channels
+      // drops it rather than showing stale matches under a new name.
+      setSearchResults(null);
+      setSearchQuery(null);
+      void refreshMessages(channel);
+      void refreshTopic(channel);
+      if (channel) {
+        // Opening a channel clears its badge; refresh the list so
+        // the cleared count shows without waiting for the next poll.
+        // A failed mark (e.g. the channel was just left in another
+        // tab) must not break opening it.
+        void markRead({ channel })
+          .then(() => refreshChannels())
+          .catch(() => undefined);
+      }
+    },
+    [refreshMessages, refreshChannels, refreshTopic],
+  );
 
   const search = useCallback(async (query: string) => {
     if (!selected) throw new Error("no channel selected");
@@ -275,6 +288,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     },
     sync: async (channel) => {
       await syncChannels(channel ?? selected ?? undefined);
+      await refreshChannels();
       await refreshMessages(selected);
       await refreshTopic(selected);
     },

@@ -3213,6 +3213,7 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {group_id: 1},
+        "per_channel": {},
         "total": 2,
     }
 
@@ -3223,6 +3224,7 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
     # The ignore pushed fresh counts to every open console, so the
@@ -3233,6 +3235,7 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     assert _counts(unread_events[-1]["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3246,6 +3249,7 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {group_id: 1},
+        "per_channel": {},
         "total": 2,
     }
 
@@ -3256,6 +3260,7 @@ def test_api_unread_zero_during_quiet_hours(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3280,6 +3285,7 @@ def test_api_unread_zero_during_quiet_hours(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {},
         "per_group": {},
+        "per_channel": {},
         "total": 0,
     }
 
@@ -3297,6 +3303,7 @@ def test_api_unread_zero_during_quiet_hours(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3337,13 +3344,13 @@ def _counts(unread):
 
 def test_snapshot_carries_unread_counts(bridge, node):
     _, _, payload = _json(bridge, "/api/status")
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
     _inbound_record(node)
     _inbound_record(node, id="m-2", received_at=102.0)
 
     _, _, payload = _json(bridge, "/api/status")
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "per_group": {}, "total": 2}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "per_group": {}, "per_channel": {}, "total": 2}
 
 
 def test_unread_revisions_only_increase(bridge, node):
@@ -3361,6 +3368,7 @@ def test_inbound_message_event_carries_unread_total(bridge, node):
     assert _counts(message_events[-1]["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3379,7 +3387,7 @@ def test_mark_read_endpoint_clears_a_conversation(bridge, node):
     )
     assert status == 200
     assert payload["ok"] is True
-    assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "per_group": {}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
 
     # Other tabs learn from the published unread event.
     events = bridge.bus.replay(0)
@@ -3387,6 +3395,7 @@ def test_mark_read_endpoint_clears_a_conversation(bridge, node):
     assert _counts(unread_events[-1]["unread"]) == {
         "per_peer": {OTHER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3395,7 +3404,7 @@ def test_mark_read_endpoint_clears_a_conversation(bridge, node):
         bridge, "/api/messages/read", method="POST", body={}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
 
 def test_mark_read_endpoint_rejects_a_bad_peer(bridge):
@@ -3431,6 +3440,7 @@ def test_mark_read_endpoint_group_leaves_dm_unread(bridge, node):
     assert _counts(payload["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3439,7 +3449,7 @@ def test_mark_read_endpoint_group_leaves_dm_unread(bridge, node):
         bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
 
 def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path):
@@ -3483,6 +3493,7 @@ def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path
     assert _counts(status["unread"]) == {
         "per_peer": {},
         "per_group": {new_id: 2},
+        "per_channel": {},
         "total": 2,
     }
 
@@ -3491,7 +3502,7 @@ def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path
         bridge, "/api/messages/read", method="POST", body={"group": new_id}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
     # And marking it unread again restores the newest post across
     # the lineage, still under the current id.
@@ -3502,6 +3513,7 @@ def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path
     assert _counts(payload["unread"]) == {
         "per_peer": {},
         "per_group": {new_id: 1},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3556,6 +3568,7 @@ def test_mark_read_group_ignores_poisoned_lineage(bridge, node, tmp_path):
     assert _counts(payload["unread"]) == {
         "per_peer": {},
         "per_group": {other_id: 1},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3605,7 +3618,7 @@ def test_mark_read_group_leaves_ignored_predecessor_unread(
         bridge, "/api/messages/read", method="POST", body={"group": new_id}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
     # And the predecessor's cursor never moved: its unread post is
     # still there in the raw inbox counts, for when it is unignored.
     assert node.inbox.unread_counts()["per_group"] == {old_id: 1}
@@ -3648,6 +3661,7 @@ def test_mark_unread_endpoint_group_scopes_to_the_group(bridge, node):
     assert _counts(payload["unread"]) == {
         "per_peer": {},
         "per_group": {group_id: 1},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3659,6 +3673,7 @@ def test_mark_unread_endpoint_group_scopes_to_the_group(bridge, node):
     assert _counts(payload["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {group_id: 1},
+        "per_channel": {},
         "total": 2,
     }
 
@@ -3684,14 +3699,14 @@ def test_mark_unread_endpoint_marks_newest_unread_again(bridge, node):
         bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
     status, _, payload = _json(
         bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
     )
     assert status == 200
     assert payload["ok"] is True
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
 
     # Other tabs learn from the published unread event.
     events = bridge.bus.replay(0)
@@ -3699,6 +3714,7 @@ def test_mark_unread_endpoint_marks_newest_unread_again(bridge, node):
     assert _counts(unread_events[-1]["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3707,7 +3723,7 @@ def test_mark_unread_endpoint_marks_newest_unread_again(bridge, node):
         bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
 
 
 def test_mark_unread_endpoint_all_marks_whole_conversation(bridge, node):
@@ -3727,7 +3743,7 @@ def test_mark_unread_endpoint_all_marks_whole_conversation(bridge, node):
         body={"peer": PEER_HASH, "all": True},
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "per_group": {}, "total": 2}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "per_group": {}, "per_channel": {}, "total": 2}
 
 
 def test_mark_unread_endpoint_rejects_bad_input(bridge, node):
@@ -3774,7 +3790,7 @@ def test_mark_unread_counts_exclude_archived_conversations(node, tmp_path):
             body={"peer": OTHER_HASH, "all": True},
         )
         assert status == 200
-        assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "per_group": {}, "total": 1}
+        assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
     finally:
         bridge.stop()
 
@@ -3804,7 +3820,7 @@ def test_mark_unread_counts_exclude_ignored_groups(bridge, node, tmp_path):
         body={"peer": PEER_HASH, "all": True},
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
 
 
 def test_mark_unread_endpoint_reports_unsaved_cursor(
@@ -5379,6 +5395,103 @@ def test_channel_polls_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_unread_counts_via_api(tmp_path):
+    import time
+
+    import RNS
+
+    from tau import cli
+    from tau.channels import (
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+        store_message,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    source = init_channel_db(tmp_path / "source.sqlite3")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        message = create_message(
+            source, bob, "general", "hello channels", name="bob", now=1000
+        )
+        # Received now — after joining — so it counts as unread.
+        store_message(conn, message, now=time.time())
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The snapshot carries the channel count, folded into the total.
+        _, _, status = _json(bridge, "/api/status")
+        assert _counts(status["unread"]) == {
+            "per_peer": {},
+            "per_group": {},
+            "per_channel": {"general": 1},
+            "total": 1,
+        }
+
+        # The channel list carries the same count for its badge.
+        _, _, payload = _json(bridge, "/api/channels")
+        assert payload["channels"][0]["unread"] == 1
+
+        # A new channel message re-publishes the unread counts.
+        bridge.record_channel_message(
+            {"channel": "general", "text": "another", "author": "x" * 32}
+        )
+        unread_events = [
+            event for event in bridge.bus.replay(0) if event["type"] == "unread"
+        ]
+        assert _counts(unread_events[-1]["unread"]) == {
+            "per_peer": {},
+            "per_group": {},
+            "per_channel": {"general": 1},
+            "total": 1,
+        }
+
+        # Marking the channel read leaves a DM's badge alone.
+        _inbound_record(node)
+        status, _, payload = _json(
+            bridge, "/api/messages/read", method="POST", body={"channel": "general"}
+        )
+        assert status == 200
+        assert _counts(payload["unread"]) == {
+            "per_peer": {PEER_HASH: 1},
+            "per_group": {},
+            "per_channel": {},
+            "total": 1,
+        }
+        _, _, payload = _json(bridge, "/api/channels")
+        assert payload["channels"][0]["unread"] == 0
+
+        # Exactly one target, and it must be a channel you joined.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/read",
+            method="POST",
+            body={"channel": "general", "peer": PEER_HASH},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/messages/read", method="POST", body={"channel": "nope"}
+        )
+        assert status == 400
+        assert "not a member" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge, "/api/messages/read", method="POST", body={"channel": 42}
+        )
+        assert status == 400
+        assert "channel" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_pages_via_api(tmp_path):
     from types import SimpleNamespace
 
@@ -6079,6 +6192,7 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
         assert _counts(bridge.unread()) == {
             "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
             "per_group": {"11" * 16: 1},
+            "per_channel": {},
             "total": 3,
         }
 
@@ -6106,6 +6220,7 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
         assert _counts(bridge.unread()) == {
             "per_peer": {OTHER_HASH: 1},
             "per_group": {"11" * 16: 1},
+            "per_channel": {},
             "total": 2,
         }
 
@@ -6119,6 +6234,7 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
         assert _counts(bridge.unread()) == {
             "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
             "per_group": {"11" * 16: 1},
+            "per_channel": {},
             "total": 3,
         }
     finally:

@@ -3987,6 +3987,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_read.set_defaults(func=cmd_channel_read)
 
+    channel_mark_read = channel_sub.add_parser(
+        "mark-read",
+        parents=[common],
+        help="clear a channel's unread badge by marking its newest message read",
+    )
+    channel_mark_read.add_argument(
+        "channel", metavar="NAME", help="channel to mark read"
+    )
+    channel_mark_read.set_defaults(func=cmd_channel_mark_read)
+
     channel_scheduled = channel_sub.add_parser(
         "scheduled",
         parents=[common],
@@ -8384,6 +8394,9 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
     json_output = _json_mode(args)
     app = ChannelApp(config, _tan_identity(config), name=config.name)
     memberships = app.memberships()
+    unread = app.unread_counts()
+    for membership in memberships:
+        membership["unread"] = unread.get(membership["channel"], 0)
     if json_output:
         _emit({"channels": memberships, "count": len(memberships)}, True)
         return _EXIT_OK
@@ -8393,10 +8406,39 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
     for membership in memberships:
         count = membership["messages"]
         noun = "message" if count == 1 else "messages"
+        unread_count = membership["unread"]
+        unread_suffix = (
+            f", {unread_count} unread" if unread_count > 0 else ""
+        )
         print(
-            f"#{membership['channel']} — {count} cached {noun}, "
+            f"#{membership['channel']} — {count} cached {noun}{unread_suffix}, "
             f"joined {_ago(time.time() - membership['joined_at'])} ago"
         )
+    return _EXIT_OK
+
+
+def cmd_channel_mark_read(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    try:
+        result = app.mark_read(name)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit(result, True)
+    elif result["cleared"] == 0:
+        print(f"#{name} has no unread messages.")
+    else:
+        cleared = result["cleared"]
+        noun = "message" if cleared == 1 else "messages"
+        print(f"marked #{name} read — cleared {cleared} unread {noun}.")
     return _EXIT_OK
 
 

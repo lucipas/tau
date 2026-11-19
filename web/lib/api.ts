@@ -516,7 +516,11 @@ export async function declineDmRequest(id: string, block = false): Promise<unkno
 
 /** Advance the read cursor for one conversation, or all when neither is given. */
 export async function markRead(
-  target: { peer: string } | { group: string } | Record<string, never> = {},
+  target:
+    | { peer: string }
+    | { group: string }
+    | { channel: string }
+    | Record<string, never> = {},
 ): Promise<UnreadCounts> {
   const data = await post<{ ok: boolean; unread: UnreadCounts }>("/api/messages/read", target);
   return data.unread;

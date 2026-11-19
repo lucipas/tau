@@ -415,7 +415,7 @@ Global options may appear before or after the command:
 | `tau tan rules` | Show or change which remote entries get committed |
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
-| `tau channel list` | List joined channels with cached message counts |
+| `tau channel list` | List joined channels with cached message and unread counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message) |
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
 | `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
@@ -428,6 +428,7 @@ Global options may appear before or after the command:
 | `tau channel edit NAME DIGEST NEW-TEXT` | Edit your own channel message (digest or hex prefix) |
 | `tau channel edits NAME` | List edit notices for a channel, newest first |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
+| `tau channel mark-read NAME` | Clear a channel's unread badge |
 | `tau channel pin NAME HASH` | Pin a stored message so it stays surfaced (and survives pruning) |
 | `tau channel unpin NAME HASH` | Drop the pin on a message in a channel |
 | `tau channel pins NAME` | List pinned messages for a channel, newest pin first |
