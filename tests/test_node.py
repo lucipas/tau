@@ -1179,6 +1179,86 @@ def test_send_group_message_with_send_after_queues_without_delivery(
     assert sent[0]["leg_sent_at"] == response["sent_at"]
 
 
+def test_send_group_poll_with_send_after_queues_poll_intact(
+    tmp_path, monkeypatch
+):
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    send_after = time.time() + 3600.0
+    response = node.send_group_message(
+        "crew",
+        "Lunch?",
+        send_after=send_after,
+        poll_options=["Monday", "Tuesday"],
+    )
+
+    # No delivery attempt at all — the poll is scheduled, not sent.
+    assert calls == []
+    assert response["ok"] is True
+    assert len(response["results"]) == 2
+    assert all(result.get("queued") for result in response["results"])
+    assert all(
+        result.get("send_after") == send_after for result in response["results"]
+    )
+    for result in response["results"]:
+        entry = node.mailbox.get_outbox(result["id"])
+        assert entry is not None
+        assert entry.send_after == send_after
+        assert entry.poll_options == ["Monday", "Tuesday"]
+        assert entry.group_id == group["id"]
+    # The sent record carries the poll, so the sender's history
+    # renders it as a poll with its options.
+    sent = node.inbox.list_messages(direction="out")
+    assert len(sent) == 1
+    assert sent[0]["poll_options"] == ["Monday", "Tuesday"]
+    assert sent[0]["leg_sent_at"] == response["sent_at"]
+
+
+def test_scheduled_group_poll_publishes_with_options_when_due(
+    tmp_path, monkeypatch
+):
+    node, group, alice, _ = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message(
+        "crew",
+        "Lunch?",
+        send_after=send_after,
+        poll_options=["Monday", "Tuesday"],
+    )
+    assert all(result.get("queued") for result in response["results"])
+    delivered = []
+    monkeypatch.setattr(
+        node,
+        "_deliver_entry",
+        lambda p, e, timeout, **kwargs: (
+            delivered.append(e),
+            True,
+        )[1],
+    )
+    monkeypatch.setattr(
+        node,
+        "_deposit_entry",
+        lambda p, e, timeout, **kwargs: False,
+    )
+    peer = alice
+    # Not due yet: the flush leaves both legs queued.
+    node._flush_peer(peer, 1.0, respect_backoff=False)
+    assert delivered == []
+    assert len(node.mailbox.outbox_list()) == 2
+    # Once the time passes, the same flush delivers the poll with
+    # its question and options intact.
+    for result in response["results"]:
+        node.mailbox.get_outbox(result["id"]).send_after = time.time() - 1.0
+    node.mailbox.save()
+    node._flush_peer(peer, 1.0, respect_backoff=False)
+    assert len(delivered) == 1
+    assert delivered[0].text == "Lunch?"
+    assert delivered[0].poll_options == ["Monday", "Tuesday"]
+
+
 def test_send_group_message_scheduled_resolves_unregistered_member(
     tmp_path, monkeypatch
 ):

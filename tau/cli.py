@@ -2678,6 +2678,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail instead of queueing the poll when a member is offline",
     )
+    group_poll.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
     group_poll.set_defaults(func=cmd_group_poll)
 
     group_vote = group_sub.add_parser(
@@ -17759,12 +17766,16 @@ def _send_group_poll_message(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    send_after: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Fan one group poll, vote, or close out, like ``cmd_group_send``.
 
-    Polls carry no expiry, schedule, quote, or wait — the same two
-    routes as a plain group send (the serving node, else a one-shot
-    local node) with the poll payload attached.
+    Polls carry no expiry, quote, or wait — the same two routes as a
+    plain group send (the serving node, else a one-shot local node)
+    with the poll payload attached.  ``send_after`` schedules a poll
+    the way it schedules a plain group message: the poll is queued
+    with a not-before time and publishes with its options intact once
+    the time arrives.
     """
     if _send_routes_via_running_node(config):
         return _send_group_via_running_node(
@@ -17772,7 +17783,7 @@ def _send_group_poll_message(
             config,
             text,
             expires_at=None,
-            send_after=None,
+            send_after=send_after,
             wait=0.0,
             poll_options=poll_options,
             poll_vote=poll_vote,
@@ -17783,7 +17794,7 @@ def _send_group_poll_message(
         config,
         text,
         expires_at=None,
-        send_after=None,
+        send_after=send_after,
         wait=0.0,
         poll_options=poll_options,
         poll_vote=poll_vote,
@@ -17808,9 +17819,19 @@ def _report_group_poll_send(
         if result.get("delivered"):
             print(f"delivered to {name}")
         elif result.get("queued"):
-            print(f"queued for {name} — they are unreachable right now")
+            if result.get("send_after"):
+                print(
+                    f"scheduled for {name}"
+                    f" — sends in {_ago(result['send_after'] - time.time())}"
+                )
+            else:
+                print(f"queued for {name} — they are unreachable right now")
         else:
             print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+    queued = [result for result in results if result.get("queued")]
+    if queued and all(result.get("send_after") for result in queued):
+        print("  it will be delivered at its scheduled time;")
+        print("  check `tau outbox` for the queue, or just leave a node serving")
     return _EXIT_ERROR if failed else _EXIT_OK
 
 
@@ -18061,6 +18082,15 @@ def cmd_close_poll(args: argparse.Namespace) -> int:
 
 
 def cmd_group_poll(args: argparse.Namespace) -> int:
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None and getattr(args, "no_queue", False):
+        # Reject the conflict before doing anything else, like
+        # ``cmd_group_send``: a scheduled poll is queued by definition.
+        print(
+            "error: --delay cannot be combined with --no-queue",
+            file=sys.stderr,
+        )
+        return 2
     config = _make_config(args)
     try:
         options = clean_poll_options(list(args.options))
@@ -18071,9 +18101,21 @@ def cmd_group_poll(args: argparse.Namespace) -> int:
     if group is None:
         print(f"error: unknown group: {args.group!r}", file=sys.stderr)
         return 2
+    send_after = None
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
     try:
         response = _send_group_poll_message(
-            args, config, args.question, poll_options=options
+            args, config, args.question, poll_options=options,
+            send_after=send_after,
         )
     except (NodeError, MailboxError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -18082,12 +18124,15 @@ def cmd_group_poll(args: argparse.Namespace) -> int:
     results = response.get("results") or []
     if results:
         poll_id = str(results[0].get("id") or "")
+    verb = "scheduled for" if send_after is not None else "posted to"
     summary = (
-        f"poll posted to {group['name']}"
+        f"poll {verb} {group['name']}"
         + (f" #{_safe_id_prefix(poll_id)}" if poll_id else "")
         + ": "
         + args.question
     )
+    if send_after is not None:
+        response["send_after"] = send_after
     return _report_group_poll_send(args, response, summary)
 
 
