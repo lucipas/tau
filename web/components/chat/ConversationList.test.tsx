@@ -17,6 +17,7 @@ function conv(overrides: Partial<Conversation> = {}): Conversation {
     unread: 0,
     muted: false,
     archived: false,
+    pinned: false,
     ...overrides,
   };
 }
@@ -48,6 +49,20 @@ describe("ConversationList", () => {
     );
     expect(screen.getByLabelText("Muted conversation")).toBeTruthy();
     expect(screen.queryByLabelText("4 unread")).toBeNull();
+  });
+
+  it("marks pinned conversations with a pin indicator", () => {
+    render(
+      <ConversationList
+        conversations={[conv({ pinned: true }), conv({ key: "b".repeat(32), name: "Bob", pinned: false })]}
+        archived={[]}
+        dmRequests={[]}
+        onSelect={() => undefined}
+        now={1700000100}
+      />,
+    );
+    expect(screen.getByLabelText("Pinned conversation")).toBeTruthy();
+    expect(screen.getByText("Bob")).toBeTruthy();
   });
 
   it("shows DM requests with accept / decline", () => {

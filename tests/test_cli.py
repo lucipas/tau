@@ -7460,6 +7460,136 @@ def test_group_messages_renders_poll_tally_and_hides_votes(
     assert "voted: Saturday" not in out
 
 
+def test_parser_channel_poll_vote_close_poll():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["channel", "poll", "general", "which day?", "Saturday", "Sunday"]
+    )
+    assert args.func is cli.cmd_channel_poll
+    assert args.options == ["Saturday", "Sunday"]
+    args = parser.parse_args(["channel", "vote", "general", "pppp", "2"])
+    assert args.func is cli.cmd_channel_vote
+    assert args.poll == "pppp"
+    assert args.option == "2"
+    args = parser.parse_args(["channel", "close-poll", "general", "pppp"])
+    assert args.func is cli.cmd_channel_close_poll
+
+
+def _seed_channel_poll_conversation(tmp_path):
+    """One node joined to #general with a posted channel poll."""
+    from tau.channels import channel_history, init_db as init_channel_db
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert (
+        cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    code = cli.main(
+        [
+            "channel",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    conn = init_channel_db(data_dir / "channels.sqlite3")
+    try:
+        poll = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+    return data_dir, poll
+
+
+def test_channel_poll_vote_close_round_trip(tmp_path, capsys):
+    data_dir, poll = _seed_channel_poll_conversation(tmp_path)
+    prefix = poll["hash"][:8]
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "channel",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    assert "voted for 'Sunday'" in capsys.readouterr().out
+
+    code = cli.main(["channel", "read", "--data-dir", str(data_dir), "general"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "which day?" in out
+    assert "1. Saturday — 0 votes" in out
+    assert "2. Sunday — 1 vote" in out
+    assert "your vote" in out
+    # The vote itself is not a chat message.
+    assert "voted: Sunday" not in out
+
+    code = cli.main(
+        [
+            "channel",
+            "close-poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+        ]
+    )
+    assert code == 0
+    assert "closed the poll" in capsys.readouterr().out
+
+    code = cli.main(["channel", "read", "--data-dir", str(data_dir), "general"])
+    assert code == 0
+    assert "closed" in capsys.readouterr().out
+
+    code = cli.main(
+        [
+            "channel",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+            "1",
+        ]
+    )
+    assert code == 2
+    assert "this poll is closed" in capsys.readouterr().err
+
+
+def test_channel_poll_rejects_one_option(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert (
+        cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    code = cli.main(
+        [
+            "channel",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            "which day?",
+            "Saturday",
+        ]
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err
+
+
 def test_parser_group_send_wait():
     parser = cli.build_parser()
     default = parser.parse_args(["group", "send", "weekend", "hello"])
@@ -9891,3 +10021,116 @@ def test_beacon_start_local_op_starts_and_sends(tmp_path):
     assert result["beacon"]["updates_sent"] == 1
     assert result["update"]["queued"] is True
     assert node.update_calls == [result["beacon"]["id"]]
+
+
+# -- channel scheduled messages (#547) --------------------------------------
+
+def _run_channel(tmp_path, *argv):
+    return cli.main(["channel", "--data-dir", str(tmp_path / "node"), *argv])
+
+
+def test_parser_channel_scheduled_arguments():
+    parser = cli.build_parser()
+
+    send = parser.parse_args(["channel", "send", "general", "hi", "--delay", "5m"])
+    assert send.func is cli.cmd_channel_send
+    assert send.delay == "5m"
+
+    listed = parser.parse_args(["channel", "scheduled"])
+    assert listed.func is cli.cmd_channel_scheduled
+    assert listed.channel is None
+
+    filtered = parser.parse_args(["channel", "scheduled", "general"])
+    assert filtered.channel == "general"
+
+    cancelled = parser.parse_args(["channel", "cancel-scheduled", "abcdef"])
+    assert cancelled.func is cli.cmd_channel_cancel_scheduled
+    assert cancelled.target == "abcdef"
+
+
+def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(tmp_path, "send", "general", "morning hello", "--delay", "5m")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert "publishes in 5m" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "morning hello" in out
+    entry_id = out.split()[0]
+
+    code = _run_channel(tmp_path, "scheduled", "general")
+    assert code == 0
+    assert "morning hello" in capsys.readouterr().out
+
+    code = _run_channel(tmp_path, "cancel-scheduled", entry_id[:8])
+    assert code == 0
+    assert "cancelled" in capsys.readouterr().out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    assert "No channel messages scheduled." in capsys.readouterr().out
+
+
+def test_channel_send_delay_json_round_trip(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "channel",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+            "send",
+            "general",
+            "later",
+            "--delay",
+            "5m",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"]["channel"] == "general"
+    assert payload["scheduled"]["text"] == "later"
+    assert payload["scheduled"]["publish_at"] > time.time()
+
+    code = cli.main(
+        ["channel", "--data-dir", str(tmp_path / "node"), "--json", "scheduled"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["scheduled"]) == 1
+    assert payload["scheduled"][0]["channel"] == "general"
+
+
+def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path, "send", "general", "hi", "--delay", "5m", "--no-publish"
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-publish" in capsys.readouterr().err
+
+    code = _run_channel(tmp_path, "send", "general", "hi", "--delay", "soon")
+    assert code == 2
+    assert "invalid --delay duration" in capsys.readouterr().err
+
+    code = _run_channel(tmp_path, "send", "general", "hi", "--delay", "8d")
+    assert code == 2
+    assert "--delay duration must be at most 1w" in capsys.readouterr().err
+
+    code = _run_channel(tmp_path, "send", "other", "hi", "--delay", "5m")
+    assert code == 2
+    assert "not a member of channel 'other'" in capsys.readouterr().err

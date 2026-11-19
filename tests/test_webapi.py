@@ -3213,6 +3213,7 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {group_id: 1},
+        "per_channel": {},
         "total": 2,
     }
 
@@ -3223,6 +3224,7 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
     # The ignore pushed fresh counts to every open console, so the
@@ -3233,6 +3235,7 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     assert _counts(unread_events[-1]["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3246,6 +3249,7 @@ def test_api_unread_excludes_ignored_group_posts(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {group_id: 1},
+        "per_channel": {},
         "total": 2,
     }
 
@@ -3256,6 +3260,7 @@ def test_api_unread_zero_during_quiet_hours(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3280,6 +3285,7 @@ def test_api_unread_zero_during_quiet_hours(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {},
         "per_group": {},
+        "per_channel": {},
         "total": 0,
     }
 
@@ -3297,6 +3303,7 @@ def test_api_unread_zero_during_quiet_hours(bridge, node, tmp_path):
     assert _counts(status["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3337,13 +3344,13 @@ def _counts(unread):
 
 def test_snapshot_carries_unread_counts(bridge, node):
     _, _, payload = _json(bridge, "/api/status")
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
     _inbound_record(node)
     _inbound_record(node, id="m-2", received_at=102.0)
 
     _, _, payload = _json(bridge, "/api/status")
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "per_group": {}, "total": 2}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "per_group": {}, "per_channel": {}, "total": 2}
 
 
 def test_unread_revisions_only_increase(bridge, node):
@@ -3361,6 +3368,7 @@ def test_inbound_message_event_carries_unread_total(bridge, node):
     assert _counts(message_events[-1]["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3379,7 +3387,7 @@ def test_mark_read_endpoint_clears_a_conversation(bridge, node):
     )
     assert status == 200
     assert payload["ok"] is True
-    assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "per_group": {}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
 
     # Other tabs learn from the published unread event.
     events = bridge.bus.replay(0)
@@ -3387,6 +3395,7 @@ def test_mark_read_endpoint_clears_a_conversation(bridge, node):
     assert _counts(unread_events[-1]["unread"]) == {
         "per_peer": {OTHER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3395,7 +3404,7 @@ def test_mark_read_endpoint_clears_a_conversation(bridge, node):
         bridge, "/api/messages/read", method="POST", body={}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
 
 def test_mark_read_endpoint_rejects_a_bad_peer(bridge):
@@ -3431,6 +3440,7 @@ def test_mark_read_endpoint_group_leaves_dm_unread(bridge, node):
     assert _counts(payload["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3439,7 +3449,7 @@ def test_mark_read_endpoint_group_leaves_dm_unread(bridge, node):
         bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
 
 def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path):
@@ -3483,6 +3493,7 @@ def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path
     assert _counts(status["unread"]) == {
         "per_peer": {},
         "per_group": {new_id: 2},
+        "per_channel": {},
         "total": 2,
     }
 
@@ -3491,7 +3502,7 @@ def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path
         bridge, "/api/messages/read", method="POST", body={"group": new_id}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
     # And marking it unread again restores the newest post across
     # the lineage, still under the current id.
@@ -3502,6 +3513,7 @@ def test_unread_counts_fold_a_renamed_groups_predecessors(bridge, node, tmp_path
     assert _counts(payload["unread"]) == {
         "per_peer": {},
         "per_group": {new_id: 1},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3556,6 +3568,7 @@ def test_mark_read_group_ignores_poisoned_lineage(bridge, node, tmp_path):
     assert _counts(payload["unread"]) == {
         "per_peer": {},
         "per_group": {other_id: 1},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3605,7 +3618,7 @@ def test_mark_read_group_leaves_ignored_predecessor_unread(
         bridge, "/api/messages/read", method="POST", body={"group": new_id}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
     # And the predecessor's cursor never moved: its unread post is
     # still there in the raw inbox counts, for when it is unignored.
     assert node.inbox.unread_counts()["per_group"] == {old_id: 1}
@@ -3648,6 +3661,7 @@ def test_mark_unread_endpoint_group_scopes_to_the_group(bridge, node):
     assert _counts(payload["unread"]) == {
         "per_peer": {},
         "per_group": {group_id: 1},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3659,6 +3673,7 @@ def test_mark_unread_endpoint_group_scopes_to_the_group(bridge, node):
     assert _counts(payload["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {group_id: 1},
+        "per_channel": {},
         "total": 2,
     }
 
@@ -3684,14 +3699,14 @@ def test_mark_unread_endpoint_marks_newest_unread_again(bridge, node):
         bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "per_group": {}, "per_channel": {}, "total": 0}
 
     status, _, payload = _json(
         bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
     )
     assert status == 200
     assert payload["ok"] is True
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
 
     # Other tabs learn from the published unread event.
     events = bridge.bus.replay(0)
@@ -3699,6 +3714,7 @@ def test_mark_unread_endpoint_marks_newest_unread_again(bridge, node):
     assert _counts(unread_events[-1]["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "per_group": {},
+        "per_channel": {},
         "total": 1,
     }
 
@@ -3707,7 +3723,7 @@ def test_mark_unread_endpoint_marks_newest_unread_again(bridge, node):
         bridge, "/api/messages/unread", method="POST", body={"peer": PEER_HASH}
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
 
 
 def test_mark_unread_endpoint_all_marks_whole_conversation(bridge, node):
@@ -3727,7 +3743,7 @@ def test_mark_unread_endpoint_all_marks_whole_conversation(bridge, node):
         body={"peer": PEER_HASH, "all": True},
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "per_group": {}, "total": 2}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "per_group": {}, "per_channel": {}, "total": 2}
 
 
 def test_mark_unread_endpoint_rejects_bad_input(bridge, node):
@@ -3774,7 +3790,7 @@ def test_mark_unread_counts_exclude_archived_conversations(node, tmp_path):
             body={"peer": OTHER_HASH, "all": True},
         )
         assert status == 200
-        assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "per_group": {}, "total": 1}
+        assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
     finally:
         bridge.stop()
 
@@ -3804,7 +3820,7 @@ def test_mark_unread_counts_exclude_ignored_groups(bridge, node, tmp_path):
         body={"peer": PEER_HASH, "all": True},
     )
     assert status == 200
-    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 1}, "per_group": {}, "per_channel": {}, "total": 1}
 
 
 def test_mark_unread_endpoint_reports_unsaved_cursor(
@@ -4986,6 +5002,16 @@ def test_channels_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/channels/messages")
         assert status == 400
 
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=hello")
+        assert status == 200
+        assert payload["query"] == "hello"
+        assert [item["text"] for item in payload["messages"]] == ["hello channels"]
+
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general")
+        assert status == 400
+        status, _, payload = _json(bridge, "/api/channels/search?q=hello")
+        assert status == 400
+
         # A blocked author is hidden, like the timeline hides their posts.
         node.blocklist = SimpleNamespace(
             blocked=frozenset({bob_message["author"]}), block_all=False
@@ -4993,8 +5019,14 @@ def test_channels_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
         assert status == 200
         assert [item["text"] for item in payload["messages"]] == ["from tester"]
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=hello")
+        assert status == 200
+        assert payload["messages"] == []
         node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
         status, _, payload = _json(bridge, "/api/channels/messages?channel=general")
+        assert status == 200
+        assert payload["messages"] == []
+        status, _, payload = _json(bridge, "/api/channels/search?channel=general&q=tester")
         assert status == 200
         assert payload["messages"] == []
         node.blocklist = None
@@ -5053,6 +5085,409 @@ def test_channels_via_api(tmp_path):
             bridge, "/api/channels/sync", method="POST", body={}
         )
         assert status == 503
+
+        # Pins: pinning, listing, blocked-author hiding, unpinning.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/pin",
+            method="POST",
+            body={"channel": "general", "hash": bob_message["hash"]},
+        )
+        assert status == 200
+        assert payload["channel"] == "general"
+        assert payload["hash"] == bob_message["hash"]
+        status, _, payload = _json(
+            bridge, "/api/channels/pins?channel=general"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["pins"]] == ["hello channels"]
+        assert payload["pins"][0]["pinned_at"] is not None
+        # Pinning twice, and pinning without a hash, are client errors.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/pin",
+            method="POST",
+            body={"channel": "general", "hash": bob_message["hash"]},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/pin",
+            method="POST",
+            body={"channel": "general"},
+        )
+        assert status == 400
+        status, _, payload = _json(bridge, "/api/channels/pins")
+        assert status == 400
+        # A blocked author is hidden from pins, like from history.
+        node.blocklist = SimpleNamespace(
+            blocked=frozenset({bob_message["author"]}), block_all=False
+        )
+        status, _, payload = _json(
+            bridge, "/api/channels/pins?channel=general"
+        )
+        assert status == 200
+        assert payload["pins"] == []
+        node.blocklist = None
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/unpin",
+            method="POST",
+            body={"channel": "general", "hash": bob_message["hash"]},
+        )
+        assert status == 200
+        assert payload["unpinned"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/unpin",
+            method="POST",
+            body={"channel": "general", "hash": bob_message["hash"]},
+        )
+        assert status == 200
+        assert payload["unpinned"] is False
+        status, _, payload = _json(
+            bridge, "/api/channels/pins?channel=general"
+        )
+        assert status == 200
+        assert payload["pins"] == []
+    finally:
+        bridge.stop()
+
+
+def test_channels_send_reply_via_api(tmp_path):
+    import RNS
+
+    from tau import cli
+    from tau.channels import (
+        ChannelApp,
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        parent = create_message(
+            conn, bob, "general", "meet at the park", name="bob", now=1000
+        )
+    finally:
+        conn.close()
+    node.channel_app = ChannelApp(node.config, node.identity, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "see you there",
+                "reply_to": parent["hash"],
+            },
+        )
+        assert status == 200
+        assert payload["message"]["reply_to"] == parent["hash"]
+
+        # An unknown parent is a 400, not a dangling reply.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "dangling", "reply_to": "f" * 64},
+        )
+        assert status == 400
+        assert "unknown message" in payload["error"]["message"]
+
+        # A non-string reply_to is a 400 too.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "bad", "reply_to": 123},
+        )
+        assert status == 400
+
+        # The messages list carries the reply with its parent digest.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == [
+            "see you there",
+            "meet at the park",
+        ]
+        assert payload["messages"][0]["reply_to"] == parent["hash"]
+        assert "reply_to" not in payload["messages"][1]
+    finally:
+        bridge.stop()
+
+
+def test_channel_polls_via_api(tmp_path):
+    from tau.channels import (
+        ChannelApp,
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+    from tau.protocol import APP_NAME, ASPECT
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    tester = RNS.Identity()
+    tester_hash = RNS.Destination.hash(tester, APP_NAME, ASPECT).hex()
+    node.destination_hexhash = tester_hash
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+    app = ChannelApp(node.config, tester, name="tester")
+    node.channel_app = app
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Posting needs 2-8 options.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/poll",
+            method="POST",
+            body={"channel": "general", "question": "q?", "options": ["only"]},
+        )
+        assert status == 400
+
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/poll",
+            method="POST",
+            body={
+                "channel": "general",
+                "question": "which day?",
+                "options": ["Saturday", "Sunday"],
+            },
+        )
+        assert status == 200
+        poll = payload["message"]
+        assert poll["poll_options"] == ["Saturday", "Sunday"]
+        assert poll["author"] == tester_hash
+
+        # A peer's vote, stored directly, counts in the tally — and
+        # the vote record itself never shows in the listing.
+        conn = init_channel_db(node.config.channels_db_path)
+        try:
+            create_message(
+                conn,
+                bob,
+                "general",
+                "voted: Sunday",
+                name="bob",
+                now=1001,
+                poll_vote={
+                    "target": {
+                        "author": poll["author"],
+                        "sent_at": poll["created_at"],
+                    },
+                    "option": 1,
+                },
+            )
+        finally:
+            conn.close()
+
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["messages"]] == ["which day?"]
+        shown = payload["messages"][0]
+        assert shown["poll"]["counts"] == [0, 1]
+        assert shown["poll"]["total"] == 1
+        assert shown["poll"]["closed"] is False
+        assert shown["poll"]["own"] is True
+
+        # Voting through the API moves the tally; a bad option is 400.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/vote",
+            method="POST",
+            body={"channel": "general", "poll": poll["hash"][:8], "option": "3"},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/vote",
+            method="POST",
+            body={"channel": "general", "poll": poll["hash"][:8], "option": 1},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert payload["messages"][0]["poll"]["counts"] == [1, 1]
+        assert payload["messages"][0]["poll"]["my_vote"] == 0
+
+        # Only the poll's creator can close it: a poll from alice
+        # refuses the close, then the own poll closes.
+        conn = init_channel_db(node.config.channels_db_path)
+        try:
+            alice_poll = create_message(
+                conn,
+                alice,
+                "general",
+                "alice asks?",
+                name="alice",
+                now=1002,
+                poll_options=["Yes", "No"],
+            )
+        finally:
+            conn.close()
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/close-poll",
+            method="POST",
+            body={"channel": "general", "poll": alice_poll["hash"]},
+        )
+        assert status == 400
+        assert "only the poll's creator" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/close-poll",
+            method="POST",
+            body={"channel": "general", "poll": poll["hash"]},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert payload["messages"][0]["poll"]["closed"] is True
+
+        # A closed poll takes no more votes.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/vote",
+            method="POST",
+            body={"channel": "general", "poll": poll["hash"], "option": 2},
+        )
+        assert status == 400
+        assert "closed" in payload["error"]["message"]
+
+        # An unknown poll hash is a 400, not a 500.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/vote",
+            method="POST",
+            body={"channel": "general", "poll": "f" * 8, "option": 1},
+        )
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_channel_unread_counts_via_api(tmp_path):
+    import time
+
+    import RNS
+
+    from tau import cli
+    from tau.channels import (
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+        store_message,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    source = init_channel_db(tmp_path / "source.sqlite3")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        message = create_message(
+            source, bob, "general", "hello channels", name="bob", now=1000
+        )
+        # Received now — after joining — so it counts as unread.
+        store_message(conn, message, now=time.time())
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The snapshot carries the channel count, folded into the total.
+        _, _, status = _json(bridge, "/api/status")
+        assert _counts(status["unread"]) == {
+            "per_peer": {},
+            "per_group": {},
+            "per_channel": {"general": 1},
+            "total": 1,
+        }
+
+        # The channel list carries the same count for its badge.
+        _, _, payload = _json(bridge, "/api/channels")
+        assert payload["channels"][0]["unread"] == 1
+
+        # A new channel message re-publishes the unread counts.
+        bridge.record_channel_message(
+            {"channel": "general", "text": "another", "author": "x" * 32}
+        )
+        unread_events = [
+            event for event in bridge.bus.replay(0) if event["type"] == "unread"
+        ]
+        assert _counts(unread_events[-1]["unread"]) == {
+            "per_peer": {},
+            "per_group": {},
+            "per_channel": {"general": 1},
+            "total": 1,
+        }
+
+        # Marking the channel read leaves a DM's badge alone.
+        _inbound_record(node)
+        status, _, payload = _json(
+            bridge, "/api/messages/read", method="POST", body={"channel": "general"}
+        )
+        assert status == 200
+        assert _counts(payload["unread"]) == {
+            "per_peer": {PEER_HASH: 1},
+            "per_group": {},
+            "per_channel": {},
+            "total": 1,
+        }
+        _, _, payload = _json(bridge, "/api/channels")
+        assert payload["channels"][0]["unread"] == 0
+
+        # Exactly one target, and it must be a channel you joined.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/read",
+            method="POST",
+            body={"channel": "general", "peer": PEER_HASH},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/messages/read", method="POST", body={"channel": "nope"}
+        )
+        assert status == 400
+        assert "not a member" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge, "/api/messages/read", method="POST", body={"channel": 42}
+        )
+        assert status == 400
+        assert "channel" in payload["error"]["message"]
     finally:
         bridge.stop()
 
@@ -5823,6 +6258,7 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
         assert _counts(bridge.unread()) == {
             "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
             "per_group": {"11" * 16: 1},
+            "per_channel": {},
             "total": 3,
         }
 
@@ -5850,6 +6286,7 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
         assert _counts(bridge.unread()) == {
             "per_peer": {OTHER_HASH: 1},
             "per_group": {"11" * 16: 1},
+            "per_channel": {},
             "total": 2,
         }
 
@@ -5863,6 +6300,7 @@ def test_archived_conversations_hide_messages_and_unread(node, tmp_path):
         assert _counts(bridge.unread()) == {
             "per_peer": {PEER_HASH: 1, OTHER_HASH: 1},
             "per_group": {"11" * 16: 1},
+            "per_channel": {},
             "total": 3,
         }
     finally:
@@ -6267,6 +6705,198 @@ def test_muted_conversations_rejects_corrupt_file(node, tmp_path):
         # The counts fail open: a corrupt file never hides the badge,
         # it just counts the conversation as unmuted.
         assert bridge.unread()["total"] == 1
+    finally:
+        bridge.stop()
+
+
+def test_pinned_conversations_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert status == 200
+        assert payload == {"pinned": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 200
+        assert payload["pin"]["target"] == PEER_HASH
+        assert payload["pin"]["kind"] == "peer"
+        assert payload["pin"]["pinned"] is True
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload["count"] == 1
+        assert payload["pinned"][0]["kind"] == "peer"
+        assert payload["pinned"][0]["target"] == PEER_HASH
+        assert payload["pinned"][0]["label"].startswith("alice")
+
+        # Pinning again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert payload["pin"]["changed"] is False
+
+        # A group pin is keyed by group id, resolved by name.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew"},
+        )
+        assert status == 200
+        assert payload["pin"]["kind"] == "group"
+        assert payload["pin"]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload["count"] == 2
+        # Newest pin first.
+        assert payload["pinned"][0]["kind"] == "group"
+        assert payload["pinned"][1]["kind"] == "peer"
+
+        # Unpinning restores the empty list.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice", "pinned": False},
+        )
+        assert status == 200
+        assert payload["pin"]["pinned"] is False
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew", "pinned": False},
+        )
+        assert payload["pin"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert payload == {"pinned": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_pinned_conversations_endpoint_rejects_bad_input(node, tmp_path):
+    from tau import cli
+    from tau.config import TauConfig
+
+    # The channel case resolves membership through the channel app,
+    # which needs an identity on disk first.
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"peer": "alice", "group": "crew"},
+            {"peer": "alice", "pinned": "yes"},
+            {"peer": "nobody"},
+            {"peer": "  "},
+            {"group": "nobody"},
+            {"channel": "general"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/conversations/pin", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_pinned_conversations_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "pinned.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/conversations/pinned")
+        assert status == 503
+        # The list endpoints fail open: a corrupt file never hides or
+        # reorders the console, it just reads every conversation as
+        # unpinned.
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"][0]["pinned"] is False
+    finally:
+        bridge.stop()
+
+
+def test_list_endpoints_carry_pinned_flag(node, tmp_path):
+    from tau import cli
+    from tau.channels import init_db as init_channel_db
+    from tau.channels import join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        join_channel(conn, "random")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"][0]["pinned"] is False
+        status, _, payload = _json(bridge, "/api/groups")
+        assert status == 200
+        assert payload["groups"][0]["pinned"] is False
+        status, _, payload = _json(bridge, "/api/channels")
+        assert status == 200
+        assert [item["channel"] for item in payload["channels"]] == [
+            "random",
+            "general",
+        ]
+        assert [item["pinned"] for item in payload["channels"]] == [False, False]
+
+        # Pinning the older channel pulls it to the front everywhere.
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"peer": "alice"},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"group": "crew"},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/conversations/pin",
+            method="POST",
+            body={"channel": "general"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/peers")
+        assert payload["peers"][0]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/groups")
+        assert payload["groups"][0]["pinned"] is True
+        status, _, payload = _json(bridge, "/api/channels")
+        assert [item["channel"] for item in payload["channels"]] == [
+            "general",
+            "random",
+        ]
+        assert [item["pinned"] for item in payload["channels"]] == [True, False]
     finally:
         bridge.stop()
 
@@ -18284,3 +18914,220 @@ def test_other_endpoints_keep_the_json_body_cap(bridge):
     )
     assert status == 400
     assert "too large" in payload["error"]["message"]
+
+
+def test_channel_schedule_via_api(tmp_path):
+    from tau.channels import init_db as init_channel_db, join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+
+    # No channel app attached: scheduling writes the queue file, like the
+    # CLI, and the serving node publishes due entries later.
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={"channel": "general", "text": "hello later", "send_in": 3600},
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["channel"] == "general"
+        assert scheduled["text"] == "hello later"
+        assert abs(scheduled["publish_at"] - (time.time() + 3600)) < 5
+
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={"channel": "general", "text": "sooner", "send_in": 60},
+        )
+        assert status == 200
+
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert status == 200
+        assert payload["count"] == 2
+        # Soonest first: the 60-second message precedes the hour-out one.
+        assert [item["text"] for item in payload["scheduled"]] == [
+            "sooner",
+            "hello later",
+        ]
+
+        # The channel filter narrows the list.
+        status, _, payload = _json(bridge, "/api/channels/scheduled?channel=other")
+        assert status == 200
+        assert payload["count"] == 0
+
+        # Cancelling by id prefix drops only that entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/cancel-scheduled",
+            method="POST",
+            body={"id": scheduled["id"][:8]},
+        )
+        assert status == 200
+        assert payload["cancelled"]["id"] == scheduled["id"]
+        assert payload["deleted_local"] is False
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["text"] == "sooner"
+
+        # Cancelling an unknown id is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/cancel-scheduled",
+            method="POST",
+            body={"id": "zz" * 8},
+        )
+        assert status == 400
+        assert "no scheduled channel message" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_channel_schedule_rejects_bad_requests(tmp_path):
+    from tau.channels import init_db as init_channel_db, join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        for body, fragment in [
+            ({"channel": "general", "text": "  ", "send_in": 60}, "text"),
+            ({"channel": "general", "text": "hello"}, "send_in"),
+            ({"channel": "general", "text": "hello", "send_in": 0}, "send_in"),
+            ({"channel": "general", "text": "hello", "send_in": 604801}, "send_in"),
+            ({"channel": "  ", "text": "hello", "send_in": 60}, "channel"),
+            ({"text": "hello", "send_in": 60}, "channel"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/channels/schedule", method="POST", body=body
+            )
+            assert status == 400
+            assert fragment in payload["error"]["message"]
+
+        # A channel never joined is refused, not queued for a publish
+        # pass that would fail every attempt.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={"channel": "other", "text": "hello", "send_in": 60},
+        )
+        assert status == 400
+        assert "not a member of channel 'other'" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge, "/api/channels/cancel-scheduled", method="POST", body={}
+        )
+        assert status == 400
+        assert "id" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+def test_channel_react_via_api(tmp_path):
+    from tau.channels import (
+        ChannelApp,
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node.registry = FakeRegistry([])
+    bob = RNS.Identity()
+    tester = RNS.Identity()
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        bob_message = create_message(
+            conn, bob, "general", "hello channels", name="bob", now=1000
+        )
+    finally:
+        conn.close()
+
+    app = ChannelApp(node.config, tester, name="tester")
+    app.node = node  # type: ignore[assignment]
+    node.channel_app = app
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Reacting attaches a summary to the message in the feed.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={
+                "channel": "general",
+                "target": bob_message["hash"][:12],
+                "reaction": "👍",
+            },
+        )
+        assert status == 200
+        assert payload["reaction"]["reaction"] == "👍"
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert payload["messages"][0]["reactions"] == [
+            {"reaction": "👍", "count": 1, "reactors": ["tester"]}
+        ]
+
+        # Validation errors are 400s: a non-string token, an unknown target.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={"channel": "general", "target": bob_message["hash"], "reaction": 5},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={"channel": "general", "target": "0" * 64, "reaction": "👍"},
+        )
+        assert status == 400
+        assert "no stored message" in payload["error"]["message"]
+
+        # An empty reaction clears yours: the summary disappears.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/react",
+            method="POST",
+            body={
+                "channel": "general",
+                "target": bob_message["hash"],
+                "reaction": "",
+            },
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert payload["messages"][0]["reactions"] == []
+    finally:
+        bridge.stop()

@@ -38,6 +38,7 @@ import {
 import { useHash } from "../chrome/useHash";
 import { useTauContext } from "../chrome/TauContext";
 import ConversationList from "./ConversationList";
+import MessageSearch from "./MessageSearch";
 import OutboxPanel from "./OutboxPanel";
 import ThreadView from "./ThreadView";
 import type { MessageAction } from "./MessageBubble";
@@ -93,6 +94,8 @@ export default function ChatSection() {
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editing, setEditing] = useState<ChatMessage | null>(null);
   const [showOutbox, setShowOutbox] = useState(false);
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchReset, setSearchReset] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const { conversations, archived: archivedConvs, dmRequests, refreshRequests } = useConversations(
@@ -165,6 +168,15 @@ export default function ChatSection() {
   );
 
   const handleBack = useCallback(() => navigate("chat"), [navigate]);
+
+  const handleOpenSearchResult = useCallback(
+    (message: ChatMessage) => {
+      if (message.group) navigate("chat", { group: message.group });
+      else if (message.peer) navigate("chat", { peer: message.peer });
+      setSearchReset((n) => n + 1);
+    },
+    [navigate],
+  );
 
   async function run(label: string, fn: () => Promise<unknown>) {
     setError(null);
@@ -331,21 +343,28 @@ export default function ChatSection() {
             onDropHeld={(target) => void outbox.dropHeld(target)}
           />
         )}
-        <div className="min-h-0 flex-1">
-          <ConversationList
-            conversations={conversations}
-            archived={archivedConvs}
-            dmRequests={dmRequests}
-            selectedKey={selectedKey}
-            onSelect={handleSelect}
-            onAcceptRequest={(req) => {
-              void run("Accept failed", () => acceptDmRequest(req.id)).then(() => void refreshRequests());
-            }}
-            onDeclineRequest={(req) => {
-              void run("Decline failed", () => declineDmRequest(req.id)).then(() => void refreshRequests());
-            }}
-          />
-        </div>
+        <MessageSearch
+          onOpen={handleOpenSearchResult}
+          onActiveChange={setSearchActive}
+          resetToken={searchReset}
+        />
+        {!searchActive && (
+          <div className="min-h-0 flex-1">
+            <ConversationList
+              conversations={conversations}
+              archived={archivedConvs}
+              dmRequests={dmRequests}
+              selectedKey={selectedKey}
+              onSelect={handleSelect}
+              onAcceptRequest={(req) => {
+                void run("Accept failed", () => acceptDmRequest(req.id)).then(() => void refreshRequests());
+              }}
+              onDeclineRequest={(req) => {
+                void run("Decline failed", () => declineDmRequest(req.id)).then(() => void refreshRequests());
+              }}
+            />
+          </div>
+        )}
       </div>
 
       <div className={`min-w-0 flex-1 flex-col ${selected ? "flex" : "hidden lg:flex"}`}>

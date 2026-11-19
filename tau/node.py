@@ -4690,6 +4690,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled-post publish failed", exc_info=True)
             try:
+                self._publish_due_scheduled_channel_messages()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Scheduled channel-message publish failed", exc_info=True)
+            try:
                 self._send_due_beacon_updates()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Beacon update round failed", exc_info=True)
@@ -4729,6 +4733,36 @@ class TauNode:
         if result["published"]:
             log.info(
                 "Published %d scheduled Tan post(s)", result["published"]
+            )
+
+    def _publish_due_scheduled_channel_messages(self) -> None:
+        """Publish channel messages whose scheduled time has come.
+
+        Only when a channel app is attached (``tau serve --channels``):
+        without one there is no publisher, and the queue simply waits
+        for a serving node that has one.  A publish failure keeps the
+        entry queued — see ``tau.scheduled_channel`` — so this never
+        raises into the mail loop.
+        """
+        app = getattr(self, "channel_app", None)
+        if app is None:
+            return
+        from .scheduled_channel import publish_due_scheduled_channel_messages
+
+        try:
+            result = publish_due_scheduled_channel_messages(
+                self.config.scheduled_channel_messages_path,
+                app,
+                resolve_peer=self.resolve_peer,
+                should_stop=self._stop_event.is_set,
+            )
+        except Exception:  # pragma: no cover - defensive; helper logs
+            log.debug("Scheduled channel-message publish failed", exc_info=True)
+            return
+        if result["published"]:
+            log.info(
+                "Published %d scheduled channel message(s)",
+                result["published"],
             )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:

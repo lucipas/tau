@@ -10,35 +10,53 @@ from tau.blocklist import BlockList, save_blocklist
 from tau.channels import (
     CHANNEL_FEED_PATH,
     CHANNEL_POST_PATH,
+    CHANNEL_REACT_PATH,
+    MAX_STORED_PER_CHANNEL,
     ChannelApp,
     ChannelError,
-    MAX_STORED_PER_CHANNEL,
     channel_history,
     channel_history_page,
+    channel_unread_counts,
     clean_channel_name,
-    create_edit,
     create_message,
+    create_topic,
+    create_reaction,
+    get_message,
+    get_topic,
+    init_db,
+    is_member,
+    is_pinned,
+    join_channel,
+    leave_channel,
+    list_memberships,
+    list_pins,
+    mark_channel_read,
+    pin_message,
+    reactions_for_messages,
+    search_channel_messages,
+    store_message,
+    store_topic,
+    store_reaction,
+    unpin_message,
+    summarize_reactions,
+    verify_message,
+    verify_topic,
+    verify_reaction,
+    create_edit,
     create_retraction,
     current_message_text,
     get_edit,
-    get_message,
     get_retraction,
     hash_message,
     hash_retraction,
-    init_db,
-    is_member,
-    join_channel,
     latest_edit_for,
-    leave_channel,
     list_edits,
-    list_memberships,
     list_retractions,
+    reply_parent,
     resolve_message_digest,
     store_edit,
-    store_message,
     store_retraction,
     verify_edit,
-    verify_message,
     verify_retraction,
 )
 from tau.cli import main
@@ -129,6 +147,229 @@ def test_duplicate_message_is_idempotent(identities, tmp_path):
     assert len(channel_history(conn, "general")) == 1
 
 
+# -- topics ------------------------------------------------------------------
+
+
+def test_create_topic_signs_and_verifies(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    topic = create_topic(conn, alice, "general", "monthly mesh meetup", now=1000)
+
+    assert topic["channel"] == "general"
+    assert topic["author"] == author_of(alice)
+    assert verify_topic(topic)["hash"] == topic["hash"]
+    assert get_topic(conn, "general")["topic"] == "monthly mesh meetup"
+
+
+def test_topic_newest_wins_and_stale_clear_is_ignored(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_topic(conn, alice, "general", "first plan", now=1000)
+
+    # Envelopes are built on a scratch store so store_topic's own
+    # verdict is what the test sees — create_topic would apply the
+    # envelope to the main store first and mask it.
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+
+    # An older topic never overwrites a newer one.
+    record, changed = store_topic(
+        conn, create_topic(scratch, bob, "general", "stale plan", now=999)
+    )
+    assert record["topic"] == "first plan"
+    assert changed is False
+    assert get_topic(conn, "general")["topic"] == "first plan"
+
+    # A newer topic wins, whoever wrote it.
+    record, changed = store_topic(
+        conn, create_topic(scratch, bob, "general", "new plan", now=1001)
+    )
+    assert record["topic"] == "new plan"
+    assert changed is True
+    assert get_topic(conn, "general")["topic"] == "new plan"
+
+    # An empty topic clears, but a stale clear must not wipe a
+    # newer topic: the stored topic stands, unchanged.
+    record, changed = store_topic(
+        conn, create_topic(scratch, alice, "general", "", now=1000)
+    )
+    assert record is not None
+    assert record["topic"] == "new plan"
+    assert changed is False
+    assert get_topic(conn, "general")["topic"] == "new plan"
+
+    record, changed = store_topic(
+        conn, create_topic(scratch, alice, "general", "", now=1002)
+    )
+    assert record is None
+    assert changed is True
+    assert get_topic(conn, "general") is None
+
+
+def test_topic_rejects_overlong_and_unnormalised(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    with pytest.raises(ChannelError, match="longer than 140"):
+        create_topic(conn, alice, "general", "x" * 141, now=1000)
+    with pytest.raises(ChannelError, match="not normalised"):
+        create_topic(conn, alice, "general", "two  spaces", now=1000)
+    with pytest.raises(ChannelError, match="not normalised"):
+        create_topic(conn, alice, "general", "line\nbreak", now=1000)
+
+
+def test_verify_topic_rejects_tampered(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    topic = create_topic(conn, alice, "general", "monthly mesh meetup", now=1000)
+
+    with pytest.raises(ChannelError):
+        verify_topic(dict(topic, topic="forged"))
+    with pytest.raises(ChannelError):
+        verify_topic(dict(topic, channel="other-room"))
+    with pytest.raises(ChannelError):
+        store_topic(conn, dict(topic, topic="forged"))
+
+
+def test_handle_post_stores_topic_and_answers(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    topic = create_topic(source, bob, "general", "bob's room", now=1000)
+
+    app = _make_app(identities, tmp_path)
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"topic": topic, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert payload["updated"] is True
+    assert payload["topic"] == "general"
+    assert app.topic("general")["topic"] == "bob's room"
+
+    # A second copy is a duplicate, not an error.
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"topic": topic, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    assert decode(response)["updated"] is False
+
+
+def test_handle_post_refuses_blocked_topic_author(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    topic = create_topic(source, bob, "general", "bob's room", now=1000)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({topic["author"]})))
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    response = app._handle_post(
+        CHANNEL_POST_PATH,
+        encode({"topic": topic, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_admitted"
+    assert app.topic("general") is None
+
+
+def test_handle_feed_includes_topic(identities, tmp_path):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        create_topic(conn, bob, "general", "bob's room", now=1000)
+    finally:
+        conn.close()
+
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert payload["topic"]["topic"] == "bob's room"
+
+    # A topic from a blocked author is not served.
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({payload["topic"]["author"]})))
+    blocked_app = ChannelApp(config, alice, name="alice", gossip=False)
+    payload = decode(
+        blocked_app._handle_feed(
+            CHANNEL_FEED_PATH,
+            encode({"channel": "general", "limit": 20}),
+            b"id",
+            None,
+            time.time(),
+        )
+    )
+    assert payload["topic"] is None
+
+
+def test_sync_pulls_topic_without_messages(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    topic = create_topic(source, bob, "general", "bob's room", now=1000)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(topic["author"]),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+
+    class _TopicNode:
+        def __init__(self, peer, topic):
+            self.registry = _FakeRegistry(peer)
+            self.topic = topic
+
+        def request(self, peer, path, payload, *, timeout=20.0):
+            assert path == CHANNEL_FEED_PATH
+            return {"ok": True, "messages": [], "has_more": False, "topic": self.topic}
+
+    node = _TopicNode(peer, topic)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, "general", limit=20)
+    assert summary["topic_updated"] is True
+    assert summary["stored"] == 0
+    assert summary["errors"] == []
+    assert app.topic("general")["topic"] == "bob's room"
+
+    # A second sync is a no-op for the topic.
+    summary = app.sync(node, "general", limit=20)
+    assert summary["topic_updated"] is False
+
+
+def test_set_topic_requires_membership(identities, tmp_path):
+    alice, _ = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    with pytest.raises(ChannelError, match="not a member"):
+        app.set_topic("general", "hello", publish=False)
+    app.join("general")
+    result = app.set_topic("general", "hello", publish=False)
+    assert result["topic"]["topic"] == "hello"
+    assert result["cleared"] is False
+    assert app.topic("general")["topic"] == "hello"
+    result = app.set_topic("general", "", publish=False)
+    assert result["cleared"] is True
+    assert app.topic("general") is None
+
+
 def test_history_orders_newest_first_and_pages_by_before(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "channels.sqlite3")
@@ -142,6 +383,224 @@ def test_history_orders_newest_first_and_pages_by_before(identities, tmp_path):
     older = channel_history(conn, "general", limit=2, before=page[-1]["created_at"])
     assert [item["text"] for item in older] == ["one"]
     assert [item["text"] for item in channel_history(conn, "other")] == ["elsewhere"]
+
+
+def test_search_matches_substring_case_insensitively(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "the bridge is up", name="alice", now=1000)
+    create_message(conn, alice, "general", "BRIDGE repairs tonight", name="alice", now=1001)
+    create_message(conn, alice, "general", "Äpfel und Brötchen", name="alice", now=1002)
+    create_message(conn, alice, "general", "unrelated", name="alice", now=1003)
+    create_message(conn, alice, "other", "bridge in another channel", name="alice", now=1004)
+
+    assert [
+        item["text"] for item in search_channel_messages(conn, "general", "bridge")
+    ] == ["BRIDGE repairs tonight", "the bridge is up"]
+    assert [
+        item["text"] for item in search_channel_messages(conn, "general", "äpfel")
+    ] == ["Äpfel und Brötchen"]
+    assert search_channel_messages(conn, "general", "nope") == []
+
+
+def test_search_respects_limit_and_excluded_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "mesh one", name="alice", now=1000)
+    create_message(conn, bob, "general", "mesh two", name="bob", now=1001)
+    create_message(conn, alice, "general", "mesh three", name="alice", now=1002)
+
+    assert [
+        item["text"]
+        for item in search_channel_messages(conn, "general", "mesh", limit=2)
+    ] == ["mesh three", "mesh two"]
+    assert [
+        item["text"]
+        for item in search_channel_messages(
+            conn, "general", "mesh", exclude_authors=[author_of(bob)]
+        )
+    ] == ["mesh three", "mesh one"]
+
+
+def test_search_rejects_empty_query(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "hello", name="alice", now=1000)
+    with pytest.raises(ChannelError, match="must not be empty"):
+        search_channel_messages(conn, "general", "   ")
+
+
+# -- replies -----------------------------------------------------------------
+
+
+def test_reply_is_part_of_the_signed_body(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+    reply = create_message(
+        conn, alice, "general", "see you there", name="alice", now=1001,
+        reply_to=parent["hash"],
+    )
+
+    assert reply["reply_to"] == parent["hash"]
+    assert verify_message(reply)["hash"] == reply["hash"]
+    assert "reply_to" not in create_message(
+        conn, alice, "general", "plain", name="alice", now=1002
+    )
+
+    # A relay cannot re-point a reply at another message: the digest
+    # is covered by the hash, so a changed target fails verification.
+    other = create_message(conn, alice, "general", "other", name="alice", now=1003)
+    with pytest.raises(ChannelError):
+        verify_message(dict(reply, reply_to=other["hash"]))
+    with pytest.raises(ChannelError):
+        verify_message({k: v for k, v in reply.items() if k != "reply_to"})
+
+
+def test_reply_without_a_parent_field_still_verifies(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, alice, "general", "hello mesh", name="alice", now=1000)
+
+    # A message written before replies existed carries no reply_to at
+    # all; it must still verify exactly as before.
+    legacy = {k: v for k, v in message.items() if k != "reply_to"}
+    assert verify_message(legacy)["hash"] == message["hash"]
+
+
+def test_create_reply_requires_a_stored_parent(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+    elsewhere = create_message(conn, alice, "other", "elsewhere", name="alice", now=1001)
+
+    with pytest.raises(ChannelError, match="unknown message"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to="f" * 64)
+    with pytest.raises(ChannelError, match="unknown message"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to="abc12345")
+    with pytest.raises(ChannelError, match="at least 4 hex"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to="abc")
+    with pytest.raises(ChannelError, match="at least 4 hex"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to="not-hex!!")
+    # A parent in another channel is not a parent in this one.
+    with pytest.raises(ChannelError, match="unknown message"):
+        create_message(conn, alice, "general", "reply", name="alice", now=1002,
+                       reply_to=elsewhere["hash"])
+
+
+def test_reply_resolves_a_unique_prefix(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+
+    reply = create_message(
+        conn, alice, "general", "see you there", name="alice", now=1001,
+        reply_to=parent["hash"][:12],
+    )
+    assert reply["reply_to"] == parent["hash"]
+    assert resolve_message_digest(conn, "general", parent["hash"]) == parent["hash"]
+
+
+def test_reply_parent_resolves_from_the_store(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    parent = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+    reply = create_message(
+        conn, alice, "general", "see you there", name="alice", now=1001,
+        reply_to=parent["hash"],
+    )
+    plain = create_message(conn, alice, "general", "plain", name="alice", now=1002)
+
+    assert reply_parent(conn, reply)["hash"] == parent["hash"]
+    assert reply_parent(conn, reply)["text"] == "meet at the park"
+    assert reply_parent(conn, plain) is None
+
+    # A reply whose parent has not arrived yet still stores and
+    # verifies; the parent simply resolves to nothing until it lands.
+    body = {
+        "v": 1,
+        "channel": "general",
+        "author": parent["author"],
+        "key": alice.get_public_key().hex(),
+        "name": "alice",
+        "text": "early reply",
+        "created_at": 1003.0,
+        "reply_to": "a" * 64,
+    }
+    digest = hash_message(body)
+    signed = dict(body, hash=digest, sig=alice.sign(bytes.fromhex(digest)).hex())
+    record, is_new = store_message(conn, signed)
+    assert is_new is True
+    assert record["reply_to"] == "a" * 64
+    assert reply_parent(conn, record) is None
+
+
+def test_old_database_gains_a_reply_column(identities, tmp_path):
+    import sqlite3
+
+    alice, _ = identities
+    path = tmp_path / "channels.sqlite3"
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE messages ("
+        "v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "channel TEXT NOT NULL, author TEXT NOT NULL, key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, "
+        "created_at REAL NOT NULL, received_at REAL NOT NULL, sig TEXT NOT NULL)"
+    )
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE memberships (channel TEXT PRIMARY KEY, joined_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+        ]
+        assert "reply_to" in columns
+        parent = create_message(conn, alice, "general", "old db", name="alice", now=1000)
+        reply = create_message(
+            conn, alice, "general", "still works", name="alice", now=1001,
+            reply_to=parent["hash"],
+        )
+        assert reply["reply_to"] == parent["hash"]
+        assert get_message(conn, reply["hash"])["reply_to"] == parent["hash"]
+    finally:
+        conn.close()
+
+
+def test_feed_serves_replies_with_their_parent_digest(identities, tmp_path):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        parent = create_message(conn, bob, "general", "one", name="bob", now=1000)
+        create_message(
+            conn, alice, "general", "two", name="alice", now=1001,
+            reply_to=parent["hash"],
+        )
+    finally:
+        conn.close()
+
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert [item["text"] for item in payload["messages"]] == ["two", "one"]
+    assert payload["messages"][0]["reply_to"] == parent["hash"]
+    assert "reply_to" not in payload["messages"][1]
 
 
 # -- membership --------------------------------------------------------------
@@ -746,6 +1205,220 @@ def test_cli_join_send_read_list(tmp_path, capsys):
         conn.close()
 
 
+def test_cli_channel_topic_round_trip(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+
+    # No topic yet.
+    assert main(["channel", "topic", "--data-dir", str(data_dir), "general"]) == 0
+    assert "has no topic set" in capsys.readouterr().out
+
+    assert (
+        main(
+            [
+                "channel",
+                "topic",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "monthly mesh meetup",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "topic of #general: monthly mesh meetup" in out
+
+    assert main(["channel", "topic", "--data-dir", str(data_dir), "general"]) == 0
+    assert "#general: monthly mesh meetup" in capsys.readouterr().out
+
+    assert (
+        main(
+            [
+                "channel",
+                "topic",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--clear",
+                "general",
+            ]
+        )
+        == 0
+    )
+    assert "cleared the topic of #general" in capsys.readouterr().out
+    assert main(["channel", "topic", "--data-dir", str(data_dir), "general"]) == 0
+    assert "has no topic set" in capsys.readouterr().out
+
+    # Setting a topic needs membership, like sending.
+    assert (
+        main(
+            [
+                "channel",
+                "topic",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "other-room",
+                "hello",
+            ]
+        )
+        == 2
+    )
+    assert "not a member" in capsys.readouterr().err
+
+    # --clear and topic text do not mix.
+    assert (
+        main(
+            [
+                "channel",
+                "topic",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--clear",
+                "general",
+                "oops",
+            ]
+        )
+        == 2
+    )
+    assert "--clear cannot be combined" in capsys.readouterr().err
+
+
+def test_cli_search_finds_matches_newest_first(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    for text in ("the bridge is up", "bridge repairs tonight", "unrelated"):
+        assert (
+            main(
+                [
+                    "channel",
+                    "send",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "general",
+                    text,
+                ]
+            )
+            == 0
+        )
+
+    assert main(["channel", "search", "--data-dir", str(data_dir), "general", "bridge"]) == 0
+    out = capsys.readouterr().out
+    assert "unrelated" not in out
+    assert out.index("bridge repairs tonight") < out.index("the bridge is up")
+
+    assert (
+        main(
+            [
+                "channel",
+                "search",
+                "--json",
+                "--data-dir",
+                str(data_dir),
+                "general",
+                "bridge",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["query"] == "bridge"
+    assert [item["text"] for item in payload["messages"]] == [
+        "bridge repairs tonight",
+        "the bridge is up",
+    ]
+
+    assert main(["channel", "search", "--data-dir", str(data_dir), "general", "nope"]) == 0
+    assert "No messages in #general matching 'nope'." in capsys.readouterr().out
+
+    assert main(["channel", "search", "--data-dir", str(data_dir), "general", "   "]) == 2
+    assert "must not be empty" in capsys.readouterr().err
+
+
+def test_cli_channel_reply_round_trip(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "meet at the park",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "sent to #general" in out
+
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        parent = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+
+    # A unique prefix is enough to name the parent.
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--reply-to",
+                parent["hash"][:12],
+                "general",
+                "see you there",
+            ]
+        )
+        == 0
+    )
+    assert "sent to #general" in capsys.readouterr().out
+
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    out = capsys.readouterr().out
+    assert "meet at the park" in out
+    assert "see you there" in out
+    assert "↩ replying to alice: meet at the park" in out
+
+    # An unknown parent is an error, not a dangling reply.
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--reply-to",
+                "f" * 64,
+                "general",
+                "dangling",
+            ]
+        )
+        == 2
+    )
+    assert "unknown message" in capsys.readouterr().err
+
+
 def test_cli_send_without_join_fails(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
@@ -854,6 +1527,920 @@ def test_cli_channel_send_without_name_flag_keeps_node_name(tmp_path, capsys):
     capsys.readouterr()
     assert main(["id", "--data-dir", str(data_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["name"] == "alice"
+
+
+# -- read cursors / unread counts --------------------------------------------
+#
+# joined_at is real wall-clock time, so tests that need a deterministic
+# join moment insert the membership row directly instead of joining.
+
+
+def _join_at(conn, channel, joined_at):
+    with conn:
+        conn.execute(
+            "INSERT INTO memberships(channel, joined_at) VALUES(?, ?)",
+            (channel, joined_at),
+        )
+
+
+def _store_from(identities, source_conn, identity, channel, text, now):
+    return create_message(source_conn, identity, channel, text, name="bob", now=now)
+
+
+def test_unread_counts_messages_received_since_join(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    # Received before joining: cached history, not unread.
+    store_message(conn, _store_from(identities, source, bob, "general", "old", 900), now=900)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    store_message(conn, _store_from(identities, source, bob, "general", "two", 1002), now=1002)
+    # Another channel's messages never count here.
+    _join_at(conn, "other", 1000)
+    store_message(conn, _store_from(identities, source, bob, "other", "elsewhere", 1003), now=1003)
+
+    assert channel_unread_counts(conn) == {"general": 2, "other": 1}
+
+
+def test_unread_counts_empty_without_messages(tmp_path):
+    conn = init_db(tmp_path / "channels.sqlite3")
+    _join_at(conn, "general", 1000)
+    assert channel_unread_counts(conn) == {}
+
+
+def test_mark_read_clears_and_new_messages_count_again(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    store_message(conn, _store_from(identities, source, bob, "general", "two", 1002), now=1002)
+
+    marked = mark_channel_read(conn, "general")
+    assert marked["cleared"] == 2
+    assert marked["hash"] is not None
+    assert channel_unread_counts(conn) == {}
+
+    store_message(conn, _store_from(identities, source, bob, "general", "three", 1003), now=1003)
+    assert channel_unread_counts(conn) == {"general": 1}
+    assert mark_channel_read(conn, "general")["cleared"] == 1
+    assert channel_unread_counts(conn) == {}
+
+
+def test_mark_read_requires_membership(tmp_path):
+    conn = init_db(tmp_path / "channels.sqlite3")
+    with pytest.raises(ChannelError, match="not a member"):
+        mark_channel_read(conn, "general")
+
+
+def test_mark_read_with_no_messages_leaves_no_cursor(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+
+    marked = mark_channel_read(conn, "general")
+    assert marked == {
+        "channel": "general",
+        "hash": None,
+        "created_at": None,
+        "cleared": 0,
+    }
+    # No cursor was set, so a message arriving after joining still counts.
+    store_message(conn, _store_from(identities, source, bob, "general", "hi", 1001), now=1001)
+    assert channel_unread_counts(conn) == {"general": 1}
+
+
+def test_late_message_before_cursor_does_not_relight(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    store_message(conn, _store_from(identities, source, bob, "general", "two", 1002), now=1002)
+    mark_channel_read(conn, "general")
+
+    # A gossip straggler created before the cursor but received after it.
+    store_message(conn, _store_from(identities, source, bob, "general", "late", 1001), now=5000)
+    assert channel_unread_counts(conn) == {}
+
+
+def test_leave_drops_cursor_so_rejoin_starts_fresh(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    mark_channel_read(conn, "general")
+    assert leave_channel(conn, "general") is True
+
+    _join_at(conn, "general", 5000)
+    # The cached message predates the rejoin: not unread again.
+    assert channel_unread_counts(conn) == {}
+
+
+def test_app_unread_counts_excludes_own_and_blocked_messages(identities, tmp_path):
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    app.join("general")
+    app.send("general", "my own post", publish=False)
+
+    source = init_db(tmp_path / "source.sqlite3")
+    conn = app.connect()
+    try:
+        # Received now — after the real-time join above — so it counts.
+        store_message(
+            conn,
+            _store_from(identities, source, bob, "general", "hi", 1001),
+            now=time.time(),
+        )
+    finally:
+        conn.close()
+    assert app.unread_counts() == {"general": 1}
+
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({author_of(bob)})))
+    assert app.unread_counts() == {}
+
+    marked = app.mark_read("general")
+    assert marked["cleared"] == 0
+    assert app.unread_counts() == {}
+
+
+def test_cli_channel_list_shows_unread_and_mark_read_clears(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    # Own sends never light the badge.
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert main(["channel", "list", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["channels"][0]["unread"] == 0
+
+    # A peer's message, received after joining, lights it.
+    bob = RNS.Identity()
+    source = init_db(tmp_path / "source.sqlite3")
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        store_message(
+            conn,
+            create_message(source, bob, "general", "hi all", name="bob", now=1000),
+            now=time.time(),
+        )
+    finally:
+        conn.close()
+    capsys.readouterr()
+    assert main(["channel", "list", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "1 unread" in out
+
+    assert main(["channel", "mark-read", "--data-dir", str(data_dir), "general"]) == 0
+    out = capsys.readouterr().out
+    assert "cleared 1 unread message" in out
+    capsys.readouterr()
+    assert main(["channel", "list", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["channels"][0]["unread"] == 0
+
+
+def test_cli_channel_mark_read_requires_membership(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "mark-read", "--data-dir", str(data_dir), "general"]) == 2
+    assert "not a member" in capsys.readouterr().err
+
+
+# -- polls -------------------------------------------------------------------
+
+def test_poll_message_signs_verifies_and_round_trips(identities, tmp_path):
+    from tau.channel_polls import channel_poll_tally, is_channel_poll
+
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    try:
+        poll = create_message(
+            conn,
+            alice,
+            "general",
+            "which colour?",
+            name="alice",
+            now=1000,
+            poll_options=["Red", "Blue"],
+        )
+        assert is_channel_poll(poll)
+        assert verify_message(poll)["hash"] == poll["hash"]
+        assert get_message(conn, poll["hash"])["poll_options"] == ["Red", "Blue"]
+        vote = create_message(
+            conn,
+            bob,
+            "general",
+            "voted: Blue",
+            name="bob",
+            now=1001,
+            poll_vote={
+                "target": {"author": poll["author"], "sent_at": poll["created_at"]},
+                "option": 1,
+            },
+        )
+        tally = channel_poll_tally(
+            channel_history(conn, "general"), poll, own_hash=author_of(bob)
+        )
+        assert tally["counts"] == [0, 1]
+        assert tally["my_vote"] == 1
+        close = create_message(
+            conn,
+            alice,
+            "general",
+            "closed the poll",
+            name="alice",
+            now=1002,
+            poll_close={"author": poll["author"], "sent_at": poll["created_at"]},
+        )
+        assert get_message(conn, close["hash"])["poll_close"] == {
+            "author": poll["author"],
+            "sent_at": poll["created_at"],
+        }
+    finally:
+        conn.close()
+
+
+def test_poll_fields_are_covered_by_the_hash(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    try:
+        poll = create_message(
+            conn,
+            alice,
+            "general",
+            "which colour?",
+            name="alice",
+            now=1000,
+            poll_options=["Red", "Blue"],
+        )
+        tampered = dict(poll, poll_options=["Red", "Green"])
+        with pytest.raises(ChannelError):
+            verify_message(tampered)
+        stripped = {k: v for k, v in poll.items() if k != "poll_options"}
+        with pytest.raises(ChannelError):
+            verify_message(stripped)
+    finally:
+        conn.close()
+
+
+def test_poll_rejects_bad_options_and_mixed_fields(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    try:
+        with pytest.raises(ChannelError, match="poll options"):
+            create_message(
+                conn, alice, "general", "q?", name="alice", now=1000,
+                poll_options=["only one"],
+            )
+        with pytest.raises(ChannelError, match="only one of"):
+            create_message(
+                conn,
+                alice,
+                "general",
+                "q?",
+                name="alice",
+                now=1000,
+                poll_options=["A", "B"],
+                poll_vote={"target": {"author": "ab" * 16, "sent_at": 1000.0}, "option": 0},
+            )
+        with pytest.raises(ChannelError, match="poll vote"):
+            create_message(
+                conn,
+                alice,
+                "general",
+                "voted",
+                name="alice",
+                now=1000,
+                poll_vote={"target": {"author": "ab" * 16, "sent_at": 1000.0}, "option": -1},
+            )
+        # A plain message still carries no poll fields at all.
+        plain = create_message(
+            conn, alice, "general", "hello", name="alice", now=1000
+        )
+        assert "poll_options" not in plain
+        assert "poll_vote" not in plain
+        assert "poll_close" not in plain
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_a_pre_poll_store(identities, tmp_path):
+    import sqlite3
+
+    alice, _ = identities
+    path = tmp_path / "channels.sqlite3"
+    old = sqlite3.connect(str(path))
+    old.executescript(
+        """
+        CREATE TABLE messages (
+            v INTEGER NOT NULL DEFAULT 1,
+            hash TEXT PRIMARY KEY,
+            channel TEXT NOT NULL,
+            author TEXT NOT NULL,
+            key TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            received_at REAL NOT NULL,
+            sig TEXT NOT NULL
+        );
+        """
+    )
+    old.commit()
+    old.close()
+    conn = init_db(path)
+    try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(messages)")
+        }
+        assert {"poll_options", "poll_vote", "poll_close"} <= columns
+        poll = create_message(
+            conn,
+            alice,
+            "general",
+            "which colour?",
+            name="alice",
+            now=1000,
+            poll_options=["Red", "Blue"],
+        )
+        assert get_message(conn, poll["hash"])["poll_options"] == ["Red", "Blue"]
+    finally:
+        conn.close()
+
+
+# -- pins ----------------------------------------------------------------------
+
+
+def test_pin_unpin_list(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    first = create_message(conn, alice, "general", "meet at the park", name="alice", now=1000)
+    second = create_message(conn, bob, "general", "bring snacks", name="bob", now=1001)
+    other = create_message(conn, alice, "other", "not here", name="alice", now=1002)
+
+    pin = pin_message(conn, "general", first["hash"], now=2000)
+    assert pin == {"channel": "general", "hash": first["hash"], "pinned_at": 2000}
+    pin_message(conn, "general", second["hash"], now=2001)
+    assert is_pinned(conn, "general", first["hash"]) is True
+    assert is_pinned(conn, "general", second["hash"]) is True
+
+    # Newest pin first, each entry carrying the stored message.
+    pins = list_pins(conn, "general")
+    assert [entry["hash"] for entry in pins] == [second["hash"], first["hash"]]
+    assert pins[0]["text"] == "bring snacks"
+    assert pins[0]["pinned_at"] == 2001
+
+    # Pinning twice, pinning a missing digest, and pinning a message
+    # stored under another channel are all errors, not silent no-ops.
+    with pytest.raises(ChannelError, match="already pinned"):
+        pin_message(conn, "general", first["hash"])
+    with pytest.raises(ChannelError, match="no stored message"):
+        pin_message(conn, "general", "0" * 64)
+    with pytest.raises(ChannelError, match="no stored message"):
+        pin_message(conn, "general", other["hash"])
+
+    assert unpin_message(conn, "general", first["hash"]) is True
+    assert is_pinned(conn, "general", first["hash"]) is False
+    assert unpin_message(conn, "general", first["hash"]) is False
+    assert [entry["hash"] for entry in list_pins(conn, "general")] == [second["hash"]]
+
+
+def test_list_pins_hides_blocked_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    mine = create_message(conn, alice, "general", "mine", name="alice", now=1000)
+    theirs = create_message(conn, bob, "general", "theirs", name="bob", now=1001)
+    pin_message(conn, "general", mine["hash"], now=2000)
+    pin_message(conn, "general", theirs["hash"], now=2001)
+    pins = list_pins(conn, "general", exclude_authors=[author_of(bob)])
+    assert [entry["hash"] for entry in pins] == [mine["hash"]]
+
+
+def test_pinned_message_survives_pruning(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    join_channel(conn, "general")
+    oldest = create_message(
+        conn, alice, "general", "msg 0", name="alice", now=1000
+    )
+    for index in range(1, MAX_STORED_PER_CHANNEL):
+        create_message(
+            conn, alice, "general", f"msg {index}", name="alice", now=1000 + index
+        )
+    pin_message(conn, "general", oldest["hash"], now=3000)
+    for index in range(MAX_STORED_PER_CHANNEL, MAX_STORED_PER_CHANNEL + 5):
+        create_message(
+            conn, alice, "general", f"msg {index}", name="alice", now=1000 + index
+        )
+    # The bound holds for unpinned messages, plus the one pinned extra.
+    stored = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE channel = 'general'"
+    ).fetchone()[0]
+    assert stored == MAX_STORED_PER_CHANNEL + 1
+    assert get_message(conn, oldest["hash"]) is not None
+    assert is_pinned(conn, "general", oldest["hash"]) is True
+    assert list_pins(conn, "general")[0]["text"] == "msg 0"
+
+
+def test_cli_channel_pin_unpin_pins(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "general",
+                "meet at the park",
+            ]
+        )
+        == 0
+    )
+    digest = json.loads(capsys.readouterr().out)["message"]["hash"]
+
+    assert (
+        main(["channel", "pin", "--data-dir", str(data_dir), "general", digest])
+        == 0
+    )
+    assert "pinned" in capsys.readouterr().out
+    # Pinning twice is an error.
+    assert (
+        main(["channel", "pin", "--data-dir", str(data_dir), "general", digest])
+        == 2
+    )
+    assert "already pinned" in capsys.readouterr().err
+    # Pinning a digest that is not stored is an error.
+    assert (
+        main(
+            ["channel", "pin", "--data-dir", str(data_dir), "general", "0" * 64]
+        )
+        == 2
+    )
+    assert "no stored message" in capsys.readouterr().err
+
+    assert (
+        main(["channel", "pins", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    assert "meet at the park" in capsys.readouterr().out
+
+    assert (
+        main(["channel", "unpin", "--data-dir", str(data_dir), "general", digest])
+        == 0
+    )
+    assert "unpinned" in capsys.readouterr().out
+    # Unpinning again is a no-op that says so, not an error.
+    assert (
+        main(["channel", "unpin", "--data-dir", str(data_dir), "general", digest])
+        == 0
+    )
+    assert "not pinned" in capsys.readouterr().out
+
+    assert (
+        main(
+            [
+                "channel",
+                "pins",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "general",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"channel": "general", "pins": [], "count": 0}
+
+
+# -- reactions ---------------------------------------------------------------
+
+def _make_reaction_target(identities, tmp_path):
+    """A stored message plus a connected app; returns (app, target)."""
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(conn, bob, "general", "meet at the park", name="bob", now=1000)
+    conn.close()
+    return _make_app(identities, tmp_path), message
+
+
+def test_create_reaction_signs_and_verifies(identities, tmp_path):
+    alice, bob = identities
+    app, message = _make_reaction_target(identities, tmp_path)
+    conn = app.connect()
+    try:
+        record = create_reaction(
+            conn, alice, "general", message["hash"], "👍", name="alice", now=1001
+        )
+    finally:
+        conn.close()
+    assert record["target"] == message["hash"]
+    assert record["reactor"] == author_of(alice)
+    assert record["reaction"] == "👍"
+    assert verify_reaction(record)["hash"] == record["hash"]
+
+    # The target is part of the signed body: re-pointing breaks the hash.
+    with pytest.raises(ChannelError):
+        verify_reaction(dict(record, target="0" * 64))
+    # So does changing the token.
+    with pytest.raises(ChannelError):
+        verify_reaction(dict(record, reaction="🎉"))
+
+
+def test_reaction_target_must_be_stored(identities, tmp_path):
+    alice, bob = identities
+    app, message = _make_reaction_target(identities, tmp_path)
+    conn = app.connect()
+    try:
+        with pytest.raises(ChannelError, match="no stored message"):
+            create_reaction(conn, alice, "general", "0" * 64, "👍", name="alice", now=1001)
+        with pytest.raises(ChannelError, match="at least 8 hex"):
+            create_reaction(conn, alice, "general", "abc", "👍", name="alice", now=1001)
+        with pytest.raises(ChannelError, match="hex prefix"):
+            create_reaction(conn, alice, "general", "zz" * 8, "👍", name="alice", now=1001)
+        with pytest.raises(ChannelError, match="hex prefix"):
+            create_reaction(conn, alice, "general", "a" * 65, "👍", name="alice", now=1001)
+        # A unique prefix resolves; a reaction that is too long does not.
+        record = create_reaction(
+            conn, alice, "general", message["hash"][:12], "👍", name="alice", now=1001
+        )
+        assert record["target"] == message["hash"]
+        with pytest.raises(ChannelError, match="longer than"):
+            create_reaction(
+                conn, alice, "general", message["hash"], "x" * 100, name="alice", now=1002
+            )
+    finally:
+        conn.close()
+
+
+def _signed_reaction(identities, tmp_path, token, now, *, subdir):
+    """A signed reaction record built in a throwaway db, never stored here.
+
+    ``create_reaction`` stores as it signs, so a record meant for a
+    later ``store_reaction`` call is built in its own database: the
+    message is identical (same author, text and time), so the target
+    hash matches.
+    """
+    alice, bob = identities
+    source = init_db(tmp_path / subdir / "channels.sqlite3")
+    message = create_message(source, bob, "general", "meet at the park", name="bob", now=1000)
+    record = create_reaction(
+        source, alice, "general", message["hash"], token, name="alice", now=now
+    )
+    source.close()
+    return record
+
+
+def test_reaction_latest_wins_and_clear(identities, tmp_path):
+    alice, bob = identities
+    app, message = _make_reaction_target(identities, tmp_path)
+    conn = app.connect()
+    try:
+        create_reaction(conn, alice, "general", message["hash"], "👍", name="alice", now=1001)
+        create_reaction(conn, bob, "general", message["hash"], "🎉", name="bob", now=1002)
+        grouped = reactions_for_messages(conn, "general", [message["hash"]])
+        assert len(grouped[message["hash"]]) == 2
+
+        # Alice changes her mind: one row per reactor, latest wins.
+        heart = _signed_reaction(identities, tmp_path, "❤️", 1003, subdir="heart")
+        record, changed = store_reaction(conn, dict(heart))
+        assert changed is True
+        grouped = reactions_for_messages(conn, "general", [message["hash"]])
+        mine = [item for item in grouped[message["hash"]] if item["reactor"] == author_of(alice)]
+        assert [item["reaction"] for item in mine] == ["❤️"]
+
+        # Clearing stores a retraction record, and readers filter it out.
+        clear = _signed_reaction(identities, tmp_path, "", 1004, subdir="clear")
+        record, changed = store_reaction(conn, dict(clear))
+        assert changed is True
+        grouped = reactions_for_messages(conn, "general", [message["hash"]])
+        assert [item["reactor"] for item in grouped[message["hash"]]] == [author_of(bob)]
+        assert summarize_reactions(grouped[message["hash"]]) == [
+            {"reaction": "🎉", "count": 1, "reactors": ["bob"]}
+        ]
+    finally:
+        conn.close()
+
+
+def test_stale_reaction_does_not_overwrite_newer(identities, tmp_path):
+    alice, bob = identities
+    app, message = _make_reaction_target(identities, tmp_path)
+    conn = app.connect()
+    try:
+        newer = _signed_reaction(identities, tmp_path, "🎉", 1005, subdir="newer")
+        older = _signed_reaction(identities, tmp_path, "👍", 1001, subdir="older")
+        record, changed = store_reaction(conn, dict(newer))
+        assert changed is True
+        # A stale re-send of the older reaction arrives late.
+        record, changed = store_reaction(conn, dict(older))
+        assert changed is False
+        assert record["reaction"] == "🎉"
+    finally:
+        conn.close()
+
+
+def test_handle_react_stores_and_answers(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi all", name="bob", now=1000)
+    reaction = create_reaction(
+        source, alice, "general", message["hash"], "👍", name="alice", now=1001
+    )
+
+    app = _make_app(identities, tmp_path)
+    response = app._handle_react(
+        CHANNEL_REACT_PATH,
+        encode({"reaction": reaction, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert payload["new"] is True
+    assert payload["stored"] == reaction["hash"]
+
+    # A second copy is a duplicate, not an error.
+    response = app._handle_react(
+        CHANNEL_REACT_PATH,
+        encode({"reaction": reaction, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    assert decode(response)["new"] is False
+
+
+def test_handle_react_rejects_tampered_and_blocked(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "hi all", name="bob", now=1000)
+    reaction = create_reaction(
+        source, alice, "general", message["hash"], "👍", name="alice", now=1001
+    )
+
+    app = _make_app(identities, tmp_path)
+    response = app._handle_react(
+        CHANNEL_REACT_PATH,
+        encode({"reaction": dict(reaction, reaction="🎉"), "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    assert decode(response)["ok"] is False
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({reaction["reactor"]}))
+    )
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    response = app._handle_react(
+        CHANNEL_REACT_PATH,
+        encode({"reaction": reaction, "ttl": 2}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_admitted"
+    conn = app.connect()
+    try:
+        assert reactions_for_messages(conn, "general", [message["hash"]]) == {
+            message["hash"]: []
+        }
+    finally:
+        conn.close()
+
+
+def test_handle_feed_carries_reactions(identities, tmp_path):
+    alice, bob = identities
+    app = _make_app(identities, tmp_path)
+    conn = app.connect()
+    try:
+        message = create_message(conn, bob, "general", "one", name="bob", now=1000)
+        create_reaction(conn, alice, "general", message["hash"], "👍", name="alice", now=1001)
+        create_reaction(conn, bob, "general", message["hash"], "🎉", name="bob", now=1002)
+    finally:
+        conn.close()
+
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert payload["ok"] is True
+    assert [item["reaction"] for item in payload["reactions"]] == ["👍", "🎉"]
+
+    # A blocked reactor's reactions are not served to peers either —
+    # but the message itself (bob's, unblocked) still is.
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({author_of(alice)}))
+    )
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    response = app._handle_feed(
+        CHANNEL_FEED_PATH,
+        encode({"channel": "general", "limit": 20}),
+        b"id",
+        None,
+        time.time(),
+    )
+    payload = decode(response)
+    assert len(payload["messages"]) == 1
+    assert [item["reaction"] for item in payload["reactions"]] == ["🎉"]
+
+
+def test_sync_pulls_reactions(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    message = create_message(source, bob, "general", "bob one", name="bob", now=1000)
+    create_reaction(source, alice, "general", message["hash"], "👍", name="alice", now=1001)
+
+    class _ReactingNode(_FakeNode):
+        def request(self, peer, path, payload, *, timeout=20.0):
+            request = decode(payload)
+            self.requests.append((path, request))
+            assert path == CHANNEL_FEED_PATH
+            messages, has_more = channel_history_page(
+                self.source,
+                request["channel"],
+                limit=request.get("limit", 20),
+                before=request.get("before"),
+                before_hash=request.get("before_hash"),
+            )
+            grouped = reactions_for_messages(
+                self.source,
+                request["channel"],
+                [item["hash"] for item in messages],
+            )
+            reactions = [
+                record for item in messages for record in grouped.get(item["hash"], [])
+            ]
+            return {
+                "ok": True,
+                "messages": messages,
+                "reactions": reactions,
+                "has_more": has_more,
+            }
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(message["author"]),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _ReactingNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, "general", limit=20)
+    assert summary["stored"] == 1
+    assert summary["reactions_stored"] == 1
+    assert summary["errors"] == []
+    conn = app.connect()
+    try:
+        grouped = reactions_for_messages(conn, "general", [message["hash"]])
+    finally:
+        conn.close()
+    assert [item["reaction"] for item in grouped[message["hash"]]] == ["👍"]
+
+
+def test_prune_drops_reactions_with_messages(identities, tmp_path, monkeypatch):
+    from tau import channels as channels_mod
+
+    alice, bob = identities
+    monkeypatch.setattr(channels_mod, "MAX_STORED_PER_CHANNEL", 1)
+    conn = init_db(tmp_path / "channels.sqlite3")
+    join_channel(conn, "general")
+    old = create_message(conn, bob, "general", "old", name="bob", now=1000)
+    create_reaction(conn, alice, "general", old["hash"], "👍", name="alice", now=1001)
+    create_message(conn, bob, "general", "new", name="bob", now=1002)
+    assert reactions_for_messages(conn, "general", [old["hash"]]) == {old["hash"]: []}
+    assert channel_history(conn, "general")[-1]["text"] == "new"
+
+
+def test_cli_channel_react_round_trip(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        target = channel_history(conn, "general")[0]["hash"]
+    finally:
+        conn.close()
+
+    assert (
+        main(
+            [
+                "channel",
+                "react",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                target[:12],
+                "👍",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "reacted 👍" in out
+
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    out = capsys.readouterr().out
+    assert "hello from the cli" in out
+    assert "👍×1" in out
+
+    # JSON read carries the reactions with the message.
+    assert (
+        main(["channel", "read", "--data-dir", str(data_dir), "--json", "general"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["messages"][0]["reactions"][0]["reaction"] == "👍"
+
+    # Clearing removes the count.
+    assert (
+        main(
+            [
+                "channel",
+                "react",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--clear",
+                "general",
+                target,
+            ]
+        )
+        == 0
+    )
+    assert "retracted your reaction" in capsys.readouterr().out
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    assert "👍" not in capsys.readouterr().out
+
+    # An unknown target is a usage error, not a silent store.
+    assert (
+        main(
+            [
+                "channel",
+                "react",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "0" * 64,
+                "👍",
+            ]
+        )
+        == 2
+    )
+    assert "no stored message" in capsys.readouterr().err
 
 
 # -- channel edits --------------------------------------------------------------
