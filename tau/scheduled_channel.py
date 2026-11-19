@@ -476,7 +476,13 @@ def schedule_channel_message(
     clean_text = _clean_text(text)
     # Lazy import: this module stays importable without Reticulum,
     # which ``tau.backup`` relies on.
-    from .channels import ChannelError, _check_wire_size, sanitize_name
+    from .channels import (
+        CHANNEL_VERSION,
+        MAX_CHANNEL_EXPIRE_SECONDS,
+        ChannelError,
+        _check_wire_size,
+        sanitize_name,
+    )
 
     clean_kind = _clean_kind(kind)
     clean_options: Tuple[str, ...] = ()
@@ -494,13 +500,20 @@ def schedule_channel_message(
     envelope = {
         # Placeholder author/key at their real lengths (destination
         # hash 32 hex, RNS public key 128 hex): a shorter placeholder
-        # would admit a message that only fails once signed.
+        # would admit a message that only fails once signed.  The
+        # remaining signed fields are carried at their real shape too:
+        # the version, an empty reply target, and an expiry (sized at
+        # the largest disappearing default, which a channel default
+        # may fill in at publish time).
+        "v": CHANNEL_VERSION,
         "channel": clean_channel,
         "author": "0" * 32,
         "key": "0" * 128,
         "name": sanitize_name(name or "anonymous"),
         "text": clean_text,
         "created_at": publish_at,
+        "expires_at": publish_at + MAX_CHANNEL_EXPIRE_SECONDS,
+        "reply_to": "",
     }
     if clean_kind == "poll":
         envelope["poll_options"] = list(clean_options)
