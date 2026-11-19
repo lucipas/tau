@@ -52,6 +52,7 @@ export interface SnapshotCounts {
 export interface UnreadCounts {
   per_peer: Record<string, number>;
   per_group: Record<string, number>;
+  per_channel: Record<string, number>;
   total: number;
   revision: number;
 }
@@ -108,6 +109,8 @@ export interface Peer {
    *  peer may be impersonating, or null. Added by the bridge. */
   lookalike_of: string | null;
   blocked: boolean;
+  /** True when this conversation is pinned to the top of the list. */
+  pinned?: boolean;
   profile: PeerProfile | null;
   /** Live path-table reachability (from /api/mesh, merged into /api/peers). */
   reachable?: boolean;
@@ -205,6 +208,8 @@ export interface Group {
   created_by_me: boolean;
   can_leave: boolean;
   ignored: boolean;
+  /** True when this conversation is pinned to the top of the list. */
+  pinned?: boolean;
 }
 
 export interface GroupChangeResult {
@@ -389,6 +394,7 @@ export interface DmRequest {
 export interface DisappearingDefaults {
   peers: Record<string, number>;
   groups: Record<string, number>;
+  channels: Record<string, number>;
 }
 
 export interface MutedConversations {
@@ -644,6 +650,27 @@ export interface TanVerifyReport {
 export interface Channel {
   channel: string;
   joined_at: number;
+  /** True when this channel is pinned to the top of the list. */
+  pinned?: boolean;
+  /** Messages newer than the last-read cursor; always present from /api/channels. */
+  unread: number;
+}
+
+export interface ChannelPollTally {
+  options: string[];
+  counts: number[];
+  total: number;
+  closed: boolean;
+  voters: { author: string; name: string; option: number; voted_at: number }[];
+  my_vote: number | null;
+  /** True when this node authored the poll (so it may close it). */
+  own: boolean;
+}
+
+export interface ChannelReaction {
+  reaction: string;
+  count: number;
+  reactors: string[];
 }
 
 export interface ChannelMessage {
@@ -657,11 +684,49 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Unix timestamp after which honest nodes purge this message, when set. */
+  expires_at?: number;
+  /** Channel poll question carried on the message itself. */
+  poll_options?: string[];
+  poll_vote?: { target: { author: string; sent_at: number }; option: number };
+  poll_close?: { author: string; sent_at: number };
+  /** Channel poll tally, attached by the bridge from the channel store. */
+  poll?: ChannelPollTally;
+  /** Present on pins: when this node pinned the message. */
+  pinned_at?: number;
+  /** Reaction summary, grouped by token; absent on old servers. */
+  reactions?: ChannelReaction[];
   /** Digest of the parent message when this message is a reply. */
   reply_to?: string;
   /** Present when the author edited this message; the text shown is the latest edit. */
   edited?: boolean;
   edited_at?: number;
+}
+
+export interface ChannelTopic {
+  v: number;
+  hash: string;
+  channel: string;
+  author: string;
+  key: string;
+  topic: string;
+  updated_at: number;
+  sig: string;
+}
+
+export interface ScheduledChannelMessage {
+  id: string;
+  channel: string;
+  text: string;
+  publish_at: number;
+  created_at: number;
+  to: string[];
+  ttl: number;
+  message_hash: string | null;
+  attempts: number;
+  next_attempt_at: number | null;
+  paused_at: number | null;
+  [key: string]: unknown;
 }
 
 // ---------------------------------------------------------------- pages --

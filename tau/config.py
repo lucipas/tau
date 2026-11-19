@@ -40,12 +40,14 @@ ARCHIVED_FILE_NAME = "archived.json"
 DISAPPEARING_FILE_NAME = "disappearing.json"
 DRAFTS_FILE_NAME = "drafts.json"
 MUTED_FILE_NAME = "muted.json"
+PINNED_FILE_NAME = "pinned.json"
 QUIET_HOURS_FILE_NAME = "quiet_hours.json"
 AWAY_FILE_NAME = "away.json"
 DM_REQUESTS_FILE_NAME = "dm-requests.json"
 INVITES_FILE_NAME = "invites.json"
 JOIN_REQUESTS_FILE_NAME = "join-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
+SCHEDULED_CHANNEL_MESSAGES_FILE_NAME = "scheduled-channel-messages.json"
 PROFILE_FILE_NAME = "profile.json"
 PROFILES_FILE_NAME = "profiles.json"
 BEACONS_FILE_NAME = "beacons.json"
@@ -93,12 +95,14 @@ class TauConfig:
     disappearing_path: Path
     drafts_path: Path
     muted_path: Path
+    pinned_path: Path
     quiet_hours_path: Path
     away_path: Path
     dm_requests_path: Path
     invites_path: Path
     join_requests_path: Path
     scheduled_posts_path: Path
+    scheduled_channel_messages_path: Path
     profile_path: Path
     profiles_path: Path
     beacons_path: Path
@@ -152,12 +156,15 @@ class TauConfig:
             disappearing_path=base / DISAPPEARING_FILE_NAME,
             drafts_path=base / DRAFTS_FILE_NAME,
             muted_path=base / MUTED_FILE_NAME,
+            pinned_path=base / PINNED_FILE_NAME,
             quiet_hours_path=base / QUIET_HOURS_FILE_NAME,
             away_path=base / AWAY_FILE_NAME,
             dm_requests_path=base / DM_REQUESTS_FILE_NAME,
             invites_path=base / INVITES_FILE_NAME,
             join_requests_path=base / JOIN_REQUESTS_FILE_NAME,
             scheduled_posts_path=base / SCHEDULED_POSTS_FILE_NAME,
+            scheduled_channel_messages_path=base
+            / SCHEDULED_CHANNEL_MESSAGES_FILE_NAME,
             profile_path=base / PROFILE_FILE_NAME,
             profiles_path=base / PROFILES_FILE_NAME,
             beacons_path=base / BEACONS_FILE_NAME,
