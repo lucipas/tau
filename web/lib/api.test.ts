@@ -5,24 +5,49 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  cancelScheduledChannelMessage,
   clearReaction,
+  createBroadcast,
+  deleteBroadcast,
+  closeChannelPoll,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
   getAwayMessage,
+  getBroadcasts,
   getChannelMessages,
+  getChannelPins,
+  getChannelScheduled,
+  getChannelTopic,
+  getGroupInviteStatus,
   getMessages,
+  getQuietHours,
   getTanThread,
   getTanTimeline,
+  joinGroupViaLink,
   markRead,
+  mintGroupInvite,
   pageFileUrl,
+  publishTanPost,
+  pinChannelMessage,
+  postChannelPoll,
   reactToChannelMessage,
   reactToMessage,
+  readFileAsDataUrl,
+  revokeGroupInvites,
   closeDmPoll,
+  sendBroadcast,
+  scheduleChannelMessage,
+  searchChannelMessages,
   sendChannelMessage,
   sendMessage,
   setAwayMessage,
+  setChannelTopic,
+  setDisappearingDefault,
+  setQuietHours,
   tanMediaUrl,
+  unpinChannelMessage,
+  voteChannelPoll,
   voteDmPoll,
   voteTanPoll,
   wsUrl,
@@ -101,6 +126,61 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
   });
 
+  it("lists scheduled channel messages, optionally filtered", async () => {
+    nextJson = { scheduled: [], count: 0 };
+    await getChannelScheduled("my channel");
+    expect(captured[0].url).toBe("/api/channels/scheduled?channel=my%20channel");
+    await getChannelScheduled();
+    expect(captured[1].url).toBe("/api/channels/scheduled");
+  });
+
+  it("posts a channel poll with question and options", async () => {
+    nextJson = { ok: true, message: { hash: "p".repeat(64) } };
+    const message = await postChannelPoll("general", "which day?", ["Saturday", "Sunday"]);
+    expect(captured[0].url).toBe("/api/channels/poll");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      channel: "general",
+      question: "which day?",
+      options: ["Saturday", "Sunday"],
+    });
+    expect(message.hash).toBe("p".repeat(64));
+  });
+
+  it("votes on a channel poll by index", async () => {
+    nextJson = { ok: true, message: { hash: "v".repeat(64) } };
+    await voteChannelPoll("general", "p".repeat(64), 1);
+    expect(captured[0].url).toBe("/api/channels/vote");
+    expect(bodyOf(0)).toEqual({ channel: "general", poll: "p".repeat(64), option: 1 });
+  });
+
+  it("closes a channel poll", async () => {
+    nextJson = { ok: true, message: { hash: "c".repeat(64) } };
+    await closeChannelPoll("general", "p".repeat(64));
+    expect(captured[0].url).toBe("/api/channels/close-poll");
+    expect(bodyOf(0)).toEqual({ channel: "general", poll: "p".repeat(64) });
+  });
+
+  it("fetches a channel topic by name", async () => {
+    nextJson = { channel: "general", topic: null };
+    await getChannelTopic("my channel");
+    expect(captured[0].url).toBe("/api/channels/topic?channel=my%20channel");
+  });
+
+  it("fetches channel pins", async () => {
+    nextJson = { channel: "general", pins: [], count: 0 };
+    await getChannelPins("my channel");
+    expect(captured[0].url).toBe("/api/channels/pins?channel=my%20channel");
+  });
+
+  it("builds the channel search query", async () => {
+    nextJson = { channel: "general", query: "hello", messages: [], count: 0 };
+    await searchChannelMessages("my channel", "hello world", 5);
+    expect(captured[0].url).toBe(
+      "/api/channels/search?channel=my%20channel&q=hello%20world&limit=5",
+    );
+  });
+
   it("reacts to a channel message by hash", async () => {
     nextJson = { ok: true, reaction: {} };
     await reactToChannelMessage("general", "ab12", "👍");
@@ -123,6 +203,18 @@ describe("GET endpoints", () => {
     };
     await getAwayMessage();
     expect(captured[0].url).toBe("/api/settings/away-message");
+  });
+
+  it("fetches the quiet-hours window", async () => {
+    nextJson = {
+      enabled: false,
+      start: "22:00",
+      end: "07:00",
+      active: false,
+      minutes_until_end: null,
+    };
+    await getQuietHours();
+    expect(captured[0].url).toBe("/api/settings/quiet-hours");
   });
 });
 
@@ -185,6 +277,22 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
   });
 
+  it("schedules a channel message with send_in seconds", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleChannelMessage("general", "later", 300);
+    expect(captured[0].url).toBe("/api/channels/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ channel: "general", text: "later", send_in: 300 });
+  });
+
+  it("cancels a scheduled channel message by id", async () => {
+    nextJson = { ok: true };
+    await cancelScheduledChannelMessage("abc123");
+    expect(captured[0].url).toBe("/api/channels/cancel-scheduled");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: "abc123" });
+  });
+
   it("votes and closes a DM poll on the DM routes", async () => {
     nextJson = { ok: true, messages: [], response: {} };
     await voteDmPoll("alice", "wire1", 2);
@@ -196,9 +304,35 @@ describe("POST endpoints", () => {
   });
 
   it("marks read with an empty body when no conversation is given", async () => {
-    nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, total: 0, revision: 1 } };
+    nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1 } };
     await markRead();
     expect(bodyOf(0)).toEqual({});
+  });
+
+  it("sets a disappearing default for a channel by name", async () => {
+    nextJson = { ok: true };
+    await setDisappearingDefault({ channel: "general" }, 300);
+    expect(captured[0].url).toBe("/api/messages/disappearing");
+    expect(bodyOf(0)).toEqual({ channel: "general", seconds: 300 });
+    await setDisappearingDefault({ channel: "general" }, null);
+    expect(bodyOf(1)).toEqual({ channel: "general", seconds: null });
+  });
+
+  it("sends a channel message with an optional expiry", async () => {
+    nextJson = { ok: true, message: {} };
+    await sendChannelMessage("general", "ephemeral");
+    expect(captured[0].url).toBe("/api/channels/send");
+    expect(bodyOf(0)).toEqual({ channel: "general", text: "ephemeral" });
+    await sendChannelMessage("general", "ephemeral", undefined, 3600);
+    expect(bodyOf(1)).toEqual({ channel: "general", text: "ephemeral", expires_in: 3600 });
+  });
+
+  it("marks a channel read by name", async () => {
+    nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 2 } };
+    const unread = await markRead({ channel: "mesh-general" });
+    expect(captured[0].url).toBe("/api/messages/read");
+    expect(bodyOf(0)).toEqual({ channel: "mesh-general" });
+    expect(unread.total).toBe(0);
   });
 
   it("fetches Tan media with the author in the body", async () => {
@@ -217,6 +351,7 @@ describe("POST endpoints", () => {
     await setAwayMessage({ enabled: false });
     expect(bodyOf(1)).toEqual({ enabled: false });
   });
+
 });
 
 describe("ApiError", () => {
@@ -250,5 +385,41 @@ describe("URL helpers", () => {
     expect(eventsUrl()).toBe("/api/events");
     expect(eventsUrl(42)).toBe("/api/events?since=42");
     expect(wsUrl()).toBe("ws://example.com/ws");
+  });
+});
+
+describe("group invite links", () => {
+  it("fetches the invite status by group", async () => {
+    nextJson = { group: {}, mode: "open", generation: 0, link: null };
+    await getGroupInviteStatus("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite?group=abc123");
+    expect(captured[0].init?.method).toBeUndefined();
+  });
+
+  it("mints a link without a mode, or with one", async () => {
+    nextJson = { ok: true, link: "tau://invite/abc", mode: "open", generation: 0 };
+    await mintGroupInvite("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ group: "abc123" });
+
+    await mintGroupInvite("abc123", "closed");
+    expect(bodyOf(1)).toEqual({ group: "abc123", mode: "closed" });
+  });
+
+  it("revokes invites for a group", async () => {
+    nextJson = { ok: true, generation: 1 };
+    await revokeGroupInvites("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite/revoke");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ group: "abc123" });
+  });
+
+  it("joins a group from a pasted link", async () => {
+    nextJson = { ok: true, status: "pending", group: { id: "abc123" } };
+    await joinGroupViaLink("tau://invite/abc");
+    expect(captured[0].url).toBe("/api/groups/join");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ link: "tau://invite/abc" });
   });
 });

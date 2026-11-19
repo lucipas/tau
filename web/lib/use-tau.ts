@@ -11,7 +11,7 @@
 //                       is built from the same stored history /api/messages
 //                       returns, exactly as the old console did.)
 //   usePeerActions()  — ping / info / verify / safety-number / block /
-//                       forget / alias / note / archive / mute actions.
+//                       forget / alias / note / archive / mute / pin actions.
 //
 // Live protocol (tau/webapi.py _serve_websocket): the first /ws frame is
 // `{ "type": "snapshot", "snapshot": {...} }`; later frames are bus events:
@@ -27,8 +27,11 @@ import {
   archiveConversation,
   blockPeer,
   cancelOutbox,
+  createBroadcast,
+  deleteBroadcast,
   dropHeldMail,
   forgetPeer,
+  getBroadcasts,
   getDmRequests,
   getHeldMail,
   getOutbox,
@@ -39,15 +42,19 @@ import {
   markUnread,
   pingPeer,
   retryOutbox,
+  sendBroadcast,
   setMuted,
   setPeerAlias,
   setPeerNote,
+  setPinnedConversation,
   unarchiveConversation,
   unblockPeer,
   verifyPeer,
   wsUrl,
 } from "./api";
 import type {
+  BroadcastList,
+  BroadcastSendResponse,
   ChatMessage,
   DmRequest,
   Group,
@@ -284,6 +291,7 @@ export interface Conversation {
   unread: number;
   muted: boolean;
   archived: boolean;
+  pinned: boolean;
 }
 
 /**
@@ -330,6 +338,7 @@ export function buildConversations(
         unread: unread?.per_group[groupId] ?? 0,
         muted: opts.mutedGroups?.has(groupId) ?? false,
         archived: false,
+        pinned: group?.pinned ?? false,
       });
     } else {
       const hash = key.slice("peer:".length);
@@ -343,6 +352,7 @@ export function buildConversations(
         unread: unread?.per_peer[hash] ?? 0,
         muted: opts.mutedPeers?.has(hash) ?? false,
         archived: opts.archived?.has(hash) ?? false,
+        pinned: peer?.pinned ?? false,
       });
     }
   }
@@ -358,14 +368,18 @@ export function buildConversations(
         unread: unread?.per_group[group.id] ?? 0,
         muted: opts.mutedGroups?.has(group.id) ?? false,
         archived: false,
+        pinned: group.pinned ?? false,
       });
     }
   }
   const filtered = opts.includeArchived
     ? out
     : out.filter((c) => !c.archived);
+  // Pinned conversations stay at the top; recency orders the rest.
   filtered.sort(
-    (a, b) => (b.lastMessage?.sent_at ?? 0) - (a.lastMessage?.sent_at ?? 0),
+    (a, b) =>
+      Number(b.pinned) - Number(a.pinned) ||
+      (b.lastMessage?.sent_at ?? 0) - (a.lastMessage?.sent_at ?? 0),
   );
   return filtered;
 }
@@ -484,6 +498,61 @@ export function useOutbox(pollMs = 15000): UseOutboxResult {
   return { outbox, held, loading, error, refresh, cancel, retry, dropHeld };
 }
 
+// -------------------------------------------------------------- broadcasts
+
+export interface UseBroadcastsResult {
+  broadcasts: BroadcastList[];
+  loading: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+  create: (name: string, members: string[]) => Promise<void>;
+  remove: (name: string) => Promise<void>;
+  send: (name: string, text: string) => Promise<BroadcastSendResponse>;
+}
+
+/** Named peer sets for one-to-many DMs; a send fans out per member. */
+export function useBroadcasts(): UseBroadcastsResult {
+  const [broadcasts, setBroadcasts] = useState<BroadcastList[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setBroadcasts(await getBroadcasts());
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const create = useCallback(
+    async (name: string, members: string[]) => {
+      await createBroadcast(name, members);
+      await refresh();
+    },
+    [refresh],
+  );
+  const remove = useCallback(
+    async (name: string) => {
+      await deleteBroadcast(name);
+      await refresh();
+    },
+    [refresh],
+  );
+  const send = useCallback(async (name: string, text: string) => {
+    const result = await sendBroadcast(name, text);
+    await refresh();
+    return result;
+  }, [refresh]);
+  return { broadcasts, loading, error, refresh, create, remove, send };
+}
+
 // ----------------------------------------------------------------- traffic
 
 export interface TrafficRow {
@@ -552,7 +621,10 @@ export interface PeerActions {
   archive: (target: string) => Promise<unknown>;
   unarchive: (target: string) => Promise<unknown>;
   mute: (target: { peer: string } | { group: string }, muted?: boolean) => Promise<unknown>;
-  markRead: (target?: { peer: string } | { group: string } | Record<string, never>) => Promise<UnreadCounts>;
+  pin: (target: { peer: string } | { group: string }, pinned?: boolean) => Promise<unknown>;
+  markRead: (
+    target?: { peer: string } | { group: string } | { channel: string } | Record<string, never>,
+  ) => Promise<UnreadCounts>;
   markUnread: (target: { peer: string } | { group: string }, all?: boolean) => Promise<UnreadCounts>;
 }
 
@@ -572,6 +644,7 @@ export function usePeerActions(): PeerActions {
       archive: (target) => archiveConversation(target),
       unarchive: (target) => unarchiveConversation(target),
       mute: (target, muted) => setMuted(target, muted),
+      pin: (target, pinned) => setPinnedConversation(target, pinned),
       markRead: (target = {}) => markRead(target),
       markUnread: (target, all) => markUnread(target, all),
     }),
