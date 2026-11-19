@@ -418,6 +418,17 @@ export interface MutedConversations {
   groups: string[];
 }
 
+export interface OwnProfile {
+  author: string | null;
+  name: string;
+  bio: string;
+  avatar: string | null;
+  links: string[];
+  version: number;
+  created_at: number | null;
+  published: boolean;
+}
+
 // --------------------------------------------------------------- outbox --
 
 export interface OutboxGroup {

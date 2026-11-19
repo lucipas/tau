@@ -1,6 +1,6 @@
-// SettingsSection.test.tsx — settings toggles, rename, away message,
-// quiet hours, disappearing defaults. Runs inside a TauContext.Provider
-// with a fake node.
+// SettingsSection.test.tsx — settings toggles, rename, your profile,
+// away message, quiet hours, disappearing defaults. Runs inside a
+// TauContext.Provider with a fake node.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -57,6 +57,34 @@ beforeEach(() => {
       return { peers: {}, groups: {}, channels: {} };
     if (url.includes("/api/channels"))
       return { channels: [{ channel: "general", joined_at: 1 }], count: 1 };
+    if (url.includes("/api/profile")) {
+      if (method === "POST") {
+        return {
+          ok: true,
+          profile: {
+            author: "a".repeat(32),
+            name: "Tester Two",
+            bio: "mesh enjoyer",
+            avatar: null,
+            links: ["https://example.org"],
+            version: 1,
+            created_at: 1000,
+            published: true,
+            changed: true,
+          },
+        };
+      }
+      return {
+        author: null,
+        name: "testnode",
+        bio: "",
+        avatar: null,
+        links: [],
+        version: 0,
+        created_at: null,
+        published: false,
+      };
+    }
     return { ok: true };
   });
   calls = router.calls;
@@ -106,6 +134,24 @@ describe("SettingsSection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Rename" }));
     await waitFor(() => expect(calls).toContain("POST /api/id/rename"));
     expect(await screen.findByText(/Node renamed to/)).toBeTruthy();
+  });
+
+  it("shows the unpublished profile and saves it", async () => {
+    renderSettings();
+    expect(await screen.findByText(/Not published yet/)).toBeTruthy();
+    const name = screen.getByLabelText("Profile display name") as HTMLInputElement;
+    expect(name.value).toBe("testnode");
+    fireEvent.change(name, { target: { value: "Tester Two" } });
+    fireEvent.change(screen.getByLabelText("Profile bio"), {
+      target: { value: "mesh enjoyer" },
+    });
+    fireEvent.change(screen.getByLabelText("Profile links"), {
+      target: { value: "https://example.org\n" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+    await waitFor(() => expect(calls).toContain("POST /api/profile"));
+    expect(await screen.findByText(/Profile saved/)).toBeTruthy();
+    expect(await screen.findByText(/Published as version 1/)).toBeTruthy();
   });
 
   it("shows the away message and saves a new one", async () => {
@@ -168,6 +214,17 @@ describe("SettingsSection", () => {
         return { peers: {}, groups: {}, channels: { general: 300 } };
       if (url.includes("/api/channels"))
         return { channels: [{ channel: "general", joined_at: 1 }], count: 1 };
+      if (url.includes("/api/profile"))
+        return {
+          author: null,
+          name: "testnode",
+          bio: "",
+          avatar: null,
+          links: [],
+          version: 0,
+          created_at: null,
+          published: false,
+        };
       return { ok: true };
     });
     calls = router.calls;

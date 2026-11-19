@@ -21,6 +21,7 @@ import {
   getChannelTopic,
   getGroupInviteStatus,
   getMessages,
+  getOwnProfile,
   getQuietHours,
   getTanThread,
   getTanTimeline,
@@ -44,6 +45,7 @@ import {
   setAwayMessage,
   setChannelTopic,
   setDisappearingDefault,
+  setOwnProfile,
   setQuietHours,
   tanMediaUrl,
   unpinChannelMessage,
@@ -342,6 +344,42 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
   });
 
+  it("fetches the own profile from /api/profile", async () => {
+    nextJson = {
+      author: null,
+      name: "testnode",
+      bio: "",
+      avatar: null,
+      links: [],
+      version: 0,
+      created_at: null,
+      published: false,
+    };
+    const profile = await getOwnProfile();
+    expect(captured[0].url).toBe("/api/profile");
+    expect(captured[0].init?.method).toBeUndefined();
+    expect(profile.name).toBe("testnode");
+    expect(profile.published).toBe(false);
+  });
+
+  it("publishes a profile patch to /api/profile", async () => {
+    nextJson = { ok: true, profile: { name: "Tester Two", version: 1 } };
+    await setOwnProfile({
+      name: "Tester Two",
+      bio: "mesh enjoyer",
+      avatar: "ab".repeat(32),
+      links: ["https://example.org"],
+    });
+    expect(captured[0].url).toBe("/api/profile");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      name: "Tester Two",
+      bio: "mesh enjoyer",
+      avatar: "ab".repeat(32),
+      links: ["https://example.org"],
+    });
+  });
+
   it("sets the away message with only the changed fields", async () => {
     nextJson = { ok: true, away_message: {} };
     await setAwayMessage({ enabled: true, message: "back on Monday" });
@@ -351,7 +389,6 @@ describe("POST endpoints", () => {
     await setAwayMessage({ enabled: false });
     expect(bodyOf(1)).toEqual({ enabled: false });
   });
-
 });
 
 describe("ApiError", () => {

@@ -38,6 +38,7 @@ import type {
   NodeSettings,
   Outbox,
   OutboxRetryResult,
+  OwnProfile,
   PageList,
   Peer,
   PeerInfo,
@@ -626,6 +627,21 @@ export async function setDisappearingDefault(
   return post("/api/messages/disappearing", { ...target, seconds });
 }
 
+/** This node's published public profile (or the node-name default). */
+export async function getOwnProfile(): Promise<OwnProfile> {
+  return get("/api/profile");
+}
+
+/** Publish a new profile version; omitted fields keep their stored value. */
+export async function setOwnProfile(patch: {
+  name?: string;
+  bio?: string;
+  avatar?: string | null;
+  links?: string[];
+}): Promise<{ ok: boolean; profile: OwnProfile & { changed: boolean } }> {
+  return post("/api/profile", patch);
+}
+
 export async function getAwayMessage(): Promise<AwayMessageSettings> {
   return get("/api/settings/away-message");
 }
@@ -651,6 +667,7 @@ export async function setQuietHours(patch: {
 }): Promise<{ ok: boolean; quiet_hours: QuietHoursSettings }> {
   return post("/api/settings/quiet-hours", patch);
 }
+
 
 export async function getMutedConversations(): Promise<MutedConversations> {
   return get("/api/messages/muted");
