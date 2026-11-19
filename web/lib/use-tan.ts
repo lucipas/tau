@@ -1,13 +1,14 @@
 // use-tan.ts — Tan social feed state for the Social tab.
 //
 // Provides:
-//   useTanFeed(opts)   — timeline (Following / All / author / tag), top posts,
-//                        mentions, search; like/unlike, repost, quote, vote,
-//                        save/hide/pin, follow/unfollow, mute, tags.
+//   useTanFeed(opts)   — timeline (Following / All / author / tag / list),
+//                        top posts, mentions, search; like/unlike, repost,
+//                        quote, vote, save/hide/pin, follow/unfollow, mute,
+//                        tags.
 //   useTanThread(ref)  — thread view rooted at one post.
 //   useTanComposer()   — publish / schedule / poll composer actions.
-//   useTanLists()      — saved / hidden / pinned / scheduled / following /
-//                        muted lists and tag follows.
+//   useTanLists()      — saved / hidden / pinned / scheduled / drafts /
+//                        following / followers / muted lists and tag follows.
 //
 // Posts arrive from /api/tan/timeline (following by default, `all=1` for
 // everything cached) with bridge annotations: likes/liked/own, quotes,
@@ -20,15 +21,23 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  addTanListMember,
+  createTanList,
   createTanPoll,
+  deleteTanList,
   deleteTanPost,
+  deleteTanDraft,
   editTanPost,
   followTanAuthor,
   followTanTag,
   getTanAuthors,
+  getTanDrafts,
+  getTanFollowers,
   getTanFollowing,
   getTanHidden,
   getTanLikers,
+  getTanListMembers,
+  getTanLists,
   getTanMentions,
   getTanMuted,
   getTanMutedKeywords,
@@ -51,7 +60,9 @@ import {
   pinTanPost,
   publishTanPost,
   quoteTanPost,
+  removeTanListMember,
   repostTanPost,
+  saveTanDraft,
   saveTanPost,
   scheduleTanPost,
   searchTan,
@@ -70,6 +81,9 @@ import {
 import type {
   ScheduledTanPost,
   TanAuthor,
+  TanDraft,
+  TanList,
+  TanListMember,
   TanPost,
   TanReactors,
   TanTag,
@@ -81,6 +95,7 @@ export interface UseTanFeedOptions {
   mode?: TanFeedMode;
   author?: string;
   tag?: string;
+  list?: string;
   limit?: number;
   /** Poll interval in ms; 0 disables polling. Default 30s. */
   pollMs?: number;
@@ -111,7 +126,7 @@ export interface UseTanFeedResult {
 }
 
 export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
-  const { mode = "following", author, tag, limit = 30, pollMs = 30_000 } = opts;
+  const { mode = "following", author, tag, list, limit = 30, pollMs = 30_000 } = opts;
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -122,7 +137,7 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
       let next: TanPost[];
       if (mode === "top") next = await getTanTop(limit, author);
       else if (mode === "mentions") next = await getTanMentions(limit);
-      else next = await getTanTimeline({ limit, all: mode === "all", author, tag });
+      else next = await getTanTimeline({ limit, all: mode === "all", author, tag, list });
       if (!mounted.current) return;
       setPosts(next);
       setError(null);
@@ -132,7 +147,7 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
     } finally {
       if (mounted.current) setLoading(false);
     }
-  }, [mode, author, tag, limit]);
+  }, [mode, author, tag, list, limit]);
 
   useEffect(() => {
     mounted.current = true;
@@ -292,14 +307,17 @@ export function useTanComposer(): UseTanComposerResult {
 export interface UseTanListsResult {
   tags: TanTag[];
   following: TanAuthor[];
+  followers: TanAuthor[];
   suggestions: TanAuthor[];
   saved: TanPost[];
   hidden: TanPost[];
   pinned: TanPost[];
   scheduled: ScheduledTanPost[];
+  drafts: TanDraft[];
   mutedAuthors: TanAuthor[];
   mutedKeywords: string[];
   mutedTags: string[];
+  lists: TanList[];
   loading: boolean;
   refresh: () => Promise<void>;
   followTag: (tag: string) => Promise<void>;
@@ -310,47 +328,66 @@ export interface UseTanListsResult {
   unmuteTag: (tag: string) => Promise<void>;
   unmuteAuthor: (target: string) => Promise<void>;
   unhide: (target: string) => Promise<void>;
+  saveDraft: (
+    text: string,
+    opts?: { replyTo?: string; expiresIn?: number },
+  ) => Promise<TanDraft>;
+  deleteDraft: (id: number) => Promise<void>;
+  createList: (name: string) => Promise<void>;
+  deleteList: (name: string) => Promise<void>;
+  addToList: (name: string, target: string) => Promise<void>;
+  removeFromList: (name: string, target: string) => Promise<void>;
+  listMembers: (name: string) => Promise<TanListMember[]>;
   authors: (sort?: "recent" | "posts" | "name", limit?: number, offset?: number) => Promise<{ authors: TanAuthor[]; total: number }>;
 }
 
-/** Discover + library lists: tags, following, suggestions, saved/hidden/pinned. */
+/** Discover + library lists: tags, following, followers, suggestions, saved/hidden/pinned. */
 export function useTanLists(): UseTanListsResult {
   const [tags, setTags] = useState<TanTag[]>([]);
   const [following, setFollowing] = useState<TanAuthor[]>([]);
+  const [followers, setFollowers] = useState<TanAuthor[]>([]);
   const [suggestions, setSuggestions] = useState<TanAuthor[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [hidden, setHidden] = useState<TanPost[]>([]);
   const [pinned, setPinned] = useState<TanPost[]>([]);
   const [scheduled, setScheduled] = useState<ScheduledTanPost[]>([]);
+  const [drafts, setDrafts] = useState<TanDraft[]>([]);
   const [mutedAuthors, setMutedAuthors] = useState<TanAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<string[]>([]);
   const [mutedTags, setMutedTags] = useState<string[]>([]);
+  const [lists, setLists] = useState<TanList[]>([]);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     try {
-      const [t, f, s, sv, h, p, sc, ma, mk, mt] = await Promise.all([
+      const [t, f, fw, s, sv, h, p, sc, d, ma, mk, mt, li] = await Promise.all([
         getTanTags(),
         getTanFollowing(),
+        getTanFollowers(),
         getTanSuggestions(),
         getTanSaved(),
         getTanHidden(),
         getTanPinned(),
         getTanScheduled(),
+        getTanDrafts(),
         getTanMuted(),
         getTanMutedKeywords(),
         getTanMutedTags(),
+        getTanLists(),
       ]);
       setTags(t);
       setFollowing(f);
+      setFollowers(fw);
       setSuggestions(s);
       setSaved(sv.posts);
       setHidden(h.posts);
       setPinned(p.posts);
       setScheduled(sc);
+      setDrafts(d);
       setMutedAuthors(ma);
       setMutedKeywords(mk);
       setMutedTags(mt);
+      setLists(li);
     } finally {
       setLoading(false);
     }
@@ -371,14 +408,17 @@ export function useTanLists(): UseTanListsResult {
   return {
     tags,
     following,
+    followers,
     suggestions,
     saved,
     hidden,
     pinned,
     scheduled,
+    drafts,
     mutedAuthors,
     mutedKeywords,
     mutedTags,
+    lists,
     loading,
     refresh,
     followTag: (tag) => mutate(() => followTanTag(tag)),
@@ -389,6 +429,20 @@ export function useTanLists(): UseTanListsResult {
     unmuteTag: (tag) => mutate(() => unmuteTanTag(tag)),
     unmuteAuthor: (target) => mutate(() => unmuteTanAuthor(target)),
     unhide: (target) => mutate(() => unhideTanPost(target)),
+    saveDraft: async (text, opts) => {
+      const draft = await saveTanDraft(text, opts);
+      await refresh();
+      return draft;
+    },
+    deleteDraft: (id) => mutate(() => deleteTanDraft(id)),
+    createList: (name) => mutate(() => createTanList(name)),
+    deleteList: (name) => mutate(() => deleteTanList(name)),
+    addToList: (name, target) => mutate(() => addTanListMember(name, target)),
+    removeFromList: (name, target) => mutate(() => removeTanListMember(name, target)),
+    listMembers: async (name) => {
+      const data = await getTanListMembers(name);
+      return data.members;
+    },
     authors: async (sort = "recent", limit = 50, offset = 0) => {
       const data = await getTanAuthors({ sort, limit, offset });
       return { authors: data.authors, total: data.total };

@@ -614,6 +614,9 @@ class TauNode:
         on_retract: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_edit: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_typing: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_beacon_update: Optional[
+            Callable[[Beacon, Dict[str, Any]], None]
+        ] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -675,6 +678,12 @@ class TauNode:
         self.on_retract = on_retract
         self.on_edit = on_edit
         self.on_typing = on_typing
+        # Called with the beacon and its send result after every
+        # beacon update goes out (first update and mail-loop ticks
+        # alike), so the console can record its own updates in its
+        # history like any other sent message; best effort, like
+        # the typing fan-out below.
+        self.on_beacon_update = on_beacon_update
         # Typing indicators, keyed by conversation — a peer hash for a
         # DM, ``"group:<id>"`` for a group — to ``{peer_hash: expires_at}``.
         # Ephemeral by design: nothing here is persisted, and an entry
@@ -2704,7 +2713,8 @@ class TauNode:
         The successor group (new id, same name) is created and a
         welcome group message pins the roster for the new member.
         Raises :class:`ValueError` when there is no pending request,
-        the group is unknown, or this node did not create it.
+        the group is unknown, this node did not create it, or the
+        peer is banned from the group.
         """
         group = self.groups.find(group_name)
         if group is None:
@@ -2712,12 +2722,27 @@ class TauNode:
         own_hash = self.destination_hexhash
         if not group.get("local") or group.get("creator") != own_hash:
             raise ValueError("only the creator can approve join requests")
+        # The pending check reads without consuming: the ban refusal
+        # below must leave the request pending, so the creator can
+        # deny it, or unban the peer and approve them afterwards.
+        pending = [
+            entry
+            for entry in self.list_join_requests(group["name"])
+            if entry["peer"] == peer_hash
+        ]
+        if not pending:
+            raise ValueError("no pending join request from that peer")
+        if peer_hash in group["members"]:
+            return {"status": "already_member", "group": _invite_group_summary(group)}
+        if peer_hash in (group.get("banned") or []):
+            raise ValueError(
+                f"cannot approve {peer_hash[:8]} into {group['name']!r}:"
+                " that peer is banned from the group"
+            )
         if not resolve_join_request(
             self.config.join_requests_path, group["name"], peer_hash
         ):
             raise ValueError("no pending join request from that peer")
-        if peer_hash in group["members"]:
-            return {"status": "already_member", "group": _invite_group_summary(group)}
         members = list(group["members"]) + [peer_hash]
         new_group = self.groups.update_members(
             group["id"], members, created_by=own_hash
@@ -7685,7 +7710,19 @@ class TauNode:
                     save_beacons(self.config.beacons_path, stored)
         except BeaconsError as exc:  # pragma: no cover - disk failure
             log.warning("Could not persist beacon update: %s", exc)
+        self._publish_beacon_update(beacon, result)
         return result
+
+    def _publish_beacon_update(
+        self, beacon: Beacon, result: Dict[str, Any]
+    ) -> None:
+        """Fan one beacon update out to the console, best effort."""
+        if self.on_beacon_update is None:
+            return
+        try:
+            self.on_beacon_update(beacon, result)
+        except Exception:  # pragma: no cover - user callback
+            log.warning("on_beacon_update callback failed", exc_info=True)
 
     def _send_due_beacon_updates(self) -> None:
         """Send the beacon updates whose time has come.

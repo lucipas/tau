@@ -163,9 +163,10 @@ beforeEach(() => {
       return {
         channels: [
           { channel: "mesh-general", joined_at: 900, unread: 3 },
+          { channel: "quiet-net", joined_at: 800, unread: 0, muted: true },
           { channel: "mesh-radio", joined_at: 800, pinned: true, unread: 0 },
         ],
-        count: 2,
+        count: 3,
       };
     }
     return { ok: true };
@@ -189,6 +190,19 @@ describe("ChannelsSection", () => {
   it("shows an unread badge on a channel with unread messages", async () => {
     render(<ChannelsSection />);
     expect(await screen.findByLabelText("3 unread")).toBeTruthy();
+  });
+
+  it("marks a muted channel and shows no badge for it", async () => {
+    render(<ChannelsSection />);
+    expect(await screen.findByLabelText("Muted channel")).toBeTruthy();
+    expect(screen.queryByLabelText("0 unread")).toBeNull();
+  });
+
+  it("mutes the selected channel", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Mute" }));
+    await waitFor(() => expect(calls).toContain("POST /api/messages/mute"));
   });
 
   it("marks a channel read when it is opened", async () => {

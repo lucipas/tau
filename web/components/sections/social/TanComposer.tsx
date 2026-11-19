@@ -48,6 +48,16 @@ export interface TanComposerProps {
   replyToName?: string;
   onCancelReply?: () => void;
   placeholder?: string;
+  /** Text to start from — a loaded draft. The parent remounts the
+   *  composer (via `key`) when a different draft is loaded. */
+  initialText?: string;
+  /** Expiry a loaded draft carries, in seconds. */
+  initialExpiresIn?: number;
+  /** Park the current text as a draft instead of posting it. */
+  onSaveDraft?: (
+    text: string,
+    opts: { replyTo?: string; expiresIn?: number },
+  ) => Promise<void>;
 }
 
 export default function TanComposer({
@@ -57,11 +67,14 @@ export default function TanComposer({
   replyToName,
   onCancelReply,
   placeholder = "What's happening on the mesh?",
+  initialText = "",
+  initialExpiresIn,
+  onSaveDraft,
 }: TanComposerProps) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(initialText);
   const [mode, setMode] = useState<"post" | "poll">("post");
   const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
-  const [expiresIn, setExpiresIn] = useState<number | undefined>(undefined);
+  const [expiresIn, setExpiresIn] = useState<number | undefined>(initialExpiresIn);
   const [sendIn, setSendIn] = useState<number | undefined>(undefined);
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -84,6 +97,22 @@ export default function TanComposer({
     setSendIn(undefined);
     setFile(null);
     if (fileRef.current) fileRef.current.value = "";
+  }
+
+  async function handleSaveDraft() {
+    if (!onSaveDraft) return;
+    const problem = validateTanText(text);
+    if (problem) return setError(problem);
+    setError(null);
+    try {
+      await onSaveDraft(text.trim(), {
+        replyTo: replyTo ?? undefined,
+        expiresIn,
+      });
+      reset();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Saving the draft failed.");
+    }
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -303,6 +332,21 @@ export default function TanComposer({
         >
           {text.length}/{TAN_MAX_CHARS}
         </span>
+        {onSaveDraft && (
+          <button
+            type="button"
+            onClick={() => void handleSaveDraft()}
+            disabled={composer.busy || mode === "poll" || !text.trim()}
+            title={
+              mode === "poll"
+                ? "Polls can't be saved as drafts"
+                : "Save this post as a draft to finish later"
+            }
+            className="rounded-full border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+          >
+            Save draft
+          </button>
+        )}
         <button
           type="submit"
           disabled={composer.busy || (mode === "post" && !text.trim())}

@@ -10,18 +10,25 @@ import {
   createBroadcast,
   deleteBroadcast,
   closeChannelPoll,
+  deleteDraft,
+  deleteTanDraft,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
   getAwayMessage,
+  getBeacons,
   getBroadcasts,
   getChannelMessages,
   getChannelPins,
   getChannelScheduled,
   getChannelTopic,
+  getDrafts,
   getGroupInviteStatus,
   getMessages,
+  getOwnProfile,
   getQuietHours,
+  getTanDrafts,
+  getTanLists,
   getTanThread,
   getTanTimeline,
   joinGroupViaLink,
@@ -35,7 +42,9 @@ import {
   reactToMessage,
   readFileAsDataUrl,
   revokeGroupInvites,
+  saveTanDraft,
   closeDmPoll,
+  saveDraft,
   sendBroadcast,
   scheduleChannelMessage,
   scheduleTanPost,
@@ -45,9 +54,13 @@ import {
   setAwayMessage,
   setChannelTopic,
   setDisappearingDefault,
+  setOwnProfile,
   setQuietHours,
+  startBeacon,
+  stopBeacon,
   tanMediaUrl,
   unpinChannelMessage,
+  updateBeaconPosition,
   voteChannelPoll,
   voteDmPoll,
   voteTanPoll,
@@ -109,6 +122,19 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/tan/timeline?limit=10&all=1&author=alice&tag=mesh");
   });
 
+  it("builds the Tan timeline query for a list", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanTimeline({ list: "Mesh Core" });
+    expect(captured[0].url).toBe("/api/tan/timeline?limit=30&list=Mesh%20Core");
+  });
+
+  it("lists Tan lists", async () => {
+    nextJson = { lists: [{ name: "Friends", created_at: 1000, members: 2 }], count: 1 };
+    const lists = await getTanLists();
+    expect(captured[0].url).toBe("/api/tan/lists");
+    expect(lists).toEqual([{ name: "Friends", created_at: 1000, members: 2 }]);
+  });
+
   it("omits empty timeline params", async () => {
     nextJson = { posts: [], count: 0 };
     await getTanTimeline();
@@ -133,6 +159,25 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/scheduled?channel=my%20channel");
     await getChannelScheduled();
     expect(captured[1].url).toBe("/api/channels/scheduled");
+  });
+
+  it("lists saved Tan drafts", async () => {
+    const draft = { id: 1, text: "half-written", reply_to: "", expires_in: null };
+    nextJson = { drafts: [draft], count: 1 };
+    const drafts = await getTanDrafts();
+    expect(captured[0].url).toBe("/api/tan/drafts");
+    expect(drafts).toEqual([draft]);
+  });
+
+  it("lists message drafts", async () => {
+    nextJson = {
+      drafts: [{ kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" }],
+      count: 1,
+    };
+    const drafts = await getDrafts();
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].name).toBe("alice");
   });
 
   it("posts a channel poll with question and options", async () => {
@@ -257,10 +302,43 @@ describe("POST endpoints", () => {
     });
   });
 
+  it("sends a DM with a location pin", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage(
+      { to: "alice" },
+      "",
+      { location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" } },
+    );
+    expect(captured[0].url).toBe("/api/messages");
+    expect(bodyOf(0)).toEqual({
+      to: "alice",
+      text: "",
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+    });
+  });
+
   it("sends a group message with the group key, not `to`", async () => {
     nextJson = { ok: true, message: {}, response: {} };
     await sendMessage({ group: "g123" }, "hi");
     expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
+  });
+
+  it("saves and deletes a message draft", async () => {
+    nextJson = {
+      ok: true,
+      draft: { kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" },
+    };
+    const draft = await saveDraft("peer", "ab".repeat(16), "hi");
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ kind: "peer", target: "ab".repeat(16), text: "hi" });
+    expect(draft.text).toBe("hi");
+
+    nextJson = { ok: true, deleted: true };
+    const deleted = await deleteDraft("peer", "ab".repeat(16));
+    expect(captured[1].url).toBe("/api/drafts/delete");
+    expect(bodyOf(1)).toEqual({ kind: "peer", target: "ab".repeat(16) });
+    expect(deleted).toBe(true);
   });
 
   it("reacts and clears a reaction on the same route", async () => {
@@ -320,6 +398,42 @@ describe("POST endpoints", () => {
     expect(bodyOf(1)).toEqual({ to: "alice", poll: "wire1" });
   });
 
+  it("lists, starts, stops and feeds beacons on the beacon routes", async () => {
+    nextJson = { beacons: [], count: 0 };
+    await getBeacons();
+    expect(captured[0].url).toBe("/api/beacons");
+
+    nextJson = { ok: true, beacon: { id: "aabbccdd" }, update: {} };
+    await startBeacon(
+      { peer: "alice" },
+      { lat: 34.05, lon: -83.88, name: "Rock Springs Park", durationSeconds: 900, coarse: true },
+    );
+    expect(captured[1].url).toBe("/api/beacons/start");
+    expect(bodyOf(1)).toEqual({
+      peer: "alice",
+      lat: 34.05,
+      lon: -83.88,
+      name: "Rock Springs Park",
+      durationSeconds: 900,
+      coarse: true,
+    });
+
+    await startBeacon({ group: "ab".repeat(16) }, { lat: 34.05, lon: -83.88 });
+    expect(captured[2].url).toBe("/api/beacons/start");
+    expect(bodyOf(2)).toEqual({ group: "ab".repeat(16), lat: 34.05, lon: -83.88 });
+
+    await stopBeacon("aabbccdd");
+    expect(captured[3].url).toBe("/api/beacons/stop");
+    expect(bodyOf(3)).toEqual({ id: "aabbccdd" });
+
+    await updateBeaconPosition("aabbccdd", 34.06, -83.87);
+    expect(captured[4].url).toBe("/api/beacons/position");
+    expect(bodyOf(4)).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87 });
+
+    await updateBeaconPosition("aabbccdd", 34.06, -83.87, "Elsewhere");
+    expect(bodyOf(5)).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87, name: "Elsewhere" });
+  });
+
   it("marks read with an empty body when no conversation is given", async () => {
     nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1 } };
     await markRead();
@@ -359,6 +473,151 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
   });
 
+  it("sets quiet hours with only the changed fields", async () => {
+    nextJson = { ok: true, quiet_hours: {} };
+    await setQuietHours({ enabled: true, start: "23:00", end: "06:30" });
+    expect(captured[0].url).toBe("/api/settings/quiet-hours");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ enabled: true, start: "23:00", end: "06:30" });
+    await setQuietHours({ enabled: false });
+    expect(bodyOf(1)).toEqual({ enabled: false });
+  });
+
+  it("fetches the own profile from /api/profile", async () => {
+    nextJson = {
+      author: null,
+      name: "testnode",
+      bio: "",
+      avatar: null,
+      links: [],
+      version: 0,
+      created_at: null,
+      published: false,
+    };
+    const profile = await getOwnProfile();
+    expect(captured[0].url).toBe("/api/profile");
+    expect(captured[0].init?.method).toBeUndefined();
+    expect(profile.name).toBe("testnode");
+    expect(profile.published).toBe(false);
+  });
+
+  it("publishes a profile patch to /api/profile", async () => {
+    nextJson = { ok: true, profile: { name: "Tester Two", version: 1 } };
+    await setOwnProfile({
+      name: "Tester Two",
+      bio: "mesh enjoyer",
+      avatar: "ab".repeat(32),
+      links: ["https://example.org"],
+    });
+    expect(captured[0].url).toBe("/api/profile");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      name: "Tester Two",
+      bio: "mesh enjoyer",
+      avatar: "ab".repeat(32),
+      links: ["https://example.org"],
+    });
+  });
+
+  it("publishes a Tan post with an image data URL when attached", async () => {
+    nextJson = { ok: true, post: {} };
+    await publishTanPost("with a picture", {
+      image: { dataUrl: "data:image/png;base64,iVBORw==" },
+    });
+    expect(captured[0].url).toBe("/api/tan/posts");
+    expect(bodyOf(0)).toEqual({
+      text: "with a picture",
+      image: "data:image/png;base64,iVBORw==",
+    });
+  });
+
+  it("publishes a Tan post without an image field when none is attached", async () => {
+    nextJson = { ok: true, post: {} };
+    await publishTanPost("text only");
+    expect(bodyOf(0)).toEqual({ text: "text only" });
+  });
+
+  it("saves a Tan draft with reply and expiry", async () => {
+    nextJson = { ok: true, draft: { id: 1 } };
+    const draft = await saveTanDraft("half-written", {
+      replyTo: "h1".padEnd(64, "0"),
+      expiresIn: 3600,
+    });
+    expect(captured[0].url).toBe("/api/tan/drafts");
+    expect(bodyOf(0)).toEqual({
+      text: "half-written",
+      reply_to: "h1".padEnd(64, "0"),
+      expires_in: 3600,
+    });
+    expect(draft).toEqual({ id: 1 });
+  });
+
+  it("saves a plain Tan draft without optional fields", async () => {
+    nextJson = { ok: true, draft: { id: 2 } };
+    await saveTanDraft("plain draft");
+    expect(bodyOf(0)).toEqual({ text: "plain draft" });
+  });
+
+  it("discards a Tan draft by id", async () => {
+    nextJson = { ok: true, draft: { id: 3 } };
+    await deleteTanDraft(3);
+    expect(captured[0].url).toBe("/api/tan/drafts/delete");
+    expect(bodyOf(0)).toEqual({ id: 3 });
+  });
+
+  it("reads a picked file as a base64 data URL", async () => {
+    const file = new File(["hello"], "pic.png", { type: "image/png" });
+    await expect(readFileAsDataUrl(file)).resolves.toBe(
+      "data:image/png;base64,aGVsbG8=",
+    );
+  });
+
+  it("lists broadcast lists from /api/broadcasts", async () => {
+    nextJson = { broadcasts: [], count: 0 };
+    const lists = await getBroadcasts();
+    expect(captured[0].url).toBe("/api/broadcasts");
+    expect(lists).toEqual([]);
+  });
+
+  it("creates a broadcast list with name and member hashes", async () => {
+    nextJson = { ok: true, broadcast: { name: "team", members: [], created_at: 1 } };
+    await createBroadcast("team", ["a".repeat(32)]);
+    expect(captured[0].url).toBe("/api/broadcasts");
+    expect(bodyOf(0)).toEqual({ name: "team", members: ["a".repeat(32)] });
+  });
+
+  it("deletes a broadcast list by name", async () => {
+    nextJson = { ok: true, name: "team" };
+    await deleteBroadcast("team");
+    expect(captured[0].url).toBe("/api/broadcasts/delete");
+    expect(bodyOf(0)).toEqual({ broadcast: "team" });
+  });
+
+  it("sends a broadcast with list name and text", async () => {
+    nextJson = { ok: true, name: "team", results: [], delivered: 0, queued: 0, failed: 0 };
+    await sendBroadcast("team", "meet at noon");
+    expect(captured[0].url).toBe("/api/broadcasts/send");
+    expect(bodyOf(0)).toEqual({ broadcast: "team", text: "meet at noon" });
+  });
+
+  it("sets a channel topic with channel and topic in the body", async () => {
+    nextJson = { ok: true, channel: "general", topic: {}, cleared: false };
+    await setChannelTopic("general", "monthly mesh meetup");
+    expect(captured[0].url).toBe("/api/channels/topic");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ channel: "general", topic: "monthly mesh meetup" });
+  });
+
+  it("pins and unpins a channel message by hash", async () => {
+    nextJson = { ok: true };
+    await pinChannelMessage("general", "a".repeat(64));
+    expect(captured[0].url).toBe("/api/channels/pin");
+    expect(bodyOf(0)).toEqual({ channel: "general", hash: "a".repeat(64) });
+    await unpinChannelMessage("general", "a".repeat(64));
+    expect(captured[1].url).toBe("/api/channels/unpin");
+    expect(bodyOf(1)).toEqual({ channel: "general", hash: "a".repeat(64) });
+  });
+
   it("sets the away message with only the changed fields", async () => {
     nextJson = { ok: true, away_message: {} };
     await setAwayMessage({ enabled: true, message: "back on Monday" });
@@ -368,7 +627,6 @@ describe("POST endpoints", () => {
     await setAwayMessage({ enabled: false });
     expect(bodyOf(1)).toEqual({ enabled: false });
   });
-
 });
 
 describe("ApiError", () => {

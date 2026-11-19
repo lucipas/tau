@@ -316,6 +316,23 @@ class Beacons:
         """A beacon by id, active or not."""
         return self.beacons.get(beacon_id)
 
+    def stop_by_id(
+        self, beacon_id: str, now: Optional[float] = None
+    ) -> Optional[Beacon]:
+        """Stop the active beacon with this id, if one is running.
+
+        The console stops by id (it lists beacons by id); the CLI
+        stops by conversation (see :meth:`stop`).  A stopped or
+        expired beacon is already over, so stopping it again is a
+        no-op that returns ``None``.
+        """
+        now = time.time() if now is None else now
+        beacon = self.beacons.get(beacon_id)
+        if beacon is None or not beacon.is_active(now):
+            return None
+        beacon.stopped = True
+        return beacon
+
     def start(
         self,
         *,

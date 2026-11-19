@@ -128,10 +128,12 @@ advances the cursor when you read a conversation, and the console shows an
 unread badge next to each peer and the unread total in the tab title.
 Opening a peer in the console clears its badge; read receipts to the sender
 are a separate feature and do not exist yet. A single conversation can be
-muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
-pinned to the top of the list with `tau pin-conversation --peer alice`
-(`--group NAME` pins a group, `--channel NAME` a joined channel),
-and `tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
+muted with `tau mute --peer alice` (or for a while with `--for 1h`), and a
+channel with `tau mute --channel general` — muted conversations still
+receive messages, they just never light the badge — and pinned to the top
+of the list with `tau pin-conversation --peer alice` (`--group NAME` pins
+a group, `--channel NAME` a joined channel). `tau quiet-hours set
+--start 22:00 --end 07:00` silences the whole badge
 every night instead — while the window is active every conversation counts
 as unread 0, and the counts come back when it ends. The Chat tab has a
 search box above the conversation list: it searches stored DM and group
@@ -255,6 +257,11 @@ tau tan timeline --json
 `tau serve --social --social-sync-interval 60` also pulls the public timeline
 from known peers every minute, so a long-running node keeps its cache fresh.
 
+Sync reaches two hops into the follow graph by default: it pulls followed
+authors plus the authors they follow (their published follow lists are fetched
+over `/tau/follows` when missing). `tau config tan-sync-depth 1` pulls followed
+authors only; the console Settings page has the same switch.
+
 Useful flags:
 
 ```bash
@@ -272,6 +279,10 @@ tau tan scheduled
 # queue entry and signed with the post when it publishes
 tau tan post --image sunrise.jpg --delay 8h "good morning, mesh"
 
+# Attach a place to a post — the place is signed with it, and the
+# timeline and console show it with an open-in-maps link
+tau tan post --location "34.05,-83.88 Rock Springs Park" "morning run"
+
 # Show every cached post, or one author's chain
 tau tan timeline --all
 tau tan timeline --author alice
@@ -288,6 +299,11 @@ tau tan top --author alice
 tau tan follow 5c04c868
 tau tan following
 
+# See who follows you, from the signed follow lists this node has
+# fetched and stored (a follower whose list was never fetched does
+# not appear yet — sync first)
+tau tan followers
+
 # Hide a word or phrase from your local views (whole-word match,
 # case-insensitive; entries keep syncing, so unmuting restores them)
 tau tan mute-keyword crypto
@@ -299,6 +315,18 @@ tau tan unmute-keyword crypto
 # but keep syncing and storing — unmute to see them again
 tau tan mute alice
 tau tan muted
+
+# Curate followed authors into named lists and read one list's timeline.
+# Lists are local-only: they are never published or synced, and deleting
+# one never unfollows anyone. Adding an author who is not followed is
+# allowed (a list is curation, not a follow) and the CLI says so.
+tau tan lists create friends
+tau tan lists add friends alice bob
+tau tan lists
+tau tan lists show friends
+tau tan timeline --list friends
+tau tan lists remove friends bob
+tau tan lists delete friends
 
 # Hide one post without muting its author: it leaves your timeline,
 # search, top posts and threads, but keeps syncing — unhide to see it again
@@ -402,6 +430,7 @@ Global options may appear before or after the command:
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan post --delay 5m TEXT` | Queue a post to publish in 5 minutes (needs `tau serve --social` running) |
+| `tau tan post --location "LAT,LON [NAME]" TEXT` | Attach a place to a post (signed with it; not with `--delay` or `--reply-to`) |
 | `tau tan scheduled` | List Tan posts queued for later publishing |
 | `tau tan cancel-scheduled ID` | Drop a queued Tan post before it publishes |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
@@ -412,6 +441,13 @@ Global options may appear before or after the command:
 | `tau tan repost POST` | Repost a post to your followers (signed entry on your chain) |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
+| `tau tan timeline --list NAME` | Show only the members of one list's posts |
+| `tau tan lists` | List named author lists with member counts |
+| `tau tan lists create NAME` | Create an empty named author list |
+| `tau tan lists add NAME PEER...` | Add authors to a list |
+| `tau tan lists remove NAME PEER...` | Remove authors from a list |
+| `tau tan lists show NAME` | Show a list's members |
+| `tau tan lists delete NAME` | Delete a list (follows and posts are untouched) |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan top` | Show the most-liked stored posts, best first |
@@ -420,6 +456,7 @@ Global options may appear before or after the command:
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan followers` | List authors who follow you (from stored follow lists) |
 | `tau tan authors` | List every author in the local Tan store |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
@@ -837,6 +874,20 @@ still refused with `not_sender`, and a creator claim the receiver
 cannot verify (no pinned roster for the group) fails closed the
 same way.
 
+A group creator can also ban a member: `tau group ban GROUP PEER`
+removes them from the roster (a roster change, so the successor
+group id applies) and records them on the group's ban list, so
+they cannot be re-added with `tau group add-member` or approved
+through a join request — including one sent with an invite link.
+`tau group unban GROUP PEER` lifts the ban without re-adding them,
+and `tau group banned GROUP` lists who is banned. The ban list is
+creator-local state, like the topic: it carries across roster
+changes and renames, so neither silently unbans anyone. A banned
+peer's messages to the group are rejected on receipt, because they
+are no longer on the roster. The web API mirrors the commands
+(`POST /api/groups/ban`, `POST /api/groups/unban`,
+`GET /api/groups/banned`); the console has no ban UI yet.
+
 Retracts are delivered live in v1, like reactions: the peer must be
 online. A DM still queued in the outbox is cancelled with
 `tau outbox cancel` instead; a queued group leg is cancelled by the
@@ -955,6 +1006,11 @@ The web console shows the same counts with a ♥ toggle on every post
 same way: `tau tan save` keeps a post to read later (local only, never
 published), and the console has a Saved view with a save toggle on every
 post (`GET /api/tan/saved`, `POST /api/tan/save` / `POST /api/tan/unsave`).
+Drafts work the same way too: `tau tan draft` parks a half-written post
+(local only, never published), and the console composer has a Save draft
+button with a Drafts view to edit or delete it (`GET /api/tan/drafts`,
+`POST /api/tan/drafts`, `POST /api/tan/drafts/delete`) — posting a loaded
+draft publishes it and drops the draft, mirroring `publish-draft`.
 
 ### Admission rules
 
@@ -1106,6 +1162,8 @@ unlinked, and stall sync at the gap.
   is read-only for groups — composing from the console comes later.
   Manage groups with `tau group create NAME --peer ...`, `tau group list`,
   `tau group send GROUP TEXT`, `tau group add-member` / `remove-member`,
+  `tau group ban` / `unban` / `banned` (creator only; a banned peer cannot
+  be re-added or approved through a join request),
   `tau group rename GROUP NEW-NAME` (creator only; a rename is a successor
   group, so members learn the new name — and retire the old one — from the
   next message sent to it, and `tau messages --group` history spans the

@@ -1083,6 +1083,147 @@ def test_group_topic_flag_conflicts_rejected(tmp_path, capsys):
     )
 
 
+def test_parser_group_ban_arguments():
+    parser = cli.build_parser()
+    ban = parser.parse_args(["group", "ban", "weekend", "carol"])
+    assert ban.group_command == "ban"
+    assert ban.func is cli.cmd_group_ban
+    assert ban.group == "weekend"
+    assert ban.peer == "carol"
+
+    unban = parser.parse_args(["group", "unban", "weekend", "carol"])
+    assert unban.func is cli.cmd_group_unban
+
+    banned = parser.parse_args(["group", "banned", "weekend"])
+    assert banned.func is cli.cmd_group_banned
+    assert banned.group == "weekend"
+
+
+class _FakeBanNode:
+    """Stub TauNode for `tau group ban`: real stores, no Reticulum."""
+
+    def __init__(self, config, **kwargs):
+        from tau.groups import GroupStore
+        from tau.identity import destination_hash, load_identity
+        from tau.peers import PeerRegistry
+
+        self.config = config
+        self.groups = GroupStore(config.groups_path)
+        self.registry = PeerRegistry(config.peers_path)
+        identity = load_identity(config.identity_path)
+        self.destination_hexhash = destination_hash(identity).hex()
+        self.started = False
+
+    def start(self, **kwargs):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def resolve_peer(self, target, timeout=10.0):
+        peer = self.registry.resolve(target)
+        if peer is None:
+            from tau.node import NodeError
+
+            raise NodeError(f"unknown peer: {target}")
+        return peer
+
+
+def _seed_group_with_carol(data_dir, own_hash):
+    from tau.groups import GroupStore
+    from tau.peers import PeerRegistry
+
+    registry = PeerRegistry(data_dir / "peers.json")
+    registry.upsert(
+        bytes.fromhex("cd" * 16),
+        b"\x02" * 64,
+        name="carol",
+        now=1000.0,
+    )
+    registry.save()
+    store = GroupStore(data_dir / "groups.json")
+    # Three members, so banning carol does not hit the last-member rule.
+    return store.create(
+        "weekend", [own_hash, "cd" * 16, "ef" * 16], created_by=own_hash
+    )
+
+
+def test_group_ban_unban_banned(tmp_path, capsys, monkeypatch):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    group = _seed_group_with_carol(data_dir, own_hash)
+
+    monkeypatch.setattr(cli, "TauNode", _FakeBanNode)
+    base = ["group", "ban", "--data-dir", str(data_dir), "weekend"]
+    assert cli.main([*base, "carol"]) == 0
+    out = capsys.readouterr().out
+    assert "banned carol from group weekend" in out
+    assert "cannot be re-added" in out
+    banned_group = GroupStore(data_dir / "groups.json").get(group["id"])
+    assert banned_group is None  # the roster change minted a successor
+    stored = GroupStore(data_dir / "groups.json").list_groups()
+    assert len(stored) == 1
+    assert sorted(stored[0]["members"]) == sorted([own_hash, "ef" * 16])
+    assert stored[0]["banned"] == ["cd" * 16]
+
+    assert cli.main(["group", "banned", "--data-dir", str(data_dir), "weekend"]) == 0
+    out = capsys.readouterr().out
+    assert "Banned from weekend" in out
+    assert "carol" in out
+
+    # A banned peer cannot be re-added through the normal path.
+    assert (
+        cli.main(
+            [
+                "group",
+                "add-member",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "--peer",
+                "carol",
+            ]
+        )
+        == 1
+    )
+    assert "is banned" in capsys.readouterr().err
+
+    assert cli.main(["group", "unban", "--data-dir", str(data_dir), "weekend", "carol"]) == 0
+    assert "unbanned carol" in capsys.readouterr().out
+    assert (
+        GroupStore(data_dir / "groups.json").get(stored[0]["id"])["banned"] == []
+    )
+
+    # Unbanning a peer who is not banned says so instead of failing.
+    assert cli.main(["group", "unban", "--data-dir", str(data_dir), "weekend", "carol"]) == 0
+    assert "was not banned" in capsys.readouterr().out
+
+    # JSON mode for the ban list.
+    assert (
+        cli.main(
+            [
+                "group",
+                "banned",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+    assert payload["banned"] == []
+
+    # Banning the creator is refused.
+    assert cli.main([*base, own_hash]) == 1
+    assert "cannot ban the creator" in capsys.readouterr().err
+
+
 def test_status_text_output(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     code = cli.main(["status", "--data-dir", str(data_dir)])
@@ -2557,6 +2698,10 @@ def test_parser_tan_follow_list_arguments():
     cached = parser.parse_args(["tan", "follows-of", "alice", "--cached"])
     assert cached.cached is True
 
+    followers = parser.parse_args(["tan", "followers"])
+    assert followers.tan_command == "followers"
+    assert followers.func is cli.cmd_tan_followers
+
 
 def test_tan_publish_follows_end_to_end(tmp_path, capsys):
     from tau.follows import load_local_follow_list
@@ -2670,6 +2815,116 @@ def test_tan_follows_of_unknown_peer(tmp_path, capsys):
     )
     assert code == 1
     assert "no peer matches" in capsys.readouterr().err
+
+
+def test_tan_followers_lists_stored_followers(tmp_path, capsys):
+    from tau.follows import FollowListStore, build_follow_list
+    from tau.tangents.tan import create_post, init_db
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    owner = load_identity(config.identity_path)
+    owner_author = destination_hash(owner).hex()
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    conn = init_db(config.social_db_path)
+    try:
+        create_post(conn, peer_identity, "hello from alice", name="alice", now=1000)
+    finally:
+        conn.close()
+    doc = build_follow_list(
+        peer_identity, authors=[owner_author], version=1, updated_at=1000.0
+    )
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+
+    code = cli.main(["tan", "followers", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "1 post(s)" in out
+
+    code = cli.main(["tan", "followers", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["followers"][0]["author"] == destination_hash(peer_identity).hex()
+    assert payload["followers"][0]["name"] == "alice"
+    assert payload["followers"][0]["posts"] == 1
+    assert payload["followers"][0]["followed"] is False
+
+
+def test_tan_followers_empty_when_no_list_names_you(tmp_path, capsys):
+    from tau.follows import FollowListStore, build_follow_list
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    peer_identity = RNS.Identity()
+    doc = build_follow_list(
+        peer_identity,
+        authors=[destination_hash(RNS.Identity()).hex()],
+        version=1,
+        updated_at=1000.0,
+    )
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+
+    code = cli.main(["tan", "followers", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No followers yet" in capsys.readouterr().out
+
+    code = cli.main(["tan", "followers", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"followers": [], "count": 0}
+
+
+def test_tan_followers_needs_identity(tmp_path, capsys):
+    code = cli.main(["tan", "followers", "--data-dir", str(tmp_path / "empty")])
+    assert code == 1
+    assert "no identity" in capsys.readouterr().err
+
+
+def test_config_tan_sync_depth_show_set_and_list(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    # Default is 2 (per #467) on a fresh node.
+    code = cli.main(["config", "tan-sync-depth", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Tan sync depth: 2" in capsys.readouterr().out
+
+    code = cli.main(
+        ["config", "tan-sync-depth", "1", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "Tan sync depth: 1" in capsys.readouterr().out
+
+    code = cli.main(
+        ["config", "tan-sync-depth", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == {"tan_sync_depth": 1}
+
+    # The plain listing shows the depth alongside the other settings.
+    code = cli.main(["config", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "tan sync depth: 1" in out
+    assert "tau config tan-sync-depth 1|2" in out
+
+
+def test_config_tan_sync_depth_rejects_bad_value(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    with pytest.raises(SystemExit):
+        cli.main(["config", "tan-sync-depth", "3", "--data-dir", str(data_dir)])
 
 
 def test_peers_show_includes_profile(tmp_path, capsys):
@@ -9816,6 +10071,78 @@ def test_tan_post_image_with_delay_schedules(tmp_path, capsys):
     assert cli.main(["tan", "scheduled", "--data-dir", str(data_dir)]) == 0
     out = capsys.readouterr().out
     assert "photo.png" in out
+
+
+def test_tan_post_with_location_stores_place(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    base = [
+        "tan",
+        "post",
+        "--data-dir",
+        str(data_dir),
+        "--no-publish",
+        "morning run",
+    ]
+    assert cli.main([*base, "--location", "34.05,-83.88 Rock Springs Park"]) == 0
+    out = capsys.readouterr().out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
+    from tau.tangents.tan import feed, init_db
+
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        posts = feed(conn)
+    finally:
+        conn.close()
+    assert len(posts) == 1
+    assert posts[0]["location"] == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+    # The timeline prints the pin with its map link.
+    assert cli.main(["tan", "timeline", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
+    # And --json carries the place through.
+    assert cli.main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
+    out = capsys.readouterr().out
+    assert "Rock Springs Park" in out
+
+
+def test_tan_post_location_rejects_bad_input(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    base = ["tan", "post", "--data-dir", str(data_dir), "--no-publish", "hi"]
+    assert cli.main([*base, "--location", "not-a-place"]) == 1
+    assert cli.main([*base, "--location", "91,0 Out of range"]) == 1
+    assert cli.main([*base, "--location", "34.05,-83.88 Park", "--delay", "5m"]) == 2
+    # A reply cannot carry a location: post first, then reply to it.
+    assert cli.main([*base, "--location", "34.05,-83.88 Park"]) == 0
+    capsys.readouterr()
+    from tau.tangents.tan import feed, init_db
+
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post_hash = feed(conn)[0]["hash"]
+    finally:
+        conn.close()
+    assert (
+        cli.main([*base, "--location", "34.05,-83.88 Park", "--reply-to", post_hash])
+        == 2
+    )
 
 
 def test_tan_media_rejects_unknown_image(tmp_path, capsys):

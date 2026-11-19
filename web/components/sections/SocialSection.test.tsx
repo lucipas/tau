@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TauContext } from "@/components/chrome/TauContext";
-import type { TanPost } from "@/lib/types";
+import type { TanDraft, TanPost } from "@/lib/types";
 import SocialSection from "./SocialSection";
 import { validateTanText } from "./social/TanComposer";
 import { fakeTau, mockFetch } from "./test-utils";
@@ -36,16 +36,52 @@ function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): Tan
 let calls: string[] = [];
 let timeline: TanPost[] = [];
 let scheduled: import("@/lib/types").ScheduledTanPost[] = [];
+let drafts: TanDraft[] = [];
+
+function makeDraft(id: number, text: string, extra: Partial<TanDraft> = {}): TanDraft {
+  return {
+    id,
+    text,
+    reply_to: "",
+    expires_in: null,
+    post_hash: "",
+    pending_peers: [],
+    claimed_at: null,
+    created_at: Math.floor(Date.now() / 1000) - 60,
+    ...extra,
+  };
+}
+
+let lists: { name: string; created_at: number; members: number }[] = [];
 
 beforeEach(() => {
   timeline = [makePost("h1".padEnd(64, "0"), "hello #mesh @bob")];
   scheduled = [];
-  const router = mockFetch((url) => {
+  drafts = [
+    makeDraft(1, "half-written thought"),
+    makeDraft(2, "agreed", { reply_to: "h1".padEnd(64, "0"), expires_in: 3600 }),
+  ];
+  lists = [];
+  const router = mockFetch((url, method) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
+    if (url.includes("/api/tan/lists")) return { lists, count: lists.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/thread")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/tags")) return { tags: [{ tag: "mesh", count: 5 }], count: 1 };
     if (url.includes("/api/tan/following")) return { following: [], count: 0 };
+    if (url.includes("/api/tan/followers"))
+      return {
+        followers: [
+          {
+            author: "b".repeat(64),
+            name: "bob",
+            posts: 2,
+            followed: false,
+            last_post: 1000,
+          },
+        ],
+        count: 1,
+      };
     if (url.includes("/api/tan/suggest")) return { suggestions: [], count: 0 };
     if (url.includes("/api/tan/saved")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/hidden")) return { posts: [], count: 0, next_offset: null };
@@ -57,6 +93,15 @@ beforeEach(() => {
     if (url.includes("/api/tan/followed-tags")) return { followed_tags: [], count: 0 };
     if (url.includes("/api/tan/authors")) return { authors: [], count: 0, total: 0 };
     if (url.includes("/api/tan/likes")) return { target: "x", likers: [], count: 0, total: 0 };
+    if (url.includes("/api/tan/drafts")) {
+      if (method === "POST" && url.includes("/delete")) {
+        return { ok: true, draft: drafts[0] ?? {} };
+      }
+      if (method === "POST") {
+        return { ok: true, draft: makeDraft(99, "saved draft") };
+      }
+      return { drafts, count: drafts.length };
+    }
     return { ok: true };
   });
   calls = router.calls;
@@ -92,6 +137,20 @@ describe("SocialSection", () => {
     expect(screen.getByRole("button", { name: "#mesh" })).toBeTruthy();
   });
 
+  it("renders a located post with its place and maps link", async () => {
+    timeline = [
+      makePost("h2".padEnd(64, "0"), "morning run", {
+        location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      }),
+    ];
+    renderSocial();
+    await screen.findByText(/morning run/);
+    const link = screen.getByRole("link", { name: /Rock Springs Park/ });
+    expect(link.getAttribute("href")).toContain("openstreetmap.org");
+    expect(link.getAttribute("href")).toContain("mlat=34.05");
+    expect(link.getAttribute("href")).toContain("mlon=-83.88");
+  });
+
   it("shows like / reply / quote counts on a post", async () => {
     renderSocial();
     await screen.findByText(/hello/);
@@ -107,6 +166,26 @@ describe("SocialSection", () => {
     await waitFor(() =>
       expect(calls).toContain("GET /api/tan/timeline?limit=30&all=1"),
     );
+  });
+
+  it("shows a list picker and filters the timeline by the chosen list", async () => {
+    lists = [{ name: "Friends", created_at: 1000, members: 2 }];
+    renderSocial();
+    const select = await screen.findByLabelText("Filter feed by list");
+    fireEvent.change(select, { target: { value: "Friends" } });
+    await waitFor(() =>
+      expect(calls).toContain("GET /api/tan/timeline?limit=30&list=Friends"),
+    );
+    expect((select as HTMLSelectElement).value).toBe("Friends");
+  });
+
+  it("shows followers with a follow-back button", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Followers" }));
+    await waitFor(() => expect(calls).toContain("GET /api/tan/followers"));
+    expect(await screen.findByText("bob")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Follow" })).toBeTruthy();
   });
 
   it("liking a post posts to /api/tan/like", async () => {
@@ -193,5 +272,56 @@ describe("SocialSection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
     expect(await screen.findByText("morning photo")).toBeTruthy();
     expect(screen.getByText(/image: photo\.png/)).toBeTruthy();
+  });
+
+  it("Drafts tab lists saved drafts with reply and expiry", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    expect(await screen.findByText("half-written thought")).toBeTruthy();
+    expect(screen.getByText("agreed")).toBeTruthy();
+    expect(screen.getByText(/In reply to h1/)).toBeTruthy();
+    expect(screen.getByText(/Disappears 1h after posting/)).toBeTruthy();
+  });
+
+  it("Save draft parks the composer's text", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.change(screen.getByLabelText("Compose a post"), {
+      target: { value: "park this for later" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/drafts"));
+    await waitFor(() =>
+      expect((screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value).toBe(""),
+    );
+  });
+
+  it("editing a draft loads it, and posting it deletes the draft", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    await screen.findByText("half-written thought");
+    const rows = screen.getAllByRole("button", { name: "Edit" });
+    fireEvent.click(rows[0]);
+    await waitFor(() =>
+      expect((screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value).toBe(
+        "half-written thought",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Post" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/posts"));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/drafts/delete"));
+  });
+
+  it("deleting a draft discards it without posting", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    await screen.findByText("half-written thought");
+    const deletes = screen.getAllByRole("button", { name: "Delete draft" });
+    fireEvent.click(deletes[0]);
+    await waitFor(() => expect(calls).toContain("POST /api/tan/drafts/delete"));
+    expect(calls).not.toContain("POST /api/tan/posts");
   });
 });
