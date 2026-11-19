@@ -69,6 +69,13 @@ describe("useTanFeed", () => {
     expect(calls[0]).toBe("GET /api/tan/timeline?limit=30");
   });
 
+  it("loads a list timeline in list mode", async () => {
+    const { result } = renderHook(() => useTanFeed({ list: "Friends", pollMs: 0 }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(calls[0]).toBe("GET /api/tan/timeline?limit=30&list=Friends");
+    expect(result.current.posts).toHaveLength(1);
+  });
+
   it("loads all posts in all mode", async () => {
     const { result } = renderHook(() => useTanFeed({ mode: "all", pollMs: 0 }));
     await waitFor(() => expect(result.current.loading).toBe(false));

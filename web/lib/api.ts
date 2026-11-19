@@ -47,6 +47,8 @@ import type {
   SendResult,
   Snapshot,
   TanAuthor,
+  TanList,
+  TanListMember,
   TanPost,
   TanQuoter,
   TanReactors,
@@ -664,6 +666,7 @@ export async function getTanTimeline(opts: {
   all?: boolean;
   author?: string;
   tag?: string;
+  list?: string;
 } = {}): Promise<TanPost[]> {
   const data = await get<{ posts: TanPost[]; count: number }>(
     `/api/tan/timeline${query({
@@ -671,6 +674,7 @@ export async function getTanTimeline(opts: {
       all: opts.all ? "1" : undefined,
       author: opts.author,
       tag: opts.tag,
+      list: opts.list,
     })}`,
   );
   return data.posts;
@@ -775,6 +779,35 @@ export async function getTanFollowedTags(): Promise<string[]> {
 export async function getTanMutedTags(): Promise<string[]> {
   const data = await get<{ muted_tags: string[]; count: number }>("/api/tan/muted-tags");
   return data.muted_tags;
+}
+
+export async function getTanLists(): Promise<TanList[]> {
+  const data = await get<{ lists: TanList[]; count: number }>("/api/tan/lists");
+  return data.lists;
+}
+
+export async function getTanListMembers(name: string): Promise<{
+  name: string;
+  members: TanListMember[];
+  count: number;
+}> {
+  return get(`/api/tan/lists/members${query({ name })}`);
+}
+
+export async function createTanList(name: string): Promise<unknown> {
+  return post("/api/tan/lists", { name });
+}
+
+export async function deleteTanList(name: string): Promise<unknown> {
+  return post("/api/tan/lists/delete", { name });
+}
+
+export async function addTanListMember(name: string, target: string): Promise<unknown> {
+  return post("/api/tan/lists/add", { name, target });
+}
+
+export async function removeTanListMember(name: string, target: string): Promise<unknown> {
+  return post("/api/tan/lists/remove", { name, target });
 }
 
 export async function getTanSaved(limit = 30, offset = 0): Promise<{ posts: TanPost[]; next_offset: number | null }> {

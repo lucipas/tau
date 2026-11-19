@@ -7293,6 +7293,122 @@ def test_tan_mute_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_lists_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    third = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "hello from tan", name="tester", now=1000)
+        theirs = create_post(conn, other, "bob's update", name="bob", now=1001)
+        hers = create_post(conn, third, "carol's update", name="carol", now=1002)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/lists")
+        assert status == 200
+        assert payload == {"lists": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge, "/api/tan/lists", method="POST", body={"name": "Friends"}
+        )
+        assert status == 200
+        assert payload["list"]["name"] == "Friends"
+        assert payload["list"]["members"] == 0
+
+        # A duplicate name (any case) is a client error.
+        status, _, payload = _json(
+            bridge, "/api/tan/lists", method="POST", body={"name": "friends"}
+        )
+        assert status == 400
+
+        # Members resolve by name, like the CLI; bob is followed here
+        # only after the follow below, so the first add notes that.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/lists/add",
+            method="POST",
+            body={"name": "Friends", "target": "bob"},
+        )
+        assert status == 200
+        assert payload["member"]["author"] == theirs["author"]
+        assert payload["member"]["added"] is True
+        assert payload["member"]["followed"] is False
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/lists/add",
+            method="POST",
+            body={"name": "Friends", "target": hers["author"]},
+        )
+        assert status == 200
+        assert payload["member"]["added"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/lists/members?name=Friends")
+        assert status == 200
+        assert payload["name"] == "Friends"
+        assert payload["count"] == 2
+        assert {item["author"] for item in payload["members"]} == {
+            theirs["author"],
+            hers["author"],
+        }
+
+        # The list timeline reads only its members.
+        status, _, payload = _json(bridge, "/api/tan/timeline?list=Friends")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "carol's update",
+            "bob's update",
+        ]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/lists/remove",
+            method="POST",
+            body={"name": "Friends", "target": "carol"},
+        )
+        assert status == 200
+        assert payload["member"]["removed"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?list=Friends")
+        assert [item["text"] for item in payload["posts"]] == ["bob's update"]
+
+        # Unknown lists and missing fields are client errors.
+        status, _, payload = _json(bridge, "/api/tan/timeline?list=Nope")
+        assert status == 400
+        status, _, payload = _json(bridge, "/api/tan/lists/members?name=Nope")
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/lists", method="POST", body={}
+        )
+        assert status == 400
+        assert "field 'name' is required" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/lists/delete",
+            method="POST",
+            body={"name": "Friends"},
+        )
+        assert status == 200
+        assert payload["list"]["deleted"] is True
+        status, _, payload = _json(bridge, "/api/tan/lists")
+        assert payload == {"lists": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
 def test_tan_follow_tag_via_api(tmp_path):
     import RNS
 

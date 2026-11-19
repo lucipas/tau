@@ -19,6 +19,7 @@ import {
   getChannelScheduled,
   getChannelTopic,
   getMessages,
+  getTanLists,
   getTanThread,
   getTanTimeline,
   markRead,
@@ -96,6 +97,19 @@ describe("GET endpoints", () => {
     nextJson = { posts: [], count: 0 };
     await getTanTimeline({ limit: 10, all: true, author: "alice", tag: "mesh" });
     expect(captured[0].url).toBe("/api/tan/timeline?limit=10&all=1&author=alice&tag=mesh");
+  });
+
+  it("builds the Tan timeline query for a list", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanTimeline({ list: "Mesh Core" });
+    expect(captured[0].url).toBe("/api/tan/timeline?limit=30&list=Mesh%20Core");
+  });
+
+  it("lists Tan lists", async () => {
+    nextJson = { lists: [{ name: "Friends", created_at: 1000, members: 2 }], count: 1 };
+    const lists = await getTanLists();
+    expect(captured[0].url).toBe("/api/tan/lists");
+    expect(lists).toEqual([{ name: "Friends", created_at: 1000, members: 2 }]);
   });
 
   it("omits empty timeline params", async () => {

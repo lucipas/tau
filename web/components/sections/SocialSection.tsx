@@ -56,6 +56,7 @@ export default function SocialSection() {
   const [tab, setTab] = useState<TanFeedMode>("following");
   const [view, setView] = useState<View>("feed");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [listFilter, setListFilter] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<TanPost[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -72,7 +73,7 @@ export default function SocialSection() {
   const [authors, setAuthors] = useState<TanAuthor[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, pollMs: 30_000 });
+  const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, list: listFilter ?? undefined, pollMs: 30_000 });
   const lists = useTanLists();
   const composer = useTanComposer();
   const thread = useTanThread(threadHash);
@@ -138,6 +139,7 @@ export default function SocialSection() {
 
   function clearFilters() {
     setTagFilter(null);
+    setListFilter(null);
     setSearchQuery("");
     setSearchResults(null);
   }
@@ -192,11 +194,19 @@ export default function SocialSection() {
             </button>
           )}
         </form>
-        {(tagFilter || searchResults) && (
+        {(tagFilter || listFilter || searchResults) && (
           <p className="mt-2 text-xs text-zinc-400">
             {tagFilter && (
               <>
                 Tag <span className="text-cyan-400">#{tagFilter}</span>{" "}
+                <button type="button" onClick={clearFilters} className="text-zinc-300 underline">
+                  clear
+                </button>
+              </>
+            )}
+            {listFilter && (
+              <>
+                List <span className="text-cyan-400">{listFilter}</span>{" "}
                 <button type="button" onClick={clearFilters} className="text-zinc-300 underline">
                   clear
                 </button>
@@ -210,6 +220,30 @@ export default function SocialSection() {
               </>
             )}
           </p>
+        )}
+        {lists.lists.length > 0 && (
+          <div className="mt-2 flex items-center gap-2 text-xs">
+            <label htmlFor="tan-list-filter" className="shrink-0 text-zinc-500">
+              List
+            </label>
+            <select
+              id="tan-list-filter"
+              aria-label="Filter feed by list"
+              value={listFilter ?? ""}
+              onChange={(e) => setListFilter(e.target.value || null)}
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500"
+            >
+              <option value="">All followed</option>
+              {lists.lists.map((l) => (
+                <option key={l.name} value={l.name}>
+                  {l.name} ({l.members})
+                </option>
+              ))}
+            </select>
+            <span className="truncate text-zinc-500">
+              Manage lists with <code>tau tan lists</code>
+            </span>
+          </div>
         )}
         <p className="mt-0.5 text-xs text-zinc-500">
           The Tan feed lives here — posts, replies, likes, polls and follows from across the mesh.
@@ -355,9 +389,11 @@ export default function SocialSection() {
                     ? "No posts match that search."
                     : tagFilter
                       ? `No posts under #${tagFilter} yet.`
-                      : tab === "following"
-                        ? "Nothing from people you follow yet — try All, or Discover someone to follow."
-                        : "No posts yet."}
+                      : listFilter
+                        ? `No posts from “${listFilter}” yet.`
+                        : tab === "following"
+                          ? "Nothing from people you follow yet — try All, or Discover someone to follow."
+                          : "No posts yet."}
                 </p>
               )}
               {posts.map((p) => (

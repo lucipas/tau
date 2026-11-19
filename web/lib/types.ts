@@ -577,6 +577,19 @@ export interface TanTag {
   count: number;
 }
 
+export interface TanList {
+  name: string;
+  created_at: number;
+  members: number;
+}
+
+export interface TanListMember {
+  author: string;
+  name: string;
+  added_at: number;
+  posts?: number;
+}
+
 export interface TanAuthor {
   author: string;
   name: string;

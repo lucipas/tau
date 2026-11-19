@@ -271,6 +271,7 @@ from .tangents.tan import (
     _author_from_identity,
     _clean_poll_options,
     _decode_options,
+    add_to_list,
     annotate_pinned,
     annotate_quote_counts,
     annotate_quotes,
@@ -282,8 +283,11 @@ from .tangents.tan import (
     author_stats,
     author_timeline,
     claim_draft,
+    clean_list_name,
     clean_tag,
+    create_list,
     delete_draft,
+    delete_list,
     draft_claim_held,
     export_entries,
     follow,
@@ -299,6 +303,9 @@ from .tangents.tan import (
     likers,
     list_authors,
     list_drafts,
+    list_member_authors,
+    list_members,
+    list_timeline,
     mentions,
     mute,
     mute_keyword,
@@ -316,6 +323,7 @@ from .tangents.tan import (
     refresh_draft_claim,
     release_draft_claim,
     reposters,
+    remove_from_list,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -330,6 +338,7 @@ from .tangents.tan import (
     suggest_authors,
     media_path,
     tags,
+    tan_lists,
     thread,
     timeline,
     top_posts,
@@ -3449,6 +3458,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--author", metavar="NAME|HASH", help="show one author's posts"
     )
     tan_timeline.add_argument(
+        "--list",
+        metavar="NAME",
+        default=None,
+        help="show only posts from this list's members",
+    )
+    tan_timeline.add_argument(
         "--tag", metavar="TAG", help="show only posts carrying this tag"
     )
     tan_timeline.add_argument(
@@ -3658,6 +3673,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     tan_muted = tan_sub.add_parser("muted", parents=[common], help="list muted authors")
     tan_muted.set_defaults(func=cmd_tan_muted)
+
+    tan_lists_cmd = tan_sub.add_parser(
+        "lists",
+        parents=[common],
+        help="curate followed authors into named lists",
+    )
+    lists_sub = tan_lists_cmd.add_subparsers(
+        dest="lists_cmd", metavar="LISTS_COMMAND"
+    )
+    lists_create = lists_sub.add_parser(
+        "create", parents=[common], help="create an empty list"
+    )
+    lists_create.add_argument("name", metavar="NAME", help="list name")
+    lists_delete = lists_sub.add_parser(
+        "delete", parents=[common], help="delete a list"
+    )
+    lists_delete.add_argument("name", metavar="NAME", help="list name")
+    lists_add = lists_sub.add_parser(
+        "add", parents=[common], help="add authors to a list"
+    )
+    lists_add.add_argument("name", metavar="NAME", help="list name")
+    lists_add.add_argument(
+        "authors", nargs="+", metavar="NAME|HASH", help="authors to add"
+    )
+    lists_remove = lists_sub.add_parser(
+        "remove", parents=[common], help="remove authors from a list"
+    )
+    lists_remove.add_argument("name", metavar="NAME", help="list name")
+    lists_remove.add_argument(
+        "authors", nargs="+", metavar="NAME|HASH", help="authors to remove"
+    )
+    lists_show = lists_sub.add_parser(
+        "show", parents=[common], help="show a list's members"
+    )
+    lists_show.add_argument("name", metavar="NAME", help="list name")
+    tan_lists_cmd.set_defaults(func=cmd_tan_lists)
 
     tan_mute_keyword = tan_sub.add_parser(
         "mute-keyword",
@@ -7200,7 +7251,17 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
     try:
         identity = load_identity(config.identity_path)
         viewer = destination_hash(identity).hex() if identity is not None else None
-        if getattr(args, "author", None):
+        if getattr(args, "list", None):
+            posts = list_timeline(
+                conn,
+                args.list,
+                limit=args.limit,
+                viewer=viewer,
+                exclude_authors=blocked,
+                exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
+            )
+        elif getattr(args, "author", None):
             author, _ = resolve_author(
                 conn, args.author, registry=PeerRegistry(config.peers_path)
             )
@@ -7883,6 +7944,142 @@ def cmd_tan_muted(args: argparse.Namespace) -> int:
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s) muted {when}"
             )
+    return _EXIT_OK
+
+
+def cmd_tan_lists(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    cmd = getattr(args, "lists_cmd", None)
+    registry = PeerRegistry(config.peers_path)
+    conn = init_db(config.social_db_path)
+    try:
+        if cmd is None:
+            records = tan_lists(conn)
+            if json_output:
+                _emit({"lists": records, "count": len(records)}, True)
+            else:
+                if not records:
+                    print("No lists yet. Create one with `tau tan lists create friends`.")
+                for record in records:
+                    count = record["members"]
+                    print(
+                        f"{record['name']:<20} {count} member(s)"
+                    )
+            return _EXIT_OK
+        if cmd == "create":
+            config.prepare()
+            record = create_list(conn, args.name)
+            if json_output:
+                _emit(record, True)
+            else:
+                print(f"created list {record['name']!r}")
+            return _EXIT_OK
+        if cmd == "delete":
+            removed = delete_list(conn, args.name)
+            if json_output:
+                _emit(
+                    {"name": args.name.strip(), "deleted": removed}, True
+                )
+            else:
+                if removed:
+                    print(f"deleted list {args.name.strip()!r}")
+                else:
+                    print(f"no list named {args.name.strip()!r}")
+            return _EXIT_OK
+        if cmd == "show":
+            records = list_members(conn, args.name)
+            for record in records:
+                record.update(author_stats(conn, record["author"]))
+                peer = registry.get(record["author"])
+                if peer is not None and peer.display_name:
+                    record["name"] = peer.display_name
+            display = next(
+                (
+                    entry["name"]
+                    for entry in tan_lists(conn)
+                    if entry["name"].casefold() == args.name.strip().casefold()
+                ),
+                args.name.strip(),
+            )
+            if json_output:
+                _emit(
+                    {
+                        "name": display,
+                        "members": records,
+                        "count": len(records),
+                    },
+                    True,
+                )
+            else:
+                if not records:
+                    print(f"List {display!r} is empty.")
+                for record in records:
+                    name = record.get("name") or "unknown"
+                    print(
+                        f"{name:<20} {short_hash(record['author']):<10} "
+                        f"{record.get('posts', 0)} post(s)"
+                    )
+            return _EXIT_OK
+        if cmd in ("add", "remove"):
+            config.prepare()
+            followed = {
+                record["author"] for record in following(conn)
+            }
+            results = []
+            for target in args.authors:
+                author, name = resolve_author(conn, target, registry=registry)
+                if cmd == "add":
+                    record = add_to_list(
+                        conn, args.name, author, author_name=name
+                    )
+                    record["followed"] = author in followed
+                    results.append(record)
+                else:
+                    removed = remove_from_list(conn, args.name, author)
+                    results.append(
+                        {
+                            "list": args.name.strip(),
+                            "author": author,
+                            "name": name,
+                            "removed": removed,
+                        }
+                    )
+            if json_output:
+                _emit({"results": results, "count": len(results)}, True)
+            else:
+                for record in results:
+                    label = record["name"] or record["author"]
+                    if cmd == "add":
+                        note = (
+                            " (not followed — a list is curation, not a follow)"
+                            if not record["followed"]
+                            else ""
+                        )
+                        if record["added"]:
+                            print(
+                                f"added {label} ({short_hash(record['author'])}) "
+                                f"to {record['list']!r}{note}"
+                            )
+                        else:
+                            print(
+                                f"{label} ({short_hash(record['author'])}) "
+                                f"is already in {record['list']!r}"
+                            )
+                    else:
+                        if record["removed"]:
+                            print(
+                                f"removed {label} ({short_hash(record['author'])}) "
+                                f"from {record['list']!r}"
+                            )
+                        else:
+                            print(
+                                f"{label} ({short_hash(record['author'])}) "
+                                f"was not in {record['list']!r}"
+                            )
+            return _EXIT_OK
+    finally:
+        conn.close()
     return _EXIT_OK
 
 

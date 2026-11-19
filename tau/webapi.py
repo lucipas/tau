@@ -126,6 +126,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/id/rename    rename this node (live name + re-announce)
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/lists    named author lists with member counts
+    GET  /api/tan/lists/members members of one list (``?name=<list>``)
     GET  /api/tan/tags     tags in stored posts, most-used first
     GET  /api/tan/top      most-liked stored posts (``?limit=10``, ``?author=<name or hash>``)
     GET  /api/tan/search   search stored posts by keyword
@@ -150,6 +152,10 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/edit     edit one of your own posts
     POST /api/tan/follow   follow an author
     POST /api/tan/unfollow stop following an author
+    POST /api/tan/lists    create a named author list
+    POST /api/tan/lists/delete delete a named author list
+    POST /api/tan/lists/add add an author to a list
+    POST /api/tan/lists/remove remove an author from a list
     GET  /api/tan/muted    muted authors
     POST /api/tan/mute     mute an author
     POST /api/tan/unmute   unmute an author
@@ -2313,6 +2319,7 @@ class WebBridge:
         include_all: bool = False,
         author: Optional[str] = None,
         tag: Optional[str] = None,
+        list_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
@@ -2326,6 +2333,7 @@ class WebBridge:
             apply_display_rules,
             author_timeline,
             following,
+            list_timeline,
             resolve_author,
             timeline,
         )
@@ -2347,7 +2355,17 @@ class WebBridge:
                 viewer = (
                     destination_hash(identity).hex() if identity is not None else None
                 )
-            if author:
+            if list_name:
+                posts = list_timeline(
+                    conn,
+                    list_name,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                    tag=tag,
+                )
+            elif author:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
                 posts = author_timeline(
                     conn,
@@ -3227,6 +3245,108 @@ class WebBridge:
             for record in records:
                 record.update(stats[record["author"]])
             return records
+        finally:
+            conn.close()
+
+    def tan_lists(self) -> List[Dict[str, Any]]:
+        from .tangents.tan import tan_lists
+
+        conn = self._tan_conn()
+        try:
+            return tan_lists(conn)
+        finally:
+            conn.close()
+
+    def tan_list_members(self, name: str) -> Dict[str, Any]:
+        from .tangents.tan import author_stats_many, list_members, tan_lists
+
+        conn = self._tan_conn()
+        try:
+            records = list_members(conn, name)
+            stats = author_stats_many(conn, [record["author"] for record in records])
+            for record in records:
+                record.update(stats[record["author"]])
+            display = next(
+                (
+                    entry["name"]
+                    for entry in tan_lists(conn)
+                    if entry["name"].casefold() == str(name).strip().casefold()
+                ),
+                str(name).strip(),
+            )
+            return {"name": display, "members": records, "count": len(records)}
+        finally:
+            conn.close()
+
+    def tan_create_list(self, name: str) -> Dict[str, Any]:
+        from .tangents.tan import create_list
+
+        conn = self._tan_conn()
+        try:
+            return create_list(conn, name)
+        finally:
+            conn.close()
+
+    def tan_delete_list(self, name: str) -> Dict[str, Any]:
+        from .tangents.tan import delete_list, tan_lists
+
+        conn = self._tan_conn()
+        try:
+            display = next(
+                (
+                    entry["name"]
+                    for entry in tan_lists(conn)
+                    if entry["name"].casefold() == str(name).strip().casefold()
+                ),
+                str(name).strip(),
+            )
+            return {"name": display, "deleted": delete_list(conn, name)}
+        finally:
+            conn.close()
+
+    def _resolve_list_target(self, conn, target: str):
+        """Resolve a list add/remove target the way the CLI does.
+
+        The registry lookup first, then the name on the author's cached
+        posts — a list member need not be followed or known to the
+        registry.
+        """
+        from .tangents.tan import TanError, resolve_author, resolve_cached_author
+
+        try:
+            return resolve_author(conn, target, registry=self.node.registry)
+        except TanError as exc:
+            try:
+                return resolve_cached_author(conn, target)
+            except TanError:
+                raise exc from None
+
+    def tan_list_add(self, name: str, target: str) -> Dict[str, Any]:
+        from .tangents.tan import add_to_list, following
+
+        conn = self._tan_conn()
+        try:
+            author, author_name = self._resolve_list_target(conn, target)
+            record = add_to_list(conn, name, author, author_name=author_name)
+            record["followed"] = author in {
+                entry["author"] for entry in following(conn)
+            }
+            return record
+        finally:
+            conn.close()
+
+    def tan_list_remove(self, name: str, target: str) -> Dict[str, Any]:
+        from .tangents.tan import remove_from_list
+
+        conn = self._tan_conn()
+        try:
+            author, author_name = self._resolve_list_target(conn, target)
+            return {
+                "list": str(name).strip(),
+                "author": author,
+                "name": author_name,
+                "removed": remove_from_list(conn, name, author),
+            }
         finally:
             conn.close()
 
@@ -11077,14 +11197,43 @@ class _WebHandler(BaseHTTPRequestHandler):
                 include_all = _query_flag(query, "all")
                 author = (query.get("author") or [None])[0]
                 tag = (query.get("tag") or [None])[0]
+                list_name = (query.get("list") or [None])[0]
                 try:
                     posts = self.bridge.tan_timeline(
-                        limit=limit, include_all=include_all, author=author, tag=tag
+                        limit=limit,
+                        include_all=include_all,
+                        author=author,
+                        tag=tag,
+                        list_name=list_name,
                     )
                 except Exception as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/lists":
+                records = self.bridge.tan_lists()
+                self._send_json(
+                    {"lists": records, "count": len(records)}, head_only
+                )
+                return
+            if path == "/api/tan/lists/members":
+                name = (query.get("name") or [None])[0]
+                if not name or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "query 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    payload = self.bridge.tan_list_members(name.strip())
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(payload, head_only)
                 return
             if path == "/api/tan/tags":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=100)
@@ -12769,6 +12918,75 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "mute": result}, head_only)
+                return
+            if path == "/api/tan/lists":
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    result = self.bridge.tan_create_list(name.strip())
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "list": result}, head_only)
+                return
+            if path == "/api/tan/lists/delete":
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    result = self.bridge.tan_delete_list(name.strip())
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "list": result}, head_only)
+                return
+            if path in ("/api/tan/lists/add", "/api/tan/lists/remove"):
+                name = body.get("name")
+                target = body.get("target") or body.get("author")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    if path.endswith("remove"):
+                        result = self.bridge.tan_list_remove(
+                            name.strip(), target.strip()
+                        )
+                    else:
+                        result = self.bridge.tan_list_add(
+                            name.strip(), target.strip()
+                        )
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "member": result}, head_only)
                 return
             if path in ("/api/tan/mute-keyword", "/api/tan/unmute-keyword"):
                 keyword = body.get("keyword")
