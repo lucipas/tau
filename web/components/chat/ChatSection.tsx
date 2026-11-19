@@ -16,6 +16,7 @@ import {
   forwardMessage,
   getArchivedConversations,
   getMutedConversations,
+  joinGroupViaLink,
   pinMessage,
   reactToMessage,
   retractMessage,
@@ -31,6 +32,7 @@ import type { ChatMessage } from "@/lib/types";
 import {
   buildConversations,
   useBeacons,
+  useBroadcasts,
   useConversations,
   useOutbox,
   usePeerActions,
@@ -39,7 +41,9 @@ import {
 import { useHash } from "../chrome/useHash";
 import { useTauContext } from "../chrome/TauContext";
 import BeaconControl from "./BeaconControl";
+import BroadcastsPanel from "./BroadcastsPanel";
 import ConversationList from "./ConversationList";
+import MessageSearch from "./MessageSearch";
 import OutboxPanel from "./OutboxPanel";
 import ThreadView from "./ThreadView";
 import type { MessageAction } from "./MessageBubble";
@@ -89,6 +93,7 @@ export default function ChatSection() {
   const actions = usePeerActions();
   const outbox = useOutbox();
   const beacons = useBeacons();
+  const broadcasts = useBroadcasts();
 
   const [mutedPeers, setMutedPeers] = useState<Set<string>>(new Set());
   const [mutedGroups, setMutedGroups] = useState<Set<string>>(new Set());
@@ -96,7 +101,14 @@ export default function ChatSection() {
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editing, setEditing] = useState<ChatMessage | null>(null);
   const [showOutbox, setShowOutbox] = useState(false);
+  const [showBroadcasts, setShowBroadcasts] = useState(false);
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchReset, setSearchReset] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [showJoin, setShowJoin] = useState(false);
+  const [joinLink, setJoinLink] = useState("");
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [joinResult, setJoinResult] = useState<string | null>(null);
 
   const { conversations, archived: archivedConvs, dmRequests, refreshRequests } = useConversations(
     tau,
@@ -167,7 +179,53 @@ export default function ChatSection() {
     [navigate],
   );
 
+  async function handleJoinGroup() {
+    const link = joinLink.trim();
+    if (!link || joinBusy) return;
+    setJoinBusy(true);
+    setError(null);
+    setJoinResult(null);
+    try {
+      const result = await joinGroupViaLink(link);
+      await tau.refresh();
+      if (
+        (result.status === "added" || result.status === "already_member") &&
+        typeof result.group === "object" &&
+        result.group.id
+      ) {
+        setJoinLink("");
+        setShowJoin(false);
+        navigate("chat", { group: result.group.id });
+      } else if (result.status === "pending") {
+        const name =
+          typeof result.group === "object" ? result.group.name : result.group;
+        setJoinResult(
+          `Join request pending — the creator of “${name}” has to approve it first.`,
+        );
+      } else {
+        const name =
+          typeof result.group === "object" ? result.group.name : result.group;
+        setJoinResult(
+          `Join request for “${name}” queued — it will be decided when it reaches the creator.`,
+        );
+      }
+    } catch (err) {
+      setError(`Join failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setJoinBusy(false);
+    }
+  }
+
   const handleBack = useCallback(() => navigate("chat"), [navigate]);
+
+  const handleOpenSearchResult = useCallback(
+    (message: ChatMessage) => {
+      if (message.group) navigate("chat", { group: message.group });
+      else if (message.peer) navigate("chat", { peer: message.peer });
+      setSearchReset((n) => n + 1);
+    },
+    [navigate],
+  );
 
   async function run(label: string, fn: () => Promise<unknown>) {
     setError(null);
@@ -194,6 +252,7 @@ export default function ChatSection() {
         expiresIn: opts.expiresIn,
         sendIn: opts.sendIn,
         pollOptions: opts.pollOptions,
+        location: opts.location,
       };
       setReplyTo(null);
       await run("Send failed", () => sendMessage(target, text, sendOpts));
@@ -314,15 +373,78 @@ export default function ChatSection() {
       >
         <header className="flex items-center justify-between border-b border-zinc-800 px-3 py-2.5">
           <h1 className="text-lg font-bold text-zinc-50">Chat</h1>
-          <button
-            type="button"
-            aria-expanded={showOutbox}
-            onClick={() => setShowOutbox((v) => !v)}
-            className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
-          >
-            Outbox{outboxCount > 0 ? ` (${outboxCount})` : ""}
-          </button>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              aria-expanded={showJoin}
+              onClick={() => {
+                setShowJoin((v) => !v);
+                setJoinResult(null);
+              }}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
+            >
+              Join a group
+            </button>
+            <button
+              type="button"
+              aria-expanded={showBroadcasts}
+              onClick={() => setShowBroadcasts((v) => !v)}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
+            >
+              Broadcasts
+              {broadcasts.broadcasts.length > 0
+                ? ` (${broadcasts.broadcasts.length})`
+                : ""}
+            </button>
+            <button
+              type="button"
+              aria-expanded={showOutbox}
+              onClick={() => setShowOutbox((v) => !v)}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
+            >
+              Outbox{outboxCount > 0 ? ` (${outboxCount})` : ""}
+            </button>
+          </div>
         </header>
+        {showJoin && (
+          <div className="border-b border-zinc-800 px-3 py-2">
+            <label className="text-xs font-semibold text-zinc-400" htmlFor="join-group-link">
+              Paste an invite link to join a group
+            </label>
+            <div className="mt-1 flex gap-2">
+              <input
+                id="join-group-link"
+                value={joinLink}
+                onChange={(e) => setJoinLink(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void handleJoinGroup();
+                }}
+                placeholder="tau://invite/…"
+                className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 font-mono text-xs text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500"
+              />
+              <button
+                type="button"
+                disabled={joinBusy || !joinLink.trim()}
+                onClick={() => void handleJoinGroup()}
+                className="shrink-0 rounded-full bg-cyan-500 px-3 py-1.5 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+              >
+                Join
+              </button>
+            </div>
+            {joinResult && <p className="mt-1 text-xs text-zinc-400">{joinResult}</p>}
+          </div>
+        )}
+        {showBroadcasts && (
+          <BroadcastsPanel
+            broadcasts={broadcasts.broadcasts}
+            peers={tau.peers}
+            loading={broadcasts.loading}
+            error={broadcasts.error}
+            onCreate={(name, members) => broadcasts.create(name, members)}
+            onDelete={(name) => broadcasts.remove(name)}
+            onSend={(name, text) => broadcasts.send(name, text)}
+          />
+        )}
         {showOutbox && (
           <OutboxPanel
             outbox={outbox.outbox}
@@ -334,21 +456,28 @@ export default function ChatSection() {
             onDropHeld={(target) => void outbox.dropHeld(target)}
           />
         )}
-        <div className="min-h-0 flex-1">
-          <ConversationList
-            conversations={conversations}
-            archived={archivedConvs}
-            dmRequests={dmRequests}
-            selectedKey={selectedKey}
-            onSelect={handleSelect}
-            onAcceptRequest={(req) => {
-              void run("Accept failed", () => acceptDmRequest(req.id)).then(() => void refreshRequests());
-            }}
-            onDeclineRequest={(req) => {
-              void run("Decline failed", () => declineDmRequest(req.id)).then(() => void refreshRequests());
-            }}
-          />
-        </div>
+        <MessageSearch
+          onOpen={handleOpenSearchResult}
+          onActiveChange={setSearchActive}
+          resetToken={searchReset}
+        />
+        {!searchActive && (
+          <div className="min-h-0 flex-1">
+            <ConversationList
+              conversations={conversations}
+              archived={archivedConvs}
+              dmRequests={dmRequests}
+              selectedKey={selectedKey}
+              onSelect={handleSelect}
+              onAcceptRequest={(req) => {
+                void run("Accept failed", () => acceptDmRequest(req.id)).then(() => void refreshRequests());
+              }}
+              onDeclineRequest={(req) => {
+                void run("Decline failed", () => declineDmRequest(req.id)).then(() => void refreshRequests());
+              }}
+            />
+          </div>
+        )}
       </div>
 
       <div className={`min-w-0 flex-1 flex-col ${selected ? "flex" : "hidden lg:flex"}`}>

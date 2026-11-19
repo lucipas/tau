@@ -52,6 +52,7 @@ export interface SnapshotCounts {
 export interface UnreadCounts {
   per_peer: Record<string, number>;
   per_group: Record<string, number>;
+  per_channel: Record<string, number>;
   total: number;
   revision: number;
 }
@@ -108,6 +109,8 @@ export interface Peer {
    *  peer may be impersonating, or null. Added by the bridge. */
   lookalike_of: string | null;
   blocked: boolean;
+  /** True when this conversation is pinned to the top of the list. */
+  pinned?: boolean;
   profile: PeerProfile | null;
   /** Live path-table reachability (from /api/mesh, merged into /api/peers). */
   reachable?: boolean;
@@ -205,6 +208,8 @@ export interface Group {
   created_by_me: boolean;
   can_leave: boolean;
   ignored: boolean;
+  /** True when this conversation is pinned to the top of the list. */
+  pinned?: boolean;
 }
 
 export interface GroupChangeResult {
@@ -221,6 +226,39 @@ export interface LeftGroup {
 export interface LeftGroups {
   left: LeftGroup[];
   ignored: { id: string; name: string }[];
+}
+
+// ---------------------------------------------------------- broadcasts --
+// A broadcast list is a named set of peers for one-to-many DMs: a send
+// fans out as one ordinary DM per member, so recipients never see each
+// other or the list. Lists are local-only, like groups, but carry no
+// shared context and no protocol of their own.
+
+export interface BroadcastMember {
+  hash: string;
+  name: string;
+}
+
+export interface BroadcastList {
+  name: string;
+  members: BroadcastMember[];
+  created_at: number;
+}
+
+export interface BroadcastSendResult {
+  hash: string;
+  name: string;
+  status: "delivered" | "queued" | "failed";
+  error?: string;
+}
+
+export interface BroadcastSendResponse {
+  ok: boolean;
+  name: string;
+  results: BroadcastSendResult[];
+  delivered: number;
+  queued: number;
+  failed: number;
 }
 
 export interface JoinRequest {
@@ -267,9 +305,12 @@ export interface ReplyRef {
 }
 
 export interface LocationPin {
-  latitude: number;
-  longitude: number;
-  label?: string;
+  /** Decimal degrees, -90..90. */
+  lat: number;
+  /** Decimal degrees, -180..180. */
+  lon: number;
+  /** Optional place name, at most 200 characters. */
+  name?: string;
   [key: string]: unknown;
 }
 
@@ -381,11 +422,39 @@ export interface DmRequest {
 export interface DisappearingDefaults {
   peers: Record<string, number>;
   groups: Record<string, number>;
+  channels: Record<string, number>;
+}
+
+export interface QuietHoursSettings {
+  enabled: boolean;
+  start: string;
+  end: string;
+  active: boolean;
+  minutes_until_end: number | null;
+}
+
+export interface AwayMessageSettings {
+  enabled: boolean;
+  message: string;
+  since: number | null;
+  replied_to: string[];
+  replied_count: number;
 }
 
 export interface MutedConversations {
   peers: string[];
   groups: string[];
+}
+
+export interface OwnProfile {
+  author: string | null;
+  name: string;
+  bio: string;
+  avatar: string | null;
+  links: string[];
+  version: number;
+  created_at: number | null;
+  published: boolean;
 }
 
 // --------------------------------------------------------------- outbox --
@@ -636,6 +705,21 @@ export interface TanVerifyReport {
 export interface Channel {
   channel: string;
   joined_at: number;
+  /** True when this channel is pinned to the top of the list. */
+  pinned?: boolean;
+  /** Messages newer than the last-read cursor; always present from /api/channels. */
+  unread: number;
+}
+
+export interface ChannelPollTally {
+  options: string[];
+  counts: number[];
+  total: number;
+  closed: boolean;
+  voters: { author: string; name: string; option: number; voted_at: number }[];
+  my_vote: number | null;
+  /** True when this node authored the poll (so it may close it). */
+  own: boolean;
 }
 
 export interface ChannelReaction {
@@ -655,6 +739,14 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Unix timestamp after which honest nodes purge this message, when set. */
+  expires_at?: number;
+  /** Channel poll question carried on the message itself. */
+  poll_options?: string[];
+  poll_vote?: { target: { author: string; sent_at: number }; option: number };
+  poll_close?: { author: string; sent_at: number };
+  /** Channel poll tally, attached by the bridge from the channel store. */
+  poll?: ChannelPollTally;
   /** Present on pins: when this node pinned the message. */
   pinned_at?: number;
   /** Reaction summary, grouped by token; absent on old servers. */
@@ -675,6 +767,21 @@ export interface ChannelTopic {
   topic: string;
   updated_at: number;
   sig: string;
+}
+
+export interface ScheduledChannelMessage {
+  id: string;
+  channel: string;
+  text: string;
+  publish_at: number;
+  created_at: number;
+  to: string[];
+  ttl: number;
+  message_hash: string | null;
+  attempts: number;
+  next_attempt_at: number | null;
+  paused_at: number | null;
+  [key: string]: unknown;
 }
 
 // ---------------------------------------------------------------- pages --

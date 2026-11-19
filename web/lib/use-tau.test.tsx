@@ -101,7 +101,7 @@ function makeSnapshot(over: Partial<Snapshot> = {}): Snapshot {
     groups: [],
     messages: [makeMessage({ id: 1 })],
     counts: { messages: 1, peers: 1 },
-    unread: { per_peer: {}, per_group: {}, total: 0, revision: 1 },
+    unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1 },
     bridge: { version: "0.0.0", web: true, url: "http://127.0.0.1:8787/", notes_editable: true },
     social: { enabled: true, posts: 0 },
     ...over,
@@ -140,7 +140,7 @@ describe("useTau live socket", () => {
 
     const live = makeMessage({ id: 2, text: "second", sent_at: 1001 });
     await act(async () => {
-      ws.receive({ type: "message", message: live, unread: { per_peer: { ["a".repeat(32)]: 1 }, per_group: {}, total: 1, revision: 2 } });
+      ws.receive({ type: "message", message: live, unread: { per_peer: { ["a".repeat(32)]: 1 }, per_group: {}, per_channel: {}, total: 1, revision: 2 } });
     });
     expect(result.current.messages).toHaveLength(2);
     expect(result.current.messages[1].text).toBe("second");
@@ -220,7 +220,7 @@ describe("buildConversations", () => {
       makeMessage({ id: 2, peer: bob.destination, peer_name: "bob", sent_at: 2000 }),
       makeMessage({ id: 3, peer: alice.destination, peer_name: "alice", sent_at: 1500, group: group.id, group_name: "crew" }),
     ];
-    const unread = { per_peer: { [bob.destination]: 2 }, per_group: { [group.id]: 1 }, total: 3, revision: 1 };
+    const unread = { per_peer: { [bob.destination]: 2 }, per_group: { [group.id]: 1 }, per_channel: {}, total: 3, revision: 1 };
     const list = buildConversations(messages, [alice, bob], [group], unread);
     expect(list.map((c) => c.kind + ":" + c.key)).toEqual([
       `dm:${bob.destination}`,
@@ -238,6 +238,33 @@ describe("buildConversations", () => {
     expect(list).toHaveLength(1);
     expect(list[0].kind).toBe("group");
     expect(list[0].lastMessage).toBeNull();
+  });
+
+  it("pinned conversations sort first, then by recency", () => {
+    const messages = [
+      makeMessage({ id: 1, peer: alice.destination, peer_name: "alice", sent_at: 1000 }),
+      makeMessage({ id: 2, peer: bob.destination, peer_name: "bob", sent_at: 2000 }),
+      makeMessage({ id: 3, peer: alice.destination, peer_name: "alice", sent_at: 1500, group: group.id, group_name: "crew" }),
+    ];
+    const pinnedAlice = { ...alice, pinned: true };
+    const list = buildConversations(messages, [pinnedAlice, bob], [group], null);
+    expect(list.map((c) => c.kind + ":" + c.key)).toEqual([
+      `dm:${alice.destination}`,
+      `dm:${bob.destination}`,
+      `group:${group.id}`,
+    ]);
+    expect(list[0].pinned).toBe(true);
+    expect(list[1].pinned).toBe(false);
+
+    // A pinned group jumps the newer DM too.
+    const pinnedGroup = { ...group, pinned: true };
+    const list2 = buildConversations(messages, [alice, bob], [pinnedGroup], null);
+    expect(list2.map((c) => c.kind + ":" + c.key)).toEqual([
+      `group:${group.id}`,
+      `dm:${bob.destination}`,
+      `dm:${alice.destination}`,
+    ]);
+    expect(list2[0].pinned).toBe(true);
   });
 });
 
