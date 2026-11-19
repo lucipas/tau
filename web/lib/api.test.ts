@@ -10,6 +10,7 @@ import {
   fetchTanMedia,
   fileUrl,
   getChannelMessages,
+  getChannelTopic,
   getChannelPins,
   getMessages,
   getTanThread,
@@ -23,6 +24,7 @@ import {
   searchChannelMessages,
   sendChannelMessage,
   sendMessage,
+  setChannelTopic,
   tanMediaUrl,
   unpinChannelMessage,
   voteDmPoll,
@@ -101,6 +103,12 @@ describe("GET endpoints", () => {
     nextJson = { channel: "general", messages: [], count: 0 };
     await getChannelMessages("my channel", 5);
     expect(captured[0].url).toBe("/api/channels/messages?channel=my%20channel&limit=5");
+  });
+
+  it("fetches a channel topic by name", async () => {
+    nextJson = { channel: "general", topic: null };
+    await getChannelTopic("my channel");
+    expect(captured[0].url).toBe("/api/channels/topic?channel=my%20channel");
   });
 
   it("fetches channel pins", async () => {
@@ -210,6 +218,14 @@ describe("POST endpoints", () => {
     await fetchTanMedia("a".repeat(64), "b".repeat(32));
     expect(captured[0].url).toBe(`/api/tan/media/${"a".repeat(64)}/fetch`);
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
+  });
+
+  it("sets a channel topic with channel and topic in the body", async () => {
+    nextJson = { ok: true, channel: "general", topic: {}, cleared: false };
+    await setChannelTopic("general", "monthly mesh meetup");
+    expect(captured[0].url).toBe("/api/channels/topic");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ channel: "general", topic: "monthly mesh meetup" });
   });
 
   it("pins and unpins a channel message by hash", async () => {

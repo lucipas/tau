@@ -162,10 +162,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/import   import an export document (every entry verified)
     GET  /api/channels     joined channels, most recently joined first
     GET  /api/channels/messages  stored messages for a channel (``?channel=<name>&limit=20``)
+    GET  /api/channels/topic  current topic for a channel (``?channel=<name>``)
     GET  /api/channels/pins  pinned messages for a channel (``?channel=<name>``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel
+    POST /api/channels/topic  set a channel topic (``{"channel": "<name>", "topic": "<text>"}``; empty clears)
     POST /api/channels/pin  pin a stored message (``{"channel": "<name>", "hash": "<64 hex>"}``)
     POST /api/channels/unpin  drop a pin (``{"channel": "<name>", "hash": "<64 hex>"}``)
     GET  /api/channels/search  stored messages in a channel matching a keyword (``?channel=<name>&q=<text>&limit=20``)
@@ -3947,6 +3949,24 @@ class WebBridge:
     def channel_join(self, channel: str) -> Dict[str, Any]:
         """Join *channel*, recording membership locally."""
         return self._local_channel_app().join(channel)
+
+    def channel_topic(self, channel: str) -> Dict[str, Any]:
+        """Current topic for *channel*, or ``None`` when unset."""
+        from .channels import clean_channel_name
+
+        return {
+            "channel": clean_channel_name(channel),
+            "topic": self._local_channel_app().topic(channel),
+        }
+
+    def channel_set_topic(self, channel: str, topic: str) -> Dict[str, Any]:
+        """Set (or clear, with ``""``) the topic of a joined channel."""
+        app = self._channel_app()
+        if app is None:
+            raise WebBridgeError(
+                "public channels are not enabled; run serve --channels"
+            )
+        return app.set_topic(channel, topic, publish=True)
 
     def channel_pin(self, channel: str, digest: str) -> Dict[str, Any]:
         """Pin a stored message in *channel*; pins survive pruning."""
@@ -10748,6 +10768,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path == "/api/channels/topic":
+                channel = query.get("channel", [None])[0]
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "query 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.channel_topic(channel)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
             if path == "/api/channels/pins":
                 channel = query.get("channel", [None])[0]
                 if not isinstance(channel, str) or not channel.strip():
@@ -12343,6 +12382,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "message": message}, head_only)
+                return
+            if path == "/api/channels/topic":
+                channel = body.get("channel")
+                topic = body.get("topic")
+                if not isinstance(channel, str) or not channel.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'channel' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(topic, str):
+                    self._send_json(
+                        {"error": {"message": "field 'topic' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.channel_set_topic(channel, topic)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
                 return
             if path == "/api/channels/react":
                 channel = body.get("channel")

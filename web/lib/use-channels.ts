@@ -16,6 +16,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   editChannelMessage,
   getChannelMessages,
+  getChannelTopic,
   getChannelPins,
   getChannels,
   joinChannel,
@@ -24,10 +25,11 @@ import {
   reactToChannelMessage,
   searchChannelMessages,
   sendChannelMessage,
+  setChannelTopic,
   syncChannels,
   unpinChannelMessage,
 } from "./api";
-import type { Channel, ChannelMessage } from "./types";
+import type { Channel, ChannelMessage, ChannelTopic } from "./types";
 
 export interface UseChannelsResult {
   channels: Channel[];
@@ -35,6 +37,8 @@ export interface UseChannelsResult {
   selected: string | null;
   select: (channel: string | null) => void;
   messages: ChannelMessage[];
+  /** Current topic of the selected channel, or null when unset. */
+  topic: ChannelTopic | null;
   /** Pinned messages for the selected channel, newest pin first. */
   pins: ChannelMessage[];
   /** Search matches for the selected channel, or null when not searching. */
@@ -49,6 +53,8 @@ export interface UseChannelsResult {
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
   send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
+  setTopic: (text: string) => Promise<void>;
+  clearTopic: () => Promise<void>;
   /** React to a message by hash; an empty reaction clears yours. */
   react: (target: string, reaction: string) => Promise<void>;
   /** Edit your own message in the selected channel, then refresh. */
@@ -62,6 +68,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
+  const [topic, setTopicState] = useState<ChannelTopic | null>(null);
   const [pins, setPins] = useState<ChannelMessage[]>([]);
   const [searchResults, setSearchResults] = useState<ChannelMessage[] | null>(null);
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
@@ -91,11 +98,24 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     }
   }, []);
 
+  const refreshTopic = useCallback(async (channel: string | null) => {
+    if (!channel) {
+      setTopicState(null);
+      return;
+    }
+    try {
+      setTopicState(await getChannelTopic(channel));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     await refreshChannels();
     await refreshMessages(selected);
+    await refreshTopic(selected);
     setLoading(false);
-  }, [refreshChannels, refreshMessages, selected]);
+  }, [refreshChannels, refreshMessages, refreshTopic, selected]);
 
   useEffect(() => {
     void refresh();
@@ -113,7 +133,8 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     setSearchResults(null);
     setSearchQuery(null);
     void refreshMessages(channel);
-  }, [refreshMessages]);
+    void refreshTopic(channel);
+  }, [refreshMessages, refreshTopic]);
 
   const search = useCallback(async (query: string) => {
     if (!selected) throw new Error("no channel selected");
@@ -143,6 +164,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     selected,
     select,
     messages,
+    topic,
     pins,
     searchResults,
     searchQuery,
@@ -156,6 +178,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       await refreshChannels();
       setSelected(channel);
       await refreshMessages(channel);
+      await refreshTopic(channel);
     },
     leave: async (channel) => {
       await leaveChannel(channel);
@@ -163,6 +186,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       if (selected === channel) {
         setSelected(null);
         setMessages([]);
+        setTopicState(null);
         setPins([]);
         setSearchResults(null);
         setSearchQuery(null);
@@ -173,6 +197,16 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       const sent = await sendChannelMessage(selected, text, replyTo);
       await refreshMessages(selected);
       return sent;
+    },
+    setTopic: async (text) => {
+      if (!selected) throw new Error("no channel selected");
+      await setChannelTopic(selected, text);
+      await refreshTopic(selected);
+    },
+    clearTopic: async () => {
+      if (!selected) throw new Error("no channel selected");
+      await setChannelTopic(selected, "");
+      await refreshTopic(selected);
     },
     react: async (target, reaction) => {
       if (!selected) throw new Error("no channel selected");
@@ -187,6 +221,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     sync: async (channel) => {
       await syncChannels(channel ?? selected ?? undefined);
       await refreshMessages(selected);
+      await refreshTopic(selected);
     },
     pin: async (hash) => {
       if (!selected) throw new Error("no channel selected");

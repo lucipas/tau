@@ -135,6 +135,27 @@ until the node stops serving them — a leave is about what *you*
 follow, not a retraction).  Blocked authors are refused at the door
 like everywhere else in tau: a message from a blocked destination is
 dropped, never stored, never re-gossipped.
+
+A channel also carries one topic: a short signed record saying what
+the room is about::
+
+    {
+      "v": 1,
+      "channel": "mesh-meetup",
+      "author": "<32 hex destination hash>",
+      "key": "<128 hex public key>",
+      "topic": "monthly mesh meetup planning",
+      "updated_at": 1760000000.0,
+      "hash": "<64 hex sha256(canonical body)>",
+      "sig": "<128 hex Ed25519 signature over the hash>"
+    }
+
+Channels have no owner, so any member may set the topic and the
+newest ``updated_at`` wins; an empty topic clears the stored one.
+Topics ride the same paths as messages — ``/tau/channel/post``
+accepts a ``{"topic": {...}}`` payload and ``/tau/channel/feed``
+answers with the channel's current topic — so a topic set by one
+member reaches the rest of the room through gossip and sync.
 """
 
 from __future__ import annotations
@@ -158,9 +179,11 @@ from .identity import load_public_key
 from .protocol import (
     APP_NAME,
     ASPECT,
+    MAX_GROUP_TOPIC_LENGTH,
     MAX_MESSAGE_CHARS,
     MAX_REQUEST_BYTES,
     ProtocolError,
+    clean_group_topic,
     clean_reaction,
     decode,
     encode,
@@ -226,6 +249,11 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # message has one — _canonical_body adds it — so a reply cannot be
 # re-pointed at another message either.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
+
+# Fields covered by the topic hash: the same shape as a message,
+# minus the display name (a topic is metadata, not a post) and with
+# the topic text in place of the message text.
+TOPIC_FIELDS = ("v", "channel", "author", "key", "topic", "updated_at")
 
 # Fields covered by a reaction's hash: the channel and the target
 # keep a reaction in its room and on its message, so a relay cannot
@@ -293,6 +321,17 @@ _REACTION_COLUMNS = (
     "reaction",
     "created_at",
     "received_at",
+    "sig",
+)
+
+_TOPIC_COLUMNS = (
+    "v",
+    "hash",
+    "channel",
+    "author",
+    "key",
+    "topic",
+    "updated_at",
     "sig",
 )
 
@@ -1248,6 +1287,21 @@ CREATE TABLE IF NOT EXISTS memberships (
     joined_at REAL NOT NULL
 );
 
+-- One topic per channel: the newest signed topic wins, and an empty
+-- topic clears the row instead of storing a blank.  Topics are
+-- metadata, not messages, so they never count toward the history
+-- cap and are never pruned with it.
+CREATE TABLE IF NOT EXISTS topics (
+    channel TEXT PRIMARY KEY,
+    v INTEGER NOT NULL DEFAULT 1,
+    hash TEXT NOT NULL,
+    author TEXT NOT NULL,
+    key TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    sig TEXT NOT NULL
+);
+
 -- Pins are local-only: a message this node marked to keep surfaced.
 -- A pinned message is never dropped by per-channel pruning, and its
 -- row is deleted with the channel when a merely-cached room is
@@ -1877,6 +1931,243 @@ def create_message(
     _check_wire_size(mesg)
     record, _ = store_message(conn, mesg, now=timestamp)
     return record
+
+
+# -- topics ------------------------------------------------------------------
+
+
+def hash_topic(topic: Dict[str, Any]) -> str:
+    """Hash a channel topic: lowercase hex sha256 of its body."""
+    if not isinstance(topic, dict):
+        raise ChannelError("a channel topic must be a JSON object")
+    missing = [field for field in TOPIC_FIELDS if field not in topic]
+    if missing:
+        raise ChannelError(
+            f"channel topic is missing fields: {', '.join(missing)}"
+        )
+    body = {field: topic[field] for field in TOPIC_FIELDS}
+    canonical = json.dumps(
+        body,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _normalize_topic(topic: Dict[str, Any], *, now: Optional[float] = None) -> Dict[str, Any]:
+    """Validate and normalise the signed part of a channel topic."""
+    if not isinstance(topic, dict):
+        raise ChannelError("a channel topic must be a JSON object")
+
+    version = topic.get("v", CHANNEL_VERSION)
+    if isinstance(version, bool) or version != CHANNEL_VERSION:
+        raise ChannelError(f"unsupported channel topic version: {version!r}")
+
+    channel = clean_channel_name(topic.get("channel"))
+    author = _require_hex(topic.get("author"), AUTHOR_HEX_LENGTH, "author")
+    key = _require_hex(topic.get("key"), KEY_HEX_LENGTH, "key")
+
+    raw_topic = topic.get("topic")
+    if not isinstance(raw_topic, str):
+        raise ChannelError("channel topic must be a string")
+    if len(" ".join(raw_topic.split())) > MAX_GROUP_TOPIC_LENGTH:
+        raise ChannelError(
+            f"channel topic is longer than {MAX_GROUP_TOPIC_LENGTH} characters"
+        )
+    cleaned = clean_group_topic(raw_topic)
+    if cleaned != raw_topic:
+        # Topics are hashed before they reach us.  Silently cleaning
+        # the text would produce a hash that no longer matches what
+        # the author signed.
+        raise ChannelError("channel topic is not normalised")
+
+    updated_at = _require_timestamp(topic.get("updated_at"), "updated_at")
+    if now is not None and updated_at > float(now) + 86400.0:
+        raise ChannelError("channel topic timestamp is too far in the future")
+
+    return {
+        "v": CHANNEL_VERSION,
+        "channel": channel,
+        "author": author,
+        "key": key,
+        "topic": cleaned,
+        "updated_at": updated_at,
+    }
+
+
+def verify_topic(topic: Dict[str, Any], *, now: Optional[float] = None) -> Dict[str, Any]:
+    """Validate a complete channel topic, including hash and signature."""
+    record = _normalize_topic(topic, now=now)
+
+    digest = topic.get("hash")
+    expected = hash_topic(record)
+    if not isinstance(digest, str) or digest.strip().lower() != expected:
+        raise ChannelError("channel topic hash does not match its contents")
+    record["hash"] = expected
+
+    signature = _require_hex(topic.get("sig"), SIG_HEX_LENGTH, "sig")
+    record["sig"] = signature
+
+    identity = _identity_from_message(record)
+    author = _author_from_identity(identity)
+    if author != record["author"]:
+        raise ChannelError("public key does not match the topic author")
+    try:
+        valid = identity.validate(bytes.fromhex(signature), bytes.fromhex(expected))
+    except Exception as exc:  # pragma: no cover - depends on RNS internals
+        raise ChannelError(f"could not check signature: {exc}") from exc
+    if not valid:
+        raise ChannelError("channel topic signature is invalid")
+    return record
+
+
+def _canonical_topic(topic: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the public, canonical representation of a topic."""
+    return {
+        "v": topic["v"],
+        "channel": topic["channel"],
+        "author": topic["author"],
+        "key": topic["key"],
+        "topic": topic["topic"],
+        "updated_at": topic["updated_at"],
+        "hash": topic["hash"],
+        "sig": topic["sig"],
+    }
+
+
+def _check_topic_wire_size(topic: Dict[str, Any]) -> None:
+    """Reject a topic whose publish envelope exceeds the budget."""
+    envelope = dict(topic)
+    envelope.setdefault("hash", "0" * HASH_HEX_LENGTH)
+    envelope.setdefault("sig", "0" * SIG_HEX_LENGTH)
+    try:
+        encode(
+            {"topic": envelope, "ttl": MAX_GOSSIP_TTL},
+            max_bytes=MAX_REQUEST_BYTES,
+        )
+    except ProtocolError as exc:
+        raise ChannelError(
+            f"channel topic is too large to publish: {exc}"
+        ) from exc
+
+
+def create_topic(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    channel: str,
+    topic: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a topic owned by *identity*.
+
+    An empty topic is a clear: the signed envelope is still stored
+    (so peers learn the topic was cleared) but :func:`get_topic`
+    returns ``None`` for the channel afterwards.
+    """
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    if not isinstance(topic, str):
+        raise ChannelError("channel topic must be a string")
+    if len(" ".join(topic.split())) > MAX_GROUP_TOPIC_LENGTH:
+        raise ChannelError(
+            f"channel topic is longer than {MAX_GROUP_TOPIC_LENGTH} characters"
+        )
+    cleaned = clean_group_topic(topic)
+    if cleaned != topic:
+        # Refuse to silently clean: the caller passed text with
+        # newlines or doubled spaces, and the stored topic would not
+        # be the text they asked for.
+        raise ChannelError("channel topic is not normalised")
+    body = {
+        "v": CHANNEL_VERSION,
+        "channel": clean_channel_name(channel),
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "topic": cleaned,
+        "updated_at": timestamp,
+    }
+    envelope = dict(body)
+    digest = hash_topic(body)
+    envelope["hash"] = digest
+    envelope["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    _check_topic_wire_size(envelope)
+    store_topic(conn, envelope, now=timestamp)
+    return envelope
+
+
+def store_topic(
+    conn: sqlite3.Connection,
+    topic: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+    verify: bool = True,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Validate and store a channel topic, returning ``(record, changed)``.
+
+    Newest ``updated_at`` wins — an older topic never overwrites a
+    newer one, and a stale clear never wipes a newer topic.  A tie
+    breaks on the hash, so two nodes holding the same timestamp keep
+    the same topic.  ``changed`` is false when the topic was already
+    stored or was older than the stored one; ``record`` is ``None``
+    when the stored topic was cleared.
+    """
+    timestamp = float(now if now is not None else time.time())
+    if verify:
+        record = verify_topic(topic, now=timestamp)
+    else:
+        record = _normalize_topic(topic, now=timestamp)
+        record["hash"] = hash_topic(record)
+        record["sig"] = _require_hex(topic.get("sig"), SIG_HEX_LENGTH, "sig")
+
+    existing = get_topic(conn, record["channel"])
+    if existing is not None and (record["updated_at"], record["hash"]) <= (
+        existing["updated_at"],
+        existing["hash"],
+    ):
+        return existing, False
+
+    with conn:
+        if not record["topic"]:
+            conn.execute(
+                "DELETE FROM topics WHERE channel = ?", (record["channel"],)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO topics(v, hash, channel, author, key, topic, "
+                "updated_at, sig) VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(channel) DO UPDATE SET "
+                "v = excluded.v, hash = excluded.hash, author = excluded.author, "
+                "key = excluded.key, topic = excluded.topic, "
+                "updated_at = excluded.updated_at, sig = excluded.sig",
+                (
+                    CHANNEL_VERSION,
+                    record["hash"],
+                    record["channel"],
+                    record["author"],
+                    record["key"],
+                    record["topic"],
+                    record["updated_at"],
+                    record["sig"],
+                ),
+            )
+    if not record["topic"]:
+        return None, existing is not None
+    return _canonical_topic(record), True
+
+
+def get_topic(conn: sqlite3.Connection, channel: str) -> Optional[Dict[str, Any]]:
+    """Return the stored topic for *channel*, or ``None``."""
+    name = clean_channel_name(channel)
+    row = conn.execute(
+        f"SELECT {', '.join(_TOPIC_COLUMNS)} FROM topics WHERE channel = ?",
+        (name,),
+    ).fetchone()
+    return _canonical_topic(dict(row)) if row is not None else None
+
+
 def channel_history_page(
     conn: sqlite3.Connection,
     channel: str,
@@ -2290,6 +2581,56 @@ class ChannelApp:
         finally:
             conn.close()
 
+    def topic(self, channel: str) -> Optional[Dict[str, Any]]:
+        """Stored topic for *channel*, or ``None``.
+
+        A topic from a blocked author never surfaces, and a
+        block-list that cannot be read fails closed to no topic —
+        the same rule as history.
+        """
+        conn = self.connect()
+        try:
+            record = get_topic(conn, channel)
+        finally:
+            conn.close()
+        if record is None or self._blocked(record["author"]):
+            return None
+        return record
+
+    def set_topic(
+        self,
+        channel: str,
+        topic: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Set the topic of a joined channel, gossiping it when asked.
+
+        An empty topic clears the stored one.  Setting requires
+        membership, like sending.
+        """
+        name = clean_channel_name(channel)
+        conn = self.connect()
+        try:
+            if not is_member(conn, name):
+                raise ChannelError(
+                    f"not a member of channel {name!r}; join it first"
+                )
+            envelope = create_topic(conn, self.identity, name, topic)
+        finally:
+            conn.close()
+        published = None
+        if publish and self.node is not None:
+            published = self.publish_topic(envelope, targets=targets, ttl=ttl)
+        return {
+            "channel": name,
+            "topic": envelope,
+            "cleared": not envelope["topic"],
+            "published": published,
+        }
+
     def pin(self, channel: str, digest: str) -> Dict[str, Any]:
         """Pin a stored message in *channel*; pins survive pruning."""
         conn = self.connect()
@@ -2535,6 +2876,7 @@ class ChannelApp:
                 "edited": 0,
                 "retracted": 0,
                 "skipped": 0,
+                "topic_updated": False,
                 "errors": [],
             }
 
@@ -2548,6 +2890,7 @@ class ChannelApp:
         edited = 0
         retracted = 0
         skipped = 0
+        topic_updated = False
         errors: List[Dict[str, str]] = []
         try:
             for peer in peers:
@@ -2579,6 +2922,28 @@ class ChannelApp:
                         )
                         break
                     messages = response.get("messages")
+                    # The feed carries the channel's current topic
+                    # alongside history, so a topic reaches a node
+                    # even when the room has no messages to page
+                    # through.  A bad topic is recorded like a bad
+                    # message, never allowed to abort the sync.
+                    raw_topic = response.get("topic")
+                    if isinstance(raw_topic, dict):
+                        if self._blocked(str(raw_topic.get("author", ""))):
+                            skipped += 1
+                        else:
+                            try:
+                                _, topic_changed = store_topic(conn, raw_topic)
+                            except (ChannelError, ProtocolError) as exc:
+                                errors.append(
+                                    {
+                                        "peer": getattr(peer, "hexhash", "?"),
+                                        "error": str(exc),
+                                    }
+                                )
+                            else:
+                                if topic_changed:
+                                    topic_updated = True
                     if not isinstance(messages, list) or not messages:
                         break
                     # Entries arrive from an untrusted peer: a bad one
@@ -2747,6 +3112,7 @@ class ChannelApp:
             "edited": edited,
             "retracted": retracted,
             "skipped": skipped,
+            "topic_updated": topic_updated,
             "errors": errors,
         }
 
@@ -2775,16 +3141,15 @@ class ChannelApp:
             total_edited += summary.get("edited", 0)
         return {"channels": summaries, "stored": total_stored, "edited": total_edited}
 
-    def publish(
+    def _publish_payload(
         self,
-        message: Dict[str, Any],
+        payload: Dict[str, Any],
         *,
         targets: Optional[Sequence[Any]] = None,
-        ttl: int = MAX_GOSSIP_TTL,
         exclude: Optional[str] = None,
         fanout: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Push a channel message to peers; return delivery counts."""
+        """Push a post payload to peers; return delivery counts."""
         node = self.node
         if node is None:
             raise ChannelError("channels are not attached to a running node")
@@ -2796,16 +3161,13 @@ class ChannelApp:
         ]
         if fanout is not None and len(peers) > max(1, int(fanout)):
             peers = random.sample(peers, max(1, int(fanout)))
-        payload = encode(
-            {"message": message, "ttl": max(0, min(int(ttl), MAX_GOSSIP_TTL))},
-            max_bytes=MAX_REQUEST_BYTES,
-        )
+        encoded = encode(payload, max_bytes=MAX_REQUEST_BYTES)
         delivered = 0
         errors: List[Dict[str, str]] = []
         for peer in peers:
             try:
                 node.request(
-                    peer, CHANNEL_POST_PATH, payload, timeout=self.request_timeout
+                    peer, CHANNEL_POST_PATH, encoded, timeout=self.request_timeout
                 )
                 delivered += 1
             except Exception as exc:
@@ -2813,6 +3175,40 @@ class ChannelApp:
                     {"peer": getattr(peer, "hexhash", "?"), "error": str(exc)}
                 )
         return {"delivered": delivered, "peers": len(peers), "errors": errors}
+
+    def publish(
+        self,
+        message: Dict[str, Any],
+        *,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+        exclude: Optional[str] = None,
+        fanout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Push a channel message to peers; return delivery counts."""
+        return self._publish_payload(
+            {"message": message, "ttl": max(0, min(int(ttl), MAX_GOSSIP_TTL))},
+            targets=targets,
+            exclude=exclude,
+            fanout=fanout,
+        )
+
+    def publish_topic(
+        self,
+        topic: Dict[str, Any],
+        *,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+        exclude: Optional[str] = None,
+        fanout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Push a channel topic to peers; return delivery counts."""
+        return self._publish_payload(
+            {"topic": topic, "ttl": max(0, min(int(ttl), MAX_GOSSIP_TTL))},
+            targets=targets,
+            exclude=exclude,
+            fanout=fanout,
+        )
 
     def publish_reaction(
         self,
@@ -3017,6 +3413,19 @@ class ChannelApp:
                     conn.close()
         except (ProtocolError, ChannelError) as exc:
             return response_error("invalid_feed_request", str(exc))
+        # The channel's current topic rides the feed with history, so
+        # a syncing peer learns it without a separate round trip.  A
+        # topic from a blocked author is not served, and a block-list
+        # that fails closed serves no topic at all.
+        topic: Optional[Dict[str, Any]] = None
+        if excluded is not None:
+            conn = self.connect()
+            try:
+                record = get_topic(conn, channel)
+            finally:
+                conn.close()
+            if record is not None and record["author"] not in excluded:
+                topic = record
         while True:
             try:
                 return response_ok(
@@ -3028,6 +3437,7 @@ class ChannelApp:
                     edits_count=len(edits),
                     channel=channel,
                     has_more=has_more,
+                    topic=topic,
                 )
             except ProtocolError as exc:
                 if len(messages) <= 1 and not reactions and not edits and not retractions:
@@ -3070,9 +3480,10 @@ class ChannelApp:
             raw_message = request.get("message")
             raw_edit = request.get("edit")
             raw_retraction = request.get("retraction")
+            raw_topic = request.get("topic")
             present = [
                 part
-                for part in (raw_message, raw_edit, raw_retraction)
+                for part in (raw_message, raw_edit, raw_retraction, raw_topic)
                 if part is not None
             ]
             if not present:
@@ -3127,6 +3538,51 @@ class ChannelApp:
                 )
             if raw_retraction is not None:
                 return self._handle_retraction_post(raw_retraction, ttl, remote_identity)
+
+            if raw_topic is not None:
+                if not isinstance(raw_topic, dict):
+                    raise ChannelError("topic must be a JSON object")
+                verified_topic = verify_topic(raw_topic)
+                if self._blocked(verified_topic["author"]):
+                    log.info(
+                        "Channel topic from blocked %s dropped",
+                        verified_topic["author"][:8],
+                    )
+                    return response_error(
+                        "not_admitted",
+                        "author is blocked on this node",
+                    )
+                conn = self.connect()
+                try:
+                    record, changed = store_topic(conn, raw_topic)
+                finally:
+                    conn.close()
+                if changed:
+                    if record is not None:
+                        log.info(
+                            "Channel #%s topic set by %s: %s",
+                            verified_topic["channel"],
+                            verified_topic["author"][:8],
+                            verified_topic["topic"],
+                        )
+                    else:
+                        log.info(
+                            "Channel #%s topic cleared by %s",
+                            verified_topic["channel"],
+                            verified_topic["author"][:8],
+                        )
+                    if self.gossip and ttl > 0:
+                        self._spawn_gossip_topic(
+                            verified_topic,
+                            ttl=ttl - 1,
+                            exclude=self._caller_hash(remote_identity),
+                        )
+                return response_ok(
+                    topic=verified_topic["channel"],
+                    updated=changed,
+                    server=self.name,
+                    node=getattr(self.node, "destination_hexhash", None),
+                )
 
             if not isinstance(raw_message, dict):
                 raise ChannelError("message must be a JSON object")
@@ -3298,6 +3754,29 @@ class ChannelApp:
                     )
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Channel gossip failed", exc_info=True)
+            finally:
+                self._gossip_slots.release()
+
+        threading.Thread(target=run, name="tau-channel-gossip", daemon=True).start()
+
+    def _spawn_gossip_topic(
+        self, topic: Dict[str, Any], *, ttl: int, exclude: Optional[str]
+    ) -> None:
+        if not self._gossip_slots.acquire(blocking=False):
+            log.debug("Skipping channel topic gossip: too many pending relays")
+            return
+
+        def run() -> None:
+            try:
+                if self.node is not None and not self._closed:
+                    self.publish_topic(
+                        topic,
+                        ttl=ttl,
+                        exclude=exclude,
+                        fanout=self.gossip_fanout,
+                    )
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Channel topic gossip failed", exc_info=True)
             finally:
                 self._gossip_slots.release()
 
