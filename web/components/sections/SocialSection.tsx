@@ -1,7 +1,7 @@
 // SocialSection.tsx — the Tan home feed (X-style): composer on top, tabs
 // Following / All / Top / Mentions, post cards, thread view, search,
-// Discover, tags, and the Saved / Hidden / Pinned / Scheduled / Muted
-// library. Built on useTanFeed / useTanThread / useTanComposer /
+// Discover, tags, Tan lists, and the Saved / Hidden / Pinned / Scheduled /
+// Muted library. Built on useTanFeed / useTanThread / useTanComposer /
 // useTanLists (web/lib/use-tan.ts).
 
 "use client";
@@ -14,7 +14,7 @@ import {
   getTanFollowedTags,
 } from "@/lib/api";
 import { formatDateTime, formatRelative, shortHash } from "@/lib/format";
-import type { TanAuthor, TanPost, TanReactors } from "@/lib/types";
+import type { TanAuthor, TanListMember, TanPost, TanReactors } from "@/lib/types";
 import {
   useTanComposer,
   useTanFeed,
@@ -26,7 +26,7 @@ import PostCard, { type ReactorKind } from "./social/PostCard";
 import TanComposer from "./social/TanComposer";
 
 type LibraryView = "saved" | "hidden" | "pinned" | "scheduled" | "muted";
-type View = "feed" | "discover" | "followers" | LibraryView;
+type View = "feed" | "discover" | "followers" | "lists" | LibraryView;
 
 const FEED_TABS: { id: TanFeedMode; label: string }[] = [
   { id: "following", label: "Following" },
@@ -241,7 +241,13 @@ export default function SocialSection() {
               ))}
             </select>
             <span className="truncate text-zinc-500">
-              Manage lists with <code>tau tan lists</code>
+              <button
+                type="button"
+                onClick={() => setView("lists")}
+                className="text-cyan-400 hover:underline"
+              >
+                Manage lists
+              </button>
             </span>
           </div>
         )}
@@ -354,6 +360,18 @@ export default function SocialSection() {
               }`}
             >
               Followers
+            </button>
+            <button
+              type="button"
+              aria-pressed={view === "lists"}
+              onClick={() => setView("lists")}
+              className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
+                view === "lists"
+                  ? "bg-cyan-500 text-zinc-950"
+                  : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
+              }`}
+            >
+              Lists
             </button>
             {LIBRARY_TABS.map((t) => (
               <button
@@ -478,6 +496,21 @@ export default function SocialSection() {
               onUnfollowAuthor={async (a) => {
                 await feed.unfollow(a);
                 void lists.refresh();
+              }}
+            />
+          )}
+
+          {view === "lists" && (
+            <ListsView
+              lists={lists}
+              onViewFeed={(name) => {
+                setListFilter(name);
+                setView("feed");
+              }}
+              onDeleteList={async (name) => {
+                if (listFilter === name) setListFilter(null);
+                await lists.deleteList(name);
+                setNotice(`Deleted list “${name}”.`);
               }}
             />
           )}
@@ -643,6 +676,273 @@ function FollowersView({
           onFollow={() => void onFollowAuthor(a.author)}
           onUnfollow={() => void onUnfollowAuthor(a.author)}
         />
+      ))}
+    </div>
+  );
+}
+
+function ListsView({
+  lists,
+  onViewFeed,
+  onDeleteList,
+}: {
+  lists: ReturnType<typeof useTanLists>;
+  onViewFeed: (name: string) => void;
+  onDeleteList: (name: string) => Promise<void>;
+}) {
+  const [newName, setNewName] = useState("");
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [members, setMembers] = useState<TanListMember[]>([]);
+  const [membersLoading, setMembersLoading] = useState(false);
+  const [membersError, setMembersError] = useState<string | null>(null);
+  const [addPick, setAddPick] = useState("");
+  const [addText, setAddText] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function loadMembers(name: string) {
+    setMembersLoading(true);
+    setMembersError(null);
+    try {
+      setMembers(await lists.listMembers(name));
+    } catch (err) {
+      setMembersError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMembersLoading(false);
+    }
+  }
+
+  function toggleMembers(name: string) {
+    if (expanded === name) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(name);
+    setAddPick("");
+    setAddText("");
+    void loadMembers(name);
+  }
+
+  async function createList() {
+    const name = newName.trim();
+    if (!name) {
+      setError("Give the list a name.");
+      return;
+    }
+    setError(null);
+    try {
+      await lists.createList(name);
+      setNewName("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function deleteList(name: string) {
+    setError(null);
+    try {
+      await onDeleteList(name);
+      setConfirmDelete(null);
+      if (expanded === name) setExpanded(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function addMember(name: string) {
+    const target = addText.trim() || addPick;
+    if (!target) {
+      setError("Pick a followed author or enter an author name or hash.");
+      return;
+    }
+    setError(null);
+    try {
+      await lists.addToList(name, target);
+      setAddText("");
+      setAddPick("");
+      await loadMembers(name);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function removeMember(name: string, author: string) {
+    setError(null);
+    try {
+      await lists.removeFromList(name, author);
+      await loadMembers(name);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  const memberAuthors = new Set(members.map((m) => m.author));
+  const addable = lists.following.filter((a) => !memberAuthors.has(a.author));
+
+  return (
+    <div className="px-3 py-4 sm:px-4">
+      <h2 className="text-sm font-bold text-zinc-100">Tan lists</h2>
+      <p className="py-1 text-xs text-zinc-500">
+        Curate followed authors into named lists, then filter the feed by one. Lists are
+        local-only — they never publish or sync.
+      </p>
+      {error && (
+        <p role="alert" className="py-2 text-sm text-red-400">
+          {error}
+        </p>
+      )}
+      <form
+        className="mt-2 flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void createList();
+        }}
+      >
+        <input
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          placeholder="New list name…"
+          aria-label="New list name"
+          className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500"
+        />
+        <button
+          type="submit"
+          className="shrink-0 rounded-full bg-cyan-500 px-3 py-1.5 text-xs font-bold text-zinc-950 hover:bg-cyan-400"
+        >
+          Create list
+        </button>
+      </form>
+
+      {lists.lists.length === 0 && (
+        <p className="py-2 text-sm text-zinc-500">
+          No lists yet — create one above, then add followed authors to it.
+        </p>
+      )}
+      {lists.lists.map((l) => (
+        <div key={l.name} className="border-b border-zinc-800 py-3">
+          <div className="flex items-center gap-2">
+            <p className="min-w-0 flex-1 truncate text-sm font-semibold text-zinc-100">
+              {l.name}{" "}
+              <span className="font-normal text-zinc-500">
+                · {l.members} member{l.members === 1 ? "" : "s"}
+              </span>
+            </p>
+            <button
+              type="button"
+              onClick={() => toggleMembers(l.name)}
+              aria-expanded={expanded === l.name}
+              className="shrink-0 rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+            >
+              {expanded === l.name ? "Hide members" : "Members"}
+            </button>
+            <button
+              type="button"
+              onClick={() => onViewFeed(l.name)}
+              className="shrink-0 rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+            >
+              View feed
+            </button>
+            {confirmDelete === l.name ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void deleteList(l.name)}
+                  className="shrink-0 rounded-full bg-red-500 px-3 py-1 text-xs font-bold text-white hover:bg-red-400"
+                >
+                  Confirm delete
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmDelete(null)}
+                  className="shrink-0 rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmDelete(l.name)}
+                className="shrink-0 rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
+              >
+                Delete
+              </button>
+            )}
+          </div>
+
+          {expanded === l.name && (
+            <div className="mt-3">
+              {membersLoading && <p className="py-2 text-sm text-zinc-500">Loading members…</p>}
+              {membersError && (
+                <p role="alert" className="py-2 text-sm text-red-400">
+                  {membersError}
+                </p>
+              )}
+              {!membersLoading && !membersError && members.length === 0 && (
+                <p className="py-2 text-sm text-zinc-500">No members yet.</p>
+              )}
+              {members.map((m) => (
+                <div key={m.author} className="flex items-center gap-3 border-b border-zinc-800 py-2">
+                  <Avatar name={m.name} seed={m.author} size="sm" />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold text-zinc-100">
+                      {m.name || shortHash(m.author)}
+                    </p>
+                    <p className="text-xs text-zinc-500">
+                      {m.posts !== undefined
+                        ? `${m.posts} post${m.posts === 1 ? "" : "s"}`
+                        : `added ${formatRelative(m.added_at)}`}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void removeMember(l.name, m.author)}
+                    aria-label={`Remove ${m.name || shortHash(m.author)} from ${l.name}`}
+                    className="shrink-0 rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <form
+                className="mt-3 flex flex-wrap gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void addMember(l.name);
+                }}
+              >
+                {addable.length > 0 && (
+                  <select
+                    value={addPick}
+                    onChange={(e) => setAddPick(e.target.value)}
+                    aria-label={`Add a followed author to ${l.name}`}
+                    className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500"
+                  >
+                    <option value="">Followed authors…</option>
+                    {addable.map((a) => (
+                      <option key={a.author} value={a.author}>
+                        {a.name || shortHash(a.author)}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <input
+                  value={addText}
+                  onChange={(e) => setAddText(e.target.value)}
+                  placeholder="Or enter an author name or hash…"
+                  aria-label={`Author name or hash to add to ${l.name}`}
+                  className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500"
+                />
+                <button
+                  type="submit"
+                  className="shrink-0 rounded-full bg-zinc-800 px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:bg-zinc-700"
+                >
+                  Add member
+                </button>
+              </form>
+            </div>
+          )}
+        </div>
       ))}
     </div>
   );

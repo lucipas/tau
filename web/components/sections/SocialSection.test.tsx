@@ -36,17 +36,23 @@ function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): Tan
 let calls: string[] = [];
 let timeline: TanPost[] = [];
 let lists: { name: string; created_at: number; members: number }[] = [];
+let listMembers: { author: string; name: string; added_at: number; posts?: number }[] = [];
+let following: { author: string; name: string; posts: number }[] = [];
 
 beforeEach(() => {
   timeline = [makePost("h1".padEnd(64, "0"), "hello #mesh @bob")];
   lists = [];
+  listMembers = [];
+  following = [];
   const router = mockFetch((url) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
+    if (url.includes("/api/tan/lists/members"))
+      return { name: "Friends", members: listMembers, count: listMembers.length };
     if (url.includes("/api/tan/lists")) return { lists, count: lists.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/thread")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/tags")) return { tags: [{ tag: "mesh", count: 5 }], count: 1 };
-    if (url.includes("/api/tan/following")) return { following: [], count: 0 };
+    if (url.includes("/api/tan/following")) return { following, count: following.length };
     if (url.includes("/api/tan/followers"))
       return {
         followers: [
@@ -146,6 +152,63 @@ describe("SocialSection", () => {
       expect(calls).toContain("GET /api/tan/timeline?limit=30&list=Friends"),
     );
     expect((select as HTMLSelectElement).value).toBe("Friends");
+  });
+
+  it("manages Tan lists from the Lists tab: create, members, add, remove, delete", async () => {
+    lists = [{ name: "Friends", created_at: 1000, members: 1 }];
+    listMembers = [{ author: "c".repeat(64), name: "carol", added_at: 1000, posts: 2 }];
+    following = [{ author: "d".repeat(64), name: "dave", posts: 1 }];
+    renderSocial();
+    await screen.findByText(/hello/);
+
+    // The header hint is a Manage button, not a CLI pointer.
+    fireEvent.click(screen.getByRole("button", { name: "Manage lists" }));
+    expect(await screen.findByText("Tan lists")).toBeTruthy();
+
+    // Create posts to /api/tan/lists.
+    fireEvent.change(screen.getByLabelText("New list name"), {
+      target: { value: "Mesh crew" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create list" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists"));
+
+    // Expanding a list loads its members.
+    fireEvent.click(screen.getByRole("button", { name: "Members" }));
+    await waitFor(() =>
+      expect(calls).toContain("GET /api/tan/lists/members?name=Friends"),
+    );
+    expect(await screen.findByText("carol")).toBeTruthy();
+
+    // Adding by name posts to /api/tan/lists/add.
+    fireEvent.change(screen.getByLabelText("Author name or hash to add to Friends"), {
+      target: { value: "dave" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add member" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists/add"));
+
+    // Removing a member posts to /api/tan/lists/remove.
+    fireEvent.click(screen.getByRole("button", { name: "Remove carol from Friends" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists/remove"));
+
+    // Deleting needs a confirm step, then posts to /api/tan/lists/delete.
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(calls).not.toContain("POST /api/tan/lists/delete");
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists/delete"));
+  });
+
+  it("the Lists tab offers followed authors in the add-member picker", async () => {
+    lists = [{ name: "Friends", created_at: 1000, members: 0 }];
+    following = [{ author: "d".repeat(64), name: "dave", posts: 1 }];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Lists" }));
+    fireEvent.click(screen.getByRole("button", { name: "Members" }));
+    const select = await screen.findByLabelText("Add a followed author to Friends");
+    expect(select.textContent).toContain("dave");
+    fireEvent.change(select, { target: { value: "d".repeat(64) } });
+    fireEvent.click(screen.getByRole("button", { name: "Add member" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists/add"));
   });
 
   it("shows followers with a follow-back button", async () => {
