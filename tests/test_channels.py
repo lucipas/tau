@@ -1527,6 +1527,168 @@ def test_cli_channel_send_without_name_flag_keeps_node_name(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["name"] == "alice"
 
 
+# -- polls -------------------------------------------------------------------
+
+def test_poll_message_signs_verifies_and_round_trips(identities, tmp_path):
+    from tau.channel_polls import channel_poll_tally, is_channel_poll
+
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    try:
+        poll = create_message(
+            conn,
+            alice,
+            "general",
+            "which colour?",
+            name="alice",
+            now=1000,
+            poll_options=["Red", "Blue"],
+        )
+        assert is_channel_poll(poll)
+        assert verify_message(poll)["hash"] == poll["hash"]
+        assert get_message(conn, poll["hash"])["poll_options"] == ["Red", "Blue"]
+        vote = create_message(
+            conn,
+            bob,
+            "general",
+            "voted: Blue",
+            name="bob",
+            now=1001,
+            poll_vote={
+                "target": {"author": poll["author"], "sent_at": poll["created_at"]},
+                "option": 1,
+            },
+        )
+        tally = channel_poll_tally(
+            channel_history(conn, "general"), poll, own_hash=author_of(bob)
+        )
+        assert tally["counts"] == [0, 1]
+        assert tally["my_vote"] == 1
+        close = create_message(
+            conn,
+            alice,
+            "general",
+            "closed the poll",
+            name="alice",
+            now=1002,
+            poll_close={"author": poll["author"], "sent_at": poll["created_at"]},
+        )
+        assert get_message(conn, close["hash"])["poll_close"] == {
+            "author": poll["author"],
+            "sent_at": poll["created_at"],
+        }
+    finally:
+        conn.close()
+
+
+def test_poll_fields_are_covered_by_the_hash(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    try:
+        poll = create_message(
+            conn,
+            alice,
+            "general",
+            "which colour?",
+            name="alice",
+            now=1000,
+            poll_options=["Red", "Blue"],
+        )
+        tampered = dict(poll, poll_options=["Red", "Green"])
+        with pytest.raises(ChannelError):
+            verify_message(tampered)
+        stripped = {k: v for k, v in poll.items() if k != "poll_options"}
+        with pytest.raises(ChannelError):
+            verify_message(stripped)
+    finally:
+        conn.close()
+
+
+def test_poll_rejects_bad_options_and_mixed_fields(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    try:
+        with pytest.raises(ChannelError, match="poll options"):
+            create_message(
+                conn, alice, "general", "q?", name="alice", now=1000,
+                poll_options=["only one"],
+            )
+        with pytest.raises(ChannelError, match="only one of"):
+            create_message(
+                conn,
+                alice,
+                "general",
+                "q?",
+                name="alice",
+                now=1000,
+                poll_options=["A", "B"],
+                poll_vote={"target": {"author": "ab" * 16, "sent_at": 1000.0}, "option": 0},
+            )
+        with pytest.raises(ChannelError, match="poll vote"):
+            create_message(
+                conn,
+                alice,
+                "general",
+                "voted",
+                name="alice",
+                now=1000,
+                poll_vote={"target": {"author": "ab" * 16, "sent_at": 1000.0}, "option": -1},
+            )
+        # A plain message still carries no poll fields at all.
+        plain = create_message(
+            conn, alice, "general", "hello", name="alice", now=1000
+        )
+        assert "poll_options" not in plain
+        assert "poll_vote" not in plain
+        assert "poll_close" not in plain
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_a_pre_poll_store(identities, tmp_path):
+    import sqlite3
+
+    alice, _ = identities
+    path = tmp_path / "channels.sqlite3"
+    old = sqlite3.connect(str(path))
+    old.executescript(
+        """
+        CREATE TABLE messages (
+            v INTEGER NOT NULL DEFAULT 1,
+            hash TEXT PRIMARY KEY,
+            channel TEXT NOT NULL,
+            author TEXT NOT NULL,
+            key TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            received_at REAL NOT NULL,
+            sig TEXT NOT NULL
+        );
+        """
+    )
+    old.commit()
+    old.close()
+    conn = init_db(path)
+    try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(messages)")
+        }
+        assert {"poll_options", "poll_vote", "poll_close"} <= columns
+        poll = create_message(
+            conn,
+            alice,
+            "general",
+            "which colour?",
+            name="alice",
+            now=1000,
+            poll_options=["Red", "Blue"],
+        )
+        assert get_message(conn, poll["hash"])["poll_options"] == ["Red", "Blue"]
+    finally:
+        conn.close()
+
+
 # -- pins ----------------------------------------------------------------------
 
 

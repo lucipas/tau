@@ -89,6 +89,28 @@ beforeEach(() => {
           },
           {
             v: 1,
+            hash: "p1".padEnd(64, "0"),
+            channel: "mesh-general",
+            author: "b".repeat(32),
+            key: "b".repeat(32),
+            name: "bob",
+            text: "which day?",
+            created_at: 1001,
+            received_at: 1001,
+            sig: "s",
+            poll_options: ["Saturday", "Sunday"],
+            poll: {
+              options: ["Saturday", "Sunday"],
+              counts: [1, 1],
+              total: 2,
+              closed: false,
+              voters: [],
+              my_vote: null,
+              own: true,
+            },
+          },
+          {
+            v: 1,
             hash: "m1".padEnd(64, "0"),
             channel: "mesh-general",
             author: "a".repeat(32),
@@ -192,6 +214,39 @@ describe("ChannelsSection", () => {
     fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
+  });
+
+  it("renders a channel poll with options, tally and close", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByText("which day?")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Saturday/ })).toBeTruthy();
+    expect(screen.getByText(/2 votes/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close poll" })).toBeTruthy();
+  });
+
+  it("votes on a channel poll option", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Sunday/ }));
+    await waitFor(() => expect(calls).toContain("POST /api/channels/vote"));
+  });
+
+  it("posts a channel poll from the composer", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(screen.getByRole("button", { name: "Poll" }));
+    fireEvent.change(screen.getByLabelText("Poll question"), {
+      target: { value: "which day?" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 1"), {
+      target: { value: "Saturday" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 2"), {
+      target: { value: "Sunday" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Post poll" }));
+    await waitFor(() => expect(calls).toContain("POST /api/channels/poll"));
   });
 
   it("shows the channel topic and saves an edited one", async () => {

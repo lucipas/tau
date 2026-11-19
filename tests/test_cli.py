@@ -7460,6 +7460,136 @@ def test_group_messages_renders_poll_tally_and_hides_votes(
     assert "voted: Saturday" not in out
 
 
+def test_parser_channel_poll_vote_close_poll():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["channel", "poll", "general", "which day?", "Saturday", "Sunday"]
+    )
+    assert args.func is cli.cmd_channel_poll
+    assert args.options == ["Saturday", "Sunday"]
+    args = parser.parse_args(["channel", "vote", "general", "pppp", "2"])
+    assert args.func is cli.cmd_channel_vote
+    assert args.poll == "pppp"
+    assert args.option == "2"
+    args = parser.parse_args(["channel", "close-poll", "general", "pppp"])
+    assert args.func is cli.cmd_channel_close_poll
+
+
+def _seed_channel_poll_conversation(tmp_path):
+    """One node joined to #general with a posted channel poll."""
+    from tau.channels import channel_history, init_db as init_channel_db
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert (
+        cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    code = cli.main(
+        [
+            "channel",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    conn = init_channel_db(data_dir / "channels.sqlite3")
+    try:
+        poll = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+    return data_dir, poll
+
+
+def test_channel_poll_vote_close_round_trip(tmp_path, capsys):
+    data_dir, poll = _seed_channel_poll_conversation(tmp_path)
+    prefix = poll["hash"][:8]
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "channel",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    assert "voted for 'Sunday'" in capsys.readouterr().out
+
+    code = cli.main(["channel", "read", "--data-dir", str(data_dir), "general"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "which day?" in out
+    assert "1. Saturday — 0 votes" in out
+    assert "2. Sunday — 1 vote" in out
+    assert "your vote" in out
+    # The vote itself is not a chat message.
+    assert "voted: Sunday" not in out
+
+    code = cli.main(
+        [
+            "channel",
+            "close-poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+        ]
+    )
+    assert code == 0
+    assert "closed the poll" in capsys.readouterr().out
+
+    code = cli.main(["channel", "read", "--data-dir", str(data_dir), "general"])
+    assert code == 0
+    assert "closed" in capsys.readouterr().out
+
+    code = cli.main(
+        [
+            "channel",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+            "1",
+        ]
+    )
+    assert code == 2
+    assert "this poll is closed" in capsys.readouterr().err
+
+
+def test_channel_poll_rejects_one_option(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert (
+        cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    code = cli.main(
+        [
+            "channel",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            "which day?",
+            "Saturday",
+        ]
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err
+
+
 def test_parser_group_send_wait():
     parser = cli.build_parser()
     default = parser.parse_args(["group", "send", "weekend", "hello"])

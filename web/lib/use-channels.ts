@@ -14,6 +14,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  closeChannelPoll,
   editChannelMessage,
   getChannelMessages,
   getChannelTopic,
@@ -22,12 +23,14 @@ import {
   joinChannel,
   leaveChannel,
   pinChannelMessage,
+  postChannelPoll,
   reactToChannelMessage,
   searchChannelMessages,
   sendChannelMessage,
   setChannelTopic,
   syncChannels,
   unpinChannelMessage,
+  voteChannelPoll,
 } from "./api";
 import type { Channel, ChannelMessage, ChannelTopic } from "./types";
 
@@ -53,6 +56,9 @@ export interface UseChannelsResult {
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
   send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
+  poll: (question: string, options: string[]) => Promise<ChannelMessage>;
+  vote: (poll: string, option: number) => Promise<ChannelMessage>;
+  closePoll: (poll: string) => Promise<ChannelMessage>;
   setTopic: (text: string) => Promise<void>;
   clearTopic: () => Promise<void>;
   /** React to a message by hash; an empty reaction clears yours. */
@@ -197,6 +203,24 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       const sent = await sendChannelMessage(selected, text, replyTo);
       await refreshMessages(selected);
       return sent;
+    },
+    poll: async (question, options) => {
+      if (!selected) throw new Error("no channel selected");
+      const posted = await postChannelPoll(selected, question, options);
+      await refreshMessages(selected);
+      return posted;
+    },
+    vote: async (poll, option) => {
+      if (!selected) throw new Error("no channel selected");
+      const cast = await voteChannelPoll(selected, poll, option);
+      await refreshMessages(selected);
+      return cast;
+    },
+    closePoll: async (poll) => {
+      if (!selected) throw new Error("no channel selected");
+      const closed = await closeChannelPoll(selected, poll);
+      await refreshMessages(selected);
+      return closed;
     },
     setTopic: async (text) => {
       if (!selected) throw new Error("no channel selected");

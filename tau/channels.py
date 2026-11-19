@@ -136,6 +136,17 @@ follow, not a retraction).  Blocked authors are refused at the door
 like everywhere else in tau: a message from a blocked destination is
 dropped, never stored, never re-gossipped.
 
+Polls are ordinary messages with one extra field: a poll carries
+``poll_options`` (the question is the text), a vote carries
+``poll_vote`` (the poll's author plus ``created_at`` and the chosen
+option index), and a close carries ``poll_close`` (the same target).
+The extra field is covered by the message hash when present, so a
+relay cannot strip or swap it without breaking the signature, and
+votes and closes flow through the same feed, post and sync paths as
+chat — tallies are derived from stored messages (see
+:mod:`tau.channel_polls`), and vote/close records are hidden from
+listings by the callers that render them.
+
 A channel also carries one topic: a short signed record saying what
 the room is about::
 
@@ -183,6 +194,8 @@ from .protocol import (
     MAX_MESSAGE_CHARS,
     MAX_REQUEST_BYTES,
     ProtocolError,
+    clean_group_poll_target,
+    clean_group_poll_vote,
     clean_group_topic,
     clean_reaction,
     decode,
@@ -192,6 +205,7 @@ from .protocol import (
     response_ok,
     sanitize_name,
 )
+from .tangents.tan import PostError, _clean_poll_options
 from .util import ensure_dir
 
 log = logging.getLogger(__name__)
@@ -250,6 +264,12 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # re-pointed at another message either.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
 
+# Poll fields ride on the message and are covered by the hash when
+# present (see _canonical_body): a poll carries poll_options, a vote
+# carries poll_vote, a close carries poll_close — at most one per
+# message, like a group poll.
+POLL_FIELDS = ("poll_options", "poll_vote", "poll_close")
+
 # Fields covered by the topic hash: the same shape as a message,
 # minus the display name (a topic is metadata, not a post) and with
 # the topic text in place of the message text.
@@ -305,6 +325,9 @@ _MESSAGE_COLUMNS = (
     "created_at",
     "received_at",
     "sig",
+    "poll_options",
+    "poll_vote",
+    "poll_close",
     "reply_to",
 )
 
@@ -388,6 +411,12 @@ def _require_timestamp(value: Any, field: str) -> float:
 
 def _canonical_body(message: Dict[str, Any]) -> bytes:
     body = {field: message[field] for field in HASH_FIELDS}
+    # Poll fields are covered too, when a message carries one: a
+    # relay that strips a poll's options (or a vote's target) breaks
+    # the hash exactly like one that edits the text.
+    for field in POLL_FIELDS:
+        if message.get(field) is not None:
+            body[field] = message[field]
     reply_to = message.get("reply_to")
     if reply_to:
         # Covered by the hash when present, so a reply cannot be
@@ -488,6 +517,32 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
     if now is not None and created_at > float(now) + 86400.0:
         raise ChannelError("channel message timestamp is too far in the future")
 
+    poll_options = mesg.get("poll_options")
+    poll_vote = mesg.get("poll_vote")
+    poll_close = mesg.get("poll_close")
+    if sum(field is not None for field in (poll_options, poll_vote, poll_close)) > 1:
+        raise ChannelError(
+            "a channel message can carry only one of poll_options, "
+            "poll_vote, poll_close"
+        )
+    cleaned_options: Optional[List[str]] = None
+    if poll_options is not None:
+        try:
+            cleaned_options = _clean_poll_options(poll_options)
+        except PostError as exc:
+            raise ChannelError(f"invalid channel poll options: {exc}") from exc
+    cleaned_vote: Optional[Dict[str, Any]] = None
+    if poll_vote is not None:
+        try:
+            cleaned_vote = clean_group_poll_vote(poll_vote)
+        except ProtocolError as exc:
+            raise ChannelError(f"invalid channel poll vote: {exc}") from exc
+    cleaned_close: Optional[Dict[str, Any]] = None
+    if poll_close is not None:
+        try:
+            cleaned_close = clean_group_poll_target(poll_close)
+        except ProtocolError as exc:
+            raise ChannelError(f"invalid channel poll close: {exc}") from exc
     raw_reply_to = mesg.get("reply_to", "")
     if raw_reply_to in (None, ""):
         reply_to = ""
@@ -504,6 +559,12 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
         "created_at": created_at,
         "reply_to": reply_to,
     }
+    if cleaned_options is not None:
+        message["poll_options"] = cleaned_options
+    if cleaned_vote is not None:
+        message["poll_vote"] = cleaned_vote
+    if cleaned_close is not None:
+        message["poll_close"] = cleaned_close
     _check_wire_size(message)
     return message
 
@@ -549,6 +610,9 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
         "hash": message["hash"],
         "sig": message["sig"],
     }
+    for field in POLL_FIELDS:
+        if message.get(field) is not None:
+            canonical[field] = message[field]
     reply_to = message.get("reply_to")
     if reply_to:
         # Plain messages keep the old wire shape: the field appears
@@ -1240,6 +1304,9 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at REAL NOT NULL,
     received_at REAL NOT NULL,
     sig TEXT NOT NULL,
+    poll_options TEXT,
+    poll_vote TEXT,
+    poll_close TEXT,
     reply_to TEXT NOT NULL DEFAULT ''
 );
 
@@ -1342,6 +1409,12 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
+    # Stores written before polls existed have no poll columns:
+    # add them so an old store keeps working without a rebuild.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    for column in POLL_FIELDS:
+        if column not in columns:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
     # Stores written before replies existed have no reply_to column:
     # add it in place so an old database keeps its history.
     columns = [
@@ -1359,8 +1432,24 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     return conn
 
 
+def _dump_poll_field(value: Any) -> Optional[str]:
+    """Encode a poll field for storage, or ``None`` when absent."""
+    if value is None:
+        return None
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+
+
 def _row_to_message(row: sqlite3.Row) -> Dict[str, Any]:
-    return _canonical_message(dict(row))
+    record = dict(row)
+    for field in POLL_FIELDS:
+        raw = record.get(field)
+        if raw is None:
+            record.pop(field, None)
+        else:
+            record[field] = json.loads(raw)
+    return _canonical_message(record)
 
 
 def _fetch_message(conn: sqlite3.Connection, digest: str) -> Optional[sqlite3.Row]:
@@ -1591,8 +1680,8 @@ def store_message(
         with conn:
             conn.execute(
                 "INSERT INTO messages(v, hash, channel, author, key, name, text, "
-                "created_at, received_at, sig, reply_to) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     CHANNEL_VERSION,
                     digest,
@@ -1604,6 +1693,9 @@ def store_message(
                     message["created_at"],
                     timestamp,
                     message["sig"],
+                    _dump_poll_field(message.get("poll_options")),
+                    _dump_poll_field(message.get("poll_vote")),
+                    _dump_poll_field(message.get("poll_close")),
                     message.get("reply_to", ""),
                 ),
             )
@@ -1900,13 +1992,21 @@ def create_message(
     *,
     name: str = "anonymous",
     now: Optional[float] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
     reply_to: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a message owned by *identity*.
 
+    At most one of ``poll_options``, ``poll_vote`` and ``poll_close``
+    may be set: a poll (the text is the question), a vote on a poll,
+    or a close of one — each validated like a group poll's.
+
     ``reply_to`` is a parent message's hash or unique hex prefix; it
     must already be stored in this channel, and it is covered by the
     new message's hash.
+
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
@@ -1919,10 +2019,17 @@ def create_message(
         "text": normalize_message(text),
         "created_at": timestamp,
     }
+    if poll_options is not None:
+        body["poll_options"] = poll_options
+    if poll_vote is not None:
+        body["poll_vote"] = poll_vote
+    if poll_close is not None:
+        body["poll_close"] = poll_close
     if reply_to is not None:
         body["reply_to"] = resolve_message_digest(conn, body["channel"], reply_to)
-    digest = hash_message(body)
-    mesg = dict(body)
+    normalized = _normalize_message(body, now=timestamp)
+    digest = hash_message(normalized)
+    mesg = dict(normalized)
     mesg["hash"] = digest
     mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
     # Measure the signed envelope, not the unsigned body: a multibyte
@@ -2255,6 +2362,26 @@ def channel_history(
     return messages
 
 
+def channel_messages_all(
+    conn: sqlite3.Connection,
+    channel: str,
+) -> List[Dict[str, Any]]:
+    """Every stored message for *channel*, newest first.
+
+    Unpaged (bounded by the per-channel store cap) for callers that
+    derive state from the whole history — poll tallies, which count
+    votes a displayed page may have left out.
+    """
+    name = clean_channel_name(channel)
+    rows = conn.execute(
+        f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
+        "WHERE channel = ? ORDER BY created_at DESC, hash DESC "
+        f"LIMIT {MAX_STORED_PER_CHANNEL}",
+        (name,),
+    ).fetchall()
+    return [_row_to_message(row) for row in rows]
+
+
 def search_channel_messages(
     conn: sqlite3.Connection,
     channel: str,
@@ -2581,6 +2708,18 @@ class ChannelApp:
         finally:
             conn.close()
 
+    def all_history(self, channel: str) -> List[Dict[str, Any]]:
+        """Every stored message for *channel*, newest first.
+
+        For deriving state from the whole history (poll tallies),
+        not for paging a listing.
+        """
+        conn = self.connect()
+        try:
+            return channel_messages_all(conn, channel)
+        finally:
+            conn.close()
+
     def topic(self, channel: str) -> Optional[Dict[str, Any]]:
         """Stored topic for *channel*, or ``None``.
 
@@ -2687,13 +2826,19 @@ class ChannelApp:
         publish: bool = False,
         targets: Optional[Sequence[Any]] = None,
         ttl: int = MAX_GOSSIP_TTL,
+        poll_options: Optional[List[str]] = None,
+        poll_vote: Optional[Dict[str, Any]] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
         reply_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a message in a joined channel, gossiping it when asked.
 
         Sending requires membership: a channel you have not joined is
-        not yours to post in.  ``reply_to`` is a parent message's hash
-        or unique hex prefix in the same channel.
+        not yours to post in.  At most one of ``poll_options``,
+        ``poll_vote`` and ``poll_close`` may be set, making the
+        message a poll, a vote on one, or a close of one.
+        ``reply_to`` is a parent message's hash or unique hex
+        prefix in the same channel.
         """
         name = clean_channel_name(channel)
         conn = self.connect()
@@ -2703,7 +2848,15 @@ class ChannelApp:
                     f"not a member of channel {name!r}; join it first"
                 )
             message = create_message(
-                conn, self.identity, name, text, name=self.name, reply_to=reply_to
+                conn,
+                self.identity,
+                name,
+                text,
+                name=self.name,
+                poll_options=poll_options,
+                poll_vote=poll_vote,
+                poll_close=poll_close,
+                reply_to=reply_to,
             )
         finally:
             conn.close()

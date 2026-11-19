@@ -417,6 +417,9 @@ Global options may appear before or after the command:
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message) |
+| `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
+| `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
+| `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
 | `tau channel topic NAME [TEXT]` | Show or set a channel's topic (any member may set it; newest wins; `--clear` removes it) |
 | `tau channel react NAME HASH EMOJI` | React to a stored channel message (one per reactor; `--clear` retracts yours) |
 | `tau channel edit NAME DIGEST NEW-TEXT` | Edit your own channel message (digest or hex prefix) |
