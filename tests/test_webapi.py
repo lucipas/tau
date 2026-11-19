@@ -5457,6 +5457,29 @@ def test_tan_timeline_and_follow(tmp_path):
         assert status == 200
         assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
 
+        # A located post carries its place through the API, so the
+        # console post card can render it with an open-in-maps link.
+        conn = init_db(node.config.social_db_path)
+        try:
+            located = create_post(
+                conn,
+                identity,
+                "from the park",
+                name="bob",
+                now=1001,
+                location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+            )
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_hash = {item["hash"]: item for item in payload["posts"]}
+        assert by_hash[located["hash"]]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
         status, _, payload = _json(
             bridge,
             "/api/tan/follow",
@@ -5469,7 +5492,8 @@ def test_tan_timeline_and_follow(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/following")
         assert status == 200
         assert payload["count"] == 1
-        assert payload["following"][0]["posts"] == 1
+        # The author now has two posts: the plain one and the located one.
+        assert payload["following"][0]["posts"] == 2
 
         status, _, payload = _json(
             bridge,

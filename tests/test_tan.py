@@ -273,6 +273,75 @@ def test_find_post_by_image(identities, tmp_path):
     assert find_post_by_image(conn, "not-a-digest") is None
 
 
+def _location_for() -> dict:
+    return {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def test_create_post_with_location_round_trips(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    location = _location_for()
+    post = create_post(
+        conn, alice, "morning run", name="alice", now=1000, location=location
+    )
+
+    assert post["location"] == location
+    assert verify_post(post)["location"] == location
+    stored = get_post(conn, post["hash"])
+    assert stored is not None and stored["location"] == location
+    assert [entry["location"] for entry in feed(conn, author=post["author"])] == [
+        location
+    ]
+
+
+def test_location_is_signed_with_the_post(identities, tmp_path):
+    alice, _ = identities
+    first = init_db(tmp_path / "a.sqlite3")
+    second = init_db(tmp_path / "b.sqlite3")
+    plain = create_post(first, alice, "same text", name="alice", now=1000)
+    with_location = create_post(
+        second, alice, "same text", name="alice", now=1000, location=_location_for()
+    )
+    assert plain["hash"] != with_location["hash"]
+
+    tampered = dict(
+        with_location, location={**with_location["location"], "lat": 0.0}
+    )
+    with pytest.raises(PostError):
+        verify_post(tampered)
+
+
+def test_location_rejected_when_invalid(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    good = _location_for()
+    bad_locations = [
+        {**good, "lat": 91.0},
+        {**good, "lat": -91.0},
+        {**good, "lon": 181.0},
+        {**good, "lon": -181.0},
+        {**good, "lat": "34.05"},
+        {**good, "lon": True},
+        {"lat": 34.05},
+        {"lon": -83.88},
+        "34.05,-83.88",
+        {**good, "name": "x" * 201},
+    ]
+    for bad in bad_locations:
+        with pytest.raises(PostError):
+            create_post(conn, alice, "x", name="alice", now=1000, location=bad)
+
+
+def test_only_posts_carry_locations(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "parent", name="alice", now=1000)
+    reply = create_reply(conn, alice, post["hash"], "a reply", name="alice", now=1001)
+    crafted = dict(reply, location=_location_for())
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
+
+
 def test_media_store_round_trip_and_prune(tmp_path):
     data = _png_bytes()
     digest = hashlib.sha256(data).hexdigest()
@@ -9795,6 +9864,43 @@ def test_init_db_migrates_pre_polls_store(identities, tmp_path):
         )
         create_vote(conn, bob, poll["hash"], 0, name="bob", now=1002)
         assert poll_results(conn, poll["hash"])["counts"] == [1, 0]
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_pre_location_store(identities, tmp_path):
+    alice, _ = identities
+    db_path = tmp_path / "tan.sqlite3"
+    conn = init_db(db_path)
+    post = create_post(conn, alice, "legacy row", name="alice", now=1000)
+    conn.execute("ALTER TABLE posts DROP COLUMN location")
+    conn.commit()
+    conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        assert "location" in columns
+        stored = get_post(conn, post["hash"])
+        assert stored is not None
+        assert "location" not in stored
+        assert verify_post(stored)["hash"] == post["hash"]
+        # And a located post works on the migrated store.
+        located = create_post(
+            conn,
+            alice,
+            "from here",
+            name="alice",
+            now=1001,
+            location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+        )
+        assert get_post(conn, located["hash"])["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
     finally:
         conn.close()
 

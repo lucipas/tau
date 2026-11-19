@@ -9881,6 +9881,78 @@ def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     )
 
 
+def test_tan_post_with_location_stores_place(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    base = [
+        "tan",
+        "post",
+        "--data-dir",
+        str(data_dir),
+        "--no-publish",
+        "morning run",
+    ]
+    assert cli.main([*base, "--location", "34.05,-83.88 Rock Springs Park"]) == 0
+    out = capsys.readouterr().out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
+    from tau.tangents.tan import feed, init_db
+
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        posts = feed(conn)
+    finally:
+        conn.close()
+    assert len(posts) == 1
+    assert posts[0]["location"] == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+    # The timeline prints the pin with its map link.
+    assert cli.main(["tan", "timeline", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
+    # And --json carries the place through.
+    assert cli.main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
+    out = capsys.readouterr().out
+    assert "Rock Springs Park" in out
+
+
+def test_tan_post_location_rejects_bad_input(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    base = ["tan", "post", "--data-dir", str(data_dir), "--no-publish", "hi"]
+    assert cli.main([*base, "--location", "not-a-place"]) == 1
+    assert cli.main([*base, "--location", "91,0 Out of range"]) == 1
+    assert cli.main([*base, "--location", "34.05,-83.88 Park", "--delay", "5m"]) == 2
+    # A reply cannot carry a location: post first, then reply to it.
+    assert cli.main([*base, "--location", "34.05,-83.88 Park"]) == 0
+    capsys.readouterr()
+    from tau.tangents.tan import feed, init_db
+
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post_hash = feed(conn)[0]["hash"]
+    finally:
+        conn.close()
+    assert (
+        cli.main([*base, "--location", "34.05,-83.88 Park", "--reply-to", post_hash])
+        == 2
+    )
+
+
 def test_tan_media_rejects_unknown_image(tmp_path, capsys):
     data_dir = tmp_path / "node"
     assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0

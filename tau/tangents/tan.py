@@ -117,6 +117,7 @@ from ..protocol import (
     MAX_NAME_LENGTH,
     MAX_REQUEST_BYTES,
     ProtocolError,
+    clean_location,
     decode,
     encode,
     normalize_message,
@@ -278,6 +279,7 @@ _POST_COLUMNS = (
     "target",
     "options",
     "image",
+    "location",
 )
 
 
@@ -335,6 +337,11 @@ def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
         # attachment for another file's hash without breaking the
         # hash, and a post without one hashes exactly as before.
         fields = fields + ("image",)
+    if mesg.get("location") is not None:
+        # A place is signed the same way: a relay cannot move the
+        # post to another place without breaking the hash, and a post
+        # without one hashes exactly as before.
+        fields = fields + ("location",)
     return fields
 
 
@@ -433,6 +440,58 @@ def _decode_image(value: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _clean_location(value: Any) -> Dict[str, Any]:
+    """Validate a Tan post place attachment: ``{lat, lon, name?}``.
+
+    The place rides the signed post, so a malformed one must be
+    rejected here — not dropped — or the hash would no longer cover
+    what the author meant to publish.  Reuses the DM pin validator
+    (:func:`tau.protocol.clean_location`), which also strips a blank
+    name and rejects out-of-range coordinates.
+    """
+    cleaned = clean_location(value)
+    if cleaned is None:
+        raise PostError(
+            "post location must be an object with latitude -90..90 and "
+            "longitude -180..180"
+        )
+    return cleaned
+
+
+def _encode_location(location: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Encode a post's place attachment for the posts table, or None."""
+    if location is None:
+        return None
+    return json.dumps(_clean_location(location), ensure_ascii=False)
+
+
+def _decode_location(value: Any) -> Optional[Dict[str, Any]]:
+    """Decode a stored place attachment: a dict, a JSON string, or None.
+
+    Rows read from the posts table carry the JSON string; normalised
+    entries carry the dict itself.  Anything else decodes to None, so
+    a damaged row never crashes a display surface.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        try:
+            return _clean_location(value)
+        except PostError:
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict):
+            try:
+                return _clean_location(parsed)
+            except PostError:
+                return None
+    return None
+
+
 def _decode_options(value: Any) -> Optional[List[str]]:
     """Decode stored poll options: a list, a JSON string, or None.
 
@@ -511,6 +570,10 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         # The attachment rides with the post entry itself, so an
         # exported or synced post carries its image reference with it.
         canonical["image"] = _decode_image(post.get("image"))
+    if post.get("location") is not None:
+        # The place rides with the post entry itself, so an exported
+        # or synced post carries its place with it.
+        canonical["location"] = _decode_location(post.get("location"))
     return canonical
 
 
@@ -640,10 +703,18 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         image = (
             _clean_image(mesg["image"]) if mesg.get("image") is not None else None
         )
+        location = (
+            _clean_location(mesg["location"])
+            if mesg.get("location") is not None
+            else None
+        )
     else:
         if mesg.get("image") is not None:
             raise PostError("only posts can carry an image")
+        if mesg.get("location") is not None:
+            raise PostError("only posts can carry a location")
         image = None
+        location = None
 
     post = {
         "v": TAN_VERSION,
@@ -658,6 +729,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "expires_at": expires_at,
         "options": options,
         "image": image,
+        "location": location,
     }
     _check_wire_size(post)
     return post
@@ -797,7 +869,8 @@ CREATE TABLE IF NOT EXISTS posts (
     kind TEXT NOT NULL DEFAULT 'post',
     target TEXT NOT NULL DEFAULT '',
     options TEXT,
-    image TEXT
+    image TEXT,
+    location TEXT
 );
 
 CREATE INDEX IF NOT EXISTS posts_author_seq ON posts(author, seq);
@@ -947,6 +1020,10 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         # A post's image attachment lives in one JSON column on its
         # own entry, like a poll's options.
         _add_column(conn, "posts", "image", "TEXT")
+    if columns and "location" not in columns:  # migrate a pre-location database
+        # A post's place lives in one JSON column on its own entry,
+        # like a post's image attachment.
+        _add_column(conn, "posts", "location", "TEXT")
     draft_columns = {
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
@@ -1604,8 +1681,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, expires_at, sig, seq, linked, kind, target, options, image) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, expires_at, sig, seq, linked, kind, target, options, image, location) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -1624,6 +1701,7 @@ def store_post(
                     post.get("target") or "",
                     _encode_options(post.get("options")),
                     _encode_image(post.get("image")),
+                    _encode_location(post.get("location")),
                 ),
             )
             if linked:
@@ -1675,6 +1753,7 @@ def create_post(
     previous: Optional[str] = None,
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a post owned by *identity*.
 
@@ -1684,13 +1763,17 @@ def create_post(
     hash.  It must be after the post's creation time.  When *image*
     is given — ``{sha256, size, mime, name}`` — the attachment is
     signed with the post the same way; the bytes themselves live in
-    the local media store, never in the post.
+    the local media store, never in the post.  When *location* is
+    given — ``{lat, lon, name?}`` — the place is signed with the post
+    the same way, so a relay cannot move the post without breaking
+    the hash.
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
     clean_name = sanitize_name(name)
     clean_text = normalize_message(text)
     clean_image = _clean_image(image) if image is not None else None
+    clean_location = _clean_location(location) if location is not None else None
     if expires_at is not None:
         expires_at = _require_timestamp(expires_at, "expires_at")
         if expires_at <= timestamp:
@@ -1718,6 +1801,8 @@ def create_post(
             body["expires_at"] = expires_at
         if clean_image is not None:
             body["image"] = clean_image
+        if clean_location is not None:
+            body["location"] = clean_location
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -8544,12 +8629,14 @@ class TanApp:
         ttl: int = MAX_GOSSIP_TTL,
         expires_at: Optional[float] = None,
         image: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a post, or a reply when *reply_to* names a parent post.
 
         When *expires_at* is given the post disappears from display
         surfaces once that time passes; see :func:`create_post`.
         A reply cannot carry an image — only a top-level post can.
+        A reply cannot carry a location either, for the same reason.
         """
         conn = self.connect()
         try:
@@ -8570,6 +8657,7 @@ class TanApp:
                     name=self.name,
                     expires_at=expires_at,
                     image=image,
+                    location=location,
                 )
         finally:
             conn.close()
