@@ -16,6 +16,7 @@
 import type {
   AllowList,
   ApiErrorBody,
+  AwayMessageSettings,
   BlockResult,
   BroadcastList,
   BroadcastSendResponse,
@@ -623,6 +624,18 @@ export async function setDisappearingDefault(
   seconds: number | null,
 ): Promise<unknown> {
   return post("/api/messages/disappearing", { ...target, seconds });
+}
+
+export async function getAwayMessage(): Promise<AwayMessageSettings> {
+  return get("/api/settings/away-message");
+}
+
+/** Set the away auto-reply; omitted fields keep their stored value. */
+export async function setAwayMessage(patch: {
+  enabled?: boolean;
+  message?: string;
+}): Promise<{ ok: boolean; away_message: AwayMessageSettings }> {
+  return post("/api/settings/away-message", patch);
 }
 
 /** The quiet-hours window, plus whether it is quiet right now. */

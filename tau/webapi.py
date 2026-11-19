@@ -98,6 +98,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages/mute mute ``{"peer": "<name or hash>"}`` or
                            ``{"group": "<id | prefix | name>"}``
                            (``"muted": false`` unmutes)
+    GET  /api/settings/away-message away auto-reply (``enabled``,
+                           ``message``, ``since``) plus how many peers
+                           have received a reply this period
+    POST /api/settings/away-message set the reply ``{"enabled": true,
+                           "message": "..."}``; omitted fields keep
+                           their stored value
     GET  /api/settings/quiet-hours quiet-hours window (``enabled``,
                            ``start``/``end`` HH:MM) plus whether it is
                            quiet now and minutes until the window ends
@@ -289,11 +295,13 @@ from .dm_requests import (
     decline_dm_request as decline_held_dm_request,
     list_dm_requests,
 )
+from .away import AwayError, AwayState, away_lock, load_away, save_away
 from .backup import BackupError, create_backup
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
     ARCHIVED_FILE_NAME,
+    AWAY_FILE_NAME,
     DISAPPEARING_FILE_NAME,
     MESSAGES_FILE_NAME,
     MUTED_FILE_NAME,
@@ -1261,6 +1269,8 @@ class WebBridge:
         self._disappearing_lock = threading.Lock()
         # Serializes mute/unmute read-modify-write cycles the same way.
         self._muted_lock = threading.Lock()
+        # Serializes away-message read-modify-write cycles the same way.
+        self._away_lock = threading.Lock()
         # Serializes pin/unpin read-modify-write cycles the same way.
         self._pinned_lock = threading.Lock()
         # Serializes quiet-hours read-modify-write cycles the same way.
@@ -8803,6 +8813,105 @@ class WebBridge:
             return None
         return data_dir / QUIET_HOURS_FILE_NAME
 
+    def _away_path(self) -> Optional[Path]:
+        """This node's away-message path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "away_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / AWAY_FILE_NAME
+
+    def away_message(self) -> Dict[str, Any]:
+        """This node's away auto-reply, for the console load.
+
+        The stored state (``enabled``, ``message`` and ``since``),
+        plus how many peers have already received a reply in this
+        away period.  A missing file means off, with the default
+        message kept.  A corrupt file is a 503 — the owner repairs
+        or removes it before the console shows the reply, the same
+        as the quiet-hours window.
+        """
+        path = self._away_path()
+        if path is None:
+            state = AwayState()
+        else:
+            try:
+                state = load_away(path)
+            except AwayError as exc:
+                raise WebBridgeError(
+                    "away message on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+        return {
+            **state.to_dict(),
+            "replied_count": len(state.replied_to),
+        }
+
+    def set_away_message(
+        self,
+        *,
+        enabled: Optional[Any] = None,
+        message: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Set the away auto-reply (or turn it off) and return it.
+
+        Either of *enabled* and *message* may be omitted, in which
+        case the stored value is kept — turning the reply off keeps
+        the message, so turning it back on restores the same text,
+        like ``tau away off``.  At least one field is required.
+        Turning it on, or changing the message while it is on, starts
+        a fresh away period (the per-peer replied list resets and
+        ``since`` restarts), like ``tau away on``; a no-op save — on
+        already, same message — leaves the current period untouched.
+        Mirrors the CLI setters: the state is reloaded inside the
+        lock so a corrupt file fails loudly instead of being silently
+        overwritten, a bad message is a :class:`ValueError`, and a
+        corrupt file is a 503.
+        """
+        if enabled is None and message is None:
+            raise ValueError(
+                "at least one of 'enabled' or 'message' is required"
+            )
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError("'enabled' must be a boolean")
+        path = self._away_path()
+        if path is None:
+            raise WebBridgeError("this node has no away-message path")
+        with self._away_lock, away_lock(path):
+            try:
+                current = load_away(path)
+            except AwayError as exc:
+                raise WebBridgeError(
+                    "away message on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+            new_enabled = current.enabled if enabled is None else enabled
+            if message is None:
+                new_message = current.message
+            else:
+                try:
+                    new_message = AwayState.on(message).message
+                except AwayError as exc:
+                    raise ValueError(str(exc)) from exc
+            if new_enabled:
+                if current.enabled and new_message == current.message:
+                    updated = current
+                else:
+                    updated = AwayState.on(new_message)
+            else:
+                updated = AwayState(enabled=False, message=new_message)
+            changed = updated != current
+            if changed:
+                save_away(path, updated)
+        return {
+            **updated.to_dict(),
+            "replied_count": len(updated.replied_to),
+            "changed": changed,
+        }
+
     def quiet_hours(self) -> Dict[str, Any]:
         """This node's quiet-hours window, for the console load.
 
@@ -11345,6 +11454,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                         {"error": {"message": str(exc)}}, head_only, 503
                     )
                 return
+            if path == "/api/settings/away-message":
+                try:
+                    self._send_json(self.bridge.away_message(), head_only)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                return
             if path == "/api/settings/quiet-hours":
                 try:
                     self._send_json(self.bridge.quiet_hours(), head_only)
@@ -12209,6 +12326,26 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/settings":
                 self._handle_settings(body, head_only)
+                return
+            if path == "/api/settings/away-message":
+                try:
+                    result = self.bridge.set_away_message(
+                        enabled=body.get("enabled"),
+                        message=body.get("message"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json(
+                    {"ok": True, "away_message": result}, head_only
+                )
                 return
             if path == "/api/settings/quiet-hours":
                 try:

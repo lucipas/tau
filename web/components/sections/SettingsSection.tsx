@@ -1,7 +1,8 @@
 // SettingsSection.tsx — node settings: file acceptance / read receipts,
-// rename the node, announce, quiet hours, and per-peer / per-group /
-// per-channel disappearing-message defaults. Built on api.ts getSettings /
-// updateSetting / renameNode / announce / getQuietHours / setQuietHours /
+// rename the node, announce, away message, quiet hours, and per-peer /
+// per-group / per-channel disappearing-message defaults. Built on api.ts
+// getSettings / updateSetting / renameNode / announce / getAwayMessage /
+// setAwayMessage / getQuietHours / setQuietHours /
 // getDisappearingDefaults / setDisappearingDefault / getChannels.
 
 "use client";
@@ -10,16 +11,18 @@ import { useEffect, useState } from "react";
 import { useTauContext } from "@/components/chrome/TauContext";
 import {
   announce,
+  getAwayMessage,
   getChannels,
   getDisappearingDefaults,
   getQuietHours,
   getSettings,
   renameNode,
+  setAwayMessage,
   setDisappearingDefault,
   setQuietHours,
   updateSetting,
 } from "@/lib/api";
-import type { Channel, NodeSettings, QuietHoursSettings } from "@/lib/types";
+import type { AwayMessageSettings, Channel, NodeSettings, QuietHoursSettings } from "@/lib/types";
 
 const EXPIRY_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "No disappearing default", seconds: null },
@@ -47,6 +50,10 @@ export default function SettingsSection() {
   const [notice, setNotice] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [nameSeeded, setNameSeeded] = useState(false);
+  const [awayMessage, setAwayMessageState] = useState<AwayMessageSettings | null>(null);
+  const [awayText, setAwayText] = useState("");
+  const [awayEnabled, setAwayEnabled] = useState(false);
+  const [awaySeeded, setAwaySeeded] = useState(false);
   const [quietHours, setQuietHoursState] = useState<QuietHoursSettings | null>(null);
   const [qhStart, setQhStart] = useState("22:00");
   const [qhEnd, setQhEnd] = useState("07:00");
@@ -60,14 +67,16 @@ export default function SettingsSection() {
   useEffect(() => {
     void (async () => {
       try {
-        const [s, dd, qh, ch] = await Promise.all([
+        const [s, dd, am, qh, ch] = await Promise.all([
           getSettings(),
           getDisappearingDefaults(),
+          getAwayMessage(),
           getQuietHours(),
           getChannels(),
         ]);
         setSettings(s);
         setDisappearing({ ...dd.peers, ...dd.groups, ...dd.channels });
+        setAwayMessageState(am);
         setQuietHoursState(qh);
         setChannels(ch);
         setError(null);
@@ -82,6 +91,12 @@ export default function SettingsSection() {
   if (tau?.node && !nameSeeded) {
     setNameSeeded(true);
     setName(tau.node.name);
+  }
+
+  if (awayMessage && !awaySeeded) {
+    setAwaySeeded(true);
+    setAwayText(awayMessage.message);
+    setAwayEnabled(awayMessage.enabled);
   }
 
   if (quietHours && !qhSeeded) {
@@ -248,6 +263,79 @@ export default function SettingsSection() {
               </span>
             </label>
           </div>
+        )}
+      </section>
+
+      <section className="border-b border-zinc-800 px-3 py-4 sm:px-4" aria-label="Away message">
+        <h2 className="text-sm font-bold text-zinc-100">Away message</h2>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+          While it is on, the first DM from each peer gets one automatic reply with
+          this message. Turning it on again starts a fresh period, so every peer
+          gets the reply once more.
+        </p>
+        {loading && <p className="py-3 text-sm text-zinc-500">Loading away message…</p>}
+        {awayMessage && (
+          <>
+            <p className="mt-2 text-sm text-zinc-300" role="status">
+              {awayMessage.enabled
+                ? `On — replying: “${awayMessage.message}”`
+                : "Off — DMs arrive as usual."}
+            </p>
+            {awayMessage.enabled && (
+              <p className="mt-1 text-xs text-zinc-500">
+                {awayMessage.replied_count === 1
+                  ? "Replied to 1 peer so far this period."
+                  : `Replied to ${awayMessage.replied_count} peers so far this period.`}
+              </p>
+            )}
+            <form
+              className="mt-3 flex flex-wrap items-center gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const next = awayText.trim();
+                if (awayEnabled && !next)
+                  return setError("The away reply needs a message.");
+                void run(
+                  async () => {
+                    const { away_message } = await setAwayMessage({
+                      enabled: awayEnabled,
+                      message: next || undefined,
+                    });
+                    setAwayMessageState(away_message);
+                    setAwayText(away_message.message);
+                  },
+                  awayEnabled ? "Away reply turned on." : "Away reply turned off.",
+                );
+              }}
+            >
+              <label className="flex items-center gap-2 text-sm text-zinc-200">
+                <input
+                  type="checkbox"
+                  checked={awayEnabled}
+                  disabled={busy}
+                  onChange={(e) => setAwayEnabled(e.target.checked)}
+                />
+                Enable away reply
+              </label>
+              <input
+                id="away-message"
+                type="text"
+                value={awayText}
+                disabled={busy}
+                onChange={(e) => setAwayText(e.target.value)}
+                aria-label="Away reply text"
+                placeholder="Away message"
+                className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+              />
+              <button
+                type="submit"
+                disabled={busy || (awayEnabled && !awayText.trim())}
+                className="rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+              >
+                Save
+              </button>
+            </form>
+          </>
         )}
       </section>
 

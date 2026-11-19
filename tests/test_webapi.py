@@ -21,6 +21,7 @@ import RNS
 
 from tau import cli
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
+from tau.away import DEFAULT_AWAY_MESSAGE
 from tau.backup import MANIFEST_NAME, restore_backup
 from tau.blocklist import BlockList, load_blocklist, save_blocklist
 from tau.config import TauConfig
@@ -6854,6 +6855,147 @@ def test_quiet_hours_without_data_dir(bridge):
     assert status == 200
     assert payload["enabled"] is False
     assert payload["active"] is False
+
+
+def test_away_message_endpoints(node, tmp_path):
+    from tau.away import AwayState, save_away
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A fresh node has no away file: off, with the default message kept.
+        status, _, payload = _json(bridge, "/api/settings/away-message")
+        assert status == 200
+        assert payload == {
+            "enabled": False,
+            "message": DEFAULT_AWAY_MESSAGE,
+            "since": None,
+            "replied_to": [],
+            "replied_count": 0,
+        }
+
+        # Turning it on with a custom message starts a fresh period.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": True, "message": "back on Monday"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["away_message"]["enabled"] is True
+        assert payload["away_message"]["message"] == "back on Monday"
+        assert payload["away_message"]["since"] is not None
+        assert payload["away_message"]["replied_count"] == 0
+        assert payload["away_message"]["changed"] is True
+
+        # A peer that already got a reply shows in the count.
+        save_away(
+            tmp_path / "away.json",
+            AwayState.on("back on Monday").with_replied(PEER_HASH),
+        )
+        status, _, payload = _json(bridge, "/api/settings/away-message")
+        assert payload["replied_count"] == 1
+        assert payload["replied_to"] == [PEER_HASH]
+
+        # A no-op save — on already, same message — leaves the period
+        # (and its replied list) untouched.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": True, "message": "back on Monday"},
+        )
+        assert payload["away_message"]["changed"] is False
+        status, _, payload = _json(bridge, "/api/settings/away-message")
+        assert payload["replied_count"] == 1
+
+        # Changing the message while on starts a fresh period.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"message": "back Tuesday instead"},
+        )
+        assert payload["away_message"]["message"] == "back Tuesday instead"
+        assert payload["away_message"]["replied_count"] == 0
+        assert payload["away_message"]["changed"] is True
+
+        # Turning it off keeps the message, so turning it back on
+        # restores the same text; the no-op set reports unchanged.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": False},
+        )
+        assert status == 200
+        assert payload["away_message"]["enabled"] is False
+        assert payload["away_message"]["message"] == "back Tuesday instead"
+        assert payload["away_message"]["changed"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": False},
+        )
+        assert payload["away_message"]["changed"] is False
+    finally:
+        bridge.stop()
+
+
+def test_away_message_endpoint_rejects_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"enabled": "yes"},
+            {"enabled": True, "message": ""},
+            {"enabled": True, "message": "   "},
+            {"enabled": True, "message": 42},
+            {"enabled": True, "message": "x" * 2001},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/settings/away-message", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_away_message_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "away.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/away-message",
+            method="POST",
+            body={"enabled": True},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/settings/away-message")
+        assert status == 503
+    finally:
+        bridge.stop()
+
+
+def test_away_message_without_data_dir(bridge):
+    # A dataless node has no away-message path: edits are refused, but
+    # the read still answers the default off state instead of failing
+    # the console poll.
+    status, _, payload = _json(
+        bridge,
+        "/api/settings/away-message",
+        method="POST",
+        body={"enabled": True},
+    )
+    assert status == 503
+    status, _, payload = _json(bridge, "/api/settings/away-message")
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["message"] == DEFAULT_AWAY_MESSAGE
 
 
 def test_muted_conversations_endpoints(node, tmp_path):

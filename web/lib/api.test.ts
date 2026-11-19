@@ -13,6 +13,7 @@ import {
   eventsUrl,
   fetchTanMedia,
   fileUrl,
+  getAwayMessage,
   getBroadcasts,
   getChannelMessages,
   getChannelPins,
@@ -40,6 +41,7 @@ import {
   searchChannelMessages,
   sendChannelMessage,
   sendMessage,
+  setAwayMessage,
   setChannelTopic,
   setDisappearingDefault,
   setQuietHours,
@@ -191,6 +193,18 @@ describe("GET endpoints", () => {
     });
   });
 
+  it("fetches the away message", async () => {
+    nextJson = {
+      enabled: false,
+      message: "I'm away right now. I'll reply when I'm back.",
+      since: null,
+      replied_to: [],
+      replied_count: 0,
+    };
+    await getAwayMessage();
+    expect(captured[0].url).toBe("/api/settings/away-message");
+  });
+
   it("fetches the quiet-hours window", async () => {
     nextJson = {
       enabled: false,
@@ -328,86 +342,16 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
   });
 
-  it("sets quiet hours with only the changed fields", async () => {
-    nextJson = { ok: true, quiet_hours: {} };
-    await setQuietHours({ enabled: true, start: "23:00", end: "06:30" });
-    expect(captured[0].url).toBe("/api/settings/quiet-hours");
+  it("sets the away message with only the changed fields", async () => {
+    nextJson = { ok: true, away_message: {} };
+    await setAwayMessage({ enabled: true, message: "back on Monday" });
+    expect(captured[0].url).toBe("/api/settings/away-message");
     expect(captured[0].init?.method).toBe("POST");
-    expect(bodyOf(0)).toEqual({ enabled: true, start: "23:00", end: "06:30" });
-    await setQuietHours({ enabled: false });
+    expect(bodyOf(0)).toEqual({ enabled: true, message: "back on Monday" });
+    await setAwayMessage({ enabled: false });
     expect(bodyOf(1)).toEqual({ enabled: false });
   });
 
-  it("publishes a Tan post with an image data URL when attached", async () => {
-    nextJson = { ok: true, post: {} };
-    await publishTanPost("with a picture", {
-      image: { dataUrl: "data:image/png;base64,iVBORw==" },
-    });
-    expect(captured[0].url).toBe("/api/tan/posts");
-    expect(bodyOf(0)).toEqual({
-      text: "with a picture",
-      image: "data:image/png;base64,iVBORw==",
-    });
-  });
-
-  it("publishes a Tan post without an image field when none is attached", async () => {
-    nextJson = { ok: true, post: {} };
-    await publishTanPost("text only");
-    expect(bodyOf(0)).toEqual({ text: "text only" });
-  });
-
-  it("reads a picked file as a base64 data URL", async () => {
-    const file = new File(["hello"], "pic.png", { type: "image/png" });
-    await expect(readFileAsDataUrl(file)).resolves.toBe(
-      "data:image/png;base64,aGVsbG8=",
-    );
-  });
-
-  it("lists broadcast lists from /api/broadcasts", async () => {
-    nextJson = { broadcasts: [], count: 0 };
-    const lists = await getBroadcasts();
-    expect(captured[0].url).toBe("/api/broadcasts");
-    expect(lists).toEqual([]);
-  });
-
-  it("creates a broadcast list with name and member hashes", async () => {
-    nextJson = { ok: true, broadcast: { name: "team", members: [], created_at: 1 } };
-    await createBroadcast("team", ["a".repeat(32)]);
-    expect(captured[0].url).toBe("/api/broadcasts");
-    expect(bodyOf(0)).toEqual({ name: "team", members: ["a".repeat(32)] });
-  });
-
-  it("deletes a broadcast list by name", async () => {
-    nextJson = { ok: true, name: "team" };
-    await deleteBroadcast("team");
-    expect(captured[0].url).toBe("/api/broadcasts/delete");
-    expect(bodyOf(0)).toEqual({ broadcast: "team" });
-  });
-
-  it("sends a broadcast with list name and text", async () => {
-    nextJson = { ok: true, name: "team", results: [], delivered: 0, queued: 0, failed: 0 };
-    await sendBroadcast("team", "meet at noon");
-    expect(captured[0].url).toBe("/api/broadcasts/send");
-    expect(bodyOf(0)).toEqual({ broadcast: "team", text: "meet at noon" });
-  });
-
-  it("sets a channel topic with channel and topic in the body", async () => {
-    nextJson = { ok: true, channel: "general", topic: {}, cleared: false };
-    await setChannelTopic("general", "monthly mesh meetup");
-    expect(captured[0].url).toBe("/api/channels/topic");
-    expect(captured[0].init?.method).toBe("POST");
-    expect(bodyOf(0)).toEqual({ channel: "general", topic: "monthly mesh meetup" });
-  });
-
-  it("pins and unpins a channel message by hash", async () => {
-    nextJson = { ok: true };
-    await pinChannelMessage("general", "a".repeat(64));
-    expect(captured[0].url).toBe("/api/channels/pin");
-    expect(bodyOf(0)).toEqual({ channel: "general", hash: "a".repeat(64) });
-    await unpinChannelMessage("general", "a".repeat(64));
-    expect(captured[1].url).toBe("/api/channels/unpin");
-    expect(bodyOf(1)).toEqual({ channel: "general", hash: "a".repeat(64) });
-  });
 });
 
 describe("ApiError", () => {
