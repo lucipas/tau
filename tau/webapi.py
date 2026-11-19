@@ -83,6 +83,10 @@ script) can read what arrives from the mesh and send messages back:
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
+    GET  /api/drafts       saved message drafts (``tau draft save``)
+    POST /api/drafts       save a message draft ``{"kind": "peer"|"group",
+                           "target": "<hash>", "text": "..."}``
+    POST /api/drafts/delete discard a message draft ``{"kind", "target"}``
     GET  /api/messages/muted muted DM conversations and groups
     POST /api/messages/mute mute ``{"peer": "<name or hash>"}`` or
                            ``{"group": "<id | prefix | name>"}``
@@ -240,6 +244,7 @@ from .disappearing import (
     load_disappearing_defaults,
     save_disappearing_defaults,
 )
+from .drafts import DRAFT_KINDS, DraftStore
 from .muted import (
     MutedError,
     expand_muted_groups,
@@ -264,6 +269,7 @@ from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
     ARCHIVED_FILE_NAME,
     DISAPPEARING_FILE_NAME,
+    DRAFTS_FILE_NAME,
     MESSAGES_FILE_NAME,
     MUTED_FILE_NAME,
     QUIET_HOURS_FILE_NAME,
@@ -8471,6 +8477,83 @@ class WebBridge:
             "changed": changed,
         }
 
+    def _drafts_path(self) -> Optional[Path]:
+        """This node's message-drafts path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "drafts_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / DRAFTS_FILE_NAME
+
+    def list_drafts(self) -> Dict[str, Any]:
+        """Saved message drafts, oldest first, with a best-effort name.
+
+        The console resolves a draft's conversation from its own lists,
+        but a draft for a peer with no messages yet is in none of them,
+        so the name is resolved here too: the peer's registry name, the
+        group name, or ``None`` when neither is known.  A dataless node
+        has no drafts file and answers empty instead of failing the
+        console poll.
+        """
+        path = self._drafts_path()
+        if path is None:
+            return {"drafts": [], "count": 0}
+        store = DraftStore(path)
+        names: Dict[str, str] = {}
+        for peer in self.peers():
+            destination = peer.get("destination")
+            if isinstance(destination, str):
+                names[destination] = str(peer.get("name") or destination)
+        for record in self._group_records():
+            group_id = record.get("id")
+            if isinstance(group_id, str):
+                names[group_id] = str(record.get("name") or group_id)
+        drafts = []
+        for draft in store.list_drafts():
+            entry = dict(draft)
+            entry["name"] = names.get(draft["target"])
+            drafts.append(entry)
+        return {"drafts": drafts, "count": len(drafts)}
+
+    def save_draft(self, *, kind: Any, target: Any, text: Any) -> Dict[str, Any]:
+        """Save (or overwrite) the draft for one conversation.
+
+        *kind* is ``"peer"`` or ``"group"`` and *target* is the peer
+        destination hash or group id — the console passes the
+        conversation key straight through, so no name resolution runs
+        here.  A bad kind, target or text is a :class:`ValueError`; a
+        failed write and a dataless node are :class:`WebBridgeError`.
+        """
+        path = self._drafts_path()
+        if path is None:
+            raise WebBridgeError("this node has no drafts path")
+        if not isinstance(kind, str) or not isinstance(target, str):
+            raise ValueError("fields 'kind' and 'target' are required")
+        if kind not in DRAFT_KINDS:
+            raise ValueError(f"unknown draft target kind: {kind!r}")
+        if not isinstance(text, str):
+            raise ValueError("field 'text' is required")
+        store = DraftStore(path)
+        try:
+            return store.save(kind, target, text)
+        except OSError as exc:
+            raise WebBridgeError(f"could not save the draft ({exc})") from exc
+
+    def delete_draft(self, *, kind: Any, target: Any) -> Dict[str, Any]:
+        """Discard the draft for one conversation; ``deleted`` says if one was there."""
+        path = self._drafts_path()
+        if path is None:
+            raise WebBridgeError("this node has no drafts path")
+        if not isinstance(kind, str) or not isinstance(target, str):
+            raise ValueError("fields 'kind' and 'target' are required")
+        if kind not in DRAFT_KINDS:
+            raise ValueError(f"unknown draft target kind: {kind!r}")
+        store = DraftStore(path)
+        return {"deleted": store.delete(kind, target)}
+
     def _muted_path(self) -> Optional[Path]:
         """This node's muted-conversations path, or ``None`` for a dataless node."""
         config = getattr(self.node, "config", None)
@@ -10506,6 +10589,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(result, head_only)
                 return
+            if path == "/api/drafts":
+                try:
+                    result = self.bridge.list_drafts()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
             if path == "/api/messages/export":
                 # The full inbox backup goes only to the local machine,
                 # even when the bridge is bound to a remote interface.
@@ -11325,6 +11416,39 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "disappearing": result}, head_only)
+                return
+            if path == "/api/drafts":
+                try:
+                    draft = self.bridge.save_draft(
+                        kind=body.get("kind"),
+                        target=body.get("target"),
+                        text=body.get("text"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "draft": draft}, head_only)
+                return
+            if path == "/api/drafts/delete":
+                try:
+                    result = self.bridge.delete_draft(
+                        kind=body.get("kind"),
+                        target=body.get("target"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, **result}, head_only)
                 return
             if path == "/api/messages/mute":
                 # ``muted`` defaults to true: posting a target mutes

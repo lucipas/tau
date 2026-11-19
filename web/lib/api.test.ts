@@ -8,6 +8,7 @@ import {
   cancelScheduledChannelMessage,
   clearReaction,
   closeChannelPoll,
+  deleteDraft,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
@@ -15,6 +16,7 @@ import {
   getChannelPins,
   getChannelScheduled,
   getChannelTopic,
+  getDrafts,
   getMessages,
   getTanThread,
   getTanTimeline,
@@ -25,6 +27,7 @@ import {
   reactToChannelMessage,
   reactToMessage,
   closeDmPoll,
+  saveDraft,
   scheduleChannelMessage,
   searchChannelMessages,
   sendChannelMessage,
@@ -117,6 +120,17 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/scheduled?channel=my%20channel");
     await getChannelScheduled();
     expect(captured[1].url).toBe("/api/channels/scheduled");
+  });
+
+  it("lists message drafts", async () => {
+    nextJson = {
+      drafts: [{ kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" }],
+      count: 1,
+    };
+    const drafts = await getDrafts();
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].name).toBe("alice");
   });
 
   it("posts a channel poll with question and options", async () => {
@@ -221,6 +235,24 @@ describe("POST endpoints", () => {
     nextJson = { ok: true, message: {}, response: {} };
     await sendMessage({ group: "g123" }, "hi");
     expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
+  });
+
+  it("saves and deletes a message draft", async () => {
+    nextJson = {
+      ok: true,
+      draft: { kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" },
+    };
+    const draft = await saveDraft("peer", "ab".repeat(16), "hi");
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ kind: "peer", target: "ab".repeat(16), text: "hi" });
+    expect(draft.text).toBe("hi");
+
+    nextJson = { ok: true, deleted: true };
+    const deleted = await deleteDraft("peer", "ab".repeat(16));
+    expect(captured[1].url).toBe("/api/drafts/delete");
+    expect(bodyOf(1)).toEqual({ kind: "peer", target: "ab".repeat(16) });
+    expect(deleted).toBe(true);
   });
 
   it("reacts and clears a reaction on the same route", async () => {

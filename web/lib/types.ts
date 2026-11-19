@@ -363,6 +363,17 @@ export interface MutedConversations {
   groups: string[];
 }
 
+/** One unsent message parked for a peer or a group (``tau draft save``). */
+export interface MessageDraft {
+  kind: "peer" | "group";
+  /** Peer destination hash or group id. */
+  target: string;
+  text: string;
+  updated_at: number;
+  /** Best-effort conversation name from the bridge; null when unknown. */
+  name: string | null;
+}
+
 // --------------------------------------------------------------- outbox --
 
 export interface OutboxGroup {

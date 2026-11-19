@@ -70,6 +70,7 @@ export function stubBridgeFetch() {
     if (url.includes("/api/outbox")) return { outbox: [], count: 0, held_for_others: 0 };
     if (url.includes("/api/messages/muted")) return { peers: [], groups: [] };
     if (url.includes("/api/conversations/archived")) return { archived: [] };
+    if (url.includes("/api/drafts")) return { drafts: [], count: 0 };
     if (url.includes("/api/messages/read")) {
       return { ok: true, unread: makeUnread() };
     }

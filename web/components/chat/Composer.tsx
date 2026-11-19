@@ -45,6 +45,10 @@ export interface ComposerProps {
   disabled?: boolean;
   /** Polls are supported for this conversation; hide the toggle otherwise. */
   allowPoll?: boolean;
+  /** A saved draft to load into the box (set when its conversation opens). */
+  draftSeed?: { key: string; text: string } | null;
+  /** Park the current text as a draft for this conversation. */
+  onSaveDraft?: (text: string) => Promise<void> | void;
   onSend: (text: string, opts: ComposerSendOptions) => Promise<void> | void;
   onSendFile: (file: File, opts: Omit<ComposerSendOptions, "pollOptions">) => Promise<void> | void;
 }
@@ -72,6 +76,8 @@ export default function Composer({
   onCancelEdit,
   disabled = false,
   allowPoll = false,
+  draftSeed,
+  onSaveDraft,
   onSend,
   onSendFile,
 }: ComposerProps) {
@@ -83,6 +89,7 @@ export default function Composer({
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  const [savingDraft, setSavingDraft] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Editing pre-fills the box; keep local edits once the user starts typing.
@@ -94,6 +101,31 @@ export default function Composer({
   if (!editing && editSeed !== null) {
     setEditSeed(null);
     setText("");
+  }
+
+  // A saved draft pre-fills the box when its conversation opens — but
+  // never clobbers text the user already typed into this composer.
+  const [draftSeedKey, setDraftSeedKey] = useState<string | null>(null);
+  if (draftSeed && draftSeedKey !== draftSeed.key) {
+    setDraftSeedKey(draftSeed.key);
+    if (text.trim() === "") setText(draftSeed.text);
+  }
+  if (!draftSeed && draftSeedKey !== null) {
+    setDraftSeedKey(null);
+  }
+
+  async function handleSaveDraft() {
+    if (!onSaveDraft || !text.trim() || savingDraft) return;
+    setError(null);
+    setSavingDraft(true);
+    try {
+      await onSaveDraft(text.trim());
+      setText("");
+    } catch (err) {
+      setError(`Save draft failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSavingDraft(false);
+    }
   }
 
   const canSend = !disabled && !sending && (mode === "poll" ? true : text.trim().length > 0 || file !== null);
@@ -305,6 +337,24 @@ export default function Composer({
             ))}
           </select>
         </label>
+        {onSaveDraft && (
+          <button
+            type="button"
+            onClick={() => void handleSaveDraft()}
+            disabled={
+              disabled ||
+              savingDraft ||
+              text.trim().length === 0 ||
+              mode === "poll" ||
+              file !== null ||
+              !!editing
+            }
+            title="Park this message as a draft to send later"
+            className="rounded-full border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-900 disabled:opacity-40"
+          >
+            Save draft
+          </button>
+        )}
         <button
           type="submit"
           disabled={!canSend}

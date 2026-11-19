@@ -11,14 +11,17 @@ import {
   closeDmPoll,
   closeGroupPoll,
   declineDmRequest,
+  deleteDraft,
   deleteMessage,
   editMessage,
   forwardMessage,
   getArchivedConversations,
+  getDrafts,
   getMutedConversations,
   pinMessage,
   reactToMessage,
   retractMessage,
+  saveDraft,
   sendFile,
   sendGroupFile,
   sendMessage,
@@ -27,7 +30,7 @@ import {
   voteGroupPoll,
   type SendMessageOptions,
 } from "@/lib/api";
-import type { ChatMessage } from "@/lib/types";
+import type { ChatMessage, MessageDraft } from "@/lib/types";
 import {
   buildConversations,
   useConversations,
@@ -38,6 +41,7 @@ import {
 import { useHash } from "../chrome/useHash";
 import { useTauContext } from "../chrome/TauContext";
 import ConversationList from "./ConversationList";
+import DraftsPanel from "./DraftsPanel";
 import OutboxPanel from "./OutboxPanel";
 import ThreadView from "./ThreadView";
 import type { MessageAction } from "./MessageBubble";
@@ -81,6 +85,11 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+/** The drafts list key for one conversation: `dm:<hash>` or `group:<id>`. */
+function draftKeyFor(kind: "peer" | "group", target: string): string {
+  return `${kind === "group" ? "group" : "dm"}:${target}`;
+}
+
 export default function ChatSection() {
   const tau = useTauContext();
   const { peer: selectedPeer, group: selectedGroup, navigate } = useHash();
@@ -94,6 +103,9 @@ export default function ChatSection() {
   const [editing, setEditing] = useState<ChatMessage | null>(null);
   const [showOutbox, setShowOutbox] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<MessageDraft[]>([]);
+  const [draftsLoading, setDraftsLoading] = useState(true);
+  const [pendingSeed, setPendingSeed] = useState<{ key: string; text: string } | null>(null);
 
   const { conversations, archived: archivedConvs, dmRequests, refreshRequests } = useConversations(
     tau,
@@ -156,6 +168,61 @@ export default function ChatSection() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey]);
 
+  const refreshDrafts = useCallback(async () => {
+    try {
+      setDrafts(await getDrafts());
+    } catch {
+      // Drafts are advisory; the chat list works without them.
+    } finally {
+      setDraftsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshDrafts();
+  }, [refreshDrafts]);
+
+  // A conversation with a saved draft loads it into the composer when
+  // opened; a conversation without one clears the seed.
+  useEffect(() => {
+    if (!selectedKey) {
+      setPendingSeed(null);
+      return;
+    }
+    const draft = drafts.find((d) => draftKeyFor(d.kind, d.target) === selectedKey);
+    setPendingSeed(draft ? { key: selectedKey, text: draft.text } : null);
+  }, [selectedKey, drafts]);
+
+  const handleOpenDraft = useCallback(
+    (draft: MessageDraft) => {
+      if (draft.kind === "group") navigate("chat", { group: draft.target });
+      else navigate("chat", { peer: draft.target });
+      setPendingSeed({ key: draftKeyFor(draft.kind, draft.target), text: draft.text });
+    },
+    [navigate],
+  );
+
+  const handleDeleteDraft = useCallback(
+    (draft: MessageDraft) => {
+      void run("Delete draft failed", () => deleteDraft(draft.kind, draft.target)).then(() =>
+        void refreshDrafts(),
+      );
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [refreshDrafts],
+  );
+
+  const handleSaveDraft = useCallback(
+    async (text: string) => {
+      if (!selected) return;
+      // Errors propagate to the composer, which shows them and keeps
+      // the text — a failed save must never clear the box.
+      await saveDraft(selected.kind === "group" ? "group" : "peer", selected.key, text);
+      void refreshDrafts();
+    },
+    [selected, refreshDrafts],
+  );
+
   const handleSelect = useCallback(
     (conv: Conversation) => {
       if (conv.kind === "group") navigate("chat", { group: conv.key });
@@ -166,13 +233,15 @@ export default function ChatSection() {
 
   const handleBack = useCallback(() => navigate("chat"), [navigate]);
 
-  async function run(label: string, fn: () => Promise<unknown>) {
+  async function run(label: string, fn: () => Promise<unknown>): Promise<boolean> {
     setError(null);
     try {
       await fn();
       await tau.refresh();
+      return true;
     } catch (err) {
       setError(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
     }
   }
 
@@ -193,10 +262,18 @@ export default function ChatSection() {
         pollOptions: opts.pollOptions,
       };
       setReplyTo(null);
-      await run("Send failed", () => sendMessage(target, text, sendOpts));
+      const sent = await run("Send failed", () => sendMessage(target, text, sendOpts));
+      // A sent message closes the draft it was loaded from, like
+      // `draft send` — but only when the send actually went through.
+      if (sent && pendingSeed && pendingSeed.key === selectedKey) {
+        await deleteDraft(selected.kind === "group" ? "group" : "peer", selected.key).catch(
+          () => undefined,
+        );
+        void refreshDrafts();
+      }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [selected, editing],
+    [selected, editing, pendingSeed, selectedKey, refreshDrafts],
   );
 
   const handleSendFile = useCallback(
@@ -331,6 +408,12 @@ export default function ChatSection() {
             onDropHeld={(target) => void outbox.dropHeld(target)}
           />
         )}
+        <DraftsPanel
+          drafts={drafts}
+          loading={draftsLoading}
+          onOpen={handleOpenDraft}
+          onDelete={handleDeleteDraft}
+        />
         <div className="min-h-0 flex-1">
           <ConversationList
             conversations={conversations}
@@ -375,6 +458,8 @@ export default function ChatSection() {
             onClosePoll={handleClosePoll}
             onSend={handleSend}
             onSendFile={handleSendFile}
+            draftSeed={pendingSeed}
+            onSaveDraft={handleSaveDraft}
             onBack={handleBack}
             onOpenPeerPanel={() => {
               // Peer details live in the right sidebar on desktop; on mobile

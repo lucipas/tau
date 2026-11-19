@@ -32,6 +32,7 @@ import type {
   MeshPage,
   MeshRow,
   MutedConversations,
+  MessageDraft,
   NodeSettings,
   Outbox,
   OutboxRetryResult,
@@ -560,6 +561,35 @@ export async function setDisappearingDefault(
 
 export async function getMutedConversations(): Promise<MutedConversations> {
   return get("/api/messages/muted");
+}
+
+/** Saved message drafts, oldest first (``tau draft save``). */
+export async function getDrafts(): Promise<MessageDraft[]> {
+  const data = await get<{ drafts: MessageDraft[]; count: number }>("/api/drafts");
+  return data.drafts ?? [];
+}
+
+/** Save (or overwrite) the draft for one peer or group conversation. */
+export async function saveDraft(
+  kind: "peer" | "group",
+  target: string,
+  text: string,
+): Promise<MessageDraft> {
+  const data = await post<{ ok: boolean; draft: MessageDraft }>("/api/drafts", {
+    kind,
+    target,
+    text,
+  });
+  return data.draft;
+}
+
+/** Discard the draft for one peer or group conversation. */
+export async function deleteDraft(kind: "peer" | "group", target: string): Promise<boolean> {
+  const data = await post<{ ok: boolean; deleted: boolean }>("/api/drafts/delete", {
+    kind,
+    target,
+  });
+  return data.deleted;
 }
 
 export async function setMuted(
