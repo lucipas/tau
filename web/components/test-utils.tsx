@@ -40,7 +40,7 @@ export function makeMessage(overrides: Partial<ChatMessage> & { id: number }): C
 }
 
 export function makeUnread(overrides: Partial<UnreadCounts> = {}): UnreadCounts {
-  return { per_peer: {}, per_group: {}, total: 0, revision: 1, ...overrides };
+  return { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1, ...overrides };
 }
 
 export function fakeTau(overrides: Partial<UseTauResult> = {}): UseTauResult {
@@ -66,6 +66,7 @@ export function fakeTau(overrides: Partial<UseTauResult> = {}): UseTauResult {
 export function stubBridgeFetch() {
   const handler = (url: string) => {
     if (url.includes("/api/messages/requests")) return { requests: [], count: 0 };
+    if (url.includes("/api/broadcasts")) return { broadcasts: [], count: 0 };
     if (url.includes("/api/outbox/held")) return { held: [], count: 0 };
     if (url.includes("/api/outbox")) return { outbox: [], count: 0, held_for_others: 0 };
     if (url.includes("/api/messages/muted")) return { peers: [], groups: [] };

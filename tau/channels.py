@@ -186,11 +186,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import RNS
 
 from .blocklist import load_blocklist
+from .disappearing import channel_default_for
 from .identity import load_public_key
 from .protocol import (
     APP_NAME,
     ASPECT,
     MAX_GROUP_TOPIC_LENGTH,
+    MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     MAX_REQUEST_BYTES,
     ProtocolError,
@@ -264,6 +266,15 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # re-pointed at another message either.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
 
+# A channel message's expiry is deliberately NOT one of the hash
+# fields: ``expires_at`` rides as an unsigned advisory field, so an
+# older node verifies, stores and serves an expiring message exactly
+# like any other (it just never expires it) and there is no interop
+# break.  Honest nodes enforce it; a modified peer can keep a copy,
+# the same as with a DM — disappearing is a hygiene preference, not
+# a security boundary.  The cap mirrors ``tau send --expire``.
+MAX_CHANNEL_EXPIRE_SECONDS = MAX_MAIL_TTL
+
 # Poll fields ride on the message and are covered by the hash when
 # present (see _canonical_body): a poll carries poll_options, a vote
 # carries poll_vote, a close carries poll_close — at most one per
@@ -323,6 +334,7 @@ _MESSAGE_COLUMNS = (
     "name",
     "text",
     "created_at",
+    "expires_at",
     "received_at",
     "sig",
     "poll_options",
@@ -517,6 +529,18 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
     if now is not None and created_at > float(now) + 86400.0:
         raise ChannelError("channel message timestamp is too far in the future")
 
+    # An expiry is advisory and unsigned (see MAX_CHANNEL_EXPIRE_SECONDS):
+    # validate its shape and range, but never let it into the hash.
+    raw_expires_at = mesg.get("expires_at")
+    expires_at = None
+    if raw_expires_at is not None:
+        expires_at = _require_timestamp(raw_expires_at, "expires_at")
+        if expires_at <= created_at:
+            raise ChannelError("channel message expires_at must be after created_at")
+        if expires_at > created_at + MAX_CHANNEL_EXPIRE_SECONDS:
+            raise ChannelError(
+                "channel message expires_at is more than 30d after created_at"
+            )
     poll_options = mesg.get("poll_options")
     poll_vote = mesg.get("poll_vote")
     poll_close = mesg.get("poll_close")
@@ -557,6 +581,7 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
         "name": name,
         "text": text,
         "created_at": created_at,
+        "expires_at": expires_at,
         "reply_to": reply_to,
     }
     if cleaned_options is not None:
@@ -610,6 +635,10 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
         "hash": message["hash"],
         "sig": message["sig"],
     }
+    # The expiry is part of the public message when set; a message
+    # without one keeps the exact shape older readers expect.
+    if message.get("expires_at") is not None:
+        canonical["expires_at"] = message["expires_at"]
     for field in POLL_FIELDS:
         if message.get(field) is not None:
             canonical[field] = message[field]
@@ -1302,6 +1331,7 @@ CREATE TABLE IF NOT EXISTS messages (
     name TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL,
     created_at REAL NOT NULL,
+    expires_at REAL,
     received_at REAL NOT NULL,
     sig TEXT NOT NULL,
     poll_options TEXT,
@@ -1353,6 +1383,17 @@ CREATE TABLE IF NOT EXISTS memberships (
     channel TEXT PRIMARY KEY,
     joined_at REAL NOT NULL
 );
+
+-- Last-read cursor per joined channel: the newest message the owner
+-- has marked read, as (created_at, hash).  Unread is everything newer
+-- than the cursor; with no cursor yet, everything received since
+-- joining.  Local-only, never gossiped; leaving drops the cursor.
+CREATE TABLE IF NOT EXISTS read_cursors (
+    channel TEXT PRIMARY KEY,
+    last_read_hash TEXT NOT NULL,
+    last_read_at REAL NOT NULL
+);
+
 
 -- One topic per channel: the newest signed topic wins, and an empty
 -- topic clears the row instead of storing a blank.  Topics are
@@ -1409,6 +1450,14 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
+    # A store created before expiring messages has no expires_at
+    # column: CREATE TABLE IF NOT EXISTS leaves it alone, so add
+    # the column in place rather than rebuilding the store.
+    columns = [
+        row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    ]
+    if "expires_at" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN expires_at REAL")
     # Stores written before polls existed have no poll columns:
     # add them so an old store keeps working without a rebuild.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
@@ -1683,6 +1732,14 @@ def store_message(
         message["sig"] = _require_hex(mesg.get("sig"), SIG_HEX_LENGTH, "sig")
 
     digest = message["hash"]
+    if (
+        message.get("expires_at") is not None
+        and message["expires_at"] <= timestamp
+    ):
+        # Already expired on arrival — a slow gossip, or a sender
+        # whose clock ran ahead: never store it, like an expired DM.
+        log.info("Dropping expired channel message %s", digest)
+        return _canonical_message(message), False
     if _retraction_for(conn, digest, message["author"]) is not None:
         # A retract notice arrived before the message did: the
         # tombstone stands, and the message is refused, not stored.
@@ -1695,8 +1752,8 @@ def store_message(
         with conn:
             conn.execute(
                 "INSERT INTO messages(v, hash, channel, author, key, name, text, "
-                "created_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, expires_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     CHANNEL_VERSION,
                     digest,
@@ -1706,6 +1763,7 @@ def store_message(
                     message["name"],
                     message["text"],
                     message["created_at"],
+                    message.get("expires_at"),
                     timestamp,
                     message["sig"],
                     _dump_poll_field(message.get("poll_options")),
@@ -1715,6 +1773,14 @@ def store_message(
                 ),
             )
             _prune_store(conn, message["channel"])
+            # Expired rows are invisible to history either way, but
+            # dropping them here keeps the store bounded on a node
+            # that receives far more than it reads.
+            conn.execute(
+                "DELETE FROM messages "
+                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (timestamp,),
+            )
     except sqlite3.IntegrityError:
         # Another thread or process inserted the same message first.
         existing = _fetch_message(conn, digest)
@@ -2007,6 +2073,7 @@ def create_message(
     *,
     name: str = "anonymous",
     now: Optional[float] = None,
+    expires_at: Optional[float] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -2024,6 +2091,8 @@ def create_message(
 
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
+    if expires_at is not None and float(expires_at) <= timestamp:
+        raise ChannelError("channel message expiry must be in the future")
     author = _author_from_identity(identity)
     body = {
         "v": CHANNEL_VERSION,
@@ -2034,6 +2103,11 @@ def create_message(
         "text": normalize_message(text),
         "created_at": timestamp,
     }
+    if expires_at is not None:
+        # Unsigned advisory field (see MAX_CHANNEL_EXPIRE_SECONDS):
+        # it rides the message but never enters the hash, so older
+        # nodes verify the message exactly as before.
+        body["expires_at"] = float(expires_at)
     if poll_options is not None:
         body["poll_options"] = poll_options
     if poll_vote is not None:
@@ -2323,6 +2397,10 @@ def channel_history_page(
     count = max(1, min(int(limit), MAX_CHANNEL_HISTORY))
     clauses = ["channel = ?"]
     params: List[Any] = [name]
+    # An expired message is gone from history even before the store
+    # purges it: a node that only reads must never show one.
+    clauses.append("(expires_at IS NULL OR expires_at > ?)")
+    params.append(time.time())
     if before is not None:
         stamp = _require_timestamp(before, "before")
         if before_hash is not None:
@@ -2469,6 +2547,9 @@ def leave_channel(conn: sqlite3.Connection, channel: str) -> bool:
         cursor = conn.execute(
             "DELETE FROM memberships WHERE channel = ?", (name,)
         )
+        # Leaving drops the read cursor too: a rejoin starts fresh,
+        # so old cached history is not resurrected as unread.
+        conn.execute("DELETE FROM read_cursors WHERE channel = ?", (name,))
     return cursor.rowcount > 0
 
 
@@ -2496,6 +2577,100 @@ def list_memberships(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def mark_channel_read(
+    conn: sqlite3.Connection,
+    channel: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Advance *channel*'s read cursor to its newest stored message.
+
+    Requires membership: marking a channel you have not joined is an
+    error, so a typo never silently clears a badge.  Returns the
+    cursor plus how many messages it cleared; with no stored messages
+    there is nothing to mark and the cursor is left alone.
+    *exclude_authors* keeps the cleared count honest — the same
+    authors :func:`channel_unread_counts` excludes from the badge.
+    """
+    name = clean_channel_name(channel)
+    row = conn.execute(
+        "SELECT channel, joined_at FROM memberships WHERE channel = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        raise ChannelError(f"not a member of #{name} — join it first")
+    newest = conn.execute(
+        "SELECT hash, created_at FROM messages WHERE channel = ? "
+        "ORDER BY created_at DESC, hash DESC LIMIT 1",
+        (name,),
+    ).fetchone()
+    cleared = channel_unread_counts(conn, exclude_authors=exclude_authors).get(
+        name, 0
+    )
+    if newest is None:
+        return {"channel": name, "hash": None, "created_at": None, "cleared": 0}
+    with conn:
+        conn.execute(
+            "INSERT INTO read_cursors(channel, last_read_hash, last_read_at) "
+            "VALUES(?, ?, ?) "
+            "ON CONFLICT(channel) DO UPDATE SET "
+            "last_read_hash = excluded.last_read_hash, "
+            "last_read_at = excluded.last_read_at",
+            (name, newest["hash"], newest["created_at"]),
+        )
+    return {
+        "channel": name,
+        "hash": newest["hash"],
+        "created_at": newest["created_at"],
+        "cleared": cleared,
+    }
+
+
+def channel_unread_counts(
+    conn: sqlite3.Connection,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> Dict[str, int]:
+    """Unread message counts per joined channel.
+
+    A message counts when it is newer than the channel's read cursor
+    — strictly newer by ``(created_at, hash)``, the same order history
+    pages in, so a late-arriving message created before the cursor
+    does not re-light the badge.  With no cursor yet, messages
+    received since joining count: history synced at join time is
+    unread, but cached messages from before a rejoin are not.
+    Authors in *exclude_authors* never count (own messages, blocked
+    authors); pass nothing to count every stored message.
+    """
+    excluded = [author for author in (exclude_authors or []) if author]
+    author_clause = ""
+    params: List[Any] = []
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        author_clause = f" AND msg.author NOT IN ({placeholders})"
+        params.extend(excluded)
+    rows = conn.execute(
+        "SELECT m.channel AS channel, "
+        "COUNT(msg.hash) AS unread "
+        "FROM memberships m "
+        "LEFT JOIN read_cursors c ON c.channel = m.channel "
+        "LEFT JOIN messages msg ON msg.channel = m.channel "
+        "AND ((c.last_read_at IS NULL AND msg.received_at > m.joined_at) "
+        "OR (c.last_read_at IS NOT NULL "
+        "AND (msg.created_at > c.last_read_at "
+        "OR (msg.created_at = c.last_read_at AND msg.hash > c.last_read_hash))))"
+        f"{author_clause} "
+        "GROUP BY m.channel",
+        params,
+    ).fetchall()
+    # Like the inbox counts, a channel with nothing unread gets no
+    # entry — the console only badges channels that have one.
+    return {
+        row["channel"]: int(row["unread"]) for row in rows if int(row["unread"]) > 0
+    }
+
 
 
 def pin_message(
@@ -2701,6 +2876,44 @@ class ChannelApp:
         finally:
             conn.close()
 
+    def mark_read(self, channel: str) -> Dict[str, Any]:
+        """Advance *channel*'s read cursor to its newest message."""
+        conn = self.connect()
+        try:
+            return mark_channel_read(
+                conn, channel, exclude_authors=self._unread_excluded()
+            )
+        finally:
+            conn.close()
+
+    def unread_counts(self) -> Dict[str, int]:
+        """Unread message counts per joined channel.
+
+        Own messages never count, and neither do blocked authors; a
+        block-list that cannot be read fails closed to all zeroes
+        rather than lighting badges for messages the reader hides.
+        """
+        excluded = self._unread_excluded()
+        if excluded is None:
+            # Fail closed: no badge at all, not even a zero entry.
+            return {}
+        conn = self.connect()
+        try:
+            return channel_unread_counts(conn, exclude_authors=excluded)
+        finally:
+            conn.close()
+
+    def _unread_excluded(self) -> Optional[List[str]]:
+        """Authors excluded from unread counts, or ``None`` fail-closed.
+
+        The node's own author hash plus the blocked list; ``None``
+        when the block-list cannot be trusted.
+        """
+        blocked = self._blocked_authors()
+        if blocked is None:
+            return None
+        return [self.author, *blocked]
+
     def memberships(self) -> List[Dict[str, Any]]:
         """Joined channels, most recently joined first."""
         conn = self.connect()
@@ -2865,6 +3078,7 @@ class ChannelApp:
         publish: bool = False,
         targets: Optional[Sequence[Any]] = None,
         ttl: int = MAX_GOSSIP_TTL,
+        expires_at: Optional[float] = None,
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
@@ -2873,13 +3087,23 @@ class ChannelApp:
         """Create a message in a joined channel, gossiping it when asked.
 
         Sending requires membership: a channel you have not joined is
-        not yours to post in.  At most one of ``poll_options``,
-        ``poll_vote`` and ``poll_close`` may be set, making the
-        message a poll, a vote on one, or a close of one.
+        not yours to post in.  An explicit *expires_at* wins; without
+        one, a per-channel disappearing default fills the expiry in,
+        exactly like a DM or group send — a corrupt defaults file
+        fails open with a warning inside ``channel_default_for``,
+        so a send never breaks over it.  At most one of
+        ``poll_options``, ``poll_vote`` and ``poll_close`` may be set,
+        making the message a poll, a vote on one, or a close of one.
         ``reply_to`` is a parent message's hash or unique hex
         prefix in the same channel.
         """
         name = clean_channel_name(channel)
+        if expires_at is None:
+            default = channel_default_for(
+                getattr(self.config, "disappearing_path", None), name
+            )
+            if default is not None:
+                expires_at = time.time() + default
         conn = self.connect()
         try:
             if not is_member(conn, name):
@@ -2892,6 +3116,7 @@ class ChannelApp:
                 name,
                 text,
                 name=self.name,
+                expires_at=expires_at,
                 poll_options=poll_options,
                 poll_vote=poll_vote,
                 poll_close=poll_close,

@@ -128,12 +128,12 @@ export default function MessageBubble({
           {message.location && (
             <p className="mt-1 text-sm">
               <a
-                href={`https://www.openstreetmap.org/?mlat=${message.location.latitude}&mlon=${message.location.longitude}#map=15/${message.location.latitude}/${message.location.longitude}`}
+                href={`https://www.openstreetmap.org/?mlat=${message.location.lat}&mlon=${message.location.lon}#map=15/${message.location.lat}/${message.location.lon}`}
                 target="_blank"
                 rel="noreferrer"
                 className={`underline ${own ? "text-cyan-100" : "text-cyan-300"}`}
               >
-                📍 {message.location.label ?? `${message.location.latitude.toFixed(5)}, ${message.location.longitude.toFixed(5)}`}
+                📍 {message.location.name ?? `${message.location.lat.toFixed(5)}, ${message.location.lon.toFixed(5)}`}
               </a>
             </p>
           )}

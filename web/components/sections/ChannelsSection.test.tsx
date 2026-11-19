@@ -161,8 +161,11 @@ beforeEach(() => {
     }
     if (url.includes("/api/channels")) {
       return {
-        channels: [{ channel: "mesh-general", joined_at: 900 }],
-        count: 1,
+        channels: [
+          { channel: "mesh-general", joined_at: 900, unread: 3 },
+          { channel: "mesh-radio", joined_at: 800, pinned: true, unread: 0 },
+        ],
+        count: 2,
       };
     }
     return { ok: true };
@@ -177,15 +180,26 @@ afterEach(() => {
 describe("ChannelsSection", () => {
   it("lists joined channels and their messages", async () => {
     render(<ChannelsSection />);
-    expect(await screen.findByRole("button", { name: "#mesh-general" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "#mesh-general" }));
+    expect(await screen.findByRole("button", { name: /#mesh-general/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
     // The message shows twice: once in the pinned strip, once in history.
     expect((await screen.findAllByText("hello channel")).length).toBe(2);
   });
 
+  it("shows an unread badge on a channel with unread messages", async () => {
+    render(<ChannelsSection />);
+    expect(await screen.findByLabelText("3 unread")).toBeTruthy();
+  });
+
+  it("marks a channel read when it is opened", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    await waitFor(() => expect(calls).toContain("POST /api/messages/read"));
+  });
+
   it("joins a new channel by name", async () => {
     render(<ChannelsSection />);
-    await screen.findByRole("button", { name: "#mesh-general" });
+    await screen.findByRole("button", { name: /#mesh-general/ });
     fireEvent.change(screen.getByLabelText("Channel name to join"), {
       target: { value: "mesh-radio" },
     });
@@ -195,7 +209,7 @@ describe("ChannelsSection", () => {
 
   it("sends a message to the selected channel", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     await screen.findAllByText("hello channel");
     fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
       target: { value: "hi all" },
@@ -206,14 +220,14 @@ describe("ChannelsSection", () => {
 
   it("shows a reply with its quoted parent", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByText("count me in")).toBeTruthy();
     expect(await screen.findByText("↩ alice: hello channel")).toBeTruthy();
   });
 
   it("reply button arms the composer for that message", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     await screen.findAllByText("hello channel");
     fireEvent.click(screen.getByRole("button", { name: "Reply to alice" }));
     expect(await screen.findByText(/Replying to/)).toBeTruthy();
@@ -231,14 +245,30 @@ describe("ChannelsSection", () => {
 
   it("sync pulls history for the selected channel", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     fireEvent.click(screen.getByRole("button", { name: /Sync/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/sync"));
   });
 
+  it("marks a pinned channel and pins the selected one", async () => {
+    render(<ChannelsSection />);
+    expect(await screen.findByRole("button", { name: "📌 #mesh-radio" })).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+    await waitFor(() => expect(calls).toContain("POST /api/conversations/pin"));
+  });
+
+  it("offers Unpin for a pinned selected channel", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: "📌 #mesh-radio" }));
+    expect(screen.getByRole("button", { name: "Unpin" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Unpin" }));
+    await waitFor(() => expect(calls).toContain("POST /api/conversations/pin"));
+  });
+
   it("shows scheduled messages for the selected channel with cancel", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByText("morning hello")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -249,7 +279,7 @@ describe("ChannelsSection", () => {
 
   it("schedules a message when Send later is picked", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     // The message shows twice: once in the pinned strip, once in history.
     await screen.findAllByText("hello channel");
     fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
@@ -267,7 +297,7 @@ describe("ChannelsSection", () => {
 
   it("renders a channel poll with options, tally and close", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByText("which day?")).toBeTruthy();
     expect(screen.getByRole("button", { name: /Saturday/ })).toBeTruthy();
     expect(screen.getByText(/2 votes/)).toBeTruthy();
@@ -276,14 +306,14 @@ describe("ChannelsSection", () => {
 
   it("votes on a channel poll option", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     fireEvent.click(await screen.findByRole("button", { name: /Sunday/ }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/vote"));
   });
 
   it("posts a channel poll from the composer", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     fireEvent.click(screen.getByRole("button", { name: "Poll" }));
     fireEvent.change(screen.getByLabelText("Poll question"), {
       target: { value: "which day?" },
@@ -300,7 +330,7 @@ describe("ChannelsSection", () => {
 
   it("shows the channel topic and saves an edited one", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByText("monthly mesh meetup")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Edit topic" }));
     fireEvent.change(screen.getByLabelText("Channel topic"), {
@@ -312,7 +342,7 @@ describe("ChannelsSection", () => {
 
   it("clears the channel topic", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     await screen.findByText("monthly mesh meetup");
     fireEvent.click(screen.getByRole("button", { name: "Clear topic" }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/topic"));
@@ -320,7 +350,7 @@ describe("ChannelsSection", () => {
 
   it("shows pins in a strip and unpins from it", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     // The pinned message shows in the strip and in history.
     await screen.findByRole("button", { name: "Unpin pinned message from alice" });
     expect(screen.getAllByText("hello channel").length).toBe(2);
@@ -332,7 +362,7 @@ describe("ChannelsSection", () => {
 
   it("marks a pinned message Pinned in history", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     const button = await screen.findByRole("button", {
       name: "Unpin message from alice",
     });
@@ -341,7 +371,7 @@ describe("ChannelsSection", () => {
 
   it("searches the selected channel and clears back to history", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     await screen.findAllByText("hello channel");
     fireEvent.change(screen.getByLabelText("Search #mesh-general"), {
       target: { value: "hello" },
@@ -359,7 +389,7 @@ describe("ChannelsSection", () => {
 
   it("marks edited messages", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByText("hello, fixed")).toBeTruthy();
     expect(screen.getByText(/edited/)).toBeTruthy();
     // Only alice's own message gets an Edit button; bob's does not.
@@ -368,7 +398,7 @@ describe("ChannelsSection", () => {
 
   it("edits your own message from the console", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
     fireEvent.change(screen.getByLabelText("Edit message"), {
       target: { value: "hello channel, fixed" },
@@ -381,7 +411,7 @@ describe("ChannelsSection", () => {
 
   it("reacts to a message from the quick-react row", async () => {
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     await screen.findAllByText("hello channel");
     // The fixture lists three messages, so every one renders a
     // quick-react row: react to the first message's row.
@@ -435,7 +465,7 @@ describe("ChannelsSection", () => {
       return { ok: true };
     });
     render(<ChannelsSection />);
-    fireEvent.click(await screen.findByRole("button", { name: "#mesh-general" }));
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByRole("button", { name: "React 👍 (2)" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "React 🎉 (1)" })).toBeTruthy();
   });

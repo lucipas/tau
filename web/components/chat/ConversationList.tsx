@@ -110,6 +110,7 @@ export default function ConversationList({
                 <span className="min-w-0 flex-1">
                   <span className="flex items-baseline justify-between gap-2">
                     <span className={`truncate text-[15px] ${conv.unread > 0 ? "font-bold text-zinc-50" : "font-medium text-zinc-200"}`}>
+                      {conv.pinned && <span title="Pinned" aria-label="Pinned conversation">📌 </span>}
                       {conv.muted && <span title="Muted" aria-label="Muted conversation">🔇 </span>}
                       {conv.name}
                     </span>

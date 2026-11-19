@@ -155,6 +155,47 @@ def test_revoke_invalidates_older_tokens(tmp_path):
     )["generation"] == 1
 
 
+def test_mint_stores_link_for_status_and_revoke_drops_it(tmp_path):
+    node, identity, own_hash = _invite_node(tmp_path)
+    group_name = "crew"
+    assert (
+        invite_status(node.config.invites_path, group_name=group_name) is None
+    )
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group_name,
+        creator_hash=own_hash,
+        mode="closed",
+    )
+    # The console shows the current link from the stored record, so
+    # it must be the token just minted — not a fresh mint per view.
+    status = invite_status(node.config.invites_path, group_name=group_name)
+    assert status is not None
+    assert status["link"] == link
+    assert status["mode"] == "closed"
+    assert status["generation"] == 0
+    # A revoke drops the link with the generation bump: the old token
+    # no longer verifies and nothing keeps advertising it.
+    revoke_invites(node.config.invites_path, group_name=group_name)
+    status = invite_status(node.config.invites_path, group_name=group_name)
+    assert status is not None
+    assert status["link"] is None
+    assert status["generation"] == 1
+    # Minting again stores the fresh link.
+    fresh = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group_name,
+        creator_hash=own_hash,
+        mode="closed",
+    )
+    assert (
+        invite_status(node.config.invites_path, group_name=group_name)["link"]
+        == fresh
+    )
+
+
 # --- join-request store ------------------------------------------------------
 
 

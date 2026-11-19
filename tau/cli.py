@@ -99,6 +99,14 @@ from .muted import (
     muted_peers_for,
     save_muted,
 )
+from .pinned import (
+    PinnedError,
+    clean_pinned_target,
+    load_pinned,
+    load_pinned_set,
+    pinned_lock,
+    save_pinned,
+)
 from .quiet_hours import (
     QuietHours,
     QuietHoursError,
@@ -749,20 +757,21 @@ def build_parser() -> argparse.ArgumentParser:
     note.add_argument("--file", type=Path, help="read the note from a file")
     note.set_defaults(func=cmd_note)
 
-    # A draft is an unsent message parked for one peer or group: saved
-    # locally with `draft save`, sent later with `draft send`.  Like a
-    # Tan draft, it never leaves the machine until it is sent.
+    # A draft is an unsent message parked for one peer, group, or
+    # channel: saved locally with `draft save`, sent later with
+    # `draft send`.  Like a Tan draft, it never leaves the machine
+    # until it is sent.
     draft = subparsers.add_parser(
         "draft",
         parents=[common],
-        help="save an unsent DM or group message to send later",
+        help="save an unsent DM, group, or channel message to send later",
     )
     draft_sub = draft.add_subparsers(dest="draft_command", metavar="DRAFT_COMMAND")
 
     draft_save = draft_sub.add_parser(
         "save",
         parents=[common],
-        help="save a message as a draft for a peer or a group",
+        help="save a message as a draft for a peer, a group, or a channel",
     )
     draft_save_target = draft_save.add_mutually_exclusive_group(required=True)
     draft_save_target.add_argument(
@@ -774,6 +783,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="NAME|ID",
         help="group name or id: draft for the group instead of a peer",
+    )
+    draft_save_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name: draft for the channel instead of a peer or group",
     )
     draft_save.add_argument(
         "message", nargs="?", help="draft text (reads stdin when omitted)"
@@ -803,6 +817,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|ID",
         help="group name or id",
     )
+    draft_show_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name",
+    )
     draft_show.set_defaults(func=cmd_draft_show)
 
     draft_delete = draft_sub.add_parser(
@@ -821,6 +840,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|ID",
         help="group name or id",
     )
+    draft_delete_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name",
+    )
     draft_delete.set_defaults(func=cmd_draft_delete)
 
     draft_send = draft_sub.add_parser(
@@ -837,7 +861,12 @@ def build_parser() -> argparse.ArgumentParser:
     draft_send_target.add_argument(
         "--group",
         metavar="NAME|ID",
-        help="group name or id: send the draft into the group",
+        help="group name or id: send the draft into a group",
+    )
+    draft_send_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name: send the draft into the channel",
     )
     draft_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
     draft_send.add_argument(
@@ -1742,6 +1771,59 @@ def build_parser() -> argparse.ArgumentParser:
     unarchive.add_argument("peer", help="peer name, destination hash or hash prefix")
     unarchive.set_defaults(func=cmd_unarchive)
 
+    pin_conversation = subparsers.add_parser(
+        "pin-conversation",
+        parents=[common],
+        help="pin a conversation so it stays at the top of the conversation list",
+    )
+    pin_target = pin_conversation.add_mutually_exclusive_group(required=True)
+    pin_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    pin_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    pin_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name (must be joined)",
+    )
+    pin_conversation.set_defaults(func=cmd_pin_conversation)
+
+    unpin_conversation = subparsers.add_parser(
+        "unpin-conversation",
+        parents=[common],
+        help="remove the pin from a conversation",
+    )
+    unpin_target = unpin_conversation.add_mutually_exclusive_group(required=True)
+    unpin_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    unpin_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    unpin_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name",
+    )
+    unpin_conversation.set_defaults(func=cmd_unpin_conversation)
+
+    pinned_conversations = subparsers.add_parser(
+        "pinned-conversations",
+        parents=[common],
+        help="list pinned conversations, newest pin first",
+    )
+    pinned_conversations.set_defaults(func=cmd_pinned_conversations)
+
     disappearing = subparsers.add_parser(
         "disappearing",
         parents=[common],
@@ -1757,6 +1839,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="GROUP",
         help="group id, id prefix or name",
+    )
+    disappearing_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name",
     )
     disappearing.add_argument(
         "duration",
@@ -3905,6 +3992,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_send.add_argument("--file", type=Path, help="read the message text from a file")
     channel_send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from every member's store "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
+    channel_send.add_argument(
         "--reply-to",
         default=None,
         metavar="HASH|PREFIX",
@@ -3986,6 +4079,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N messages (default 20)",
     )
     channel_read.set_defaults(func=cmd_channel_read)
+
+    channel_mark_read = channel_sub.add_parser(
+        "mark-read",
+        parents=[common],
+        help="clear a channel's unread badge by marking its newest message read",
+    )
+    channel_mark_read.add_argument(
+        "channel", metavar="NAME", help="channel to mark read"
+    )
+    channel_mark_read.set_defaults(func=cmd_channel_mark_read)
 
     channel_scheduled = channel_sub.add_parser(
         "scheduled",
@@ -4552,6 +4655,7 @@ def _print_peer_table(
     now: Optional[float] = None,
     safety_numbers: Optional[Dict[str, str]] = None,
     lookalikes: Optional[Dict[str, Peer]] = None,
+    pinned: Optional[Set[str]] = None,
 ) -> None:
     """Print the peers table, flagging possible lookalikes.
 
@@ -4559,6 +4663,8 @@ def _print_peer_table(
     peer or saved contact it may be impersonating (see
     :meth:`PeerRegistry.lookalike_for`); a flagged peer is rendered
     with the collision in its name cell and a warning below the table.
+    *pinned* names the destination hashes pinned to the top of the
+    list, shown with a 📌 in the name cell.
     """
     rows = list(peers)
     if not rows:
@@ -4574,6 +4680,8 @@ def _print_peer_table(
         collided = lookalikes.get(peer.hexhash) if lookalikes else None
         if collided is not None:
             name = f"{name} ⚠ lookalike of {collided.display_name}"
+        if pinned is not None and peer.hexhash in pinned:
+            name = f"📌 {name}"
         table.append(
             (
                 peer.hexhash,
@@ -5439,6 +5547,7 @@ def _publish_local_channel_message(
     to: Optional[List[str]] = None,
     ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
+    expires_at: Optional[float] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -5452,23 +5561,18 @@ def _publish_local_channel_message(
     if text is None:
         raise ChannelError("nothing to publish")
     name = clean_channel_name(channel)
-    conn = publisher.connect()
-    try:
-        if not is_channel_member(conn, name):
-            raise ChannelError(f"not a member of channel {name!r}; join it first")
-        message = create_channel_message(
-            conn,
-            node.identity,
-            name,
-            text,
-            name=node.name,
-            poll_options=poll_options,
-            poll_vote=poll_vote,
-            poll_close=poll_close,
-            reply_to=reply_to,
-        )
-    finally:
-        conn.close()
+    # Creation goes through app.send so a per-channel disappearing
+    # default fills the expiry in when no explicit one was passed —
+    # the same path the no-publish and console sends take.
+    message = publisher.send(
+        name,
+        text,
+        expires_at=expires_at,
+        poll_options=poll_options,
+        poll_vote=poll_vote,
+        poll_close=poll_close,
+        reply_to=reply_to,
+    )
     published = publisher.publish(
         message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
     )
@@ -5675,6 +5779,7 @@ def _publish_local_post(
             to=to,
             ttl=ttl,
             timeout=timeout,
+            expires_at=expires_at,
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
@@ -8384,6 +8489,12 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
     json_output = _json_mode(args)
     app = ChannelApp(config, _tan_identity(config), name=config.name)
     memberships = app.memberships()
+    pinned = load_pinned_set(config.pinned_path, "channel")
+    unread = app.unread_counts()
+    for membership in memberships:
+        membership["pinned"] = membership["channel"] in pinned
+        membership["unread"] = unread.get(membership["channel"], 0)
+    memberships = sorted(memberships, key=lambda m: not m["pinned"])
     if json_output:
         _emit({"channels": memberships, "count": len(memberships)}, True)
         return _EXIT_OK
@@ -8393,10 +8504,41 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
     for membership in memberships:
         count = membership["messages"]
         noun = "message" if count == 1 else "messages"
-        print(
-            f"#{membership['channel']} — {count} cached {noun}, "
-            f"joined {_ago(time.time() - membership['joined_at'])} ago"
+        pinned_suffix = " [pinned]" if membership["pinned"] else ""
+        unread_count = membership["unread"]
+        unread_suffix = (
+            f", {unread_count} unread" if unread_count > 0 else ""
         )
+        print(
+            f"#{membership['channel']} — {count} cached {noun}{unread_suffix}, "
+            f"joined {_ago(time.time() - membership['joined_at'])} ago"
+            f"{pinned_suffix}"
+        )
+    return _EXIT_OK
+
+
+def cmd_channel_mark_read(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    try:
+        result = app.mark_read(name)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit(result, True)
+    elif result["cleared"] == 0:
+        print(f"#{name} has no unread messages.")
+    else:
+        cleared = result["cleared"]
+        noun = "message" if cleared == 1 else "messages"
+        print(f"marked #{name} read — cleared {cleared} unread {noun}.")
     return _EXIT_OK
 
 
@@ -8409,6 +8551,17 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    expires_at = None
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        try:
+            expires_at = time.time() + _parse_duration(
+                expire_text, flag="--expire"
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
@@ -8465,7 +8618,10 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         app = ChannelApp(config, _tan_identity(config), name=config.name)
         try:
             message = app.send(
-                name, text, reply_to=getattr(args, "reply_to", None)
+                name,
+                text,
+                expires_at=expires_at,
+                reply_to=getattr(args, "reply_to", None),
             )
         except ChannelError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -8486,6 +8642,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
+                expires_at=expires_at,
             )
             message, published = result["message"], result["published"]
         else:
@@ -8505,6 +8662,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
+                    expires_at=expires_at,
                 )
                 message, published = result["message"], result["published"]
             finally:
@@ -8514,6 +8672,11 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         _emit({"message": message, "published": published}, True)
     else:
         print(f"sent to #{name} {short_hash(message['hash'])}")
+        if message.get("expires_at") is not None:
+            print(
+                "  disappears in "
+                f"{_ago(float(message['expires_at']) - time.time())}"
+            )
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -10362,6 +10525,10 @@ def cmd_peers(args: argparse.Namespace) -> int:
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
     peers = registry.all(max_age=max_age)
+    # Pinned conversations stay at the top; the registry order is kept
+    # within each half, so the sort is stable.
+    pinned = load_pinned_set(config.pinned_path, "peer")
+    peers = sorted(peers, key=lambda peer: peer.hexhash not in pinned)
     safety_numbers: Optional[Dict[str, str]] = None
     if getattr(args, "safety_number", False):
         identity = load_identity(config.identity_path)
@@ -10382,6 +10549,7 @@ def cmd_peers(args: argparse.Namespace) -> int:
             entry["lookalike_of"] = (
                 collided.display_name if collided is not None else None
             )
+            entry["pinned"] = entry["destination"] in pinned
         if safety_numbers is not None:
             for entry in payload:
                 entry["safety_number"] = safety_numbers[entry["destination"]]
@@ -10391,6 +10559,7 @@ def cmd_peers(args: argparse.Namespace) -> int:
             peers,
             safety_numbers=safety_numbers,
             lookalikes=_lookalike_map(registry, peers),
+            pinned=pinned,
         )
     return _EXIT_OK
 
@@ -14691,6 +14860,16 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
         key = group["id"]
         label = f"group {group['name']} ({short_hash(key)})"
         is_group = True
+        is_channel = False
+    elif getattr(args, "channel", None) is not None:
+        try:
+            key = clean_channel_name(args.channel)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        label = f"channel #{key}"
+        is_group = False
+        is_channel = True
     else:
         inbox = Inbox(config.inbox_path)
         registry = PeerRegistry(config.peers_path)
@@ -14699,6 +14878,7 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else "unknown"
         label = f"conversation with {name} ({short_hash(key)})"
         is_group = False
+        is_channel = False
     seconds = None
     if args.duration is not None:
         try:
@@ -14724,6 +14904,12 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
                 defaults = defaults.without_group(key)
             elif seconds is not None:
                 defaults = defaults.with_group(key, seconds)
+        elif is_channel:
+            previous = defaults.channel_default(key)
+            if getattr(args, "off", False):
+                defaults = defaults.without_channel(key)
+            elif seconds is not None:
+                defaults = defaults.with_channel(key, seconds)
         else:
             previous = defaults.peer_default(key)
             if getattr(args, "off", False):
@@ -14743,6 +14929,7 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
             {
                 "target": key,
                 "group": is_group,
+                "channel": is_channel,
                 "disappearing_seconds": current,
                 "changed": changed,
             },
@@ -14769,6 +14956,166 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
             f"Messages to {label} disappear after "
             f"{_describe_duration(previous)} unless a send passes its own --expire."
         )
+    return _EXIT_OK
+
+
+def _resolve_pin_target(
+    config: TauConfig, args: argparse.Namespace
+) -> Tuple[str, List[str], str]:
+    """Resolve a pin command's --peer/--group/--channel to (kind, keys, label).
+
+    A group resolves to its whole rename lineage, like a mute: the
+    pin follows the conversation across a rename.  A channel must be
+    joined — pinning a channel this node never joined is a typo, not
+    a pin.  Unpinning a channel needs no membership: a pin for a
+    channel left since stays removable.
+    """
+    if getattr(args, "group", None):
+        try:
+            group = GroupStore(config.groups_path).find(args.group)
+        except ValueError:
+            raise NodeError(f"unknown group: {args.group!r}") from None
+        lineage = sorted(group_lineage(group))
+        label = f"group {group['name']} ({short_hash(group['id'])})"
+        return "group", lineage, label
+    if getattr(args, "channel", None):
+        try:
+            name = clean_channel_name(args.channel)
+        except ChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        return "channel", [name], f"channel #{name}"
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    destination = _resolve_inbox_peer(inbox, registry, args.peer)
+    peer = registry.get(destination)
+    name = peer.display_name if peer is not None else "unknown"
+    return (
+        "peer",
+        [destination],
+        f"conversation with {name} ({short_hash(destination)})",
+    )
+
+
+def _edit_pinned(
+    config: TauConfig,
+    kind: str,
+    keys: List[str],
+    *,
+    pin: bool,
+) -> Tuple[bool, PinnedList]:
+    """Pin or unpin every key in *keys*, reloading inside the lock.
+
+    Returns (changed, new list): pinning an already-pinned
+    conversation — or unpinning an unpinned one — is a no-op, not an
+    error, mirroring the archive commands.
+    """
+    with pinned_lock(config.pinned_path):
+        try:
+            pinned = load_pinned(config.pinned_path)
+        except PinnedError as exc:
+            raise NodeError(str(exc)) from exc
+        updated = pinned
+        changed = False
+        for key in keys:
+            already = updated.is_pinned(kind, key)
+            if pin and not already:
+                updated = updated.with_pinned(kind, key)
+                changed = True
+            elif not pin and already:
+                updated = updated.without(kind, key)
+                changed = True
+        if changed:
+            save_pinned(config.pinned_path, updated)
+    return changed, updated
+
+
+def cmd_pin_conversation(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    kind, keys, label = _resolve_pin_target(config, args)
+    if kind == "channel":
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        conn = app.connect()
+        try:
+            if not is_channel_member(conn, keys[0]):
+                raise NodeError(
+                    f"not a member of channel {keys[0]!r}; join it first"
+                )
+        finally:
+            conn.close()
+    try:
+        changed, _ = _edit_pinned(config, kind, keys, pin=True)
+    except PinnedError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit(
+            {"kind": kind, "target": keys[0], "pinned": True, "changed": changed},
+            True,
+        )
+        return _EXIT_OK
+    if changed:
+        print(f"Pinned {label} — it now stays at the top of the list.")
+    else:
+        print(f"{label} is already pinned.")
+    return _EXIT_OK
+
+
+def cmd_unpin_conversation(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    kind, keys, label = _resolve_pin_target(config, args)
+    changed, _ = _edit_pinned(config, kind, keys, pin=False)
+    if _json_mode(args):
+        _emit(
+            {"kind": kind, "target": keys[0], "pinned": False, "changed": changed},
+            True,
+        )
+        return _EXIT_OK
+    if changed:
+        print(f"Unpinned {label}.")
+    else:
+        print(f"{label} was not pinned.")
+    return _EXIT_OK
+
+
+def cmd_pinned_conversations(args: argparse.Namespace) -> int:
+    """List pinned conversations, newest pin first."""
+    config = _make_config(args)
+    try:
+        pinned = load_pinned(config.pinned_path)
+    except PinnedError as exc:
+        raise NodeError(str(exc)) from exc
+    registry = PeerRegistry(config.peers_path)
+    store = GroupStore(config.groups_path)
+
+    def describe(entry) -> Dict[str, Any]:
+        if entry.kind == "peer":
+            peer = registry.get(entry.target)
+            name = peer.display_name if peer is not None else "unknown"
+            label = f"{name} ({short_hash(entry.target)})"
+        elif entry.kind == "group":
+            try:
+                group = store.find(entry.target)
+                label = f"group {group['name']} ({short_hash(entry.target)})"
+            except ValueError:
+                label = f"group {short_hash(entry.target)}"
+        else:
+            label = f"channel #{entry.target}"
+        return {
+            "kind": entry.kind,
+            "target": entry.target,
+            "label": label,
+            "pinned_at": entry.pinned_at,
+        }
+
+    entries = [describe(entry) for entry in pinned.entries]
+    if _json_mode(args):
+        _emit({"pinned": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No pinned conversations — pin one with `tau pin-conversation`.")
+        return _EXIT_OK
+    for entry in entries:
+        age = _ago(time.time() - float(entry["pinned_at"]))
+        print(f"{entry['label']} — pinned {age} ago")
     return _EXIT_OK
 
 
@@ -15486,9 +15833,19 @@ def cmd_group_list(args: argparse.Namespace) -> int:
     store = GroupStore(config.groups_path)
     registry = PeerRegistry(config.peers_path)
     ignored = load_ignored_group_ids(config.ignored_groups_path)
-    groups = [_describe_group(group, registry) for group in store.list_groups()]
+    records = store.list_groups()
+    # A group reads as pinned when any id in its rename lineage is
+    # pinned, like a mute — the pin follows the conversation, not the id.
+    pinned_ids = load_pinned_set(config.pinned_path, "group")
+    pinned = {
+        record["id"]: bool(group_lineage(record) & pinned_ids)
+        for record in records
+    }
+    groups = [_describe_group(group, registry) for group in records]
     for group in groups:
         group["ignored"] = group["id"] in ignored
+        group["pinned"] = pinned.get(group["id"], False)
+    groups = sorted(groups, key=lambda group: not group["pinned"])
     if _json_mode(args):
         _emit({"groups": groups, "count": len(groups)}, True)
         return _EXIT_OK
@@ -15498,7 +15855,8 @@ def cmd_group_list(args: argparse.Namespace) -> int:
     for group in groups:
         names = ", ".join(member["name"] for member in group["members"])
         ignored_suffix = " [ignored]" if group["ignored"] else ""
-        print(f"{group['name']} ({group['id'][:8]}) — {names}{ignored_suffix}")
+        pinned_suffix = " [pinned]" if group["pinned"] else ""
+        print(f"{group['name']} ({group['id'][:8]}) — {names}{ignored_suffix}{pinned_suffix}")
         if group.get("topic"):
             print(f"  topic: {group['topic']}")
     return _EXIT_OK
@@ -17473,12 +17831,20 @@ def cmd_note(args: argparse.Namespace) -> int:
 def _resolve_draft_target(
     config: TauConfig, args: argparse.Namespace
 ) -> Tuple[str, str, str]:
-    """Resolve a draft command's ``--to``/``--group`` to ``(kind, id, name)``.
+    """Resolve a draft command's ``--to``/``--group``/``--channel`` to ``(kind, id, name)``.
 
     Peers resolve through the local registry only — a draft is local
     state for someone this node already knows, so there is no reason to
     start a node and discover.  Groups resolve through the group store.
+    Channels need no lookup: the name is the key, so it is cleaned and
+    returned as-is; ``cmd_draft_save`` checks membership separately.
     """
+    if getattr(args, "channel", None):
+        try:
+            name = clean_channel_name(args.channel)
+        except ChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        return "channel", name, name
     if getattr(args, "group", None):
         try:
             group = GroupStore(config.groups_path).find(args.group)
@@ -17504,6 +17870,8 @@ def _describe_draft(
     if draft["kind"] == "group":
         group = GroupStore(config.groups_path).get(str(draft["target"]))
         name = str(group["name"]) if group is not None else short_hash(draft["target"])
+    elif draft["kind"] == "channel":
+        name = str(draft["target"])
     else:
         peer = PeerRegistry(config.peers_path).get(str(draft["target"]))
         name = peer.display_name if peer is not None else short_hash(draft["target"])
@@ -17523,13 +17891,24 @@ def _draft_preview(text: str) -> str:
 
 
 def cmd_draft_save(args: argparse.Namespace) -> int:
-    """Save a message as a draft for a peer or a group.
+    """Save a message as a draft for a peer, a group, or a channel.
 
     Local-only: the text is validated like a send but never queued or
     transmitted.  Saving again overwrites the conversation's draft.
+    A channel draft requires membership, like a group draft requires
+    the group to exist — so a typo'd channel fails here, at save time,
+    instead of silently parking a draft that can never be sent.
     """
     config = _make_config(args)
     kind, target, name = _resolve_draft_target(config, args)
+    if kind == "channel":
+        conn = init_channel_db(config.channels_db_path)
+        try:
+            member = is_channel_member(conn, target)
+        finally:
+            conn.close()
+        if not member:
+            raise NodeError(f"not a member of channel {target!r}; join it first")
     text = _read_message(args)
     try:
         draft = DraftStore(config.drafts_path).save(kind, target, text)
@@ -17559,10 +17938,18 @@ def cmd_draft_list(args: argparse.Namespace) -> int:
         print("No drafts yet — save one with `tau draft save --to PEER \"text\"`.")
         return _EXIT_OK
     for draft in drafts:
-        where = "group " if draft["kind"] == "group" else ""
+        if draft["kind"] == "channel":
+            where = "channel "
+        elif draft["kind"] == "group":
+            where = "group "
+        else:
+            where = ""
+        # A channel draft's target is its name, so the hash prefix
+        # other drafts show would just repeat it.
+        target = "" if draft["kind"] == "channel" else f" ({draft['target'][:8]})"
         age = _ago(time.time() - float(draft["updated_at"]))
         print(
-            f"{where}{draft['target_name']} ({draft['target'][:8]}) — "
+            f"{where}{draft['target_name']}{target} — "
             f"{_draft_preview(str(draft['text']))} [{age} ago]"
         )
     return _EXIT_OK
@@ -17603,8 +17990,10 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
 
     The draft is deleted once the message is queued or delivered — a
     failed send keeps it, so nothing is lost to a transient failure.
-    Delivery reuses :func:`cmd_send` wholesale for a peer target, or
-    :func:`cmd_group_send` for a group target, exactly like a forward.
+    Delivery reuses :func:`cmd_send` wholesale for a peer target,
+    :func:`cmd_group_send` for a group target, or
+    :func:`cmd_channel_send` for a channel target, exactly like a
+    forward.
     """
     config = _make_config(args)
     kind, target, name = _resolve_draft_target(config, args)
@@ -17612,9 +18001,10 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
     draft = store.get(kind, target)
     if draft is None:
         raise NodeError(f"no draft for {name}")
-    # `cmd_send`/`cmd_group_send` read their text from `args.message`;
-    # hand them the draft text and let them own delivery, queueing, and
-    # output.  The remaining flags come from this subcommand's parser.
+    # `cmd_send`/`cmd_group_send`/`cmd_channel_send` read their text
+    # from `args.message`; hand them the draft text and let them own
+    # delivery, queueing, and output.  The remaining flags come from
+    # this subcommand's parser.
     args.message = str(draft["text"])
     args.file = None
     args.location = None
@@ -17625,6 +18015,9 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
     if kind == "group":
         args.group = target
         code = cmd_group_send(args)
+    elif kind == "channel":
+        args.channel = target
+        code = cmd_channel_send(args)
     else:
         args.to = [target]
         code = cmd_send(args)
