@@ -117,6 +117,7 @@ from ..protocol import (
     MAX_NAME_LENGTH,
     MAX_REQUEST_BYTES,
     ProtocolError,
+    clean_location,
     decode,
     encode,
     normalize_message,
@@ -147,10 +148,26 @@ DEFAULT_SUGGEST_LIMIT = 5
 # suggestion score points; one like on the candidate's posts is worth 1.
 SUGGEST_FOLLOWED_WEIGHT = 2
 MAX_FOLLOWS = 512
+# How many hops of the follow graph a Tan sync (and the Following
+# timeline) reaches: 1 = followed authors only, 2 = plus the authors
+# they follow.  Default 2, per issue #467 — the people your friends
+# follow are the authors most likely worth reading next.  Depth 3+
+# is out: the closure grows fast and the marginal author is rarely
+# worth the bandwidth.  A fetch of a followed author's list that
+# fails is recorded, never fatal; at most this many lists are fetched
+# per sync, so one slow peer cannot stall the whole round.
+TAN_SYNC_DEPTH_DEFAULT = 2
+TAN_SYNC_DEPTH_MIN = 1
+TAN_SYNC_DEPTH_MAX = 2
+TAN_SYNC_DEPTH_FETCH_TIMEOUT = 5.0
+MAX_SYNC_DEPTH_FETCHES = 32
 MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_FOLLOWED_TAGS = 256
 MAX_MUTED_TAGS = 256
+MAX_TAN_LISTS = 32
+MAX_LIST_MEMBERS = 256
+MAX_LIST_NAME = 32
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
 MAX_DRAFTS = 100
@@ -265,6 +282,7 @@ _POST_COLUMNS = (
     "target",
     "options",
     "image",
+    "location",
 )
 
 
@@ -322,6 +340,11 @@ def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
         # attachment for another file's hash without breaking the
         # hash, and a post without one hashes exactly as before.
         fields = fields + ("image",)
+    if mesg.get("location") is not None:
+        # A place is signed the same way: a relay cannot move the
+        # post to another place without breaking the hash, and a post
+        # without one hashes exactly as before.
+        fields = fields + ("location",)
     return fields
 
 
@@ -420,6 +443,58 @@ def _decode_image(value: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _clean_location(value: Any) -> Dict[str, Any]:
+    """Validate a Tan post place attachment: ``{lat, lon, name?}``.
+
+    The place rides the signed post, so a malformed one must be
+    rejected here — not dropped — or the hash would no longer cover
+    what the author meant to publish.  Reuses the DM pin validator
+    (:func:`tau.protocol.clean_location`), which also strips a blank
+    name and rejects out-of-range coordinates.
+    """
+    cleaned = clean_location(value)
+    if cleaned is None:
+        raise PostError(
+            "post location must be an object with latitude -90..90 and "
+            "longitude -180..180"
+        )
+    return cleaned
+
+
+def _encode_location(location: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Encode a post's place attachment for the posts table, or None."""
+    if location is None:
+        return None
+    return json.dumps(_clean_location(location), ensure_ascii=False)
+
+
+def _decode_location(value: Any) -> Optional[Dict[str, Any]]:
+    """Decode a stored place attachment: a dict, a JSON string, or None.
+
+    Rows read from the posts table carry the JSON string; normalised
+    entries carry the dict itself.  Anything else decodes to None, so
+    a damaged row never crashes a display surface.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        try:
+            return _clean_location(value)
+        except PostError:
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict):
+            try:
+                return _clean_location(parsed)
+            except PostError:
+                return None
+    return None
+
+
 def _decode_options(value: Any) -> Optional[List[str]]:
     """Decode stored poll options: a list, a JSON string, or None.
 
@@ -498,6 +573,10 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         # The attachment rides with the post entry itself, so an
         # exported or synced post carries its image reference with it.
         canonical["image"] = _decode_image(post.get("image"))
+    if post.get("location") is not None:
+        # The place rides with the post entry itself, so an exported
+        # or synced post carries its place with it.
+        canonical["location"] = _decode_location(post.get("location"))
     return canonical
 
 
@@ -627,10 +706,18 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         image = (
             _clean_image(mesg["image"]) if mesg.get("image") is not None else None
         )
+        location = (
+            _clean_location(mesg["location"])
+            if mesg.get("location") is not None
+            else None
+        )
     else:
         if mesg.get("image") is not None:
             raise PostError("only posts can carry an image")
+        if mesg.get("location") is not None:
+            raise PostError("only posts can carry a location")
         image = None
+        location = None
 
     post = {
         "v": TAN_VERSION,
@@ -645,6 +732,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "expires_at": expires_at,
         "options": options,
         "image": image,
+        "location": location,
     }
     _check_wire_size(post)
     return post
@@ -678,6 +766,7 @@ def check_post_text_fits(
     name: Optional[str] = None,
     reply_to: Optional[str] = None,
     expires: bool = False,
+    image: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Raise PostError if *text* cannot fit a Tan request once encoded.
 
@@ -689,7 +778,9 @@ def check_post_text_fits(
     will carry, so a text that passes here always fits; one that fails
     is rejected before it is stored.  When *expires* is true the post
     will also carry a float ``expires_at`` instead of ``null``, so a
-    widest-possible timestamp stands in for it.
+    widest-possible timestamp stands in for it.  When *image* is given
+    the attachment rides in the estimate too — its descriptor is
+    ~150 bytes of JSON, enough to push a borderline text over budget.
     """
     try:
         clean_text = normalize_message(text)
@@ -714,6 +805,7 @@ def check_post_text_fits(
             "expires_at": (
                 now + MAX_TAN_POST_EXPIRY + 0.123456789 if expires else None
             ),
+            **({"image": _clean_image(image)} if image is not None else {}),
         }
     )
 
@@ -829,7 +921,8 @@ CREATE TABLE IF NOT EXISTS posts (
     kind TEXT NOT NULL DEFAULT 'post',
     target TEXT NOT NULL DEFAULT '',
     options TEXT,
-    image TEXT
+    image TEXT,
+    location TEXT
 );
 
 CREATE INDEX IF NOT EXISTS posts_author_seq ON posts(author, seq);
@@ -873,6 +966,20 @@ CREATE TABLE IF NOT EXISTS muted_authors (
     muted_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tan_lists (
+    name TEXT PRIMARY KEY,
+    display TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tan_list_members (
+    list_name TEXT NOT NULL,
+    author TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    added_at REAL NOT NULL,
+    PRIMARY KEY (list_name, author)
+);
+
 CREATE TABLE IF NOT EXISTS saved_posts (
     hash TEXT PRIMARY KEY,
     saved_at REAL NOT NULL
@@ -910,6 +1017,23 @@ CREATE TABLE IF NOT EXISTS drafts (
     created_at REAL NOT NULL
 );
 """
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+    """Column names of *table* right now — a fresh read, not a snapshot.
+
+    Migrations run while other threads may be migrating the same file,
+    so a column set read once at the start of :func:`init_db` can go
+    stale mid-migration: a thread that snapshots after ``kind`` lands
+    but before ``target`` would conclude the pair is done and return
+    without it.  Every migration decision below re-reads, so a column
+    is only skipped when it is really there; the check-then-ALTER gap
+    that remains is the one :func:`_add_column` already tolerates.
+    """
+    return {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
 
 
 def _add_column(
@@ -960,58 +1084,59 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         except OSError:  # pragma: no cover - best effort
             pass
     conn.executescript(_SCHEMA)
-    columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(posts)").fetchall()
-    }
+    columns = _table_columns(conn, "posts")
     if columns and "v" not in columns:  # migrate an early scaffold database
         _add_column(conn, "posts", "v", "INTEGER NOT NULL DEFAULT 1")
-    if columns and "kind" not in columns:  # migrate a pre-reactions database
+    if columns and "kind" not in _table_columns(conn, "posts"):
+        # migrate a pre-reactions database; kind and target are checked
+        # separately — a concurrent migration may have added one but
+        # not the other yet (see _table_columns).
         _add_column(conn, "posts", "kind", "TEXT NOT NULL DEFAULT 'post'")
+    if columns and "target" not in _table_columns(conn, "posts"):
         _add_column(conn, "posts", "target", "TEXT NOT NULL DEFAULT ''")
-    if columns and "expires_at" not in columns:  # migrate a pre-expiry database
+    if columns and "expires_at" not in _table_columns(conn, "posts"):
+        # migrate a pre-expiry database
         _add_column(conn, "posts", "expires_at", "REAL")
-    if columns and "options" not in columns:  # migrate a pre-polls database
-        # A poll's options live in one JSON column on its own entry, so
-        # the migration is a single ALTER, not a new table.
+    if columns and "options" not in _table_columns(conn, "posts"):
+        # migrate a pre-polls database: a poll's options live in one
+        # JSON column on its own entry, so the migration is a single
+        # ALTER, not a new table.
         _add_column(conn, "posts", "options", "TEXT")
-    if columns and "image" not in columns:  # migrate a pre-media database
-        # A post's image attachment lives in one JSON column on its
-        # own entry, like a poll's options.
+    if columns and "image" not in _table_columns(conn, "posts"):
+        # migrate a pre-media database: a post's image attachment lives
+        # in one JSON column on its own entry, like a poll's options.
         _add_column(conn, "posts", "image", "TEXT")
-    draft_columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
-    }
+    if columns and "location" not in columns:  # migrate a pre-location database
+        # A post's place lives in one JSON column on its own entry,
+        # like a post's image attachment.
+        _add_column(conn, "posts", "location", "TEXT")
+    draft_columns = _table_columns(conn, "drafts")
     if draft_columns and "post_hash" not in draft_columns:
         # migrate a pre-retry database: drafts could not remember
         # the signed post a partial publish had already created
         _add_draft_column(conn, "post_hash", "TEXT")
-    if draft_columns and "pending_peers" not in draft_columns:
+    if draft_columns and "pending_peers" not in _table_columns(conn, "drafts"):
         _add_draft_column(conn, "pending_peers", "TEXT")
-    if draft_columns and "claimed_at" not in draft_columns:
+    if draft_columns and "claimed_at" not in _table_columns(conn, "drafts"):
         # migrate a pre-claim database: drafts could not be claimed,
         # so two concurrent publish-draft runs could sign two posts
         _add_draft_column(conn, "claimed_at", "REAL")
-    if draft_columns and "claim_token" not in draft_columns:
+    if draft_columns and "claim_token" not in _table_columns(conn, "drafts"):
         # the claim's owner token, so only the publisher that won
         # the claim can refresh or release it
         _add_draft_column(conn, "claim_token", "TEXT")
-    purged_columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(purged_posts)").fetchall()
-    }
+    purged_columns = _table_columns(conn, "purged_posts")
     if purged_columns and "linked" not in purged_columns:
         # migrate a pre-provenance database: purge records made
         # before the linked flag existed cannot prove a chain
         # position, so they bridge nothing — the column defaults to 0.
         _add_column(conn, "purged_posts", "linked", "INTEGER NOT NULL DEFAULT 0")
-    if purged_columns and "target" not in purged_columns:
+    if purged_columns and "target" not in _table_columns(conn, "purged_posts"):
         # migrate a pre-target database: records made before the
         # target was carried cannot name the deleted original, so an
         # edit record stays unbacked until it is re-recorded.
         _add_column(conn, "purged_posts", "target", "TEXT NOT NULL DEFAULT ''")
-    if purged_columns and "restored" not in purged_columns:
+    if purged_columns and "restored" not in _table_columns(conn, "purged_posts"):
         # migrate a pre-provenance database: records made before the
         # restored flag existed were all made locally, so they count
         # as verified — the column defaults to 0.
@@ -1636,8 +1761,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, expires_at, sig, seq, linked, kind, target, options, image) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, expires_at, sig, seq, linked, kind, target, options, image, location) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -1656,6 +1781,7 @@ def store_post(
                     post.get("target") or "",
                     _encode_options(post.get("options")),
                     _encode_image(post.get("image")),
+                    _encode_location(post.get("location")),
                 ),
             )
             if linked:
@@ -1707,6 +1833,7 @@ def create_post(
     previous: Optional[str] = None,
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a post owned by *identity*.
 
@@ -1716,13 +1843,17 @@ def create_post(
     hash.  It must be after the post's creation time.  When *image*
     is given — ``{sha256, size, mime, name}`` — the attachment is
     signed with the post the same way; the bytes themselves live in
-    the local media store, never in the post.
+    the local media store, never in the post.  When *location* is
+    given — ``{lat, lon, name?}`` — the place is signed with the post
+    the same way, so a relay cannot move the post without breaking
+    the hash.
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
     clean_name = sanitize_name(name)
     clean_text = normalize_message(text)
     clean_image = _clean_image(image) if image is not None else None
+    clean_location = _clean_location(location) if location is not None else None
     if expires_at is not None:
         expires_at = _require_timestamp(expires_at, "expires_at")
         if expires_at <= timestamp:
@@ -1750,6 +1881,8 @@ def create_post(
             body["expires_at"] = expires_at
         if clean_image is not None:
             body["image"] = clean_image
+        if clean_location is not None:
+            body["location"] = clean_location
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -6208,6 +6341,83 @@ def following(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     ]
 
 
+def followers_from_lists(
+    follow_lists: Dict[str, Sequence[str]], own_author: str
+) -> List[str]:
+    """Authors whose stored follow list includes *own_author*, sorted.
+
+    The input maps a list author to the authors on their published,
+    signature-verified follow list — the shape
+    :meth:`TanApp._stored_follow_lists` returns.  Entries that are not
+    well-formed author hashes are skipped, and a list that names its
+    own author does not make that author their own follower.
+    """
+    own = _require_hex(own_author, AUTHOR_HEX_LENGTH, "own_author")
+    followers: Set[str] = set()
+    for list_author, authors in follow_lists.items():
+        if not isinstance(list_author, str) or not isinstance(authors, (list, tuple)):
+            continue
+        try:
+            list_author = _require_hex(list_author, AUTHOR_HEX_LENGTH, "author")
+        except PostError:
+            continue
+        if list_author == own:
+            continue
+        for entry in authors:
+            if isinstance(entry, str) and entry == own:
+                followers.add(list_author)
+                break
+    return sorted(followers)
+
+
+def expand_follow_scope(
+    followed: Sequence[str],
+    follow_lists: Dict[str, Sequence[str]],
+    *,
+    depth: int = TAN_SYNC_DEPTH_MAX,
+    limit: int = MAX_FOLLOWS,
+) -> List[str]:
+    """Authors in scope at a follow-graph depth, in stable order.
+
+    Depth 1 returns the followed authors.  Depth 2 adds every author
+    on a followed author's published follow list — the second hop.
+    Followed authors always come first, in follow order, then the
+    second hop in sorted order, so the result is deterministic and a
+    cap keeps the newest follows instead of the newest strangers.
+    Entries that are not well-formed author hashes are skipped: a
+    stored list is signature-verified, so this is belt and braces
+    against a hand-edited file, not a trust decision.
+    """
+    seen: Set[str] = set()
+    scoped: List[str] = []
+    for author in followed:
+        try:
+            clean = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+        except TanError:
+            continue
+        if clean in seen:
+            continue
+        seen.add(clean)
+        scoped.append(clean)
+    if depth < TAN_SYNC_DEPTH_MAX:
+        return scoped
+    second_hop: Set[str] = set()
+    for author in scoped:
+        for candidate in follow_lists.get(author, []):
+            try:
+                clean = _require_hex(candidate, AUTHOR_HEX_LENGTH, "author")
+            except TanError:
+                continue
+            if clean not in seen:
+                second_hop.add(clean)
+    for author in sorted(second_hop):
+        if len(scoped) >= max(1, int(limit)):
+            break
+        seen.add(author)
+        scoped.append(author)
+    return scoped
+
+
 def suggest_authors(
     conn: sqlite3.Connection,
     *,
@@ -6512,6 +6722,249 @@ def muted(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def clean_list_name(value: Any) -> Tuple[str, str]:
+    """Normalise a user-supplied list name, or raise :class:`TanError`.
+
+    Returns the (key, display) pair: the key is the casefolded name
+    lists are stored and looked up under, the display is the name as
+    typed.  A list name is 1..32 characters of letters, digits, spaces,
+    ``-`` or ``_``, starting with a letter or digit.
+    """
+    if not isinstance(value, str):
+        raise TanError("list name must be text")
+    raw = value.strip()
+    if (
+        not raw
+        or len(raw) > MAX_LIST_NAME
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]*", raw) is None
+    ):
+        raise TanError(
+            f"not a list name: {value!r} "
+            f"(1-{MAX_LIST_NAME} letters, digits, spaces, - or _)"
+        )
+    return raw.casefold(), raw
+
+
+def create_list(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Create an empty named author list.
+
+    Lists are local-only curation: they are never published, signed or
+    synced, so creating one touches no chain and no peer.  Creating a
+    list that already exists (case-insensitively) is an error.
+    """
+    key, display = clean_list_name(name)
+    timestamp = float(now if now is not None else time.time())
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT name, display, created_at FROM tan_lists WHERE name = ?",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            raise TanError(f"list {existing['display']!r} already exists")
+        count = conn.execute("SELECT COUNT(*) AS n FROM tan_lists").fetchone()["n"]
+        if int(count) >= MAX_TAN_LISTS:
+            raise TanError(f"lists are limited to {MAX_TAN_LISTS}")
+        conn.execute(
+            "INSERT INTO tan_lists(name, display, created_at) VALUES(?, ?, ?)",
+            (key, display, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {"name": display, "created_at": timestamp, "members": 0}
+
+
+def delete_list(conn: sqlite3.Connection, name: str) -> bool:
+    """Delete a list and its memberships.  Returns whether one existed.
+
+    Deleting a list never unfollows anyone and never deletes a post —
+    it only drops the local curation.
+    """
+    key, _ = clean_list_name(name)
+    with conn:
+        cursor = conn.execute("DELETE FROM tan_lists WHERE name = ?", (key,))
+        conn.execute(
+            "DELETE FROM tan_list_members WHERE list_name = ?", (key,)
+        )
+    return cursor.rowcount > 0
+
+
+def tan_lists(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Named author lists, oldest first, each with its member count."""
+    rows = conn.execute(
+        "SELECT l.name AS key, l.display AS name, l.created_at AS created_at, "
+        "COUNT(m.author) AS members FROM tan_lists l "
+        "LEFT JOIN tan_list_members m ON m.list_name = l.name "
+        "GROUP BY l.name ORDER BY l.created_at ASC"
+    ).fetchall()
+    return [
+        {
+            "name": str(row["name"]),
+            "created_at": float(row["created_at"]),
+            "members": int(row["members"]),
+        }
+        for row in rows
+    ]
+
+
+def _list_display(conn: sqlite3.Connection, name: str) -> str:
+    """The display name of the list *name* names, or raise :class:`TanError`."""
+    key, _ = clean_list_name(name)
+    row = conn.execute(
+        "SELECT display FROM tan_lists WHERE name = ?", (key,)
+    ).fetchone()
+    if row is None:
+        raise TanError(f"no list named {name!r}")
+    return str(row["display"])
+
+
+def list_members(conn: sqlite3.Connection, name: str) -> List[Dict[str, Any]]:
+    """Members of one list, most recently added first."""
+    display = _list_display(conn, name)
+    key = display.casefold()
+    rows = conn.execute(
+        "SELECT author, name, added_at FROM tan_list_members "
+        "WHERE list_name = ? ORDER BY added_at DESC",
+        (key,),
+    ).fetchall()
+    return [
+        {
+            "author": str(row["author"]),
+            "name": str(row["name"]),
+            "added_at": float(row["added_at"]),
+        }
+        for row in rows
+    ]
+
+
+def list_member_authors(conn: sqlite3.Connection, name: str) -> List[str]:
+    """Author hashes of one list's members, in add order."""
+    display = _list_display(conn, name)
+    rows = conn.execute(
+        "SELECT author FROM tan_list_members WHERE list_name = ? "
+        "ORDER BY added_at ASC",
+        (display.casefold(),),
+    ).fetchall()
+    return [str(row["author"]) for row in rows]
+
+
+def add_to_list(
+    conn: sqlite3.Connection,
+    name: str,
+    author: str,
+    *,
+    author_name: str = "",
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Add *author* to a list.  Re-adding keeps the original ``added_at``.
+
+    The author need not be followed — a list is a curation, not a
+    second follow graph — so callers that care should say so.  Returns
+    the membership record with ``added`` saying whether this call added
+    them (``False`` when they were already a member).
+    """
+    display = _list_display(conn, name)
+    key = display.casefold()
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    clean_name = sanitize_name(author_name, fallback="") if author_name else ""
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking for an existing membership
+    # and the capacity, so a concurrent add cannot slip in between
+    # check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT added_at FROM tan_list_members "
+            "WHERE list_name = ? AND author = ?",
+            (key, author),
+        ).fetchone()
+        if existing is None:
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM tan_list_members WHERE list_name = ?",
+                (key,),
+            ).fetchone()["n"]
+            if int(count) >= MAX_LIST_MEMBERS:
+                raise TanError(
+                    f"list {display!r} is limited to {MAX_LIST_MEMBERS} members"
+                )
+        conn.execute(
+            "INSERT INTO tan_list_members(list_name, author, name, added_at) "
+            "VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(list_name, author) DO UPDATE SET "
+            "name = CASE WHEN excluded.name != '' THEN excluded.name "
+            "ELSE tan_list_members.name END, "
+            "added_at = tan_list_members.added_at",
+            (key, author, clean_name, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    if existing is not None:
+        timestamp = float(existing["added_at"])
+    return {
+        "list": display,
+        "author": author,
+        "name": clean_name,
+        "added_at": timestamp,
+        "added": existing is None,
+    }
+
+
+def remove_from_list(conn: sqlite3.Connection, name: str, author: str) -> bool:
+    """Remove *author* from a list.  Returns whether one was removed."""
+    display = _list_display(conn, name)
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM tan_list_members WHERE list_name = ? AND author = ?",
+            (display.casefold(), author),
+        )
+    return cursor.rowcount > 0
+
+
+def list_timeline(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    limit: int = 30,
+    viewer: Optional[str] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+    tag: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """The timeline read through one list: only its members' posts.
+
+    The same silencing as :func:`timeline` applies — muted and blocked
+    authors stay hidden — and a followed tag never pulls a non-member's
+    post into a list view, even though it would into the full timeline.
+    A list with no members, or a list naming no stored posts, reads
+    empty; an unknown list is an error.
+    """
+    members = list_member_authors(conn, name)
+    if not members:
+        return []
+    posts = timeline(
+        conn,
+        members,
+        limit=limit,
+        viewer=viewer,
+        exclude_authors=exclude_authors,
+        exclude_all=exclude_all,
+        tag=tag,
+    )
+    wanted = set(members)
+    return [post for post in posts if post.get("author") in wanted]
 
 
 def _muted_keyword_list(conn: sqlite3.Connection) -> List[str]:
@@ -7873,6 +8326,55 @@ def count_authors(
     return int(row[0])
 
 
+def followers(
+    conn: sqlite3.Connection,
+    follow_lists: Dict[str, Sequence[str]],
+    own_author: str,
+    *,
+    registry: Any = None,
+) -> List[Dict[str, Any]]:
+    """One record per author who follows *own_author*.
+
+    A follower is an author whose latest stored, signature-verified
+    follow list names *own_author* (see :func:`followers_from_lists`).
+    Only stored lists are consulted — this never does network I/O, so
+    a follower whose list was never fetched does not appear yet.
+    Each record carries the display name (the peer registry's when it
+    knows the author, else the name on their most recent stored post),
+    the visible-post stats :func:`author_stats_many` returns, and
+    whether the viewer follows them back.  Records come back most
+    recently posting first, then by author hash, so the order is stable.
+    """
+    authors = followers_from_lists(follow_lists, own_author)
+    if not authors:
+        return []
+    stats = author_stats_many(conn, authors)
+    followed = {record["author"] for record in following(conn)}
+    records: List[Dict[str, Any]] = []
+    for author in authors:
+        name = ""
+        if registry is not None and hasattr(registry, "get"):
+            peer = registry.get(author)
+            if peer is not None:
+                name = getattr(peer, "display_name", "") or ""
+        if not name:
+            row = conn.execute(
+                "SELECT name FROM posts WHERE author = ? AND name != '' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (author,),
+            ).fetchone()
+            if row is not None:
+                name = str(row["name"])
+        record = dict(stats[author])
+        record["name"] = name
+        record["followed"] = author in followed
+        records.append(record)
+    records.sort(
+        key=lambda record: (-record["last_post"], record["author"])
+    )
+    return records
+
+
 def _int_or_none(value: Any) -> Optional[int]:
     """Return *value* as an int, or None when it is not integer-shaped.
 
@@ -8283,6 +8785,143 @@ class TanApp:
             author, own_author=self.author, followed=followed
         )
 
+    def _sync_depth(self) -> int:
+        """This node's Tan sync depth (1 or 2), defaulting to 2.
+
+        Read live from ``node.json`` on every call, so a change made
+        on the CLI or in the console applies to the next sync without
+        a restart.  A node without a data directory (tests, embeds)
+        takes the default.
+        """
+        from ..config import tan_sync_depth
+
+        data_dir = getattr(self.config, "data_dir", None)
+        if data_dir is None:
+            return TAN_SYNC_DEPTH_DEFAULT
+        try:
+            return tan_sync_depth(Path(data_dir))
+        except Exception:
+            return TAN_SYNC_DEPTH_DEFAULT
+
+    def _stored_follow_lists(self) -> Dict[str, List[str]]:
+        """Follow lists this node has already verified and stored.
+
+        Prefers the running node's store (it picks up lists fetched
+        since start); falls back to opening the store from the data
+        directory.  Anything missing or unreadable means no second
+        hop is known yet — depth 2 then behaves like depth 1 for
+        those authors, rather than failing the sync.
+        """
+        from ..follows import FollowListStore
+
+        store = getattr(self.node, "follow_list_store", None)
+        docs: List[Dict[str, Any]] = []
+        if store is not None:
+            try:
+                docs = store.all()
+            except Exception:
+                docs = []
+        if not docs:
+            path = getattr(self.config, "follow_lists_path", None)
+            if path is not None:
+                try:
+                    docs = FollowListStore(path).all()
+                except Exception:
+                    docs = []
+        lists: Dict[str, List[str]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            author = doc.get("author")
+            authors = doc.get("authors")
+            if isinstance(author, str) and isinstance(authors, list):
+                lists[author] = [
+                    entry for entry in authors if isinstance(entry, str)
+                ]
+        return lists
+
+    def _fetch_missing_follow_lists(
+        self,
+        lists: Dict[str, List[str]],
+        followed: Sequence[str],
+        *,
+        peers: Optional[Sequence[Any]] = None,
+        errors: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, List[str]]:
+        """Fetch the follow lists depth 2 needs that are not stored yet.
+
+        Only authors whose list is not already stored are asked, only
+        when the peer is known to the registry (no discovery during a
+        sync), and at most ``MAX_SYNC_DEPTH_FETCHES`` fetches per sync.
+        A fetch that fails is recorded in *errors* when given and never
+        raises — the author simply contributes no second hop this round.
+        """
+        node = self.node
+        request_follows = (
+            getattr(node, "request_follows", None) if node is not None else None
+        )
+        if request_follows is None:
+            return lists
+        by_hash = {
+            getattr(peer, "hexhash", ""): peer for peer in (peers or [])
+        }
+        fetched = dict(lists)
+        attempts = 0
+        for author in followed:
+            if author in fetched or attempts >= MAX_SYNC_DEPTH_FETCHES:
+                continue
+            peer = by_hash.get(author)
+            if peer is None:
+                continue
+            attempts += 1
+            try:
+                doc = request_follows(
+                    peer, timeout=TAN_SYNC_DEPTH_FETCH_TIMEOUT
+                )
+            except Exception as exc:
+                if errors is not None:
+                    errors.append(
+                        {
+                            "peer": author,
+                            "author": author,
+                            "error": f"follow list fetch failed: {exc}",
+                        }
+                    )
+                continue
+            if isinstance(doc, dict) and isinstance(doc.get("authors"), list):
+                fetched[author] = [
+                    entry for entry in doc["authors"] if isinstance(entry, str)
+                ]
+        return fetched
+
+    def _scope_authors(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        peers: Optional[Sequence[Any]] = None,
+        fetch: bool = False,
+        errors: Optional[List[Dict[str, str]]] = None,
+    ) -> List[str]:
+        """Authors in scope for sync and the Following timeline.
+
+        Followed authors, plus at depth 2 the authors on their
+        published follow lists.  The display path (``fetch=False``)
+        uses stored lists only, so reading the timeline never does
+        network I/O; sync (``fetch=True``) asks known peers for lists
+        it does not hold yet.  Blocked and muted authors are not
+        filtered here — the sync loop's admission check and the
+        timeline's display rules still exclude them, at every depth.
+        """
+        followed = [record["author"] for record in following(conn)]
+        if self._sync_depth() < TAN_SYNC_DEPTH_MAX:
+            return followed
+        lists = self._stored_follow_lists()
+        if fetch:
+            lists = self._fetch_missing_follow_lists(
+                lists, followed, peers=peers, errors=errors
+            )
+        return expand_follow_scope(followed, lists, depth=self._sync_depth())
+
     # -- lifecycle ---------------------------------------------------------
 
     def attach(self, node: Any) -> None:
@@ -8313,12 +8952,14 @@ class TanApp:
         ttl: int = MAX_GOSSIP_TTL,
         expires_at: Optional[float] = None,
         image: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a post, or a reply when *reply_to* names a parent post.
 
         When *expires_at* is given the post disappears from display
         surfaces once that time passes; see :func:`create_post`.
         A reply cannot carry an image — only a top-level post can.
+        A reply cannot carry a location either, for the same reason.
         """
         conn = self.connect()
         try:
@@ -8339,6 +8980,7 @@ class TanApp:
                     name=self.name,
                     expires_at=expires_at,
                     image=image,
+                    location=location,
                 )
         finally:
             conn.close()
@@ -8387,7 +9029,7 @@ class TanApp:
         conn = self.connect()
         try:
             if authors is None and not include_all:
-                authors = [record["author"] for record in following(conn)]
+                authors = self._scope_authors(conn)
                 authors.append(self.author)
             posts = timeline(
                 conn,
@@ -8565,6 +9207,59 @@ class TanApp:
         finally:
             conn.close()
 
+    def _stored_follow_lists(self) -> Dict[str, List[str]]:
+        """Follow lists this node has already verified and stored.
+
+        Prefers the running node's store (it picks up lists fetched
+        since start); falls back to opening the store from the data
+        directory.  Anything missing or unreadable means no follower
+        is known yet — the caller sees an empty list rather than an
+        error, because a follower whose list was never fetched simply
+        has not been observed.
+        """
+        from ..follows import FollowListStore
+
+        store = getattr(self.node, "follow_list_store", None)
+        docs: List[Dict[str, Any]] = []
+        if store is not None:
+            try:
+                docs = store.all()
+            except Exception:
+                docs = []
+        if not docs:
+            path = getattr(self.config, "follow_lists_path", None)
+            if path is not None:
+                try:
+                    docs = FollowListStore(path).all()
+                except Exception:
+                    docs = []
+        lists: Dict[str, List[str]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            author = doc.get("author")
+            authors = doc.get("authors")
+            if isinstance(author, str) and isinstance(authors, list):
+                lists[author] = [
+                    entry for entry in authors if isinstance(entry, str)
+                ]
+        return lists
+
+    def followers(self) -> List[Dict[str, Any]]:
+        """Authors who follow this node, from stored follow lists.
+
+        See :func:`followers` for the record shape.  Names come from
+        the attached node's peer registry when it knows the author.
+        """
+        conn = self.connect()
+        try:
+            registry = getattr(self.node, "registry", None)
+            return followers(
+                conn, self._stored_follow_lists(), self.author, registry=registry
+            )
+        finally:
+            conn.close()
+
     def sync(
         self,
         node: Any,
@@ -8599,7 +9294,9 @@ class TanApp:
         errors: List[Dict[str, str]] = []
         try:
             if authors is None:
-                authors = [record["author"] for record in following(conn)]
+                authors = self._scope_authors(
+                    conn, peers=peers, fetch=True, errors=errors
+                )
             authors = list(authors)
             if self.author not in authors:
                 authors.append(self.author)

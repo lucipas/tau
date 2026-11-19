@@ -677,6 +677,34 @@ def test_handle_typing_records_start_stop_and_expiry(tmp_path):
     assert node.typing_peers(alice.hexhash, now=109.0) == []
 
 
+def test_beacon_update_callback_fires_and_survives_failure(tmp_path):
+    from tau.beacons import Beacons
+
+    node, _, _, _ = _typing_node(tmp_path)
+    beacons = Beacons()
+    beacon = beacons.start(
+        target="ab" * 16,
+        target_kind="dm",
+        target_name="alice",
+        location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+        now=1000.0,
+    )
+    events = []
+    node.on_beacon_update = lambda b, r: events.append((b, r))
+    node._publish_beacon_update(beacon, {"id": "00" * 16, "queued": False})
+    assert len(events) == 1
+    assert events[0][0] is beacon
+    assert events[0][1] == {"id": "00" * 16, "queued": False}
+    # A failing callback must not take the update down with it.
+    def _boom(beacon, result):
+        raise RuntimeError("boom")
+
+    node.on_beacon_update = _boom
+    node._publish_beacon_update(beacon, {"id": "00" * 16, "queued": False})
+    node.on_beacon_update = None
+    node._publish_beacon_update(beacon, {"id": "00" * 16, "queued": False})
+
+
 def test_handle_typing_rejects_anonymous_and_non_member(tmp_path):
     from tau.protocol import decode, encode_typing
 

@@ -315,10 +315,35 @@ export interface LocationPin {
 }
 
 export interface LiveBeacon {
-  latitude: number;
-  longitude: number;
-  expires_at?: number;
+  /** Beacon id (8 random bytes, hex). */
+  id: string;
+  /** Unix time the beacon stops sharing. */
+  expires_at: number;
+  /** Update sequence number, 1-based. */
+  seq: number;
   [key: string]: unknown;
+}
+
+/** A live beacon this node is sharing, as served by GET /api/beacons. */
+export interface Beacon {
+  id: string;
+  /** Destination hash of the DM peer, or the group id. */
+  target: string;
+  target_kind: "dm" | "group";
+  target_name: string;
+  started_at: number;
+  expires_at: number;
+  /** Seconds between updates. */
+  interval: number;
+  coarse: boolean;
+  location: { lat: number; lon: number; name?: string };
+  location_file?: string;
+  next_update_at: number;
+  updates_sent: number;
+  stopped: boolean;
+  /** Still sharing: not stopped and unexpired. */
+  active: boolean;
+  expires_in_seconds: number;
 }
 
 export interface GroupPollVote {
@@ -419,6 +444,18 @@ export interface AwayMessageSettings {
 export interface MutedConversations {
   peers: string[];
   groups: string[];
+  channels: string[];
+}
+
+/** One unsent message parked for a peer or a group (``tau draft save``). */
+export interface MessageDraft {
+  kind: "peer" | "group";
+  /** Peer destination hash or group id. */
+  target: string;
+  text: string;
+  updated_at: number;
+  /** Best-effort conversation name from the bridge; null when unknown. */
+  name: string | null;
 }
 
 export interface OwnProfile {
@@ -499,6 +536,7 @@ export interface OutboxRetryResult {
 export interface NodeSettings {
   accept_files: boolean;
   send_read_receipts: boolean;
+  tan_sync_depth: number;
 }
 
 export interface AllowList {
@@ -551,6 +589,14 @@ export interface TanImage {
   [key: string]: unknown;
 }
 
+/** A place attached to a Tan post: decimal degrees, optional place name. */
+export interface TanLocation {
+  lat: number;
+  lon: number;
+  name?: string;
+  [key: string]: unknown;
+}
+
 export interface TanParentSummary {
   hash: string;
   author: string;
@@ -582,6 +628,7 @@ export interface TanPost {
   expires_at: number | null;
   options?: string[];
   image?: TanImage | null;
+  location?: TanLocation | null;
   // --- annotations added by the bridge (tau/tangents/tan.py) ---
   likes: number;
   liked: boolean;
@@ -605,6 +652,19 @@ export interface TanPost {
 export interface TanTag {
   tag: string;
   count: number;
+}
+
+export interface TanList {
+  name: string;
+  created_at: number;
+  members: number;
+}
+
+export interface TanListMember {
+  author: string;
+  name: string;
+  added_at: number;
+  posts?: number;
 }
 
 export interface TanAuthor {
@@ -664,6 +724,22 @@ export interface ScheduledTanPost {
   kind?: "post" | "poll";
   /** Fixed poll choices; only present when kind is "poll". */
   options?: string[];
+  /** Image attachment descriptor, when the queued post carries one. */
+  image?: { sha256: string; size: number; mime: string; name: string } | null;
+  [key: string]: unknown;
+}
+
+/** A saved Tan post draft: plain text plus the reply target and the
+ *  expiry it will carry once published (mirrors the CLI's tan draft). */
+export interface TanDraft {
+  id: number;
+  text: string;
+  reply_to: string;
+  expires_in: number | null;
+  post_hash: string;
+  pending_peers: string[];
+  claimed_at: number | null;
+  created_at: number;
   [key: string]: unknown;
 }
 
@@ -688,6 +764,8 @@ export interface Channel {
   pinned?: boolean;
   /** Messages newer than the last-read cursor; always present from /api/channels. */
   unread: number;
+  /** True when the channel is muted: its badge stays dark. */
+  muted?: boolean;
 }
 
 export interface ChannelPollTally {

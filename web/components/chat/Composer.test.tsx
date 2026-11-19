@@ -112,4 +112,56 @@ describe("Composer", () => {
     fireEvent.click(screen.getByText("Send"));
     expect(onSend).toHaveBeenCalledWith("vanish soon", expect.objectContaining({ expiresIn: 3600 }));
   });
+
+  it("hides Save draft without an onSaveDraft handler", () => {
+    render(<Composer onSend={() => undefined} onSendFile={() => undefined} />);
+    expect(screen.queryByText("Save draft")).toBeNull();
+  });
+
+  it("saves a draft and clears the box", async () => {
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    render(<Composer onSend={() => undefined} onSendFile={() => undefined} onSaveDraft={onSaveDraft} />);
+    const save = screen.getByText("Save draft") as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "park me" } });
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    expect(onSaveDraft).toHaveBeenCalledWith("park me");
+    await vi.waitFor(() =>
+      expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(""),
+    );
+  });
+
+  it("keeps the text when saving a draft fails", async () => {
+    const onSaveDraft = vi.fn().mockRejectedValue(new Error("boom"));
+    render(<Composer onSend={() => undefined} onSendFile={() => undefined} onSaveDraft={onSaveDraft} />);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "keep me" } });
+    fireEvent.click(screen.getByText("Save draft"));
+    await vi.waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/Save draft failed/));
+    expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("keep me");
+  });
+
+  it("pre-fills the box from a draft seed, but never clobbers typed text", () => {
+    const { rerender } = render(
+      <Composer onSend={() => undefined} onSendFile={() => undefined} />,
+    );
+    rerender(
+      <Composer
+        onSend={() => undefined}
+        onSendFile={() => undefined}
+        draftSeed={{ key: "dm:aa", text: "saved hello" }}
+      />,
+    );
+    expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("saved hello");
+
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "my own words" } });
+    rerender(
+      <Composer
+        onSend={() => undefined}
+        onSendFile={() => undefined}
+        draftSeed={{ key: "dm:bb", text: "another draft" }}
+      />,
+    );
+    expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("my own words");
+  });
 });

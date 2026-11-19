@@ -13,8 +13,8 @@ import {
   cancelScheduledTanPost,
   getTanFollowedTags,
 } from "@/lib/api";
-import { formatDateTime, formatRelative, shortHash } from "@/lib/format";
-import type { TanAuthor, TanPost, TanReactors } from "@/lib/types";
+import { formatDateTime, formatDuration, formatRelative, shortHash } from "@/lib/format";
+import type { TanAuthor, TanDraft, TanPost, TanReactors } from "@/lib/types";
 import {
   useTanComposer,
   useTanFeed,
@@ -25,8 +25,8 @@ import {
 import PostCard, { type ReactorKind } from "./social/PostCard";
 import TanComposer from "./social/TanComposer";
 
-type LibraryView = "saved" | "hidden" | "pinned" | "scheduled" | "muted";
-type View = "feed" | "discover" | LibraryView;
+type LibraryView = "saved" | "hidden" | "pinned" | "scheduled" | "drafts" | "muted";
+type View = "feed" | "discover" | "followers" | LibraryView;
 
 const FEED_TABS: { id: TanFeedMode; label: string }[] = [
   { id: "following", label: "Following" },
@@ -40,6 +40,7 @@ const LIBRARY_TABS: { id: LibraryView; label: string }[] = [
   { id: "hidden", label: "Hidden" },
   { id: "pinned", label: "Pinned" },
   { id: "scheduled", label: "Scheduled" },
+  { id: "drafts", label: "Drafts" },
   { id: "muted", label: "Muted" },
 ];
 
@@ -56,6 +57,7 @@ export default function SocialSection() {
   const [tab, setTab] = useState<TanFeedMode>("following");
   const [view, setView] = useState<View>("feed");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [listFilter, setListFilter] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<TanPost[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -71,8 +73,11 @@ export default function SocialSection() {
   const [keywordInput, setKeywordInput] = useState("");
   const [authors, setAuthors] = useState<TanAuthor[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  /** Draft loaded into the composer; the composer remounts (via `key`)
+   *  when a different draft is loaded, so its initial text applies. */
+  const [loadedDraft, setLoadedDraft] = useState<TanDraft | null>(null);
 
-  const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, pollMs: 30_000 });
+  const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, list: listFilter ?? undefined, pollMs: 30_000 });
   const lists = useTanLists();
   const composer = useTanComposer();
   const thread = useTanThread(threadHash);
@@ -97,13 +102,57 @@ export default function SocialSection() {
   }, [view]);
 
   function openThread(post: TanPost) {
+    setLoadedDraft(null);
     setThreadHash(post.hash);
     setReactors(null);
   }
 
   function openReply(post: TanPost) {
+    setLoadedDraft(null);
     setThreadHash(post.hash);
     setReplyTo(post);
+  }
+
+  /** Load a draft into the composer: a reply draft opens its thread,
+   *  a top-level draft goes to the feed composer. The draft stays saved
+   *  until the composer posts it, so leaving the thread loses nothing. */
+  function loadDraft(draft: TanDraft) {
+    setLoadedDraft(draft);
+    setReplyTo(null);
+    if (draft.reply_to) {
+      setThreadHash(draft.reply_to);
+    } else {
+      setThreadHash(null);
+      setView("feed");
+    }
+    setNotice("Draft loaded — post it to publish, or save it again to keep editing.");
+  }
+
+  /** A successful composer submit consumes the loaded draft, mirroring
+   *  `publish-draft`: the posted text is no longer a draft. */
+  async function consumeLoadedDraft() {
+    if (!loadedDraft) return;
+    const id = loadedDraft.id;
+    setLoadedDraft(null);
+    await lists.deleteDraft(id);
+    setNotice("Draft published.");
+  }
+
+  /** Park the composer's text as a draft. Saving an edited loaded draft
+   *  supersedes it: the new row is saved first, then the old one is
+   *  dropped, so the text is never lost and the list never holds two
+   *  copies of the same post. */
+  async function handleSaveDraft(
+    text: string,
+    opts: { replyTo?: string; expiresIn?: number },
+  ) {
+    const saved = await lists.saveDraft(text, opts);
+    if (loadedDraft && loadedDraft.id !== saved.id) {
+      const old = loadedDraft;
+      setLoadedDraft(null);
+      await lists.deleteDraft(old.id);
+    }
+    setNotice("Draft saved — find it under Drafts.");
   }
 
   async function runSearch(q: string) {
@@ -138,6 +187,7 @@ export default function SocialSection() {
 
   function clearFilters() {
     setTagFilter(null);
+    setListFilter(null);
     setSearchQuery("");
     setSearchResults(null);
   }
@@ -192,11 +242,19 @@ export default function SocialSection() {
             </button>
           )}
         </form>
-        {(tagFilter || searchResults) && (
+        {(tagFilter || listFilter || searchResults) && (
           <p className="mt-2 text-xs text-zinc-400">
             {tagFilter && (
               <>
                 Tag <span className="text-cyan-400">#{tagFilter}</span>{" "}
+                <button type="button" onClick={clearFilters} className="text-zinc-300 underline">
+                  clear
+                </button>
+              </>
+            )}
+            {listFilter && (
+              <>
+                List <span className="text-cyan-400">{listFilter}</span>{" "}
                 <button type="button" onClick={clearFilters} className="text-zinc-300 underline">
                   clear
                 </button>
@@ -211,6 +269,30 @@ export default function SocialSection() {
             )}
           </p>
         )}
+        {lists.lists.length > 0 && (
+          <div className="mt-2 flex items-center gap-2 text-xs">
+            <label htmlFor="tan-list-filter" className="shrink-0 text-zinc-500">
+              List
+            </label>
+            <select
+              id="tan-list-filter"
+              aria-label="Filter feed by list"
+              value={listFilter ?? ""}
+              onChange={(e) => setListFilter(e.target.value || null)}
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500"
+            >
+              <option value="">All followed</option>
+              {lists.lists.map((l) => (
+                <option key={l.name} value={l.name}>
+                  {l.name} ({l.members})
+                </option>
+              ))}
+            </select>
+            <span className="truncate text-zinc-500">
+              Manage lists with <code>tau tan lists</code>
+            </span>
+          </div>
+        )}
         <p className="mt-0.5 text-xs text-zinc-500">
           The Tan feed lives here — posts, replies, likes, polls and follows from across the mesh.
         </p>
@@ -224,6 +306,7 @@ export default function SocialSection() {
               onClick={() => {
                 setThreadHash(null);
                 setReplyTo(null);
+                setLoadedDraft(null);
               }}
               className="rounded-full px-2 py-1 text-sm text-cyan-400 hover:bg-zinc-900"
             >
@@ -232,15 +315,20 @@ export default function SocialSection() {
             <h2 className="text-sm font-bold text-zinc-100">Thread</h2>
           </div>
           <TanComposer
+            key={loadedDraft ? `draft-${loadedDraft.id}` : "fresh"}
             composer={composer}
             replyTo={replyTo?.hash ?? threadHash}
             replyToName={replyTo?.name ?? thread.root?.name}
             onCancelReply={() => setReplyTo(null)}
-            onPosted={() => {
+            onPosted={async () => {
               setReplyTo(null);
-              void thread.refresh();
-              void feed.refresh();
+              await consumeLoadedDraft();
+              await thread.refresh();
+              await feed.refresh();
             }}
+            onSaveDraft={handleSaveDraft}
+            initialText={loadedDraft?.text}
+            initialExpiresIn={loadedDraft?.expires_in ?? undefined}
             placeholder="Reply to this post…"
           />
           {thread.loading && (
@@ -309,6 +397,18 @@ export default function SocialSection() {
             >
               Discover
             </button>
+            <button
+              type="button"
+              aria-pressed={view === "followers"}
+              onClick={() => setView("followers")}
+              className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
+                view === "followers"
+                  ? "bg-cyan-500 text-zinc-950"
+                  : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
+              }`}
+            >
+              Followers
+            </button>
             {LIBRARY_TABS.map((t) => (
               <button
                 key={t.id}
@@ -328,8 +428,15 @@ export default function SocialSection() {
 
           {showComposer && (
             <TanComposer
+              key={loadedDraft ? `draft-${loadedDraft.id}` : "fresh"}
               composer={composer}
-              onPosted={() => void feed.refresh()}
+              onPosted={async () => {
+                await consumeLoadedDraft();
+                await feed.refresh();
+              }}
+              onSaveDraft={handleSaveDraft}
+              initialText={loadedDraft?.text}
+              initialExpiresIn={loadedDraft?.expires_in ?? undefined}
             />
           )}
 
@@ -355,9 +462,11 @@ export default function SocialSection() {
                     ? "No posts match that search."
                     : tagFilter
                       ? `No posts under #${tagFilter} yet.`
-                      : tab === "following"
-                        ? "Nothing from people you follow yet — try All, or Discover someone to follow."
-                        : "No posts yet."}
+                      : listFilter
+                        ? `No posts from “${listFilter}” yet.`
+                        : tab === "following"
+                          ? "Nothing from people you follow yet — try All, or Discover someone to follow."
+                          : "No posts yet."}
                 </p>
               )}
               {posts.map((p) => (
@@ -419,6 +528,21 @@ export default function SocialSection() {
             />
           )}
 
+          {view === "followers" && (
+            <FollowersView
+              lists={lists}
+              onFollowAuthor={async (a) => {
+                await feed.follow(a);
+                setNotice("Followed.");
+                void lists.refresh();
+              }}
+              onUnfollowAuthor={async (a) => {
+                await feed.unfollow(a);
+                void lists.refresh();
+              }}
+            />
+          )}
+
           {view === "saved" && (
             <LibraryList
               title="Saved posts"
@@ -467,6 +591,15 @@ export default function SocialSection() {
               onCancel={async (id) => {
                 await cancelScheduledTanPost(id);
                 await lists.refresh();
+              }}
+            />
+          )}
+          {view === "drafts" && (
+            <DraftsView
+              drafts={lists.drafts}
+              onEdit={loadDraft}
+              onDelete={async (id) => {
+                await lists.deleteDraft(id);
               }}
             />
           )}
@@ -545,6 +678,42 @@ function ReactorRow({ name, author, at }: { name: string; author: string; at: nu
         {name || shortHash(author)}{" "}
         <span className="font-normal text-zinc-500">· {formatRelative(at)}</span>
       </p>
+    </div>
+  );
+}
+
+function FollowersView({
+  lists,
+  onFollowAuthor,
+  onUnfollowAuthor,
+}: {
+  lists: ReturnType<typeof useTanLists>;
+  onFollowAuthor: (author: string) => Promise<void>;
+  onUnfollowAuthor: (author: string) => Promise<void>;
+}) {
+  // Followers are derived from stored follow lists only, so the list
+  // is empty until a sync has fetched at least one peer's list.
+  const following = new Set(lists.following.map((f) => f.author));
+  return (
+    <div className="px-3 py-4 sm:px-4">
+      <h2 className="text-sm font-bold text-zinc-100">Followers</h2>
+      <p className="py-1 text-xs text-zinc-500">
+        Authors whose published follow list names you, from lists this node has fetched.
+      </p>
+      {lists.followers.length === 0 && (
+        <p className="py-2 text-sm text-zinc-500">
+          No followers yet — sync to fetch follow lists.
+        </p>
+      )}
+      {lists.followers.map((a) => (
+        <AuthorRow
+          key={a.author}
+          author={a}
+          followed={following.has(a.author)}
+          onFollow={() => void onFollowAuthor(a.author)}
+          onUnfollow={() => void onUnfollowAuthor(a.author)}
+        />
+      ))}
     </div>
   );
 }
@@ -771,8 +940,12 @@ function ScheduledView({
               ))}
             </ul>
           )}
+          {/* No thumbnail here: a queued post's image stays private
+              until the post is published (see tan_media), so the
+              media route 404s for it — the name is the attachment. */}
           <p className="mt-1 text-xs text-zinc-500">
             Publishes {formatDateTime(s.publish_at)}
+            {s.image ? ` · image: ${s.image.name}` : ""}
             {s.paused_at ? " · paused" : ""}
             {s.attempts > 0 ? ` · ${s.attempts} attempt${s.attempts === 1 ? "" : "s"}` : ""}
           </p>
@@ -783,6 +956,57 @@ function ScheduledView({
           >
             Cancel scheduled {s.kind === "poll" ? "poll" : "post"}
           </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DraftsView({
+  drafts,
+  onEdit,
+  onDelete,
+}: {
+  drafts: TanDraft[];
+  onEdit: (draft: TanDraft) => void;
+  onDelete: (id: number) => Promise<void>;
+}) {
+  return (
+    <div>
+      <h2 className="border-b border-zinc-800 px-4 py-3 text-sm font-bold text-zinc-100">
+        Drafts
+      </h2>
+      {drafts.length === 0 && (
+        <p className="px-4 py-6 text-sm text-zinc-500">
+          No drafts yet — park a half-written post with “Save draft” in the composer.
+        </p>
+      )}
+      {drafts.map((d) => (
+        <div key={d.id} className="border-b border-zinc-800 px-4 py-3">
+          <p className="text-sm whitespace-pre-wrap text-zinc-200">{d.text}</p>
+          <p className="mt-1 text-xs text-zinc-500">
+            Saved {formatDateTime(d.created_at)}
+            {d.reply_to ? ` · In reply to ${shortHash(d.reply_to)}` : ""}
+            {d.expires_in
+              ? ` · Disappears ${formatDuration(d.expires_in)} after posting`
+              : ""}
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => onEdit(d)}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-900"
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              onClick={() => void onDelete(d.id)}
+              className="rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
+            >
+              Delete draft
+            </button>
+          </div>
         </div>
       ))}
     </div>

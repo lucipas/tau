@@ -1,6 +1,6 @@
-// TanComposer.test.tsx — image attach publishes with the post; replies,
-// polls and scheduled posts cannot carry one. The composer prop is a fake,
-// so no fetch stub is needed.
+// TanComposer.test.tsx — image attach publishes with the post, and a
+// scheduled post can carry one too; replies and polls cannot. The
+// composer prop is a fake, so no fetch stub is needed.
 
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -99,18 +99,27 @@ describe("TanComposer image attach", () => {
     expect(attach.getAttribute("title")).toMatch(/Polls can't carry an image/);
   });
 
-  it("refuses to schedule a post with an image attached", async () => {
+  it("schedules a post with an image attached", async () => {
     const composer = makeComposer();
-    render(<TanComposer composer={composer} />);
+    const onPosted = vi.fn();
+    render(<TanComposer composer={composer} onPosted={onPosted} />);
     pickImage();
     typePost("later with pic");
     fireEvent.change(screen.getByLabelText("Send later"), {
       target: { value: "300" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Schedule" }));
-    expect((await screen.findByRole("alert")).textContent).toMatch(/can't be scheduled/);
+    await waitFor(() =>
+      expect(composer.schedule).toHaveBeenCalledWith(
+        "later with pic",
+        300,
+        expect.objectContaining({
+          image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+        }),
+      ),
+    );
     expect(composer.publish).not.toHaveBeenCalled();
-    expect(composer.schedule).not.toHaveBeenCalled();
+    expect(onPosted).toHaveBeenCalled();
   });
 
   it("refuses an image over the 2 MB limit", async () => {
@@ -179,5 +188,81 @@ describe("TanComposer image attach", () => {
       ),
     );
     expect(composer.schedulePoll).not.toHaveBeenCalled();
+  });
+});
+
+describe("TanComposer drafts", () => {
+  it("saves the text as a draft and clears the composer", async () => {
+    const composer = makeComposer();
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    render(<TanComposer composer={composer} onSaveDraft={onSaveDraft} />);
+    typePost("half-written thought");
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() =>
+      expect(onSaveDraft).toHaveBeenCalledWith("half-written thought", {
+        replyTo: undefined,
+        expiresIn: undefined,
+      }),
+    );
+    expect(
+      (screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value,
+    ).toBe("");
+    expect(composer.publish).not.toHaveBeenCalled();
+  });
+
+  it("carries reply and expiry into the saved draft", async () => {
+    const composer = makeComposer();
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    render(
+      <TanComposer
+        composer={composer}
+        replyTo={"ab".repeat(32)}
+        onSaveDraft={onSaveDraft}
+      />,
+    );
+    typePost("agreed");
+    fireEvent.change(screen.getByLabelText("Post expiry"), {
+      target: { value: "3600" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() =>
+      expect(onSaveDraft).toHaveBeenCalledWith("agreed", {
+        replyTo: "ab".repeat(32),
+        expiresIn: 3600,
+      }),
+    );
+  });
+
+  it("prefills text and expiry from a loaded draft", () => {
+    const composer = makeComposer();
+    render(
+      <TanComposer
+        composer={composer}
+        initialText="back to this later"
+        initialExpiresIn={3600}
+      />,
+    );
+    expect(
+      (screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value,
+    ).toBe("back to this later");
+    expect(
+      (screen.getByLabelText("Post expiry") as HTMLSelectElement).value,
+    ).toBe("3600");
+  });
+
+  it("disables Save draft in poll mode and hides it without a handler", () => {
+    const composer = makeComposer();
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    render(<TanComposer composer={composer} onSaveDraft={onSaveDraft} />);
+    fireEvent.click(screen.getByRole("button", { name: "📊 Poll" }));
+    const save = screen.getByRole("button", { name: "Save draft" });
+    expect(save.hasAttribute("disabled")).toBe(true);
+    expect(save.getAttribute("title")).toMatch(/Polls can't be saved as drafts/);
+  });
+
+  it("shows no Save draft button when the parent cannot save drafts", () => {
+    const composer = makeComposer();
+    render(<TanComposer composer={composer} />);
+    expect(screen.queryByRole("button", { name: "Save draft" })).toBeNull();
   });
 });

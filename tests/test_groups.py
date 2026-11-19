@@ -604,6 +604,134 @@ def test_group_store_topic_survives_roster_change(tmp_path):
     assert store.get(grown["id"])["topic"] == "planning the meetup"
 
 
+def test_group_store_ban_removes_member_and_records_ban(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    banned = store.ban(group["id"], OTHER_HASH, created_by=OWN_HASH)
+    # A roster change, so the successor group id applies.
+    assert banned["id"] == derive_group_id(
+        OWN_HASH, "weekend", [OWN_HASH, THIRD_HASH]
+    )
+    assert banned["id"] != group["id"]
+    assert banned["members"] == [OWN_HASH, THIRD_HASH]
+    assert banned["banned"] == [OTHER_HASH]
+    assert banned["name"] == "weekend"
+    assert store.get(group["id"]) is None
+    assert store.get(banned["id"]) == banned
+    assert len(store) == 1
+    # The ban survives a reload.
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(banned["id"])["banned"] == [OTHER_HASH]
+
+
+def test_group_store_ban_non_member_records_ban_without_successor(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    banned = store.ban(group["id"], STRANGER_HASH, created_by=OWN_HASH)
+    # No roster change, so the id is untouched.
+    assert banned["id"] == group["id"]
+    assert banned["members"] == [OWN_HASH, OTHER_HASH]
+    assert banned["banned"] == [STRANGER_HASH]
+    # Banning again changes nothing.
+    assert store.ban(group["id"], STRANGER_HASH, created_by=OWN_HASH) == banned
+
+
+def test_group_store_ban_refuses_creator_bad_hash_and_non_creator(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="cannot ban the creator"):
+        store.ban(group["id"], OWN_HASH, created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="invalid peer hash"):
+        store.ban(group["id"], "not-a-hash", created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="only the creator"):
+        store.ban(group["id"], OTHER_HASH, created_by=OTHER_HASH)
+    with pytest.raises(ValueError, match="unknown group"):
+        store.ban(generate_group_id(), OTHER_HASH, created_by=OWN_HASH)
+
+
+def test_group_store_ban_refuses_last_other_member(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="last other member"):
+        store.ban(group["id"], OTHER_HASH, created_by=OWN_HASH)
+    # Banning a peer who is not a member still works: the roster does
+    # not shrink, so the minimum is untouched.
+    banned = store.ban(group["id"], STRANGER_HASH, created_by=OWN_HASH)
+    assert banned["members"] == [OWN_HASH, OTHER_HASH]
+    assert banned["banned"] == [STRANGER_HASH]
+
+
+def test_group_store_banned_peer_cannot_be_readded(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    banned = store.ban(group["id"], OTHER_HASH, created_by=OWN_HASH)
+    assert banned["members"] == [OWN_HASH, THIRD_HASH]
+    with pytest.raises(ValueError, match="is banned"):
+        store.update_members(
+            banned["id"],
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            created_by=OWN_HASH,
+        )
+    # Unbanning restores the normal path, without re-adding the peer.
+    unbanned = store.unban(banned["id"], OTHER_HASH, created_by=OWN_HASH)
+    assert unbanned["banned"] == []
+    assert unbanned["id"] == banned["id"]
+    assert unbanned["members"] == [OWN_HASH, THIRD_HASH]
+    restored = store.update_members(
+        unbanned["id"],
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        created_by=OWN_HASH,
+    )
+    assert restored["members"] == [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    # Unbanning a peer who is not banned is a no-op.
+    assert (
+        store.unban(restored["id"], STRANGER_HASH, created_by=OWN_HASH)
+        == restored
+    )
+    with pytest.raises(ValueError, match="only the creator"):
+        store.unban(restored["id"], OTHER_HASH, created_by=OTHER_HASH)
+
+
+def test_group_store_ban_survives_roster_change_and_rename(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    banned = store.ban(group["id"], OTHER_HASH, created_by=OWN_HASH)
+    grown = store.update_members(
+        banned["id"],
+        [OWN_HASH, THIRD_HASH, STRANGER_HASH],
+        created_by=OWN_HASH,
+    )
+    assert grown["banned"] == [OTHER_HASH]
+    renamed = store.rename(grown["id"], "getaway", created_by=OWN_HASH)
+    assert renamed["banned"] == [OTHER_HASH]
+    assert renamed["name"] == "getaway"
+
+
+def test_group_store_banned_load_keeps_only_usable_hashes(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    store.ban(group["id"], STRANGER_HASH, created_by=OWN_HASH)
+    # Hand-edit the stored record: a malformed entry, a duplicate, and
+    # a banned hash that is also a member (stale or hand-edited).
+    raw = json.loads((tmp_path / "groups.json").read_text())
+    raw["groups"][0]["banned"] = [
+        "not-hex",
+        STRANGER_HASH,
+        STRANGER_HASH,
+        OTHER_HASH,
+        42,
+    ]
+    (tmp_path / "groups.json").write_text(json.dumps(raw))
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(group["id"])["banned"] == [STRANGER_HASH]
+
+
 def test_group_store_record_topic_pinning(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     members = [OWN_HASH, OTHER_HASH, THIRD_HASH]

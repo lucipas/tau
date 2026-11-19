@@ -37,7 +37,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .protocol import ProtocolError, normalize_message
+from .protocol import ProtocolError, normalize_message, sanitize_file_name
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -121,6 +121,66 @@ def _clean_targets(value: Any) -> Tuple[str, ...]:
             raise ScheduledPostsError(f"not a publish target: {target!r}")
         cleaned.append(target)
     return tuple(cleaned)
+
+
+def _clean_image(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate a queued post's image attachment: ``{sha256, size, mime, name}``.
+
+    The same shape :func:`tau.tangents.tan._clean_image` validates for
+    an immediate post, re-checked here so a hand-edited queue file
+    cannot smuggle a bad descriptor into the publish pass.  The bytes
+    themselves are never in the queue — only the descriptor; they live
+    pinned in the local media store from schedule time.  ``None`` means
+    no image (and is what old queue files without the field load as).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ScheduledPostsError("scheduled post image must be an object")
+    sha256 = value.get("sha256")
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        raise ScheduledPostsError(
+            "scheduled post image sha256 must be a 64 character hex digest"
+        )
+    try:
+        bytes.fromhex(sha256)
+    except ValueError as exc:
+        raise ScheduledPostsError(
+            "scheduled post image sha256 must be a 64 character hex digest"
+        ) from exc
+    size = value.get("size")
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise ScheduledPostsError("scheduled post image size must be an integer")
+    # Lazy import: this module stays importable without Reticulum, which
+    # ``tau.backup`` relies on — the same reason schedule_post imports
+    # its Tan helpers lazily.
+    from .tangents.tan import IMAGE_MIME_TYPES, MAX_IMAGE_BYTES
+
+    if size < 1 or size > MAX_IMAGE_BYTES:
+        raise ScheduledPostsError(
+            f"scheduled post image of {size} bytes exceeds the "
+            f"{MAX_IMAGE_BYTES} byte limit"
+        )
+    mime = value.get("mime")
+    if mime not in IMAGE_MIME_TYPES:
+        raise ScheduledPostsError(
+            "scheduled post image mime must be one of: " + ", ".join(IMAGE_MIME_TYPES)
+        )
+    name = value.get("name")
+    if (
+        not isinstance(name, str)
+        or not sanitize_file_name(name)
+        or sanitize_file_name(name) != name
+    ):
+        raise ScheduledPostsError(
+            "scheduled post image name must be a safe bare file name"
+        )
+    return {
+        "sha256": sha256.lower(),
+        "size": size,
+        "mime": mime,
+        "name": name,
+    }
 
 
 def _clean_ttl(value: Any) -> int:
@@ -228,6 +288,10 @@ class ScheduledPost:
     # unchanged.
     kind: str = "post"
     options: Tuple[str, ...] = ()
+    # Image attachment descriptor (``{sha256, size, mime, name}``) for a
+    # post scheduled with ``--image``; the bytes live pinned in the
+    # local media store, never in the queue.  ``None`` means no image.
+    image: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -248,6 +312,7 @@ class ScheduledPost:
         object.__setattr__(self, "expires_in", _clean_duration(self.expires_in))
         object.__setattr__(self, "kind", _clean_kind(self.kind))
         object.__setattr__(self, "options", _clean_options(self.options))
+        object.__setattr__(self, "image", _clean_image(self.image))
         if self.kind == "poll":
             # A poll is a top-level entry: it has no reply target, and
             # its options are fixed at schedule time.
@@ -255,6 +320,8 @@ class ScheduledPost:
                 raise ScheduledPostsError("a scheduled poll cannot be a reply")
             if not 2 <= len(self.options) <= 8:
                 raise ScheduledPostsError("a scheduled poll needs 2-8 options")
+            if self.image is not None:
+                raise ScheduledPostsError("a scheduled poll cannot carry an image")
         elif self.options:
             raise ScheduledPostsError("a scheduled post cannot carry poll options")
 
@@ -275,6 +342,7 @@ class ScheduledPost:
             "expires_in": self.expires_in,
             "kind": self.kind,
             "options": list(self.options),
+            "image": self.image,
         }
 
     @classmethod
@@ -297,6 +365,7 @@ class ScheduledPost:
             expires_in=_clean_duration(data.get("expires_in", 0.0)),
             kind=_clean_kind(data.get("kind", "post")),
             options=_clean_options(data.get("options")),
+            image=_clean_image(data.get("image")),
         )
 
 
@@ -440,6 +509,7 @@ def schedule_post(
     expires_in: float = 0.0,
     kind: str = "post",
     options: Optional[Sequence[str]] = None,
+    image: Optional[Dict[str, Any]] = None,
 ) -> ScheduledPost:
     """Queue a post for *publish_at*; returns the stored entry.
 
@@ -449,12 +519,19 @@ def schedule_post(
     publish pass.  When *expires_in* is given the post disappears from
     display surfaces that long after it is published; it shares the
     delay cap — a post cannot outlive the furthest it may be queued.
-
     With ``kind="poll"`` the text is the poll question and *options*
     carries its fixed choices: a poll cannot be a reply, and the
     question plus options get the same wire-size preflight an
     immediate ``tau tan poll`` gets, so a poll that could never fit
-    the 8 KiB Tan request is refused here.
+    the 8 KiB Tan request is refused here.  A poll cannot carry an
+    image: no side supports a scheduled poll with an attachment.
+
+    When *image* is given — the ``{sha256, size, mime, name}``
+    descriptor an immediate post carries — the attachment is stored on
+    the entry and signed with the post at publish time; the bytes live
+    pinned in the local media store, never in the queue.  An image is
+    top-level-only, the same rule as an immediate post, so it is
+    refused with a reply target.
     """
     try:
         clean_text = normalize_message(text)
@@ -475,9 +552,12 @@ def schedule_post(
         )
     clean_kind = _clean_kind(kind)
     clean_options: Tuple[str, ...] = ()
+    clean_image = _clean_image(image)
     if clean_kind == "poll":
         if reply_to is not None:
             raise ScheduledPostsError("a scheduled poll cannot be a reply")
+        if clean_image is not None:
+            raise ScheduledPostsError("a scheduled poll cannot carry an image")
         from .tangents.tan import _clean_poll_options
 
         try:
@@ -496,12 +576,17 @@ def schedule_post(
     else:
         if options:
             raise ScheduledPostsError("a scheduled post cannot carry poll options")
+        if clean_image is not None and reply_to is not None:
+            raise ScheduledPostsError(
+                "an image can only be attached to a top-level post, not a reply"
+            )
         try:
             check_post_text_fits(
                 clean_text,
                 name=name,
                 reply_to=reply_to,
                 expires=clean_expires_in > 0,
+                image=clean_image,
             )
         except PostError as exc:
             raise ScheduledPostsError(str(exc)) from exc
@@ -516,6 +601,7 @@ def schedule_post(
         expires_in=clean_expires_in,
         kind=clean_kind,
         options=clean_options,
+        image=clean_image,
     )
     with scheduled_posts_lock(path):
         queue = load_scheduled_posts(path)
@@ -701,6 +787,7 @@ def publish_due_scheduled_posts(
                                 post.text,
                                 reply_to=post.reply_to,
                                 expires_at=expires_at,
+                                image=post.image,
                             )
                         # Persist the signed post's identity before sending, so
                         # a retry after a crash re-sends it rather than signing

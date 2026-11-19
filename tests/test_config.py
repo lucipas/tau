@@ -9,6 +9,8 @@ from tau.config import (
     TauConfig,
     parse_host_port,
     render_rns_config,
+    set_node_setting,
+    tan_sync_depth,
     write_node_metadata,
     write_rns_config,
 )
@@ -96,3 +98,32 @@ def test_default_data_dir_uses_environment(tmp_path, monkeypatch):
 
     monkeypatch.delenv("TAU_HOME")
     assert config.default_data_dir() == Path.home() / ".tau"
+
+
+def test_tan_sync_depth_defaults_to_two(tmp_path):
+    # A fresh data directory has no node.json: the #467 default applies.
+    assert tan_sync_depth(tmp_path) == 2
+    assert not (tmp_path / "node.json").exists()
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_tan_sync_depth_round_trips(tmp_path, depth):
+    set_node_setting(tmp_path, "tan_sync_depth", depth)
+    assert tan_sync_depth(tmp_path) == depth
+
+
+@pytest.mark.parametrize("value", [0, 3, -1, "2", True, None, 1.5])
+def test_tan_sync_depth_rejects_bad_values(tmp_path, value):
+    # Any value outside 1..2 — including a boolean or a string, which a
+    # hand-edited node.json might hold — falls back to the default.
+    set_node_setting(tmp_path, "tan_sync_depth", value)
+    assert tan_sync_depth(tmp_path) == 2
+
+
+def test_tan_sync_depth_keeps_other_settings(tmp_path):
+    set_node_setting(tmp_path, "send_read_receipts", False)
+    set_node_setting(tmp_path, "tan_sync_depth", 1)
+    assert tan_sync_depth(tmp_path) == 1
+    stored = config.load_node_settings(tmp_path)
+    assert stored["send_read_receipts"] is False
+    assert stored["tan_sync_depth"] == 1

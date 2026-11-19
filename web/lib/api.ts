@@ -17,6 +17,7 @@ import type {
   AllowList,
   ApiErrorBody,
   AwayMessageSettings,
+  Beacon,
   BlockResult,
   BroadcastList,
   BroadcastSendResponse,
@@ -35,6 +36,7 @@ import type {
   MeshPage,
   MeshRow,
   MutedConversations,
+  MessageDraft,
   NodeSettings,
   Outbox,
   OutboxRetryResult,
@@ -50,6 +52,9 @@ import type {
   SendResult,
   Snapshot,
   TanAuthor,
+  TanDraft,
+  TanList,
+  TanListMember,
   TanPost,
   TanQuoter,
   TanReactors,
@@ -245,10 +250,10 @@ export async function getSettings(): Promise<NodeSettings> {
   return get("/api/settings");
 }
 
-/** `setting` is "accept_files" | "send_read_receipts"; value must be boolean. */
+/** `setting` is "accept_files" | "send_read_receipts" | "tan_sync_depth"; boolean settings take a boolean, tan_sync_depth takes 1 or 2. */
 export async function updateSetting(
-  setting: "accept_files" | "send_read_receipts",
-  value: boolean,
+  setting: "accept_files" | "send_read_receipts" | "tan_sync_depth",
+  value: boolean | number,
 ): Promise<NodeSettings> {
   const data = await post<{ ok: boolean; settings: NodeSettings }>("/api/settings", {
     setting,
@@ -359,6 +364,30 @@ export async function removeGroupMembers(group: string, members: string[]): Prom
   return post("/api/groups/remove-member", { group, members });
 }
 
+export interface GroupBannedEntry {
+  hash: string;
+  name: string;
+}
+
+export interface GroupBannedResult {
+  group: Group;
+  banned: GroupBannedEntry[];
+  previous_id?: string;
+  count?: number;
+}
+
+export async function banGroupMember(group: string, peer: string): Promise<GroupBannedResult> {
+  return post("/api/groups/ban", { group, peer });
+}
+
+export async function unbanGroupMember(group: string, peer: string): Promise<GroupBannedResult & { unbanned: GroupBannedEntry; was_banned: boolean }> {
+  return post("/api/groups/unban", { group, peer });
+}
+
+export async function getGroupBanned(group: string): Promise<GroupBannedResult> {
+  return get(`/api/groups/banned${query({ group })}`);
+}
+
 export async function approveJoinRequest(group: string, peer: string): Promise<unknown> {
   return post("/api/groups/approve-join", { group, peer });
 }
@@ -440,6 +469,51 @@ export async function voteDmPoll(
 
 export async function closeDmPoll(peer: string, poll: string): Promise<DmPollActionResult> {
   return post("/api/dm/close-poll", { to: peer, poll });
+}
+
+// --------------------------------------------------------------- beacons --
+
+/** Live beacons this node is sharing, active first. */
+export async function getBeacons(): Promise<{ beacons: Beacon[]; count: number }> {
+  return get("/api/beacons");
+}
+
+export interface StartBeaconOptions {
+  lat: number;
+  lon: number;
+  name?: string;
+  /** Seconds the beacon runs (60..28800, default 3600). */
+  durationSeconds?: number;
+  /** Round updates to ~1 km and drop the place name. */
+  coarse?: boolean;
+}
+
+/** Start a live beacon; the first update goes out at once. */
+export async function startBeacon(
+  target: { peer?: string; group?: string },
+  opts: StartBeaconOptions,
+): Promise<{ beacon: Beacon; update: unknown }> {
+  return post("/api/beacons/start", { ...target, ...opts });
+}
+
+/** Stop a live beacon by id. */
+export async function stopBeacon(id: string): Promise<{ beacon: Beacon }> {
+  return post("/api/beacons/stop", { id });
+}
+
+/** Feed a running beacon a fresh position from the browser's geolocation. */
+export async function updateBeaconPosition(
+  id: string,
+  lat: number,
+  lon: number,
+  name?: string,
+): Promise<{ beacon: Beacon }> {
+  return post("/api/beacons/position", {
+    id,
+    lat,
+    lon,
+    ...(name !== undefined ? { name } : {}),
+  });
 }
 
 // -------------------------------------------------------------- messages --
@@ -676,8 +750,37 @@ export async function getMutedConversations(): Promise<MutedConversations> {
   return get("/api/messages/muted");
 }
 
+/** Saved message drafts, oldest first (``tau draft save``). */
+export async function getDrafts(): Promise<MessageDraft[]> {
+  const data = await get<{ drafts: MessageDraft[]; count: number }>("/api/drafts");
+  return data.drafts ?? [];
+}
+
+/** Save (or overwrite) the draft for one peer or group conversation. */
+export async function saveDraft(
+  kind: "peer" | "group",
+  target: string,
+  text: string,
+): Promise<MessageDraft> {
+  const data = await post<{ ok: boolean; draft: MessageDraft }>("/api/drafts", {
+    kind,
+    target,
+    text,
+  });
+  return data.draft;
+}
+
+/** Discard the draft for one peer or group conversation. */
+export async function deleteDraft(kind: "peer" | "group", target: string): Promise<boolean> {
+  const data = await post<{ ok: boolean; deleted: boolean }>("/api/drafts/delete", {
+    kind,
+    target,
+  });
+  return data.deleted;
+}
+
 export async function setMuted(
-  target: { peer: string } | { group: string },
+  target: { peer: string } | { group: string } | { channel: string },
   muted = true,
 ): Promise<unknown> {
   return post("/api/messages/mute", { ...target, muted });
@@ -745,6 +848,7 @@ export async function getTanTimeline(opts: {
   all?: boolean;
   author?: string;
   tag?: string;
+  list?: string;
 } = {}): Promise<TanPost[]> {
   const data = await get<{ posts: TanPost[]; count: number }>(
     `/api/tan/timeline${query({
@@ -752,6 +856,7 @@ export async function getTanTimeline(opts: {
       all: opts.all ? "1" : undefined,
       author: opts.author,
       tag: opts.tag,
+      list: opts.list,
     })}`,
   );
   return data.posts;
@@ -799,6 +904,11 @@ export async function getTanThread(ref: string): Promise<TanPost[]> {
 export async function getTanFollowing(): Promise<TanAuthor[]> {
   const data = await get<{ following: TanAuthor[]; count: number }>("/api/tan/following");
   return data.following;
+}
+
+export async function getTanFollowers(): Promise<TanAuthor[]> {
+  const data = await get<{ followers: TanAuthor[]; count: number }>("/api/tan/followers");
+  return data.followers;
 }
 
 export async function getTanAuthors(opts: {
@@ -856,6 +966,35 @@ export async function getTanFollowedTags(): Promise<string[]> {
 export async function getTanMutedTags(): Promise<string[]> {
   const data = await get<{ muted_tags: string[]; count: number }>("/api/tan/muted-tags");
   return data.muted_tags;
+}
+
+export async function getTanLists(): Promise<TanList[]> {
+  const data = await get<{ lists: TanList[]; count: number }>("/api/tan/lists");
+  return data.lists;
+}
+
+export async function getTanListMembers(name: string): Promise<{
+  name: string;
+  members: TanListMember[];
+  count: number;
+}> {
+  return get(`/api/tan/lists/members${query({ name })}`);
+}
+
+export async function createTanList(name: string): Promise<unknown> {
+  return post("/api/tan/lists", { name });
+}
+
+export async function deleteTanList(name: string): Promise<unknown> {
+  return post("/api/tan/lists/delete", { name });
+}
+
+export async function addTanListMember(name: string, target: string): Promise<unknown> {
+  return post("/api/tan/lists/add", { name, target });
+}
+
+export async function removeTanListMember(name: string, target: string): Promise<unknown> {
+  return post("/api/tan/lists/remove", { name, target });
 }
 
 export async function getTanSaved(limit = 30, offset = 0): Promise<{ posts: TanPost[]; next_offset: number | null }> {
@@ -970,6 +1109,7 @@ export async function scheduleTanPost(
     reply_to: opts.replyTo,
     send_in: sendIn,
     expires_in: opts.expiresIn ?? 0,
+    image: opts.image?.dataUrl,
   });
 }
 
@@ -990,6 +1130,30 @@ export async function scheduleTanPoll(
 
 export async function cancelScheduledTanPost(id: string): Promise<unknown> {
   return post("/api/tan/cancel-scheduled", { id });
+}
+
+/** Saved Tan post drafts, newest first. */
+export async function getTanDrafts(): Promise<TanDraft[]> {
+  const data = await get<{ drafts: TanDraft[]; count: number }>("/api/tan/drafts");
+  return data.drafts;
+}
+
+/** Save a Tan post draft (plain text plus optional reply and expiry). */
+export async function saveTanDraft(
+  text: string,
+  opts: PublishTanOptions = {},
+): Promise<TanDraft> {
+  const data = await post<{ ok: boolean; draft: TanDraft }>("/api/tan/drafts", {
+    text,
+    reply_to: opts.replyTo,
+    expires_in: opts.expiresIn,
+  });
+  return data.draft;
+}
+
+/** Discard a saved Tan post draft without publishing it. */
+export async function deleteTanDraft(id: number): Promise<unknown> {
+  return post("/api/tan/drafts/delete", { id });
 }
 
 export async function quoteTanPost(target: string, text: string): Promise<TanPost> {
