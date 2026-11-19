@@ -275,6 +275,10 @@ tau tan post --to alice "direct delivery"
 tau tan post --delay 8h "good morning, mesh"
 tau tan scheduled
 
+# Schedule a post with a photo attached — the image is stored with the
+# queue entry and signed with the post when it publishes
+tau tan post --image sunrise.jpg --delay 8h "good morning, mesh"
+
 # Attach a place to a post — the place is signed with it, and the
 # timeline and console show it with an open-in-maps link
 tau tan post --location "34.05,-83.88 Rock Springs Park" "morning run"

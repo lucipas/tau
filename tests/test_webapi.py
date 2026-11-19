@@ -13554,11 +13554,41 @@ def test_tan_schedule_post_via_api(tmp_path):
         assert payload["scheduled"]["expires_in"] == 3600
         assert abs(payload["scheduled"]["publish_at"] - (time.time() + 60)) < 5
 
+        # An image rides the queue entry: the bytes land pinned in the
+        # media store at schedule time, and the descriptor is stored
+        # with the entry until the publish pass attaches it.
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
+        digest = hashlib.sha256(png).hexdigest()
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"text": "morning photo", "send_in": 30, "image": data_url},
+        )
+        assert status == 200
+        assert payload["scheduled"]["image"] == {
+            "sha256": digest,
+            "size": len(png),
+            "mime": "image/png",
+            "name": "image.png",
+        }
+        # The bytes are pinned in the media store for the publish pass —
+        # not served yet: a local upload stays private until a post
+        # carrying it is published, so /api/tan/media/<digest> 404s
+        # until the scheduled post goes out.
+        from tau.tangents.tan import media_path
+
+        assert media_path(tmp_path, digest) is not None
+
         status, _, payload = _json(bridge, "/api/tan/scheduled")
         assert status == 200
-        assert payload["count"] == 3
-        # Soonest first: the 60-second reply precedes the hour-out post.
+        assert payload["count"] == 4
+        # Soonest first: the 30-second photo precedes the 60-second posts.
         assert [item["text"] for item in payload["scheduled"]] == [
+            "morning photo",
             "agreed",
             "vanish later",
             "hello later",
@@ -13575,8 +13605,8 @@ def test_tan_schedule_post_via_api(tmp_path):
         assert payload["cancelled"]["id"] == scheduled["id"]
         assert payload["deleted_local"] is False
         status, _, payload = _json(bridge, "/api/tan/scheduled")
-        assert payload["count"] == 2
-        assert payload["scheduled"][0]["text"] == "agreed"
+        assert payload["count"] == 3
+        assert payload["scheduled"][0]["text"] == "morning photo"
 
         # Cancelling an unknown id is a bad request, not a crash.
         status, _, payload = _json(
@@ -13602,7 +13632,7 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
     identity = RNS.Identity()
     conn = init_db(node.config.social_db_path)
     try:
-        create_post(conn, identity, "api quotable", name="tester", now=1000)
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
     finally:
         conn.close()
 
@@ -13633,6 +13663,23 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
             (
                 {"text": "hello", "send_in": 3600, "expires_in": 3600},
                 "shorter than",
+            ),
+            (
+                {
+                    "text": "reply with pic",
+                    "send_in": 60,
+                    "reply_to": post["hash"][:16],
+                    "image": "data:image/png;base64,iVBORw0KGgo=",
+                },
+                "not a reply",
+            ),
+            (
+                {"text": "hello", "send_in": 60, "image": 42},
+                "data URL",
+            ),
+            (
+                {"text": "hello", "send_in": 60, "image": "not a data url"},
+                "data URL",
             ),
         ]:
             status, _, payload = _json(
