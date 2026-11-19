@@ -444,6 +444,18 @@ export interface AwayMessageSettings {
 export interface MutedConversations {
   peers: string[];
   groups: string[];
+  channels: string[];
+}
+
+/** One unsent message parked for a peer or a group (``tau draft save``). */
+export interface MessageDraft {
+  kind: "peer" | "group";
+  /** Peer destination hash or group id. */
+  target: string;
+  text: string;
+  updated_at: number;
+  /** Best-effort conversation name from the bridge; null when unknown. */
+  name: string | null;
 }
 
 export interface OwnProfile {
@@ -524,6 +536,7 @@ export interface OutboxRetryResult {
 export interface NodeSettings {
   accept_files: boolean;
   send_read_receipts: boolean;
+  tan_sync_depth: number;
 }
 
 export interface AllowList {
@@ -576,6 +589,14 @@ export interface TanImage {
   [key: string]: unknown;
 }
 
+/** A place attached to a Tan post: decimal degrees, optional place name. */
+export interface TanLocation {
+  lat: number;
+  lon: number;
+  name?: string;
+  [key: string]: unknown;
+}
+
 export interface TanParentSummary {
   hash: string;
   author: string;
@@ -607,6 +628,7 @@ export interface TanPost {
   expires_at: number | null;
   options?: string[];
   image?: TanImage | null;
+  location?: TanLocation | null;
   // --- annotations added by the bridge (tau/tangents/tan.py) ---
   likes: number;
   liked: boolean;
@@ -630,6 +652,19 @@ export interface TanPost {
 export interface TanTag {
   tag: string;
   count: number;
+}
+
+export interface TanList {
+  name: string;
+  created_at: number;
+  members: number;
+}
+
+export interface TanListMember {
+  author: string;
+  name: string;
+  added_at: number;
+  posts?: number;
 }
 
 export interface TanAuthor {
@@ -685,10 +720,28 @@ export interface ScheduledTanPost {
   next_attempt_at: number | null;
   paused_at: number | null;
   expires_in?: number;
-  /** "post" for a queued post, "repost" for a queued repost, "quote" for a queued quote. */
-  kind?: "post" | "repost" | "quote";
+  /** "post" for a queued post, "repost" for a queued repost, "quote" for a queued quote, "poll" for a queued poll question. */
+  kind?: "post" | "repost" | "quote" | "poll";
   /** Hash of the post being reposted or quoted; only present for those kinds. */
   target_post?: string | null;
+  /** Fixed poll choices; only present when kind is "poll". */
+  options?: string[];
+  /** Image attachment descriptor, when the queued post carries one. */
+  image?: { sha256: string; size: number; mime: string; name: string } | null;
+  [key: string]: unknown;
+}
+
+/** A saved Tan post draft: plain text plus the reply target and the
+ *  expiry it will carry once published (mirrors the CLI's tan draft). */
+export interface TanDraft {
+  id: number;
+  text: string;
+  reply_to: string;
+  expires_in: number | null;
+  post_hash: string;
+  pending_peers: string[];
+  claimed_at: number | null;
+  created_at: number;
   [key: string]: unknown;
 }
 
@@ -713,6 +766,8 @@ export interface Channel {
   pinned?: boolean;
   /** Messages newer than the last-read cursor; always present from /api/channels. */
   unread: number;
+  /** True when the channel is muted: its badge stays dark. */
+  muted?: boolean;
 }
 
 export interface ChannelPollTally {

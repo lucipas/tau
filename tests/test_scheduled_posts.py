@@ -18,9 +18,10 @@ from tau.scheduled_posts import (
     load_scheduled_posts,
     publish_due_scheduled_posts,
     save_scheduled_posts,
-    schedule_post,
     schedule_quote,
     schedule_repost,
+    schedule_poll,
+    schedule_post,
 )
 
 
@@ -162,6 +163,30 @@ def test_schedule_post_accepts_long_text_that_fits(tmp_path):
     assert load_scheduled_posts(path).posts[0].id == post.id
 
 
+def test_schedule_poll_round_trip(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    poll = schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=2000.0,
+        to=["alice"],
+        ttl=2,
+        now=1000.0,
+    )
+    queue = load_scheduled_posts(path)
+    assert len(queue) == 1
+    assert queue.posts[0] == poll
+    assert poll.kind == "poll"
+    assert poll.text == "pizza or tacos?"
+    assert poll.options == ("Pizza", "Tacos")
+    assert poll.reply_to is None
+    assert poll.to == ("alice",)
+    assert poll.ttl == 2
+    assert poll.publish_at == 2000.0
+    assert poll.created_at == 1000.0
+
+
 def test_schedule_repost_and_quote_round_trip(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     repost = schedule_repost(
@@ -184,6 +209,30 @@ def test_schedule_repost_and_quote_round_trip(tmp_path):
     assert quote.kind == "quote"
     assert quote.text == "this, tomorrow"
     assert quote.target_post == "e" * 64
+
+
+def test_load_old_queue_file_without_kind_is_post(tmp_path):
+    # Queue files written before polls could be scheduled carry no
+    # kind or options: they load as posts, exactly as before.
+    path = tmp_path / "scheduled-posts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "posts": [
+                    {
+                        "id": "a" * 16,
+                        "text": "old post",
+                        "publish_at": 1000.0,
+                        "created_at": 900.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_scheduled_posts(path).posts[0]
+    assert loaded.kind == "post"
+    assert loaded.options == ()
 
 
 def test_old_queue_file_without_kind_loads_as_post(tmp_path):
@@ -210,6 +259,49 @@ def test_old_queue_file_without_kind_loads_as_post(tmp_path):
     assert queue.posts[0].target_post is None
 
 
+def test_schedule_poll_refuses_bad_options(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    for options in (
+        ["only one"],
+        ["a", "b", "c", "d", "e", "f", "g", "h", "i"],
+        ["Pizza", "Pizza"],
+        ["Pizza", "  "],
+        ["Pizza", 7],
+    ):
+        with pytest.raises(ScheduledPostsError):
+            schedule_poll(
+                path,
+                question="pick one",
+                options=options,  # type: ignore[arg-type]
+                publish_at=2000.0,
+                now=1000.0,
+            )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_poll_refuses_reply_and_post_refuses_options(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="cannot be a reply"):
+        schedule_post(
+            path,
+            text="pick one",
+            publish_at=2000.0,
+            reply_to="b" * 64,
+            kind="poll",
+            options=["A", "B"],
+            now=1000.0,
+        )
+    with pytest.raises(ScheduledPostsError, match="cannot carry poll options"):
+        schedule_post(
+            path,
+            text="plain post",
+            publish_at=2000.0,
+            options=["A", "B"],
+            now=1000.0,
+        )
+    assert load_scheduled_posts(path).posts == ()
+
+
 def test_schedule_repost_and_quote_validation(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     # A repost carries no text, no reply target, no expiry — and it
@@ -231,13 +323,30 @@ def test_schedule_repost_and_quote_validation(tmp_path):
     with pytest.raises(ScheduledPostsError, match="cannot carry a target post"):
         schedule_post(path, text="hi", publish_at=1000.0, target_post="d" * 64)
     with pytest.raises(ScheduledPostsError, match="not a scheduled entry kind"):
-        schedule_post(path, text="hi", publish_at=1000.0, kind="poll")
+        schedule_post(path, text="hi", publish_at=1000.0, kind="bogus")
     # The dataclass enforces the same rules for hand-built entries.
     with pytest.raises(ScheduledPostsError, match="carries no text"):
         _post(kind="repost", text="nope", target_post="d" * 64)
     with pytest.raises(ScheduledPostsError, match="needs a target post"):
         _post(kind="quote", target_post=None)
     assert _post(kind="repost", text="", target_post="d" * 64).kind == "repost"
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_poll_rejects_question_and_options_that_cannot_fit(tmp_path):
+    # A 1,860-character question fits alone and with two short options,
+    # but not once 8 hundred-character options join it: refuse at
+    # schedule time, instead of failing every publish attempt forever.
+    path = tmp_path / "scheduled-posts.json"
+    long_options = [chr(ord("a") + i) + "x" * 99 for i in range(8)]
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        schedule_poll(
+            path,
+            question="😀" * 1860,
+            options=long_options,
+            publish_at=1000.0,
+            now=900.0,
+        )
     assert load_scheduled_posts(path).posts == ()
 
 
@@ -254,6 +363,95 @@ def test_schedule_quote_rejects_comment_that_only_fits_without_a_target(tmp_path
     assert load_scheduled_posts(path).posts == ()
 
 
+def _image() -> dict:
+    return {
+        "sha256": "a" * 64,
+        "size": 72,
+        "mime": "image/png",
+        "name": "photo.png",
+    }
+
+
+def test_schedule_post_with_image_round_trips(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="morning", publish_at=1000.0, now=900.0, image=_image()
+    )
+    assert post.image == _image()
+    assert load_scheduled_posts(path).posts[0].image == _image()
+    assert load_scheduled_posts(path).posts[0].to_dict()["image"] == _image()
+
+
+def test_schedule_post_without_image_loads_as_none(tmp_path):
+    # Old queue files predate the image field: they load with no image.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="plain", publish_at=1000.0, now=900.0)
+    assert post.image is None
+    stored = post.to_dict()
+    del stored["image"]
+    path.write_text(json.dumps({"posts": [stored]}))
+    assert load_scheduled_posts(path).posts[0].image is None
+
+
+def test_schedule_post_rejects_image_on_reply(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="top-level"):
+        schedule_post(
+            path,
+            text="reply",
+            publish_at=1000.0,
+            now=900.0,
+            reply_to="b" * 64,
+            image=_image(),
+        )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_poll_accepts_long_question_with_long_options(tmp_path):
+    # 1,500 four-byte characters plus 8 hundred-character options still
+    # fit the request with room to spare.
+    path = tmp_path / "scheduled-posts.json"
+    long_options = [chr(ord("a") + i) + "x" * 99 for i in range(8)]
+    poll = schedule_poll(
+        path,
+        question="😀" * 1500,
+        options=long_options,
+        publish_at=1000.0,
+        now=900.0,
+    )
+    assert load_scheduled_posts(path).posts[0].id == poll.id
+
+
+def test_schedule_post_rejects_bad_image(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    bad_images = [
+        {"sha256": "zz" * 32, "size": 72, "mime": "image/png", "name": "photo.png"},
+        {"sha256": "a" * 64, "size": 0, "mime": "image/png", "name": "photo.png"},
+        {"sha256": "a" * 64, "size": 72, "mime": "image/tiff", "name": "photo.png"},
+        {"sha256": "a" * 64, "size": 72, "mime": "image/png", "name": "../photo.png"},
+        "not-an-object",
+    ]
+    for bad in bad_images:
+        with pytest.raises(ScheduledPostsError):
+            schedule_post(path, text="x", publish_at=1000.0, now=900.0, image=bad)
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_text_that_only_fits_without_image(tmp_path):
+    # The image descriptor is ~130 bytes of JSON inside the 8 KiB Tan
+    # request: 1,860 four-byte characters fit on their own (the first
+    # failure without an image is 1,891) but not with one attached
+    # (the first failure with an image is 1,858).  Refuse at schedule
+    # time, instead of failing every publish attempt forever.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="😀" * 1860, publish_at=1000.0, now=900.0)
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        schedule_post(
+            path, text="😀" * 1860, publish_at=1000.0, now=900.0, image=_image()
+        )
+    assert len(load_scheduled_posts(path).posts) == 1
+
+
 def test_cancel_scheduled_post_end_to_end(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
@@ -268,20 +466,24 @@ def test_cancel_scheduled_post_end_to_end(tmp_path):
 class _FakeTanApp:
     """TanApp stand-in: records creates and publishes, delivers to nobody."""
 
-    def __init__(self, fail_publish: bool = False, fail_repost: bool = False):
+    def __init__(
+        self, fail_publish: bool = False, fail_repost: bool = False
+    ):
         self.created = []
         self.reposted = []
         self.quoted = []
+        self.polled = []
         self.published = []
         self.fail_publish = fail_publish
         self.fail_repost = fail_repost
 
-    def create_post(self, text, *, reply_to=None, expires_at=None):
+    def create_post(self, text, *, reply_to=None, expires_at=None, image=None):
         post = {
             "hash": "c" * 64,
             "text": text,
             "reply_to": reply_to,
             "expires_at": expires_at,
+            "image": image,
         }
         self.created.append(post)
         return post
@@ -303,8 +505,18 @@ class _FakeTanApp:
         self.quoted.append(record)
         return record
 
+    def create_poll(self, question, options, *, expires_at=None):
+        poll = {
+            "hash": "d" * 64,
+            "text": question,
+            "options": list(options),
+            "expires_at": expires_at,
+        }
+        self.polled.append(poll)
+        return poll
+
     def get_post(self, digest):
-        for post in (*self.created, *self.reposted, *self.quoted):
+        for post in [*self.created, *self.reposted, *self.quoted, *self.polled]:
             if post["hash"] == digest:
                 return post
         return None
@@ -334,6 +546,35 @@ def test_publish_due_publishes_and_removes_only_due(tmp_path):
     assert len(queue) == 1
 
 
+def test_publish_due_publishes_poll_through_create_poll(tmp_path):
+    # A due poll is signed as a poll, not a post: the question and its
+    # fixed options go to create_poll, and the entry leaves the queue.
+    path = tmp_path / "scheduled-posts.json"
+    due = schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        to=["alice"],
+        now=900.0,
+    )
+    app = _FakeTanApp()
+    resolved = [SimpleNamespace(hexhash="alice-hash")]
+
+    result = publish_due_scheduled_posts(
+        path, app, resolve_peer=lambda target: resolved[0], now=2000.0
+    )
+    assert result == {"published": 1, "kept": 0}
+    assert app.created == []
+    assert len(app.polled) == 1
+    assert app.polled[0]["text"] == "pizza or tacos?"
+    assert app.polled[0]["options"] == ["Pizza", "Tacos"]
+    assert app.published[0][1] == resolved
+    queue = load_scheduled_posts(path)
+    assert all(post.id != due.id for post in queue.posts)
+    assert len(queue) == 0
+
+
 def test_publish_due_publishes_scheduled_repost_and_quote(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     repost = schedule_repost(
@@ -360,6 +601,23 @@ def test_publish_due_publishes_scheduled_repost_and_quote(tmp_path):
     assert app.published[0][0] is app.reposted[0]
     assert app.published[1][0] is app.quoted[0]
     assert repost.id != quote.id
+
+
+def test_publish_due_keeps_failed_poll_queued(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=["Pizza", "Tacos"],
+        publish_at=1000.0,
+        now=900.0,
+    )
+    app = _FakeTanApp(fail_publish=True)
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+    assert len(app.polled) == 1
+    assert len(load_scheduled_posts(path)) == 1
 
 
 def test_publish_due_keeps_failed_repost_queued(tmp_path):
@@ -392,6 +650,20 @@ def test_publish_due_repost_retry_resends_same_record(tmp_path):
     result = publish_due_scheduled_posts(path, app, now=10000.0)
     assert result == {"published": 1, "kept": 0}
     assert len(app.reposted) == 1
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_publish_due_attaches_scheduled_image(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(
+        path, text="morning", publish_at=1000.0, now=900.0, image=_image()
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert app.created[0]["image"] == _image()
+    assert app.published[0][0]["image"] == _image()
     assert load_scheduled_posts(path).posts == ()
 
 
@@ -931,6 +1203,67 @@ def test_cli_schedule_list_cancel(tmp_path, capsys):
     assert len(load_scheduled_posts(data_dir / "scheduled-posts.json")) == 0
 
 
+def test_cli_schedule_poll_list_cancel(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert (
+        _run_cli(
+            data_dir,
+            [
+                "tan", "poll", "--delay", "2h",
+                "pizza or tacos?", "--option", "Pizza", "--option", "Tacos",
+            ],
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "scheduled" in out and "asks in 2h" in out
+
+    assert _run_cli(data_dir, ["tan", "scheduled"]) == 0
+    listed = capsys.readouterr().out
+    assert "pizza or tacos?" in listed
+    assert "poll · 2 options" in listed
+    assert "1. Pizza" in listed
+    assert "2. Tacos" in listed
+
+    queue = load_scheduled_posts(data_dir / "scheduled-posts.json")
+    assert len(queue) == 1
+    assert queue.posts[0].kind == "poll"
+    assert queue.posts[0].options == ("Pizza", "Tacos")
+    poll_id = queue.posts[0].id
+    assert _run_cli(data_dir, ["tan", "cancel-scheduled", poll_id[:8]]) == 0
+    assert len(load_scheduled_posts(data_dir / "scheduled-posts.json")) == 0
+
+
+def test_cli_schedule_poll_rejects_bad_delay_and_no_publish(tmp_path):
+    data_dir = tmp_path / "node"
+    argv = ["tan", "poll", "pick one?", "--option", "A", "--option", "B"]
+    assert _run_cli(data_dir, [*argv, "--delay", "soon"]) == 2
+    assert _run_cli(data_dir, [*argv, "--delay", "2h", "--no-publish"]) == 2
+    assert _run_cli(data_dir, [*argv, "--delay", "30d"]) == 2
+    assert (
+        _run_cli(data_dir, [*argv, "--delay", "2h", "--expire", "1h"]) == 2
+    )
+    assert len(load_scheduled_posts(data_dir / "scheduled-posts.json")) == 0
+
+
+def test_cli_schedule_poll_json_output(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert (
+        _run_cli(
+            data_dir,
+            [
+                "tan", "poll", "--delay", "5m", "--json",
+                "pick one?", "--option", "A", "--option", "B",
+            ],
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"]["kind"] == "poll"
+    assert payload["scheduled"]["text"] == "pick one?"
+    assert payload["scheduled"]["options"] == ["A", "B"]
+
+
 def test_cli_schedule_rejects_bad_delay_and_no_publish(tmp_path):
     data_dir = tmp_path / "node"
     assert _run_cli(data_dir, ["tan", "post", "--delay", "soon", "hi"]) == 2
@@ -945,7 +1278,7 @@ def test_cli_schedule_rejects_bad_delay_and_no_publish(tmp_path):
 def test_cli_scheduled_empty_and_cancel_unknown(tmp_path, capsys):
     data_dir = tmp_path / "node"
     assert _run_cli(data_dir, ["tan", "scheduled"]) == 0
-    assert "No Tan posts, reposts or quotes scheduled." in capsys.readouterr().out
+    assert "No Tan posts, reposts, quotes or polls scheduled." in capsys.readouterr().out
     assert _run_cli(data_dir, ["tan", "cancel-scheduled", "abcd"]) == 1
 
 

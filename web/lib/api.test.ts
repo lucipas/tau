@@ -10,6 +10,8 @@ import {
   createBroadcast,
   deleteBroadcast,
   closeChannelPoll,
+  deleteDraft,
+  deleteTanDraft,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
@@ -20,10 +22,13 @@ import {
   getChannelPins,
   getChannelScheduled,
   getChannelTopic,
+  getDrafts,
   getGroupInviteStatus,
   getMessages,
   getOwnProfile,
   getQuietHours,
+  getTanDrafts,
+  getTanLists,
   getTanThread,
   getTanTimeline,
   joinGroupViaLink,
@@ -37,9 +42,13 @@ import {
   reactToMessage,
   readFileAsDataUrl,
   revokeGroupInvites,
+  saveTanDraft,
   closeDmPoll,
+  saveDraft,
   sendBroadcast,
   scheduleChannelMessage,
+  scheduleTanPoll,
+  scheduleTanPost,
   scheduleTanQuote,
   scheduleTanRepost,
   searchChannelMessages,
@@ -116,6 +125,19 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/tan/timeline?limit=10&all=1&author=alice&tag=mesh");
   });
 
+  it("builds the Tan timeline query for a list", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanTimeline({ list: "Mesh Core" });
+    expect(captured[0].url).toBe("/api/tan/timeline?limit=30&list=Mesh%20Core");
+  });
+
+  it("lists Tan lists", async () => {
+    nextJson = { lists: [{ name: "Friends", created_at: 1000, members: 2 }], count: 1 };
+    const lists = await getTanLists();
+    expect(captured[0].url).toBe("/api/tan/lists");
+    expect(lists).toEqual([{ name: "Friends", created_at: 1000, members: 2 }]);
+  });
+
   it("omits empty timeline params", async () => {
     nextJson = { posts: [], count: 0 };
     await getTanTimeline();
@@ -140,6 +162,25 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/scheduled?channel=my%20channel");
     await getChannelScheduled();
     expect(captured[1].url).toBe("/api/channels/scheduled");
+  });
+
+  it("lists saved Tan drafts", async () => {
+    const draft = { id: 1, text: "half-written", reply_to: "", expires_in: null };
+    nextJson = { drafts: [draft], count: 1 };
+    const drafts = await getTanDrafts();
+    expect(captured[0].url).toBe("/api/tan/drafts");
+    expect(drafts).toEqual([draft]);
+  });
+
+  it("lists message drafts", async () => {
+    nextJson = {
+      drafts: [{ kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" }],
+      count: 1,
+    };
+    const drafts = await getDrafts();
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].name).toBe("alice");
   });
 
   it("posts a channel poll with question and options", async () => {
@@ -285,6 +326,24 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
   });
 
+  it("saves and deletes a message draft", async () => {
+    nextJson = {
+      ok: true,
+      draft: { kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" },
+    };
+    const draft = await saveDraft("peer", "ab".repeat(16), "hi");
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ kind: "peer", target: "ab".repeat(16), text: "hi" });
+    expect(draft.text).toBe("hi");
+
+    nextJson = { ok: true, deleted: true };
+    const deleted = await deleteDraft("peer", "ab".repeat(16));
+    expect(captured[1].url).toBe("/api/drafts/delete");
+    expect(bodyOf(1)).toEqual({ kind: "peer", target: "ab".repeat(16) });
+    expect(deleted).toBe(true);
+  });
+
   it("reacts and clears a reaction on the same route", async () => {
     nextJson = { ok: true };
     await reactToMessage("wire9", "👍");
@@ -308,7 +367,7 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ channel: "general", text: "later", send_in: 300 });
   });
 
-  it("schedules a Tan repost or quote with kind and target_post", async () => {
+it("schedules a Tan repost or quote with kind and target_post", async () => {
     nextJson = { ok: true, scheduled: {} };
     await scheduleTanRepost("d".repeat(64), 3600);
     expect(captured[0].url).toBe("/api/tan/schedule");
@@ -325,6 +384,36 @@ describe("POST endpoints", () => {
       target_post: "e".repeat(64),
       text: "my take",
       send_in: 300,
+    });
+  });
+
+
+  it("schedules a Tan poll with poll_options and send_in seconds", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleTanPoll("pizza or tacos?", ["Pizza", "Tacos"], 300);
+    expect(captured[0].url).toBe("/api/tan/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      text: "pizza or tacos?",
+      poll_options: ["Pizza", "Tacos"],
+      send_in: 300,
+      expires_in: 0,
+    });
+  });
+
+  it("schedules a Tan post with an image data URL", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleTanPost("later with pic", 300, {
+      image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+    });
+    expect(captured[0].url).toBe("/api/tan/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      text: "later with pic",
+      reply_to: undefined,
+      send_in: 300,
+      expires_in: 0,
+      image: "data:image/png;base64,aGVsbG8=",
     });
   });
 
@@ -421,6 +510,16 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
   });
 
+  it("sets quiet hours with only the changed fields", async () => {
+    nextJson = { ok: true, quiet_hours: {} };
+    await setQuietHours({ enabled: true, start: "23:00", end: "06:30" });
+    expect(captured[0].url).toBe("/api/settings/quiet-hours");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ enabled: true, start: "23:00", end: "06:30" });
+    await setQuietHours({ enabled: false });
+    expect(bodyOf(1)).toEqual({ enabled: false });
+  });
+
   it("fetches the own profile from /api/profile", async () => {
     nextJson = {
       author: null,
@@ -455,6 +554,105 @@ describe("POST endpoints", () => {
       avatar: "ab".repeat(32),
       links: ["https://example.org"],
     });
+  });
+
+  it("publishes a Tan post with an image data URL when attached", async () => {
+    nextJson = { ok: true, post: {} };
+    await publishTanPost("with a picture", {
+      image: { dataUrl: "data:image/png;base64,iVBORw==" },
+    });
+    expect(captured[0].url).toBe("/api/tan/posts");
+    expect(bodyOf(0)).toEqual({
+      text: "with a picture",
+      image: "data:image/png;base64,iVBORw==",
+    });
+  });
+
+  it("publishes a Tan post without an image field when none is attached", async () => {
+    nextJson = { ok: true, post: {} };
+    await publishTanPost("text only");
+    expect(bodyOf(0)).toEqual({ text: "text only" });
+  });
+
+  it("saves a Tan draft with reply and expiry", async () => {
+    nextJson = { ok: true, draft: { id: 1 } };
+    const draft = await saveTanDraft("half-written", {
+      replyTo: "h1".padEnd(64, "0"),
+      expiresIn: 3600,
+    });
+    expect(captured[0].url).toBe("/api/tan/drafts");
+    expect(bodyOf(0)).toEqual({
+      text: "half-written",
+      reply_to: "h1".padEnd(64, "0"),
+      expires_in: 3600,
+    });
+    expect(draft).toEqual({ id: 1 });
+  });
+
+  it("saves a plain Tan draft without optional fields", async () => {
+    nextJson = { ok: true, draft: { id: 2 } };
+    await saveTanDraft("plain draft");
+    expect(bodyOf(0)).toEqual({ text: "plain draft" });
+  });
+
+  it("discards a Tan draft by id", async () => {
+    nextJson = { ok: true, draft: { id: 3 } };
+    await deleteTanDraft(3);
+    expect(captured[0].url).toBe("/api/tan/drafts/delete");
+    expect(bodyOf(0)).toEqual({ id: 3 });
+  });
+
+  it("reads a picked file as a base64 data URL", async () => {
+    const file = new File(["hello"], "pic.png", { type: "image/png" });
+    await expect(readFileAsDataUrl(file)).resolves.toBe(
+      "data:image/png;base64,aGVsbG8=",
+    );
+  });
+
+  it("lists broadcast lists from /api/broadcasts", async () => {
+    nextJson = { broadcasts: [], count: 0 };
+    const lists = await getBroadcasts();
+    expect(captured[0].url).toBe("/api/broadcasts");
+    expect(lists).toEqual([]);
+  });
+
+  it("creates a broadcast list with name and member hashes", async () => {
+    nextJson = { ok: true, broadcast: { name: "team", members: [], created_at: 1 } };
+    await createBroadcast("team", ["a".repeat(32)]);
+    expect(captured[0].url).toBe("/api/broadcasts");
+    expect(bodyOf(0)).toEqual({ name: "team", members: ["a".repeat(32)] });
+  });
+
+  it("deletes a broadcast list by name", async () => {
+    nextJson = { ok: true, name: "team" };
+    await deleteBroadcast("team");
+    expect(captured[0].url).toBe("/api/broadcasts/delete");
+    expect(bodyOf(0)).toEqual({ broadcast: "team" });
+  });
+
+  it("sends a broadcast with list name and text", async () => {
+    nextJson = { ok: true, name: "team", results: [], delivered: 0, queued: 0, failed: 0 };
+    await sendBroadcast("team", "meet at noon");
+    expect(captured[0].url).toBe("/api/broadcasts/send");
+    expect(bodyOf(0)).toEqual({ broadcast: "team", text: "meet at noon" });
+  });
+
+  it("sets a channel topic with channel and topic in the body", async () => {
+    nextJson = { ok: true, channel: "general", topic: {}, cleared: false };
+    await setChannelTopic("general", "monthly mesh meetup");
+    expect(captured[0].url).toBe("/api/channels/topic");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ channel: "general", topic: "monthly mesh meetup" });
+  });
+
+  it("pins and unpins a channel message by hash", async () => {
+    nextJson = { ok: true };
+    await pinChannelMessage("general", "a".repeat(64));
+    expect(captured[0].url).toBe("/api/channels/pin");
+    expect(bodyOf(0)).toEqual({ channel: "general", hash: "a".repeat(64) });
+    await unpinChannelMessage("general", "a".repeat(64));
+    expect(captured[1].url).toBe("/api/channels/unpin");
+    expect(bodyOf(1)).toEqual({ channel: "general", hash: "a".repeat(64) });
   });
 
   it("sets the away message with only the changed fields", async () => {

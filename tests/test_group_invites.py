@@ -1,6 +1,7 @@
 """Group invite links + request-to-join (issue #466)."""
 
 import base64
+import time
 import types
 
 import pytest
@@ -326,6 +327,38 @@ def test_closed_group_join_queues_request(tmp_path, monkeypatch):
     # Approving twice fails: there is no pending request any more.
     with pytest.raises(ValueError, match="no pending join request"):
         node.approve_join_request(group["name"], carol.hexhash)
+
+
+def test_approve_join_request_refuses_banned_peer(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    _, carol = _peer_identity(JOINER)
+    group = _group(node, own_hash, bob)
+    # Carol is banned before she ever asks: the ban bars the approve
+    # path, so an invite link cannot bring her back in.
+    node.groups.ban(group["id"], carol.hexhash, created_by=own_hash)
+    record_join_request(
+        node.config.join_requests_path,
+        group["name"],
+        carol.hexhash,
+        now=time.time(),
+    )
+    with pytest.raises(ValueError, match="is banned"):
+        node.approve_join_request(group["name"], carol.hexhash)
+    # The request is still pending — the creator can deny it, or
+    # unban Carol and approve her afterwards.
+    assert len(node.list_join_requests(group["name"])) == 1
+    welcomes = []
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda group_arg, text, **kwargs: welcomes.append((group_arg, text)),
+    )
+    node.groups.unban(group["id"], carol.hexhash, created_by=own_hash)
+    outcome = node.approve_join_request(group["name"], carol.hexhash)
+    assert outcome["status"] == "added"
+    assert carol.hexhash in outcome["group"]["members"]
+    assert len(welcomes) == 1
 
 
 def test_deny_join_request(tmp_path, monkeypatch):
