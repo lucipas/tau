@@ -33,6 +33,10 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/groups/join-requests pending join requests for groups this node created
     POST /api/groups/approve-join approve ``{"group": "<name>", "peer": "<hash>"}``
     POST /api/groups/deny-join deny ``{"group": "<name>", "peer": "<hash>"}``
+    GET  /api/groups/invite the stored invite state for a group this node created (mode, generation, last minted link)
+    POST /api/groups/invite mint an invite link ``{"group": "...", "mode": "open"|"closed"}`` (mode optional; defaults to the stored mode, or "open")
+    POST /api/groups/invite/revoke invalidate every invite minted for a group ``{"group": "..."}``
+    POST /api/groups/join join a group with an invite link ``{"link": "tau://invite/..."}``
     POST /api/groups/vote vote on a group poll ``{"group": "...", "poll": "<wire id>", "option": <1-based number or exact text>}``
     POST /api/groups/close-poll close a group poll you created ``{"group": "...", "poll": "<wire id>"}``
     POST /api/dm/vote vote on a DM poll ``{"to": "...", "poll": "<wire id>", "option": <1-based number or exact text>}``
@@ -297,7 +301,15 @@ from .channel_polls import (
     poll_identity as channel_poll_identity,
     resolve_channel_poll,
 )
-from .group_invites import list_join_requests
+from .group_invites import (
+    JOIN_REQUEST_KIND,
+    InviteError,
+    invite_status,
+    list_join_requests,
+    mint_invite,
+    parse_invite_link,
+    revoke_invites,
+)
 from .groups import GroupStore, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
@@ -4842,6 +4854,181 @@ class WebBridge:
         pending request.
         """
         return self.node.deny_join_request(group, peer)
+
+    def _resolve_invite_group(self, group: str) -> Tuple[Dict[str, Any], str]:
+        """Find a group and check this node created it.
+
+        Returns the group record and this node's destination hash.
+        Raises ``ValueError`` for an unknown group or a non-creator
+        caller — the same rule the CLI enforces for minting invites.
+        """
+        if not isinstance(group, str) or not group.strip():
+            raise ValueError("field 'group' is required")
+        found = self.node.groups.find(group.strip())
+        own_hash = self.node.destination_hexhash
+        if not found.get("local") or found.get("creator") != own_hash:
+            raise ValueError(
+                "only the creator can manage invite links for a group"
+            )
+        return found, own_hash
+
+    def group_invite_status(self, group: str) -> Dict[str, Any]:
+        """The invite state for a group this node created.
+
+        Returns the described group plus the stored mode, the
+        generation, and the last minted link (``None`` when nothing
+        was minted yet).  Creator-only: the link is a shareable
+        secret the creator hands out.  Raises ``ValueError`` for an
+        unknown group or a non-creator caller.
+        """
+        found, _own_hash = self._resolve_invite_group(group)
+        status = invite_status(
+            self.node.config.invites_path, group_name=found["name"]
+        )
+        return {
+            "group": self._describe_group(found),
+            "mode": status["mode"] if status is not None else "open",
+            "generation": status["generation"] if status is not None else 0,
+            "link": status["link"] if status is not None else None,
+        }
+
+    def mint_group_invite(
+        self, group: str, mode: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Mint (or re-mint) an invite link for a group this node created.
+
+        Mirrors ``tau group invite``: *mode* is ``"open"`` or
+        ``"closed"`` and defaults to the stored mode, or ``"open"``
+        when nothing was minted yet.  Minting never invalidates
+        older tokens; only :meth:`revoke_group_invites` does.
+        Raises ``ValueError`` for an unknown group, a non-creator
+        caller, a bad mode, or a missing local identity.
+        """
+        from .identity import destination_hash, load_identity
+
+        found, own_hash = self._resolve_invite_group(group)
+        config = self.node.config
+        if mode is not None and (not isinstance(mode, str) or not mode.strip()):
+            raise ValueError("field 'mode' must be 'open' or 'closed'")
+        identity = load_identity(config.identity_path)
+        if identity is None:
+            raise ValueError(
+                f"no identity at {config.identity_path}; run `tau init` first"
+            )
+        if destination_hash(identity).hex() != own_hash:
+            raise ValueError("local identity does not match this node")
+        stored = invite_status(config.invites_path, group_name=found["name"])
+        try:
+            link = mint_invite(
+                config.invites_path,
+                identity,
+                group_name=found["name"],
+                creator_hash=own_hash,
+                mode=(
+                    mode.strip()
+                    if mode is not None
+                    else (stored["mode"] if stored is not None else "open")
+                ),
+            )
+        except InviteError as exc:
+            raise ValueError(str(exc)) from exc
+        status = invite_status(config.invites_path, group_name=found["name"])
+        return {
+            "group": self._describe_group(found),
+            "link": link,
+            "mode": status["mode"] if status is not None else "open",
+            "generation": status["generation"] if status is not None else 0,
+        }
+
+    def revoke_group_invites(self, group: str) -> Dict[str, Any]:
+        """Invalidate every invite minted for a group this node created.
+
+        Mirrors ``tau group invite --revoke``: bumps the stored
+        generation, so every token minted so far stops verifying,
+        and drops the stored link.  Raises ``ValueError`` for an
+        unknown group or a non-creator caller.
+        """
+        found, _own_hash = self._resolve_invite_group(group)
+        generation = revoke_invites(
+            self.node.config.invites_path, group_name=found["name"]
+        )
+        return {"group": self._describe_group(found), "generation": generation}
+
+    def join_group_via_link(
+        self, link: str, *, timeout: float = 20.0
+    ) -> Dict[str, Any]:
+        """Join a group with an invite link, from the console.
+
+        Mirrors ``tau group join``: the link is sent as a
+        ``group-join-request`` DM to the creator named in the token.
+        An open group adds this node at once (the roster is pinned
+        locally from the reply), a closed group leaves the request
+        pending, and an unreachable creator leaves the request queued
+        for the store-and-forward path to decide when it arrives.
+        Returns ``{"status": ..., "group": ...}`` where status is
+        ``added``, ``already_member``, ``pending`` or ``queued``.
+        Raises ``ValueError`` for a malformed link, a failed request,
+        or an unexpected reply; send failures surface as
+        ``NodeError``/``MailboxError`` for the route handler.
+        """
+        if not isinstance(link, str) or not link.strip():
+            raise ValueError("field 'link' is required")
+        try:
+            token = parse_invite_link(link.strip())
+        except InviteError as exc:
+            raise ValueError(str(exc)) from exc
+        mailbox = getattr(self.node, "mailbox", None)
+        queued_before = (
+            {entry.id for entry in mailbox.outbox_list()}
+            if mailbox is not None
+            else set()
+        )
+        response = self.node.send_message(
+            token["creator"],
+            link.strip(),
+            timeout=timeout,
+            kind=JOIN_REQUEST_KIND,
+        )
+        if not isinstance(response, dict):
+            raise ValueError(f"unexpected join reply: {response!r}")
+        # A "queued" claim only counts with a fresh local outbox id —
+        # the same guard ``tau send`` applies, so a peer cannot fake
+        # a queued delivery with an arbitrary id.
+        if response.get("queued") and (
+            isinstance(response.get("id"), str)
+            and response["id"] not in queued_before
+        ):
+            return {"status": "queued", "group": token["group"]}
+        if not response.get("ok"):
+            error = response.get("error") or {}
+            message = (
+                error.get("message")
+                if isinstance(error, dict) and error.get("message")
+                else "join request failed"
+            )
+            raise ValueError(f"join request failed: {message}")
+        status = response.get("status")
+        group = (
+            response.get("group")
+            if isinstance(response.get("group"), dict)
+            else {}
+        )
+        if status in ("added", "already_member") and group.get("id"):
+            pinned = self.node.groups.record(
+                group["id"],
+                group.get("name", ""),
+                list(group.get("members", [])),
+                creator=group.get("creator", ""),
+                sender=group.get("creator", ""),
+                sent_at=time.time(),
+            )
+            described = (
+                self._describe_group(pinned) if pinned is not None else group
+            )
+            return {"status": status, "group": described}
+        if status == "pending" and group.get("id"):
+            return {"status": "pending", "group": group}
+        raise ValueError(f"unexpected join reply: {response!r}")
 
     def accept_dm_request(self, ref: str) -> Dict[str, Any]:
         """Accept one held DM request: allow-list the sender, deliver the message.
@@ -10889,6 +11076,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                     {"requests": requests, "count": len(requests)}, head_only
                 )
                 return
+            if path == "/api/groups/invite":
+                target = query.get("group")
+                if not target or not target[0].strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    status = self.bridge.group_invite_status(target[0].strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(status, head_only)
+                return
             if path == "/api/messages":
                 pinned_only = query.get("pinned") == ["1"]
                 # A pinned view spans the whole console log, not just
@@ -12148,6 +12354,68 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **decided}, head_only)
+                return
+            if path == "/api/groups/invite":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    minted = self.bridge.mint_group_invite(
+                        target.strip(), body.get("mode")
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **minted}, head_only)
+                return
+            if path == "/api/groups/invite/revoke":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    revoked = self.bridge.revoke_group_invites(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **revoked}, head_only)
+                return
+            if path == "/api/groups/join":
+                link = body.get("link")
+                if not isinstance(link, str) or not link.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'link' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    joined = self.bridge.join_group_via_link(link.strip())
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                except MailboxError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **joined}, head_only)
                 return
             if path == "/api/groups/rename":
                 target = body.get("group")

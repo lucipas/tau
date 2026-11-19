@@ -18,10 +18,13 @@ import {
   getChannelPins,
   getChannelScheduled,
   getChannelTopic,
+  getGroupInviteStatus,
   getMessages,
   getTanThread,
   getTanTimeline,
+  joinGroupViaLink,
   markRead,
+  mintGroupInvite,
   pageFileUrl,
   publishTanPost,
   pinChannelMessage,
@@ -29,6 +32,7 @@ import {
   reactToChannelMessage,
   reactToMessage,
   readFileAsDataUrl,
+  revokeGroupInvites,
   closeDmPoll,
   sendBroadcast,
   scheduleChannelMessage,
@@ -413,5 +417,41 @@ describe("URL helpers", () => {
     expect(eventsUrl()).toBe("/api/events");
     expect(eventsUrl(42)).toBe("/api/events?since=42");
     expect(wsUrl()).toBe("ws://example.com/ws");
+  });
+});
+
+describe("group invite links", () => {
+  it("fetches the invite status by group", async () => {
+    nextJson = { group: {}, mode: "open", generation: 0, link: null };
+    await getGroupInviteStatus("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite?group=abc123");
+    expect(captured[0].init?.method).toBeUndefined();
+  });
+
+  it("mints a link without a mode, or with one", async () => {
+    nextJson = { ok: true, link: "tau://invite/abc", mode: "open", generation: 0 };
+    await mintGroupInvite("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ group: "abc123" });
+
+    await mintGroupInvite("abc123", "closed");
+    expect(bodyOf(1)).toEqual({ group: "abc123", mode: "closed" });
+  });
+
+  it("revokes invites for a group", async () => {
+    nextJson = { ok: true, generation: 1 };
+    await revokeGroupInvites("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite/revoke");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ group: "abc123" });
+  });
+
+  it("joins a group from a pasted link", async () => {
+    nextJson = { ok: true, status: "pending", group: { id: "abc123" } };
+    await joinGroupViaLink("tau://invite/abc");
+    expect(captured[0].url).toBe("/api/groups/join");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ link: "tau://invite/abc" });
   });
 });

@@ -172,6 +172,7 @@ class FakeNode:
             social_db_path=data_dir / "social.db",
             tan_rules_path=data_dir / "tan-rules.json",
             dm_requests_path=data_dir / "dm-requests.json",
+            invites_path=data_dir / "invites.json",
             join_requests_path=data_dir / "join-requests.json",
             allowlist_path=data_dir / "allowlist.json",
             blocklist_path=data_dir / "blocklist.json",
@@ -14676,6 +14677,232 @@ def test_deny_join_request_endpoint_refuses_peer(bridge, node):
     _, _, listed = _json(bridge, "/api/groups/join-requests")
     assert listed == {"requests": [], "count": 0}
     assert node.group_sent == []
+
+
+def _seed_own_identity(node):
+    """Make the fixture node's disk identity its real identity.
+
+    The bridge mints with the identity loaded from disk, and the
+    token's creator must be this node's destination hash — so the
+    fixture's hash follows the identity, and groups it creates are
+    created by that hash.
+    """
+    from tau.identity import destination_hash, save_identity
+
+    save_identity(node.identity, node.config.identity_path)
+    node.destination_hexhash = destination_hash(node.identity).hex()
+    return node.destination_hexhash
+
+
+def _own_group(node, name="team"):
+    own_hash = _seed_own_identity(node)
+    node.groups.create(name, [PEER_HASH, own_hash], created_by=own_hash)
+    return own_hash
+
+
+def test_group_invite_status_endpoint_reports_no_link_before_mint(bridge, node):
+    _own_group(node)
+    status, _, payload = _json(bridge, "/api/groups/invite?group=team")
+    assert status == 200
+    assert payload["group"]["name"] == "team"
+    assert payload["mode"] == "open"
+    assert payload["generation"] == 0
+    assert payload["link"] is None
+    # A group this node did not create is not its link to manage.
+    status, _, payload = _json(bridge, "/api/groups/invite?group=crew")
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/groups/invite?group=nope")
+    assert status == 400
+    assert "unknown group" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/groups/invite")
+    assert status == 400
+    assert "field 'group'" in payload["error"]["message"]
+
+
+def test_group_invite_endpoint_mints_a_verifiable_link(bridge, node):
+    from tau.group_invites import (
+        load_invites,
+        parse_invite_link,
+        verify_invite_link,
+    )
+
+    own_hash = _own_group(node)
+    status, _, payload = _json(
+        bridge, "/api/groups/invite", method="POST", body={"group": "team"}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["mode"] == "open"
+    assert payload["generation"] == 0
+    link = payload["link"]
+    assert link.startswith("tau://invite/")
+    token = parse_invite_link(link)
+    assert token["creator"] == own_hash
+    assert token["group"] == "team"
+    assert (
+        verify_invite_link(
+            link,
+            identity=node.identity,
+            invites=load_invites(node.config.invites_path),
+        )["mode"]
+        == "open"
+    )
+    # Minting again with a mode switches the stored mode without
+    # bumping the generation.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/invite",
+        method="POST",
+        body={"group": "team", "mode": "closed"},
+    )
+    assert status == 200
+    assert payload["mode"] == "closed"
+    assert payload["generation"] == 0
+    assert (
+        verify_invite_link(
+            payload["link"],
+            identity=node.identity,
+            invites=load_invites(node.config.invites_path),
+        )["mode"]
+        == "closed"
+    )
+    # The status endpoint now shows the current link.
+    _, _, listed = _json(bridge, "/api/groups/invite?group=team")
+    assert listed["link"] == payload["link"]
+    assert listed["mode"] == "closed"
+    # Bad mode and non-creator groups are refused.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/invite",
+        method="POST",
+        body={"group": "team", "mode": "wide-open"},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/invite",
+        method="POST",
+        body={"group": "crew"},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/groups/invite", method="POST", body={})
+    assert status == 400
+    assert "field 'group'" in payload["error"]["message"]
+
+
+def test_group_invite_revoke_endpoint_drops_link(bridge, node):
+    from tau.group_invites import InviteError, load_invites, verify_invite_link
+
+    _own_group(node)
+    _, _, minted = _json(
+        bridge, "/api/groups/invite", method="POST", body={"group": "team"}
+    )
+    link = minted["link"]
+    status, _, payload = _json(
+        bridge, "/api/groups/invite/revoke", method="POST", body={"group": "team"}
+    )
+    assert status == 200
+    assert payload["generation"] == 1
+    _, _, listed = _json(bridge, "/api/groups/invite?group=team")
+    assert listed["link"] is None
+    assert listed["generation"] == 1
+    with pytest.raises(InviteError):
+        verify_invite_link(
+            link,
+            identity=node.identity,
+            invites=load_invites(node.config.invites_path),
+        )
+    status, _, payload = _json(
+        bridge, "/api/groups/invite/revoke", method="POST", body={"group": "crew"}
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+
+
+def test_group_join_endpoint_joins_from_link(bridge, node, monkeypatch, tmp_path):
+    from tau.group_invites import mint_invite
+    from tau.identity import destination_hash
+    from tau.protocol import derive_group_id
+
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    own_hash = _seed_own_identity(node)
+    link = mint_invite(
+        tmp_path / "invites.json",
+        creator,
+        group_name="remote-crew",
+        creator_hash=creator_hash,
+        mode="open",
+    )
+    members = [creator_hash, own_hash]
+    group_id = derive_group_id(creator_hash, "remote-crew", members)
+    reply_group = {
+        "id": group_id,
+        "name": "remote-crew",
+        "members": members,
+        "creator": creator_hash,
+    }
+    sent = {}
+    replies = {
+        "reply": {"ok": True, "status": "added", "group": dict(reply_group)}
+    }
+
+    def fake_send(target, text, **kwargs):
+        sent["target"] = target
+        sent["text"] = text
+        sent["kind"] = kwargs.get("kind")
+        return dict(replies["reply"])
+
+    monkeypatch.setattr(node, "send_message", fake_send)
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 200
+    assert payload["status"] == "added"
+    assert payload["group"]["id"] == group_id
+    assert own_hash in [member["hash"] for member in payload["group"]["members"]]
+    # The link went to the creator as a join request, and the roster
+    # from the reply is pinned locally.
+    assert sent["target"] == creator_hash
+    assert sent["text"] == link
+    assert sent["kind"] == "group-join-request"
+    assert node.groups.get(group_id) is not None
+    # A closed group's reply leaves the request pending.
+    replies["reply"] = {"ok": True, "status": "pending", "group": dict(reply_group)}
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 200
+    assert payload["status"] == "pending"
+    assert payload["group"]["id"] == group_id
+    # An unreachable creator queues the request.
+    replies["reply"] = {"queued": True, "id": "mail-new-1"}
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 200
+    assert payload["status"] == "queued"
+    assert payload["group"] == "remote-crew"
+    # An error reply and malformed links are refused.
+    replies["reply"] = {
+        "ok": False,
+        "error": {"message": "invite link is not valid"},
+    }
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 400
+    assert "join request failed" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": "garbage"}
+    )
+    assert status == 400
+    assert "not an invite link" in payload["error"]["message"]
+    status, _, payload = _json(bridge, "/api/groups/join", method="POST", body={})
+    assert status == 400
+    assert "field 'link'" in payload["error"]["message"]
 
 
 def test_join_request_endpoints_validate_fields(bridge, node):

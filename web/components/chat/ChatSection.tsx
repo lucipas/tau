@@ -16,6 +16,7 @@ import {
   forwardMessage,
   getArchivedConversations,
   getMutedConversations,
+  joinGroupViaLink,
   pinMessage,
   reactToMessage,
   retractMessage,
@@ -101,6 +102,10 @@ export default function ChatSection() {
   const [searchActive, setSearchActive] = useState(false);
   const [searchReset, setSearchReset] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [showJoin, setShowJoin] = useState(false);
+  const [joinLink, setJoinLink] = useState("");
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [joinResult, setJoinResult] = useState<string | null>(null);
 
   const { conversations, archived: archivedConvs, dmRequests, refreshRequests } = useConversations(
     tau,
@@ -170,6 +175,43 @@ export default function ChatSection() {
     },
     [navigate],
   );
+
+  async function handleJoinGroup() {
+    const link = joinLink.trim();
+    if (!link || joinBusy) return;
+    setJoinBusy(true);
+    setError(null);
+    setJoinResult(null);
+    try {
+      const result = await joinGroupViaLink(link);
+      await tau.refresh();
+      if (
+        (result.status === "added" || result.status === "already_member") &&
+        typeof result.group === "object" &&
+        result.group.id
+      ) {
+        setJoinLink("");
+        setShowJoin(false);
+        navigate("chat", { group: result.group.id });
+      } else if (result.status === "pending") {
+        const name =
+          typeof result.group === "object" ? result.group.name : result.group;
+        setJoinResult(
+          `Join request pending — the creator of “${name}” has to approve it first.`,
+        );
+      } else {
+        const name =
+          typeof result.group === "object" ? result.group.name : result.group;
+        setJoinResult(
+          `Join request for “${name}” queued — it will be decided when it reaches the creator.`,
+        );
+      }
+    } catch (err) {
+      setError(`Join failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setJoinBusy(false);
+    }
+  }
 
   const handleBack = useCallback(() => navigate("chat"), [navigate]);
 
@@ -330,6 +372,17 @@ export default function ChatSection() {
           <div className="flex gap-2">
             <button
               type="button"
+              aria-expanded={showJoin}
+              onClick={() => {
+                setShowJoin((v) => !v);
+                setJoinResult(null);
+              }}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
+            >
+              Join a group
+            </button>
+            <button
+              type="button"
               aria-expanded={showBroadcasts}
               onClick={() => setShowBroadcasts((v) => !v)}
               className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
@@ -349,6 +402,34 @@ export default function ChatSection() {
             </button>
           </div>
         </header>
+        {showJoin && (
+          <div className="border-b border-zinc-800 px-3 py-2">
+            <label className="text-xs font-semibold text-zinc-400" htmlFor="join-group-link">
+              Paste an invite link to join a group
+            </label>
+            <div className="mt-1 flex gap-2">
+              <input
+                id="join-group-link"
+                value={joinLink}
+                onChange={(e) => setJoinLink(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void handleJoinGroup();
+                }}
+                placeholder="tau://invite/…"
+                className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 font-mono text-xs text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500"
+              />
+              <button
+                type="button"
+                disabled={joinBusy || !joinLink.trim()}
+                onClick={() => void handleJoinGroup()}
+                className="shrink-0 rounded-full bg-cyan-500 px-3 py-1.5 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+              >
+                Join
+              </button>
+            </div>
+            {joinResult && <p className="mt-1 text-xs text-zinc-400">{joinResult}</p>}
+          </div>
+        )}
         {showBroadcasts && (
           <BroadcastsPanel
             broadcasts={broadcasts.broadcasts}
