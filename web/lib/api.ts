@@ -20,6 +20,7 @@ import type {
   BlockResult,
   Channel,
   ChannelMessage,
+  ChannelTopic,
   ChatMessage,
   DoctorReport,
   DmRequest,
@@ -1078,6 +1079,21 @@ export async function unpinChannelMessage(channel: string, hash: string): Promis
 /** Pull missing history for one channel, or every joined channel when omitted. */
 export async function syncChannels(channel?: string, limit = 20): Promise<unknown> {
   return post("/api/channels/sync", channel ? { channel, limit } : { limit });
+}
+
+export async function getChannelTopic(channel: string): Promise<ChannelTopic | null> {
+  const data = await get<{ channel: string; topic: ChannelTopic | null }>(
+    `/api/channels/topic${query({ channel })}`,
+  );
+  return data.topic;
+}
+
+/** Set a channel topic; an empty topic clears it. */
+export async function setChannelTopic(
+  channel: string,
+  topic: string,
+): Promise<{ ok: boolean; channel: string; topic: ChannelTopic; cleared: boolean }> {
+  return post("/api/channels/topic", { channel, topic });
 }
 
 // ----------------------------------------------------------------- pages --

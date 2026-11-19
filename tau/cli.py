@@ -3964,6 +3964,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_read.set_defaults(func=cmd_channel_read)
 
+    channel_topic = channel_sub.add_parser(
+        "topic",
+        parents=[common],
+        help="show or set a channel's topic (any member may set it; newest wins)",
+    )
+    channel_topic.add_argument("channel", metavar="NAME", help="channel to show or set the topic of")
+    channel_topic.add_argument(
+        "text", nargs="?", help="topic text (omit to show the current topic)"
+    )
+    channel_topic.add_argument("--file", type=Path, help="read the topic text from a file")
+    channel_topic.add_argument(
+        "--clear", action="store_true", help="clear the channel topic"
+    )
+    channel_topic.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_topic.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_topic.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_topic.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_topic.set_defaults(func=cmd_channel_topic)
+
     channel_pin = channel_sub.add_parser(
         "pin",
         parents=[common],
@@ -5299,6 +5328,32 @@ def _publish_local_channel_message(
     return {"message": message, "published": published}
 
 
+def _publish_local_channel_topic(
+    node: TauNode,
+    *,
+    channel: str,
+    topic: Optional[str] = None,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    if topic is None:
+        raise ChannelError("nothing to publish")
+    return publisher.set_topic(
+        channel,
+        topic,
+        publish=True,
+        targets=targets,
+        ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)),
+    )
+
+
 def _publish_local_channel_reaction(
     node: TauNode,
     *,
@@ -5401,6 +5456,7 @@ def _publish_local_post(
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
+    topic: Optional[str] = None,
     reaction_target: Optional[str] = None,
     reaction: Optional[str] = None,
     channel_edit: Optional[Dict[str, Any]] = None,
@@ -5432,6 +5488,17 @@ def _publish_local_post(
             timeout=timeout,
         )
     if channel is not None:
+        if topic is not None:
+            # A channel topic rides the same local publish socket as
+            # a channel message; route it before the Tan handling.
+            return _publish_local_channel_topic(
+                node,
+                channel=channel,
+                topic=topic,
+                to=to,
+                ttl=ttl,
+                timeout=timeout,
+            )
         if reaction_target is not None:
             # A channel reaction rides the same local publish socket
             # as a Tan post; route it before the Tan-only handling.
@@ -8641,6 +8708,119 @@ def cmd_channel_sync(args: argparse.Namespace) -> int:
             print(line)
             for error in summary["errors"]:
                 print(f"  {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_topic(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "clear", False) and getattr(args, "text", None) is not None:
+        print("error: --clear cannot be combined with topic text", file=sys.stderr)
+        return 2
+
+    # Show mode: no text, no --file, no --clear.  Setting from stdin
+    # is deliberately not offered: an empty topic clears, so a bare
+    # `tau channel topic NAME` with stdin closed must never be read
+    # as a clear.
+    show = (
+        getattr(args, "text", None) is None
+        and not getattr(args, "file", None)
+        and not getattr(args, "clear", False)
+    )
+    if show:
+        try:
+            app = ChannelApp(config, _tan_identity(config), name=config.name)
+            record = app.topic(name)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if json_output:
+            _emit({"channel": name, "topic": record}, True)
+        elif record is None:
+            print(f"#{name} has no topic set")
+        else:
+            print(f"#{name}: {record['topic']}")
+        return _EXIT_OK
+
+    try:
+        topic = "" if getattr(args, "clear", False) else _read_message(args)
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not getattr(args, "clear", False) and not topic.strip():
+        print(
+            "error: topic text must not be empty "
+            "(use --clear to remove the topic)",
+            file=sys.stderr,
+        )
+        return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            result = app.set_topic(name, topic)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel=name,
+                topic=topic,
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            published = result["published"]
+        else:
+            try:
+                result = _publish_local_channel_topic(
+                    node,
+                    channel=name,
+                    topic=topic,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                published = result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit(
+            {
+                "channel": name,
+                "topic": result["topic"],
+                "cleared": result["cleared"],
+                "published": published,
+            },
+            True,
+        )
+    else:
+        if result["cleared"]:
+            print(f"cleared the topic of #{name}")
+        else:
+            print(f"topic of #{name}: {result['topic']['topic']}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
     return _EXIT_OK
 
 
