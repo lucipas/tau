@@ -5492,6 +5492,72 @@ def test_channel_unread_counts_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_send_with_expiry_via_api(tmp_path):
+    from tau.channels import ChannelApp, join_channel
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    # Attach a real channel app so sends work; its node points at the
+    # fake so gossip has nowhere to go (delivered 0, no raise).
+    app = ChannelApp(node.config, node.identity, name="tester", gossip=False)
+    app.node = node
+    node.channel_app = app
+    app.join("general")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "ephemeral", "expires_in": 3600},
+        )
+        assert status == 200
+        expires_at = payload["message"]["expires_at"]
+        assert expires_at - time.time() == pytest.approx(3600, abs=5)
+
+        # The stored message carries the expiry into history.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert payload["messages"][0]["expires_at"] == expires_at
+
+        # A bad expires_in is a 400 before the bridge is touched.
+        for bad in (0, -5, "1h", True, 31 * 24 * 3600):
+            status, _, payload = _json(
+                bridge,
+                "/api/channels/send",
+                method="POST",
+                body={"channel": "general", "text": "nope", "expires_in": bad},
+            )
+            assert status == 400, bad
+            assert "error" in payload
+
+        # Without expires_in, a channel default fills the expiry in.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"channel": "general", "seconds": 300},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={"channel": "general", "text": "defaulted"},
+        )
+        assert status == 200
+        assert payload["message"]["expires_at"] - time.time() == pytest.approx(
+            300, abs=5
+        )
+    finally:
+        bridge.stop()
+
+
 def test_pages_via_api(tmp_path):
     from types import SimpleNamespace
 
@@ -6279,7 +6345,7 @@ def test_disappearing_defaults_endpoints(node, tmp_path):
     try:
         status, _, payload = _json(bridge, "/api/messages/disappearing")
         assert status == 200
-        assert payload == {"peers": {}, "groups": {}}
+        assert payload == {"peers": {}, "groups": {}, "channels": {}}
 
         status, _, payload = _json(
             bridge,
@@ -6291,11 +6357,40 @@ def test_disappearing_defaults_endpoints(node, tmp_path):
         assert payload["disappearing"] == {
             "target": PEER_HASH,
             "group": False,
+            "channel": False,
             "disappearing_seconds": 3600,
             "changed": True,
         }
         status, _, payload = _json(bridge, "/api/messages/disappearing")
-        assert payload == {"peers": {PEER_HASH: 3600.0}, "groups": {}}
+        assert payload == {"peers": {PEER_HASH: 3600.0}, "groups": {}, "channels": {}}
+
+        # A channel default is keyed by channel name, no lookup needed.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"channel": "general", "seconds": 600},
+        )
+        assert status == 200
+        assert payload["disappearing"]["channel"] is True
+        assert payload["disappearing"]["group"] is False
+        assert payload["disappearing"]["target"] == "general"
+        assert payload["disappearing"]["disappearing_seconds"] == 600
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert payload["channels"] == {"general": 600.0}
+
+        # Clearing a channel default removes the entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/disappearing",
+            method="POST",
+            body={"channel": "general", "seconds": None},
+        )
+        assert status == 200
+        assert payload["disappearing"]["disappearing_seconds"] is None
+        assert payload["disappearing"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/messages/disappearing")
+        assert payload["channels"] == {}
 
         # A group default is keyed by group id, resolved by name.
         status, _, payload = _json(
@@ -6340,6 +6435,8 @@ def test_disappearing_defaults_endpoint_rejects_bad_input(node, tmp_path):
         for body in (
             {},
             {"peer": "alice", "group": "crew", "seconds": 60},
+            {"peer": "alice", "channel": "general", "seconds": 60},
+            {"group": "crew", "channel": "general", "seconds": 60},
             {"peer": "alice", "seconds": 0},
             {"peer": "alice", "seconds": -5},
             {"peer": "alice", "seconds": 31 * 24 * 3600},
@@ -6348,6 +6445,8 @@ def test_disappearing_defaults_endpoint_rejects_bad_input(node, tmp_path):
             {"peer": "nobody", "seconds": 60},
             {"peer": "  ", "seconds": 60},
             {"group": "nobody", "seconds": 60},
+            {"channel": "bad name!", "seconds": 60},
+            {"channel": "general", "seconds": 8 * 24 * 3600},
         ):
             status, _, payload = _json(
                 bridge, "/api/messages/disappearing", method="POST", body=body
@@ -6389,7 +6488,7 @@ def test_disappearing_defaults_without_data_dir(bridge):
     assert status == 503
     status, _, payload = _json(bridge, "/api/messages/disappearing")
     assert status == 200
-    assert payload == {"peers": {}, "groups": {}}
+    assert payload == {"peers": {}, "groups": {}, "channels": {}}
 
 
 def test_muted_conversations_endpoints(node, tmp_path):

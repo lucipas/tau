@@ -361,6 +361,7 @@ export interface DmRequest {
 export interface DisappearingDefaults {
   peers: Record<string, number>;
   groups: Record<string, number>;
+  channels: Record<string, number>;
 }
 
 export interface MutedConversations {
@@ -650,6 +651,8 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Unix timestamp after which honest nodes purge this message, when set. */
+  expires_at?: number;
   /** Channel poll question carried on the message itself. */
   poll_options?: string[];
   poll_vote?: { target: { author: string; sent_at: number }; option: number };

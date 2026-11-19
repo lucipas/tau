@@ -1840,6 +1840,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="GROUP",
         help="group id, id prefix or name",
     )
+    disappearing_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name",
+    )
     disappearing.add_argument(
         "duration",
         nargs="?",
@@ -3987,6 +3992,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_send.add_argument("--file", type=Path, help="read the message text from a file")
     channel_send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from every member's store "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
+    channel_send.add_argument(
         "--reply-to",
         default=None,
         metavar="HASH|PREFIX",
@@ -5536,6 +5547,7 @@ def _publish_local_channel_message(
     to: Optional[List[str]] = None,
     ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
+    expires_at: Optional[float] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -5549,23 +5561,18 @@ def _publish_local_channel_message(
     if text is None:
         raise ChannelError("nothing to publish")
     name = clean_channel_name(channel)
-    conn = publisher.connect()
-    try:
-        if not is_channel_member(conn, name):
-            raise ChannelError(f"not a member of channel {name!r}; join it first")
-        message = create_channel_message(
-            conn,
-            node.identity,
-            name,
-            text,
-            name=node.name,
-            poll_options=poll_options,
-            poll_vote=poll_vote,
-            poll_close=poll_close,
-            reply_to=reply_to,
-        )
-    finally:
-        conn.close()
+    # Creation goes through app.send so a per-channel disappearing
+    # default fills the expiry in when no explicit one was passed —
+    # the same path the no-publish and console sends take.
+    message = publisher.send(
+        name,
+        text,
+        expires_at=expires_at,
+        poll_options=poll_options,
+        poll_vote=poll_vote,
+        poll_close=poll_close,
+        reply_to=reply_to,
+    )
     published = publisher.publish(
         message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
     )
@@ -5772,6 +5779,7 @@ def _publish_local_post(
             to=to,
             ttl=ttl,
             timeout=timeout,
+            expires_at=expires_at,
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
@@ -8544,6 +8552,17 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    expires_at = None
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        try:
+            expires_at = time.time() + _parse_duration(
+                expire_text, flag="--expire"
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
         if getattr(args, "no_publish", False):
@@ -8599,7 +8618,10 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         app = ChannelApp(config, _tan_identity(config), name=config.name)
         try:
             message = app.send(
-                name, text, reply_to=getattr(args, "reply_to", None)
+                name,
+                text,
+                expires_at=expires_at,
+                reply_to=getattr(args, "reply_to", None),
             )
         except ChannelError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -8620,6 +8642,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
+                expires_at=expires_at,
             )
             message, published = result["message"], result["published"]
         else:
@@ -8639,6 +8662,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
+                    expires_at=expires_at,
                 )
                 message, published = result["message"], result["published"]
             finally:
@@ -8648,6 +8672,11 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         _emit({"message": message, "published": published}, True)
     else:
         print(f"sent to #{name} {short_hash(message['hash'])}")
+        if message.get("expires_at") is not None:
+            print(
+                "  disappears in "
+                f"{_ago(float(message['expires_at']) - time.time())}"
+            )
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -14831,6 +14860,16 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
         key = group["id"]
         label = f"group {group['name']} ({short_hash(key)})"
         is_group = True
+        is_channel = False
+    elif getattr(args, "channel", None) is not None:
+        try:
+            key = clean_channel_name(args.channel)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        label = f"channel #{key}"
+        is_group = False
+        is_channel = True
     else:
         inbox = Inbox(config.inbox_path)
         registry = PeerRegistry(config.peers_path)
@@ -14839,6 +14878,7 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else "unknown"
         label = f"conversation with {name} ({short_hash(key)})"
         is_group = False
+        is_channel = False
     seconds = None
     if args.duration is not None:
         try:
@@ -14864,6 +14904,12 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
                 defaults = defaults.without_group(key)
             elif seconds is not None:
                 defaults = defaults.with_group(key, seconds)
+        elif is_channel:
+            previous = defaults.channel_default(key)
+            if getattr(args, "off", False):
+                defaults = defaults.without_channel(key)
+            elif seconds is not None:
+                defaults = defaults.with_channel(key, seconds)
         else:
             previous = defaults.peer_default(key)
             if getattr(args, "off", False):
@@ -14883,6 +14929,7 @@ def cmd_disappearing(args: argparse.Namespace) -> int:
             {
                 "target": key,
                 "group": is_group,
+                "channel": is_channel,
                 "disappearing_seconds": current,
                 "changed": changed,
             },

@@ -168,7 +168,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/channels/pins  pinned messages for a channel (``?channel=<name>``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
-    POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?}``)
+    POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?}``; ``expires_in`` seconds, at most 30d)
     POST /api/channels/schedule  schedule a channel message for later
     GET  /api/channels/scheduled  queued channel messages, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message
@@ -4073,19 +4073,33 @@ class WebBridge:
         return {"channel": clean_channel_name(channel), "left": left}
 
     def channel_send(
-        self, channel: str, text: str, *, reply_to: Optional[str] = None
+        self,
+        channel: str,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        expires_in: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send *text* to a joined channel, gossiping it to peers.
 
         ``reply_to`` is a parent message's hash or unique hex prefix
         in the same channel.
+
+        *expires_in* is an optional disappearing lifetime in seconds;
+        without one, a per-channel disappearing default fills the
+        expiry in, exactly like the CLI's ``tau channel send``.
         """
         app = self._channel_app()
         if app is None:
             raise WebBridgeError(
                 "public channels are not enabled; run serve --channels"
             )
-        return app.send(channel, text, publish=True, reply_to=reply_to)
+        expires_at = None
+        if expires_in is not None:
+            expires_at = time.time() + float(expires_in)
+        return app.send(
+            channel, text, publish=True, reply_to=reply_to, expires_at=expires_at
+        )
 
     def channel_edit(
         self, channel: str, target: str, text: str
@@ -8418,14 +8432,15 @@ class WebBridge:
     def disappearing_defaults(self) -> Dict[str, Any]:
         """All per-conversation disappearing defaults, for the console load.
 
-        Mirrors the stored file: peer destination hashes and group ids,
-        each mapped to its default lifetime in seconds.  A corrupt file
-        is a 503 — the owner repairs or removes it before the console
-        shows defaults, the same as the archive list.
+        Mirrors the stored file: peer destination hashes, group ids
+        and channel names, each mapped to its default lifetime in
+        seconds.  A corrupt file is a 503 — the owner repairs or
+        removes it before the console shows defaults, the same as
+        the archive list.
         """
         path = self._disappearing_path()
         if path is None:
-            return {"peers": {}, "groups": {}}
+            return {"peers": {}, "groups": {}, "channels": {}}
         try:
             defaults = load_disappearing_defaults(path)
         except DisappearingError as exc:
@@ -8433,39 +8448,57 @@ class WebBridge:
                 "disappearing defaults on disk are unusable; fix or remove them "
                 f"before editing ({exc})"
             ) from exc
-        return {"peers": dict(defaults.peers), "groups": dict(defaults.groups)}
+        return {
+            "peers": dict(defaults.peers),
+            "groups": dict(defaults.groups),
+            "channels": dict(defaults.channels),
+        }
 
     def set_disappearing_default(
         self,
         *,
         peer: Optional[str] = None,
         group: Optional[str] = None,
+        channel: Optional[str] = None,
         seconds: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Set or clear one conversation's disappearing default.
 
-        Exactly one of *peer* (registry name, hash or prefix) or *group*
-        (id, prefix or name) names the conversation; *seconds* is the
-        default lifetime, or ``None`` to clear it.  Mirrors
-        ``tau disappearing``: the list is reloaded inside the lock so
+        Exactly one of *peer* (registry name, hash or prefix), *group*
+        (id, prefix or name) or *channel* (name) names the conversation;
+        *seconds* is the default lifetime, or ``None`` to clear it.
+        Mirrors ``tau disappearing``: the list is reloaded inside the lock so
         two writes racing cannot discard each other's conversation, a
         bad duration is a :class:`ValueError`, and a corrupt file is a
         503.  The node picks the default up on the next send — every
         read reloads the file, so there is no cached copy to refresh.
         """
-        if (peer is None) == (group is None):
-            raise ValueError("exactly one of 'peer' or 'group' is required")
+        provided = [value for value in (peer, group, channel) if value is not None]
+        if len(provided) != 1:
+            raise ValueError(
+                "exactly one of 'peer', 'group' or 'channel' is required"
+            )
         if group is not None:
             if not isinstance(group, str) or not group.strip():
                 raise ValueError("field 'group' is required")
             record = self.node.groups.find(group.strip())
             key = record["id"]
             is_group = True
+            is_channel = False
+        elif channel is not None:
+            if not isinstance(channel, str) or not channel.strip():
+                raise ValueError("field 'channel' is required")
+            from .channels import clean_channel_name
+
+            key = clean_channel_name(channel.strip())
+            is_group = False
+            is_channel = True
         else:
             if not isinstance(peer, str) or not peer.strip():
                 raise ValueError("field 'peer' is required")
             key = self._resolve_block_target(peer.strip())
             is_group = False
+            is_channel = False
         path = self._disappearing_path()
         if path is None:
             raise WebBridgeError("this node has no disappearing-defaults path")
@@ -8485,6 +8518,13 @@ class WebBridge:
                         if seconds is None
                         else current.with_group(key, seconds)
                     )
+                elif is_channel:
+                    previous = current.channel_default(key)
+                    updated = (
+                        current.without_channel(key)
+                        if seconds is None
+                        else current.with_channel(key, seconds)
+                    )
                 else:
                     previous = current.peer_default(key)
                     updated = (
@@ -8502,6 +8542,7 @@ class WebBridge:
         return {
             "target": key,
             "group": is_group,
+            "channel": is_channel,
             "disappearing_seconds": seconds,
             "changed": changed,
         }
@@ -11629,6 +11670,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     result = self.bridge.set_disappearing_default(
                         peer=body.get("peer"),
                         group=body.get("group"),
+                        channel=body.get("channel"),
                         seconds=body.get("seconds"),
                     )
                 except WebBridgeError as exc:
@@ -12911,8 +12953,34 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                expires_in = body.get("expires_in")
+                if expires_in is not None and (
+                    not isinstance(expires_in, (int, float))
+                    or isinstance(expires_in, bool)
+                    or not _valid_expires_in(expires_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'expires_in' must be a number of "
+                                "seconds (0 < expires_in <= 2592000)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
-                    message = self.bridge.channel_send(channel, text, reply_to=reply_to)
+                    message = self.bridge.channel_send(
+                        channel,
+                        text,
+                        reply_to=reply_to,
+                        expires_in=(
+                            float(expires_in)
+                            if expires_in is not None
+                            else None
+                        ),
+                    )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
