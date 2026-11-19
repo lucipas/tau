@@ -135,7 +135,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
-    POST /api/tan/posts    publish a Tan post
+    POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
     POST /api/tan/schedule schedule a Tan post for later
     GET  /api/tan/scheduled queued Tan posts, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
@@ -3336,10 +3336,22 @@ class WebBridge:
         *,
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
+        image: Optional[str] = None,
     ) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        if image is not None and reply_to is not None:
+            raise ValueError(
+                "an image can only be attached to a top-level post, not a reply"
+            )
+        image_attachment: Optional[Dict[str, Any]] = None
+        if image is not None:
+            from .tangents.tan import image_attachment_from_data_url
+
+            image_attachment = image_attachment_from_data_url(
+                image, Path(self._tan_db_path()).parent
+            )
         if reply_to is not None:
             conn = self._tan_conn()
             try:
@@ -3352,7 +3364,11 @@ class WebBridge:
         if expires_in is not None:
             expires_at = time.time() + float(expires_in)
         return app.create_post(
-            text, reply_to=reply_to, publish=True, expires_at=expires_at
+            text,
+            reply_to=reply_to,
+            publish=True,
+            expires_at=expires_at,
+            image=image_attachment,
         )
 
     def tan_schedule_post(
@@ -11564,12 +11580,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_bundle_import(head_only)
                 return
-            # A file send carries base64 bytes and an import carries a whole
-            # message history or a whole signed chain, so each gets a larger
-            # body cap than a chat message or a single action.
-            if path == "/api/send-file":
-                limit = MAX_FILE_BODY_BYTES
-            elif path == "/api/groups/send-file":
+            # A file send carries base64 bytes, a Tan post may carry a
+            # base64 image, and an import carries a whole message history
+            # or a whole signed chain, so each gets a larger body cap than
+            # a chat message or a single action.
+            if path in ("/api/send-file", "/api/groups/send-file", "/api/tan/posts"):
                 limit = MAX_FILE_BODY_BYTES
             elif path in ("/api/messages/import", "/api/tan/import"):
                 limit = MAX_IMPORT_BYTES
@@ -12581,6 +12596,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                image = body.get("image")
+                if image is not None and not isinstance(image, str):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'image' must be a base64 data URL"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
                     post = self.bridge.tan_post(
                         text,
@@ -12588,6 +12615,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else None
                         ),
+                        image=image,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

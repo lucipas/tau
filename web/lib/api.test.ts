@@ -23,10 +23,12 @@ import {
   getTanTimeline,
   markRead,
   pageFileUrl,
+  publishTanPost,
   pinChannelMessage,
   postChannelPoll,
   reactToChannelMessage,
   reactToMessage,
+  readFileAsDataUrl,
   closeDmPoll,
   sendBroadcast,
   scheduleChannelMessage,
@@ -306,6 +308,31 @@ describe("POST endpoints", () => {
     await fetchTanMedia("a".repeat(64), "b".repeat(32));
     expect(captured[0].url).toBe(`/api/tan/media/${"a".repeat(64)}/fetch`);
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
+  });
+
+  it("publishes a Tan post with an image data URL when attached", async () => {
+    nextJson = { ok: true, post: {} };
+    await publishTanPost("with a picture", {
+      image: { dataUrl: "data:image/png;base64,iVBORw==" },
+    });
+    expect(captured[0].url).toBe("/api/tan/posts");
+    expect(bodyOf(0)).toEqual({
+      text: "with a picture",
+      image: "data:image/png;base64,iVBORw==",
+    });
+  });
+
+  it("publishes a Tan post without an image field when none is attached", async () => {
+    nextJson = { ok: true, post: {} };
+    await publishTanPost("text only");
+    expect(bodyOf(0)).toEqual({ text: "text only" });
+  });
+
+  it("reads a picked file as a base64 data URL", async () => {
+    const file = new File(["hello"], "pic.png", { type: "image/png" });
+    await expect(readFileAsDataUrl(file)).resolves.toBe(
+      "data:image/png;base64,aGVsbG8=",
+    );
   });
 
   it("lists broadcast lists from /api/broadcasts", async () => {
