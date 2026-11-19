@@ -1,9 +1,10 @@
 // use-tan.ts — Tan social feed state for the Social tab.
 //
 // Provides:
-//   useTanFeed(opts)   — timeline (Following / All / author / tag), top posts,
-//                        mentions, search; like/unlike, repost, quote, vote,
-//                        save/hide/pin, follow/unfollow, mute, tags.
+//   useTanFeed(opts)   — timeline (Following / All / author / tag / list),
+//                        top posts, mentions, search; like/unlike, repost,
+//                        quote, vote, save/hide/pin, follow/unfollow, mute,
+//                        tags.
 //   useTanThread(ref)  — thread view rooted at one post.
 //   useTanComposer()   — publish / schedule / poll composer actions.
 //   useTanLists()      — saved / hidden / pinned / scheduled / following /
@@ -20,7 +21,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  addTanListMember,
+  createTanList,
   createTanPoll,
+  deleteTanList,
   deleteTanPost,
   editTanPost,
   followTanAuthor,
@@ -30,6 +34,8 @@ import {
   getTanFollowing,
   getTanHidden,
   getTanLikers,
+  getTanListMembers,
+  getTanLists,
   getTanMentions,
   getTanMuted,
   getTanMutedKeywords,
@@ -52,6 +58,7 @@ import {
   pinTanPost,
   publishTanPost,
   quoteTanPost,
+  removeTanListMember,
   repostTanPost,
   saveTanPost,
   scheduleTanPost,
@@ -71,6 +78,8 @@ import {
 import type {
   ScheduledTanPost,
   TanAuthor,
+  TanList,
+  TanListMember,
   TanPost,
   TanReactors,
   TanTag,
@@ -82,6 +91,7 @@ export interface UseTanFeedOptions {
   mode?: TanFeedMode;
   author?: string;
   tag?: string;
+  list?: string;
   limit?: number;
   /** Poll interval in ms; 0 disables polling. Default 30s. */
   pollMs?: number;
@@ -112,7 +122,7 @@ export interface UseTanFeedResult {
 }
 
 export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
-  const { mode = "following", author, tag, limit = 30, pollMs = 30_000 } = opts;
+  const { mode = "following", author, tag, list, limit = 30, pollMs = 30_000 } = opts;
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -123,7 +133,7 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
       let next: TanPost[];
       if (mode === "top") next = await getTanTop(limit, author);
       else if (mode === "mentions") next = await getTanMentions(limit);
-      else next = await getTanTimeline({ limit, all: mode === "all", author, tag });
+      else next = await getTanTimeline({ limit, all: mode === "all", author, tag, list });
       if (!mounted.current) return;
       setPosts(next);
       setError(null);
@@ -133,7 +143,7 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
     } finally {
       if (mounted.current) setLoading(false);
     }
-  }, [mode, author, tag, limit]);
+  }, [mode, author, tag, list, limit]);
 
   useEffect(() => {
     mounted.current = true;
@@ -302,6 +312,7 @@ export interface UseTanListsResult {
   mutedAuthors: TanAuthor[];
   mutedKeywords: string[];
   mutedTags: string[];
+  lists: TanList[];
   loading: boolean;
   refresh: () => Promise<void>;
   followTag: (tag: string) => Promise<void>;
@@ -312,6 +323,11 @@ export interface UseTanListsResult {
   unmuteTag: (tag: string) => Promise<void>;
   unmuteAuthor: (target: string) => Promise<void>;
   unhide: (target: string) => Promise<void>;
+  createList: (name: string) => Promise<void>;
+  deleteList: (name: string) => Promise<void>;
+  addToList: (name: string, target: string) => Promise<void>;
+  removeFromList: (name: string, target: string) => Promise<void>;
+  listMembers: (name: string) => Promise<TanListMember[]>;
   authors: (sort?: "recent" | "posts" | "name", limit?: number, offset?: number) => Promise<{ authors: TanAuthor[]; total: number }>;
 }
 
@@ -328,11 +344,12 @@ export function useTanLists(): UseTanListsResult {
   const [mutedAuthors, setMutedAuthors] = useState<TanAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<string[]>([]);
   const [mutedTags, setMutedTags] = useState<string[]>([]);
+  const [lists, setLists] = useState<TanList[]>([]);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     try {
-      const [t, f, fw, s, sv, h, p, sc, ma, mk, mt] = await Promise.all([
+      const [t, f, fw, s, sv, h, p, sc, ma, mk, mt, li] = await Promise.all([
         getTanTags(),
         getTanFollowing(),
         getTanFollowers(),
@@ -344,6 +361,7 @@ export function useTanLists(): UseTanListsResult {
         getTanMuted(),
         getTanMutedKeywords(),
         getTanMutedTags(),
+        getTanLists(),
       ]);
       setTags(t);
       setFollowing(f);
@@ -356,6 +374,7 @@ export function useTanLists(): UseTanListsResult {
       setMutedAuthors(ma);
       setMutedKeywords(mk);
       setMutedTags(mt);
+      setLists(li);
     } finally {
       setLoading(false);
     }
@@ -385,6 +404,7 @@ export function useTanLists(): UseTanListsResult {
     mutedAuthors,
     mutedKeywords,
     mutedTags,
+    lists,
     loading,
     refresh,
     followTag: (tag) => mutate(() => followTanTag(tag)),
@@ -395,6 +415,14 @@ export function useTanLists(): UseTanListsResult {
     unmuteTag: (tag) => mutate(() => unmuteTanTag(tag)),
     unmuteAuthor: (target) => mutate(() => unmuteTanAuthor(target)),
     unhide: (target) => mutate(() => unhideTanPost(target)),
+    createList: (name) => mutate(() => createTanList(name)),
+    deleteList: (name) => mutate(() => deleteTanList(name)),
+    addToList: (name, target) => mutate(() => addTanListMember(name, target)),
+    removeFromList: (name, target) => mutate(() => removeTanListMember(name, target)),
+    listMembers: async (name) => {
+      const data = await getTanListMembers(name);
+      return data.members;
+    },
     authors: async (sort = "recent", limit = 50, offset = 0) => {
       const data = await getTanAuthors({ sort, limit, offset });
       return { authors: data.authors, total: data.total };

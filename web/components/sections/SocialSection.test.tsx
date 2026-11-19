@@ -35,11 +35,14 @@ function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): Tan
 
 let calls: string[] = [];
 let timeline: TanPost[] = [];
+let lists: { name: string; created_at: number; members: number }[] = [];
 
 beforeEach(() => {
   timeline = [makePost("h1".padEnd(64, "0"), "hello #mesh @bob")];
+  lists = [];
   const router = mockFetch((url) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
+    if (url.includes("/api/tan/lists")) return { lists, count: lists.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/thread")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/tags")) return { tags: [{ tag: "mesh", count: 5 }], count: 1 };
@@ -132,6 +135,17 @@ describe("SocialSection", () => {
     await waitFor(() =>
       expect(calls).toContain("GET /api/tan/timeline?limit=30&all=1"),
     );
+  });
+
+  it("shows a list picker and filters the timeline by the chosen list", async () => {
+    lists = [{ name: "Friends", created_at: 1000, members: 2 }];
+    renderSocial();
+    const select = await screen.findByLabelText("Filter feed by list");
+    fireEvent.change(select, { target: { value: "Friends" } });
+    await waitFor(() =>
+      expect(calls).toContain("GET /api/tan/timeline?limit=30&list=Friends"),
+    );
+    expect((select as HTMLSelectElement).value).toBe("Friends");
   });
 
   it("shows followers with a follow-back button", async () => {

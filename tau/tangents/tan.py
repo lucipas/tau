@@ -165,6 +165,9 @@ MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_FOLLOWED_TAGS = 256
 MAX_MUTED_TAGS = 256
+MAX_TAN_LISTS = 32
+MAX_LIST_MEMBERS = 256
+MAX_LIST_NAME = 32
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
 MAX_DRAFTS = 100
@@ -914,6 +917,20 @@ CREATE TABLE IF NOT EXISTS muted_authors (
     muted_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tan_lists (
+    name TEXT PRIMARY KEY,
+    display TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tan_list_members (
+    list_name TEXT NOT NULL,
+    author TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    added_at REAL NOT NULL,
+    PRIMARY KEY (list_name, author)
+);
+
 CREATE TABLE IF NOT EXISTS saved_posts (
     hash TEXT PRIMARY KEY,
     saved_at REAL NOT NULL
@@ -951,6 +968,23 @@ CREATE TABLE IF NOT EXISTS drafts (
     created_at REAL NOT NULL
 );
 """
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+    """Column names of *table* right now — a fresh read, not a snapshot.
+
+    Migrations run while other threads may be migrating the same file,
+    so a column set read once at the start of :func:`init_db` can go
+    stale mid-migration: a thread that snapshots after ``kind`` lands
+    but before ``target`` would conclude the pair is done and return
+    without it.  Every migration decision below re-reads, so a column
+    is only skipped when it is really there; the check-then-ALTER gap
+    that remains is the one :func:`_add_column` already tolerates.
+    """
+    return {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
 
 
 def _add_column(
@@ -1001,62 +1035,59 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         except OSError:  # pragma: no cover - best effort
             pass
     conn.executescript(_SCHEMA)
-    columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(posts)").fetchall()
-    }
+    columns = _table_columns(conn, "posts")
     if columns and "v" not in columns:  # migrate an early scaffold database
         _add_column(conn, "posts", "v", "INTEGER NOT NULL DEFAULT 1")
-    if columns and "kind" not in columns:  # migrate a pre-reactions database
+    if columns and "kind" not in _table_columns(conn, "posts"):
+        # migrate a pre-reactions database; kind and target are checked
+        # separately — a concurrent migration may have added one but
+        # not the other yet (see _table_columns).
         _add_column(conn, "posts", "kind", "TEXT NOT NULL DEFAULT 'post'")
+    if columns and "target" not in _table_columns(conn, "posts"):
         _add_column(conn, "posts", "target", "TEXT NOT NULL DEFAULT ''")
-    if columns and "expires_at" not in columns:  # migrate a pre-expiry database
+    if columns and "expires_at" not in _table_columns(conn, "posts"):
+        # migrate a pre-expiry database
         _add_column(conn, "posts", "expires_at", "REAL")
-    if columns and "options" not in columns:  # migrate a pre-polls database
-        # A poll's options live in one JSON column on its own entry, so
-        # the migration is a single ALTER, not a new table.
+    if columns and "options" not in _table_columns(conn, "posts"):
+        # migrate a pre-polls database: a poll's options live in one
+        # JSON column on its own entry, so the migration is a single
+        # ALTER, not a new table.
         _add_column(conn, "posts", "options", "TEXT")
-    if columns and "image" not in columns:  # migrate a pre-media database
-        # A post's image attachment lives in one JSON column on its
-        # own entry, like a poll's options.
+    if columns and "image" not in _table_columns(conn, "posts"):
+        # migrate a pre-media database: a post's image attachment lives
+        # in one JSON column on its own entry, like a poll's options.
         _add_column(conn, "posts", "image", "TEXT")
     if columns and "location" not in columns:  # migrate a pre-location database
         # A post's place lives in one JSON column on its own entry,
         # like a post's image attachment.
         _add_column(conn, "posts", "location", "TEXT")
-    draft_columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
-    }
+    draft_columns = _table_columns(conn, "drafts")
     if draft_columns and "post_hash" not in draft_columns:
         # migrate a pre-retry database: drafts could not remember
         # the signed post a partial publish had already created
         _add_draft_column(conn, "post_hash", "TEXT")
-    if draft_columns and "pending_peers" not in draft_columns:
+    if draft_columns and "pending_peers" not in _table_columns(conn, "drafts"):
         _add_draft_column(conn, "pending_peers", "TEXT")
-    if draft_columns and "claimed_at" not in draft_columns:
+    if draft_columns and "claimed_at" not in _table_columns(conn, "drafts"):
         # migrate a pre-claim database: drafts could not be claimed,
         # so two concurrent publish-draft runs could sign two posts
         _add_draft_column(conn, "claimed_at", "REAL")
-    if draft_columns and "claim_token" not in draft_columns:
+    if draft_columns and "claim_token" not in _table_columns(conn, "drafts"):
         # the claim's owner token, so only the publisher that won
         # the claim can refresh or release it
         _add_draft_column(conn, "claim_token", "TEXT")
-    purged_columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(purged_posts)").fetchall()
-    }
+    purged_columns = _table_columns(conn, "purged_posts")
     if purged_columns and "linked" not in purged_columns:
         # migrate a pre-provenance database: purge records made
         # before the linked flag existed cannot prove a chain
         # position, so they bridge nothing — the column defaults to 0.
         _add_column(conn, "purged_posts", "linked", "INTEGER NOT NULL DEFAULT 0")
-    if purged_columns and "target" not in purged_columns:
+    if purged_columns and "target" not in _table_columns(conn, "purged_posts"):
         # migrate a pre-target database: records made before the
         # target was carried cannot name the deleted original, so an
         # edit record stays unbacked until it is re-recorded.
         _add_column(conn, "purged_posts", "target", "TEXT NOT NULL DEFAULT ''")
-    if purged_columns and "restored" not in purged_columns:
+    if purged_columns and "restored" not in _table_columns(conn, "purged_posts"):
         # migrate a pre-provenance database: records made before the
         # restored flag existed were all made locally, so they count
         # as verified — the column defaults to 0.
@@ -6642,6 +6673,249 @@ def muted(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def clean_list_name(value: Any) -> Tuple[str, str]:
+    """Normalise a user-supplied list name, or raise :class:`TanError`.
+
+    Returns the (key, display) pair: the key is the casefolded name
+    lists are stored and looked up under, the display is the name as
+    typed.  A list name is 1..32 characters of letters, digits, spaces,
+    ``-`` or ``_``, starting with a letter or digit.
+    """
+    if not isinstance(value, str):
+        raise TanError("list name must be text")
+    raw = value.strip()
+    if (
+        not raw
+        or len(raw) > MAX_LIST_NAME
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]*", raw) is None
+    ):
+        raise TanError(
+            f"not a list name: {value!r} "
+            f"(1-{MAX_LIST_NAME} letters, digits, spaces, - or _)"
+        )
+    return raw.casefold(), raw
+
+
+def create_list(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Create an empty named author list.
+
+    Lists are local-only curation: they are never published, signed or
+    synced, so creating one touches no chain and no peer.  Creating a
+    list that already exists (case-insensitively) is an error.
+    """
+    key, display = clean_list_name(name)
+    timestamp = float(now if now is not None else time.time())
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT name, display, created_at FROM tan_lists WHERE name = ?",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            raise TanError(f"list {existing['display']!r} already exists")
+        count = conn.execute("SELECT COUNT(*) AS n FROM tan_lists").fetchone()["n"]
+        if int(count) >= MAX_TAN_LISTS:
+            raise TanError(f"lists are limited to {MAX_TAN_LISTS}")
+        conn.execute(
+            "INSERT INTO tan_lists(name, display, created_at) VALUES(?, ?, ?)",
+            (key, display, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {"name": display, "created_at": timestamp, "members": 0}
+
+
+def delete_list(conn: sqlite3.Connection, name: str) -> bool:
+    """Delete a list and its memberships.  Returns whether one existed.
+
+    Deleting a list never unfollows anyone and never deletes a post —
+    it only drops the local curation.
+    """
+    key, _ = clean_list_name(name)
+    with conn:
+        cursor = conn.execute("DELETE FROM tan_lists WHERE name = ?", (key,))
+        conn.execute(
+            "DELETE FROM tan_list_members WHERE list_name = ?", (key,)
+        )
+    return cursor.rowcount > 0
+
+
+def tan_lists(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Named author lists, oldest first, each with its member count."""
+    rows = conn.execute(
+        "SELECT l.name AS key, l.display AS name, l.created_at AS created_at, "
+        "COUNT(m.author) AS members FROM tan_lists l "
+        "LEFT JOIN tan_list_members m ON m.list_name = l.name "
+        "GROUP BY l.name ORDER BY l.created_at ASC"
+    ).fetchall()
+    return [
+        {
+            "name": str(row["name"]),
+            "created_at": float(row["created_at"]),
+            "members": int(row["members"]),
+        }
+        for row in rows
+    ]
+
+
+def _list_display(conn: sqlite3.Connection, name: str) -> str:
+    """The display name of the list *name* names, or raise :class:`TanError`."""
+    key, _ = clean_list_name(name)
+    row = conn.execute(
+        "SELECT display FROM tan_lists WHERE name = ?", (key,)
+    ).fetchone()
+    if row is None:
+        raise TanError(f"no list named {name!r}")
+    return str(row["display"])
+
+
+def list_members(conn: sqlite3.Connection, name: str) -> List[Dict[str, Any]]:
+    """Members of one list, most recently added first."""
+    display = _list_display(conn, name)
+    key = display.casefold()
+    rows = conn.execute(
+        "SELECT author, name, added_at FROM tan_list_members "
+        "WHERE list_name = ? ORDER BY added_at DESC",
+        (key,),
+    ).fetchall()
+    return [
+        {
+            "author": str(row["author"]),
+            "name": str(row["name"]),
+            "added_at": float(row["added_at"]),
+        }
+        for row in rows
+    ]
+
+
+def list_member_authors(conn: sqlite3.Connection, name: str) -> List[str]:
+    """Author hashes of one list's members, in add order."""
+    display = _list_display(conn, name)
+    rows = conn.execute(
+        "SELECT author FROM tan_list_members WHERE list_name = ? "
+        "ORDER BY added_at ASC",
+        (display.casefold(),),
+    ).fetchall()
+    return [str(row["author"]) for row in rows]
+
+
+def add_to_list(
+    conn: sqlite3.Connection,
+    name: str,
+    author: str,
+    *,
+    author_name: str = "",
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Add *author* to a list.  Re-adding keeps the original ``added_at``.
+
+    The author need not be followed — a list is a curation, not a
+    second follow graph — so callers that care should say so.  Returns
+    the membership record with ``added`` saying whether this call added
+    them (``False`` when they were already a member).
+    """
+    display = _list_display(conn, name)
+    key = display.casefold()
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    clean_name = sanitize_name(author_name, fallback="") if author_name else ""
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking for an existing membership
+    # and the capacity, so a concurrent add cannot slip in between
+    # check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT added_at FROM tan_list_members "
+            "WHERE list_name = ? AND author = ?",
+            (key, author),
+        ).fetchone()
+        if existing is None:
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM tan_list_members WHERE list_name = ?",
+                (key,),
+            ).fetchone()["n"]
+            if int(count) >= MAX_LIST_MEMBERS:
+                raise TanError(
+                    f"list {display!r} is limited to {MAX_LIST_MEMBERS} members"
+                )
+        conn.execute(
+            "INSERT INTO tan_list_members(list_name, author, name, added_at) "
+            "VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(list_name, author) DO UPDATE SET "
+            "name = CASE WHEN excluded.name != '' THEN excluded.name "
+            "ELSE tan_list_members.name END, "
+            "added_at = tan_list_members.added_at",
+            (key, author, clean_name, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    if existing is not None:
+        timestamp = float(existing["added_at"])
+    return {
+        "list": display,
+        "author": author,
+        "name": clean_name,
+        "added_at": timestamp,
+        "added": existing is None,
+    }
+
+
+def remove_from_list(conn: sqlite3.Connection, name: str, author: str) -> bool:
+    """Remove *author* from a list.  Returns whether one was removed."""
+    display = _list_display(conn, name)
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM tan_list_members WHERE list_name = ? AND author = ?",
+            (display.casefold(), author),
+        )
+    return cursor.rowcount > 0
+
+
+def list_timeline(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    limit: int = 30,
+    viewer: Optional[str] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+    tag: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """The timeline read through one list: only its members' posts.
+
+    The same silencing as :func:`timeline` applies — muted and blocked
+    authors stay hidden — and a followed tag never pulls a non-member's
+    post into a list view, even though it would into the full timeline.
+    A list with no members, or a list naming no stored posts, reads
+    empty; an unknown list is an error.
+    """
+    members = list_member_authors(conn, name)
+    if not members:
+        return []
+    posts = timeline(
+        conn,
+        members,
+        limit=limit,
+        viewer=viewer,
+        exclude_authors=exclude_authors,
+        exclude_all=exclude_all,
+        tag=tag,
+    )
+    wanted = set(members)
+    return [post for post in posts if post.get("author") in wanted]
 
 
 def _muted_keyword_list(conn: sqlite3.Connection) -> List[str]:

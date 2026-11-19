@@ -312,6 +312,18 @@ tau tan unmute-keyword crypto
 tau tan mute alice
 tau tan muted
 
+# Curate followed authors into named lists and read one list's timeline.
+# Lists are local-only: they are never published or synced, and deleting
+# one never unfollows anyone. Adding an author who is not followed is
+# allowed (a list is curation, not a follow) and the CLI says so.
+tau tan lists create friends
+tau tan lists add friends alice bob
+tau tan lists
+tau tan lists show friends
+tau tan timeline --list friends
+tau tan lists remove friends bob
+tau tan lists delete friends
+
 # Hide one post without muting its author: it leaves your timeline,
 # search, top posts and threads, but keeps syncing — unhide to see it again
 tau tan hide <hash>
@@ -425,6 +437,13 @@ Global options may appear before or after the command:
 | `tau tan repost POST` | Repost a post to your followers (signed entry on your chain) |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
+| `tau tan timeline --list NAME` | Show only the members of one list's posts |
+| `tau tan lists` | List named author lists with member counts |
+| `tau tan lists create NAME` | Create an empty named author list |
+| `tau tan lists add NAME PEER...` | Add authors to a list |
+| `tau tan lists remove NAME PEER...` | Remove authors from a list |
+| `tau tan lists show NAME` | Show a list's members |
+| `tau tan lists delete NAME` | Delete a list (follows and posts are untouched) |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan top` | Show the most-liked stored posts, best first |
