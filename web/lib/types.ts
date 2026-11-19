@@ -325,11 +325,11 @@ export interface ChatMessage {
   in_reply_to?: ReplyRef;
   location?: LocationPin;
   beacon?: LiveBeacon;
-  /** Group poll question carried on the message itself. */
+  /** Group or DM poll question carried on the message itself. */
   poll_options?: string[];
   poll_vote?: GroupPollVote;
   poll_close?: GroupPollClose;
-  /** Group poll tally, attached by the bridge from the node inbox. */
+  /** Group or DM poll tally, attached by the bridge from the node inbox. */
   poll?: GroupPollTally;
   file?: StoredFile;
   excerpt_hash?: string;
@@ -616,6 +616,23 @@ export interface Channel {
   unread: number;
 }
 
+export interface ChannelPollTally {
+  options: string[];
+  counts: number[];
+  total: number;
+  closed: boolean;
+  voters: { author: string; name: string; option: number; voted_at: number }[];
+  my_vote: number | null;
+  /** True when this node authored the poll (so it may close it). */
+  own: boolean;
+}
+
+export interface ChannelReaction {
+  reaction: string;
+  count: number;
+  reactors: string[];
+}
+
 export interface ChannelMessage {
   v: number;
   hash: string;
@@ -627,6 +644,47 @@ export interface ChannelMessage {
   created_at: number;
   received_at: number;
   sig: string;
+  /** Channel poll question carried on the message itself. */
+  poll_options?: string[];
+  poll_vote?: { target: { author: string; sent_at: number }; option: number };
+  poll_close?: { author: string; sent_at: number };
+  /** Channel poll tally, attached by the bridge from the channel store. */
+  poll?: ChannelPollTally;
+  /** Present on pins: when this node pinned the message. */
+  pinned_at?: number;
+  /** Reaction summary, grouped by token; absent on old servers. */
+  reactions?: ChannelReaction[];
+  /** Digest of the parent message when this message is a reply. */
+  reply_to?: string;
+  /** Present when the author edited this message; the text shown is the latest edit. */
+  edited?: boolean;
+  edited_at?: number;
+}
+
+export interface ChannelTopic {
+  v: number;
+  hash: string;
+  channel: string;
+  author: string;
+  key: string;
+  topic: string;
+  updated_at: number;
+  sig: string;
+}
+
+export interface ScheduledChannelMessage {
+  id: string;
+  channel: string;
+  text: string;
+  publish_at: number;
+  created_at: number;
+  to: string[];
+  ttl: number;
+  message_hash: string | null;
+  attempts: number;
+  next_attempt_at: number | null;
+  paused_at: number | null;
+  [key: string]: unknown;
 }
 
 // ---------------------------------------------------------------- pages --
