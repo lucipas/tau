@@ -14,7 +14,10 @@ beforeEach(() => {
   settings = { accept_files: true, send_read_receipts: false };
   const router = mockFetch((url) => {
     if (url.includes("/api/settings")) return settings;
-    if (url.includes("/api/messages/disappearing")) return { peers: {}, groups: {} };
+    if (url.includes("/api/messages/disappearing"))
+      return { peers: {}, groups: {}, channels: {} };
+    if (url.includes("/api/channels"))
+      return { channels: [{ channel: "general", joined_at: 1 }], count: 1 };
     return { ok: true };
   });
   calls = router.calls;
@@ -69,7 +72,7 @@ describe("SettingsSection", () => {
   it("saves a disappearing default for a peer", async () => {
     renderSettings();
     await screen.findByDisplayValue("testnode");
-    fireEvent.change(screen.getByLabelText("Peer or group"), {
+    fireEvent.change(screen.getByLabelText("Peer, group or channel"), {
       target: { value: `peer:${"b".repeat(32)}` },
     });
     fireEvent.change(screen.getByLabelText("Disappearing time"), {
@@ -77,5 +80,38 @@ describe("SettingsSection", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Save default" }));
     await waitFor(() => expect(calls).toContain("POST /api/messages/disappearing"));
+  });
+
+  it("saves a disappearing default for a channel", async () => {
+    renderSettings();
+    await screen.findByDisplayValue("testnode");
+    fireEvent.change(screen.getByLabelText("Peer, group or channel"), {
+      target: { value: "channel:general" },
+    });
+    fireEvent.change(screen.getByLabelText("Disappearing time"), {
+      target: { value: "300" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save default" }));
+    await waitFor(() => expect(calls).toContain("POST /api/messages/disappearing"));
+    expect(await screen.findByText(/Disappearing default saved/)).toBeTruthy();
+  });
+
+  it("lists a channel default under its channel name", async () => {
+    const router = mockFetch((url) => {
+      if (url.includes("/api/settings")) return settings;
+      if (url.includes("/api/messages/disappearing"))
+        return { peers: {}, groups: {}, channels: { general: 300 } };
+      if (url.includes("/api/channels"))
+        return { channels: [{ channel: "general", joined_at: 1 }], count: 1 };
+      return { ok: true };
+    });
+    calls = router.calls;
+    renderSettings();
+    // The label appears twice: once as a picker option, once as the
+    // saved-default row; the row's "5 minutes" likewise.
+    const labels = await screen.findAllByText("Channel: #general");
+    expect(labels).toHaveLength(2);
+    const times = screen.getAllByText("5 minutes");
+    expect(times).toHaveLength(2);
   });
 });

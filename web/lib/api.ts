@@ -17,8 +17,11 @@ import type {
   AllowList,
   ApiErrorBody,
   BlockResult,
+  BroadcastList,
+  BroadcastSendResponse,
   Channel,
   ChannelMessage,
+  ChannelTopic,
   ChatMessage,
   DoctorReport,
   DmRequest,
@@ -39,6 +42,7 @@ import type {
   PeerInfo,
   PingResult,
   SafetyNumberResult,
+  ScheduledChannelMessage,
   ScheduledTanPost,
   SendResult,
   Snapshot,
@@ -301,6 +305,33 @@ export async function deleteGroup(group: string): Promise<{ id: string; name: st
   return post("/api/groups/delete", { group });
 }
 
+// ---------------------------------------------------------- broadcasts --
+// One message, many private DMs: a send fans out as an ordinary DM per
+// member, so recipients never see each other or the list.
+
+export async function getBroadcasts(): Promise<BroadcastList[]> {
+  const data = await get<{ broadcasts: BroadcastList[]; count: number }>("/api/broadcasts");
+  return data.broadcasts ?? [];
+}
+
+export async function createBroadcast(
+  name: string,
+  members: string[],
+): Promise<{ ok: boolean; broadcast: BroadcastList }> {
+  return post("/api/broadcasts", { name, members });
+}
+
+export async function deleteBroadcast(broadcast: string): Promise<{ ok: boolean; name: string }> {
+  return post("/api/broadcasts/delete", { broadcast });
+}
+
+export async function sendBroadcast(
+  broadcast: string,
+  text: string,
+): Promise<BroadcastSendResponse> {
+  return post("/api/broadcasts/send", { broadcast, text });
+}
+
 export async function leaveGroup(group: string): Promise<{ id: string; name: string; already_left?: boolean; also_left?: string[] }> {
   return post("/api/groups/leave", { group });
 }
@@ -514,7 +545,11 @@ export async function declineDmRequest(id: string, block = false): Promise<unkno
 
 /** Advance the read cursor for one conversation, or all when neither is given. */
 export async function markRead(
-  target: { peer: string } | { group: string } | Record<string, never> = {},
+  target:
+    | { peer: string }
+    | { group: string }
+    | { channel: string }
+    | Record<string, never> = {},
 ): Promise<UnreadCounts> {
   const data = await post<{ ok: boolean; unread: UnreadCounts }>("/api/messages/read", target);
   return data.unread;
@@ -548,9 +583,9 @@ export async function getDisappearingDefaults(): Promise<DisappearingDefaults> {
   return get("/api/messages/disappearing");
 }
 
-/** Set a disappearing default (seconds; null clears it) for one peer or group. */
+/** Set a disappearing default (seconds; null clears it) for one peer, group or channel. */
 export async function setDisappearingDefault(
-  target: { peer: string } | { group: string },
+  target: { peer: string } | { group: string } | { channel: string },
   seconds: number | null,
 ): Promise<unknown> {
   return post("/api/messages/disappearing", { ...target, seconds });
@@ -565,6 +600,19 @@ export async function setMuted(
   muted = true,
 ): Promise<unknown> {
   return post("/api/messages/mute", { ...target, muted });
+}
+
+/** Pinned conversations, newest pin first. */
+export async function getPinnedConversations(): Promise<unknown> {
+  return get("/api/conversations/pinned");
+}
+
+/** Pin or unpin one conversation (peer, group, or channel). */
+export async function setPinnedConversation(
+  target: { peer: string } | { group: string } | { channel: string },
+  pinned = true,
+): Promise<unknown> {
+  return post("/api/conversations/pin", { ...target, pinned });
 }
 
 /** Export stored DMs as the CLI's JSON document (loopback only). */
@@ -977,6 +1025,18 @@ export async function getChannelMessages(channel: string, limit = 20): Promise<C
   return data.messages;
 }
 
+/** Stored messages in a channel matching a keyword, newest first. */
+export async function searchChannelMessages(
+  channel: string,
+  q: string,
+  limit = 20,
+): Promise<ChannelMessage[]> {
+  const data = await get<{ channel: string; query: string; messages: ChannelMessage[]; count: number }>(
+    `/api/channels/search${query({ channel, q, limit })}`,
+  );
+  return data.messages;
+}
+
 export async function joinChannel(channel: string): Promise<Channel> {
   return post("/api/channels/join", { channel });
 }
@@ -989,11 +1049,14 @@ export async function sendChannelMessage(
   channel: string,
   text: string,
   replyTo?: string,
+  expiresIn?: number,
 ): Promise<ChannelMessage> {
-  return post(
-    "/api/channels/send",
-    replyTo ? { channel, text, reply_to: replyTo } : { channel, text },
-  );
+  return post("/api/channels/send", {
+    channel,
+    text,
+    ...(replyTo ? { reply_to: replyTo } : {}),
+    ...(expiresIn !== undefined ? { expires_in: expiresIn } : {}),
+  });
 }
 
 export async function editChannelMessage(
@@ -1009,9 +1072,101 @@ export async function editChannelMessage(
   return data.edit;
 }
 
+/** React to a stored channel message; an empty reaction clears yours. */
+export async function reactToChannelMessage(
+  channel: string,
+  target: string,
+  reaction: string,
+): Promise<{ reaction: string }> {
+  return post("/api/channels/react", { channel, target, reaction });
+}
+
+export async function getChannelPins(channel: string): Promise<ChannelMessage[]> {
+  const data = await get<{ channel: string; pins: ChannelMessage[]; count: number }>(
+    `/api/channels/pins${query({ channel })}`,
+  );
+  return data.pins;
+}
+
+export async function pinChannelMessage(channel: string, hash: string): Promise<{ channel: string; hash: string; pinned_at: number }> {
+  return post("/api/channels/pin", { channel, hash });
+}
+
+export async function unpinChannelMessage(channel: string, hash: string): Promise<{ channel: string; hash: string; unpinned: boolean }> {
+  return post("/api/channels/unpin", { channel, hash });
+}
+
+export async function postChannelPoll(
+  channel: string,
+  question: string,
+  options: string[],
+): Promise<ChannelMessage> {
+  const data = await post<{ ok: boolean; message: ChannelMessage }>("/api/channels/poll", {
+    channel,
+    question,
+    options,
+  });
+  return data.message;
+}
+
+export async function voteChannelPoll(
+  channel: string,
+  poll: string,
+  option: number | string,
+): Promise<ChannelMessage> {
+  const data = await post<{ ok: boolean; message: ChannelMessage }>("/api/channels/vote", {
+    channel,
+    poll,
+    option,
+  });
+  return data.message;
+}
+
+export async function closeChannelPoll(channel: string, poll: string): Promise<ChannelMessage> {
+  const data = await post<{ ok: boolean; message: ChannelMessage }>("/api/channels/close-poll", {
+    channel,
+    poll,
+  });
+  return data.message;
+}
+
+export async function getChannelScheduled(channel?: string): Promise<ScheduledChannelMessage[]> {
+  const data = await get<{ scheduled: ScheduledChannelMessage[]; count: number }>(
+    `/api/channels/scheduled${query({ channel })}`,
+  );
+  return data.scheduled;
+}
+
+export async function scheduleChannelMessage(
+  channel: string,
+  text: string,
+  sendIn: number,
+): Promise<ScheduledChannelMessage> {
+  return post("/api/channels/schedule", { channel, text, send_in: sendIn });
+}
+
+export async function cancelScheduledChannelMessage(id: string): Promise<unknown> {
+  return post("/api/channels/cancel-scheduled", { id });
+}
+
 /** Pull missing history for one channel, or every joined channel when omitted. */
 export async function syncChannels(channel?: string, limit = 20): Promise<unknown> {
   return post("/api/channels/sync", channel ? { channel, limit } : { limit });
+}
+
+export async function getChannelTopic(channel: string): Promise<ChannelTopic | null> {
+  const data = await get<{ channel: string; topic: ChannelTopic | null }>(
+    `/api/channels/topic${query({ channel })}`,
+  );
+  return data.topic;
+}
+
+/** Set a channel topic; an empty topic clears it. */
+export async function setChannelTopic(
+  channel: string,
+  topic: string,
+): Promise<{ ok: boolean; channel: string; topic: ChannelTopic; cleared: boolean }> {
+  return post("/api/channels/topic", { channel, topic });
 }
 
 // ----------------------------------------------------------------- pages --
