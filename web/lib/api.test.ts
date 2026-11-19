@@ -10,6 +10,7 @@ import {
   createBroadcast,
   deleteBroadcast,
   closeChannelPoll,
+  deleteTanDraft,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
@@ -21,6 +22,7 @@ import {
   getGroupInviteStatus,
   getMessages,
   getQuietHours,
+  getTanDrafts,
   getTanThread,
   getTanTimeline,
   joinGroupViaLink,
@@ -34,6 +36,7 @@ import {
   reactToMessage,
   readFileAsDataUrl,
   revokeGroupInvites,
+  saveTanDraft,
   closeDmPoll,
   sendBroadcast,
   scheduleChannelMessage,
@@ -130,6 +133,14 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/scheduled?channel=my%20channel");
     await getChannelScheduled();
     expect(captured[1].url).toBe("/api/channels/scheduled");
+  });
+
+  it("lists saved Tan drafts", async () => {
+    const draft = { id: 1, text: "half-written", reply_to: "", expires_in: null };
+    nextJson = { drafts: [draft], count: 1 };
+    const drafts = await getTanDrafts();
+    expect(captured[0].url).toBe("/api/tan/drafts");
+    expect(drafts).toEqual([draft]);
   });
 
   it("posts a channel poll with question and options", async () => {
@@ -354,6 +365,34 @@ describe("POST endpoints", () => {
     nextJson = { ok: true, post: {} };
     await publishTanPost("text only");
     expect(bodyOf(0)).toEqual({ text: "text only" });
+  });
+
+  it("saves a Tan draft with reply and expiry", async () => {
+    nextJson = { ok: true, draft: { id: 1 } };
+    const draft = await saveTanDraft("half-written", {
+      replyTo: "h1".padEnd(64, "0"),
+      expiresIn: 3600,
+    });
+    expect(captured[0].url).toBe("/api/tan/drafts");
+    expect(bodyOf(0)).toEqual({
+      text: "half-written",
+      reply_to: "h1".padEnd(64, "0"),
+      expires_in: 3600,
+    });
+    expect(draft).toEqual({ id: 1 });
+  });
+
+  it("saves a plain Tan draft without optional fields", async () => {
+    nextJson = { ok: true, draft: { id: 2 } };
+    await saveTanDraft("plain draft");
+    expect(bodyOf(0)).toEqual({ text: "plain draft" });
+  });
+
+  it("discards a Tan draft by id", async () => {
+    nextJson = { ok: true, draft: { id: 3 } };
+    await deleteTanDraft(3);
+    expect(captured[0].url).toBe("/api/tan/drafts/delete");
+    expect(bodyOf(0)).toEqual({ id: 3 });
   });
 
   it("reads a picked file as a base64 data URL", async () => {

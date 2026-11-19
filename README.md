@@ -951,6 +951,11 @@ The web console shows the same counts with a ♥ toggle on every post
 same way: `tau tan save` keeps a post to read later (local only, never
 published), and the console has a Saved view with a save toggle on every
 post (`GET /api/tan/saved`, `POST /api/tan/save` / `POST /api/tan/unsave`).
+Drafts work the same way too: `tau tan draft` parks a half-written post
+(local only, never published), and the console composer has a Save draft
+button with a Drafts view to edit or delete it (`GET /api/tan/drafts`,
+`POST /api/tan/drafts`, `POST /api/tan/drafts/delete`) — posting a loaded
+draft publishes it and drops the draft, mirroring `publish-draft`.
 
 ### Admission rules
 

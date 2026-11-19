@@ -48,6 +48,7 @@ import type {
   SendResult,
   Snapshot,
   TanAuthor,
+  TanDraft,
   TanPost,
   TanQuoter,
   TanReactors,
@@ -942,6 +943,30 @@ export async function scheduleTanPost(
 
 export async function cancelScheduledTanPost(id: string): Promise<unknown> {
   return post("/api/tan/cancel-scheduled", { id });
+}
+
+/** Saved Tan post drafts, newest first. */
+export async function getTanDrafts(): Promise<TanDraft[]> {
+  const data = await get<{ drafts: TanDraft[]; count: number }>("/api/tan/drafts");
+  return data.drafts;
+}
+
+/** Save a Tan post draft (plain text plus optional reply and expiry). */
+export async function saveTanDraft(
+  text: string,
+  opts: PublishTanOptions = {},
+): Promise<TanDraft> {
+  const data = await post<{ ok: boolean; draft: TanDraft }>("/api/tan/drafts", {
+    text,
+    reply_to: opts.replyTo,
+    expires_in: opts.expiresIn,
+  });
+  return data.draft;
+}
+
+/** Discard a saved Tan post draft without publishing it. */
+export async function deleteTanDraft(id: number): Promise<unknown> {
+  return post("/api/tan/drafts/delete", { id });
 }
 
 export async function quoteTanPost(target: string, text: string): Promise<TanPost> {

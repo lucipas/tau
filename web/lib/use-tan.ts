@@ -6,8 +6,8 @@
 //                        save/hide/pin, follow/unfollow, mute, tags.
 //   useTanThread(ref)  — thread view rooted at one post.
 //   useTanComposer()   — publish / schedule / poll composer actions.
-//   useTanLists()      — saved / hidden / pinned / scheduled / following /
-//                        muted lists and tag follows.
+//   useTanLists()      — saved / hidden / pinned / scheduled / drafts /
+//                        following / muted lists and tag follows.
 //
 // Posts arrive from /api/tan/timeline (following by default, `all=1` for
 // everything cached) with bridge annotations: likes/liked/own, quotes,
@@ -22,10 +22,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createTanPoll,
   deleteTanPost,
+  deleteTanDraft,
   editTanPost,
   followTanAuthor,
   followTanTag,
   getTanAuthors,
+  getTanDrafts,
   getTanFollowing,
   getTanHidden,
   getTanLikers,
@@ -52,6 +54,7 @@ import {
   publishTanPost,
   quoteTanPost,
   repostTanPost,
+  saveTanDraft,
   saveTanPost,
   scheduleTanPost,
   searchTan,
@@ -70,6 +73,7 @@ import {
 import type {
   ScheduledTanPost,
   TanAuthor,
+  TanDraft,
   TanPost,
   TanReactors,
   TanTag,
@@ -297,6 +301,7 @@ export interface UseTanListsResult {
   hidden: TanPost[];
   pinned: TanPost[];
   scheduled: ScheduledTanPost[];
+  drafts: TanDraft[];
   mutedAuthors: TanAuthor[];
   mutedKeywords: string[];
   mutedTags: string[];
@@ -310,6 +315,11 @@ export interface UseTanListsResult {
   unmuteTag: (tag: string) => Promise<void>;
   unmuteAuthor: (target: string) => Promise<void>;
   unhide: (target: string) => Promise<void>;
+  saveDraft: (
+    text: string,
+    opts?: { replyTo?: string; expiresIn?: number },
+  ) => Promise<TanDraft>;
+  deleteDraft: (id: number) => Promise<void>;
   authors: (sort?: "recent" | "posts" | "name", limit?: number, offset?: number) => Promise<{ authors: TanAuthor[]; total: number }>;
 }
 
@@ -322,6 +332,7 @@ export function useTanLists(): UseTanListsResult {
   const [hidden, setHidden] = useState<TanPost[]>([]);
   const [pinned, setPinned] = useState<TanPost[]>([]);
   const [scheduled, setScheduled] = useState<ScheduledTanPost[]>([]);
+  const [drafts, setDrafts] = useState<TanDraft[]>([]);
   const [mutedAuthors, setMutedAuthors] = useState<TanAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<string[]>([]);
   const [mutedTags, setMutedTags] = useState<string[]>([]);
@@ -329,7 +340,7 @@ export function useTanLists(): UseTanListsResult {
 
   const refresh = useCallback(async () => {
     try {
-      const [t, f, s, sv, h, p, sc, ma, mk, mt] = await Promise.all([
+      const [t, f, s, sv, h, p, sc, d, ma, mk, mt] = await Promise.all([
         getTanTags(),
         getTanFollowing(),
         getTanSuggestions(),
@@ -337,6 +348,7 @@ export function useTanLists(): UseTanListsResult {
         getTanHidden(),
         getTanPinned(),
         getTanScheduled(),
+        getTanDrafts(),
         getTanMuted(),
         getTanMutedKeywords(),
         getTanMutedTags(),
@@ -348,6 +360,7 @@ export function useTanLists(): UseTanListsResult {
       setHidden(h.posts);
       setPinned(p.posts);
       setScheduled(sc);
+      setDrafts(d);
       setMutedAuthors(ma);
       setMutedKeywords(mk);
       setMutedTags(mt);
@@ -376,6 +389,7 @@ export function useTanLists(): UseTanListsResult {
     hidden,
     pinned,
     scheduled,
+    drafts,
     mutedAuthors,
     mutedKeywords,
     mutedTags,
@@ -389,6 +403,12 @@ export function useTanLists(): UseTanListsResult {
     unmuteTag: (tag) => mutate(() => unmuteTanTag(tag)),
     unmuteAuthor: (target) => mutate(() => unmuteTanAuthor(target)),
     unhide: (target) => mutate(() => unhideTanPost(target)),
+    saveDraft: async (text, opts) => {
+      const draft = await saveTanDraft(text, opts);
+      await refresh();
+      return draft;
+    },
+    deleteDraft: (id) => mutate(() => deleteTanDraft(id)),
     authors: async (sort = "recent", limit = 50, offset = 0) => {
       const data = await getTanAuthors({ sort, limit, offset });
       return { authors: data.authors, total: data.total };

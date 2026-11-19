@@ -125,3 +125,79 @@ describe("TanComposer image attach", () => {
     expect(composer.publish).not.toHaveBeenCalled();
   });
 });
+
+describe("TanComposer drafts", () => {
+  it("saves the text as a draft and clears the composer", async () => {
+    const composer = makeComposer();
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    render(<TanComposer composer={composer} onSaveDraft={onSaveDraft} />);
+    typePost("half-written thought");
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() =>
+      expect(onSaveDraft).toHaveBeenCalledWith("half-written thought", {
+        replyTo: undefined,
+        expiresIn: undefined,
+      }),
+    );
+    expect(
+      (screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value,
+    ).toBe("");
+    expect(composer.publish).not.toHaveBeenCalled();
+  });
+
+  it("carries reply and expiry into the saved draft", async () => {
+    const composer = makeComposer();
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    render(
+      <TanComposer
+        composer={composer}
+        replyTo={"ab".repeat(32)}
+        onSaveDraft={onSaveDraft}
+      />,
+    );
+    typePost("agreed");
+    fireEvent.change(screen.getByLabelText("Post expiry"), {
+      target: { value: "3600" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() =>
+      expect(onSaveDraft).toHaveBeenCalledWith("agreed", {
+        replyTo: "ab".repeat(32),
+        expiresIn: 3600,
+      }),
+    );
+  });
+
+  it("prefills text and expiry from a loaded draft", () => {
+    const composer = makeComposer();
+    render(
+      <TanComposer
+        composer={composer}
+        initialText="back to this later"
+        initialExpiresIn={3600}
+      />,
+    );
+    expect(
+      (screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value,
+    ).toBe("back to this later");
+    expect(
+      (screen.getByLabelText("Post expiry") as HTMLSelectElement).value,
+    ).toBe("3600");
+  });
+
+  it("disables Save draft in poll mode and hides it without a handler", () => {
+    const composer = makeComposer();
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    render(<TanComposer composer={composer} onSaveDraft={onSaveDraft} />);
+    fireEvent.click(screen.getByRole("button", { name: "📊 Poll" }));
+    const save = screen.getByRole("button", { name: "Save draft" });
+    expect(save.hasAttribute("disabled")).toBe(true);
+    expect(save.getAttribute("title")).toMatch(/Polls can't be saved as drafts/);
+  });
+
+  it("shows no Save draft button when the parent cannot save drafts", () => {
+    const composer = makeComposer();
+    render(<TanComposer composer={composer} />);
+    expect(screen.queryByRole("button", { name: "Save draft" })).toBeNull();
+  });
+});

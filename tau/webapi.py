@@ -149,6 +149,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/schedule schedule a Tan post for later
     GET  /api/tan/scheduled queued Tan posts, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
+    GET  /api/tan/drafts   saved Tan post drafts, newest first
+    POST /api/tan/drafts   save a Tan post draft
+    POST /api/tan/drafts/delete discard a saved Tan post draft
     POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
@@ -3487,6 +3490,58 @@ class WebBridge:
             on_cancel=_delete_stored,
         )
         return {"cancelled": post.to_dict(), "deleted_local": deleted_local}
+
+    def tan_drafts(self) -> List[Dict[str, Any]]:
+        """Saved Tan post drafts, newest first (the CLI's ``tan drafts``).
+
+        Drafts need no attached Tan app — they live in the social DB,
+        so a draft saved from the CLI shows up in the console too.
+        """
+        from .tangents.tan import list_drafts
+
+        conn = self._tan_conn()
+        try:
+            return list_drafts(conn)
+        finally:
+            conn.close()
+
+    def tan_save_draft(
+        self,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        expires_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Save a Tan post draft, like ``tau tan draft``.
+
+        The reply target is resolved to its full hash, like
+        :meth:`tan_post` resolves it; the expiry clock starts when
+        the draft is published, not when it is saved.
+        """
+        from .tangents.tan import resolve_post, save_draft
+
+        conn = self._tan_conn()
+        try:
+            if reply_to is not None:
+                reply_to = resolve_post(conn, reply_to)["hash"]
+            return save_draft(
+                conn,
+                text,
+                reply_to=reply_to or "",
+                expires_in=expires_in,
+            )
+        finally:
+            conn.close()
+
+    def tan_delete_draft(self, ref: Any) -> Dict[str, Any]:
+        """Delete a saved Tan post draft, like ``tau tan discard-draft``."""
+        from .tangents.tan import delete_draft
+
+        conn = self._tan_conn()
+        try:
+            return delete_draft(conn, ref)
+        finally:
+            conn.close()
 
     def tan_react(self, target: str, *, liked: bool) -> Dict[str, Any]:
         app = self._tan_app()
@@ -11701,6 +11756,21 @@ class _WebHandler(BaseHTTPRequestHandler):
                     {"scheduled": scheduled, "count": len(scheduled)}, head_only
                 )
                 return
+            if path == "/api/tan/drafts":
+                try:
+                    drafts = self.bridge.tan_drafts()
+                except Exception:
+                    log.exception("failed to load saved Tan drafts")
+                    self._send_json(
+                        {"error": {"message": "could not load saved drafts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {"drafts": drafts, "count": len(drafts)}, head_only
+                )
+                return
             if path == "/api/tan/rules":
                 from .tangents.tan import ENTRY_KINDS
 
@@ -13125,6 +13195,78 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/tan/drafts":
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                reply_to = body.get("reply_to")
+                if reply_to is not None and (
+                    not isinstance(reply_to, str) or not reply_to.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'reply_to' must be a post hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                expires_in = body.get("expires_in")
+                if expires_in is not None:
+                    if (
+                        not isinstance(expires_in, (int, float))
+                        or isinstance(expires_in, bool)
+                        or not _valid_tan_expires_in(expires_in)
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'expires_in' must be a number of "
+                                    "seconds (0 < expires_in <= 604800)"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                try:
+                    draft = self.bridge.tan_save_draft(
+                        text,
+                        reply_to=reply_to,
+                        expires_in=(
+                            float(expires_in) if expires_in is not None else None
+                        ),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "draft": draft}, head_only)
+                return
+            if path == "/api/tan/drafts/delete":
+                target = body.get("id") or body.get("draft")
+                if target is None or isinstance(target, bool):
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    draft = self.bridge.tan_delete_draft(target)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "draft": draft}, head_only)
                 return
             if path == "/api/tan/quote":
                 target = body.get("target") or body.get("hash")
