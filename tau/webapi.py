@@ -28,6 +28,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/delete delete ``{"group": "<id | prefix | name>"}``
     POST /api/groups/add-member add ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
+    POST /api/groups/ban ban ``{"group": "...", "peer": "<hash>"}``
+    POST /api/groups/unban unban ``{"group": "...", "peer": "<hash>"}``
+    GET  /api/groups/banned banned peers for a group (``?group=...``)
     POST /api/groups/rename rename ``{"group": "<id | prefix | name>", "name": "<new name>"}``
     POST /api/groups/topic set or clear the topic ``{"group": "...", "topic": "..."}`` / ``{"group": "...", "clear": true}``
     GET  /api/groups/join-requests pending join requests for groups this node created
@@ -9662,6 +9665,139 @@ class WebBridge:
             "previous_id": group["id"],
         }
 
+    def _describe_banned(self, group: Dict[str, Any]) -> List[Dict[str, str]]:
+        """A group's ban list with display names for the console."""
+        entries = []
+        for banned_hash in group.get("banned") or []:
+            peer = self.node.registry.get(banned_hash)
+            entries.append(
+                {
+                    "hash": banned_hash,
+                    "name": (
+                        peer.display_name
+                        if peer is not None
+                        else banned_hash[:8]
+                    ),
+                }
+            )
+        return entries
+
+    def ban_group_member(self, query: str, peer: str) -> Dict[str, Any]:
+        """Ban a peer from a group from the console.
+
+        Mirrors ``tau group ban``: only the group's creator can ban,
+        the peer is removed from the roster when they are a member
+        and recorded on the ban list either way, so they cannot be
+        re-added or approved through a join request afterwards.  The
+        id derives from the roster, so banning a member is a
+        successor group (same name, new id) and the old id is
+        reported as ``previous_id``.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        if not isinstance(peer, str) or not peer.strip():
+            raise ValueError("field 'peer' is required")
+        group = self.node.groups.find(query.strip())
+        own_hash = self.node.destination_hexhash
+        if not group["local"] or group["creator"] != own_hash:
+            raise ValueError("only the creator can ban members of a group")
+        cleaned = peer.strip().lower()
+        # A member (or an already-banned peer) resolves straight from
+        # the roster, like a removal; anything else resolves through
+        # the registry, so the picker can pass a name as well as a hash.
+        known = list(group["members"]) + list(group.get("banned") or [])
+        if len(cleaned) == 32 and cleaned in known:
+            resolved = cleaned
+        else:
+            try:
+                found = self.node.registry.resolve(cleaned)
+            except PeerError as exc:
+                raise ValueError(str(exc)) from exc
+            if found is None:
+                raise ValueError(f"unknown peer: {peer.strip()}")
+            resolved = found.destination_hash.hex()
+        new_group = self.node.groups.ban(
+            group["id"], resolved, created_by=own_hash
+        )
+        return {
+            "group": self._describe_group(new_group),
+            "banned": self._describe_banned(new_group),
+            "previous_id": group["id"],
+        }
+
+    def unban_group_member(self, query: str, peer: str) -> Dict[str, Any]:
+        """Lift a ban on a group from the console.
+
+        Mirrors ``tau group unban``: only the group's creator can
+        unban, and the peer is not re-added to the roster — they can
+        join again afterwards, but only through the normal paths.  A
+        banned hash (full or unique prefix) needs no lookup; anything
+        else resolves through the registry, so the picker can pass a
+        name as well as a hash.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        if not isinstance(peer, str) or not peer.strip():
+            raise ValueError("field 'peer' is required")
+        group = self.node.groups.find(query.strip())
+        own_hash = self.node.destination_hexhash
+        if not group["local"] or group["creator"] != own_hash:
+            raise ValueError("only the creator can unban members of a group")
+        banned = list(group.get("banned") or [])
+        cleaned = peer.strip().lower()
+        matches = [entry for entry in banned if entry.startswith(cleaned)]
+        if len(matches) == 1:
+            resolved = matches[0]
+        elif len(matches) > 1:
+            raise ValueError(
+                f"ambiguous peer: {peer.strip()!r} matches several banned"
+                " peers; pass a longer hash prefix"
+            )
+        else:
+            try:
+                found = self.node.registry.resolve(cleaned)
+            except PeerError as exc:
+                raise ValueError(str(exc)) from exc
+            if found is not None:
+                resolved = found.destination_hash.hex()
+            elif len(cleaned) == 32:
+                try:
+                    bytes.fromhex(cleaned)
+                except ValueError:
+                    raise ValueError(f"unknown peer: {peer.strip()}") from None
+                resolved = cleaned
+            else:
+                raise ValueError(f"unknown peer: {peer.strip()}")
+        was_banned = resolved in banned
+        new_group = self.node.groups.unban(
+            group["id"], resolved, created_by=own_hash
+        )
+        described = self._describe_group(new_group)
+        found_peer = self.node.registry.get(resolved)
+        return {
+            "group": described,
+            "unbanned": {
+                "hash": resolved,
+                "name": (
+                    found_peer.display_name
+                    if found_peer is not None
+                    else resolved[:8]
+                ),
+            },
+            "was_banned": was_banned,
+        }
+
+    def banned_group_members(self, query: str) -> Dict[str, Any]:
+        """List the peers banned from a group, for the console."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        group = self.node.groups.find(query.strip())
+        return {
+            "group": self._describe_group(group),
+            "banned": self._describe_banned(group),
+            "count": len(group.get("banned") or []),
+        }
+
     def rename_group(self, query: str, name: str) -> Dict[str, Any]:
         """Rename a group from the console, mirroring ``tau group rename``.
 
@@ -11063,6 +11199,25 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/groups/left":
                 self._send_json(self.bridge.left_groups(), head_only)
                 return
+            if path == "/api/groups/banned":
+                target = query.get("group")
+                if not target or not target[0].strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    banned = self.bridge.banned_group_members(target[0].strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(banned, head_only)
+                return
             if path == "/api/broadcasts":
                 broadcasts = self.bridge.list_broadcasts()
                 self._send_json(
@@ -12310,6 +12465,43 @@ class _WebHandler(BaseHTTPRequestHandler):
                         body.get("members"),
                         adding=(path == "/api/groups/add-member"),
                     )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **changed}, head_only)
+                return
+            if path in (
+                "/api/groups/ban",
+                "/api/groups/unban",
+            ):
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                peer = body.get("peer")
+                if not isinstance(peer, str) or not peer.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'peer' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/groups/ban":
+                        changed = self.bridge.ban_group_member(
+                            target.strip(), peer.strip()
+                        )
+                    else:
+                        changed = self.bridge.unban_group_member(
+                            target.strip(), peer.strip()
+                        )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
