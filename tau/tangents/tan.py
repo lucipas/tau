@@ -91,6 +91,7 @@ is offline as long as any peer still has that author's posts cached.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -146,6 +147,19 @@ DEFAULT_SUGGEST_LIMIT = 5
 # suggestion score points; one like on the candidate's posts is worth 1.
 SUGGEST_FOLLOWED_WEIGHT = 2
 MAX_FOLLOWS = 512
+# How many hops of the follow graph a Tan sync (and the Following
+# timeline) reaches: 1 = followed authors only, 2 = plus the authors
+# they follow.  Default 2, per issue #467 — the people your friends
+# follow are the authors most likely worth reading next.  Depth 3+
+# is out: the closure grows fast and the marginal author is rarely
+# worth the bandwidth.  A fetch of a followed author's list that
+# fails is recorded, never fatal; at most this many lists are fetched
+# per sync, so one slow peer cannot stall the whole round.
+TAN_SYNC_DEPTH_DEFAULT = 2
+TAN_SYNC_DEPTH_MIN = 1
+TAN_SYNC_DEPTH_MAX = 2
+TAN_SYNC_DEPTH_FETCH_TIMEOUT = 5.0
+MAX_SYNC_DEPTH_FETCHES = 32
 MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_FOLLOWED_TAGS = 256
@@ -1203,6 +1217,69 @@ def store_media(
     if not pinned:
         _prune_media_store(directory, max_total_bytes=max_total_bytes)
     return target
+
+
+def detect_image_mime(data: bytes) -> Optional[str]:
+    """Detect a Tan image's MIME type from its magic bytes, or None.
+
+    The declared type is never trusted — the bytes decide — so a
+    mislabelled upload cannot smuggle another format past the post.
+    """
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def image_attachment_from_data_url(
+    value: Any, data_dir: Union[str, Path]
+) -> Dict[str, Any]:
+    """Decode a base64 data-URL image upload into a Tan attachment dict.
+
+    Validates the same way the CLI's ``_read_image`` does — JPEG, PNG,
+    GIF or WebP by magic bytes, 1 byte .. ``MAX_IMAGE_BYTES`` — then
+    stores the bytes pinned in the local media store, so the author can
+    serve them when a peer asks.  Returns the ``{sha256, size, mime,
+    name}`` descriptor the signed post carries; the bytes themselves
+    never go in the post.  Raises :class:`PostError` on bad input.
+    """
+    if not isinstance(value, str) or not value.startswith("data:"):
+        raise PostError("post image must be a base64 data URL")
+    try:
+        header, encoded = value[5:].split(",", 1)
+    except ValueError as exc:
+        raise PostError("post image must be a base64 data URL") from exc
+    if not header.endswith(";base64"):
+        raise PostError("post image must be a base64 data URL")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise PostError("post image is not valid base64") from exc
+    if len(data) < 1 or len(data) > MAX_IMAGE_BYTES:
+        raise PostError(
+            f"post image of {len(data)} bytes is outside the "
+            f"1..{MAX_IMAGE_BYTES} byte limit"
+        )
+    mime = detect_image_mime(data)
+    if mime is None:
+        raise PostError("post image must be a JPEG, PNG, GIF or WebP file")
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        store_media(data_dir, digest, data, pinned=True)
+    except TanError as exc:
+        raise PostError(str(exc)) from exc
+    ext = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/gif": "gif",
+        "image/webp": "webp",
+    }[mime]
+    return {"sha256": digest, "size": len(data), "mime": mime, "name": f"image.{ext}"}
 
 
 def _prune_media_store(directory: Path, *, max_total_bytes: int) -> None:
@@ -6128,6 +6205,54 @@ def followers_from_lists(
     return sorted(followers)
 
 
+def expand_follow_scope(
+    followed: Sequence[str],
+    follow_lists: Dict[str, Sequence[str]],
+    *,
+    depth: int = TAN_SYNC_DEPTH_MAX,
+    limit: int = MAX_FOLLOWS,
+) -> List[str]:
+    """Authors in scope at a follow-graph depth, in stable order.
+
+    Depth 1 returns the followed authors.  Depth 2 adds every author
+    on a followed author's published follow list — the second hop.
+    Followed authors always come first, in follow order, then the
+    second hop in sorted order, so the result is deterministic and a
+    cap keeps the newest follows instead of the newest strangers.
+    Entries that are not well-formed author hashes are skipped: a
+    stored list is signature-verified, so this is belt and braces
+    against a hand-edited file, not a trust decision.
+    """
+    seen: Set[str] = set()
+    scoped: List[str] = []
+    for author in followed:
+        try:
+            clean = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+        except TanError:
+            continue
+        if clean in seen:
+            continue
+        seen.add(clean)
+        scoped.append(clean)
+    if depth < TAN_SYNC_DEPTH_MAX:
+        return scoped
+    second_hop: Set[str] = set()
+    for author in scoped:
+        for candidate in follow_lists.get(author, []):
+            try:
+                clean = _require_hex(candidate, AUTHOR_HEX_LENGTH, "author")
+            except TanError:
+                continue
+            if clean not in seen:
+                second_hop.add(clean)
+    for author in sorted(second_hop):
+        if len(scoped) >= max(1, int(limit)):
+            break
+        seen.add(author)
+        scoped.append(author)
+    return scoped
+
+
 def suggest_authors(
     conn: sqlite3.Connection,
     *,
@@ -8252,6 +8377,143 @@ class TanApp:
             author, own_author=self.author, followed=followed
         )
 
+    def _sync_depth(self) -> int:
+        """This node's Tan sync depth (1 or 2), defaulting to 2.
+
+        Read live from ``node.json`` on every call, so a change made
+        on the CLI or in the console applies to the next sync without
+        a restart.  A node without a data directory (tests, embeds)
+        takes the default.
+        """
+        from ..config import tan_sync_depth
+
+        data_dir = getattr(self.config, "data_dir", None)
+        if data_dir is None:
+            return TAN_SYNC_DEPTH_DEFAULT
+        try:
+            return tan_sync_depth(Path(data_dir))
+        except Exception:
+            return TAN_SYNC_DEPTH_DEFAULT
+
+    def _stored_follow_lists(self) -> Dict[str, List[str]]:
+        """Follow lists this node has already verified and stored.
+
+        Prefers the running node's store (it picks up lists fetched
+        since start); falls back to opening the store from the data
+        directory.  Anything missing or unreadable means no second
+        hop is known yet — depth 2 then behaves like depth 1 for
+        those authors, rather than failing the sync.
+        """
+        from ..follows import FollowListStore
+
+        store = getattr(self.node, "follow_list_store", None)
+        docs: List[Dict[str, Any]] = []
+        if store is not None:
+            try:
+                docs = store.all()
+            except Exception:
+                docs = []
+        if not docs:
+            path = getattr(self.config, "follow_lists_path", None)
+            if path is not None:
+                try:
+                    docs = FollowListStore(path).all()
+                except Exception:
+                    docs = []
+        lists: Dict[str, List[str]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            author = doc.get("author")
+            authors = doc.get("authors")
+            if isinstance(author, str) and isinstance(authors, list):
+                lists[author] = [
+                    entry for entry in authors if isinstance(entry, str)
+                ]
+        return lists
+
+    def _fetch_missing_follow_lists(
+        self,
+        lists: Dict[str, List[str]],
+        followed: Sequence[str],
+        *,
+        peers: Optional[Sequence[Any]] = None,
+        errors: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, List[str]]:
+        """Fetch the follow lists depth 2 needs that are not stored yet.
+
+        Only authors whose list is not already stored are asked, only
+        when the peer is known to the registry (no discovery during a
+        sync), and at most ``MAX_SYNC_DEPTH_FETCHES`` fetches per sync.
+        A fetch that fails is recorded in *errors* when given and never
+        raises — the author simply contributes no second hop this round.
+        """
+        node = self.node
+        request_follows = (
+            getattr(node, "request_follows", None) if node is not None else None
+        )
+        if request_follows is None:
+            return lists
+        by_hash = {
+            getattr(peer, "hexhash", ""): peer for peer in (peers or [])
+        }
+        fetched = dict(lists)
+        attempts = 0
+        for author in followed:
+            if author in fetched or attempts >= MAX_SYNC_DEPTH_FETCHES:
+                continue
+            peer = by_hash.get(author)
+            if peer is None:
+                continue
+            attempts += 1
+            try:
+                doc = request_follows(
+                    peer, timeout=TAN_SYNC_DEPTH_FETCH_TIMEOUT
+                )
+            except Exception as exc:
+                if errors is not None:
+                    errors.append(
+                        {
+                            "peer": author,
+                            "author": author,
+                            "error": f"follow list fetch failed: {exc}",
+                        }
+                    )
+                continue
+            if isinstance(doc, dict) and isinstance(doc.get("authors"), list):
+                fetched[author] = [
+                    entry for entry in doc["authors"] if isinstance(entry, str)
+                ]
+        return fetched
+
+    def _scope_authors(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        peers: Optional[Sequence[Any]] = None,
+        fetch: bool = False,
+        errors: Optional[List[Dict[str, str]]] = None,
+    ) -> List[str]:
+        """Authors in scope for sync and the Following timeline.
+
+        Followed authors, plus at depth 2 the authors on their
+        published follow lists.  The display path (``fetch=False``)
+        uses stored lists only, so reading the timeline never does
+        network I/O; sync (``fetch=True``) asks known peers for lists
+        it does not hold yet.  Blocked and muted authors are not
+        filtered here — the sync loop's admission check and the
+        timeline's display rules still exclude them, at every depth.
+        """
+        followed = [record["author"] for record in following(conn)]
+        if self._sync_depth() < TAN_SYNC_DEPTH_MAX:
+            return followed
+        lists = self._stored_follow_lists()
+        if fetch:
+            lists = self._fetch_missing_follow_lists(
+                lists, followed, peers=peers, errors=errors
+            )
+        return expand_follow_scope(followed, lists, depth=self._sync_depth())
+
     # -- lifecycle ---------------------------------------------------------
 
     def attach(self, node: Any) -> None:
@@ -8356,7 +8618,7 @@ class TanApp:
         conn = self.connect()
         try:
             if authors is None and not include_all:
-                authors = [record["author"] for record in following(conn)]
+                authors = self._scope_authors(conn)
                 authors.append(self.author)
             posts = timeline(
                 conn,
@@ -8621,7 +8883,9 @@ class TanApp:
         errors: List[Dict[str, str]] = []
         try:
             if authors is None:
-                authors = [record["author"] for record in following(conn)]
+                authors = self._scope_authors(
+                    conn, peers=peers, fetch=True, errors=errors
+                )
             authors = list(authors)
             if self.author not in authors:
                 authors.append(self.author)

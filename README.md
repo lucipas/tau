@@ -128,10 +128,12 @@ advances the cursor when you read a conversation, and the console shows an
 unread badge next to each peer and the unread total in the tab title.
 Opening a peer in the console clears its badge; read receipts to the sender
 are a separate feature and do not exist yet. A single conversation can be
-muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
-pinned to the top of the list with `tau pin-conversation --peer alice`
-(`--group NAME` pins a group, `--channel NAME` a joined channel),
-and `tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
+muted with `tau mute --peer alice` (or for a while with `--for 1h`), and a
+channel with `tau mute --channel general` — muted conversations still
+receive messages, they just never light the badge — and pinned to the top
+of the list with `tau pin-conversation --peer alice` (`--group NAME` pins
+a group, `--channel NAME` a joined channel). `tau quiet-hours set
+--start 22:00 --end 07:00` silences the whole badge
 every night instead — while the window is active every conversation counts
 as unread 0, and the counts come back when it ends. The Chat tab has a
 search box above the conversation list: it searches stored DM and group
@@ -254,6 +256,11 @@ tau tan timeline --json
 
 `tau serve --social --social-sync-interval 60` also pulls the public timeline
 from known peers every minute, so a long-running node keeps its cache fresh.
+
+Sync reaches two hops into the follow graph by default: it pulls followed
+authors plus the authors they follow (their published follow lists are fetched
+over `/tau/follows` when missing). `tau config tan-sync-depth 1` pulls followed
+authors only; the console Settings page has the same switch.
 
 Useful flags:
 
@@ -430,7 +437,7 @@ Global options may appear before or after the command:
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message and unread counts |
-| `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message) |
+| `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message; `--expire 30s` makes it a disappearing message, purged from members' stores after the duration; a per-channel default from `tau disappearing --channel` fills the expiry in when no `--expire` is passed) |
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
 | `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
 | `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
@@ -494,6 +501,8 @@ tau outbox
 # Broadcast lists: one message, many private DMs (no shared group)
 tau broadcast create team --peer alice --peer bob
 tau broadcast send team "meet at noon"
+# The web console has the same lists: Chat → Broadcasts, for
+# creating a list, sending to it, and deleting it.
 
 # Read back messages this node received (newest first)
 tau messages
@@ -698,10 +707,19 @@ expiry travels inside the encrypted payload — and inside the signed
 sealed envelope for relayed mail, so a holder cannot extend it — the
 receiver shows the deadline and purges the message once it passes, and
 a queued copy (and any sealed copy deposited from it) expires on the
-same schedule. The web console composer has the same picker. Honest
+same schedule. The web console composer has the same picker.
+`tau group send` takes the same `--expire`, and `tau channel send
+--expire 1h` does the same for a channel message — the expiry rides
+the message as an unsigned field, so an older node still verifies and
+shows it (it just never purges it), while a current node drops it on
+receipt once expired and purges it from its store. `tau disappearing
+[--peer PEER | --group GROUP | --channel NAME] [DURATION | --off]`
+sets a standing default (at most 7d) for one conversation, filled in
+whenever a send passes no explicit `--expire`; the console Settings
+page edits the same defaults. Honest
 caveat: expiry is cooperative — a modified client can keep copies, so
-this is hygiene, not a guarantee. Tan posts are public signed chains
-and never expire; tombstones already cover their removal.
+this is hygiene, not a guarantee. Tan posts take the same `--expire`
+on `tau tan post` (at most 7d); tombstones already cover their removal.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

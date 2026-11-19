@@ -243,7 +243,10 @@ export function useTanThread(ref: string | null): UseTanThreadResult {
 // ------------------------------------------------------------- composer ---
 
 export interface UseTanComposerResult {
-  publish: (text: string, opts?: { replyTo?: string; expiresIn?: number }) => Promise<TanPost>;
+  publish: (
+    text: string,
+    opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } },
+  ) => Promise<TanPost>;
   schedule: (text: string, sendIn: number, opts?: { replyTo?: string; expiresIn?: number }) => Promise<ScheduledTanPost>;
   poll: (question: string, options: string[], expiresIn?: number) => Promise<TanPost>;
   busy: boolean;
@@ -270,7 +273,13 @@ export function useTanComposer(): UseTanComposerResult {
 
   return {
     publish: (text, opts) =>
-      run(() => publishTanPost(text, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn })),
+      run(() =>
+        publishTanPost(text, {
+          replyTo: opts?.replyTo,
+          expiresIn: opts?.expiresIn,
+          image: opts?.image,
+        }),
+      ),
     schedule: (text, sendIn, opts) =>
       run(() => scheduleTanPost(text, sendIn, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn })),
     poll: (question, options, expiresIn) => run(() => createTanPoll(question, options, expiresIn)),

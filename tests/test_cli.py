@@ -2753,6 +2753,39 @@ def test_tan_followers_needs_identity(tmp_path, capsys):
     assert "no identity" in capsys.readouterr().err
 
 
+def test_config_tan_sync_depth_show_set_and_list(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    # Default is 2 (per #467) on a fresh node.
+    code = cli.main(["config", "tan-sync-depth", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Tan sync depth: 2" in capsys.readouterr().out
+
+    code = cli.main(
+        ["config", "tan-sync-depth", "1", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "Tan sync depth: 1" in capsys.readouterr().out
+
+    code = cli.main(
+        ["config", "tan-sync-depth", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == {"tan_sync_depth": 1}
+
+    # The plain listing shows the depth alongside the other settings.
+    code = cli.main(["config", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "tan sync depth: 1" in out
+    assert "tau config tan-sync-depth 1|2" in out
+
+
+def test_config_tan_sync_depth_rejects_bad_value(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    with pytest.raises(SystemExit):
+        cli.main(["config", "tan-sync-depth", "3", "--data-dir", str(data_dir)])
+
+
 def test_peers_show_includes_profile(tmp_path, capsys):
     data_dir, _, _ = _seed_peer_profile(tmp_path)
     code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])

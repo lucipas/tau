@@ -1563,6 +1563,24 @@ def test_unread_counts_messages_received_since_join(identities, tmp_path):
     assert channel_unread_counts(conn) == {"general": 2, "other": 1}
 
 
+def test_unread_counts_excludes_muted_channels(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    _join_at(conn, "other", 1000)
+    store_message(conn, _store_from(identities, source, bob, "other", "elsewhere", 1002), now=1002)
+
+    assert channel_unread_counts(conn, exclude_channels=["general"]) == {"other": 1}
+    assert channel_unread_counts(conn, exclude_channels=["general", "other"]) == {}
+    # Excluding a channel that has nothing unread changes nothing.
+    assert channel_unread_counts(conn, exclude_channels=["missing"]) == {
+        "general": 1,
+        "other": 1,
+    }
+
+
 def test_unread_counts_empty_without_messages(tmp_path):
     conn = init_db(tmp_path / "channels.sqlite3")
     _join_at(conn, "general", 1000)
@@ -1666,6 +1684,43 @@ def test_app_unread_counts_excludes_own_and_blocked_messages(identities, tmp_pat
     marked = app.mark_read("general")
     assert marked["cleared"] == 0
     assert app.unread_counts() == {}
+
+
+def test_app_unread_counts_excludes_muted_channels(identities, tmp_path):
+    from tau.muted import MutedConversations, save_muted
+
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    app.join("general")
+    app.send("general", "my own post", publish=False)
+
+    source = init_db(tmp_path / "source.sqlite3")
+    conn = app.connect()
+    try:
+        store_message(
+            conn,
+            _store_from(identities, source, bob, "general", "hi", 1001),
+            now=time.time(),
+        )
+    finally:
+        conn.close()
+    assert app.unread_counts() == {"general": 1}
+
+    save_muted(
+        config.muted_path,
+        MutedConversations(channels=frozenset({"general"})),
+    )
+    assert app.unread_counts() == {}
+
+    # Unmuting restores the count: the read cursor never moved.
+    save_muted(config.muted_path, MutedConversations())
+    assert app.unread_counts() == {"general": 1}
+
+    # A corrupt mutes file fails open — the channel counts as unmuted
+    # rather than breaking the whole read.
+    config.muted_path.write_text("{not json", encoding="utf-8")
+    assert app.unread_counts() == {"general": 1}
 
 
 def test_cli_channel_list_shows_unread_and_mark_read_clears(tmp_path, capsys):
@@ -3426,3 +3481,267 @@ def test_cli_channel_retract_rejects_unknown_and_others(tmp_path, capsys):
         assert get_message(conn, other["hash"]) is not None
     finally:
         conn.close()
+
+# -- disappearing channel messages -------------------------------------------
+
+
+def test_expiry_is_unsigned_and_leaves_the_hash_unchanged(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    now = time.time()
+    plain = create_message(conn, alice, "general", "plain hello", name="alice", now=now)
+    expiring = create_message(
+        conn,
+        alice,
+        "general",
+        "ephemeral hello",
+        name="alice",
+        now=now,
+        expires_at=now + 3600,
+    )
+
+    # The expiry never enters the signed body: an old node verifies an
+    # expiring message exactly like a plain one, and the hash is the
+    # same with the expiry stripped off.
+    assert expiring["hash"] == hash_message(
+        {key: value for key, value in expiring.items() if key != "expires_at"}
+    )
+    assert verify_message(expiring)["expires_at"] == now + 3600
+    assert verify_message(plain).get("expires_at") is None
+    assert "expires_at" not in plain
+    assert expiring["expires_at"] == now + 3600
+
+
+def test_normalize_rejects_bad_expiry(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    now = time.time()
+    message = create_message(conn, alice, "general", "hello", name="alice", now=now)
+    created_at = message["created_at"]
+    for bad in (
+        created_at - 1,
+        created_at,
+        created_at + 31 * 24 * 3600,
+        "soon",
+        True,
+        float("inf"),
+    ):
+        with pytest.raises(ChannelError):
+            verify_message(dict(message, expires_at=bad))
+
+
+def test_create_message_rejects_a_past_expiry(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    now = time.time()
+    with pytest.raises(ChannelError, match="in the future"):
+        create_message(
+            conn, alice, "general", "hello", name="alice", now=now, expires_at=now - 1
+        )
+
+
+def test_store_drops_an_already_expired_message(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    now = time.time()
+    # Created two hours ago, expired one hour ago: valid when signed,
+    # but already dead on arrival.
+    message = create_message(
+        source, bob, "general", "too late", name="bob", now=now - 7200,
+        expires_at=now - 3600,
+    )
+    conn = init_db(tmp_path / "channels.sqlite3")
+    stored, is_new = store_message(conn, message, now=now)
+    assert is_new is False
+    assert get_message(conn, message["hash"]) is None
+    assert channel_history(conn, "general") == []
+
+
+def test_history_hides_expired_messages_but_keeps_live_ones(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    now = time.time()
+    create_message(
+        conn, alice, "general", "gone by now", name="alice",
+        now=now - 7200, expires_at=now - 3600,
+    )
+    live = create_message(
+        conn, alice, "general", "still here", name="alice",
+        now=now - 60, expires_at=now + 3600,
+    )
+    assert [item["text"] for item in channel_history(conn, "general")] == [
+        "still here"
+    ]
+    assert channel_history(conn, "general")[0]["expires_at"] == live["expires_at"]
+
+
+def test_store_purges_expired_rows(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    base = time.time()
+    short = create_message(
+        conn, alice, "general", "short lived", name="alice",
+        now=base, expires_at=base + 60,
+    )
+    assert get_message(conn, short["hash"]) is not None
+    # A later store purges rows whose expiry has passed by then.
+    create_message(
+        conn, alice, "general", "next", name="alice",
+        now=base + 3600, expires_at=base + 7200,
+    )
+    assert get_message(conn, short["hash"]) is None
+    assert [item["text"] for item in channel_history(conn, "general")] == ["next"]
+
+
+def test_init_db_migrates_a_store_without_expires_at(identities, tmp_path):
+    import sqlite3
+
+    alice, _ = identities
+    path = tmp_path / "channels.sqlite3"
+    # A store as written before expiring messages: no expires_at column.
+    raw = sqlite3.connect(str(path))
+    raw.executescript(
+        "CREATE TABLE messages ("
+        "v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "channel TEXT NOT NULL, author TEXT NOT NULL, key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, "
+        "created_at REAL NOT NULL, received_at REAL NOT NULL, sig TEXT NOT NULL);"
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        "CREATE TABLE retractions (hash TEXT NOT NULL, channel TEXT NOT NULL, "
+        "author TEXT NOT NULL, key TEXT NOT NULL, created_at REAL NOT NULL, "
+        "received_at REAL NOT NULL, sig TEXT NOT NULL, PRIMARY KEY (hash, author));"
+        "CREATE TABLE memberships (channel TEXT PRIMARY KEY, joined_at REAL NOT NULL);"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = init_db(path)
+    try:
+        columns = [
+            row[1]
+            for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+        ]
+        assert "expires_at" in columns
+        message = create_message(
+            conn, alice, "general", "hello", name="alice", expires_at=time.time() + 60
+        )
+        assert message["expires_at"] is not None
+        assert get_message(conn, message["hash"])["expires_at"] == message["expires_at"]
+    finally:
+        conn.close()
+
+
+def test_send_applies_the_channel_default(identities, tmp_path, monkeypatch):
+    from tau.disappearing import DisappearingDefaults, save_disappearing_defaults
+
+    alice, _ = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    save_disappearing_defaults(
+        config.disappearing_path,
+        DisappearingDefaults(channels={"general": 300.0}),
+    )
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    app.join("general")
+    message = app.send("general", "with default", publish=False)
+    assert message["expires_at"] is not None
+    assert message["expires_at"] - time.time() == pytest.approx(300, abs=5)
+
+    # An explicit expiry wins over the default.
+    explicit = time.time() + 7200
+    message = app.send("general", "explicit", publish=False, expires_at=explicit)
+    assert message["expires_at"] == explicit
+
+
+def test_send_without_default_or_expiry_has_none(identities, tmp_path):
+    alice, _ = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    app.join("general")
+    message = app.send("general", "forever", publish=False)
+    assert "expires_at" not in message
+
+
+def test_cli_channel_send_expire_roundtrip(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--expire",
+                "1h",
+                "--json",
+                "general",
+                "ephemeral hello",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    expires_at = payload["message"]["expires_at"]
+    assert expires_at - time.time() == pytest.approx(3600, abs=5)
+
+    assert main(["channel", "read", "--data-dir", str(data_dir), "general"]) == 0
+    assert "ephemeral hello" in capsys.readouterr().out
+
+    # The channel default fills the expiry in when no --expire is passed.
+    assert (
+        main(
+            ["disappearing", "--data-dir", str(data_dir), "--channel", "general", "5m"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "general",
+                "defaulted hello",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["message"]["expires_at"] - time.time() == pytest.approx(
+        300, abs=5
+    )
+
+
+def test_cli_channel_send_expire_rejects_bad_durations(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    for bad in ("0s", "31d", "not-a-duration"):
+        assert (
+            main(
+                [
+                    "channel",
+                    "send",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "--expire",
+                    bad,
+                    "general",
+                    "nope",
+                ]
+            )
+            == 2
+        )
+        assert "error" in capsys.readouterr().err

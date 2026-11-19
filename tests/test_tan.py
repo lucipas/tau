@@ -11,7 +11,7 @@ import RNS
 import pytest
 
 from tau.cli import main
-from tau.config import TauConfig
+from tau.config import TauConfig, set_node_setting
 from tau.follows import FollowListStore, build_follow_list
 from tau.identity import destination_hash, load_identity
 from tau.peers import Peer
@@ -59,6 +59,7 @@ from tau.tangents.tan import (
     draft_claim_held,
     edit_states,
     export_entries,
+    expand_follow_scope,
     extract_tags,
     feed,
     find_post_by_image,
@@ -1239,6 +1240,188 @@ def test_sync_pulls_missing_posts(identities, tmp_path):
         "bob one",
         "bob two",
     ]
+
+
+def test_expand_follow_scope_depth_one_keeps_followed_only():
+    alice, bob = "aa" * 16, "bb" * 16
+    assert expand_follow_scope([alice, bob, alice], {alice: [bob]}, depth=1) == [
+        alice,
+        bob,
+    ]
+
+
+def test_expand_follow_scope_depth_two_adds_second_hop():
+    alice, bob, carol, dave = "aa" * 16, "bb" * 16, "cc" * 16, "dd" * 16
+    scoped = expand_follow_scope(
+        [bob, carol],
+        {bob: [dave, alice], carol: [dave]},
+        depth=2,
+    )
+    # dave is on both followed authors' lists (the second hop, deduped)
+    # and alice is on bob's list too; the hop comes back sorted.
+    assert scoped == [bob, carol, alice, dave]
+
+
+def test_expand_follow_scope_skips_malformed_entries():
+    alice = "aa" * 16
+    scoped = expand_follow_scope(
+        [alice, "not-hex", ""],
+        {alice: ["zz" * 16, "bb" * 16]},
+        depth=2,
+    )
+    assert scoped == [alice, "bb" * 16]
+
+
+def test_expand_follow_scope_caps_the_second_hop():
+    alice = "aa" * 16
+    second = ["%032x" % n for n in range(1, 6)]
+    scoped = expand_follow_scope([alice], {alice: second}, depth=2, limit=3)
+    assert scoped == [alice, *sorted(second)[:2]]
+
+
+def _sync_depth_two_setup(identities, tmp_path):
+    """Alice follows bob; bob's published list names carol; the source
+    holds one post each from bob and carol.  Returns the pieces a sync
+    test needs."""
+    alice, bob = identities
+    carol = RNS.Identity()
+    source = init_db(tmp_path / "source.sqlite3")
+    create_post(source, bob, "bob one", name="bob", now=1000)
+    create_post(source, carol, "carol one", name="carol", now=1001)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = TanApp(config, alice, name="alice", gossip=False)
+    conn = app.connect()
+    try:
+        follow(conn, author_of(bob), name="bob")
+    finally:
+        conn.close()
+    bob_list = build_follow_list(
+        bob, authors=[author_of(carol)], version=1, updated_at=1000.0
+    )
+    peer = Peer(
+        destination_hash=bytes.fromhex(author_of(bob)),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    return alice, bob, carol, source, config, app, bob_list, peer
+
+
+class _FakeNodeWithFollows(_FakeNode):
+    """_FakeNode that can also answer follow-list fetches."""
+
+    def __init__(self, peer, source, *, follow_lists=None, fetch_error=None):
+        super().__init__(peer, source)
+        self.follow_lists = follow_lists or {}
+        self.fetch_error = fetch_error
+        self.fetch_calls = []
+
+    def request_follows(self, peer, *, timeout=5.0):
+        self.fetch_calls.append(getattr(peer, "hexhash", "?"))
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        return self.follow_lists.get(getattr(peer, "hexhash", ""))
+
+
+def test_sync_depth_two_pulls_second_hop_from_stored_list(identities, tmp_path):
+    _, _, carol, source, config, app, bob_list, peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    # Bob's list is already stored, so no fetch happens during sync.
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(bob_list)
+    store.save()
+
+    node = _FakeNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, limit=20)
+    assert summary["stored"] == 2
+    assert summary["errors"] == []
+    assert [
+        post["text"] for post in feed(app.connect(), author=author_of(carol))
+    ] == ["carol one"]
+
+
+def test_sync_depth_one_skips_second_hop(identities, tmp_path):
+    _, _, carol, source, config, app, bob_list, peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(bob_list)
+    store.save()
+    set_node_setting(tmp_path, "tan_sync_depth", 1)
+
+    node = _FakeNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, limit=20)
+    assert summary["stored"] == 1
+    assert summary["errors"] == []
+    assert feed(app.connect(), author=author_of(carol)) == []
+
+
+def test_sync_depth_two_fetches_missing_follow_list(identities, tmp_path):
+    _, bob, carol, source, _, app, bob_list, peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    node = _FakeNodeWithFollows(
+        peer, source, follow_lists={author_of(bob): bob_list}
+    )
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, limit=20)
+    assert summary["stored"] == 2
+    assert summary["errors"] == []
+    assert node.fetch_calls == [author_of(bob)]
+    assert [
+        post["text"] for post in feed(app.connect(), author=author_of(carol))
+    ] == ["carol one"]
+
+
+def test_sync_depth_two_records_failed_follow_list_fetch(identities, tmp_path):
+    from tau.instance_lock import NodeError
+
+    _, _, carol, source, _, app, _, peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    node = _FakeNodeWithFollows(
+        peer, source, fetch_error=NodeError("peer unreachable")
+    )
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, limit=20)
+    # Bob's own post still syncs; only the second hop is lost.
+    assert summary["stored"] == 1
+    assert any(
+        "follow list fetch failed" in error["error"]
+        for error in summary["errors"]
+    )
+    assert feed(app.connect(), author=author_of(carol)) == []
+
+
+def test_timeline_depth_two_shows_second_hop_posts(identities, tmp_path):
+    _, _, carol, _, config, app, bob_list, _peer = _sync_depth_two_setup(
+        identities, tmp_path
+    )
+    # Carol's post is already stored locally (as a sync would leave it);
+    # bob's list is stored, so the timeline can resolve the second hop
+    # without any network fetch.
+    conn = app.connect()
+    try:
+        create_post(conn, carol, "carol one", name="carol", now=1001)
+    finally:
+        conn.close()
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(bob_list)
+    store.save()
+
+    assert [post["text"] for post in app.timeline()] == ["carol one"]
+
+    set_node_setting(tmp_path, "tan_sync_depth", 1)
+    assert app.timeline() == []
 
 
 def test_cli_post_and_timeline(tmp_path):

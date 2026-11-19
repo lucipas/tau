@@ -17,13 +17,18 @@ is never silently overwritten.  Unmuting restores normal counting
 from that point on, including messages that arrived while muted —
 the read cursor is untouched by muting, so nothing is lost.
 
-A mute may be timed: ``peer_until`` / ``group_until`` map a muted
-key to the epoch second the mute lifts.  An entry with no expiry is
-indefinite, as before, and files written before timed mutes existed
-carry no expiry maps at all and load unchanged.  Expiry is enforced
-at every read — an expired entry counts as unmuted — and expired
-entries are dropped on load, so the file self-cleans on the next
-save; a mute is never resurrected by a stale entry.
+A mute may be timed: ``peer_until`` / ``group_until`` /
+``channel_until`` map a muted key to the epoch second the mute
+lifts.  An entry with no expiry is indefinite, as before, and files
+written before timed mutes existed carry no expiry maps at all and
+load unchanged.  Expiry is enforced at every read — an expired entry
+counts as unmuted — and expired entries are dropped on load, so the
+file self-cleans on the next save; a mute is never resurrected by a
+stale entry.
+
+Channels mute by name, like DMs and groups mute by destination hash
+and group id: a muted channel still receives and lists its messages,
+but its per-channel unread count is 0.
 """
 
 from __future__ import annotations
@@ -76,6 +81,20 @@ def _clean_group_id(value: Any) -> str:
     return cleaned
 
 
+def _clean_channel(value: Any) -> str:
+    # Channel names are validated by ``tau.channels``; anything else
+    # is not a channel.  The name is the mute key — channels have no
+    # id separate from their name.  Imported here, not at the top:
+    # ``tau.channels`` imports this module for the count paths, so a
+    # top-level import would be circular.
+    from .channels import ChannelError, clean_channel_name
+
+    try:
+        return clean_channel_name(value)
+    except ChannelError as exc:
+        raise MutedError(str(exc)) from exc
+
+
 def _clean_muted(values: Any, *, kind: str) -> FrozenSet[str]:
     if not isinstance(values, list):
         raise MutedError(f"{kind} muted conversations must be a JSON array")
@@ -86,6 +105,8 @@ def _clean_muted(values: Any, *, kind: str) -> FrozenSet[str]:
                 cleaned.add(clean_destination(key))
             except AllowListError as exc:
                 raise MutedError(str(exc)) from exc
+        elif kind == "channel":
+            cleaned.add(_clean_channel(key))
         else:
             cleaned.add(_clean_group_id(key))
     return frozenset(cleaned)
@@ -113,6 +134,8 @@ def _clean_until_map(
     for key, until in values.items():
         if kind == "peer":
             cleaned_key = _clean_destination(key)
+        elif kind == "channel":
+            cleaned_key = _clean_channel(key)
         else:
             cleaned_key = _clean_group_id(key)
         if cleaned_key not in keys:
@@ -154,24 +177,34 @@ def _with_until(
 
 @dataclass(frozen=True)
 class MutedConversations:
-    """Muted DM peers and groups, as destination hashes and group ids.
+    """Muted DM peers, groups, and channels.
 
-    ``peer_until`` / ``group_until`` hold the epoch second a timed
-    mute lifts, per muted key; a key absent from its map is muted
-    indefinitely.  The maps are plain dicts (the dataclass is never
-    hashed), rebuilt — never mutated — by the ``with_*`` methods.
+    Peers mute by destination hash, groups by id, channels by name.
+    ``peer_until`` / ``group_until`` / ``channel_until`` hold the
+    epoch second a timed mute lifts, per muted key; a key absent from
+    its map is muted indefinitely.  The maps are plain dicts (the
+    dataclass is never hashed), rebuilt — never mutated — by the
+    ``with_*`` methods.
     """
 
     peers: FrozenSet[str] = field(default_factory=frozenset)
     groups: FrozenSet[str] = field(default_factory=frozenset)
+    channels: FrozenSet[str] = field(default_factory=frozenset)
     peer_until: Dict[str, float] = field(default_factory=dict)
     group_until: Dict[str, float] = field(default_factory=dict)
+    channel_until: Dict[str, float] = field(default_factory=dict)
 
     def _live(
         self, key: str, *, kind: str, now: Optional[float] = None
     ) -> bool:
         """Whether *key*'s mute is still in force: no expiry, or unexpired."""
-        until = (self.peer_until if kind == "peer" else self.group_until).get(key)
+        until = (
+            self.peer_until
+            if kind == "peer"
+            else self.channel_until
+            if kind == "channel"
+            else self.group_until
+        ).get(key)
         if until is None:
             return True
         now = time.time() if now is None else now
@@ -229,6 +262,34 @@ class MutedConversations:
             return None
         return self.group_until.get(key)
 
+    def is_muted_channel(
+        self, channel: Optional[str], now: Optional[float] = None
+    ) -> bool:
+        """Whether the channel is muted, or ``False`` when unusable."""
+        if channel is None:
+            return False
+        try:
+            key = _clean_channel(channel)
+        except MutedError:
+            return False
+        return key in self.channels and self._live(key, kind="channel", now=now)
+
+    def muted_until_channel(
+        self, channel: Optional[str], now: Optional[float] = None
+    ) -> Optional[float]:
+        """Epoch second the channel's timed mute lifts, else ``None``."""
+        if channel is None:
+            return None
+        try:
+            key = _clean_channel(channel)
+        except MutedError:
+            return None
+        if key not in self.channels or not self._live(
+            key, kind="channel", now=now
+        ):
+            return None
+        return self.channel_until.get(key)
+
     def with_peer(
         self, destination: str, until: Optional[float] = None
     ) -> "MutedConversations":
@@ -238,8 +299,10 @@ class MutedConversations:
         return MutedConversations(
             peers=frozenset(peers),
             groups=self.groups,
+            channels=self.channels,
             peer_until=_with_until(self.peer_until, key, until),
             group_until=dict(self.group_until),
+            channel_until=dict(self.channel_until),
         )
 
     def without_peer(self, destination: str) -> "MutedConversations":
@@ -251,8 +314,10 @@ class MutedConversations:
         return MutedConversations(
             peers=frozenset(peers),
             groups=self.groups,
+            channels=self.channels,
             peer_until=peer_until,
             group_until=dict(self.group_until),
+            channel_until=dict(self.channel_until),
         )
 
     def is_muted_group_lineage(
@@ -297,8 +362,10 @@ class MutedConversations:
         return MutedConversations(
             peers=self.peers,
             groups=frozenset(groups),
+            channels=self.channels,
             peer_until=dict(self.peer_until),
             group_until=group_until,
+            channel_until=dict(self.channel_until),
         )
 
     def without_group_lineage(
@@ -311,8 +378,10 @@ class MutedConversations:
         return MutedConversations(
             peers=self.peers,
             groups=frozenset(groups),
+            channels=self.channels,
             peer_until=dict(self.peer_until),
             group_until=group_until,
+            channel_until=dict(self.channel_until),
         )
 
     def with_group(
@@ -324,8 +393,10 @@ class MutedConversations:
         return MutedConversations(
             peers=self.peers,
             groups=frozenset(groups),
+            channels=self.channels,
             peer_until=dict(self.peer_until),
             group_until=_with_until(self.group_until, key, until),
+            channel_until=dict(self.channel_until),
         )
 
     def without_group(self, group_id: str) -> "MutedConversations":
@@ -337,8 +408,40 @@ class MutedConversations:
         return MutedConversations(
             peers=self.peers,
             groups=frozenset(groups),
+            channels=self.channels,
             peer_until=dict(self.peer_until),
             group_until=group_until,
+            channel_until=dict(self.channel_until),
+        )
+
+    def with_channel(
+        self, channel: str, until: Optional[float] = None
+    ) -> "MutedConversations":
+        key = _clean_channel(channel)
+        channels = set(self.channels)
+        channels.add(key)
+        return MutedConversations(
+            peers=self.peers,
+            groups=self.groups,
+            channels=frozenset(channels),
+            peer_until=dict(self.peer_until),
+            group_until=dict(self.group_until),
+            channel_until=_with_until(self.channel_until, key, until),
+        )
+
+    def without_channel(self, channel: str) -> "MutedConversations":
+        key = _clean_channel(channel)
+        channels = set(self.channels)
+        channels.discard(key)
+        channel_until = dict(self.channel_until)
+        channel_until.pop(key, None)
+        return MutedConversations(
+            peers=self.peers,
+            groups=self.groups,
+            channels=frozenset(channels),
+            peer_until=dict(self.peer_until),
+            group_until=dict(self.group_until),
+            channel_until=channel_until,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -346,6 +449,10 @@ class MutedConversations:
             "peers": sorted(self.peers),
             "groups": sorted(self.groups),
         }
+        # The channel list is omitted when empty, so a file with no
+        # channel mutes keeps exactly the old shape.
+        if self.channels:
+            data["channels"] = sorted(self.channels)
         # Expiry maps are omitted when empty, so a file of indefinite
         # mutes keeps exactly the old shape.
         peer_until = {
@@ -362,6 +469,13 @@ class MutedConversations:
         }
         if group_until:
             data["group_until"] = group_until
+        channel_until = {
+            key: until
+            for key, until in sorted(self.channel_until.items())
+            if key in self.channels
+        }
+        if channel_until:
+            data["channel_until"] = channel_until
         return data
 
     @classmethod
@@ -370,17 +484,23 @@ class MutedConversations:
             raise MutedError("muted conversations must be a JSON object")
         # A file that lost a section must not silently unmute that
         # side; the fail-open loader treats the file as corrupt
-        # instead.
+        # instead.  Channels are the exception: files written before
+        # channel mutes existed carry no "channels" key, and load
+        # unchanged with nothing muted.
         if "peers" not in data or "groups" not in data:
             raise MutedError("peers and groups are required")
         now = time.time() if now is None else now
         peers = _clean_muted(data.get("peers"), kind="peer")
         groups = _clean_muted(data.get("groups"), kind="group")
+        channels = _clean_muted(data.get("channels", []), kind="channel")
         peer_until, expired_peers = _clean_until_map(
             data.get("peer_until"), kind="peer", keys=peers, now=now
         )
         group_until, expired_groups = _clean_until_map(
             data.get("group_until"), kind="group", keys=groups, now=now
+        )
+        channel_until, expired_channels = _clean_until_map(
+            data.get("channel_until"), kind="channel", keys=channels, now=now
         )
         # A key whose expiry has passed leaves the muted set with it:
         # dropping only the expiry would promote the timed mute to an
@@ -388,8 +508,10 @@ class MutedConversations:
         return cls(
             peers=peers - expired_peers,
             groups=groups - expired_groups,
+            channels=channels - expired_channels,
             peer_until=peer_until,
             group_until=group_until,
+            channel_until=channel_until,
         )
 
 
@@ -509,6 +631,23 @@ def muted_groups_for(path: Optional[Union[str, Path]]) -> FrozenSet[str]:
     """Muted groups, failing open on a corrupt file."""
     try:
         return load_muted(path).groups
+    except MutedError as exc:
+        log.warning(
+            "Muted conversations at %s are unusable (%s); counting as unmuted",
+            path,
+            exc,
+        )
+        return frozenset()
+
+
+def muted_channels_for(path: Optional[Union[str, Path]]) -> FrozenSet[str]:
+    """Muted channels, failing open on a corrupt file.
+
+    The load already drops timed mutes whose hour has passed, so
+    the set holds only the channels whose mute is still in force.
+    """
+    try:
+        return load_muted(path).channels
     except MutedError as exc:
         log.warning(
             "Muted conversations at %s are unusable (%s); counting as unmuted",

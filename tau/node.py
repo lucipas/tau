@@ -69,6 +69,7 @@ from .group_invites import (
     resolve_join_request,
     verify_invite_link,
 )
+from .broadcasts import BroadcastStore
 from .groups import GroupStore, pinned_group
 from .group_polls import PostError, clean_poll_options
 from .identity import (
@@ -613,6 +614,9 @@ class TauNode:
         on_retract: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_edit: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_typing: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_beacon_update: Optional[
+            Callable[[Beacon, Dict[str, Any]], None]
+        ] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -622,6 +626,11 @@ class TauNode:
         self.mailbox = Mailbox(config.mailbox_path)
         self.inbox = Inbox(config.inbox_path)
         self.groups = GroupStore(getattr(config, "groups_path", None))
+        # Broadcast lists: named peer sets for one-to-many DMs, local
+        # state like groups — the console lists and sends them, and the
+        # store reloads from disk on list so a CLI-created list shows
+        # up without restarting the server.
+        self.broadcasts = BroadcastStore(getattr(config, "broadcasts_path", None))
         # Public profiles: the local one this node publishes (reloaded
         # from disk on every announce, so a one-shot `tau profile set`
         # reaches peers without a restart) and the received ones, keyed
@@ -669,6 +678,12 @@ class TauNode:
         self.on_retract = on_retract
         self.on_edit = on_edit
         self.on_typing = on_typing
+        # Called with the beacon and its send result after every
+        # beacon update goes out (first update and mail-loop ticks
+        # alike), so the console can record its own updates in its
+        # history like any other sent message; best effort, like
+        # the typing fan-out below.
+        self.on_beacon_update = on_beacon_update
         # Typing indicators, keyed by conversation — a peer hash for a
         # DM, ``"group:<id>"`` for a group — to ``{peer_hash: expires_at}``.
         # Ephemeral by design: nothing here is persisted, and an entry
@@ -7679,7 +7694,19 @@ class TauNode:
                     save_beacons(self.config.beacons_path, stored)
         except BeaconsError as exc:  # pragma: no cover - disk failure
             log.warning("Could not persist beacon update: %s", exc)
+        self._publish_beacon_update(beacon, result)
         return result
+
+    def _publish_beacon_update(
+        self, beacon: Beacon, result: Dict[str, Any]
+    ) -> None:
+        """Fan one beacon update out to the console, best effort."""
+        if self.on_beacon_update is None:
+            return
+        try:
+            self.on_beacon_update(beacon, result)
+        except Exception:  # pragma: no cover - user callback
+            log.warning("on_beacon_update callback failed", exc_info=True)
 
     def _send_due_beacon_updates(self) -> None:
         """Send the beacon updates whose time has come.
