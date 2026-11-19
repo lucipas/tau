@@ -66,6 +66,7 @@ from .config import (
     parse_host_port,
     send_read_receipts_enabled,
     set_node_setting,
+    tan_sync_depth,
     write_node_metadata,
     write_rns_config,
 )
@@ -1698,6 +1699,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="whether this node sends read receipts when it reads a DM",
     )
     config_receipts.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    config_depth = config_sub.add_parser(
+        "tan-sync-depth",
+        parents=[common],
+        help="how many hops of the follow graph Tan sync reaches (1 or 2, default 2)",
+    )
+    config_depth.add_argument(
+        "depth",
+        nargs="?",
+        choices=["1", "2"],
+        help="1 = followed authors only, 2 = plus the authors they follow",
+    )
+    config_depth.set_defaults(func=cmd_config)
     config_cmd.set_defaults(func=cmd_config)
 
     block = subparsers.add_parser(
@@ -19011,9 +19026,33 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("  its messages as delivered, never read")
         return _EXIT_OK
 
+    if command == "tan-sync-depth":
+        depth_arg = getattr(args, "depth", None)
+        if depth_arg is None:
+            depth = tan_sync_depth(config.data_dir)
+            if json_output:
+                _emit({"tan_sync_depth": depth}, True)
+            else:
+                print(f"Tan sync depth: {depth}")
+                print("  1 = followed authors only")
+                print("  2 = plus the authors they follow (default)")
+            return _EXIT_OK
+        depth = int(depth_arg)
+        set_node_setting(config.data_dir, "tan_sync_depth", depth)
+        if json_output:
+            _emit({"tan_sync_depth": depth}, True)
+        else:
+            print(f"Tan sync depth: {depth}")
+            if depth == 1:
+                print("  sync pulls followed authors only")
+            else:
+                print("  sync also pulls the authors they follow")
+        return _EXIT_OK
+
     settings = {
         "accept_files": accept_files_enabled(config.data_dir),
         "send_read_receipts": send_read_receipts_enabled(config.data_dir),
+        "tan_sync_depth": tan_sync_depth(config.data_dir),
     }
     if json_output:
         _emit(settings, True)
@@ -19023,8 +19062,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"Settings ({config.data_dir / 'node.json'}):")
         print(f"  accept files: {accept_state}")
         print(f"  send read receipts: {receipts_state}")
+        print(f"  tan sync depth: {settings['tan_sync_depth']}")
         print("  change with: tau config accept-files on|off")
         print("  change with: tau config read-receipts on|off")
+        print("  change with: tau config tan-sync-depth 1|2")
     return _EXIT_OK
 
 

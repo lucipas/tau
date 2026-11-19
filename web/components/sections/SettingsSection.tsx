@@ -1,7 +1,8 @@
-// SettingsSection.tsx — node settings: file acceptance / read receipts,
-// rename the node, announce, and per-peer / per-group disappearing-message
-// defaults. Built on api.ts getSettings / updateSetting / renameNode /
-// announce / getDisappearingDefaults / setDisappearingDefault.
+// SettingsSection.tsx — node settings: file acceptance / read receipts /
+// Tan sync depth, rename the node, announce, and per-peer / per-group
+// disappearing-message defaults. Built on api.ts getSettings /
+// updateSetting / renameNode / announce / getDisappearingDefaults /
+// setDisappearingDefault.
 
 "use client";
 
@@ -222,6 +223,38 @@ export default function SettingsSection() {
                   Let senders know when you&apos;ve read their messages.
                 </span>
               </span>
+            </label>
+            <label className="flex items-start gap-3 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-3">
+              <span className="flex-1">
+                <span className="block text-sm font-semibold text-zinc-100">
+                  Tan sync depth
+                </span>
+                <span className="block text-xs text-zinc-500">
+                  How far into the follow graph a sync reaches. 1 hop pulls followed
+                  authors only; 2 hops also pulls the authors they follow.
+                </span>
+              </span>
+              <select
+                value={String(settings.tan_sync_depth)}
+                disabled={busy}
+                aria-label="Tan sync depth"
+                onChange={(e) =>
+                  void run(
+                    async () => {
+                      setSettings(
+                        await updateSetting("tan_sync_depth", Number(e.target.value)),
+                      );
+                    },
+                    e.target.value === "1"
+                      ? "Tan sync now pulls followed authors only."
+                      : "Tan sync now also pulls the authors they follow.",
+                  )
+                }
+                className="shrink-0 rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-sm text-zinc-100 outline-none"
+              >
+                <option value="1">1 hop — followed only</option>
+                <option value="2">2 hops — plus their follows</option>
+              </select>
             </label>
           </div>
         )}

@@ -431,6 +431,7 @@ export interface OutboxRetryResult {
 export interface NodeSettings {
   accept_files: boolean;
   send_read_receipts: boolean;
+  tan_sync_depth: number;
 }
 
 export interface AllowList {

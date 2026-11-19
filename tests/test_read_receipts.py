@@ -773,10 +773,12 @@ def test_cli_config_read_receipts(tmp_path, capsys):
     code = cli.main(["config", "--data-dir", str(data_dir), "--json"])
     assert code == 0
     # Bare `tau config` reports every known setting, so the file
-    # setting (off by default) is listed alongside read receipts.
+    # setting (off by default) and the sync depth are listed alongside
+    # read receipts.
     assert json.loads(capsys.readouterr().out) == {
         "accept_files": False,
         "send_read_receipts": False,
+        "tan_sync_depth": 2,
     }
 
     assert (

@@ -230,6 +230,29 @@ def send_read_receipts_enabled(data_dir: Path) -> bool:
     return load_node_settings(data_dir).get("send_read_receipts", True) is not False
 
 
+def tan_sync_depth(data_dir: Path) -> int:
+    """How many hops of the follow graph Tan sync reaches (see #467).
+
+    1 = followed authors only, 2 = plus the authors they follow.
+    Default 2; any other value (including a corrupt one) falls back
+    to the default, so a hand-edited node.json cannot wedge sync.
+    """
+    from .tangents.tan import (
+        TAN_SYNC_DEPTH_DEFAULT,
+        TAN_SYNC_DEPTH_MAX,
+        TAN_SYNC_DEPTH_MIN,
+    )
+
+    value = load_node_settings(data_dir).get(
+        "tan_sync_depth", TAN_SYNC_DEPTH_DEFAULT
+    )
+    if isinstance(value, bool) or not isinstance(value, int):
+        return TAN_SYNC_DEPTH_DEFAULT
+    if value < TAN_SYNC_DEPTH_MIN or value > TAN_SYNC_DEPTH_MAX:
+        return TAN_SYNC_DEPTH_DEFAULT
+    return value
+
+
 def write_node_metadata(data_dir: Path, name: str) -> Path:
     from .util import atomic_write_json
 
@@ -260,7 +283,7 @@ def load_node_settings(data_dir: Path) -> Dict[str, object]:
         return {}
     return {
         key: raw[key]
-        for key in ("accept_files", "send_read_receipts")
+        for key in ("accept_files", "send_read_receipts", "tan_sync_depth")
         if key in raw
     }
 
