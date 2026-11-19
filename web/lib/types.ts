@@ -397,6 +397,14 @@ export interface DisappearingDefaults {
   channels: Record<string, number>;
 }
 
+export interface QuietHoursSettings {
+  enabled: boolean;
+  start: string;
+  end: string;
+  active: boolean;
+  minutes_until_end: number | null;
+}
+
 export interface MutedConversations {
   peers: string[];
   groups: string[];

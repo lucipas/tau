@@ -6733,6 +6733,129 @@ def test_disappearing_defaults_without_data_dir(bridge):
     assert payload == {"peers": {}, "groups": {}, "channels": {}}
 
 
+def test_quiet_hours_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A fresh node has no window: off, with the default times kept.
+        status, _, payload = _json(bridge, "/api/settings/quiet-hours")
+        assert status == 200
+        assert payload == {
+            "enabled": False,
+            "start": "22:00",
+            "end": "07:00",
+            "active": False,
+            "minutes_until_end": None,
+        }
+
+        # A window covering right now reports active, with minutes left.
+        now = time.localtime()
+        current = now.tm_hour * 60 + now.tm_min
+        start = (current - 60) % (24 * 60)
+        end = (current + 60) % (24 * 60)
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/quiet-hours",
+            method="POST",
+            body={
+                "enabled": True,
+                "start": f"{start // 60:02d}:{start % 60:02d}",
+                "end": f"{end // 60:02d}:{end % 60:02d}",
+            },
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["quiet_hours"]["enabled"] is True
+        assert payload["quiet_hours"]["active"] is True
+        assert payload["quiet_hours"]["minutes_until_end"] is not None
+        assert 0 < payload["quiet_hours"]["minutes_until_end"] <= 120
+        assert payload["quiet_hours"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/settings/quiet-hours")
+        assert payload["enabled"] is True
+        assert payload["active"] is True
+
+        # Turning it off keeps the start/end, so turning it back on
+        # restores the same window; the no-op set reports unchanged.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/quiet-hours",
+            method="POST",
+            body={"enabled": False},
+        )
+        assert status == 200
+        assert payload["quiet_hours"]["enabled"] is False
+        assert payload["quiet_hours"]["active"] is False
+        assert payload["quiet_hours"]["minutes_until_end"] is None
+        assert payload["quiet_hours"]["start"] == (
+            f"{start // 60:02d}:{start % 60:02d}"
+        )
+        assert payload["quiet_hours"]["end"] == f"{end // 60:02d}:{end % 60:02d}"
+        assert payload["quiet_hours"]["changed"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/quiet-hours",
+            method="POST",
+            body={"enabled": False},
+        )
+        assert payload["quiet_hours"]["changed"] is False
+    finally:
+        bridge.stop()
+
+
+def test_quiet_hours_endpoint_rejects_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"enabled": "yes"},
+            {"start": "25:00", "end": "07:00"},
+            {"start": "22:00", "end": "7am"},
+            {"start": "22:00", "end": "22:00"},
+            {"start": 2200, "end": "07:00"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/settings/quiet-hours", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_quiet_hours_rejects_corrupt_file(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        (tmp_path / "quiet_hours.json").write_text("{not json", encoding="utf-8")
+        status, _, payload = _json(
+            bridge,
+            "/api/settings/quiet-hours",
+            method="POST",
+            body={"enabled": True, "start": "22:00", "end": "07:00"},
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        status, _, payload = _json(bridge, "/api/settings/quiet-hours")
+        assert status == 503
+    finally:
+        bridge.stop()
+
+
+def test_quiet_hours_without_data_dir(bridge):
+    # A dataless node has no quiet-hours path: edits are refused, but
+    # the read still answers the default off window instead of failing
+    # the console poll.
+    status, _, payload = _json(
+        bridge,
+        "/api/settings/quiet-hours",
+        method="POST",
+        body={"enabled": True, "start": "22:00", "end": "07:00"},
+    )
+    assert status == 503
+    status, _, payload = _json(bridge, "/api/settings/quiet-hours")
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["active"] is False
+
+
 def test_muted_conversations_endpoints(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:
