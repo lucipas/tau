@@ -266,7 +266,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Collection, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Callable, Collection, Deque, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
@@ -344,6 +344,7 @@ from .config import (
     accept_files_enabled,
     send_read_receipts_enabled,
     set_node_setting,
+    tan_sync_depth,
     write_node_metadata,
 )
 from .channel_polls import (
@@ -1526,20 +1527,31 @@ class WebBridge:
         return {
             "accept_files": accept_files_enabled(data_dir),
             "send_read_receipts": send_read_receipts_enabled(data_dir),
+            "tan_sync_depth": tan_sync_depth(data_dir),
         }
 
-    def update_setting(self, setting: str, value: bool) -> Dict[str, Any]:
+    def update_setting(self, setting: str, value: Union[bool, int]) -> Dict[str, Any]:
         """Change one node setting and return the fresh settings.
 
-        Only the keys ``tau config`` manages are accepted, and the value
-        must be a real boolean — anything else is a client error, not a
-        value to coerce. The write keeps the other settings (and the
-        node's name) in place.
+        Only the keys ``tau config`` manages are accepted.  Boolean
+        settings take a real boolean — anything else is a client
+        error, not a value to coerce — and ``tan_sync_depth`` takes
+        the integer 1 or 2 (a boolean is not an integer here, even
+        though Python subclasses it). The write keeps the other
+        settings (and the node's name) in place.
         """
-        if setting not in ("accept_files", "send_read_receipts"):
+        if setting == "tan_sync_depth":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value not in (1, 2)
+            ):
+                raise ValueError("setting 'tan_sync_depth' must be 1 or 2")
+        elif setting in ("accept_files", "send_read_receipts"):
+            if not isinstance(value, bool):
+                raise ValueError(f"setting {setting!r} must be true or false")
+        else:
             raise ValueError(f"unknown setting {setting!r}")
-        if not isinstance(value, bool):
-            raise ValueError(f"setting {setting!r} must be true or false")
         data_dir = self._data_dir()
         if data_dir is None:
             raise WebBridgeError("this node has no data directory")

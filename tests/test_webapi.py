@@ -11404,7 +11404,11 @@ def test_settings_defaults(node, tmp_path):
         status, _, payload = _json(bridge, "/api/settings")
         assert status == 200
         # A fresh data directory has no node.json: the CLI defaults apply.
-        assert payload == {"accept_files": False, "send_read_receipts": True}
+        assert payload == {
+            "accept_files": False,
+            "send_read_receipts": True,
+            "tan_sync_depth": 2,
+        }
         assert not (tmp_path / "node.json").exists()
     finally:
         bridge.stop()
@@ -11422,7 +11426,11 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
         assert status == 200
         assert payload == {
             "ok": True,
-            "settings": {"accept_files": True, "send_read_receipts": True},
+            "settings": {
+                "accept_files": True,
+                "send_read_receipts": True,
+                "tan_sync_depth": 2,
+            },
         }
 
         # Toggling the second setting keeps the first, on disk and on read.
@@ -11436,14 +11444,34 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
         assert payload["settings"] == {
             "accept_files": True,
             "send_read_receipts": False,
+            "tan_sync_depth": 2,
+        }
+
+        # The depth setting takes 1 or 2 and keeps the others too.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "tan_sync_depth", "value": 1},
+        )
+        assert status == 200
+        assert payload["settings"] == {
+            "accept_files": True,
+            "send_read_receipts": False,
+            "tan_sync_depth": 1,
         }
         status, _, payload = _json(bridge, "/api/settings")
-        assert payload == {"accept_files": True, "send_read_receipts": False}
+        assert payload == {
+            "accept_files": True,
+            "send_read_receipts": False,
+            "tan_sync_depth": 1,
+        }
         stored = json.loads(
             (tmp_path / "node.json").read_text(encoding="utf-8")
         )
         assert stored["accept_files"] is True
         assert stored["send_read_receipts"] is False
+        assert stored["tan_sync_depth"] == 1
     finally:
         bridge.stop()
 
@@ -11458,6 +11486,10 @@ def test_settings_update_rejects_bad_input(node, tmp_path):
             ({"setting": "accept_files", "value": "yes"}, "must be true or false"),
             ({"setting": "accept_files", "value": 1}, "must be true or false"),
             ({"setting": "accept_files", "value": None}, "must be true or false"),
+            ({"setting": "tan_sync_depth", "value": 3}, "must be 1 or 2"),
+            ({"setting": "tan_sync_depth", "value": 0}, "must be 1 or 2"),
+            ({"setting": "tan_sync_depth", "value": True}, "must be 1 or 2"),
+            ({"setting": "tan_sync_depth", "value": "2"}, "must be 1 or 2"),
         ]:
             status, _, payload = _json(
                 bridge, "/api/settings", method="POST", body=body

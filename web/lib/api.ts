@@ -247,10 +247,10 @@ export async function getSettings(): Promise<NodeSettings> {
   return get("/api/settings");
 }
 
-/** `setting` is "accept_files" | "send_read_receipts"; value must be boolean. */
+/** `setting` is "accept_files" | "send_read_receipts" | "tan_sync_depth"; boolean settings take a boolean, tan_sync_depth takes 1 or 2. */
 export async function updateSetting(
-  setting: "accept_files" | "send_read_receipts",
-  value: boolean,
+  setting: "accept_files" | "send_read_receipts" | "tan_sync_depth",
+  value: boolean | number,
 ): Promise<NodeSettings> {
   const data = await post<{ ok: boolean; settings: NodeSettings }>("/api/settings", {
     setting,

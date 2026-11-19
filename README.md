@@ -257,6 +257,11 @@ tau tan timeline --json
 `tau serve --social --social-sync-interval 60` also pulls the public timeline
 from known peers every minute, so a long-running node keeps its cache fresh.
 
+Sync reaches two hops into the follow graph by default: it pulls followed
+authors plus the authors they follow (their published follow lists are fetched
+over `/tau/follows` when missing). `tau config tan-sync-depth 1` pulls followed
+authors only; the console Settings page has the same switch.
+
 Useful flags:
 
 ```bash
