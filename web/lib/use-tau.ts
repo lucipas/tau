@@ -11,7 +11,7 @@
 //                       is built from the same stored history /api/messages
 //                       returns, exactly as the old console did.)
 //   usePeerActions()  — ping / info / verify / safety-number / block /
-//                       forget / alias / note / archive / mute actions.
+//                       forget / alias / note / archive / mute / pin actions.
 //
 // Live protocol (tau/webapi.py _serve_websocket): the first /ws frame is
 // `{ "type": "snapshot", "snapshot": {...} }`; later frames are bus events:
@@ -42,6 +42,7 @@ import {
   setMuted,
   setPeerAlias,
   setPeerNote,
+  setPinnedConversation,
   unarchiveConversation,
   unblockPeer,
   verifyPeer,
@@ -284,6 +285,7 @@ export interface Conversation {
   unread: number;
   muted: boolean;
   archived: boolean;
+  pinned: boolean;
 }
 
 /**
@@ -330,6 +332,7 @@ export function buildConversations(
         unread: unread?.per_group[groupId] ?? 0,
         muted: opts.mutedGroups?.has(groupId) ?? false,
         archived: false,
+        pinned: group?.pinned ?? false,
       });
     } else {
       const hash = key.slice("peer:".length);
@@ -343,6 +346,7 @@ export function buildConversations(
         unread: unread?.per_peer[hash] ?? 0,
         muted: opts.mutedPeers?.has(hash) ?? false,
         archived: opts.archived?.has(hash) ?? false,
+        pinned: peer?.pinned ?? false,
       });
     }
   }
@@ -358,14 +362,18 @@ export function buildConversations(
         unread: unread?.per_group[group.id] ?? 0,
         muted: opts.mutedGroups?.has(group.id) ?? false,
         archived: false,
+        pinned: group.pinned ?? false,
       });
     }
   }
   const filtered = opts.includeArchived
     ? out
     : out.filter((c) => !c.archived);
+  // Pinned conversations stay at the top; recency orders the rest.
   filtered.sort(
-    (a, b) => (b.lastMessage?.sent_at ?? 0) - (a.lastMessage?.sent_at ?? 0),
+    (a, b) =>
+      Number(b.pinned) - Number(a.pinned) ||
+      (b.lastMessage?.sent_at ?? 0) - (a.lastMessage?.sent_at ?? 0),
   );
   return filtered;
 }
@@ -552,6 +560,7 @@ export interface PeerActions {
   archive: (target: string) => Promise<unknown>;
   unarchive: (target: string) => Promise<unknown>;
   mute: (target: { peer: string } | { group: string }, muted?: boolean) => Promise<unknown>;
+  pin: (target: { peer: string } | { group: string }, pinned?: boolean) => Promise<unknown>;
   markRead: (
     target?: { peer: string } | { group: string } | { channel: string } | Record<string, never>,
   ) => Promise<UnreadCounts>;
@@ -574,6 +583,7 @@ export function usePeerActions(): PeerActions {
       archive: (target) => archiveConversation(target),
       unarchive: (target) => unarchiveConversation(target),
       mute: (target, muted) => setMuted(target, muted),
+      pin: (target, pinned) => setPinnedConversation(target, pinned),
       markRead: (target = {}) => markRead(target),
       markUnread: (target, all) => markUnread(target, all),
     }),

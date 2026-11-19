@@ -50,6 +50,9 @@ Global options may appear before or after the command:
 | `tau archive PEER` | Hide a peer's conversation from `tau messages` (history kept, mail keeps arriving; idempotent) |
 | `tau unarchive PEER` | Restore an archived conversation to `tau messages` (idempotent) |
 | `tau archived` | List archived conversations (peer name + hash, message count) |
+| `tau pin-conversation --peer PEER` | Pin a conversation so it stays at the top of the conversation list (`--group NAME` pins a group, `--channel NAME` a joined channel; local-only, idempotent) |
+| `tau unpin-conversation --peer PEER` | Remove the pin from a conversation (`--group NAME` / `--channel NAME` for a group or channel pin) |
+| `tau pinned-conversations` | List pinned conversations, newest pin first |
 | `tau messages export` | Back up stored direct messages as a JSON export (`--peer` for one sender, `--output` for a file) |
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
 | `tau messages delete ID` | Delete one stored direct message from the local inbox (full id or unique prefix) |

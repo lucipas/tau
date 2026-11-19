@@ -573,6 +573,19 @@ export async function setMuted(
   return post("/api/messages/mute", { ...target, muted });
 }
 
+/** Pinned conversations, newest pin first. */
+export async function getPinnedConversations(): Promise<unknown> {
+  return get("/api/conversations/pinned");
+}
+
+/** Pin or unpin one conversation (peer, group, or channel). */
+export async function setPinnedConversation(
+  target: { peer: string } | { group: string } | { channel: string },
+  pinned = true,
+): Promise<unknown> {
+  return post("/api/conversations/pin", { ...target, pinned });
+}
+
 /** Export stored DMs as the CLI's JSON document (loopback only). */
 export async function exportMessages(): Promise<unknown> {
   return get("/api/messages/export");

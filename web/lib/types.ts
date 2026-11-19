@@ -109,6 +109,8 @@ export interface Peer {
    *  peer may be impersonating, or null. Added by the bridge. */
   lookalike_of: string | null;
   blocked: boolean;
+  /** True when this conversation is pinned to the top of the list. */
+  pinned?: boolean;
   profile: PeerProfile | null;
   /** Live path-table reachability (from /api/mesh, merged into /api/peers). */
   reachable?: boolean;
@@ -206,6 +208,8 @@ export interface Group {
   created_by_me: boolean;
   can_leave: boolean;
   ignored: boolean;
+  /** True when this conversation is pinned to the top of the list. */
+  pinned?: boolean;
 }
 
 export interface GroupChangeResult {
@@ -612,6 +616,8 @@ export interface TanVerifyReport {
 export interface Channel {
   channel: string;
   joined_at: number;
+  /** True when this channel is pinned to the top of the list. */
+  pinned?: boolean;
   /** Messages newer than the last-read cursor; always present from /api/channels. */
   unread: number;
 }

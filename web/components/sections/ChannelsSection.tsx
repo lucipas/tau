@@ -325,7 +325,7 @@ export default function ChannelsSection() {
                   : "border-zinc-700 text-zinc-300 hover:bg-zinc-900"
               }`}
             >
-              #{c.channel}
+              {c.pinned ? "📌 " : ""}#{c.channel}
               <UnreadChip count={c.unread} className="ml-1" />
             </button>
           ))}
@@ -356,6 +356,13 @@ export default function ChannelsSection() {
               )}
             </h2>
             <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={() => void channels.pinConversation(channels.selected!, !selectedChannel?.pinned)}
+                className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+              >
+                {selectedChannel?.pinned ? "Unpin" : "Pin"}
+              </button>
               <button
                 type="button"
                 onClick={() => void handleSync()}

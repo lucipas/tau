@@ -32,6 +32,7 @@ import {
   searchChannelMessages,
   sendChannelMessage,
   setChannelTopic,
+  setPinnedConversation,
   syncChannels,
   unpinChannelMessage,
   voteChannelPoll,
@@ -66,6 +67,7 @@ export interface UseChannelsResult {
   refresh: () => Promise<void>;
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
+  pinConversation: (channel: string, pinned?: boolean) => Promise<void>;
   send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
   schedule: (text: string, sendIn: number) => Promise<ScheduledChannelMessage>;
   cancelScheduled: (id: string) => Promise<void>;
@@ -231,6 +233,10 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
         setSearchResults(null);
         setSearchQuery(null);
       }
+    },
+    pinConversation: async (channel, pinned = true) => {
+      await setPinnedConversation({ channel }, pinned);
+      await refreshChannels();
     },
     send: async (text, replyTo) => {
       if (!selected) throw new Error("no channel selected");
