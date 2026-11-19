@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TauContext } from "@/components/chrome/TauContext";
-import type { TanPost } from "@/lib/types";
+import type { TanDraft, TanPost } from "@/lib/types";
 import SocialSection from "./SocialSection";
 import { validateTanText } from "./social/TanComposer";
 import { fakeTau, mockFetch } from "./test-utils";
@@ -35,12 +35,32 @@ function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): Tan
 
 let calls: string[] = [];
 let timeline: TanPost[] = [];
+let drafts: TanDraft[] = [];
+
+function makeDraft(id: number, text: string, extra: Partial<TanDraft> = {}): TanDraft {
+  return {
+    id,
+    text,
+    reply_to: "",
+    expires_in: null,
+    post_hash: "",
+    pending_peers: [],
+    claimed_at: null,
+    created_at: Math.floor(Date.now() / 1000) - 60,
+    ...extra,
+  };
+}
+
 let lists: { name: string; created_at: number; members: number }[] = [];
 
 beforeEach(() => {
   timeline = [makePost("h1".padEnd(64, "0"), "hello #mesh @bob")];
+  drafts = [
+    makeDraft(1, "half-written thought"),
+    makeDraft(2, "agreed", { reply_to: "h1".padEnd(64, "0"), expires_in: 3600 }),
+  ];
   lists = [];
-  const router = mockFetch((url) => {
+  const router = mockFetch((url, method) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/lists")) return { lists, count: lists.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
@@ -71,6 +91,15 @@ beforeEach(() => {
     if (url.includes("/api/tan/followed-tags")) return { followed_tags: [], count: 0 };
     if (url.includes("/api/tan/authors")) return { authors: [], count: 0, total: 0 };
     if (url.includes("/api/tan/likes")) return { target: "x", likers: [], count: 0, total: 0 };
+    if (url.includes("/api/tan/drafts")) {
+      if (method === "POST" && url.includes("/delete")) {
+        return { ok: true, draft: drafts[0] ?? {} };
+      }
+      if (method === "POST") {
+        return { ok: true, draft: makeDraft(99, "saved draft") };
+      }
+      return { drafts, count: drafts.length };
+    }
     return { ok: true };
   });
   calls = router.calls;
@@ -212,5 +241,56 @@ describe("SocialSection", () => {
       expect(calls).toContain("GET /api/tan/search?q=mesh&limit=30"),
     );
     expect(await screen.findByText(/1 result for/)).toBeTruthy();
+  });
+
+  it("Drafts tab lists saved drafts with reply and expiry", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    expect(await screen.findByText("half-written thought")).toBeTruthy();
+    expect(screen.getByText("agreed")).toBeTruthy();
+    expect(screen.getByText(/In reply to h1/)).toBeTruthy();
+    expect(screen.getByText(/Disappears 1h after posting/)).toBeTruthy();
+  });
+
+  it("Save draft parks the composer's text", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.change(screen.getByLabelText("Compose a post"), {
+      target: { value: "park this for later" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/drafts"));
+    await waitFor(() =>
+      expect((screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value).toBe(""),
+    );
+  });
+
+  it("editing a draft loads it, and posting it deletes the draft", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    await screen.findByText("half-written thought");
+    const rows = screen.getAllByRole("button", { name: "Edit" });
+    fireEvent.click(rows[0]);
+    await waitFor(() =>
+      expect((screen.getByLabelText("Compose a post") as HTMLTextAreaElement).value).toBe(
+        "half-written thought",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Post" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/posts"));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/drafts/delete"));
+  });
+
+  it("deleting a draft discards it without posting", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    await screen.findByText("half-written thought");
+    const deletes = screen.getAllByRole("button", { name: "Delete draft" });
+    fireEvent.click(deletes[0]);
+    await waitFor(() => expect(calls).toContain("POST /api/tan/drafts/delete"));
+    expect(calls).not.toContain("POST /api/tan/posts");
   });
 });

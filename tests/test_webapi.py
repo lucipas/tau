@@ -13648,6 +13648,140 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
         bridge.stop()
 
 
+def test_tan_drafts_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    # Drafts need no Tan app attached: they live in the social DB, so
+    # a draft saved from the CLI shows up in the console too.
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/drafts")
+        assert status == 200
+        assert payload == {"drafts": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts",
+            method="POST",
+            body={"text": "half-written thought"},
+        )
+        assert status == 200
+        draft = payload["draft"]
+        assert draft["text"] == "half-written thought"
+        assert draft["reply_to"] == ""
+        assert draft["expires_in"] is None
+
+        # A reply resolves its target to the full hash, like tan_post,
+        # and the expiry rides along for the publish.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts",
+            method="POST",
+            body={
+                "text": "agreed",
+                "reply_to": post["hash"][:16],
+                "expires_in": 3600,
+            },
+        )
+        assert status == 200
+        reply_draft = payload["draft"]
+        assert reply_draft["reply_to"] == post["hash"]
+        assert reply_draft["expires_in"] == 3600
+
+        status, _, payload = _json(bridge, "/api/tan/drafts")
+        assert status == 200
+        assert payload["count"] == 2
+        # Newest first: the reply draft precedes the plain one.
+        assert [item["id"] for item in payload["drafts"]] == [
+            reply_draft["id"],
+            draft["id"],
+        ]
+
+        # Discarding by id drops only that draft.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts/delete",
+            method="POST",
+            body={"id": draft["id"]},
+        )
+        assert status == 200
+        assert payload["draft"]["id"] == draft["id"]
+        status, _, payload = _json(bridge, "/api/tan/drafts")
+        assert payload["count"] == 1
+        assert payload["drafts"][0]["id"] == reply_draft["id"]
+
+        # Discarding an unknown draft is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts/delete",
+            method="POST",
+            body={"id": 9999},
+        )
+        assert status == 400
+        assert "unknown draft" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_drafts_rejects_bad_requests(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        for body, fragment in [
+            ({"text": "  "}, "text"),
+            ({"reply_to": "ab" * 16}, "text"),
+            ({"text": "hello", "reply_to": "cd" * 32}, "unknown post"),
+            ({"text": "hello", "reply_to": "zz" * 16}, "unknown post"),
+            ({"text": "hello", "expires_in": 0}, "expires_in"),
+            ({"text": "hello", "expires_in": -10}, "expires_in"),
+            ({"text": "hello", "expires_in": "soon"}, "expires_in"),
+            ({"text": "hello", "expires_in": True}, "expires_in"),
+            ({"text": "hello", "expires_in": 604801}, "expires_in"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/drafts", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+        for body in [{}]:
+            status, _, payload = _json(
+                bridge, "/api/tan/drafts/delete", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "id" in payload["error"]["message"], body
+        # An id supplied under "draft" is accepted — and an unknown one
+        # is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge, "/api/tan/drafts/delete", method="POST", body={"draft": 1}
+        )
+        assert status == 400
+        assert "unknown draft" in payload["error"]["message"]
+        # Nothing saved by the rejected requests.
+        status, _, payload = _json(bridge, "/api/tan/drafts")
+        assert status == 200
+        assert payload == {"drafts": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
 def test_tan_cancel_scheduled_post_removes_stored_post(tmp_path):
     import RNS
 

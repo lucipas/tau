@@ -723,6 +723,20 @@ export interface ScheduledTanPost {
   [key: string]: unknown;
 }
 
+/** A saved Tan post draft: plain text plus the reply target and the
+ *  expiry it will carry once published (mirrors the CLI's tan draft). */
+export interface TanDraft {
+  id: number;
+  text: string;
+  reply_to: string;
+  expires_in: number | null;
+  post_hash: string;
+  pending_peers: string[];
+  claimed_at: number | null;
+  created_at: number;
+  [key: string]: unknown;
+}
+
 export interface TanRules {
   /** Shape is the ruleset's to_dict(): kinds allow/deny lists and
    *  limits. Kept open — the UI reads known keys defensively. */

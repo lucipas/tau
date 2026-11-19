@@ -7,8 +7,8 @@
 //                        tags.
 //   useTanThread(ref)  — thread view rooted at one post.
 //   useTanComposer()   — publish / schedule / poll composer actions.
-//   useTanLists()      — saved / hidden / pinned / scheduled / following /
-//                        followers / muted lists and tag follows.
+//   useTanLists()      — saved / hidden / pinned / scheduled / drafts /
+//                        following / followers / muted lists and tag follows.
 //
 // Posts arrive from /api/tan/timeline (following by default, `all=1` for
 // everything cached) with bridge annotations: likes/liked/own, quotes,
@@ -26,10 +26,12 @@ import {
   createTanPoll,
   deleteTanList,
   deleteTanPost,
+  deleteTanDraft,
   editTanPost,
   followTanAuthor,
   followTanTag,
   getTanAuthors,
+  getTanDrafts,
   getTanFollowers,
   getTanFollowing,
   getTanHidden,
@@ -60,6 +62,7 @@ import {
   quoteTanPost,
   removeTanListMember,
   repostTanPost,
+  saveTanDraft,
   saveTanPost,
   scheduleTanPost,
   searchTan,
@@ -78,6 +81,7 @@ import {
 import type {
   ScheduledTanPost,
   TanAuthor,
+  TanDraft,
   TanList,
   TanListMember,
   TanPost,
@@ -309,6 +313,7 @@ export interface UseTanListsResult {
   hidden: TanPost[];
   pinned: TanPost[];
   scheduled: ScheduledTanPost[];
+  drafts: TanDraft[];
   mutedAuthors: TanAuthor[];
   mutedKeywords: string[];
   mutedTags: string[];
@@ -323,6 +328,11 @@ export interface UseTanListsResult {
   unmuteTag: (tag: string) => Promise<void>;
   unmuteAuthor: (target: string) => Promise<void>;
   unhide: (target: string) => Promise<void>;
+  saveDraft: (
+    text: string,
+    opts?: { replyTo?: string; expiresIn?: number },
+  ) => Promise<TanDraft>;
+  deleteDraft: (id: number) => Promise<void>;
   createList: (name: string) => Promise<void>;
   deleteList: (name: string) => Promise<void>;
   addToList: (name: string, target: string) => Promise<void>;
@@ -341,6 +351,7 @@ export function useTanLists(): UseTanListsResult {
   const [hidden, setHidden] = useState<TanPost[]>([]);
   const [pinned, setPinned] = useState<TanPost[]>([]);
   const [scheduled, setScheduled] = useState<ScheduledTanPost[]>([]);
+  const [drafts, setDrafts] = useState<TanDraft[]>([]);
   const [mutedAuthors, setMutedAuthors] = useState<TanAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<string[]>([]);
   const [mutedTags, setMutedTags] = useState<string[]>([]);
@@ -349,7 +360,7 @@ export function useTanLists(): UseTanListsResult {
 
   const refresh = useCallback(async () => {
     try {
-      const [t, f, fw, s, sv, h, p, sc, ma, mk, mt, li] = await Promise.all([
+      const [t, f, fw, s, sv, h, p, sc, d, ma, mk, mt, li] = await Promise.all([
         getTanTags(),
         getTanFollowing(),
         getTanFollowers(),
@@ -358,6 +369,7 @@ export function useTanLists(): UseTanListsResult {
         getTanHidden(),
         getTanPinned(),
         getTanScheduled(),
+        getTanDrafts(),
         getTanMuted(),
         getTanMutedKeywords(),
         getTanMutedTags(),
@@ -371,6 +383,7 @@ export function useTanLists(): UseTanListsResult {
       setHidden(h.posts);
       setPinned(p.posts);
       setScheduled(sc);
+      setDrafts(d);
       setMutedAuthors(ma);
       setMutedKeywords(mk);
       setMutedTags(mt);
@@ -401,6 +414,7 @@ export function useTanLists(): UseTanListsResult {
     hidden,
     pinned,
     scheduled,
+    drafts,
     mutedAuthors,
     mutedKeywords,
     mutedTags,
@@ -415,6 +429,12 @@ export function useTanLists(): UseTanListsResult {
     unmuteTag: (tag) => mutate(() => unmuteTanTag(tag)),
     unmuteAuthor: (target) => mutate(() => unmuteTanAuthor(target)),
     unhide: (target) => mutate(() => unhideTanPost(target)),
+    saveDraft: async (text, opts) => {
+      const draft = await saveTanDraft(text, opts);
+      await refresh();
+      return draft;
+    },
+    deleteDraft: (id) => mutate(() => deleteTanDraft(id)),
     createList: (name) => mutate(() => createTanList(name)),
     deleteList: (name) => mutate(() => deleteTanList(name)),
     addToList: (name, target) => mutate(() => addTanListMember(name, target)),
