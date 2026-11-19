@@ -26,7 +26,7 @@ import PostCard, { type ReactorKind } from "./social/PostCard";
 import TanComposer from "./social/TanComposer";
 
 type LibraryView = "saved" | "hidden" | "pinned" | "scheduled" | "drafts" | "muted";
-type View = "feed" | "discover" | LibraryView;
+type View = "feed" | "discover" | "followers" | LibraryView;
 
 const FEED_TABS: { id: TanFeedMode; label: string }[] = [
   { id: "following", label: "Following" },
@@ -57,6 +57,7 @@ export default function SocialSection() {
   const [tab, setTab] = useState<TanFeedMode>("following");
   const [view, setView] = useState<View>("feed");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [listFilter, setListFilter] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<TanPost[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -76,7 +77,7 @@ export default function SocialSection() {
    *  when a different draft is loaded, so its initial text applies. */
   const [loadedDraft, setLoadedDraft] = useState<TanDraft | null>(null);
 
-  const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, pollMs: 30_000 });
+  const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, list: listFilter ?? undefined, pollMs: 30_000 });
   const lists = useTanLists();
   const composer = useTanComposer();
   const thread = useTanThread(threadHash);
@@ -186,6 +187,7 @@ export default function SocialSection() {
 
   function clearFilters() {
     setTagFilter(null);
+    setListFilter(null);
     setSearchQuery("");
     setSearchResults(null);
   }
@@ -240,11 +242,19 @@ export default function SocialSection() {
             </button>
           )}
         </form>
-        {(tagFilter || searchResults) && (
+        {(tagFilter || listFilter || searchResults) && (
           <p className="mt-2 text-xs text-zinc-400">
             {tagFilter && (
               <>
                 Tag <span className="text-cyan-400">#{tagFilter}</span>{" "}
+                <button type="button" onClick={clearFilters} className="text-zinc-300 underline">
+                  clear
+                </button>
+              </>
+            )}
+            {listFilter && (
+              <>
+                List <span className="text-cyan-400">{listFilter}</span>{" "}
                 <button type="button" onClick={clearFilters} className="text-zinc-300 underline">
                   clear
                 </button>
@@ -258,6 +268,30 @@ export default function SocialSection() {
               </>
             )}
           </p>
+        )}
+        {lists.lists.length > 0 && (
+          <div className="mt-2 flex items-center gap-2 text-xs">
+            <label htmlFor="tan-list-filter" className="shrink-0 text-zinc-500">
+              List
+            </label>
+            <select
+              id="tan-list-filter"
+              aria-label="Filter feed by list"
+              value={listFilter ?? ""}
+              onChange={(e) => setListFilter(e.target.value || null)}
+              className="min-w-0 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none focus:border-cyan-500"
+            >
+              <option value="">All followed</option>
+              {lists.lists.map((l) => (
+                <option key={l.name} value={l.name}>
+                  {l.name} ({l.members})
+                </option>
+              ))}
+            </select>
+            <span className="truncate text-zinc-500">
+              Manage lists with <code>tau tan lists</code>
+            </span>
+          </div>
         )}
         <p className="mt-0.5 text-xs text-zinc-500">
           The Tan feed lives here — posts, replies, likes, polls and follows from across the mesh.
@@ -363,6 +397,18 @@ export default function SocialSection() {
             >
               Discover
             </button>
+            <button
+              type="button"
+              aria-pressed={view === "followers"}
+              onClick={() => setView("followers")}
+              className={`shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold ${
+                view === "followers"
+                  ? "bg-cyan-500 text-zinc-950"
+                  : "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100"
+              }`}
+            >
+              Followers
+            </button>
             {LIBRARY_TABS.map((t) => (
               <button
                 key={t.id}
@@ -416,9 +462,11 @@ export default function SocialSection() {
                     ? "No posts match that search."
                     : tagFilter
                       ? `No posts under #${tagFilter} yet.`
-                      : tab === "following"
-                        ? "Nothing from people you follow yet — try All, or Discover someone to follow."
-                        : "No posts yet."}
+                      : listFilter
+                        ? `No posts from “${listFilter}” yet.`
+                        : tab === "following"
+                          ? "Nothing from people you follow yet — try All, or Discover someone to follow."
+                          : "No posts yet."}
                 </p>
               )}
               {posts.map((p) => (
@@ -476,6 +524,21 @@ export default function SocialSection() {
               }}
               onMuteTag={async (t) => {
                 await lists.muteTag(t);
+              }}
+            />
+          )}
+
+          {view === "followers" && (
+            <FollowersView
+              lists={lists}
+              onFollowAuthor={async (a) => {
+                await feed.follow(a);
+                setNotice("Followed.");
+                void lists.refresh();
+              }}
+              onUnfollowAuthor={async (a) => {
+                await feed.unfollow(a);
+                void lists.refresh();
               }}
             />
           )}
@@ -615,6 +678,42 @@ function ReactorRow({ name, author, at }: { name: string; author: string; at: nu
         {name || shortHash(author)}{" "}
         <span className="font-normal text-zinc-500">· {formatRelative(at)}</span>
       </p>
+    </div>
+  );
+}
+
+function FollowersView({
+  lists,
+  onFollowAuthor,
+  onUnfollowAuthor,
+}: {
+  lists: ReturnType<typeof useTanLists>;
+  onFollowAuthor: (author: string) => Promise<void>;
+  onUnfollowAuthor: (author: string) => Promise<void>;
+}) {
+  // Followers are derived from stored follow lists only, so the list
+  // is empty until a sync has fetched at least one peer's list.
+  const following = new Set(lists.following.map((f) => f.author));
+  return (
+    <div className="px-3 py-4 sm:px-4">
+      <h2 className="text-sm font-bold text-zinc-100">Followers</h2>
+      <p className="py-1 text-xs text-zinc-500">
+        Authors whose published follow list names you, from lists this node has fetched.
+      </p>
+      {lists.followers.length === 0 && (
+        <p className="py-2 text-sm text-zinc-500">
+          No followers yet — sync to fetch follow lists.
+        </p>
+      )}
+      {lists.followers.map((a) => (
+        <AuthorRow
+          key={a.author}
+          author={a}
+          followed={following.has(a.author)}
+          onFollow={() => void onFollowAuthor(a.author)}
+          onUnfollow={() => void onUnfollowAuthor(a.author)}
+        />
+      ))}
     </div>
   );
 }

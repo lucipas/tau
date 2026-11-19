@@ -225,6 +225,30 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
             if entry not in seen_ids:
                 seen_ids.add(entry)
                 renamed_from.append(entry)
+    # Banned members: destination hashes the creator barred from the
+    # group (see GroupStore.ban).  Like the rename lineage it is not
+    # part of the id derivation, so a stored record with a malformed
+    # entry keeps only the usable hashes instead of dropping the group.
+    # A banned hash that is also a current member is dropped: the
+    # roster is authoritative, and the ban is enforced when the roster
+    # changes, so a record that names a member as banned can only be
+    # stale or hand-edited.
+    banned: List[str] = []
+    raw_banned = raw.get("banned")
+    if isinstance(raw_banned, list):
+        seen_banned = set()
+        for entry in raw_banned:
+            if not isinstance(entry, str) or len(entry) != 32:
+                continue
+            try:
+                bytes.fromhex(entry)
+            except ValueError:
+                continue
+            entry = entry.lower()
+            if entry in seen_banned or entry in cleaned:
+                continue
+            seen_banned.add(entry)
+            banned.append(entry)
     return {
         "id": group_id.lower(),
         "name": name,
@@ -237,6 +261,7 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         "topic": clean_group_topic(raw.get("topic")),
         "topic_sent_at": topic_sent_at,
         "renamed_from": renamed_from,
+        "banned": banned,
     }
 
 
@@ -530,8 +555,107 @@ class GroupStore:
                 raise
         return dict(group)
 
+    def _clean_banned(self, raw_banned: Any) -> List[str]:
+        """Validate a caller-supplied ban list (strict: bad input fails).
+
+        Unlike the lenient load path in :func:`_valid_group`, a caller
+        passing a ban list gets an error for a malformed hash instead
+        of a silently dropped entry.
+        """
+        if not isinstance(raw_banned, list):
+            raise ValueError("banned must be a list of destination hashes")
+        cleaned: List[str] = []
+        for entry in raw_banned:
+            if not isinstance(entry, str) or len(entry) != 32:
+                raise ValueError(f"invalid banned hash: {entry!r}")
+            try:
+                bytes.fromhex(entry)
+            except ValueError:
+                raise ValueError(f"invalid banned hash: {entry!r}") from None
+            entry = entry.lower()
+            if entry not in cleaned:
+                cleaned.append(entry)
+        return cleaned
+
+    def _apply_roster_change(
+        self,
+        existing: Dict[str, Any],
+        members: List[str],
+        *,
+        created_by: str,
+        banned: List[str],
+    ) -> Dict[str, Any]:
+        """Swap a group for its roster successor inside a held transaction.
+
+        The caller holds :meth:`_transaction` and has already checked
+        that this node created the group.  A roster change is the same
+        group continuing: the successor keeps the topic, the rename
+        lineage, and the ban list.  When the roster is unchanged the
+        call is a no-op — except a changed ban list, which is saved
+        onto the same id, so banning a peer who is not a member needs
+        no successor at all.
+        """
+        try:
+            new_id = derive_group_id(
+                existing["creator"], existing["name"], members
+            )
+        except ProtocolError as exc:
+            raise ValueError(f"invalid group: {exc}") from exc
+        if new_id == existing["id"]:
+            if banned == list(existing.get("banned") or []):
+                return dict(existing)
+            snapshot = self._snapshot()
+            self._groups[existing["id"]] = {**existing, "banned": banned}
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+            return dict(self._groups[existing["id"]])
+        if new_id in self._groups:  # pragma: no cover - hash collision
+            raise ValueError("group id already exists with another roster")
+        candidate = _valid_group(
+            {
+                "id": new_id,
+                "name": existing["name"],
+                "members": members,
+                "created_at": existing["created_at"],
+                "creator": existing["creator"],
+                "created_by": existing["creator"],
+                "local": True,
+                # A roster change is the same group continuing: the
+                # topic, the rename lineage, and the ban list carry
+                # into the successor.
+                "topic": existing.get("topic", ""),
+                "topic_sent_at": existing.get("topic_sent_at"),
+                "renamed_from": existing.get("renamed_from") or [],
+                "banned": banned,
+            }
+        )
+        if candidate is None:
+            raise ValueError("invalid group: the creator must be a member")
+        snapshot = self._snapshot()
+        del self._groups[existing["id"]]
+        self._groups[new_id] = candidate
+        self._retire(existing)
+        if new_id in self._retired:
+            # The roster is live again (a member re-added restores
+            # the original roster), so it must not stay retired.
+            self._unretire(new_id)
+        try:
+            self._save()
+        except OSError:
+            self._restore(snapshot)
+            raise
+        return dict(candidate)
+
     def update_members(
-        self, group_id: str, members: List[str], *, created_by: str
+        self,
+        group_id: str,
+        members: List[str],
+        *,
+        created_by: str,
+        banned: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Replace the roster of a group this node created.
 
@@ -544,6 +668,11 @@ class GroupStore:
         by replaying an old group message, and the retirement is lifted
         if the roster is ever changed back to it.
 
+        ``banned`` replaces the group's ban list; when omitted the
+        existing list carries into the successor, so a roster change
+        never unbans anyone.  A banned peer cannot be added: the new
+        roster is refused when it names one.
+
         Raises :class:`ValueError` when the group is unknown, was not
         created by this node, or the new roster is invalid, and
         :class:`OSError` when the write fails (the store is left as it
@@ -555,48 +684,116 @@ class GroupStore:
                 raise ValueError(f"unknown group: {group_id!r}")
             if not existing["local"] or existing["creator"] != created_by.lower():
                 raise ValueError("only the creator can change a group's members")
-            try:
-                new_id = derive_group_id(
-                    existing["creator"], existing["name"], members
-                )
-            except ProtocolError as exc:
-                raise ValueError(f"invalid group: {exc}") from exc
-            if new_id == existing["id"]:
-                return dict(existing)
-            if new_id in self._groups:  # pragma: no cover - hash collision
-                raise ValueError("group id already exists with another roster")
-            candidate = _valid_group(
-                {
-                    "id": new_id,
-                    "name": existing["name"],
-                    "members": members,
-                    "created_at": existing["created_at"],
-                    "creator": existing["creator"],
-                    "created_by": existing["creator"],
-                    "local": True,
-                    # A roster change is the same group continuing: the
-                    # topic carries into the successor.
-                    "topic": existing.get("topic", ""),
-                    "topic_sent_at": existing.get("topic_sent_at"),
-                    "renamed_from": existing.get("renamed_from") or [],
-                }
+            if banned is None:
+                new_banned = list(existing.get("banned") or [])
+            else:
+                new_banned = self._clean_banned(banned)
+            banned_set = set(new_banned)
+            for member in members:
+                if isinstance(member, str) and member.lower() in banned_set:
+                    raise ValueError(
+                        f"cannot add {member.lower()[:8]} to group"
+                        f" {existing['name']!r}: that peer is banned"
+                    )
+            return self._apply_roster_change(
+                existing, members, created_by=created_by, banned=new_banned
             )
-            if candidate is None:
-                raise ValueError("invalid group: the creator must be a member")
+        # pragma: no cover - _apply_roster_change always returns
+
+    def ban(
+        self, group_id: str, member_hash: str, *, created_by: str
+    ) -> Dict[str, Any]:
+        """Ban a peer from a group this node created.
+
+        The peer is removed from the roster when they are a member —
+        a roster change, so the successor group id applies — and is
+        recorded on the group's ban list either way, so banning a
+        peer who is not a member still bars them from being added or
+        approved later.  Banning the creator is refused, and banning
+        a peer who is already banned changes nothing.
+
+        Raises :class:`ValueError` when the group is unknown, was not
+        created by this node, the hash is malformed, or the peer is
+        the creator, and :class:`OSError` when the write fails (the
+        store is left as it was on disk).
+        """
+        if not isinstance(member_hash, str) or len(member_hash.strip()) != 32:
+            raise ValueError(f"invalid peer hash: {member_hash!r}")
+        try:
+            cleaned = member_hash.strip().lower()
+            bytes.fromhex(cleaned)
+        except ValueError:
+            raise ValueError(f"invalid peer hash: {member_hash!r}") from None
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            if not existing["local"] or existing["creator"] != created_by.lower():
+                raise ValueError("only the creator can ban members of a group")
+            if cleaned == created_by.lower():
+                raise ValueError("cannot ban the creator from the group")
+            banned = list(existing.get("banned") or [])
+            if cleaned in banned and cleaned not in existing["members"]:
+                return dict(existing)
+            members = [m for m in existing["members"] if m != cleaned]
+            if (
+                cleaned in existing["members"]
+                and len(members) < MIN_GROUP_MEMBERS
+            ):
+                # A group needs at least two members: banning the last
+                # other member would leave only the creator, which the
+                # protocol forbids — delete the group instead.
+                raise ValueError(
+                    "cannot ban the last other member of the group;"
+                    " delete the group instead"
+                )
+            if cleaned not in banned:
+                banned.append(cleaned)
+            return self._apply_roster_change(
+                existing, members, created_by=created_by, banned=banned
+            )
+        # pragma: no cover - _apply_roster_change always returns
+
+    def unban(
+        self, group_id: str, member_hash: str, *, created_by: str
+    ) -> Dict[str, Any]:
+        """Lift a ban on a group this node created.
+
+        Only the ban list changes, so the group id is untouched and
+        the peer is not re-added to the roster — they can join again
+        afterwards, but only through the normal paths.  Unbanning a
+        peer who is not banned changes nothing.
+
+        Raises :class:`ValueError` when the group is unknown, was not
+        created by this node, or the hash is malformed, and
+        :class:`OSError` when the write fails (the store is left as it
+        was on disk).
+        """
+        if not isinstance(member_hash, str) or len(member_hash.strip()) != 32:
+            raise ValueError(f"invalid peer hash: {member_hash!r}")
+        try:
+            cleaned = member_hash.strip().lower()
+            bytes.fromhex(cleaned)
+        except ValueError:
+            raise ValueError(f"invalid peer hash: {member_hash!r}") from None
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            if not existing["local"] or existing["creator"] != created_by.lower():
+                raise ValueError("only the creator can unban members of a group")
+            banned = list(existing.get("banned") or [])
+            if cleaned not in banned:
+                return dict(existing)
+            banned.remove(cleaned)
             snapshot = self._snapshot()
-            del self._groups[existing["id"]]
-            self._groups[new_id] = candidate
-            self._retire(existing)
-            if new_id in self._retired:
-                # The roster is live again (a member re-added restores
-                # the original roster), so it must not stay retired.
-                self._unretire(new_id)
+            self._groups[existing["id"]] = {**existing, "banned": banned}
             try:
                 self._save()
             except OSError:
                 self._restore(snapshot)
                 raise
-        return dict(candidate)
+        return dict(self._groups[group_id.lower()])
 
     def set_topic(
         self, group_id: str, topic: str, *, created_by: str
@@ -690,6 +887,10 @@ class GroupStore:
                     "created_by": existing["creator"],
                     "local": True,
                     "roster_sent_at": existing.get("roster_sent_at"),
+                    # A rename is the same group continuing: the ban
+                    # list carries into the successor, so renaming
+                    # cannot silently unban anyone.
+                    "banned": existing.get("banned") or [],
                     # The successor remembers the newest predecessors,
                     # newest first, so a member that missed an
                     # intermediate rename still retires them, and group

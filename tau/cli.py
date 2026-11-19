@@ -66,6 +66,7 @@ from .config import (
     parse_host_port,
     send_read_receipts_enabled,
     set_node_setting,
+    tan_sync_depth,
     write_node_metadata,
     write_rns_config,
 )
@@ -271,6 +272,7 @@ from .tangents.tan import (
     _author_from_identity,
     _clean_poll_options,
     _decode_options,
+    add_to_list,
     annotate_pinned,
     annotate_quote_counts,
     annotate_quotes,
@@ -282,13 +284,17 @@ from .tangents.tan import (
     author_stats,
     author_timeline,
     claim_draft,
+    clean_list_name,
     clean_tag,
+    create_list,
     delete_draft,
+    delete_list,
     draft_claim_held,
     export_entries,
     follow,
     follow_tag,
     followed_tags,
+    followers,
     following,
     find_post_by_image,
     get_draft,
@@ -299,6 +305,9 @@ from .tangents.tan import (
     likers,
     list_authors,
     list_drafts,
+    list_member_authors,
+    list_members,
+    list_timeline,
     mentions,
     mute,
     mute_keyword,
@@ -316,6 +325,7 @@ from .tangents.tan import (
     refresh_draft_claim,
     release_draft_claim,
     reposters,
+    remove_from_list,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -330,6 +340,7 @@ from .tangents.tan import (
     suggest_authors,
     media_path,
     tags,
+    tan_lists,
     thread,
     timeline,
     top_posts,
@@ -1729,6 +1740,20 @@ def build_parser() -> argparse.ArgumentParser:
     config_receipts.set_defaults(func=cmd_config)
     config_cmd.set_defaults(func=cmd_config)
 
+    config_depth = config_sub.add_parser(
+        "tan-sync-depth",
+        parents=[common],
+        help="how many hops of the follow graph Tan sync reaches (1 or 2, default 2)",
+    )
+    config_depth.add_argument(
+        "depth",
+        nargs="?",
+        choices=["1", "2"],
+        help="1 = followed authors only, 2 = plus the authors they follow",
+    )
+    config_depth.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
     block = subparsers.add_parser(
         "block",
         parents=[common],
@@ -1873,6 +1898,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="GROUP",
         help="group id, id prefix or name",
+    )
+    mute_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name (a joined channel)",
     )
     mute.add_argument(
         "--off",
@@ -2442,6 +2472,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_remove_member.set_defaults(func=cmd_group_remove_member)
 
+    group_ban = group_sub.add_parser(
+        "ban",
+        parents=[common],
+        help="ban a peer from a group you created",
+    )
+    group_ban.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_ban.add_argument(
+        "peer", metavar="PEER", help="peer name or destination hash"
+    )
+    group_ban.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_ban.set_defaults(func=cmd_group_ban)
+
+    group_unban = group_sub.add_parser(
+        "unban",
+        parents=[common],
+        help="lift a ban on a group you created",
+    )
+    group_unban.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_unban.add_argument(
+        "peer", metavar="PEER", help="peer name or destination hash"
+    )
+    group_unban.set_defaults(func=cmd_group_unban)
+
+    group_banned = group_sub.add_parser(
+        "banned",
+        parents=[common],
+        help="list the peers banned from a group you created",
+    )
+    group_banned.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_banned.set_defaults(func=cmd_group_banned)
+
     group_invite = group_sub.add_parser(
         "invite",
         parents=[common],
@@ -2994,6 +3067,15 @@ def build_parser() -> argparse.ArgumentParser:
         "and the bytes are fetched on demand with `tau tan media`",
     )
     tan_post.add_argument(
+        "--location",
+        default=None,
+        metavar="LAT,LON [NAME]",
+        help="attach a place to the post (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park") — the signed post carries '
+        "the place, and the timeline and console show it with an "
+        "open-in-maps link",
+    )
+    tan_post.add_argument(
         "--reply-to",
         default=None,
         metavar="POST",
@@ -3449,6 +3531,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--author", metavar="NAME|HASH", help="show one author's posts"
     )
     tan_timeline.add_argument(
+        "--list",
+        metavar="NAME",
+        default=None,
+        help="show only posts from this list's members",
+    )
+    tan_timeline.add_argument(
         "--tag", metavar="TAG", help="show only posts carrying this tag"
     )
     tan_timeline.add_argument(
@@ -3585,6 +3673,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_following.set_defaults(func=cmd_tan_following)
 
+    tan_followers = tan_sub.add_parser(
+        "followers",
+        parents=[common],
+        help="list authors who follow you, from stored follow lists",
+    )
+    tan_followers.set_defaults(func=cmd_tan_followers)
+
     tan_publish_follows = tan_sub.add_parser(
         "publish-follows",
         parents=[common],
@@ -3658,6 +3753,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     tan_muted = tan_sub.add_parser("muted", parents=[common], help="list muted authors")
     tan_muted.set_defaults(func=cmd_tan_muted)
+
+    tan_lists_cmd = tan_sub.add_parser(
+        "lists",
+        parents=[common],
+        help="curate followed authors into named lists",
+    )
+    lists_sub = tan_lists_cmd.add_subparsers(
+        dest="lists_cmd", metavar="LISTS_COMMAND"
+    )
+    lists_create = lists_sub.add_parser(
+        "create", parents=[common], help="create an empty list"
+    )
+    lists_create.add_argument("name", metavar="NAME", help="list name")
+    lists_delete = lists_sub.add_parser(
+        "delete", parents=[common], help="delete a list"
+    )
+    lists_delete.add_argument("name", metavar="NAME", help="list name")
+    lists_add = lists_sub.add_parser(
+        "add", parents=[common], help="add authors to a list"
+    )
+    lists_add.add_argument("name", metavar="NAME", help="list name")
+    lists_add.add_argument(
+        "authors", nargs="+", metavar="NAME|HASH", help="authors to add"
+    )
+    lists_remove = lists_sub.add_parser(
+        "remove", parents=[common], help="remove authors from a list"
+    )
+    lists_remove.add_argument("name", metavar="NAME", help="list name")
+    lists_remove.add_argument(
+        "authors", nargs="+", metavar="NAME|HASH", help="authors to remove"
+    )
+    lists_show = lists_sub.add_parser(
+        "show", parents=[common], help="show a list's members"
+    )
+    lists_show.add_argument("name", metavar="NAME", help="list name")
+    tan_lists_cmd.set_defaults(func=cmd_tan_lists)
 
     tan_mute_keyword = tan_sub.add_parser(
         "mute-keyword",
@@ -5096,6 +5227,22 @@ def _print_tan_image(post: Dict[str, Any]) -> None:
     )
 
 
+def _print_tan_location(post: Dict[str, Any], indent: str = "  ") -> None:
+    """Print a post's place attachment lines, when it has one.
+
+    A hand-edited record with a bad pin just shows its text: the
+    cleaner drops it instead of breaking the display, like a bad DM
+    pin in :func:`cmd_messages`.
+    """
+    location = clean_location(post.get("location"))
+    if location is None:
+        return
+    name = location.get("name")
+    label = name if isinstance(name, str) and name else "Location"
+    print(f"{indent}📍 {label} — {location['lat']}, {location['lon']}")
+    print(f"{indent}{location_maps_url(location)}")
+
+
 def _print_tan_posts(
     posts: Sequence[Dict[str, Any]],
     *,
@@ -5171,6 +5318,7 @@ def _print_tan_posts(
         if post.get("kind") == "poll":
             _print_poll_options(post)
         _print_tan_image(post)
+        _print_tan_location(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -5228,6 +5376,7 @@ def _print_tan_thread(
                 )
         if post.get("kind") == "poll":
             _print_poll_options(post, indent=f"{indent}  ")
+        _print_tan_location(post, indent=f"{indent}  ")
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -5272,6 +5421,7 @@ def _print_saved_posts(
         if post.get("kind") == "poll":
             _print_poll_options(post)
         _print_tan_image(post)
+        _print_tan_location(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -5372,6 +5522,7 @@ def _print_pinned_posts(
         if post.get("kind") == "poll":
             _print_poll_options(post)
         _print_tan_image(post)
+        _print_tan_location(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -5706,6 +5857,7 @@ def _publish_local_post(
     timeout: float = 15.0,
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
@@ -5810,7 +5962,8 @@ def _publish_local_post(
         if text is None:
             raise TanError("nothing to publish")
         post = publisher.create_post(
-            text, reply_to=reply_to, expires_at=expires_at, image=image
+            text, reply_to=reply_to, expires_at=expires_at, image=image,
+            location=location,
         )
     published = publisher.publish(
         post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
@@ -5863,6 +6016,24 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             return 2
         image = _read_image(args.image, config.data_dir)
 
+    location = None
+    if getattr(args, "location", None) is not None:
+        if reply_to is not None:
+            print(
+                "error: --location can only be attached to a top-level post, "
+                "not a reply",
+                file=sys.stderr,
+            )
+            return 2
+        if getattr(args, "delay", None) is not None:
+            print(
+                "error: --location cannot be combined with --delay — "
+                "scheduled posts cannot carry an attachment yet",
+                file=sys.stderr,
+            )
+            return 2
+        location = _location_from_args(args)
+
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
         if getattr(args, "no_publish", False):
@@ -5912,7 +6083,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
         post = app.create_post(
-            text, reply_to=reply_to, expires_at=expires_at, image=image
+            text, reply_to=reply_to, expires_at=expires_at, image=image,
+            location=location,
         )
         published = None
     else:
@@ -5935,6 +6107,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             )
             if image is not None:
                 request["image"] = image
+            if location is not None:
+                request["location"] = location
             result = publish_running(config.data_dir, **request)
             post, published = result["post"], result["published"]
         else:
@@ -5955,6 +6129,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                     timeout=float(getattr(args, "timeout", 15.0)),
                     expires_at=expires_at,
                     image=image,
+                    location=location,
                 )
                 post, published = result["post"], result["published"]
             finally:
@@ -5982,6 +6157,12 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             size = int(image.get("size") or 0)
             size_text = f"{size / 1024:.1f} KiB" if size >= 1024 else f"{size} B"
             print(f"  image {image.get('name')} ({size_text}, {image.get('mime')})")
+        location = clean_location(post.get("location"))
+        if location is not None:
+            name = location.get("name")
+            label = name if isinstance(name, str) and name else "Location"
+            print(f"  📍 {label} — {location['lat']}, {location['lon']}")
+            print(f"  {location_maps_url(location)}")
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -7200,7 +7381,17 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
     try:
         identity = load_identity(config.identity_path)
         viewer = destination_hash(identity).hex() if identity is not None else None
-        if getattr(args, "author", None):
+        if getattr(args, "list", None):
+            posts = list_timeline(
+                conn,
+                args.list,
+                limit=args.limit,
+                viewer=viewer,
+                exclude_authors=blocked,
+                exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
+            )
+        elif getattr(args, "author", None):
             author, _ = resolve_author(
                 conn, args.author, registry=PeerRegistry(config.peers_path)
             )
@@ -7591,6 +7782,55 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_tan_followers(args: argparse.Namespace) -> int:
+    """List the authors who follow this node.
+
+    Followers are derived from the peers' signed follow lists this
+    node has already verified and stored — the same lists the sync
+    depth uses — so this never does network I/O.  A follower whose
+    list was never fetched does not appear yet; fetch it first with
+    ``tau tan follows-of`` or a sync.
+    """
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    own_author = destination_hash(identity).hex()
+    store = FollowListStore(config.follow_lists_path)
+    lists = {
+        doc["author"]: doc["authors"]
+        for doc in store.all()
+        if isinstance(doc, dict)
+        and isinstance(doc.get("author"), str)
+        and isinstance(doc.get("authors"), list)
+    }
+    registry = PeerRegistry(config.peers_path)
+    conn = init_db(config.social_db_path)
+    try:
+        records = followers(conn, lists, own_author, registry=registry)
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"followers": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print(
+                "No followers yet — nobody with a stored follow list "
+                "follows you. Try `tau tan sync` to fetch follow lists."
+            )
+        for record in records:
+            name = record.get("name") or "unknown"
+            followed = "following" if record.get("followed") else ""
+            print(
+                f"{name:<20} {short_hash(record['author']):<10} "
+                f"{record.get('posts', 0)} post(s)  {followed}".rstrip()
+            )
+    return _EXIT_OK
+
+
 def _print_follow_list(
     doc: Dict[str, Any],
     registry: Optional[PeerRegistry] = None,
@@ -7883,6 +8123,142 @@ def cmd_tan_muted(args: argparse.Namespace) -> int:
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s) muted {when}"
             )
+    return _EXIT_OK
+
+
+def cmd_tan_lists(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    cmd = getattr(args, "lists_cmd", None)
+    registry = PeerRegistry(config.peers_path)
+    conn = init_db(config.social_db_path)
+    try:
+        if cmd is None:
+            records = tan_lists(conn)
+            if json_output:
+                _emit({"lists": records, "count": len(records)}, True)
+            else:
+                if not records:
+                    print("No lists yet. Create one with `tau tan lists create friends`.")
+                for record in records:
+                    count = record["members"]
+                    print(
+                        f"{record['name']:<20} {count} member(s)"
+                    )
+            return _EXIT_OK
+        if cmd == "create":
+            config.prepare()
+            record = create_list(conn, args.name)
+            if json_output:
+                _emit(record, True)
+            else:
+                print(f"created list {record['name']!r}")
+            return _EXIT_OK
+        if cmd == "delete":
+            removed = delete_list(conn, args.name)
+            if json_output:
+                _emit(
+                    {"name": args.name.strip(), "deleted": removed}, True
+                )
+            else:
+                if removed:
+                    print(f"deleted list {args.name.strip()!r}")
+                else:
+                    print(f"no list named {args.name.strip()!r}")
+            return _EXIT_OK
+        if cmd == "show":
+            records = list_members(conn, args.name)
+            for record in records:
+                record.update(author_stats(conn, record["author"]))
+                peer = registry.get(record["author"])
+                if peer is not None and peer.display_name:
+                    record["name"] = peer.display_name
+            display = next(
+                (
+                    entry["name"]
+                    for entry in tan_lists(conn)
+                    if entry["name"].casefold() == args.name.strip().casefold()
+                ),
+                args.name.strip(),
+            )
+            if json_output:
+                _emit(
+                    {
+                        "name": display,
+                        "members": records,
+                        "count": len(records),
+                    },
+                    True,
+                )
+            else:
+                if not records:
+                    print(f"List {display!r} is empty.")
+                for record in records:
+                    name = record.get("name") or "unknown"
+                    print(
+                        f"{name:<20} {short_hash(record['author']):<10} "
+                        f"{record.get('posts', 0)} post(s)"
+                    )
+            return _EXIT_OK
+        if cmd in ("add", "remove"):
+            config.prepare()
+            followed = {
+                record["author"] for record in following(conn)
+            }
+            results = []
+            for target in args.authors:
+                author, name = resolve_author(conn, target, registry=registry)
+                if cmd == "add":
+                    record = add_to_list(
+                        conn, args.name, author, author_name=name
+                    )
+                    record["followed"] = author in followed
+                    results.append(record)
+                else:
+                    removed = remove_from_list(conn, args.name, author)
+                    results.append(
+                        {
+                            "list": args.name.strip(),
+                            "author": author,
+                            "name": name,
+                            "removed": removed,
+                        }
+                    )
+            if json_output:
+                _emit({"results": results, "count": len(results)}, True)
+            else:
+                for record in results:
+                    label = record["name"] or record["author"]
+                    if cmd == "add":
+                        note = (
+                            " (not followed — a list is curation, not a follow)"
+                            if not record["followed"]
+                            else ""
+                        )
+                        if record["added"]:
+                            print(
+                                f"added {label} ({short_hash(record['author'])}) "
+                                f"to {record['list']!r}{note}"
+                            )
+                        else:
+                            print(
+                                f"{label} ({short_hash(record['author'])}) "
+                                f"is already in {record['list']!r}"
+                            )
+                    else:
+                        if record["removed"]:
+                            print(
+                                f"removed {label} ({short_hash(record['author'])}) "
+                                f"from {record['list']!r}"
+                            )
+                        else:
+                            print(
+                                f"{label} ({short_hash(record['author'])}) "
+                                f"was not in {record['list']!r}"
+                            )
+            return _EXIT_OK
+    finally:
+        conn.close()
     return _EXIT_OK
 
 
@@ -15121,17 +15497,34 @@ def cmd_pinned_conversations(args: argparse.Namespace) -> int:
 
 def cmd_mute(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    if getattr(args, "off", False) and args.peer is None and args.group is None:
-        print("error: --off needs a --peer or --group to unmute", file=sys.stderr)
+    channel = getattr(args, "channel", None)
+    if (
+        getattr(args, "off", False)
+        and args.peer is None
+        and args.group is None
+        and channel is None
+    ):
+        print(
+            "error: --off needs a --peer, --group or --channel to unmute",
+            file=sys.stderr,
+        )
         return _EXIT_ERROR
     for_duration = getattr(args, "for_duration", None)
-    if for_duration is not None and args.peer is None and args.group is None:
-        print("error: --for needs a --peer or --group to mute", file=sys.stderr)
+    if (
+        for_duration is not None
+        and args.peer is None
+        and args.group is None
+        and channel is None
+    ):
+        print(
+            "error: --for needs a --peer, --group or --channel to mute",
+            file=sys.stderr,
+        )
         return _EXIT_ERROR
     if getattr(args, "off", False) and for_duration is not None:
         print("error: --off and --for cannot be combined", file=sys.stderr)
         return _EXIT_ERROR
-    if args.peer is None and args.group is None:
+    if args.peer is None and args.group is None and channel is None:
         # No target lists what is muted, mirroring `tau archived`.
         muted = load_muted(config.muted_path)
         now = time.time()
@@ -15139,6 +15532,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
             payload: Dict[str, Any] = {
                 "peers": sorted(muted.peers),
                 "groups": sorted(muted.groups),
+                "channels": sorted(muted.channels),
             }
             peer_until = {
                 key: until
@@ -15154,11 +15548,18 @@ def cmd_mute(args: argparse.Namespace) -> int:
             }
             if group_until:
                 payload["group_until"] = group_until
+            channel_until = {
+                key: until
+                for key, until in sorted(muted.channel_until.items())
+                if key in muted.channels
+            }
+            if channel_until:
+                payload["channel_until"] = channel_until
             _emit(payload, True)
             return _EXIT_OK
         registry = PeerRegistry(config.peers_path)
         store = GroupStore(config.groups_path)
-        if not muted.peers and not muted.groups:
+        if not muted.peers and not muted.groups and not muted.channels:
             print("No muted conversations.")
             return _EXIT_OK
         for destination in sorted(muted.peers):
@@ -15184,8 +15585,33 @@ def cmd_mute(args: argparse.Namespace) -> int:
                 else ""
             )
             print(f"{label}{suffix}")
+        for channel_name in sorted(muted.channels):
+            until = muted.muted_until_channel(channel_name, now=now)
+            suffix = (
+                f" — muted for {_ago(until - now)} more"
+                if until is not None
+                else ""
+            )
+            print(f"channel #{channel_name}{suffix}")
         return _EXIT_OK
-    if args.group is not None:
+    if channel is not None:
+        # A channel mute is meaningless for a channel whose messages
+        # are not stored here, so muting requires membership — like
+        # a group mute requires the group to exist.
+        try:
+            name = clean_channel_name(channel)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        if name not in {m["channel"] for m in app.memberships()}:
+            print(f"error: not a member of #{name} — join it first", file=sys.stderr)
+            return _EXIT_ERROR
+        key = name
+        label = f"channel #{name}"
+        is_group = False
+        is_channel = True
+    elif args.group is not None:
         store = GroupStore(config.groups_path)
         group = store.find(args.group)
         key = group["id"]
@@ -15193,6 +15619,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
         lineage = group_lineage(group)
         label = f"group {group['name']} ({short_hash(key)})"
         is_group = True
+        is_channel = False
     else:
         inbox = Inbox(config.inbox_path)
         registry = PeerRegistry(config.peers_path)
@@ -15201,6 +15628,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else "unknown"
         label = f"conversation with {name} ({short_hash(key)})"
         is_group = False
+        is_channel = False
     seconds = None
     until = None
     if for_duration is not None:
@@ -15225,6 +15653,13 @@ def cmd_mute(args: argparse.Namespace) -> int:
                 updated = muted.without_group_lineage(lineage)
             else:
                 updated = muted.with_group_lineage(lineage, until=until)
+        elif is_channel:
+            previous = muted.is_muted_channel(key)
+            previous_until = muted.muted_until_channel(key)
+            if getattr(args, "off", False):
+                updated = muted.without_channel(key)
+            else:
+                updated = muted.with_channel(key, until=until)
         else:
             previous = muted.is_muted_peer(key)
             previous_until = muted.muted_until_peer(key)
@@ -15243,6 +15678,8 @@ def cmd_mute(args: argparse.Namespace) -> int:
     # off the previous state.
     if is_group:
         effective_until = updated.muted_until_group_lineage(lineage)
+    elif is_channel:
+        effective_until = updated.muted_until_channel(key)
     else:
         effective_until = updated.muted_until_peer(key)
     if _json_mode(args):
@@ -15250,6 +15687,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
             {
                 "target": key,
                 "group": is_group,
+                "channel": is_channel,
                 "muted": current,
                 "changed": changed,
                 "until": effective_until,
@@ -16378,6 +16816,206 @@ def cmd_group_add_member(args: argparse.Namespace) -> int:
 
 def cmd_group_remove_member(args: argparse.Namespace) -> int:
     return _change_group_members(args, adding=False)
+
+
+def _describe_banned(group: Dict[str, Any], registry: PeerRegistry) -> List[Dict[str, str]]:
+    """A group's ban list with display names for output."""
+    entries = []
+    for banned_hash in group.get("banned") or []:
+        peer = registry.get(banned_hash)
+        entries.append(
+            {
+                "hash": banned_hash,
+                "name": peer.display_name if peer is not None else banned_hash[:8],
+            }
+        )
+    return entries
+
+
+def cmd_group_ban(args: argparse.Namespace) -> int:
+    """Ban a peer from a group this node created.
+
+    The peer is removed from the roster when they are a member and
+    recorded on the ban list either way, so they cannot be re-added
+    or approved through a join request afterwards.  Only the creator
+    can ban; the ban itself needs a running node only to resolve an
+    unknown peer — a member (or an already-banned peer) resolves
+    straight from the roster, like a removal.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        group = node.groups.find(args.group)
+        if not group["local"] or group["creator"] != own_hash:
+            raise NodeError("only the creator can ban members of a group")
+        members = list(group["members"])
+        banned = list(group.get("banned") or [])
+        fast = _roster_hash(args.peer, members + banned)
+        if fast is not None:
+            known = node.registry.get(fast)
+            peer = SimpleNamespace(
+                hexhash=fast,
+                display_name=(
+                    known.display_name if known is not None else fast[:8]
+                ),
+            )
+        else:
+            peer = node.resolve_peer(
+                args.peer,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+        previous_id = group["id"]
+        try:
+            new_group = node.groups.ban(
+                group["id"], peer.hexhash, created_by=own_hash
+            )
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    finally:
+        node.stop()
+
+    described = _describe_group(new_group, node.registry)
+    banned_entries = _describe_banned(new_group, node.registry)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": described,
+                "banned": banned_entries,
+                "previous_id": previous_id,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if previous_id != new_group["id"]:
+        print(
+            f"banned {peer.display_name} from group {new_group['name']}"
+            f" ({previous_id[:8]} -> {new_group['id'][:8]})"
+        )
+    else:
+        print(
+            f"banned {peer.display_name} from group {new_group['name']}"
+            f" ({new_group['id'][:8]})"
+        )
+    print("They cannot be re-added or approved through a join request.")
+    print("Lift it with `tau group unban`.")
+    return _EXIT_OK
+
+
+def _resolve_banned_peer(
+    target: str, banned: List[str], registry: PeerRegistry
+) -> str:
+    """Resolve an unban target to a banned hash.
+
+    A banned hash (full or unique prefix) needs no lookup; anything
+    else resolves through the registry, so a name works too.  A bare
+    hash for a peer the registry never saw is still usable — the ban
+    list is the authority, and unbanning a hash that is not banned
+    changes nothing.
+    """
+    cleaned = target.strip().lower()
+    if not cleaned:
+        raise NodeError("pass a peer name or destination hash")
+    matches = [entry for entry in banned if entry.startswith(cleaned)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise NodeError(
+            f"ambiguous peer: {target!r} matches several banned peers;"
+            " pass a longer hash prefix"
+        )
+    try:
+        peer = registry.resolve(target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is not None:
+        return peer.destination_hash.hex()
+    if len(cleaned) == 32:
+        try:
+            bytes.fromhex(cleaned)
+        except ValueError:
+            raise NodeError(f"unknown peer: {target!r}") from None
+        return cleaned
+    raise NodeError(f"unknown peer: {target!r}")
+
+
+def cmd_group_unban(args: argparse.Namespace) -> int:
+    """Lift a ban on a group this node created.
+
+    Needs no running node: the ban list is local creator state, and
+    the target resolves from the ban list or the registry.  The peer
+    is not re-added to the roster — they can join again afterwards,
+    but only through the normal paths.
+    """
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    own_hash = destination_hash(identity).hex()
+    if not group["local"] or group["creator"] != own_hash:
+        raise NodeError("only the creator can unban members of a group")
+    registry = PeerRegistry(config.peers_path)
+    resolved = _resolve_banned_peer(
+        args.peer, list(group.get("banned") or []), registry
+    )
+    was_banned = resolved in (group.get("banned") or [])
+    try:
+        new_group = store.unban(group["id"], resolved, created_by=own_hash)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_group(new_group, registry)
+    peer = registry.get(resolved)
+    name = peer.display_name if peer is not None else resolved[:8]
+    if _json_mode(args):
+        _emit(
+            {
+                "group": described,
+                "unbanned": {"hash": resolved, "name": name},
+                "was_banned": was_banned,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if was_banned:
+        print(f"unbanned {name} from group {new_group['name']} ({new_group['id'][:8]})")
+    else:
+        print(f"{name} was not banned from group {new_group['name']}.")
+    return _EXIT_OK
+
+
+def cmd_group_banned(args: argparse.Namespace) -> int:
+    """List the peers banned from a group this node created."""
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    registry = PeerRegistry(config.peers_path)
+    entries = _describe_banned(group, registry)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": _describe_group(group, registry),
+                "banned": entries,
+                "count": len(entries),
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not entries:
+        print(f"No banned peers in {group['name']} ({group['id'][:8]}).")
+        return _EXIT_OK
+    print(f"Banned from {group['name']} ({group['id'][:8]}):")
+    for entry in entries:
+        print(f"  {entry['name']} ({entry['hash'][:8]})")
+    return _EXIT_OK
 
 
 def cmd_group_invite(args: argparse.Namespace) -> int:
@@ -19362,9 +20000,33 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("  its messages as delivered, never read")
         return _EXIT_OK
 
+    if command == "tan-sync-depth":
+        depth_arg = getattr(args, "depth", None)
+        if depth_arg is None:
+            depth = tan_sync_depth(config.data_dir)
+            if json_output:
+                _emit({"tan_sync_depth": depth}, True)
+            else:
+                print(f"Tan sync depth: {depth}")
+                print("  1 = followed authors only")
+                print("  2 = plus the authors they follow (default)")
+            return _EXIT_OK
+        depth = int(depth_arg)
+        set_node_setting(config.data_dir, "tan_sync_depth", depth)
+        if json_output:
+            _emit({"tan_sync_depth": depth}, True)
+        else:
+            print(f"Tan sync depth: {depth}")
+            if depth == 1:
+                print("  sync pulls followed authors only")
+            else:
+                print("  sync also pulls the authors they follow")
+        return _EXIT_OK
+
     settings = {
         "accept_files": accept_files_enabled(config.data_dir),
         "send_read_receipts": send_read_receipts_enabled(config.data_dir),
+        "tan_sync_depth": tan_sync_depth(config.data_dir),
     }
     if json_output:
         _emit(settings, True)
@@ -19374,8 +20036,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"Settings ({config.data_dir / 'node.json'}):")
         print(f"  accept files: {accept_state}")
         print(f"  send read receipts: {receipts_state}")
+        print(f"  tan sync depth: {settings['tan_sync_depth']}")
         print("  change with: tau config accept-files on|off")
         print("  change with: tau config read-receipts on|off")
+        print("  change with: tau config tan-sync-depth 1|2")
     return _EXIT_OK
 
 

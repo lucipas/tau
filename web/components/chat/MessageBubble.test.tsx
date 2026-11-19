@@ -76,6 +76,37 @@ describe("MessageBubble", () => {
     expect(onVotePoll).toHaveBeenCalledWith(expect.objectContaining({ id: 10 }), 1);
   });
 
+  it("renders a location pin with an open-in-maps link", () => {
+    render(
+      <MessageBubble
+        message={makeMessage({
+          id: 11,
+          text: "meet here",
+          location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+        })}
+        now={1700000060}
+      />,
+    );
+    const link = screen.getByRole("link", { name: /Rock Springs Park/ });
+    expect(link.getAttribute("href")).toContain("openstreetmap.org");
+    expect(link.getAttribute("href")).toContain("mlat=34.05");
+    expect(link.getAttribute("href")).toContain("mlon=-83.88");
+  });
+
+  it("renders coordinates when a pin has no place name", () => {
+    render(
+      <MessageBubble
+        message={makeMessage({
+          id: 12,
+          text: "📍 34.05, -83.88",
+          location: { lat: 34.05, lon: -83.88 },
+        })}
+        now={1700000060}
+      />,
+    );
+    expect(screen.getByText(/34\.05000, -83\.88000/)).toBeTruthy();
+  });
+
   it("shows the disappearing countdown", () => {
     render(
       <MessageBubble

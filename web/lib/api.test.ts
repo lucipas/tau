@@ -10,19 +10,25 @@ import {
   createBroadcast,
   deleteBroadcast,
   closeChannelPoll,
+  deleteDraft,
   deleteTanDraft,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
+  getAwayMessage,
+  getBeacons,
   getBroadcasts,
   getChannelMessages,
   getChannelPins,
   getChannelScheduled,
   getChannelTopic,
+  getDrafts,
   getGroupInviteStatus,
   getMessages,
+  getOwnProfile,
   getQuietHours,
   getTanDrafts,
+  getTanLists,
   getTanThread,
   getTanTimeline,
   joinGroupViaLink,
@@ -38,16 +44,22 @@ import {
   revokeGroupInvites,
   saveTanDraft,
   closeDmPoll,
+  saveDraft,
   sendBroadcast,
   scheduleChannelMessage,
   searchChannelMessages,
   sendChannelMessage,
   sendMessage,
+  setAwayMessage,
   setChannelTopic,
   setDisappearingDefault,
+  setOwnProfile,
   setQuietHours,
+  startBeacon,
+  stopBeacon,
   tanMediaUrl,
   unpinChannelMessage,
+  updateBeaconPosition,
   voteChannelPoll,
   voteDmPoll,
   voteTanPoll,
@@ -109,6 +121,19 @@ describe("GET endpoints", () => {
     expect(captured[0].url).toBe("/api/tan/timeline?limit=10&all=1&author=alice&tag=mesh");
   });
 
+  it("builds the Tan timeline query for a list", async () => {
+    nextJson = { posts: [], count: 0 };
+    await getTanTimeline({ list: "Mesh Core" });
+    expect(captured[0].url).toBe("/api/tan/timeline?limit=30&list=Mesh%20Core");
+  });
+
+  it("lists Tan lists", async () => {
+    nextJson = { lists: [{ name: "Friends", created_at: 1000, members: 2 }], count: 1 };
+    const lists = await getTanLists();
+    expect(captured[0].url).toBe("/api/tan/lists");
+    expect(lists).toEqual([{ name: "Friends", created_at: 1000, members: 2 }]);
+  });
+
   it("omits empty timeline params", async () => {
     nextJson = { posts: [], count: 0 };
     await getTanTimeline();
@@ -141,6 +166,17 @@ describe("GET endpoints", () => {
     const drafts = await getTanDrafts();
     expect(captured[0].url).toBe("/api/tan/drafts");
     expect(drafts).toEqual([draft]);
+  });
+
+  it("lists message drafts", async () => {
+    nextJson = {
+      drafts: [{ kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" }],
+      count: 1,
+    };
+    const drafts = await getDrafts();
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].name).toBe("alice");
   });
 
   it("posts a channel poll with question and options", async () => {
@@ -202,6 +238,18 @@ describe("GET endpoints", () => {
     });
   });
 
+  it("fetches the away message", async () => {
+    nextJson = {
+      enabled: false,
+      message: "I'm away right now. I'll reply when I'm back.",
+      since: null,
+      replied_to: [],
+      replied_count: 0,
+    };
+    await getAwayMessage();
+    expect(captured[0].url).toBe("/api/settings/away-message");
+  });
+
   it("fetches the quiet-hours window", async () => {
     nextJson = {
       enabled: false,
@@ -253,10 +301,43 @@ describe("POST endpoints", () => {
     });
   });
 
+  it("sends a DM with a location pin", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage(
+      { to: "alice" },
+      "",
+      { location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" } },
+    );
+    expect(captured[0].url).toBe("/api/messages");
+    expect(bodyOf(0)).toEqual({
+      to: "alice",
+      text: "",
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+    });
+  });
+
   it("sends a group message with the group key, not `to`", async () => {
     nextJson = { ok: true, message: {}, response: {} };
     await sendMessage({ group: "g123" }, "hi");
     expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
+  });
+
+  it("saves and deletes a message draft", async () => {
+    nextJson = {
+      ok: true,
+      draft: { kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" },
+    };
+    const draft = await saveDraft("peer", "ab".repeat(16), "hi");
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ kind: "peer", target: "ab".repeat(16), text: "hi" });
+    expect(draft.text).toBe("hi");
+
+    nextJson = { ok: true, deleted: true };
+    const deleted = await deleteDraft("peer", "ab".repeat(16));
+    expect(captured[1].url).toBe("/api/drafts/delete");
+    expect(bodyOf(1)).toEqual({ kind: "peer", target: "ab".repeat(16) });
+    expect(deleted).toBe(true);
   });
 
   it("reacts and clears a reaction on the same route", async () => {
@@ -298,6 +379,42 @@ describe("POST endpoints", () => {
     await closeDmPoll("alice", "wire1");
     expect(captured[1].url).toBe("/api/dm/close-poll");
     expect(bodyOf(1)).toEqual({ to: "alice", poll: "wire1" });
+  });
+
+  it("lists, starts, stops and feeds beacons on the beacon routes", async () => {
+    nextJson = { beacons: [], count: 0 };
+    await getBeacons();
+    expect(captured[0].url).toBe("/api/beacons");
+
+    nextJson = { ok: true, beacon: { id: "aabbccdd" }, update: {} };
+    await startBeacon(
+      { peer: "alice" },
+      { lat: 34.05, lon: -83.88, name: "Rock Springs Park", durationSeconds: 900, coarse: true },
+    );
+    expect(captured[1].url).toBe("/api/beacons/start");
+    expect(bodyOf(1)).toEqual({
+      peer: "alice",
+      lat: 34.05,
+      lon: -83.88,
+      name: "Rock Springs Park",
+      durationSeconds: 900,
+      coarse: true,
+    });
+
+    await startBeacon({ group: "ab".repeat(16) }, { lat: 34.05, lon: -83.88 });
+    expect(captured[2].url).toBe("/api/beacons/start");
+    expect(bodyOf(2)).toEqual({ group: "ab".repeat(16), lat: 34.05, lon: -83.88 });
+
+    await stopBeacon("aabbccdd");
+    expect(captured[3].url).toBe("/api/beacons/stop");
+    expect(bodyOf(3)).toEqual({ id: "aabbccdd" });
+
+    await updateBeaconPosition("aabbccdd", 34.06, -83.87);
+    expect(captured[4].url).toBe("/api/beacons/position");
+    expect(bodyOf(4)).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87 });
+
+    await updateBeaconPosition("aabbccdd", 34.06, -83.87, "Elsewhere");
+    expect(bodyOf(5)).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87, name: "Elsewhere" });
   });
 
   it("marks read with an empty body when no conversation is given", async () => {
@@ -347,6 +464,42 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ enabled: true, start: "23:00", end: "06:30" });
     await setQuietHours({ enabled: false });
     expect(bodyOf(1)).toEqual({ enabled: false });
+  });
+
+  it("fetches the own profile from /api/profile", async () => {
+    nextJson = {
+      author: null,
+      name: "testnode",
+      bio: "",
+      avatar: null,
+      links: [],
+      version: 0,
+      created_at: null,
+      published: false,
+    };
+    const profile = await getOwnProfile();
+    expect(captured[0].url).toBe("/api/profile");
+    expect(captured[0].init?.method).toBeUndefined();
+    expect(profile.name).toBe("testnode");
+    expect(profile.published).toBe(false);
+  });
+
+  it("publishes a profile patch to /api/profile", async () => {
+    nextJson = { ok: true, profile: { name: "Tester Two", version: 1 } };
+    await setOwnProfile({
+      name: "Tester Two",
+      bio: "mesh enjoyer",
+      avatar: "ab".repeat(32),
+      links: ["https://example.org"],
+    });
+    expect(captured[0].url).toBe("/api/profile");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      name: "Tester Two",
+      bio: "mesh enjoyer",
+      avatar: "ab".repeat(32),
+      links: ["https://example.org"],
+    });
   });
 
   it("publishes a Tan post with an image data URL when attached", async () => {
@@ -446,6 +599,16 @@ describe("POST endpoints", () => {
     await unpinChannelMessage("general", "a".repeat(64));
     expect(captured[1].url).toBe("/api/channels/unpin");
     expect(bodyOf(1)).toEqual({ channel: "general", hash: "a".repeat(64) });
+  });
+
+  it("sets the away message with only the changed fields", async () => {
+    nextJson = { ok: true, away_message: {} };
+    await setAwayMessage({ enabled: true, message: "back on Monday" });
+    expect(captured[0].url).toBe("/api/settings/away-message");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ enabled: true, message: "back on Monday" });
+    await setAwayMessage({ enabled: false });
+    expect(bodyOf(1)).toEqual({ enabled: false });
   });
 });
 
