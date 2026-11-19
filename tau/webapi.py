@@ -4648,6 +4648,7 @@ class WebBridge:
                 options=poll_options,
                 publish_at=time.time() + float(send_in),
                 name=getattr(self.node, "name", None),
+                disappearing_path=config.disappearing_path,
             )
             return entry.to_dict()
         entry = schedule_channel_message(
@@ -4656,6 +4657,7 @@ class WebBridge:
             text=text,
             publish_at=time.time() + float(send_in),
             name=getattr(self.node, "name", None),
+            disappearing_path=config.disappearing_path,
         )
         return entry.to_dict()
 

@@ -453,6 +453,7 @@ def schedule_channel_message(
     name: Optional[str] = None,
     kind: str = "message",
     options: Optional[Sequence[str]] = None,
+    disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a channel message for *publish_at*; returns the stored entry.
 
@@ -467,6 +468,14 @@ def schedule_channel_message(
     again when the message is created, so a long display name can
     still only shrink the margin, never grow it past the check here.
 
+    The measured envelope carries the expiry the publish pass will
+    actually apply: the channel's disappearing default (resolved from
+    *disappearing_path*) when one is set, and no expiry at all when
+    the channel has none — a channel without a default publishes a
+    message with no ``expires_at``, so sizing one in would reject a
+    poll that fits.  When no disappearing path is given, no default
+    is assumed.
+
     With ``kind="poll"`` the text is the poll question and *options*
     carries its fixed choices: the question plus options get the same
     wire-size preflight an immediate ``tau channel poll`` gets, so a
@@ -478,11 +487,11 @@ def schedule_channel_message(
     # which ``tau.backup`` relies on.
     from .channels import (
         CHANNEL_VERSION,
-        MAX_CHANNEL_EXPIRE_SECONDS,
         ChannelError,
         _check_wire_size,
         sanitize_name,
     )
+    from .disappearing import channel_default_for
 
     clean_kind = _clean_kind(kind)
     clean_options: Tuple[str, ...] = ()
@@ -502,9 +511,11 @@ def schedule_channel_message(
         # hash 32 hex, RNS public key 128 hex): a shorter placeholder
         # would admit a message that only fails once signed.  The
         # remaining signed fields are carried at their real shape too:
-        # the version, an empty reply target, and an expiry (sized at
-        # the largest disappearing default, which a channel default
-        # may fill in at publish time).
+        # the version and an empty reply target.  An expiry rides
+        # only when the channel has a disappearing default — the
+        # publish pass applies that same default, and a channel
+        # without one publishes with no expiry at all, so sizing
+        # one in here would reject a poll that fits on the wire.
         "v": CHANNEL_VERSION,
         "channel": clean_channel,
         "author": "0" * 32,
@@ -512,9 +523,11 @@ def schedule_channel_message(
         "name": sanitize_name(name or "anonymous"),
         "text": clean_text,
         "created_at": publish_at,
-        "expires_at": publish_at + MAX_CHANNEL_EXPIRE_SECONDS,
         "reply_to": "",
     }
+    default_expire = channel_default_for(disappearing_path, clean_channel)
+    if default_expire is not None:
+        envelope["expires_at"] = publish_at + default_expire
     if clean_kind == "poll":
         envelope["poll_options"] = list(clean_options)
     try:
@@ -549,6 +562,7 @@ def schedule_channel_poll(
     ttl: int = 3,
     now: Optional[float] = None,
     name: Optional[str] = None,
+    disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a poll for *publish_at*; returns the stored entry.
 
@@ -567,6 +581,7 @@ def schedule_channel_poll(
         name=name,
         kind="poll",
         options=options,
+        disappearing_path=disappearing_path,
     )
 
 

@@ -8984,6 +8984,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
+                disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
             raise NodeError(str(exc)) from exc
@@ -9725,6 +9726,7 @@ def cmd_channel_poll(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
+                disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
             raise NodeError(str(exc)) from exc

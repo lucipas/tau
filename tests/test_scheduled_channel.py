@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tau.disappearing import DisappearingDefaults, save_disappearing_defaults
 from tau.scheduled_channel import (
     MAX_PUBLISH_ATTEMPTS,
     ScheduledChannelError,
@@ -230,6 +231,56 @@ def test_schedule_poll_rejects_options_that_cannot_fit_the_wire(tmp_path):
             now=1000.0,
         )
     assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_poll_preflight_is_expiry_aware(tmp_path):
+    # The schedule-time wire-size preflight must mirror the expiry
+    # the publish pass will actually apply.  A 1,915-emoji question
+    # fits the 8 KiB envelope without an expiry but overflows it
+    # once the ``expires_at`` field (~20 bytes) is added, so it is
+    # accepted for a channel with no disappearing default and refused
+    # for one with a default.  (With the old always-max-expiry
+    # preflight, the no-default case was wrongly refused too.)
+    question = "😀" * 1915
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_poll(
+        path,
+        channel="general",
+        question=question,
+        options=["aa", "bb"],
+        publish_at=2000.0,
+        now=1000.0,
+    )
+    assert load_scheduled_channel_messages(path).messages[0].id == entry.id
+
+    defaults_path = tmp_path / "disappearing.json"
+    save_disappearing_defaults(
+        defaults_path, DisappearingDefaults(channels={"general": 3600.0})
+    )
+    path_with_default = tmp_path / "scheduled-with-default.json"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_poll(
+            path_with_default,
+            channel="general",
+            question=question,
+            options=["aa", "bb"],
+            publish_at=2000.0,
+            now=1000.0,
+            disappearing_path=defaults_path,
+        )
+    assert load_scheduled_channel_messages(path_with_default).messages == ()
+    # And a poll five emoji shorter still fits even with the default:
+    # the expiry-aware check still runs when an expiry will be carried.
+    entry = schedule_channel_poll(
+        path_with_default,
+        channel="general",
+        question="😀" * 1910,
+        options=["aa", "bb"],
+        publish_at=2000.0,
+        now=1000.0,
+        disappearing_path=defaults_path,
+    )
+    assert load_scheduled_channel_messages(path_with_default).messages[0].id == entry.id
 
 
 def test_queue_without_kind_loads_as_message(tmp_path):
