@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   acceptDmRequest,
   clearReaction,
+  closeDmPoll,
   closeGroupPoll,
   declineDmRequest,
   deleteMessage,
@@ -22,6 +23,7 @@ import {
   sendGroupFile,
   sendMessage,
   unpinMessage,
+  voteDmPoll,
   voteGroupPoll,
   type SendMessageOptions,
 } from "@/lib/api";
@@ -273,9 +275,13 @@ export default function ChatSection() {
 
   const handleVotePoll = useCallback(
     (message: ChatMessage, option: number) => {
-      if (!selected || selected.kind !== "group") return;
+      if (!selected) return;
       const pollId = message.wire_id ?? String(message.id);
-      void run("Vote failed", () => voteGroupPoll(selected.key, pollId, option));
+      void run("Vote failed", () =>
+        selected.kind === "group"
+          ? voteGroupPoll(selected.key, pollId, option)
+          : voteDmPoll(selected.key, pollId, option),
+      );
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selected],
@@ -283,9 +289,13 @@ export default function ChatSection() {
 
   const handleClosePoll = useCallback(
     (message: ChatMessage) => {
-      if (!selected || selected.kind !== "group") return;
+      if (!selected) return;
       const pollId = message.wire_id ?? String(message.id);
-      void run("Close poll failed", () => closeGroupPoll(selected.key, pollId));
+      void run("Close poll failed", () =>
+        selected.kind === "group"
+          ? closeGroupPoll(selected.key, pollId)
+          : closeDmPoll(selected.key, pollId),
+      );
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selected],
@@ -380,8 +390,8 @@ export default function ChatSection() {
             onForward={handleForward}
             onReact={handleReact}
             onClearReaction={handleClearReaction}
-            onVotePoll={selected.kind === "group" ? handleVotePoll : undefined}
-            onClosePoll={selected.kind === "group" ? handleClosePoll : undefined}
+            onVotePoll={handleVotePoll}
+            onClosePoll={handleClosePoll}
             onSend={handleSend}
             onSendFile={handleSendFile}
             onBack={handleBack}

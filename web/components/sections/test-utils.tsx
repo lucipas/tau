@@ -60,7 +60,7 @@ export function fakeTau(overrides: Partial<UseTauResult> = {}): UseTauResult {
     groups: [],
     messages: [],
     counts: { messages: 0, peers: 1 },
-    unread: { per_peer: {}, per_group: {}, total: 0, revision: 0 },
+    unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 0 },
     bridge: { version: "0.1.0", web: true, url: "", notes_editable: true },
     social: { enabled: true, posts: 0 },
   };

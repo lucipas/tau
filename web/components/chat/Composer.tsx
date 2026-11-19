@@ -43,7 +43,7 @@ export interface ComposerProps {
   editing?: ChatMessage | null;
   onCancelEdit?: () => void;
   disabled?: boolean;
-  /** Polls are group-only in the bridge; hide the poll toggle for DMs. */
+  /** Polls are supported for this conversation; hide the toggle otherwise. */
   allowPoll?: boolean;
   onSend: (text: string, opts: ComposerSendOptions) => Promise<void> | void;
   onSendFile: (file: File, opts: Omit<ComposerSendOptions, "pollOptions">) => Promise<void> | void;

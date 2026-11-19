@@ -19,7 +19,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import AbstractSet, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import __version__
 from .allowlist import (
@@ -133,12 +133,26 @@ from .group_invites import (
     revoke_invites,
 )
 from .broadcasts import BroadcastStore
+from .channel_polls import (
+    attach_channel_poll_tallies,
+    channel_poll_tally,
+    is_channel_poll,
+    is_channel_poll_close,
+    is_channel_poll_vote,
+    poll_identity as channel_poll_identity,
+    resolve_channel_poll,
+)
 from .groups import GroupStore, pinned_group, pinned_rosters, visible_reactions
 from .group_polls import (
     PostError,
+    attach_dm_poll_tallies,
     attach_group_poll_tallies,
     clean_poll_options,
+    dm_poll_tally,
     group_poll_tally,
+    is_dm_poll,
+    is_dm_poll_close,
+    is_dm_poll_vote,
     is_group_poll,
     is_group_poll_close,
     is_group_poll_vote,
@@ -202,6 +216,13 @@ from .scheduled_posts import (
     cancel_scheduled_post,
     load_scheduled_posts,
     schedule_post,
+)
+from .scheduled_channel import (
+    MAX_SCHEDULED_CHANNEL_DELAY,
+    ScheduledChannelError,
+    cancel_scheduled_channel_message,
+    load_scheduled_channel_messages,
+    schedule_channel_message,
 )
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
@@ -316,12 +337,16 @@ from .tangents.tan import (
 )
 from .channels import (
     DEFAULT_CHANNEL_LIMIT,
+    MAX_FEED_EDITS,
     ChannelApp,
     ChannelError,
     clean_channel_name,
+    create_edit as create_channel_edit,
     create_message as create_channel_message,
+    create_reaction as create_channel_reaction,
     init_db as init_channel_db,
     is_member as is_channel_member,
+    reply_parent as channel_reply_parent,
 )
 
 log = logging.getLogger(__name__)
@@ -387,8 +412,6 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
         dest="json_output",
         help="emit machine readable JSON",
     )
-
-
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     _add_common_options(common)
@@ -602,6 +625,13 @@ def build_parser() -> argparse.ArgumentParser:
         '"34.05,-83.88 Rock Springs Park"); without message text the '
         "place name (or the coordinates) becomes the text, and the "
         "message is tagged location unless --kind says otherwise",
+    )
+    send.add_argument(
+        "--poll-options",
+        nargs="+",
+        default=None,
+        metavar="OPTION",
+        help="post the message as a poll question with 2-8 options",
     )
     send.add_argument(
         "--wait",
@@ -959,6 +989,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     retract.set_defaults(func=cmd_retract)
+
+    vote = subparsers.add_parser(
+        "vote",
+        parents=[common],
+        help="vote on a DM poll (option number or exact option text)",
+    )
+    vote.add_argument(
+        "--to",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    vote.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message id or unique prefix (see `tau messages`)",
+    )
+    vote.add_argument(
+        "option",
+        metavar="OPTION",
+        help="option number (1-based) or the exact option text",
+    )
+    vote.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    vote.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the vote when the peer is offline",
+    )
+    vote.set_defaults(func=cmd_vote)
+
+    close_poll = subparsers.add_parser(
+        "close-poll",
+        parents=[common],
+        help="close a DM poll you created (freezes the tally)",
+    )
+    close_poll.add_argument(
+        "--to",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash",
+    )
+    close_poll.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message id or unique prefix (see `tau messages`)",
+    )
+    close_poll.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    close_poll.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the close when the peer is offline",
+    )
+    close_poll.set_defaults(func=cmd_close_poll)
 
     edit = subparsers.add_parser(
         "edit",
@@ -3822,6 +3905,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_send.add_argument("--file", type=Path, help="read the message text from a file")
     channel_send.add_argument(
+        "--reply-to",
+        default=None,
+        metavar="HASH|PREFIX",
+        help="reply to this message instead of posting standalone (message hash or unique hash prefix)",
+    )
+    channel_send.add_argument(
         "--to",
         action="append",
         default=None,
@@ -3833,9 +3922,55 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="store locally without contacting peers",
     )
+    channel_send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and publish it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d). A node serving "
+        "with --channels publishes it when the time comes",
+    )
     channel_send.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     channel_send.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     channel_send.set_defaults(func=cmd_channel_send)
+
+    channel_react = channel_sub.add_parser(
+        "react",
+        parents=[common],
+        help="react to a stored channel message (one reaction per reactor; empty clears yours)",
+    )
+    channel_react.add_argument("channel", metavar="NAME", help="channel to react in")
+    channel_react.add_argument(
+        "target",
+        metavar="HASH",
+        help="message hash or unique hex prefix (at least 8 characters)",
+    )
+    channel_react.add_argument(
+        "reaction",
+        nargs="?",
+        default=None,
+        metavar="EMOJI",
+        help="emoji or short token (omit with --clear to retract yours)",
+    )
+    channel_react.add_argument(
+        "--clear",
+        action="store_true",
+        help="retract your reaction to the message",
+    )
+    channel_react.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_react.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_react.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_react.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_react.set_defaults(func=cmd_channel_react)
 
     channel_read = channel_sub.add_parser(
         "read",
@@ -3851,6 +3986,155 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N messages (default 20)",
     )
     channel_read.set_defaults(func=cmd_channel_read)
+
+    channel_mark_read = channel_sub.add_parser(
+        "mark-read",
+        parents=[common],
+        help="clear a channel's unread badge by marking its newest message read",
+    )
+    channel_mark_read.add_argument(
+        "channel", metavar="NAME", help="channel to mark read"
+    )
+    channel_mark_read.set_defaults(func=cmd_channel_mark_read)
+
+    channel_scheduled = channel_sub.add_parser(
+        "scheduled",
+        parents=[common],
+        help="list channel messages queued for later publishing",
+    )
+    channel_scheduled.add_argument(
+        "channel",
+        nargs="?",
+        default=None,
+        metavar="NAME",
+        help="only messages queued for this channel (default: all channels)",
+    )
+    channel_scheduled.set_defaults(func=cmd_channel_scheduled)
+
+    channel_cancel_scheduled = channel_sub.add_parser(
+        "cancel-scheduled",
+        parents=[common],
+        help="drop a queued channel message before it publishes",
+    )
+    channel_cancel_scheduled.add_argument(
+        "target", metavar="ID", help="scheduled message id or unique id prefix"
+    )
+    channel_cancel_scheduled.set_defaults(func=cmd_channel_cancel_scheduled)
+    channel_topic = channel_sub.add_parser(
+        "topic",
+        parents=[common],
+        help="show or set a channel's topic (any member may set it; newest wins)",
+    )
+    channel_topic.add_argument("channel", metavar="NAME", help="channel to show or set the topic of")
+    channel_topic.add_argument(
+        "text", nargs="?", help="topic text (omit to show the current topic)"
+    )
+    channel_topic.add_argument("--file", type=Path, help="read the topic text from a file")
+    channel_topic.add_argument(
+        "--clear", action="store_true", help="clear the channel topic"
+    )
+    channel_topic.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_topic.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_topic.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_topic.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_topic.set_defaults(func=cmd_channel_topic)
+
+    channel_pin = channel_sub.add_parser(
+        "pin",
+        parents=[common],
+        help="pin a stored message so it stays surfaced (and survives pruning)",
+    )
+    channel_pin.add_argument("channel", metavar="NAME", help="channel holding the message")
+    channel_pin.add_argument("digest", metavar="HASH", help="message hash to pin")
+    channel_pin.set_defaults(func=cmd_channel_pin)
+
+    channel_unpin = channel_sub.add_parser(
+        "unpin",
+        parents=[common],
+        help="drop the pin on a message in a channel",
+    )
+    channel_unpin.add_argument("channel", metavar="NAME", help="channel holding the message")
+    channel_unpin.add_argument("digest", metavar="HASH", help="message hash to unpin")
+    channel_unpin.set_defaults(func=cmd_channel_unpin)
+
+    channel_pins = channel_sub.add_parser(
+        "pins",
+        parents=[common],
+        help="list pinned messages for a channel, newest pin first",
+    )
+    channel_pins.add_argument("channel", metavar="NAME", help="channel to list pins for")
+    channel_pins.set_defaults(func=cmd_channel_pins)
+    channel_search = channel_sub.add_parser(
+        "search",
+        parents=[common],
+        help="search stored messages in a channel by keyword, newest first",
+    )
+    channel_search.add_argument("channel", metavar="NAME", help="channel to search")
+    channel_search.add_argument("query", metavar="TEXT", help="text to search for")
+    channel_search.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_CHANNEL_LIMIT,
+        metavar="N",
+        help="show the newest N matches (default 20)",
+    )
+    channel_search.set_defaults(func=cmd_channel_search)
+
+    channel_edit = channel_sub.add_parser(
+        "edit",
+        parents=[common],
+        help="edit your own message in a joined channel",
+    )
+    channel_edit.add_argument("channel", metavar="NAME", help="channel to edit in")
+    channel_edit.add_argument(
+        "target",
+        metavar="DIGEST|PREFIX",
+        help="message to edit (full digest, or a hex prefix of at least 4 characters)",
+    )
+    channel_edit.add_argument(
+        "text", nargs="?", help="replacement text (reads stdin when omitted)"
+    )
+    channel_edit.add_argument("--file", type=Path, help="read the replacement text from a file")
+    channel_edit.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_edit.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_edit.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_edit.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_edit.set_defaults(func=cmd_channel_edit)
+
+    channel_edits = channel_sub.add_parser(
+        "edits",
+        parents=[common],
+        help="list edit notices for a channel, newest first",
+    )
+    channel_edits.add_argument("channel", metavar="NAME", help="channel to list edits for")
+    channel_edits.add_argument(
+        "--limit",
+        type=int,
+        default=MAX_FEED_EDITS,
+        metavar="N",
+        help="show the newest N edits (default 50)",
+    )
+    channel_edits.set_defaults(func=cmd_channel_edits)
 
     channel_sync = channel_sub.add_parser(
         "sync",
@@ -3877,6 +4161,146 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_sync.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     channel_sync.set_defaults(func=cmd_channel_sync)
+
+    channel_poll = channel_sub.add_parser(
+        "poll",
+        parents=[common],
+        help="post a poll in a joined channel (question + 2-8 options)",
+    )
+    channel_poll.add_argument("channel", metavar="NAME", help="channel to post the poll in")
+    channel_poll.add_argument(
+        "question", metavar="QUESTION", help="the poll question"
+    )
+    channel_poll.add_argument(
+        "options",
+        metavar="OPTION",
+        nargs="+",
+        help="2-8 distinct options",
+    )
+    channel_poll.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_poll.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_poll.set_defaults(func=cmd_channel_poll)
+
+    channel_vote = channel_sub.add_parser(
+        "vote",
+        parents=[common],
+        help="vote on a channel poll (option number or exact option text)",
+    )
+    channel_vote.add_argument("channel", metavar="NAME", help="channel the poll is in")
+    channel_vote.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message hash or unique prefix (see `tau channel read`)",
+    )
+    channel_vote.add_argument(
+        "option",
+        metavar="OPTION",
+        help="option number (1-based) or the exact option text",
+    )
+    channel_vote.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_vote.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_vote.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_vote.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_vote.set_defaults(func=cmd_channel_vote)
+
+    channel_close_poll = channel_sub.add_parser(
+        "close-poll",
+        parents=[common],
+        help="close a channel poll you created (freezes the tally)",
+    )
+    channel_close_poll.add_argument("channel", metavar="NAME", help="channel the poll is in")
+    channel_close_poll.add_argument(
+        "poll",
+        metavar="POLL",
+        help="poll message hash or unique prefix (see `tau channel read`)",
+    )
+    channel_close_poll.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    channel_close_poll.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    channel_close_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    channel_close_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    channel_close_poll.set_defaults(func=cmd_channel_close_poll)
+
+    channel_retract = channel_sub.add_parser(
+        "retract",
+        parents=[common],
+        help="retract one of your own messages from a channel",
+    )
+    channel_retract.add_argument(
+        "channel", metavar="NAME", help="channel the message is in"
+    )
+    channel_retract.add_argument(
+        "digest",
+        metavar="DIGEST|PREFIX",
+        help="message hash or unique prefix (shown by `tau channel read`)",
+    )
+    channel_retract.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="gossip only to these peers (repeatable)",
+    )
+    channel_retract.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="retract locally without gossiping it to peers",
+    )
+    channel_retract.add_argument(
+        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
+    )
+    channel_retract.add_argument(
+        "--timeout", type=float, default=15.0, metavar="SECONDS"
+    )
+    channel_retract.set_defaults(func=cmd_channel_retract)
+
+    channel_retractions = channel_sub.add_parser(
+        "retractions",
+        parents=[common],
+        help="list stored retract notices for a channel",
+    )
+    channel_retractions.add_argument(
+        "channel", metavar="NAME", help="channel to list"
+    )
+    channel_retractions.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_CHANNEL_LIMIT,
+        metavar="N",
+        help="show the newest N notices (default 20)",
+    )
+    channel_retractions.set_defaults(func=cmd_channel_retractions)
 
     bundle = subparsers.add_parser(
         "bundle",
@@ -5021,6 +5445,110 @@ def _publish_local_channel_message(
     *,
     channel: str,
     text: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    if text is None:
+        raise ChannelError("nothing to publish")
+    name = clean_channel_name(channel)
+    conn = publisher.connect()
+    try:
+        if not is_channel_member(conn, name):
+            raise ChannelError(f"not a member of channel {name!r}; join it first")
+        message = create_channel_message(
+            conn,
+            node.identity,
+            name,
+            text,
+            name=node.name,
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+            reply_to=reply_to,
+        )
+    finally:
+        conn.close()
+    published = publisher.publish(
+        message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
+    return {"message": message, "published": published}
+
+
+def _publish_local_channel_topic(
+    node: TauNode,
+    *,
+    channel: str,
+    topic: Optional[str] = None,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    if topic is None:
+        raise ChannelError("nothing to publish")
+    return publisher.set_topic(
+        channel,
+        topic,
+        publish=True,
+        targets=targets,
+        ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)),
+    )
+
+
+def _publish_local_channel_reaction(
+    node: TauNode,
+    *,
+    channel: str,
+    target: str,
+    reaction: str,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    name = clean_channel_name(channel)
+    conn = publisher.connect()
+    try:
+        if not is_channel_member(conn, name):
+            raise ChannelError(f"not a member of channel {name!r}; join it first")
+        record = create_channel_reaction(
+            conn, node.identity, name, target, reaction, name=node.name
+        )
+    finally:
+        conn.close()
+    published = publisher.publish_reaction(
+        record, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
+    return {"reaction": record, "published": published}
+
+
+def _publish_local_channel_edit(
+    node: TauNode,
+    *,
+    channel: str,
+    target: str,
+    text: Optional[str] = None,
     to: Optional[List[str]] = None,
     ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
@@ -5038,15 +5566,38 @@ def _publish_local_channel_message(
     try:
         if not is_channel_member(conn, name):
             raise ChannelError(f"not a member of channel {name!r}; join it first")
-        message = create_channel_message(
-            conn, node.identity, name, text, name=node.name
-        )
+        notice = create_channel_edit(conn, node.identity, name, target, text)
     finally:
         conn.close()
-    published = publisher.publish(
-        message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    published = publisher.publish_edit(
+        notice, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
     )
-    return {"message": message, "published": published}
+    return {"edit": notice, "published": published}
+
+
+def _publish_local_channel_retraction(
+    node: TauNode,
+    *,
+    channel: str,
+    digest: str,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = ChannelApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    name = clean_channel_name(channel)
+    return publisher.retract(
+        name,
+        digest,
+        publish=True,
+        targets=targets,
+        ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)),
+    )
 
 
 def _publish_local_post(
@@ -5062,17 +5613,81 @@ def _publish_local_post(
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
+    topic: Optional[str] = None,
+    reaction_target: Optional[str] = None,
+    reaction: Optional[str] = None,
+    channel_edit: Optional[Dict[str, Any]] = None,
+    retract_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if channel is not None:
-        # A channel send rides the same local publish socket as a Tan
+    if channel_edit is not None:
+        # A channel edit rides the same local publish socket as a Tan
         # post; route it before the Tan-only handling below.
+        return _publish_local_channel_edit(
+            node,
+            channel=str(channel_edit.get("channel", "")),
+            target=str(channel_edit.get("target", "")),
+            text=channel_edit.get("text"),
+            to=to,
+            ttl=ttl,
+            timeout=timeout,
+        )
+    if retract_digest is not None:
+        # A channel retract rides the same local publish socket as a
+        # channel send; route it before the Tan-only handling below.
+        if channel is None:
+            raise ChannelError("a channel is required to retract a message")
+        return _publish_local_channel_retraction(
+            node,
+            channel=channel,
+            digest=retract_digest,
+            to=to,
+            ttl=ttl,
+            timeout=timeout,
+        )
+    if channel is not None:
+        if topic is not None:
+            # A channel topic rides the same local publish socket as
+            # a channel message; route it before the Tan handling.
+            return _publish_local_channel_topic(
+                node,
+                channel=channel,
+                topic=topic,
+                to=to,
+                ttl=ttl,
+                timeout=timeout,
+            )
+        if reaction_target is not None:
+            # A channel reaction rides the same local publish socket
+            # as a Tan post; route it before the Tan-only handling.
+            return _publish_local_channel_reaction(
+                node,
+                channel=channel,
+                target=reaction_target,
+                reaction=reaction if reaction is not None else "",
+                to=to,
+                ttl=ttl,
+                timeout=timeout,
+            )
+        # A channel send rides the same local publish socket as a Tan
+        # post; route it before the Tan-only handling below.  A poll,
+        # vote or close rides it the same way, as poll fields on the
+        # channel message.  The channel reply target rides along: it is
+        # a channel message hash, not a Tan post hash, so it must not
+        # reach create_post.
         return _publish_local_channel_message(
             node,
             channel=channel,
             text=text,
+            reply_to=reply_to,
             to=to,
             ttl=ttl,
             timeout=timeout,
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
         )
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = TanApp(
@@ -7668,23 +8283,73 @@ def cmd_tan_sync(args: argparse.Namespace) -> int:
         for error in summary["errors"]:
             print(f"  {short_hash(error['peer'])}: {error['error']}")
     return _EXIT_OK
-
-
 def _print_channel_messages(
-    messages: List[Dict[str, Any]], *, json_output: bool, channel: str
+    messages: List[Dict[str, Any]],
+    *,
+    json_output: bool,
+    channel: str,
+    reactions: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> None:
+    from .channels import summarize_reactions
+
     if json_output:
+        if reactions:
+            for message in messages:
+                message["reactions"] = reactions.get(str(message.get("hash", "")), [])
         _emit({"channel": channel, "messages": messages, "count": len(messages)}, True)
         return
     if not messages:
         print(f"No stored messages in #{channel}.")
         return
     for message in messages:
+        # Votes and closes are not chat: they ride as messages so
+        # peers can tally them, but they render on the poll itself.
+        if is_channel_poll_vote(message) or is_channel_poll_close(message):
+            continue
         name = message.get("name") or "anonymous"
         author = short_hash(str(message.get("author", "")))
-        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}):")
+        edited = " (edited)" if message.get("edited") else ""
+        digest = short_hash(str(message.get("hash", "")))
+        print(f"[{_stamp(message.get('created_at'))}] {name} ({author}){edited} [{digest}]:")
+        if message.get("reply_to"):
+            parent = message.get("reply_parent")
+            if parent:
+                parent_text = str(parent.get("text", "")).splitlines()
+                excerpt = parent_text[0] if parent_text else ""
+                print(
+                    f"  ↩ replying to {parent.get('name') or 'anonymous'}: {excerpt}"
+                )
+            else:
+                print(
+                    "  ↩ replying to "
+                    f"{short_hash(str(message['reply_to']))} "
+                    "(message not stored yet)"
+                )
         for line in str(message.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        tally = message.get("poll")
+        if isinstance(tally, dict) and is_channel_poll(message):
+            options = tally.get("options") or []
+            counts = tally.get("counts") or []
+            total = tally.get("total") or 0
+            closed = bool(tally.get("closed"))
+            my_vote = tally.get("my_vote")
+            state = " — closed" if closed else ""
+            print(f"  Poll ({total} vote{'s' if total != 1 else ''}{state}):")
+            for position, option in enumerate(options):
+                count = counts[position] if position < len(counts) else 0
+                mine = " <-- your vote" if my_vote == position else ""
+                plural = "s" if count != 1 else ""
+                print(f"    {position + 1}. {option} — {count} vote{plural}{mine}")
+            print(f"    #{short_hash(str(message.get('hash', '')))}")
+        summary = summarize_reactions(
+            (reactions or {}).get(str(message.get("hash", "")), [])
+        )
+        if summary:
+            joined = "  ".join(
+                f"{item['reaction']}×{item['count']}" for item in summary
+            )
+            print(f"  {joined}")
 
 
 def cmd_channel_join(args: argparse.Namespace) -> int:
@@ -7729,6 +8394,9 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
     json_output = _json_mode(args)
     app = ChannelApp(config, _tan_identity(config), name=config.name)
     memberships = app.memberships()
+    unread = app.unread_counts()
+    for membership in memberships:
+        membership["unread"] = unread.get(membership["channel"], 0)
     if json_output:
         _emit({"channels": memberships, "count": len(memberships)}, True)
         return _EXIT_OK
@@ -7738,10 +8406,39 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
     for membership in memberships:
         count = membership["messages"]
         noun = "message" if count == 1 else "messages"
+        unread_count = membership["unread"]
+        unread_suffix = (
+            f", {unread_count} unread" if unread_count > 0 else ""
+        )
         print(
-            f"#{membership['channel']} — {count} cached {noun}, "
+            f"#{membership['channel']} — {count} cached {noun}{unread_suffix}, "
             f"joined {_ago(time.time() - membership['joined_at'])} ago"
         )
+    return _EXIT_OK
+
+
+def cmd_channel_mark_read(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    try:
+        result = app.mark_read(name)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit(result, True)
+    elif result["cleared"] == 0:
+        print(f"#{name} has no unread messages.")
+    else:
+        cleared = result["cleared"]
+        noun = "message" if cleared == 1 else "messages"
+        print(f"marked #{name} read — cleared {cleared} unread {noun}.")
     return _EXIT_OK
 
 
@@ -7755,10 +8452,63 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled message is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_CHANNEL_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        # Refuse to queue for a channel we have not joined: the
+        # publish pass would fail every attempt the same way.
+        conn = init_channel_db(config.channels_db_path)
+        try:
+            member = is_channel_member(conn, name)
+        finally:
+            conn.close()
+        if not member:
+            print(
+                f"error: not a member of channel {name!r}; join it first",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            entry = schedule_channel_message(
+                config.scheduled_channel_messages_path,
+                channel=name,
+                text=text,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+            )
+        except ScheduledChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        if json_output:
+            _emit({"scheduled": entry.to_dict()}, True)
+        else:
+            print(f"scheduled {entry.id} — publishes in {_ago(delay)}")
+            print("  list it with `tau channel scheduled`; a node serving")
+            print("  with --channels publishes it when the time comes.")
+        return _EXIT_OK
+
     if getattr(args, "no_publish", False):
         app = ChannelApp(config, _tan_identity(config), name=config.name)
         try:
-            message = app.send(name, text)
+            message = app.send(
+                name, text, reply_to=getattr(args, "reply_to", None)
+            )
         except ChannelError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -7774,6 +8524,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 config.data_dir,
                 channel=name,
                 text=text,
+                reply_to=getattr(args, "reply_to", None),
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
@@ -7792,6 +8543,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                     node,
                     channel=name,
                     text=text,
+                    reply_to=getattr(args, "reply_to", None),
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
@@ -7804,6 +8556,92 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         _emit({"message": message, "published": published}, True)
     else:
         print(f"sent to #{name} {short_hash(message['hash'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_react(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "clear", False):
+        if getattr(args, "reaction", None):
+            print("error: --clear takes no reaction", file=sys.stderr)
+            return 2
+        token = ""
+    else:
+        token = getattr(args, "reaction", None)
+        if token is None:
+            print("error: a reaction is required (or --clear to retract yours)", file=sys.stderr)
+            return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            record = app.react(name, args.target, token)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel=name,
+                reaction_target=args.target,
+                reaction=token,
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            record, published = result["reaction"], result["published"]
+        else:
+            try:
+                app = ChannelApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                app.attach(node)
+                result = _publish_local_channel_reaction(
+                    node,
+                    channel=name,
+                    target=args.target,
+                    reaction=token,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                record, published = result["reaction"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"reaction": record, "published": published}, True)
+    else:
+        if token:
+            print(
+                f"reacted {token} to {short_hash(record['target'])} in #{name}"
+            )
+        else:
+            print(f"retracted your reaction to {short_hash(record['target'])} in #{name}")
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -7830,15 +8668,335 @@ def cmd_channel_read(args: argparse.Namespace) -> int:
         # The block-list failed closed: hide everything, like the
         # timeline does, instead of showing messages we cannot vet.
         messages = []
+        reactions: Dict[str, List[Dict[str, Any]]] = {}
     else:
         messages = [
             message
             for message in messages
             if str(message.get("author", "")) not in blocked
         ]
+        reactions = app.reactions(
+            name, [str(message.get("hash", "")) for message in messages]
+        )
+    # Votes and closes are not chat: hide them from the listing and
+    # render their tally on the poll instead, from the full history.
+    messages = [
+        message
+        for message in messages
+        if not is_channel_poll_vote(message)
+        and not is_channel_poll_close(message)
+    ]
+    _attach_channel_poll_tallies(
+        app, messages, _own_destination_hash(config), blocked=blocked
+    )
     # History comes newest first; reading is oldest first.
     messages = list(reversed(messages))
-    _print_channel_messages(messages, json_output=json_output, channel=name)
+    # Resolve each reply's parent from the local store so the reader
+    # sees who and what is being answered.  A parent from a blocked
+    # author stays hidden, like a blocked message itself; a parent
+    # that has not arrived yet simply has no quote.
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        for message in messages:
+            if not message.get("reply_to"):
+                continue
+            parent = channel_reply_parent(conn, message)
+            if parent is None:
+                continue
+            if blocked is not None and str(parent.get("author", "")) in blocked:
+                continue
+            message["reply_parent"] = {
+                "hash": parent["hash"],
+                "name": parent.get("name", ""),
+                "text": parent.get("text", ""),
+            }
+    finally:
+        conn.close()
+    _print_channel_messages(messages, json_output=json_output, channel=name, reactions=reactions)
+    return _EXIT_OK
+
+
+def cmd_channel_search(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    query = str(getattr(args, "query", "") or "")
+    if not query.strip():
+        print("error: search text must not be empty", file=sys.stderr)
+        return 2
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    blocked = load_blocked_set(config.blocklist_path)
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    if blocked is None:
+        # The block-list failed closed: hide everything, like the
+        # timeline does, instead of showing messages we cannot vet.
+        messages = []
+    else:
+        messages = app.search(
+            name,
+            query,
+            limit=int(getattr(args, "limit", DEFAULT_CHANNEL_LIMIT)),
+            exclude_authors=blocked,
+        )
+    # Search results stay newest first, like `tan search`: the most
+    # recent match is the one the reader usually wants.
+    if json_output:
+        _emit(
+            {
+                "channel": name,
+                "query": query.strip(),
+                "messages": messages,
+                "count": len(messages),
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not messages:
+        print(f"No messages in #{name} matching {query.strip()!r}.")
+        return _EXIT_OK
+    _print_channel_messages(messages, json_output=False, channel=name)
+    return _EXIT_OK
+
+
+def cmd_channel_edit(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            notice = app.edit(name, args.target, text)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel_edit={
+                    "channel": name,
+                    "target": args.target,
+                    "text": text,
+                },
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            notice, published = result["edit"], result["published"]
+        else:
+            try:
+                app = ChannelApp(
+                    config,
+                    node.identity,
+                    name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                app.attach(node)
+                result = _publish_local_channel_edit(
+                    node,
+                    channel=name,
+                    target=args.target,
+                    text=text,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                notice, published = result["edit"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"edit": notice, "published": published}, True)
+    else:
+        print(f"edited #{name} {short_hash(notice['target'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_edits(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    edits = app.edits(name, limit=int(getattr(args, "limit", MAX_FEED_EDITS)))
+    if json_output:
+        _emit({"channel": name, "edits": edits, "count": len(edits)}, True)
+        return _EXIT_OK
+    if not edits:
+        print(f"No stored edits in #{name}.")
+        return _EXIT_OK
+    for edit in edits:
+        author = short_hash(str(edit.get("author", "")))
+        target = short_hash(str(edit.get("target", "")))
+        print(f"[{_stamp(edit.get('created_at'))}] {target} by {author}:")
+        for line in str(edit.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_channel_pin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        pin = app.pin(args.channel, args.digest)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit(pin, True)
+    else:
+        print(f"pinned {short_hash(pin['hash'])} in #{pin['channel']}")
+    return _EXIT_OK
+
+
+def cmd_channel_unpin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        unpinned = app.unpin(args.channel, args.digest)
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if json_output:
+        _emit(
+            {"channel": name, "hash": args.digest, "unpinned": unpinned}, True
+        )
+    else:
+        if unpinned:
+            print(f"unpinned {short_hash(args.digest)} in #{name}")
+        else:
+            print(f"not pinned in #{name}: {short_hash(args.digest)}")
+    return _EXIT_OK
+
+
+def cmd_channel_pins(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    pins = app.pins(name)
+    if json_output:
+        _emit({"channel": name, "pins": pins, "count": len(pins)}, True)
+        return _EXIT_OK
+    if not pins:
+        print(f"No pinned messages in #{name}.")
+        return _EXIT_OK
+    _print_channel_messages(pins, json_output=False, channel=name)
+    return _EXIT_OK
+
+
+def cmd_channel_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        queue = load_scheduled_channel_messages(
+            config.scheduled_channel_messages_path
+        )
+    except ScheduledChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    entries = queue.messages
+    channel_filter = getattr(args, "channel", None)
+    if channel_filter is not None:
+        try:
+            channel_filter = clean_channel_name(channel_filter)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        entries = tuple(
+            entry for entry in entries if entry.channel == channel_filter
+        )
+    if json_output:
+        _emit({"scheduled": [entry.to_dict() for entry in entries]}, True)
+        return _EXIT_OK
+    if not entries:
+        if channel_filter is not None:
+            print(f"No channel messages scheduled for #{channel_filter}.")
+        else:
+            print("No channel messages scheduled.")
+        return _EXIT_OK
+    now = time.time()
+    for entry in entries:
+        when = _stamp(entry.publish_at)
+        if entry.publish_at <= now:
+            when += " (due — publishes on the next serve pass)"
+        else:
+            when += f" (in {_ago(entry.publish_at - now)})"
+        print(f"{entry.id}  #{entry.channel}  {when}")
+        if entry.to:
+            print(f"  to {', '.join(entry.to)}")
+        for line in entry.text.splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_channel_cancel_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    deleted_local = False
+
+    def _delete_stored_message(entry: Any) -> None:
+        # A publish attempt already stored the signed message locally
+        # (see publish_due_scheduled_channel_messages): dropping only
+        # the queue entry would leave it in the local channel history.
+        # Peers that received a copy before the failure keep theirs —
+        # a local delete cannot retract what already went out.
+        nonlocal deleted_local
+        if entry.message_hash is None:
+            return
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        if app.delete_message(entry.message_hash):
+            deleted_local = True
+
+    try:
+        entry = cancel_scheduled_channel_message(
+            config.scheduled_channel_messages_path,
+            args.target,
+            on_cancel=_delete_stored_message,
+        )
+    except ScheduledChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    if json_output:
+        _emit(
+            {"cancelled": entry.to_dict(), "deleted_local": deleted_local},
+            True,
+        )
+    else:
+        print(f"cancelled {entry.id} — it will not be published")
+        if deleted_local:
+            print("  also removed the stored message from the local channel")
     return _EXIT_OK
 
 
@@ -7894,13 +9052,472 @@ def cmd_channel_sync(args: argparse.Namespace) -> int:
             print("No channels joined yet — join one with `tau channel join <name>`.")
             return _EXIT_OK
         for name, summary in summaries.items():
-            print(
+            line = (
                 f"#{name}: synced {summary['stored']} new message(s) "
                 f"from {summary['peers']} peer(s); "
                 f"{summary['duplicates']} duplicate(s)"
             )
+            reactions = summary.get("reactions_stored", 0)
+            if reactions:
+                noun = "reaction" if reactions == 1 else "reactions"
+                line += f"; {reactions} new {noun}"
+            if summary.get("edited"):
+                line += f"; {summary['edited']} edit(s) applied"
+            if summary.get("retracted"):
+                line += f"; {summary['retracted']} retraction(s)"
+            print(line)
             for error in summary["errors"]:
                 print(f"  {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def _send_channel_poll_message(
+    args: argparse.Namespace,
+    config: TauConfig,
+    channel: str,
+    text: str,
+    *,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Post one channel poll, vote, or close, like ``cmd_channel_send``.
+
+    The same three routes as a plain channel send (the serving node
+    via IPC, else a one-shot local node, else local-only storage)
+    with the poll payload attached.
+    """
+    name = clean_channel_name(channel)
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        message = app.send(
+            name,
+            text,
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+        return {"message": message, "published": None}
+    node = TauNode(config, name=config.name)
+    try:
+        node.start(exclusive=True)
+    except InstanceAlreadyRunning:
+        from .local_publish import publish_running
+
+        request: Dict[str, Any] = {
+            "channel": name,
+            "text": text,
+            "to": getattr(args, "to", None),
+            "ttl": getattr(args, "ttl", MAX_GOSSIP_TTL),
+            "timeout": float(getattr(args, "timeout", 15.0)),
+        }
+        if poll_options is not None:
+            request["poll_options"] = poll_options
+        if poll_vote is not None:
+            request["poll_vote"] = poll_vote
+        if poll_close is not None:
+            request["poll_close"] = poll_close
+        return publish_running(config.data_dir, **request)
+    try:
+        app = ChannelApp(
+            config,
+            node.identity,
+            name=config.name,
+            request_timeout=float(getattr(args, "timeout", 15.0)),
+        )
+        app.attach(node)
+        return _publish_local_channel_message(
+            node,
+            channel=name,
+            text=text,
+            to=getattr(args, "to", None),
+            ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+            timeout=float(getattr(args, "timeout", 15.0)),
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+    finally:
+        node.stop()
+
+
+def _report_channel_poll_send(
+    args: argparse.Namespace,
+    result: Dict[str, Any],
+    summary: str,
+) -> int:
+    """Report a channel poll/vote/close send, like ``cmd_channel_send``."""
+    message = result.get("message") or {}
+    published = result.get("published")
+    if _json_mode(args):
+        _emit(result, True)
+        return _EXIT_OK
+    print(summary)
+    print(f"  #{short_hash(str(message.get('hash', '')))}")
+    if published is None:
+        print("  stored locally (not published)")
+    else:
+        print(
+            f"  published to {published['delivered']}/{published['peers']} peer(s)"
+        )
+        for error in published["errors"]:
+            print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_poll(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        options = clean_poll_options(list(args.options))
+    except PostError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        result = _send_channel_poll_message(
+            args, config, name, args.question, poll_options=options
+        )
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    summary = f"poll posted to #{name}: {args.question}"
+    return _report_channel_poll_send(args, result, summary)
+
+
+def _resolve_channel_poll_for_vote(
+    args: argparse.Namespace, config: TauConfig, name: str
+) -> Dict[str, Any]:
+    """Resolve ``tau channel vote`` / ``close-poll`` to one stored poll.
+
+    Raises :class:`ChannelError` when the reference is empty, matches
+    nothing, or matches more than one poll.
+    """
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    history = app.all_history(name)
+    return resolve_channel_poll(history, args.poll)
+
+
+def cmd_channel_vote(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        poll = _resolve_channel_poll_for_vote(args, config, name)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    history = app.all_history(name)
+    own_hash = _own_destination_hash(config)
+    tally = channel_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is closed", file=sys.stderr)
+        return 2
+    options = tally["options"]
+    choice = str(args.option).strip()
+    index: Optional[int] = None
+    if choice.isdigit():
+        index = int(choice) - 1
+    else:
+        for position, option in enumerate(options):
+            if option == choice:
+                index = position
+                break
+    if index is None or not 0 <= index < len(options):
+        print(
+            "error: option must be a number 1-"
+            f"{len(options)} or one of: {', '.join(options)}",
+            file=sys.stderr,
+        )
+        return 2
+    identity = channel_poll_identity(poll)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        result = _send_channel_poll_message(
+            args,
+            config,
+            name,
+            f"voted: {options[index]}",
+            poll_vote={
+                "target": {"author": identity[0], "sent_at": identity[1]},
+                "option": index,
+            },
+        )
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    summary = f"voted for {options[index]!r} on {poll.get('text')!r} in #{name}"
+    return _report_channel_poll_send(args, result, summary)
+
+
+def cmd_channel_close_poll(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        poll = _resolve_channel_poll_for_vote(args, config, name)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    own_hash = _own_destination_hash(config)
+    identity = channel_poll_identity(poll)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    if own_hash is None or identity[0] != own_hash.lower():
+        print(
+            "error: only the poll's creator can close it",
+            file=sys.stderr,
+        )
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    history = app.all_history(name)
+    tally = channel_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is already closed", file=sys.stderr)
+        return 2
+    try:
+        result = _send_channel_poll_message(
+            args,
+            config,
+            name,
+            "closed the poll",
+            poll_close={"author": identity[0], "sent_at": identity[1]},
+        )
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    summary = f"closed the poll {poll.get('text')!r} in #{name}"
+    return _report_channel_poll_send(args, result, summary)
+
+
+def cmd_channel_topic(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "clear", False) and getattr(args, "text", None) is not None:
+        print("error: --clear cannot be combined with topic text", file=sys.stderr)
+        return 2
+
+    # Show mode: no text, no --file, no --clear.  Setting from stdin
+    # is deliberately not offered: an empty topic clears, so a bare
+    # `tau channel topic NAME` with stdin closed must never be read
+    # as a clear.
+    show = (
+        getattr(args, "text", None) is None
+        and not getattr(args, "file", None)
+        and not getattr(args, "clear", False)
+    )
+    if show:
+        try:
+            app = ChannelApp(config, _tan_identity(config), name=config.name)
+            record = app.topic(name)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if json_output:
+            _emit({"channel": name, "topic": record}, True)
+        elif record is None:
+            print(f"#{name} has no topic set")
+        else:
+            print(f"#{name}: {record['topic']}")
+        return _EXIT_OK
+
+    try:
+        topic = "" if getattr(args, "clear", False) else _read_message(args)
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not getattr(args, "clear", False) and not topic.strip():
+        print(
+            "error: topic text must not be empty "
+            "(use --clear to remove the topic)",
+            file=sys.stderr,
+        )
+        return 2
+
+    if getattr(args, "no_publish", False):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        try:
+            result = app.set_topic(name, topic)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir,
+                channel=name,
+                topic=topic,
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            published = result["published"]
+        else:
+            try:
+                result = _publish_local_channel_topic(
+                    node,
+                    channel=name,
+                    topic=topic,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                published = result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit(
+            {
+                "channel": name,
+                "topic": result["topic"],
+                "cleared": result["cleared"],
+                "published": published,
+            },
+            True,
+        )
+    else:
+        if result["cleared"]:
+            print(f"cleared the topic of #{name}")
+        else:
+            print(f"topic of #{name}: {result['topic']['topic']}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_retract(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        if getattr(args, "no_publish", False):
+            app = ChannelApp(config, _tan_identity(config), name=config.name)
+            result = app.retract(name, args.digest)
+            notice, published = result["retraction"], result["published"]
+        else:
+            node = TauNode(config, name=config.name)
+            try:
+                node.start(exclusive=True)
+            except InstanceAlreadyRunning:
+                from .local_publish import publish_running
+
+                result = publish_running(
+                    config.data_dir,
+                    retract_digest=args.digest,
+                    channel=name,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                notice, published = result["retraction"], result["published"]
+            else:
+                try:
+                    app = ChannelApp(
+                        config,
+                        node.identity,
+                        name=config.name,
+                        request_timeout=float(getattr(args, "timeout", 15.0)),
+                    )
+                    app.attach(node)
+                    result = app.retract(
+                        name,
+                        args.digest,
+                        publish=True,
+                        targets=(
+                            [node.resolve_peer(target) for target in args.to]
+                            if getattr(args, "to", None)
+                            else None
+                        ),
+                        ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    )
+                    notice, published = result["retraction"], result["published"]
+                finally:
+                    node.stop()
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if json_output:
+        _emit({"channel": name, "retraction": notice, "published": published}, True)
+    else:
+        print(f"retracted {short_hash(notice['hash'])} from #{name}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_channel_retractions(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    notices = app.retractions(name, limit=int(getattr(args, "limit", DEFAULT_CHANNEL_LIMIT)))
+    if json_output:
+        _emit({"channel": name, "retractions": notices, "count": len(notices)}, True)
+        return _EXIT_OK
+    if not notices:
+        print(f"No retractions recorded in #{name}.")
+        return _EXIT_OK
+    for notice in notices:
+        print(
+            f"[{_stamp(notice.get('created_at'))}] "
+            f"{short_hash(str(notice.get('author', '')))} retracted "
+            f"{short_hash(str(notice.get('hash', '')))}"
+        )
     return _EXIT_OK
 
 
@@ -10162,6 +11779,9 @@ def _send_local_message(
     location: Optional[Dict[str, Any]] = None,
     wait: float = 0.0,
     send_after: Optional[float] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Send one DM on the running node, for the local send server.
 
@@ -10190,6 +11810,9 @@ def _send_local_message(
         kind=kind,
         location=location,
         send_after=send_after,
+        poll_options=poll_options,
+        poll_vote=poll_vote,
+        poll_close=poll_close,
     )
     result = _finalize_send_result(
         response, target=target, expires_at=expires_at, queued_before=queued_before
@@ -10537,6 +12160,9 @@ def _send_via_local_node(
     wait: float = 0.0,
     send_after: Optional[float] = None,
     location: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
     timeout = float(getattr(args, "timeout", 20.0))
@@ -10583,6 +12209,9 @@ def _send_via_local_node(
                     kind=kind,
                     location=location,
                     send_after=send_after,
+                    poll_options=poll_options,
+                    poll_vote=poll_vote,
+                    poll_close=poll_close,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 log.debug(
@@ -10643,6 +12272,9 @@ def _send_via_running_node(
     wait: float = 0.0,
     send_after: Optional[float] = None,
     location: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Send through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -10674,6 +12306,9 @@ def _send_via_running_node(
                 location=location,
                 wait=wait,
                 send_after=send_after,
+                poll_options=poll_options,
+                poll_vote=poll_vote,
+                poll_close=poll_close,
             )
         except LocalIPCUnavailable as exc:
             raise NodeError(
@@ -11118,6 +12753,13 @@ def cmd_send(args: argparse.Namespace) -> int:
     if wait_given and getattr(args, "no_queue", False):
         print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
         return 2
+    poll_options = None
+    if getattr(args, "poll_options", None):
+        try:
+            poll_options = clean_poll_options(list(args.poll_options))
+        except PostError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     # Validate the pin before reading the message, so an invalid
     # --location fails at once instead of blocking on stdin.
     location = _location_from_args(args)
@@ -11179,12 +12821,14 @@ def cmd_send(args: argparse.Namespace) -> int:
         results = _send_via_running_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after, location=location,
+            poll_options=poll_options,
         )
     else:
         log.info("sending via a local one-shot node")
         results = _send_via_local_node(
             args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
             send_after=send_after, location=location,
+            poll_options=poll_options,
         )
 
     failed = [result for result in results if not result.get("ok", True)]
@@ -11880,6 +13524,90 @@ def _attach_group_poll_tallies(
             entry["poll"] = match["poll"]
 
 
+def _attach_channel_poll_tallies(
+    app: ChannelApp,
+    entries: List[Dict[str, Any]],
+    own_hash: Optional[str],
+    *,
+    blocked: Optional[AbstractSet[str]] = None,
+) -> None:
+    """Attach a ``poll`` tally to each channel-poll record in *entries*.
+
+    The tally derives from the channel's full stored history — votes
+    a displayed page left out still count — so the history is
+    re-read for the channel involved.  Blocked authors are left out
+    of the tally history, so their votes never count.  Entries are
+    the copies :meth:`ChannelApp.history` returns, so attaching here
+    never touches the stored records.
+    """
+    channels = {
+        str(entry.get("channel"))
+        for entry in entries
+        if entry.get("channel")
+    }
+    if not channels:
+        return
+    for channel in sorted(channels):
+        history = app.all_history(channel)
+        if blocked is not None:
+            history = [
+                record
+                for record in history
+                if str(record.get("author", "")) not in blocked
+            ]
+        attach_channel_poll_tallies(history, own_hash=own_hash)
+        by_hash = {
+            str(item.get("hash")): item for item in history
+        }
+        for entry in entries:
+            if not is_channel_poll(entry):
+                continue
+            match = by_hash.get(str(entry.get("hash")))
+            if match is not None and "poll" in match:
+                entry["poll"] = match["poll"]
+
+
+def _attach_dm_poll_tallies(
+    inbox: Inbox,
+    entries: List[Dict[str, Any]],
+    own_hash: Optional[str],
+) -> None:
+    """Attach a ``poll`` tally to each DM-poll record in *entries*.
+
+    The tally derives from the conversation's full stored history —
+    votes a filter left out of *entries* (read votes under
+    ``--unread``, say) still count — so the history is re-read per
+    peer involved.  Entries are the copies
+    :meth:`Inbox.list_messages` returns, so attaching here never
+    touches the stored records.
+    """
+    peer_hashes = {
+        str(entry.get("destination"))
+        for entry in entries
+        if entry.get("kind") != "group" and entry.get("destination")
+    }
+    if not peer_hashes:
+        return
+    history: List[Dict[str, Any]] = []
+    for peer_hash in sorted(peer_hashes):
+        history.extend(
+            inbox.list_messages(limit=None, peer=peer_hash, direction=None)
+        )
+    attach_dm_poll_tallies(history, own_hash=own_hash)
+    by_id = {
+        (str(item.get("destination")), str(item.get("id"))): item
+        for item in history
+    }
+    for entry in entries:
+        if not is_dm_poll(entry):
+            continue
+        match = by_id.get(
+            (str(entry.get("destination")), str(entry.get("id")))
+        )
+        if match is not None and "poll" in match:
+            entry["poll"] = match["poll"]
+
+
 def _own_destination_hash(config: TauConfig) -> Optional[str]:
     """This node's destination hash, or ``None`` without an identity."""
     identity = load_identity(config.identity_path)
@@ -12089,7 +13817,7 @@ def _print_message_entry(
                 print(f"  live beacon · update {beacon['seq']} · expired")
     poll = entry.get("poll")
     if isinstance(poll, dict) and poll.get("options"):
-        # A group poll renders its tally under the question, like a
+        # A group or DM poll renders its tally under the question, like a
         # Tan poll: one line per option with its vote count, plus the
         # total and the closed state.  Votes and closes themselves are
         # never printed as messages (see cmd_messages).
@@ -12383,6 +14111,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
     _attach_group_poll_tallies(
         inbox, entries, _own_destination_hash(config)
     )
+    _attach_dm_poll_tallies(
+        inbox, entries, _own_destination_hash(config)
+    )
     shown = entries if limit is None else entries[:limit]
     omitted = entries[len(shown):]
     # Unread mail the window omitted: reported, never silently cleared.
@@ -12422,6 +14153,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             for entry in shown
             if not is_group_poll_vote(entry)
             and not is_group_poll_close(entry)
+            and not is_dm_poll_vote(entry)
+            and not is_dm_poll_close(entry)
         ]
         for entry in printable:
             _print_message_entry(
@@ -12656,6 +14389,7 @@ def cmd_pinned(args: argparse.Namespace) -> int:
     else:
         own_hash = _own_destination_hash(config)
         _attach_group_poll_tallies(inbox, shown, own_hash)
+        _attach_dm_poll_tallies(inbox, shown, own_hash)
         for entry in shown:
             _print_message_entry(
                 inbox, registry, entry, blocked=blocked, own_hash=own_hash
@@ -15075,6 +16809,245 @@ def _group_poll_history(
 ) -> List[Dict[str, Any]]:
     """This group's stored messages, for tallying one of its polls."""
     return inbox.list_messages(limit=None, group=group_id, direction=None)
+
+
+def _resolve_dm_poll(
+    inbox: Inbox, ref: str, peer_hash: str
+) -> Dict[str, Any]:
+    """Resolve ``tau vote`` / ``close-poll`` to one stored DM poll.
+
+    Same scoping as :func:`_resolve_group_poll` but for a DM
+    conversation: the reference (a message id or unique prefix, as
+    shown by ``tau messages``) must match exactly one stored poll
+    record with this peer.  A vote or close record never resolves
+    — only the poll itself can be voted on or closed.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("poll must not be empty")
+    matches = [
+        item
+        for item in inbox.find_prefix(ref, peer=peer_hash)
+        if is_dm_poll(item)
+    ]
+    exact = [m for m in matches if str(m["id"]) == ref]
+    if not exact:
+        folded = ref.lower()
+        exact = [m for m in matches if str(m["id"]).lower() == folded]
+    if exact:
+        matches = exact
+    if len(matches) > 1:
+        raise NodeError(
+            f"{len(matches)} polls with this peer match {ref!r};"
+            " use a longer prefix"
+        )
+    if not matches:
+        raise NodeError(
+            f"no poll {ref!r} with this peer;"
+            " votes name a poll from this conversation's history"
+        )
+    return matches[0]
+
+
+def _dm_poll_history(inbox: Inbox, peer_hash: str) -> List[Dict[str, Any]]:
+    """This conversation's stored messages, for tallying one of its polls."""
+    return inbox.list_messages(limit=None, peer=peer_hash, direction=None)
+
+
+def _send_dm_poll_message(
+    args: argparse.Namespace,
+    config: TauConfig,
+    peer: str,
+    text: str,
+    *,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Send one DM poll vote or close, like ``cmd_send``.
+
+    Votes and closes carry no expiry, schedule, quote, or wait —
+    the same two routes as a plain DM send (the serving node, else
+    a one-shot local node) with the poll payload attached.
+    """
+    if _send_routes_via_running_node(config):
+        results = _send_via_running_node(
+            args,
+            config,
+            text,
+            [peer],
+            expires_at=None,
+            reply_ids={},
+            wait=0.0,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+    else:
+        results = _send_via_local_node(
+            args,
+            config,
+            text,
+            [peer],
+            expires_at=None,
+            reply_ids={},
+            wait=0.0,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        )
+    return {"results": results}
+
+
+def _report_dm_poll_send(
+    args: argparse.Namespace,
+    response: Dict[str, Any],
+    summary: str,
+) -> int:
+    """Report a DM poll vote/close send, like ``cmd_send`` does."""
+    results = response.get("results") or []
+    # A direct delivery keeps no "delivered" key — the single-recipient
+    # send shape carries "ok" instead (see _finalize_send_result) — so
+    # delivered is "ok" and not queued and not explicitly undelivered,
+    # the same rule cmd_send reports by.
+    failed = [
+        result
+        for result in results
+        if not result.get("ok", True) or result.get("delivered") is False
+    ]
+    if _json_mode(args):
+        _emit(response, True)
+        return _EXIT_ERROR if failed else _EXIT_OK
+    print(summary)
+    for result in results:
+        name = result.get("target") or (result.get("to") or "")[:8]
+        if result.get("queued"):
+            print(f"queued for {name} — they are unreachable right now")
+        elif result.get("ok", True) and result.get("delivered") is not False:
+            print(f"delivered to {name}")
+        else:
+            print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+    return _EXIT_ERROR if failed else _EXIT_OK
+
+
+def cmd_vote(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.to, direction=None
+        )
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        poll = _resolve_dm_poll(inbox, args.poll, peer_hash)
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    history = _dm_poll_history(inbox, peer_hash)
+    own_hash = _own_destination_hash(config)
+    tally = dm_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is closed", file=sys.stderr)
+        return 2
+    options = tally["options"]
+    choice = str(args.option).strip()
+    index: Optional[int] = None
+    if choice.isdigit():
+        index = int(choice) - 1
+    else:
+        for position, option in enumerate(options):
+            if option == choice:
+                index = position
+                break
+    if index is None or not 0 <= index < len(options):
+        print(
+            "error: option must be a number 1-"
+            f"{len(options)} or one of: {', '.join(options)}",
+            file=sys.stderr,
+        )
+        return 2
+    identity = poll_identity(poll, own_hash)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        response = _send_dm_poll_message(
+            args,
+            config,
+            args.to,
+            f"voted: {options[index]}",
+            poll_vote={
+                "target": {"author": identity[0], "sent_at": identity[1]},
+                "option": index,
+            },
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    summary = (
+        f"voted for {options[index]!r} on {poll.get('text')!r}"
+        f" with {name}"
+    )
+    return _report_dm_poll_send(args, response, summary)
+
+
+def cmd_close_poll(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.to, direction=None
+        )
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        poll = _resolve_dm_poll(inbox, args.poll, peer_hash)
+    except NodeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    own_hash = _own_destination_hash(config)
+    identity = poll_identity(poll, own_hash)
+    if identity is None:
+        print(
+            "error: this poll has no usable identity;"
+            " it may predate polls or lack an identity",
+            file=sys.stderr,
+        )
+        return 2
+    if own_hash is None or identity[0] != own_hash.lower():
+        print(
+            "error: only the poll's creator can close it",
+            file=sys.stderr,
+        )
+        return 2
+    history = _dm_poll_history(inbox, peer_hash)
+    tally = dm_poll_tally(history, poll, own_hash=own_hash)
+    if tally["closed"]:
+        print("error: this poll is already closed", file=sys.stderr)
+        return 2
+    try:
+        response = _send_dm_poll_message(
+            args,
+            config,
+            args.to,
+            "closed the poll",
+            poll_close={"author": identity[0], "sent_at": identity[1]},
+        )
+    except (NodeError, MailboxError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    summary = f"closed the poll {poll.get('text')!r} with {name}"
+    return _report_dm_poll_send(args, response, summary)
 
 
 def cmd_group_poll(args: argparse.Namespace) -> int:

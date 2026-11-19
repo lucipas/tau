@@ -2513,6 +2513,12 @@ class TauNode:
                     record["location"] = message["location"]
                 if message.get("beacon") is not None:
                     record["beacon"] = message["beacon"]
+                if message.get("poll_options") is not None:
+                    record["poll_options"] = message["poll_options"]
+                if message.get("poll_vote") is not None:
+                    record["poll_vote"] = message["poll_vote"]
+                if message.get("poll_close") is not None:
+                    record["poll_close"] = message["poll_close"]
                 log.info(
                     "Message from %s (%s): %s",
                     caller_name,
@@ -4684,6 +4690,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled-post publish failed", exc_info=True)
             try:
+                self._publish_due_scheduled_channel_messages()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Scheduled channel-message publish failed", exc_info=True)
+            try:
                 self._send_due_beacon_updates()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Beacon update round failed", exc_info=True)
@@ -4723,6 +4733,36 @@ class TauNode:
         if result["published"]:
             log.info(
                 "Published %d scheduled Tan post(s)", result["published"]
+            )
+
+    def _publish_due_scheduled_channel_messages(self) -> None:
+        """Publish channel messages whose scheduled time has come.
+
+        Only when a channel app is attached (``tau serve --channels``):
+        without one there is no publisher, and the queue simply waits
+        for a serving node that has one.  A publish failure keeps the
+        entry queued — see ``tau.scheduled_channel`` — so this never
+        raises into the mail loop.
+        """
+        app = getattr(self, "channel_app", None)
+        if app is None:
+            return
+        from .scheduled_channel import publish_due_scheduled_channel_messages
+
+        try:
+            result = publish_due_scheduled_channel_messages(
+                self.config.scheduled_channel_messages_path,
+                app,
+                resolve_peer=self.resolve_peer,
+                should_stop=self._stop_event.is_set,
+            )
+        except Exception:  # pragma: no cover - defensive; helper logs
+            log.debug("Scheduled channel-message publish failed", exc_info=True)
+            return
+        if result["published"]:
+            log.info(
+                "Published %d scheduled channel message(s)",
+                result["published"],
             )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:
@@ -5185,6 +5225,9 @@ class TauNode:
                 location=fresh.location,
                 beacon=fresh.beacon,
                 kind=getattr(fresh, "kind", None),
+                poll_options=fresh.poll_options,
+                poll_vote=fresh.poll_vote,
+                poll_close=fresh.poll_close,
             )
         # A replacement can still land after the fresh read: abort the
         # send instead of delivering the superseded version — the
@@ -6372,6 +6415,9 @@ class TauNode:
         kind: Optional[str] = None,
         location: Optional[Dict[str, Any]] = None,
         beacon: Optional[Dict[str, Any]] = None,
+        poll_options: Optional[List[str]] = None,
+        poll_vote: Optional[Dict[str, Any]] = None,
+        poll_close: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
@@ -6391,6 +6437,18 @@ class TauNode:
         queueing and sealed relay copies alike, so the receiver can
         tell a live update from a one-off pin; a beacon without a pin
         is rejected, since an update that renders nowhere is noise.
+
+        ``poll_options`` makes this send a poll, exactly like a group
+        poll: the text is the question and the options ride alongside
+        it (validated with the Tan poll rules — 2-8 distinct, short,
+        normalised choices).  ``poll_vote`` casts a vote for one option
+        of the poll its target names, and ``poll_close`` closes that
+        poll; both ride the same way, through queueing and the queued
+        re-send.  At most one of the three may be set.  A poll, vote
+        or close is recorded with the wire send time under
+        ``leg_sent_at`` (the record's own ``sent_at`` is the local
+        record time), so the tally can name the poll by the
+        (author, sent_at) identity the wire carries.
 
         ``expires_at`` is an optional sender-set expiry (epoch seconds):
         it travels in the message payload and inside sealed relay
@@ -6428,6 +6486,49 @@ class TauNode:
             )
         if cleaned_beacon is not None and cleaned_location is None:
             raise NodeError("a beacon update must carry a location pin")
+        if sum(
+            field is not None
+            for field in (poll_options, poll_vote, poll_close)
+        ) > 1:
+            raise NodeError(
+                "a message can carry only one of poll_options, "
+                "poll_vote, poll_close"
+            )
+        cleaned_options: Optional[List[str]] = None
+        if poll_options is not None:
+            try:
+                cleaned_options = clean_poll_options(poll_options)
+            except PostError as exc:
+                raise NodeError(str(exc)) from exc
+        cleaned_vote: Optional[Dict[str, Any]] = None
+        if poll_vote is not None:
+            try:
+                cleaned_vote = clean_group_poll_vote(poll_vote)
+            except ProtocolError as exc:
+                raise NodeError(f"invalid poll vote: {exc}") from exc
+        cleaned_close: Optional[Dict[str, Any]] = None
+        if poll_close is not None:
+            try:
+                cleaned_close = clean_group_poll_target(poll_close)
+            except ProtocolError as exc:
+                raise NodeError(f"invalid poll close: {exc}") from exc
+        # One send time for the wire and the records: the sent record
+        # carries it under leg_sent_at (see the docstring), and a
+        # queued copy re-sends with the same time, so the poll's
+        # identity is the same on both ends.
+        wire_sent_at = time.time()
+        # The poll fields the sent record carries, plus the shared
+        # wire time; empty for a plain message, so ordinary records
+        # gain no new field.
+        poll_record: Dict[str, Any] = {}
+        if cleaned_options is not None:
+            poll_record["poll_options"] = cleaned_options
+        if cleaned_vote is not None:
+            poll_record["poll_vote"] = cleaned_vote
+        if cleaned_close is not None:
+            poll_record["poll_close"] = cleaned_close
+        if poll_record:
+            poll_record["leg_sent_at"] = wire_sent_at
         if cleaned_location is not None and kind is None:
             # A pin without an explicit kind is a location message, so
             # the receiver can filter on it; an explicit kind wins.
@@ -6480,11 +6581,15 @@ class TauNode:
         payload = encode_message(
             normalized,
             message_id=message_id,
+            sent_at=wire_sent_at,
             kind=clean_kind,
             expires_at=expires_at,
             in_reply_to=reply_to,
             location=cleaned_location,
             beacon=cleaned_beacon,
+            poll_options=cleaned_options,
+            poll_vote=cleaned_vote,
+            poll_close=cleaned_close,
         )
         peer: Optional[Peer] = None
         try:
@@ -6519,6 +6624,10 @@ class TauNode:
                         beacon=cleaned_beacon,
                         kind=clean_kind,
                         send_after=send_after,
+                        sent_at=wire_sent_at,
+                        poll_options=cleaned_options,
+                        poll_vote=cleaned_vote,
+                        poll_close=cleaned_close,
                     )
                 except MailboxError:
                     # Nothing was queued: forget the sent record made
@@ -6557,6 +6666,7 @@ class TauNode:
                             if cleaned_beacon is not None
                             else {}
                         ),
+                        **poll_record,
                     }
                 )
                 self.mailbox.record_sent(
@@ -6625,6 +6735,7 @@ class TauNode:
                         if cleaned_beacon is not None
                         else {}
                     ),
+                    **poll_record,
                 }
             )
             if self.registry.get(peer.destination_hash) is None:
@@ -6668,6 +6779,10 @@ class TauNode:
                 location=cleaned_location,
                 beacon=cleaned_beacon,
                 kind=clean_kind,
+                sent_at=wire_sent_at,
+                poll_options=cleaned_options,
+                poll_vote=cleaned_vote,
+                poll_close=cleaned_close,
                 # A scheduled send to an undiscovered peer queues here:
                 # the not-before time must survive the fallback, or the
                 # message would go out as soon as the peer is heard from.
@@ -6695,6 +6810,7 @@ class TauNode:
                         if cleaned_beacon is not None
                         else {}
                     ),
+                    **poll_record,
                 }
             )
             self.mailbox.record_sent(
