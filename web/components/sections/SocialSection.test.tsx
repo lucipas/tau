@@ -90,6 +90,20 @@ describe("SocialSection", () => {
     expect(screen.getByRole("button", { name: "#mesh" })).toBeTruthy();
   });
 
+  it("renders a located post with its place and maps link", async () => {
+    timeline = [
+      makePost("h2".padEnd(64, "0"), "morning run", {
+        location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      }),
+    ];
+    renderSocial();
+    await screen.findByText(/morning run/);
+    const link = screen.getByRole("link", { name: /Rock Springs Park/ });
+    expect(link.getAttribute("href")).toContain("openstreetmap.org");
+    expect(link.getAttribute("href")).toContain("mlat=34.05");
+    expect(link.getAttribute("href")).toContain("mlon=-83.88");
+  });
+
   it("shows like / reply / quote counts on a post", async () => {
     renderSocial();
     await screen.findByText(/hello/);

@@ -277,6 +277,21 @@ export default function PostCard({
             />
           )}
 
+          {shown.location && (
+            <p className="mt-2 text-sm">
+              <a
+                href={`https://www.openstreetmap.org/?mlat=${shown.location.lat}&mlon=${shown.location.lon}#map=15/${shown.location.lat}/${shown.location.lon}`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-cyan-300 underline"
+              >
+                📍{" "}
+                {shown.location.name ??
+                  `${shown.location.lat.toFixed(5)}, ${shown.location.lon.toFixed(5)}`}
+              </a>
+            </p>
+          )}
+
           {quoted && (
             <div className="mt-2 rounded-xl border border-zinc-800 p-3">
               <p className="text-xs text-zinc-500">

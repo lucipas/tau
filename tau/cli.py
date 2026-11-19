@@ -2994,6 +2994,15 @@ def build_parser() -> argparse.ArgumentParser:
         "and the bytes are fetched on demand with `tau tan media`",
     )
     tan_post.add_argument(
+        "--location",
+        default=None,
+        metavar="LAT,LON [NAME]",
+        help="attach a place to the post (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park") — the signed post carries '
+        "the place, and the timeline and console show it with an "
+        "open-in-maps link",
+    )
+    tan_post.add_argument(
         "--reply-to",
         default=None,
         metavar="POST",
@@ -5096,6 +5105,22 @@ def _print_tan_image(post: Dict[str, Any]) -> None:
     )
 
 
+def _print_tan_location(post: Dict[str, Any], indent: str = "  ") -> None:
+    """Print a post's place attachment lines, when it has one.
+
+    A hand-edited record with a bad pin just shows its text: the
+    cleaner drops it instead of breaking the display, like a bad DM
+    pin in :func:`cmd_messages`.
+    """
+    location = clean_location(post.get("location"))
+    if location is None:
+        return
+    name = location.get("name")
+    label = name if isinstance(name, str) and name else "Location"
+    print(f"{indent}📍 {label} — {location['lat']}, {location['lon']}")
+    print(f"{indent}{location_maps_url(location)}")
+
+
 def _print_tan_posts(
     posts: Sequence[Dict[str, Any]],
     *,
@@ -5171,6 +5196,7 @@ def _print_tan_posts(
         if post.get("kind") == "poll":
             _print_poll_options(post)
         _print_tan_image(post)
+        _print_tan_location(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -5228,6 +5254,7 @@ def _print_tan_thread(
                 )
         if post.get("kind") == "poll":
             _print_poll_options(post, indent=f"{indent}  ")
+        _print_tan_location(post, indent=f"{indent}  ")
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -5272,6 +5299,7 @@ def _print_saved_posts(
         if post.get("kind") == "poll":
             _print_poll_options(post)
         _print_tan_image(post)
+        _print_tan_location(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -5372,6 +5400,7 @@ def _print_pinned_posts(
         if post.get("kind") == "poll":
             _print_poll_options(post)
         _print_tan_image(post)
+        _print_tan_location(post)
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -5706,6 +5735,7 @@ def _publish_local_post(
     timeout: float = 15.0,
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
     channel: Optional[str] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
@@ -5810,7 +5840,8 @@ def _publish_local_post(
         if text is None:
             raise TanError("nothing to publish")
         post = publisher.create_post(
-            text, reply_to=reply_to, expires_at=expires_at, image=image
+            text, reply_to=reply_to, expires_at=expires_at, image=image,
+            location=location,
         )
     published = publisher.publish(
         post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
@@ -5863,6 +5894,24 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             return 2
         image = _read_image(args.image, config.data_dir)
 
+    location = None
+    if getattr(args, "location", None) is not None:
+        if reply_to is not None:
+            print(
+                "error: --location can only be attached to a top-level post, "
+                "not a reply",
+                file=sys.stderr,
+            )
+            return 2
+        if getattr(args, "delay", None) is not None:
+            print(
+                "error: --location cannot be combined with --delay — "
+                "scheduled posts cannot carry an attachment yet",
+                file=sys.stderr,
+            )
+            return 2
+        location = _location_from_args(args)
+
     delay_text = getattr(args, "delay", None)
     if delay_text is not None:
         if getattr(args, "no_publish", False):
@@ -5912,7 +5961,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
         post = app.create_post(
-            text, reply_to=reply_to, expires_at=expires_at, image=image
+            text, reply_to=reply_to, expires_at=expires_at, image=image,
+            location=location,
         )
         published = None
     else:
@@ -5935,6 +5985,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             )
             if image is not None:
                 request["image"] = image
+            if location is not None:
+                request["location"] = location
             result = publish_running(config.data_dir, **request)
             post, published = result["post"], result["published"]
         else:
@@ -5955,6 +6007,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                     timeout=float(getattr(args, "timeout", 15.0)),
                     expires_at=expires_at,
                     image=image,
+                    location=location,
                 )
                 post, published = result["post"], result["published"]
             finally:
@@ -5982,6 +6035,12 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             size = int(image.get("size") or 0)
             size_text = f"{size / 1024:.1f} KiB" if size >= 1024 else f"{size} B"
             print(f"  image {image.get('name')} ({size_text}, {image.get('mime')})")
+        location = clean_location(post.get("location"))
+        if location is not None:
+            name = location.get("name")
+            label = name if isinstance(name, str) and name else "Location"
+            print(f"  📍 {label} — {location['lat']}, {location['lon']}")
+            print(f"  {location_maps_url(location)}")
         if published is None:
             print("  stored locally (not published)")
         else:

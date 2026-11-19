@@ -488,6 +488,14 @@ export interface TanImage {
   [key: string]: unknown;
 }
 
+/** A place attached to a Tan post: decimal degrees, optional place name. */
+export interface TanLocation {
+  lat: number;
+  lon: number;
+  name?: string;
+  [key: string]: unknown;
+}
+
 export interface TanParentSummary {
   hash: string;
   author: string;
@@ -519,6 +527,7 @@ export interface TanPost {
   expires_at: number | null;
   options?: string[];
   image?: TanImage | null;
+  location?: TanLocation | null;
   // --- annotations added by the bridge (tau/tangents/tan.py) ---
   likes: number;
   liked: boolean;

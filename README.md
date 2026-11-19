@@ -268,6 +268,10 @@ tau tan post --to alice "direct delivery"
 tau tan post --delay 8h "good morning, mesh"
 tau tan scheduled
 
+# Attach a place to a post — the place is signed with it, and the
+# timeline and console show it with an open-in-maps link
+tau tan post --location "34.05,-83.88 Rock Springs Park" "morning run"
+
 # Show every cached post, or one author's chain
 tau tan timeline --all
 tau tan timeline --author alice
@@ -398,6 +402,7 @@ Global options may appear before or after the command:
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan post --delay 5m TEXT` | Queue a post to publish in 5 minutes (needs `tau serve --social` running) |
+| `tau tan post --location "LAT,LON [NAME]" TEXT` | Attach a place to a post (signed with it; not with `--delay` or `--reply-to`) |
 | `tau tan scheduled` | List Tan posts queued for later publishing |
 | `tau tan cancel-scheduled ID` | Drop a queued Tan post before it publishes |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
