@@ -14,17 +14,20 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
+  cancelScheduledChannelMessage,
   closeChannelPoll,
   editChannelMessage,
   getChannelMessages,
-  getChannelTopic,
   getChannelPins,
+  getChannelScheduled,
+  getChannelTopic,
   getChannels,
   joinChannel,
   leaveChannel,
   pinChannelMessage,
   postChannelPoll,
   reactToChannelMessage,
+  scheduleChannelMessage,
   searchChannelMessages,
   sendChannelMessage,
   setChannelTopic,
@@ -32,7 +35,12 @@ import {
   unpinChannelMessage,
   voteChannelPoll,
 } from "./api";
-import type { Channel, ChannelMessage, ChannelTopic } from "./types";
+import type {
+  Channel,
+  ChannelMessage,
+  ChannelTopic,
+  ScheduledChannelMessage,
+} from "./types";
 
 export interface UseChannelsResult {
   channels: Channel[];
@@ -40,6 +48,8 @@ export interface UseChannelsResult {
   selected: string | null;
   select: (channel: string | null) => void;
   messages: ChannelMessage[];
+  /** Queued channel messages for the selected channel (soonest first). */
+  scheduled: ScheduledChannelMessage[];
   /** Current topic of the selected channel, or null when unset. */
   topic: ChannelTopic | null;
   /** Pinned messages for the selected channel, newest pin first. */
@@ -56,6 +66,8 @@ export interface UseChannelsResult {
   join: (channel: string) => Promise<void>;
   leave: (channel: string) => Promise<void>;
   send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
+  schedule: (text: string, sendIn: number) => Promise<ScheduledChannelMessage>;
+  cancelScheduled: (id: string) => Promise<void>;
   poll: (question: string, options: string[]) => Promise<ChannelMessage>;
   vote: (poll: string, option: number) => Promise<ChannelMessage>;
   closePoll: (poll: string) => Promise<ChannelMessage>;
@@ -74,6 +86,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChannelMessage[]>([]);
+  const [scheduled, setScheduled] = useState<ScheduledChannelMessage[]>([]);
   const [topic, setTopicState] = useState<ChannelTopic | null>(null);
   const [pins, setPins] = useState<ChannelMessage[]>([]);
   const [searchResults, setSearchResults] = useState<ChannelMessage[] | null>(null);
@@ -93,6 +106,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
   const refreshMessages = useCallback(async (channel: string | null) => {
     if (!channel) {
       setMessages([]);
+      setScheduled([]);
       setPins([]);
       return;
     }
@@ -111,6 +125,11 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     }
     try {
       setTopicState(await getChannelTopic(channel));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      setScheduled(await getChannelScheduled(channel));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -170,6 +189,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     selected,
     select,
     messages,
+    scheduled,
     topic,
     pins,
     searchResults,
@@ -192,6 +212,7 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       if (selected === channel) {
         setSelected(null);
         setMessages([]);
+        setScheduled([]);
         setTopicState(null);
         setPins([]);
         setSearchResults(null);
@@ -203,6 +224,16 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       const sent = await sendChannelMessage(selected, text, replyTo);
       await refreshMessages(selected);
       return sent;
+    },
+    schedule: async (text, sendIn) => {
+      if (!selected) throw new Error("no channel selected");
+      const entry = await scheduleChannelMessage(selected, text, sendIn);
+      await refreshMessages(selected);
+      return entry;
+    },
+    cancelScheduled: async (id) => {
+      await cancelScheduledChannelMessage(id);
+      await refreshMessages(selected);
     },
     poll: async (question, options) => {
       if (!selected) throw new Error("no channel selected");

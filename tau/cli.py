@@ -217,6 +217,13 @@ from .scheduled_posts import (
     load_scheduled_posts,
     schedule_post,
 )
+from .scheduled_channel import (
+    MAX_SCHEDULED_CHANNEL_DELAY,
+    ScheduledChannelError,
+    cancel_scheduled_channel_message,
+    load_scheduled_channel_messages,
+    schedule_channel_message,
+)
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
@@ -3915,6 +3922,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="store locally without contacting peers",
     )
+    channel_send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and publish it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d). A node serving "
+        "with --channels publishes it when the time comes",
+    )
     channel_send.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     channel_send.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     channel_send.set_defaults(func=cmd_channel_send)
@@ -3973,6 +3987,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_read.set_defaults(func=cmd_channel_read)
 
+    channel_scheduled = channel_sub.add_parser(
+        "scheduled",
+        parents=[common],
+        help="list channel messages queued for later publishing",
+    )
+    channel_scheduled.add_argument(
+        "channel",
+        nargs="?",
+        default=None,
+        metavar="NAME",
+        help="only messages queued for this channel (default: all channels)",
+    )
+    channel_scheduled.set_defaults(func=cmd_channel_scheduled)
+
+    channel_cancel_scheduled = channel_sub.add_parser(
+        "cancel-scheduled",
+        parents=[common],
+        help="drop a queued channel message before it publishes",
+    )
+    channel_cancel_scheduled.add_argument(
+        "target", metavar="ID", help="scheduled message id or unique id prefix"
+    )
+    channel_cancel_scheduled.set_defaults(func=cmd_channel_cancel_scheduled)
     channel_topic = channel_sub.add_parser(
         "topic",
         parents=[common],
@@ -8373,6 +8410,57 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled message is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_CHANNEL_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        # Refuse to queue for a channel we have not joined: the
+        # publish pass would fail every attempt the same way.
+        conn = init_channel_db(config.channels_db_path)
+        try:
+            member = is_channel_member(conn, name)
+        finally:
+            conn.close()
+        if not member:
+            print(
+                f"error: not a member of channel {name!r}; join it first",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            entry = schedule_channel_message(
+                config.scheduled_channel_messages_path,
+                channel=name,
+                text=text,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+            )
+        except ScheduledChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        if json_output:
+            _emit({"scheduled": entry.to_dict()}, True)
+        else:
+            print(f"scheduled {entry.id} — publishes in {_ago(delay)}")
+            print("  list it with `tau channel scheduled`; a node serving")
+            print("  with --channels publishes it when the time comes.")
+        return _EXIT_OK
+
     if getattr(args, "no_publish", False):
         app = ChannelApp(config, _tan_identity(config), name=config.name)
         try:
@@ -8785,6 +8873,88 @@ def cmd_channel_pins(args: argparse.Namespace) -> int:
         print(f"No pinned messages in #{name}.")
         return _EXIT_OK
     _print_channel_messages(pins, json_output=False, channel=name)
+    return _EXIT_OK
+
+
+def cmd_channel_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        queue = load_scheduled_channel_messages(
+            config.scheduled_channel_messages_path
+        )
+    except ScheduledChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    entries = queue.messages
+    channel_filter = getattr(args, "channel", None)
+    if channel_filter is not None:
+        try:
+            channel_filter = clean_channel_name(channel_filter)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        entries = tuple(
+            entry for entry in entries if entry.channel == channel_filter
+        )
+    if json_output:
+        _emit({"scheduled": [entry.to_dict() for entry in entries]}, True)
+        return _EXIT_OK
+    if not entries:
+        if channel_filter is not None:
+            print(f"No channel messages scheduled for #{channel_filter}.")
+        else:
+            print("No channel messages scheduled.")
+        return _EXIT_OK
+    now = time.time()
+    for entry in entries:
+        when = _stamp(entry.publish_at)
+        if entry.publish_at <= now:
+            when += " (due — publishes on the next serve pass)"
+        else:
+            when += f" (in {_ago(entry.publish_at - now)})"
+        print(f"{entry.id}  #{entry.channel}  {when}")
+        if entry.to:
+            print(f"  to {', '.join(entry.to)}")
+        for line in entry.text.splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_channel_cancel_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    deleted_local = False
+
+    def _delete_stored_message(entry: Any) -> None:
+        # A publish attempt already stored the signed message locally
+        # (see publish_due_scheduled_channel_messages): dropping only
+        # the queue entry would leave it in the local channel history.
+        # Peers that received a copy before the failure keep theirs —
+        # a local delete cannot retract what already went out.
+        nonlocal deleted_local
+        if entry.message_hash is None:
+            return
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        if app.delete_message(entry.message_hash):
+            deleted_local = True
+
+    try:
+        entry = cancel_scheduled_channel_message(
+            config.scheduled_channel_messages_path,
+            args.target,
+            on_cancel=_delete_stored_message,
+        )
+    except ScheduledChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    if json_output:
+        _emit(
+            {"cancelled": entry.to_dict(), "deleted_local": deleted_local},
+            True,
+        )
+    else:
+        print(f"cancelled {entry.id} — it will not be published")
+        if deleted_local:
+            print("  also removed the stored message from the local channel")
     return _EXIT_OK
 
 
