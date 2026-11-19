@@ -2333,6 +2333,247 @@ def test_api_groups_create_is_idempotent(bridge, node, tmp_path):
     assert listed["count"] == 1
 
 
+def test_api_broadcasts_list_empty(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    status, _, payload = _json(bridge, "/api/broadcasts")
+    assert status == 200
+    assert payload == {"broadcasts": [], "count": 0}
+
+
+def test_api_broadcasts_create_and_list(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    broadcast = payload["broadcast"]
+    assert broadcast["name"] == "team"
+    assert broadcast["members"] == [{"hash": PEER_HASH, "name": "alice"}]
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert listed["count"] == 1
+    assert listed["broadcasts"][0]["name"] == "team"
+
+
+def test_api_broadcasts_create_rejects_bad_input(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    cases = [
+        ({}, "field 'name' is required"),
+        ({"name": "  ", "members": [PEER_HASH]}, "field 'name' is required"),
+        ({"name": "team"}, "field 'members' must be a non-empty list"),
+        ({"name": "team", "members": []}, "field 'members' must be a non-empty list"),
+        ({"name": "team", "members": ["not-a-hash"]}, "unknown peer"),
+        ({"name": "team", "members": [OTHER_HASH]}, "unknown peer"),
+        (
+            {"name": "team", "members": [node.destination_hexhash]},
+            "cannot add yourself",
+        ),
+    ]
+    for body, message in cases:
+        status, _, payload = _json(
+            bridge, "/api/broadcasts", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert listed["count"] == 0
+
+
+def test_api_broadcasts_create_duplicate_name_is_rejected(
+    bridge, node, tmp_path
+):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "Team", "members": [PEER_HASH]},
+    )
+    assert status == 400
+    assert "already exists" in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert listed["count"] == 1
+
+
+def test_api_broadcasts_delete_removes_list(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/delete",
+        method="POST",
+        body={"broadcast": "team"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["name"] == "team"
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert listed["count"] == 0
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/delete",
+        method="POST",
+        body={"broadcast": "team"},
+    )
+    assert status == 400
+    assert "unknown broadcast list" in payload["error"]["message"]
+
+
+def test_api_broadcasts_send_fans_out_to_members(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/send",
+        method="POST",
+        body={"broadcast": "team", "text": "meet at noon"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["name"] == "team"
+    assert payload["delivered"] == 1
+    assert payload["queued"] == 0
+    assert payload["failed"] == 0
+    assert payload["results"] == [
+        {"hash": PEER_HASH, "name": "alice", "status": "delivered"}
+    ]
+    assert node.sent == [("alice", "meet at noon", None)]
+
+
+def test_api_broadcasts_send_reports_partial_failure(
+    bridge, node, tmp_path
+):
+    from tau.broadcasts import BroadcastStore
+    from tau.peers import Peer
+
+    # A second registry peer the fake node cannot resolve: its send
+    # fails, but the first member still gets the message.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex(OTHER_HASH),
+            name="bob",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH, OTHER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/send",
+        method="POST",
+        body={"broadcast": "team", "text": "meet at noon"},
+    )
+    assert status == 200
+    assert payload["delivered"] == 1
+    assert payload["failed"] == 1
+    assert payload["results"][0]["status"] == "delivered"
+    assert payload["results"][1] == {
+        "hash": OTHER_HASH,
+        "name": "bob",
+        "status": "failed",
+        "error": f"unknown peer: {OTHER_HASH}",
+    }
+    assert node.sent == [("alice", "meet at noon", None)]
+
+
+def test_api_broadcasts_send_reports_queued_member(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    real_send = node.send_message
+
+    def queued_send(peer, text, **kwargs):
+        real_send(peer, text, **kwargs)
+        return {"ok": True, "queued": True, "id": "ab" * 16}
+
+    node.send_message = queued_send
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/broadcasts/send",
+            method="POST",
+            body={"broadcast": "team", "text": "meet at noon"},
+        )
+    finally:
+        node.send_message = real_send
+    assert status == 200
+    assert payload["delivered"] == 0
+    assert payload["queued"] == 1
+    assert payload["failed"] == 0
+    assert payload["results"][0]["status"] == "queued"
+
+
+def test_api_broadcasts_send_rejects_bad_input(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    cases = [
+        ({"text": "hi"}, "field 'broadcast' is required"),
+        ({"broadcast": "  ", "text": "hi"}, "field 'broadcast' is required"),
+        ({"broadcast": "team"}, "field 'text' is required"),
+        ({"broadcast": "team", "text": "  "}, "message text is required"),
+        ({"broadcast": "nope", "text": "hi"}, "unknown broadcast list"),
+    ]
+    for body, message in cases:
+        status, _, payload = _json(
+            bridge, "/api/broadcasts/send", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+    assert node.sent == []
+
+
 def test_api_groups_create_rejects_unknown_member(bridge, node, tmp_path):
     from tau.groups import GroupStore
 

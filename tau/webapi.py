@@ -43,6 +43,11 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/ignore ignore ``{"group": "..."}``
     POST /api/groups/unignore unignore ``{"group": "..."}``
     GET  /api/groups/left   groups this node has left, plus ignored groups
+    GET  /api/broadcasts   saved broadcast lists with their member lists
+    POST /api/broadcasts   create ``{"name": "...", "members": ["<hash>", ...]}``
+    POST /api/broadcasts/delete delete ``{"broadcast": "<name>"}``
+    POST /api/broadcasts/send send ``{"broadcast": "<name>", "text": "..."}`` —
+                           one DM per member, per-member results in reply
     GET  /api/messages     recent inbound/outbound messages
                            (``?pinned=1`` lists pinned messages only,
                            across the whole console log)
@@ -9037,6 +9042,150 @@ class WebBridge:
             raise ValueError(f"unknown group: {query.strip()!r}")
         return {"id": group["id"], "name": group["name"]}
 
+    # -- broadcast lists -------------------------------------------------
+    # CLI-only until now (`tau broadcast`); the console lists, creates,
+    # sends and deletes them.  Lists never travel on the wire: a send
+    # fans out as one ordinary DM per member through send_message, so
+    # an offline member queues exactly like a one-to-one DM and no
+    # list metadata ever reaches a recipient.
+
+    def _describe_broadcast(self, broadcast: Dict[str, Any]) -> Dict[str, Any]:
+        members = []
+        for member_hash in broadcast["members"]:
+            peer = self.node.registry.get(member_hash)
+            members.append(
+                {
+                    "hash": member_hash,
+                    "name": (
+                        peer.display_name
+                        if peer is not None
+                        else member_hash[:8]
+                    ),
+                }
+            )
+        return {
+            "name": broadcast["name"],
+            "members": members,
+            "created_at": broadcast["created_at"],
+        }
+
+    def list_broadcasts(self) -> List[Dict[str, Any]]:
+        try:
+            return [
+                self._describe_broadcast(broadcast)
+                for broadcast in self.node.broadcasts.list_broadcasts()
+            ]
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read broadcast store", exc_info=True)
+            return []
+
+    def create_broadcast(
+        self, name: Any, members: Any
+    ) -> Dict[str, Any]:
+        """Create a broadcast list from the console, mirroring ``tau broadcast create``.
+
+        Members are peer hashes from the console's picker; like group
+        creation, each must already be in the registry — an unknown
+        hash would leave a DM that can never be sent — and this node
+        is the sender, never a member.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'name' is required")
+        if not isinstance(members, list) or not members:
+            raise ValueError("field 'members' must be a non-empty list")
+        cleaned: List[str] = []
+        for member in members:
+            if not isinstance(member, str) or not member.strip():
+                raise ValueError("field 'members' must contain peer hashes")
+            cleaned.append(member.strip().lower())
+        own_hash = self.node.destination_hexhash
+        for member in cleaned:
+            if member == own_hash:
+                raise ValueError(
+                    "cannot add yourself to a broadcast list;"
+                    " you are the sender, not a member"
+                )
+            peer = self.node.registry.get(member)
+            if peer is None or peer.destination_hash.hex() != member:
+                raise ValueError(f"unknown peer: {member}")
+        broadcast = self.node.broadcasts.create(name.strip(), cleaned)
+        return self._describe_broadcast(broadcast)
+
+    def delete_broadcast(self, name: str) -> Dict[str, Any]:
+        """Delete a broadcast list from the console, mirroring ``tau broadcast delete``."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'broadcast' is required")
+        broadcast = self.node.broadcasts.find(name.strip())
+        if not self.node.broadcasts.delete(broadcast["name"]):
+            raise ValueError(f"unknown broadcast list: {name.strip()!r}")
+        return {"name": broadcast["name"]}
+
+    def send_broadcast(
+        self,
+        name: str,
+        text: str,
+        *,
+        timeout: float = 20.0,
+    ) -> Dict[str, Any]:
+        """Send a broadcast from the console: one DM per member.
+
+        The text is validated once, up front, so a bad send never
+        reaches the first member before failing on the second.  Each
+        member is then sent independently: a member whose peer cannot
+        be resolved or whose send fails is reported as ``failed`` with
+        the reason, and the rest still go out — a partial fan-out is
+        visible in the response, never silent.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'broadcast' is required")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("message text is required")
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(
+                f"message is longer than {MAX_MESSAGE_CHARS} characters"
+            )
+        broadcast = self.node.broadcasts.find(name.strip())
+        results = []
+        for member_hash in broadcast["members"]:
+            peer = self.node.registry.get(member_hash)
+            display = (
+                peer.display_name if peer is not None else member_hash[:8]
+            )
+            try:
+                _, response = self.send_message(
+                    member_hash, text, timeout=timeout
+                )
+            except Exception as exc:  # one bad member must not stop the rest
+                results.append(
+                    {
+                        "hash": member_hash,
+                        "name": display,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "hash": member_hash,
+                    "name": display,
+                    "status": "queued" if response.get("queued") else "delivered",
+                }
+            )
+        return {
+            "name": broadcast["name"],
+            "results": results,
+            "delivered": sum(
+                1 for result in results if result["status"] == "delivered"
+            ),
+            "queued": sum(
+                1 for result in results if result["status"] == "queued"
+            ),
+            "failed": sum(
+                1 for result in results if result["status"] == "failed"
+            ),
+        }
+
     def leave_group(self, query: str) -> Dict[str, Any]:
         """Leave a known group from the console, mirroring ``tau group leave``.
 
@@ -10711,6 +10860,13 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/groups/left":
                 self._send_json(self.bridge.left_groups(), head_only)
                 return
+            if path == "/api/broadcasts":
+                broadcasts = self.bridge.list_broadcasts()
+                self._send_json(
+                    {"broadcasts": broadcasts, "count": len(broadcasts)},
+                    head_only,
+                )
+                return
             if path == "/api/groups/join-requests":
                 requests = self.bridge.join_requests()
                 self._send_json(
@@ -11758,6 +11914,76 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "deleted": deleted}, head_only)
+                return
+            if path == "/api/broadcasts":
+                try:
+                    broadcast = self.bridge.create_broadcast(
+                        body.get("name"), body.get("members")
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "broadcast": broadcast}, head_only)
+                return
+            if path == "/api/broadcasts/delete":
+                target = body.get("broadcast")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'broadcast' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    deleted = self.bridge.delete_broadcast(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **deleted}, head_only)
+                return
+            if path == "/api/broadcasts/send":
+                target = body.get("broadcast")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'broadcast' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if not isinstance(text, str):
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                timeout = body.get("timeout")
+                if timeout is None:
+                    timeout = 20.0
+                if (
+                    not isinstance(timeout, (int, float))
+                    or isinstance(timeout, bool)
+                ):
+                    timeout = 20.0
+                timeout = max(1.0, min(float(timeout), 120.0))
+                try:
+                    result = self.bridge.send_broadcast(
+                        target.strip(), text, timeout=timeout
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **result}, head_only)
                 return
             if path == "/api/groups/leave":
                 target = body.get("group")

@@ -17,6 +17,8 @@ import type {
   AllowList,
   ApiErrorBody,
   BlockResult,
+  BroadcastList,
+  BroadcastSendResponse,
   Channel,
   ChannelMessage,
   ChannelTopic,
@@ -301,6 +303,33 @@ export async function createGroup(name: string, members: string[]): Promise<Grou
 
 export async function deleteGroup(group: string): Promise<{ id: string; name: string }> {
   return post("/api/groups/delete", { group });
+}
+
+// ---------------------------------------------------------- broadcasts --
+// One message, many private DMs: a send fans out as an ordinary DM per
+// member, so recipients never see each other or the list.
+
+export async function getBroadcasts(): Promise<BroadcastList[]> {
+  const data = await get<{ broadcasts: BroadcastList[]; count: number }>("/api/broadcasts");
+  return data.broadcasts ?? [];
+}
+
+export async function createBroadcast(
+  name: string,
+  members: string[],
+): Promise<{ ok: boolean; broadcast: BroadcastList }> {
+  return post("/api/broadcasts", { name, members });
+}
+
+export async function deleteBroadcast(broadcast: string): Promise<{ ok: boolean; name: string }> {
+  return post("/api/broadcasts/delete", { broadcast });
+}
+
+export async function sendBroadcast(
+  broadcast: string,
+  text: string,
+): Promise<BroadcastSendResponse> {
+  return post("/api/broadcasts/send", { broadcast, text });
 }
 
 export async function leaveGroup(group: string): Promise<{ id: string; name: string; already_left?: boolean; also_left?: string[] }> {

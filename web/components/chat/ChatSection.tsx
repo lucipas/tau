@@ -30,6 +30,7 @@ import {
 import type { ChatMessage } from "@/lib/types";
 import {
   buildConversations,
+  useBroadcasts,
   useConversations,
   useOutbox,
   usePeerActions,
@@ -37,6 +38,7 @@ import {
 } from "@/lib/use-tau";
 import { useHash } from "../chrome/useHash";
 import { useTauContext } from "../chrome/TauContext";
+import BroadcastsPanel from "./BroadcastsPanel";
 import ConversationList from "./ConversationList";
 import MessageSearch from "./MessageSearch";
 import OutboxPanel from "./OutboxPanel";
@@ -87,6 +89,7 @@ export default function ChatSection() {
   const { peer: selectedPeer, group: selectedGroup, navigate } = useHash();
   const actions = usePeerActions();
   const outbox = useOutbox();
+  const broadcasts = useBroadcasts();
 
   const [mutedPeers, setMutedPeers] = useState<Set<string>>(new Set());
   const [mutedGroups, setMutedGroups] = useState<Set<string>>(new Set());
@@ -94,6 +97,7 @@ export default function ChatSection() {
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editing, setEditing] = useState<ChatMessage | null>(null);
   const [showOutbox, setShowOutbox] = useState(false);
+  const [showBroadcasts, setShowBroadcasts] = useState(false);
   const [searchActive, setSearchActive] = useState(false);
   const [searchReset, setSearchReset] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -323,15 +327,39 @@ export default function ChatSection() {
       >
         <header className="flex items-center justify-between border-b border-zinc-800 px-3 py-2.5">
           <h1 className="text-lg font-bold text-zinc-50">Chat</h1>
-          <button
-            type="button"
-            aria-expanded={showOutbox}
-            onClick={() => setShowOutbox((v) => !v)}
-            className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
-          >
-            Outbox{outboxCount > 0 ? ` (${outboxCount})` : ""}
-          </button>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              aria-expanded={showBroadcasts}
+              onClick={() => setShowBroadcasts((v) => !v)}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
+            >
+              Broadcasts
+              {broadcasts.broadcasts.length > 0
+                ? ` (${broadcasts.broadcasts.length})`
+                : ""}
+            </button>
+            <button
+              type="button"
+              aria-expanded={showOutbox}
+              onClick={() => setShowOutbox((v) => !v)}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
+            >
+              Outbox{outboxCount > 0 ? ` (${outboxCount})` : ""}
+            </button>
+          </div>
         </header>
+        {showBroadcasts && (
+          <BroadcastsPanel
+            broadcasts={broadcasts.broadcasts}
+            peers={tau.peers}
+            loading={broadcasts.loading}
+            error={broadcasts.error}
+            onCreate={(name, members) => broadcasts.create(name, members)}
+            onDelete={(name) => broadcasts.remove(name)}
+            onSend={(name, text) => broadcasts.send(name, text)}
+          />
+        )}
         {showOutbox && (
           <OutboxPanel
             outbox={outbox.outbox}
