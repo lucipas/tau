@@ -33,7 +33,7 @@ const EXPIRY_OPTIONS: { label: string; seconds: number | undefined }[] = [
   { label: "7 days", seconds: 7 * 86400 },
 ];
 
-const SCHEDULE_OPTIONS: { label: string; seconds: number | undefined }[] = [
+export const SCHEDULE_OPTIONS: { label: string; seconds: number | undefined }[] = [
   { label: "Post now", seconds: undefined },
   { label: "In 5 minutes", seconds: 5 * 60 },
   { label: "In 1 hour", seconds: 3600 },

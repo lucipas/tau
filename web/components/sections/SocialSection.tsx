@@ -916,21 +916,34 @@ function ScheduledView({
   return (
     <div>
       <h2 className="border-b border-zinc-800 px-4 py-3 text-sm font-bold text-zinc-100">
-        Scheduled posts and polls
+        Scheduled posts, reposts, quotes and polls
       </h2>
       {scheduled.length === 0 && (
         <p className="px-4 py-6 text-sm text-zinc-500">
-          Nothing scheduled — pick “Send later” in the composer to queue a post or poll.
+          Nothing scheduled — pick “Send later” in the composer to queue a
+          post, repost, quote or poll, or schedule a repost from a post’s ⋯ menu.
         </p>
       )}
       {scheduled.map((s) => (
         <div key={s.id} className="border-b border-zinc-800 px-4 py-3">
+          {s.kind === "repost" && (
+            <p className="text-xs font-semibold text-emerald-400">
+              Repost · {shortHash(s.target_post ?? "")}
+            </p>
+          )}
+          {s.kind === "quote" && (
+            <p className="text-xs font-semibold text-cyan-400">
+              Quote · {shortHash(s.target_post ?? "")}
+            </p>
+          )}
           {s.kind === "poll" && (
             <p className="text-xs font-semibold text-cyan-400">
               Poll · {(s.options ?? []).length} options
             </p>
           )}
-          <p className="text-sm whitespace-pre-wrap text-zinc-200">{s.text}</p>
+          {s.text ? (
+            <p className="text-sm whitespace-pre-wrap text-zinc-200">{s.text}</p>
+          ) : null}
           {s.kind === "poll" && (
             <ul className="mt-1 space-y-0.5">
               {(s.options ?? []).map((option, i) => (
@@ -954,7 +967,14 @@ function ScheduledView({
             onClick={() => void onCancel(s.id)}
             className="mt-2 rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
           >
-            Cancel scheduled {s.kind === "poll" ? "poll" : "post"}
+            Cancel scheduled{" "}
+            {s.kind === "repost"
+              ? "repost"
+              : s.kind === "quote"
+                ? "quote"
+                : s.kind === "poll"
+                  ? "poll"
+                  : "post"}
           </button>
         </div>
       ))}

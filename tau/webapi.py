@@ -179,8 +179,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
-    POST /api/tan/schedule schedule a Tan post — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL)
-    GET  /api/tan/scheduled queued Tan posts and polls, soonest first
+    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL)
+    GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     GET  /api/tan/drafts   saved Tan post drafts, newest first
     POST /api/tan/drafts   save a Tan post draft
@@ -3668,6 +3668,8 @@ class WebBridge:
     def tan_schedule_post(
         self, text: str, *, reply_to: Optional[str] = None, send_in: float,
         expires_in: float = 0.0,
+        kind: Optional[str] = None,
+        target_post: Optional[str] = None,
         poll_options: Optional[List[str]] = None,
         image: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -3682,12 +3684,22 @@ class WebBridge:
         store at schedule time — and rides the queue entry until the
         publish pass attaches it.
 
+        With *kind* ``"repost"`` / ``"quote"`` the entry amplifies
+        *target_post* instead: a repost carries no text, a quote
+        carries its comment as the text, and the target is resolved
+        the same way as a reply target.
+
         With *poll_options* the entry is a poll instead: the text is
         its question, the options ride alongside it, and a reply
         target is refused — polls are top-level entries.  A poll
         cannot carry an image.
         """
-        from .scheduled_posts import schedule_poll, schedule_post
+        from .scheduled_posts import (
+            schedule_poll,
+            schedule_post,
+            schedule_quote,
+            schedule_repost,
+        )
         from .tangents.tan import MAX_GOSSIP_TTL, resolve_post
 
         if image is not None and reply_to is not None:
@@ -3709,7 +3721,32 @@ class WebBridge:
                 reply_to = resolve_post(conn, reply_to)["hash"]
             finally:
                 conn.close()
+        if target_post is not None:
+            conn = self._tan_conn()
+            try:
+                target_post = resolve_post(conn, target_post)["hash"]
+            finally:
+                conn.close()
         config = self.node.config
+        if kind == "repost":
+            post = schedule_repost(
+                config.scheduled_posts_path,
+                target_post=target_post,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                name=getattr(self.node, "name", None),
+            )
+            return post.to_dict()
+        if kind == "quote":
+            post = schedule_quote(
+                config.scheduled_posts_path,
+                target_post=target_post,
+                text=text,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                name=getattr(self.node, "name", None),
+            )
+            return post.to_dict()
         if poll_options is not None:
             post = schedule_poll(
                 config.scheduled_posts_path,
@@ -14404,8 +14441,73 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "post": post}, head_only)
                 return
             if path == "/api/tan/schedule":
+                kind = body.get("kind")
+                if kind is not None and kind not in ("repost", "quote"):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'kind' must be 'repost' or 'quote'"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                target_post = body.get("target_post")
+                if kind is not None:
+                    if not isinstance(target_post, str) or not target_post.strip():
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'target_post' is required to "
+                                    "schedule a repost or quote"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                elif target_post is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'target_post' needs kind "
+                                "'repost' or 'quote'"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 text = body.get("text")
-                if not isinstance(text, str) or not text.strip():
+                if kind == "repost":
+                    # A repost carries no text; an absent text is fine,
+                    # a non-string one is a client bug, and a non-empty
+                    # one would be silently dropped.
+                    if text is not None and not isinstance(text, str):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'text' must be a string"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if isinstance(text, str) and text.strip():
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "a scheduled repost carries no text"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    text = ""
+                elif not isinstance(text, str) or not text.strip():
                     self._send_json(
                         {"error": {"message": "field 'text' is required"}},
                         head_only,
@@ -14418,6 +14520,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                 ):
                     self._send_json(
                         {"error": {"message": "field 'reply_to' must be a post hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if kind is not None and reply_to is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "a scheduled repost or quote cannot "
+                                "be a reply"
+                            }
+                        },
                         head_only,
                         400,
                     )
@@ -14440,6 +14554,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 expires_in = body.get("expires_in")
+                if kind is not None and expires_in is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "a scheduled repost or quote cannot "
+                                "expire"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 if expires_in is not None:
                     # A scheduled post's expiry shares the 7d queue cap
                     # (see schedule_post): it cannot outlive the furthest
@@ -14527,6 +14653,8 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else 0.0
                         ),
+                        kind=kind,
+                        target_post=target_post,
                         poll_options=poll_options,
                         image=image,
                     )

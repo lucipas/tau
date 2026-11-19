@@ -1,8 +1,8 @@
 // PostCard.tsx — one Tan post in the X-style feed: avatar, author,
 // relative time, rich text, attached image, poll with vote bars, and the
 // like / reply / repost / quote action row plus a ⋯ menu (save, hide, pin,
-// share, mute, follow, edit, delete). All rendering is React elements;
-// post text is never injected as HTML.
+// share, mute, follow, edit, delete, schedule repost). All rendering is
+// React elements; post text is never injected as HTML.
 
 "use client";
 
@@ -13,6 +13,7 @@ import { tanMediaUrl } from "@/lib/api";
 import type { TanPost } from "@/lib/types";
 import type { UseTanFeedResult } from "@/lib/use-tan";
 import RichText from "./RichText";
+import { SCHEDULE_OPTIONS } from "./TanComposer";
 
 export type FeedActions = Pick<
   UseTanFeedResult,
@@ -20,6 +21,8 @@ export type FeedActions = Pick<
   | "unlike"
   | "repost"
   | "quote"
+  | "scheduleRepost"
+  | "scheduleQuote"
   | "vote"
   | "share"
   | "save"
@@ -120,6 +123,8 @@ export default function PostCard({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [quoteOpen, setQuoteOpen] = useState(false);
   const [quoteText, setQuoteText] = useState("");
+  const [quoteSendIn, setQuoteSendIn] = useState<number | undefined>(undefined);
+  const [scheduleRepostOpen, setScheduleRepostOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [shareTarget, setShareTarget] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -380,6 +385,18 @@ export default function PostCard({
                   🔇 Mute author
                 </button>
               )}
+              {!shown.own && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    setScheduleRepostOpen((v) => !v);
+                  }}
+                  className="rounded-full border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+                >
+                  ⏰ Schedule repost
+                </button>
+              )}
               {shown.own && (
                 <>
                   <button
@@ -418,6 +435,45 @@ export default function PostCard({
                   )}
                 </>
               )}
+            </div>
+          )}
+
+          {scheduleRepostOpen && (
+            <div
+              className="mt-2 flex flex-wrap items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900 p-2"
+              role="group"
+              aria-label="Schedule repost"
+            >
+              <span className="text-xs text-zinc-400">Repost in</span>
+              {SCHEDULE_OPTIONS.filter((o) => o.seconds !== undefined).map(
+                (o) => (
+                  <button
+                    key={o.label}
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      void run(async () => {
+                        await actions.scheduleRepost(
+                          shown.hash,
+                          o.seconds as number,
+                        );
+                        setScheduleRepostOpen(false);
+                        setMenuOpen(false);
+                      })
+                    }
+                    className="rounded-full border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+                  >
+                    {o.label}
+                  </button>
+                ),
+              )}
+              <button
+                type="button"
+                onClick={() => setScheduleRepostOpen(false)}
+                className="rounded-full border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+              >
+                Cancel
+              </button>
             </div>
           )}
 
@@ -465,24 +521,62 @@ export default function PostCard({
                 rows={2}
                 className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-500"
               />
-              <div className="flex gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <label
+                  className="text-xs text-zinc-400"
+                  htmlFor={`quote-send-${shown.hash.slice(0, 8)}`}
+                >
+                  Send
+                </label>
+                <select
+                  id={`quote-send-${shown.hash.slice(0, 8)}`}
+                  value={quoteSendIn === undefined ? "" : String(quoteSendIn)}
+                  onChange={(e) =>
+                    setQuoteSendIn(
+                      e.target.value === "" ? undefined : Number(e.target.value),
+                    )
+                  }
+                  aria-label="Send quote later"
+                  className="rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 outline-none"
+                >
+                  {SCHEDULE_OPTIONS.map((o) => (
+                    <option
+                      key={o.label}
+                      value={o.seconds === undefined ? "" : String(o.seconds)}
+                    >
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
                 <button
                   type="button"
                   disabled={busy || !quoteText.trim()}
                   onClick={() =>
                     void run(async () => {
-                      await actions.quote(shown.hash, quoteText.trim());
+                      if (quoteSendIn !== undefined) {
+                        await actions.scheduleQuote(
+                          shown.hash,
+                          quoteText.trim(),
+                          quoteSendIn,
+                        );
+                      } else {
+                        await actions.quote(shown.hash, quoteText.trim());
+                      }
                       setQuoteText("");
+                      setQuoteSendIn(undefined);
                       setQuoteOpen(false);
                     })
                   }
                   className="rounded-full bg-cyan-500 px-3 py-1 text-xs font-bold text-zinc-950 disabled:opacity-40"
                 >
-                  Post quote
+                  {quoteSendIn !== undefined ? "Schedule quote" : "Post quote"}
                 </button>
                 <button
                   type="button"
-                  onClick={() => setQuoteOpen(false)}
+                  onClick={() => {
+                    setQuoteOpen(false);
+                    setQuoteSendIn(undefined);
+                  }}
                   className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300"
                 >
                   Cancel

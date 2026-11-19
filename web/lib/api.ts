@@ -1128,6 +1128,31 @@ export async function scheduleTanPoll(
   });
 }
 
+export async function scheduleTanRepost(
+  target: string,
+  sendIn: number,
+): Promise<ScheduledTanPost> {
+  return post("/api/tan/schedule", {
+    kind: "repost",
+    target_post: target,
+    send_in: sendIn,
+  });
+}
+
+/** Queue a quote of a post for later: the comment plus the quoted post. */
+export async function scheduleTanQuote(
+  target: string,
+  text: string,
+  sendIn: number,
+): Promise<ScheduledTanPost> {
+  return post("/api/tan/schedule", {
+    kind: "quote",
+    target_post: target,
+    text,
+    send_in: sendIn,
+  });
+}
+
 export async function cancelScheduledTanPost(id: string): Promise<unknown> {
   return post("/api/tan/cancel-scheduled", { id });
 }
