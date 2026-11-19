@@ -15,6 +15,7 @@ from tau.scheduled_posts import (
     ScheduledPosts,
     ScheduledPostsError,
     cancel_scheduled_post,
+    edit_scheduled_post,
     load_scheduled_posts,
     publish_due_scheduled_posts,
     save_scheduled_posts,
@@ -169,6 +170,121 @@ def test_cancel_scheduled_post_end_to_end(tmp_path):
     assert len(load_scheduled_posts(path)) == 0
     with pytest.raises(ScheduledPostsError):
         cancel_scheduled_post(path, post.id)
+
+
+def test_edit_scheduled_post_text_and_time(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="later", publish_at=2000.0, now=1000.0, expires_in=3600.0
+    )
+    edited = edit_scheduled_post(
+        path, post.id[:8], text="much later", publish_at=3000.0, now=1000.0
+    )
+    assert edited.id == post.id
+    assert edited.text == "much later"
+    assert edited.publish_at == 3000.0
+    # Everything else rides along untouched.
+    assert edited.created_at == 1000.0
+    assert edited.expires_in == 3600.0
+    assert edited.reply_to is None
+    stored = load_scheduled_posts(path).posts[0]
+    assert stored.text == "much later" and stored.publish_at == 3000.0
+
+
+def test_edit_scheduled_post_text_only_keeps_time(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
+    edited = edit_scheduled_post(path, post.id, text="corrected", now=1000.0)
+    assert edited.text == "corrected"
+    assert edited.publish_at == 2000.0
+
+
+def test_edit_scheduled_post_time_only_keeps_text(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
+    edited = edit_scheduled_post(path, post.id, publish_at=2500.0, now=1000.0)
+    assert edited.text == "later"
+    assert edited.publish_at == 2500.0
+
+
+def test_edit_scheduled_post_requires_a_change(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
+    with pytest.raises(ScheduledPostsError, match="nothing to change"):
+        edit_scheduled_post(path, post.id, now=1000.0)
+    assert load_scheduled_posts(path).posts[0].text == "later"
+
+
+def test_edit_scheduled_post_rejects_unknown_and_ambiguous(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
+    with pytest.raises(ScheduledPostsError, match="no scheduled post"):
+        edit_scheduled_post(path, "zz" * 8, text="nope", now=1000.0)
+    # Two entries sharing a one-character prefix: that prefix is ambiguous.
+    save_scheduled_posts(
+        path,
+        ScheduledPosts(
+            posts=(
+                _post("aa" + "0" * 14, text="first"),
+                _post("ab" + "0" * 14, text="second"),
+            )
+        ),
+    )
+    with pytest.raises(ScheduledPostsError, match="ambiguous"):
+        edit_scheduled_post(path, "a", text="nope", now=1000.0)
+    assert post.id not in {p.id for p in load_scheduled_posts(path).posts}
+
+
+def test_edit_scheduled_post_refuses_already_created(tmp_path):
+    # A publish attempt already stored the signed post: the text is
+    # signed, so changing it would orphan the stored copy.  Cancel
+    # instead — the entry stays exactly as it was.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
+    queue = load_scheduled_posts(path)
+    stored = queue.posts[0]
+    save_scheduled_posts(
+        path,
+        queue.with_replaced(
+            ScheduledPost(**{**stored.to_dict(), "post_hash": "a" * 64})
+        ),
+    )
+    with pytest.raises(ScheduledPostsError, match="already created"):
+        edit_scheduled_post(path, post.id, text="too late", now=1000.0)
+    assert load_scheduled_posts(path).posts[0].text == "later"
+
+
+def test_edit_scheduled_post_validates_new_text(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
+    with pytest.raises(ScheduledPostsError):
+        edit_scheduled_post(path, post.id, text="   ", now=1000.0)
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        edit_scheduled_post(path, post.id, text="😀" * 2000, now=1000.0)
+    # Nothing saved by the refused edits.
+    assert load_scheduled_posts(path).posts[0].text == "later"
+
+
+def test_edit_scheduled_post_validates_new_time(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
+    with pytest.raises(ScheduledPostsError, match="in the future"):
+        edit_scheduled_post(path, post.id, publish_at=1000.0, now=1000.0)
+    with pytest.raises(ScheduledPostsError, match="within 7d"):
+        edit_scheduled_post(
+            path, post.id, publish_at=1000.0 + 7 * 86400 + 1, now=1000.0
+        )
+    assert load_scheduled_posts(path).posts[0].publish_at == 2000.0
+
+
+def test_edit_scheduled_post_refuses_time_past_expiry(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="later", publish_at=2000.0, now=1000.0, expires_in=3600.0
+    )
+    with pytest.raises(ScheduledPostsError, match="expire before it is published"):
+        edit_scheduled_post(path, post.id, publish_at=1000.0 + 3600.0, now=1000.0)
+    assert load_scheduled_posts(path).posts[0].publish_at == 2000.0
 
 
 class _FakeTanApp:
@@ -754,6 +870,46 @@ def test_cli_schedule_list_cancel(tmp_path, capsys):
     post_id = queue.posts[0].id
     assert _run_cli(data_dir, ["tan", "cancel-scheduled", post_id[:8]]) == 0
     assert len(load_scheduled_posts(data_dir / "scheduled-posts.json")) == 0
+
+
+def test_cli_edit_scheduled(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["tan", "post", "--delay", "5m", "good morning"]) == 0
+    queue = load_scheduled_posts(data_dir / "scheduled-posts.json")
+    post_id = queue.posts[0].id
+
+    assert (
+        _run_cli(
+            data_dir,
+            ["tan", "edit-scheduled", post_id[:8], "--text", "good morning!"],
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "edited" in out and "good morning!" in out
+    queue = load_scheduled_posts(data_dir / "scheduled-posts.json")
+    assert queue.posts[0].text == "good morning!"
+    first_publish_at = queue.posts[0].publish_at
+
+    assert (
+        _run_cli(data_dir, ["tan", "edit-scheduled", post_id, "--delay", "2h"])
+        == 0
+    )
+    queue = load_scheduled_posts(data_dir / "scheduled-posts.json")
+    assert queue.posts[0].text == "good morning!"
+    assert queue.posts[0].publish_at > first_publish_at
+
+    # Nothing to change, an unknown id, and an over-cap delay are errors.
+    assert _run_cli(data_dir, ["tan", "edit-scheduled", post_id]) == 2
+    assert (
+        _run_cli(data_dir, ["tan", "edit-scheduled", "zz" * 8, "--text", "nope"])
+        == 1
+    )
+    assert (
+        _run_cli(data_dir, ["tan", "edit-scheduled", post_id, "--delay", "30d"])
+        == 2
+    )
+    assert len(load_scheduled_posts(data_dir / "scheduled-posts.json")) == 1
 
 
 def test_cli_schedule_rejects_bad_delay_and_no_publish(tmp_path):

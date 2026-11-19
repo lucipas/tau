@@ -35,9 +35,23 @@ function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): Tan
 
 let calls: string[] = [];
 let timeline: TanPost[] = [];
+let scheduled: {
+  id: string;
+  text: string;
+  reply_to: string | null;
+  to: string[];
+  ttl: number;
+  publish_at: number;
+  created_at: number;
+  post_hash: string | null;
+  attempts: number;
+  next_attempt_at: number | null;
+  paused_at: number | null;
+}[] = [];
 
 beforeEach(() => {
   timeline = [makePost("h1".padEnd(64, "0"), "hello #mesh @bob")];
+  scheduled = [];
   const router = mockFetch((url) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
@@ -48,7 +62,8 @@ beforeEach(() => {
     if (url.includes("/api/tan/saved")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/hidden")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/pinned")) return { posts: [], count: 0, next_offset: null };
-    if (url.includes("/api/tan/scheduled")) return { scheduled: [], count: 0 };
+    if (url.includes("/api/tan/scheduled"))
+      return { scheduled, count: scheduled.length };
     if (url.includes("/api/tan/muted-keywords")) return { muted_keywords: [], count: 0 };
     if (url.includes("/api/tan/muted-tags")) return { muted_tags: [], count: 0 };
     if (url.includes("/api/tan/muted")) return { muted: [], count: 0 };
@@ -162,5 +177,63 @@ describe("SocialSection", () => {
       expect(calls).toContain("GET /api/tan/search?q=mesh&limit=30"),
     );
     expect(await screen.findByText(/1 result for/)).toBeTruthy();
+  });
+
+  it("edits a scheduled post's text from the Scheduled tab", async () => {
+    scheduled = [
+      {
+        id: "ab12cd34ef56ab12",
+        text: "hello later",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("hello later")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Edit scheduled post"), {
+      target: { value: "hello sooner" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/tan/edit-scheduled"),
+    );
+  });
+
+  it("saving an unchanged scheduled post makes no request", async () => {
+    scheduled = [
+      {
+        id: "ab12cd34ef56ab12",
+        text: "hello later",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("hello later")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Edit scheduled post")).toBeNull(),
+    );
+    expect(calls).not.toContain("POST /api/tan/edit-scheduled");
   });
 });

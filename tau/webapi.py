@@ -175,6 +175,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/schedule schedule a Tan post for later
     GET  /api/tan/scheduled queued Tan posts, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
+    POST /api/tan/edit-scheduled edit a queued Tan post's text/time
     POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
@@ -3581,6 +3582,35 @@ class WebBridge:
             on_cancel=_delete_stored,
         )
         return {"cancelled": post.to_dict(), "deleted_local": deleted_local}
+
+    def tan_edit_scheduled_post(
+        self,
+        target: str,
+        *,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or publish time of a queued Tan post.
+
+        Like :meth:`tan_schedule_post`: only the queue entry is
+        touched, so no attached Tan app is needed.  A *send_in* counts
+        from now, the same way the console's Send-later picker does.
+        """
+        from .scheduled_posts import edit_scheduled_post
+
+        publish_at = None
+        if send_in is not None:
+            publish_at = time.time() + float(send_in)
+        post = edit_scheduled_post(
+            self.node.config.scheduled_posts_path,
+            target,
+            text=text,
+            publish_at=publish_at,
+            # Validate against the name the serving app publishes with
+            # (node.name, refreshed at startup), not the configured name.
+            name=getattr(self.node, "name", None),
+        )
+        return post.to_dict()
 
     def tan_react(self, target: str, *, liked: bool) -> Dict[str, Any]:
         app = self._tan_app()
@@ -13956,6 +13986,69 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/tan/edit-scheduled":
+                target = body.get("id") or body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if text is not None and (
+                    not isinstance(text, str) or not text.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'text' must be non-empty"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                send_in = body.get("send_in")
+                if send_in is not None and (
+                    not isinstance(send_in, (int, float))
+                    or isinstance(send_in, bool)
+                    or not _valid_schedule_in(send_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'send_in' must be a number of "
+                                "seconds (0 < send_in <= 604800)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                if text is None and send_in is None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'text' and/or 'send_in' is required"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    scheduled = self.bridge.tan_edit_scheduled_post(
+                        target.strip(),
+                        text=text,
+                        send_in=(
+                            float(send_in) if send_in is not None else None
+                        ),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "scheduled": scheduled}, head_only)
                 return
             if path == "/api/tan/quote":
                 target = body.get("target") or body.get("hash")

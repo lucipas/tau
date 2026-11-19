@@ -1053,6 +1053,21 @@ export async function cancelScheduledTanPost(id: string): Promise<unknown> {
   return post("/api/tan/cancel-scheduled", { id });
 }
 
+export async function editScheduledTanPost(
+  id: string,
+  opts: { text?: string; sendIn?: number },
+): Promise<ScheduledTanPost> {
+  const data = await post<{ ok: boolean; scheduled: ScheduledTanPost }>(
+    "/api/tan/edit-scheduled",
+    {
+      id,
+      text: opts.text,
+      send_in: opts.sendIn,
+    },
+  );
+  return data.scheduled;
+}
+
 export async function quoteTanPost(target: string, text: string): Promise<TanPost> {
   return post("/api/tan/quote", { target, text });
 }

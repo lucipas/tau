@@ -3151,6 +3151,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_cancel_scheduled.set_defaults(func=cmd_tan_cancel_scheduled)
 
+    tan_edit_scheduled = tan_sub.add_parser(
+        "edit-scheduled",
+        parents=[common],
+        help="change the text and/or publish time of a queued Tan post",
+    )
+    tan_edit_scheduled.add_argument(
+        "target", metavar="ID", help="scheduled post id or unique id prefix"
+    )
+    tan_edit_scheduled.add_argument(
+        "--text", default=None, help="replacement text for the queued post"
+    )
+    tan_edit_scheduled.add_argument(
+        "--delay",
+        default=None,
+        help="publish this far from now, like 30m or 2h (at most 7d)",
+    )
+    tan_edit_scheduled.set_defaults(func=cmd_tan_edit_scheduled)
+
     tan_quote = tan_sub.add_parser(
         "quote",
         parents=[common],
@@ -6545,6 +6563,48 @@ def cmd_tan_cancel_scheduled(args: argparse.Namespace) -> int:
         print(f"cancelled {post.id} — it will not be published")
         if deleted_local:
             print("  also removed the stored post from the local feed")
+    return _EXIT_OK
+
+
+def cmd_tan_edit_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    if getattr(args, "text", None) is None and getattr(args, "delay", None) is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    publish_at = None
+    if getattr(args, "delay", None) is not None:
+        try:
+            delay = _parse_duration(
+                args.delay,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_POST_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        publish_at = time.time() + delay
+    from .scheduled_posts import edit_scheduled_post
+
+    try:
+        post = edit_scheduled_post(
+            config.scheduled_posts_path,
+            args.target,
+            text=getattr(args, "text", None),
+            publish_at=publish_at,
+            name=config.name,
+        )
+    except ScheduledPostsError as exc:
+        raise NodeError(str(exc)) from exc
+    if json_output:
+        _emit({"edited": post.to_dict()}, True)
+    else:
+        print(f"edited {post.id} — publishes {_stamp(post.publish_at)}")
+        for line in post.text.splitlines() or [""]:
+            print(f"  {line}")
     return _EXIT_OK
 
 

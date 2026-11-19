@@ -13200,6 +13200,111 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
         bridge.stop()
 
 
+def test_tan_edit_scheduled_post_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.scheduled_posts import (
+        ScheduledPost,
+        load_scheduled_posts,
+        new_scheduled_post_id,
+        save_scheduled_posts,
+    )
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"text": "hello later", "send_in": 3600},
+        )
+        assert status == 200
+        entry = payload["scheduled"]
+
+        # Text and time change together; the id stays the same.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit-scheduled",
+            method="POST",
+            body={"id": entry["id"][:8], "text": "hello sooner", "send_in": 60},
+        )
+        assert status == 200
+        assert payload["scheduled"]["id"] == entry["id"]
+        assert payload["scheduled"]["text"] == "hello sooner"
+        assert abs(payload["scheduled"]["publish_at"] - (time.time() + 60)) < 5
+
+        # Text-only and time-only edits leave the other half alone.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit-scheduled",
+            method="POST",
+            body={"id": entry["id"], "text": "final wording"},
+        )
+        assert status == 200
+        assert payload["scheduled"]["text"] == "final wording"
+        first_publish_at = payload["scheduled"]["publish_at"]
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit-scheduled",
+            method="POST",
+            body={"id": entry["id"], "send_in": 7200},
+        )
+        assert status == 200
+        assert payload["scheduled"]["text"] == "final wording"
+        assert payload["scheduled"]["publish_at"] > first_publish_at
+
+        # Bad requests: missing id, neither field, bad send_in, unknown id.
+        for body, fragment in [
+            ({"text": "x", "send_in": 60}, "id"),
+            ({"id": entry["id"]}, "text"),
+            ({"id": entry["id"], "text": "  "}, "text"),
+            ({"id": entry["id"], "send_in": 0}, "send_in"),
+            ({"id": entry["id"], "send_in": 604801}, "send_in"),
+            ({"id": "zz" * 8, "text": "x"}, "no scheduled post"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/edit-scheduled", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+
+        # An entry whose publish already stored the signed post cannot
+        # be edited — cancel it instead.
+        queue = load_scheduled_posts(node.config.scheduled_posts_path)
+        created = ScheduledPost(
+            id=new_scheduled_post_id(),
+            text="already stored",
+            publish_at=time.time() + 3600,
+            created_at=time.time(),
+            post_hash="b" * 64,
+        )
+        save_scheduled_posts(
+            node.config.scheduled_posts_path, queue.with_added(created)
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit-scheduled",
+            method="POST",
+            body={"id": created.id, "text": "too late"},
+        )
+        assert status == 400
+        assert "already created" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_cancel_scheduled_post_removes_stored_post(tmp_path):
     import RNS
 

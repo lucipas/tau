@@ -459,6 +459,92 @@ def cancel_scheduled_post(
     return post
 
 
+def edit_scheduled_post(
+    path: Union[str, Path],
+    prefix: str,
+    *,
+    text: Optional[str] = None,
+    publish_at: Optional[float] = None,
+    name: Optional[str] = None,
+    now: Optional[float] = None,
+) -> ScheduledPost:
+    """Change the text and/or publish time of one queued post.
+
+    At least one of *text* / *publish_at* must be given.  The new text
+    gets the same validation as scheduling does (``normalize_message``
+    plus the wire-size preflight against the entry's reply target and
+    expiry), so an edit cannot queue a post that could never be
+    published.  A new publish time must be in the future, within the
+    7-day queue cap, and — when the entry expires — sooner than the
+    expiry, or the post would expire before it goes out.
+
+    An entry whose publish already created the signed post (it has a
+    stored ``post_hash``) cannot be edited: the text is already signed,
+    so changing it would orphan the stored copy.  Cancel it instead.
+    Everything else about the entry — reply target, audience, TTL,
+    expiry, retry state — is left untouched.
+    """
+    if text is None and publish_at is None:
+        raise ScheduledPostsError(
+            "nothing to change — pass a new text and/or a new publish time"
+        )
+    at = now if now is not None else time.time()
+    clean_text: Optional[str] = None
+    if text is not None:
+        try:
+            clean_text = normalize_message(text)
+        except ProtocolError as exc:
+            raise ScheduledPostsError(str(exc)) from exc
+    clean_publish_at: Optional[float] = None
+    if publish_at is not None:
+        clean_publish_at = _clean_timestamp(publish_at, "publish_at")
+        if clean_publish_at <= at:
+            raise ScheduledPostsError("publish time must be in the future")
+        if clean_publish_at - at > MAX_SCHEDULED_POST_DELAY:
+            raise ScheduledPostsError(
+                "publish time must be within 7d (the scheduled-post delay cap)"
+            )
+    with scheduled_posts_lock(path):
+        queue = load_scheduled_posts(path)
+        post = queue.resolve(prefix)
+        if post.post_hash is not None:
+            raise ScheduledPostsError(
+                "that post was already created — cancel it instead of editing it"
+            )
+        if clean_text is not None:
+            # Lazy import: this module stays importable without
+            # Reticulum, which ``tau.backup`` relies on.
+            from .tangents.tan import PostError, check_post_text_fits
+
+            try:
+                check_post_text_fits(
+                    clean_text,
+                    name=name,
+                    reply_to=post.reply_to,
+                    expires=post.expires_in > 0,
+                )
+            except PostError as exc:
+                raise ScheduledPostsError(str(exc)) from exc
+        if (
+            clean_publish_at is not None
+            and post.expires_in > 0
+            and clean_publish_at - at >= post.expires_in
+        ):
+            raise ScheduledPostsError(
+                "publish time must be sooner than the post's expiry — "
+                "the post would expire before it is published"
+            )
+        edited = replace(
+            post,
+            text=clean_text if clean_text is not None else post.text,
+            publish_at=(
+                clean_publish_at if clean_publish_at is not None else post.publish_at
+            ),
+        )
+        save_scheduled_posts(path, queue.with_replaced(edited))
+    return edited
+
+
 class _PassPaused(Exception):
     """Internal: the publish pass ends early — node stopping, or the
     pass budget elapsed.  Raised instead of recording a publish

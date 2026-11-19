@@ -267,6 +267,8 @@ tau tan post --to alice "direct delivery"
 # Schedule a post for the morning crowd (publishes while serving with --social)
 tau tan post --delay 8h "good morning, mesh"
 tau tan scheduled
+# Fix a typo or move a queued post: at least one of --text / --delay is required
+tau tan edit-scheduled ab12cd34 --text "good morning, mesh!" --delay 2h
 
 # Show every cached post, or one author's chain
 tau tan timeline --all
@@ -400,6 +402,7 @@ Global options may appear before or after the command:
 | `tau tan post --delay 5m TEXT` | Queue a post to publish in 5 minutes (needs `tau serve --social` running) |
 | `tau tan scheduled` | List Tan posts queued for later publishing |
 | `tau tan cancel-scheduled ID` | Drop a queued Tan post before it publishes |
+| `tau tan edit-scheduled ID [--text TEXT] [--delay DURATION]` | Change a queued post's text and/or publish time |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan poll TEXT --option A --option B` | Ask a question with options (signed poll entry on your chain) |
