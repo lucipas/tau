@@ -747,16 +747,29 @@ function ScheduledView({
   return (
     <div>
       <h2 className="border-b border-zinc-800 px-4 py-3 text-sm font-bold text-zinc-100">
-        Scheduled posts
+        Scheduled posts, reposts and quotes
       </h2>
       {scheduled.length === 0 && (
         <p className="px-4 py-6 text-sm text-zinc-500">
-          Nothing scheduled — pick “Send later” in the composer to queue a post.
+          Nothing scheduled — pick “Send later” in the composer to queue a
+          post, or schedule a repost from a post’s ⋯ menu.
         </p>
       )}
       {scheduled.map((s) => (
         <div key={s.id} className="border-b border-zinc-800 px-4 py-3">
-          <p className="text-sm whitespace-pre-wrap text-zinc-200">{s.text}</p>
+          {s.kind === "repost" && (
+            <p className="text-xs font-semibold text-emerald-400">
+              Repost · {shortHash(s.target_post ?? "")}
+            </p>
+          )}
+          {s.kind === "quote" && (
+            <p className="text-xs font-semibold text-cyan-400">
+              Quote · {shortHash(s.target_post ?? "")}
+            </p>
+          )}
+          {s.text ? (
+            <p className="text-sm whitespace-pre-wrap text-zinc-200">{s.text}</p>
+          ) : null}
           <p className="mt-1 text-xs text-zinc-500">
             Publishes {formatDateTime(s.publish_at)}
             {s.paused_at ? " · paused" : ""}
@@ -767,7 +780,12 @@ function ScheduledView({
             onClick={() => void onCancel(s.id)}
             className="mt-2 rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
           >
-            Cancel scheduled post
+            Cancel scheduled{" "}
+            {s.kind === "repost"
+              ? "repost"
+              : s.kind === "quote"
+                ? "quote"
+                : "post"}
           </button>
         </div>
       ))}

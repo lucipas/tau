@@ -54,6 +54,8 @@ import {
   repostTanPost,
   saveTanPost,
   scheduleTanPost,
+  scheduleTanQuote,
+  scheduleTanRepost,
   searchTan,
   shareTanPost,
   unfollowTanAuthor,
@@ -95,6 +97,12 @@ export interface UseTanFeedResult {
   unlike: (target: string) => Promise<void>;
   repost: (target: string) => Promise<void>;
   quote: (target: string, text: string) => Promise<TanPost>;
+  scheduleRepost: (target: string, sendIn: number) => Promise<void>;
+  scheduleQuote: (
+    target: string,
+    text: string,
+    sendIn: number,
+  ) => Promise<ScheduledTanPost>;
   vote: (target: string, option: number) => Promise<void>;
   share: (target: string, dest: { to: string } | { group: string }) => Promise<void>;
   save: (target: string) => Promise<void>;
@@ -170,6 +178,13 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
       const post = await quoteTanPost(target, text);
       await load();
       return post;
+    },
+    scheduleRepost: (target, sendIn) =>
+      mutate(() => scheduleTanRepost(target, sendIn)),
+    scheduleQuote: async (target, text, sendIn) => {
+      const scheduled = await scheduleTanQuote(target, text, sendIn);
+      await load();
+      return scheduled;
     },
     vote: (target, option) => mutate(() => voteTanPoll(target, option)),
     share: (target, dest) => mutate(() => shareTanPost(target, dest)),

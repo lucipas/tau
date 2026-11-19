@@ -19,6 +19,8 @@ from tau.scheduled_posts import (
     publish_due_scheduled_posts,
     save_scheduled_posts,
     schedule_post,
+    schedule_quote,
+    schedule_repost,
 )
 
 
@@ -160,6 +162,98 @@ def test_schedule_post_accepts_long_text_that_fits(tmp_path):
     assert load_scheduled_posts(path).posts[0].id == post.id
 
 
+def test_schedule_repost_and_quote_round_trip(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    repost = schedule_repost(
+        path, target_post="d" * 64, publish_at=2000.0, now=1000.0
+    )
+    quote = schedule_quote(
+        path,
+        target_post="e" * 64,
+        text="this, tomorrow",
+        publish_at=3000.0,
+        now=1000.0,
+    )
+    queue = load_scheduled_posts(path)
+    assert len(queue) == 2
+    assert queue.posts[0] == repost
+    assert repost.kind == "repost"
+    assert repost.text == ""
+    assert repost.target_post == "d" * 64
+    assert queue.posts[1] == quote
+    assert quote.kind == "quote"
+    assert quote.text == "this, tomorrow"
+    assert quote.target_post == "e" * 64
+
+
+def test_old_queue_file_without_kind_loads_as_post(tmp_path):
+    # Queue files written before kinds existed carry no kind or
+    # target_post: they load as plain posts, exactly as before.
+    path = tmp_path / "scheduled-posts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "posts": [
+                    {
+                        "id": "a" * 16,
+                        "text": "hi",
+                        "publish_at": 1000.0,
+                        "created_at": 900.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    queue = load_scheduled_posts(path)
+    assert queue.posts[0].kind == "post"
+    assert queue.posts[0].target_post is None
+
+
+def test_schedule_repost_and_quote_validation(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    # A repost carries no text, no reply target, no expiry — and it
+    # must name the post it amplifies.
+    with pytest.raises(ScheduledPostsError, match="carries no text"):
+        schedule_post(path, text="nope", publish_at=1000.0, kind="repost",
+                      target_post="d" * 64)
+    with pytest.raises(ScheduledPostsError, match="needs a target post"):
+        schedule_post(path, text="", publish_at=1000.0, kind="repost")
+    with pytest.raises(ScheduledPostsError, match="cannot be a reply"):
+        schedule_post(path, text="", publish_at=1000.0, kind="repost",
+                      target_post="d" * 64, reply_to="b" * 64)
+    with pytest.raises(ScheduledPostsError, match="cannot expire"):
+        schedule_post(path, text="", publish_at=1000.0, kind="repost",
+                      target_post="d" * 64, expires_in=60.0)
+    # A quote needs its target too, and a plain post cannot carry one.
+    with pytest.raises(ScheduledPostsError, match="needs a target post"):
+        schedule_post(path, text="hi", publish_at=1000.0, kind="quote")
+    with pytest.raises(ScheduledPostsError, match="cannot carry a target post"):
+        schedule_post(path, text="hi", publish_at=1000.0, target_post="d" * 64)
+    with pytest.raises(ScheduledPostsError, match="not a scheduled entry kind"):
+        schedule_post(path, text="hi", publish_at=1000.0, kind="poll")
+    # The dataclass enforces the same rules for hand-built entries.
+    with pytest.raises(ScheduledPostsError, match="carries no text"):
+        _post(kind="repost", text="nope", target_post="d" * 64)
+    with pytest.raises(ScheduledPostsError, match="needs a target post"):
+        _post(kind="quote", target_post=None)
+    assert _post(kind="repost", text="", target_post="d" * 64).kind == "repost"
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_quote_rejects_comment_that_only_fits_without_a_target(tmp_path):
+    # 1,880 four-byte characters fit a plain post, but a quote carries
+    # its target hash in the envelope too: refuse at schedule time
+    # instead of failing every publish attempt forever.
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        schedule_quote(
+            path, target_post="d" * 64, text="😀" * 1880,
+            publish_at=1000.0, now=900.0,
+        )
+    assert load_scheduled_posts(path).posts == ()
+
+
 def test_cancel_scheduled_post_end_to_end(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
@@ -174,10 +268,13 @@ def test_cancel_scheduled_post_end_to_end(tmp_path):
 class _FakeTanApp:
     """TanApp stand-in: records creates and publishes, delivers to nobody."""
 
-    def __init__(self, fail_publish: bool = False):
+    def __init__(self, fail_publish: bool = False, fail_repost: bool = False):
         self.created = []
+        self.reposted = []
+        self.quoted = []
         self.published = []
         self.fail_publish = fail_publish
+        self.fail_repost = fail_repost
 
     def create_post(self, text, *, reply_to=None, expires_at=None):
         post = {
@@ -189,8 +286,25 @@ class _FakeTanApp:
         self.created.append(post)
         return post
 
+    def repost(self, target):
+        if self.fail_repost:
+            raise RuntimeError("post has been deleted")
+        record = {"hash": "a" * 64, "kind": "repost", "target": target}
+        self.reposted.append(record)
+        return record
+
+    def quote(self, target, text):
+        record = {
+            "hash": "b" * 64,
+            "kind": "quote",
+            "target": target,
+            "text": text,
+        }
+        self.quoted.append(record)
+        return record
+
     def get_post(self, digest):
-        for post in self.created:
+        for post in (*self.created, *self.reposted, *self.quoted):
             if post["hash"] == digest:
                 return post
         return None
@@ -218,6 +332,67 @@ def test_publish_due_publishes_and_removes_only_due(tmp_path):
     queue = load_scheduled_posts(path)
     assert all(post.id != due.id for post in queue.posts)
     assert len(queue) == 1
+
+
+def test_publish_due_publishes_scheduled_repost_and_quote(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    repost = schedule_repost(
+        path, target_post="d" * 64, publish_at=1000.0, now=900.0
+    )
+    quote = schedule_quote(
+        path, target_post="e" * 64, text="this, tomorrow",
+        publish_at=1000.0, now=900.0,
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 2, "kept": 0}
+    assert [record["target"] for record in app.reposted] == ["d" * 64]
+    assert [(record["target"], record["text"]) for record in app.quoted] == [
+        ("e" * 64, "this, tomorrow")
+    ]
+    # Both went out through the same publish path as a post.
+    assert len(app.published) == 2
+    assert app.published[0][0]["hash"] == "a" * 64
+    assert app.published[1][0]["hash"] == "b" * 64
+    assert load_scheduled_posts(path).posts == ()
+    # The stored records are the ones that went out.
+    assert app.published[0][0] is app.reposted[0]
+    assert app.published[1][0] is app.quoted[0]
+    assert repost.id != quote.id
+
+
+def test_publish_due_keeps_failed_repost_queued(tmp_path):
+    # A repost whose target is gone by publish time (deleted, or
+    # already reposted) fails the target checks: it stays queued with
+    # backoff like any other failed publish, never dropped silently.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_repost(path, target_post="d" * 64, publish_at=1000.0, now=900.0)
+    app = _FakeTanApp(fail_repost=True)
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+    queue = load_scheduled_posts(path)
+    assert len(queue) == 1
+    assert queue.posts[0].attempts == 1
+    assert app.published == []
+
+
+def test_publish_due_repost_retry_resends_same_record(tmp_path):
+    # A publish failure after the repost was created must not sign a
+    # second repost on retry: the stored record is re-sent instead.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_repost(path, target_post="d" * 64, publish_at=1000.0, now=900.0)
+    app = _FakeTanApp(fail_publish=True)
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+    assert len(app.reposted) == 1
+    app.fail_publish = False
+    result = publish_due_scheduled_posts(path, app, now=10000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.reposted) == 1
+    assert load_scheduled_posts(path).posts == ()
 
 
 def test_publish_due_keeps_failed_posts_queued(tmp_path):
@@ -770,7 +945,7 @@ def test_cli_schedule_rejects_bad_delay_and_no_publish(tmp_path):
 def test_cli_scheduled_empty_and_cancel_unknown(tmp_path, capsys):
     data_dir = tmp_path / "node"
     assert _run_cli(data_dir, ["tan", "scheduled"]) == 0
-    assert "No Tan posts scheduled." in capsys.readouterr().out
+    assert "No Tan posts, reposts or quotes scheduled." in capsys.readouterr().out
     assert _run_cli(data_dir, ["tan", "cancel-scheduled", "abcd"]) == 1
 
 
@@ -784,6 +959,75 @@ def test_cli_schedule_json_output(tmp_path, capsys):
     )
     payload = json.loads(capsys.readouterr().out)
     assert payload["scheduled"]["text"] == "hello json"
+
+
+def _seed_post(data_dir: Path) -> str:
+    """Store one post from another author; returns its hash."""
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    config = TauConfig.resolve(data_dir=data_dir)
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(conn, RNS.Identity(), "worth resharing", name="alice", now=1000)
+    finally:
+        conn.close()
+    return post["hash"]
+
+
+def test_cli_schedule_repost_and_quote(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    target = _seed_post(data_dir)
+    assert (
+        _run_cli(data_dir, ["tan", "repost", target[:12], "--delay", "5m"]) == 0
+    )
+    out = capsys.readouterr().out
+    assert "scheduled" in out and "reposts" in out and "in 5m" in out
+    assert (
+        _run_cli(
+            data_dir,
+            ["tan", "quote", target[:12], "my take", "--delay", "5m"],
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "scheduled" in out and "quotes" in out and "in 5m" in out
+
+    assert _run_cli(data_dir, ["tan", "scheduled"]) == 0
+    listed = capsys.readouterr().out
+    assert "repost of" in listed
+    assert "quote of" in listed
+    assert "my take" in listed
+
+    queue = load_scheduled_posts(data_dir / "scheduled-posts.json")
+    assert len(queue) == 2
+    assert [post.kind for post in queue.posts] == ["repost", "quote"]
+    assert all(post.target_post == target for post in queue.posts)
+
+
+def test_cli_schedule_repost_and_quote_reject_bad_delay(tmp_path):
+    data_dir = tmp_path / "node"
+    target = _seed_post(data_dir)
+    assert _run_cli(data_dir, ["tan", "repost", target[:12], "--delay", "soon"]) == 2
+    assert (
+        _run_cli(
+            data_dir,
+            ["tan", "repost", target[:12], "--delay", "5m", "--no-publish"],
+        )
+        == 2
+    )
+    assert (
+        _run_cli(
+            data_dir,
+            ["tan", "quote", target[:12], "x", "--delay", "5m", "--no-publish"],
+        )
+        == 2
+    )
+    # An unknown target is refused fast, before anything is queued.
+    assert _run_cli(data_dir, ["tan", "repost", "f" * 12, "--delay", "5m"]) == 1
+    assert len(load_scheduled_posts(data_dir / "scheduled-posts.json")) == 0
 
 
 def test_cancel_removes_stored_post_after_failed_publish(tmp_path, capsys):

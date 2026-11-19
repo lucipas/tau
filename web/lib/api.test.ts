@@ -40,6 +40,8 @@ import {
   closeDmPoll,
   sendBroadcast,
   scheduleChannelMessage,
+  scheduleTanQuote,
+  scheduleTanRepost,
   searchChannelMessages,
   sendChannelMessage,
   sendMessage,
@@ -304,6 +306,26 @@ describe("POST endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/schedule");
     expect(captured[0].init?.method).toBe("POST");
     expect(bodyOf(0)).toEqual({ channel: "general", text: "later", send_in: 300 });
+  });
+
+  it("schedules a Tan repost or quote with kind and target_post", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleTanRepost("d".repeat(64), 3600);
+    expect(captured[0].url).toBe("/api/tan/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      kind: "repost",
+      target_post: "d".repeat(64),
+      send_in: 3600,
+    });
+    await scheduleTanQuote("e".repeat(64), "my take", 300);
+    expect(captured[1].url).toBe("/api/tan/schedule");
+    expect(bodyOf(1)).toEqual({
+      kind: "quote",
+      target_post: "e".repeat(64),
+      text: "my take",
+      send_in: 300,
+    });
   });
 
   it("cancels a scheduled channel message by id", async () => {

@@ -685,6 +685,10 @@ export interface ScheduledTanPost {
   next_attempt_at: number | null;
   paused_at: number | null;
   expires_in?: number;
+  /** "post" for a queued post, "repost" for a queued repost, "quote" for a queued quote. */
+  kind?: "post" | "repost" | "quote";
+  /** Hash of the post being reposted or quoted; only present for those kinds. */
+  target_post?: string | null;
   [key: string]: unknown;
 }
 

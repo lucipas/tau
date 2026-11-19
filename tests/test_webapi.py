@@ -13002,6 +13002,111 @@ def test_tan_schedule_post_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_schedule_repost_and_quote_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A repost carries no text: the target resolves to its full hash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"kind": "repost", "target_post": post["hash"][:16], "send_in": 3600},
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "repost"
+        assert scheduled["text"] == ""
+        assert scheduled["target_post"] == post["hash"]
+        assert abs(scheduled["publish_at"] - (time.time() + 3600)) < 5
+
+        # A quote carries its comment as the text.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "kind": "quote",
+                "target_post": post["hash"],
+                "text": "my take",
+                "send_in": 60,
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "quote"
+        assert scheduled["text"] == "my take"
+        assert scheduled["target_post"] == post["hash"]
+
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload["count"] == 2
+        assert [item["kind"] for item in payload["scheduled"]] == [
+            "quote",
+            "repost",
+        ]
+
+        # Bad repost/quote requests are 400s and queue nothing.
+        for body, fragment in [
+            ({"kind": "repost", "send_in": 60}, "target_post"),
+            ({"kind": "quote", "send_in": 60}, "target_post"),
+            (
+                {"kind": "quote", "target_post": post["hash"], "send_in": 60},
+                "text",
+            ),
+            (
+                {"kind": "poll", "target_post": post["hash"], "send_in": 60},
+                "kind",
+            ),
+            (
+                {
+                    "kind": "repost",
+                    "target_post": post["hash"],
+                    "send_in": 60,
+                    "reply_to": post["hash"],
+                },
+                "reply",
+            ),
+            (
+                {
+                    "kind": "quote",
+                    "target_post": post["hash"],
+                    "text": "x",
+                    "send_in": 60,
+                    "expires_in": 3600,
+                },
+                "expire",
+            ),
+            (
+                {"kind": "repost", "target_post": "cd" * 32, "send_in": 60},
+                "unknown post",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/schedule", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert payload["count"] == 2
+    finally:
+        bridge.stop()
+
+
 def test_tan_schedule_post_rejects_bad_requests(tmp_path):
     import RNS
 
