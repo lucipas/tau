@@ -30,6 +30,7 @@ import {
 import type { ChatMessage } from "@/lib/types";
 import {
   buildConversations,
+  useBeacons,
   useConversations,
   useOutbox,
   usePeerActions,
@@ -37,6 +38,7 @@ import {
 } from "@/lib/use-tau";
 import { useHash } from "../chrome/useHash";
 import { useTauContext } from "../chrome/TauContext";
+import BeaconControl from "./BeaconControl";
 import ConversationList from "./ConversationList";
 import OutboxPanel from "./OutboxPanel";
 import ThreadView from "./ThreadView";
@@ -86,6 +88,7 @@ export default function ChatSection() {
   const { peer: selectedPeer, group: selectedGroup, navigate } = useHash();
   const actions = usePeerActions();
   const outbox = useOutbox();
+  const beacons = useBeacons();
 
   const [mutedPeers, setMutedPeers] = useState<Set<string>>(new Set());
   const [mutedGroups, setMutedGroups] = useState<Set<string>>(new Set());
@@ -358,33 +361,43 @@ export default function ChatSection() {
           </p>
         )}
         {selected ? (
-          <ThreadView
-            conversation={selected}
-            messages={tau.messages}
-            typingName={typingName}
-            replyTo={replyTo}
-            onReplyToChange={setReplyTo}
-            editing={editing}
-            onEditingChange={setEditing}
-            forwardTargets={forwardTargets}
-            onMessageAction={handleMessageAction}
-            onForward={handleForward}
-            onReact={handleReact}
-            onClearReaction={handleClearReaction}
-            onVotePoll={handleVotePoll}
-            onClosePoll={handleClosePoll}
-            onSend={handleSend}
-            onSendFile={handleSendFile}
-            onBack={handleBack}
-            onOpenPeerPanel={() => {
-              // Peer details live in the right sidebar on desktop; on mobile
-              // the People tab shows the same panel for this conversation.
-              navigate(
-                "people",
-                selected.kind === "group" ? { group: selected.key } : { peer: selected.key },
-              );
-            }}
-          />
+          <>
+            <BeaconControl
+              target={{ kind: selected.kind, key: selected.key, name: selected.name }}
+              beacons={beacons.beacons}
+              onRefresh={beacons.refresh}
+              onError={(message) => setError(message)}
+            />
+            <div className="min-h-0 flex-1">
+              <ThreadView
+                conversation={selected}
+                messages={tau.messages}
+                typingName={typingName}
+                replyTo={replyTo}
+                onReplyToChange={setReplyTo}
+                editing={editing}
+                onEditingChange={setEditing}
+                forwardTargets={forwardTargets}
+                onMessageAction={handleMessageAction}
+                onForward={handleForward}
+                onReact={handleReact}
+                onClearReaction={handleClearReaction}
+                onVotePoll={handleVotePoll}
+                onClosePoll={handleClosePoll}
+                onSend={handleSend}
+                onSendFile={handleSendFile}
+                onBack={handleBack}
+                onOpenPeerPanel={() => {
+                  // Peer details live in the right sidebar on desktop; on mobile
+                  // the People tab shows the same panel for this conversation.
+                  navigate(
+                    "people",
+                    selected.kind === "group" ? { group: selected.key } : { peer: selected.key },
+                  );
+                }}
+              />
+            </div>
+          </>
         ) : (
           <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
             <p className="text-lg font-semibold text-zinc-200">Select a conversation</p>

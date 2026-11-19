@@ -9,6 +9,7 @@ import {
   eventsUrl,
   fetchTanMedia,
   fileUrl,
+  getBeacons,
   getChannelMessages,
   getChannelPins,
   getMessages,
@@ -23,8 +24,11 @@ import {
   searchChannelMessages,
   sendChannelMessage,
   sendMessage,
+  startBeacon,
+  stopBeacon,
   tanMediaUrl,
   unpinChannelMessage,
+  updateBeaconPosition,
   voteDmPoll,
   voteTanPoll,
   wsUrl,
@@ -197,6 +201,42 @@ describe("POST endpoints", () => {
     await closeDmPoll("alice", "wire1");
     expect(captured[1].url).toBe("/api/dm/close-poll");
     expect(bodyOf(1)).toEqual({ to: "alice", poll: "wire1" });
+  });
+
+  it("lists, starts, stops and feeds beacons on the beacon routes", async () => {
+    nextJson = { beacons: [], count: 0 };
+    await getBeacons();
+    expect(captured[0].url).toBe("/api/beacons");
+
+    nextJson = { ok: true, beacon: { id: "aabbccdd" }, update: {} };
+    await startBeacon(
+      { peer: "alice" },
+      { lat: 34.05, lon: -83.88, name: "Rock Springs Park", durationSeconds: 900, coarse: true },
+    );
+    expect(captured[1].url).toBe("/api/beacons/start");
+    expect(bodyOf(1)).toEqual({
+      peer: "alice",
+      lat: 34.05,
+      lon: -83.88,
+      name: "Rock Springs Park",
+      durationSeconds: 900,
+      coarse: true,
+    });
+
+    await startBeacon({ group: "ab".repeat(16) }, { lat: 34.05, lon: -83.88 });
+    expect(captured[2].url).toBe("/api/beacons/start");
+    expect(bodyOf(2)).toEqual({ group: "ab".repeat(16), lat: 34.05, lon: -83.88 });
+
+    await stopBeacon("aabbccdd");
+    expect(captured[3].url).toBe("/api/beacons/stop");
+    expect(bodyOf(3)).toEqual({ id: "aabbccdd" });
+
+    await updateBeaconPosition("aabbccdd", 34.06, -83.87);
+    expect(captured[4].url).toBe("/api/beacons/position");
+    expect(bodyOf(4)).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87 });
+
+    await updateBeaconPosition("aabbccdd", 34.06, -83.87, "Elsewhere");
+    expect(bodyOf(5)).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87, name: "Elsewhere" });
   });
 
   it("marks read with an empty body when no conversation is given", async () => {

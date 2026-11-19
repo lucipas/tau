@@ -6,6 +6,10 @@
 //                       typing indicators, connection state, refresh().
 //   useConversations()— DM + group conversation list derived from the snapshot.
 //   useOutbox()       — queued mail (store-and-forward outbox + held mail).
+//   useBeacons()      — live beacons this node is sharing.
+//   useBeaconFeed()   — keeps active beacons fed with the browser's position
+//                       (geolocation watch, throttled); mount once, at the
+//                       shell, so sharing survives leaving the chat tab.
 //   useTraffic()      — per-peer traffic summary derived from message history.
 //                       (There is NO /api/traffic endpoint: the traffic view
 //                       is built from the same stored history /api/messages
@@ -29,6 +33,7 @@ import {
   cancelOutbox,
   dropHeldMail,
   forgetPeer,
+  getBeacons,
   getDmRequests,
   getHeldMail,
   getOutbox,
@@ -44,10 +49,12 @@ import {
   setPeerNote,
   unarchiveConversation,
   unblockPeer,
+  updateBeaconPosition,
   verifyPeer,
   wsUrl,
 } from "./api";
 import type {
+  Beacon,
   ChatMessage,
   DmRequest,
   Group,
@@ -482,6 +489,106 @@ export function useOutbox(pollMs = 15000): UseOutboxResult {
     [refresh],
   );
   return { outbox, held, loading, error, refresh, cancel, retry, dropHeld };
+}
+
+// ----------------------------------------------------------------- beacons
+
+export interface UseBeaconsResult {
+  beacons: Beacon[];
+  loading: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+}
+
+/** Live beacons this node is sharing, polled like the outbox. */
+export function useBeacons(pollMs = 15000): UseBeaconsResult {
+  const [beacons, setBeacons] = useState<Beacon[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const listed = await getBeacons();
+      setBeacons(listed.beacons ?? []);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const id = setInterval(() => void refresh(), pollMs);
+    return () => clearInterval(id);
+  }, [refresh, pollMs]);
+
+  return { beacons, loading, error, refresh };
+}
+
+/** Seconds between position feeds: the beacon tick is every 5 minutes,
+//  so a feed a minute is plenty, and it keeps the browser from
+//  hammering the bridge on every GPS fix. */
+const BEACON_FEED_MIN_INTERVAL_S = 60;
+
+/**
+ * Keep every active beacon fed with the browser's position.
+ *
+ * Mount once, at the shell: a geolocation watch per active beacon
+ * posts its fixes to the bridge (throttled), and watches are dropped
+ * when their beacon stops or expires.  Without geolocation there is
+ * nothing to feed — a beacon started from a typed position simply
+ * repeats it, like a CLI beacon with no position file.
+ */
+export function useBeaconFeed(): void {
+  const { beacons } = useBeacons();
+  const watchesRef = useRef(new Map<string, number>());
+  const lastSentRef = useRef(new Map<string, number>());
+
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !navigator.geolocation) return;
+    const active = beacons.filter((b) => b.active);
+    for (const beacon of active) {
+      if (watchesRef.current.has(beacon.id)) continue;
+      const watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          const now = Date.now() / 1000;
+          const last = lastSentRef.current.get(beacon.id) ?? 0;
+          if (now - last < BEACON_FEED_MIN_INTERVAL_S) return;
+          lastSentRef.current.set(beacon.id, now);
+          void updateBeaconPosition(
+            beacon.id,
+            pos.coords.latitude,
+            pos.coords.longitude,
+          ).catch(() => undefined);
+        },
+        () => undefined,
+        { enableHighAccuracy: false, maximumAge: 30000, timeout: 10000 },
+      );
+      watchesRef.current.set(beacon.id, watchId);
+    }
+    for (const [id, watchId] of watchesRef.current) {
+      if (!active.some((b) => b.id === id)) {
+        navigator.geolocation.clearWatch(watchId);
+        watchesRef.current.delete(id);
+        lastSentRef.current.delete(id);
+      }
+    }
+  }, [beacons]);
+
+  useEffect(
+    () => () => {
+      if (typeof navigator !== "undefined" && navigator.geolocation) {
+        for (const watchId of watchesRef.current.values()) {
+          navigator.geolocation.clearWatch(watchId);
+        }
+      }
+      watchesRef.current.clear();
+      lastSentRef.current.clear();
+    },
+    [],
+  );
 }
 
 // ----------------------------------------------------------------- traffic
