@@ -128,10 +128,12 @@ advances the cursor when you read a conversation, and the console shows an
 unread badge next to each peer and the unread total in the tab title.
 Opening a peer in the console clears its badge; read receipts to the sender
 are a separate feature and do not exist yet. A single conversation can be
-muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
-pinned to the top of the list with `tau pin-conversation --peer alice`
-(`--group NAME` pins a group, `--channel NAME` a joined channel),
-and `tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
+muted with `tau mute --peer alice` (or for a while with `--for 1h`), and a
+channel with `tau mute --channel general` — muted conversations still
+receive messages, they just never light the badge — and pinned to the top
+of the list with `tau pin-conversation --peer alice` (`--group NAME` pins
+a group, `--channel NAME` a joined channel). `tau quiet-hours set
+--start 22:00 --end 07:00` silences the whole badge
 every night instead — while the window is active every conversation counts
 as unread 0, and the counts come back when it ends. The Chat tab has a
 search box above the conversation list: it searches stored DM and group

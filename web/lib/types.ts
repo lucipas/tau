@@ -444,6 +444,7 @@ export interface AwayMessageSettings {
 export interface MutedConversations {
   peers: string[];
   groups: string[];
+  channels: string[];
 }
 
 /** One unsent message parked for a peer or a group (``tau draft save``). */
@@ -720,6 +721,8 @@ export interface Channel {
   pinned?: boolean;
   /** Messages newer than the last-read cursor; always present from /api/channels. */
   unread: number;
+  /** True when the channel is muted: its badge stays dark. */
+  muted?: boolean;
 }
 
 export interface ChannelPollTally {

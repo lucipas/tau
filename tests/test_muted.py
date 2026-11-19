@@ -19,6 +19,7 @@ from tau.muted import (
     MutedConversations,
     MutedError,
     load_muted,
+    muted_channels_for,
     muted_groups_for,
     muted_peers_for,
     save_muted,
@@ -82,6 +83,91 @@ def test_malformed_documents_raise(tmp_path):
         load_muted(path)
 
 
+def test_channel_mute_roundtrip(tmp_path):
+    path = tmp_path / "muted.json"
+    saved = save_muted(
+        path,
+        MutedConversations(channels=frozenset({"general"})),
+    )
+    assert saved == path
+    loaded = load_muted(path)
+    assert loaded.channels == frozenset({"general"})
+    assert loaded.is_muted_channel("general") is True
+    assert loaded.is_muted_channel("other") is False
+    assert loaded.is_muted_channel(None) is False
+    assert loaded.is_muted_channel("bad name!") is False
+    assert loaded.to_dict() == {
+        "peers": [],
+        "groups": [],
+        "channels": ["general"],
+    }
+
+
+def test_old_muted_file_without_channels_loads(tmp_path):
+    # Files written before channel mutes existed carry no "channels"
+    # key and load unchanged, with nothing muted.
+    path = tmp_path / "muted.json"
+    path.write_text(
+        json.dumps({"peers": [ALICE], "groups": [GROUP_ID]}), encoding="utf-8"
+    )
+    loaded = load_muted(path)
+    assert loaded.channels == frozenset()
+    assert loaded.is_muted_channel("general") is False
+
+
+def test_malformed_channel_mutes_raise(tmp_path):
+    path = tmp_path / "muted.json"
+    for document in (
+        {"peers": [], "groups": [], "channels": "not-a-list"},
+        {"peers": [], "groups": [], "channels": ["bad name!"]},
+        {"peers": [], "groups": [], "channels": ["general"], "channel_until": "soon"},
+        {
+            "peers": [],
+            "groups": [],
+            "channels": ["general"],
+            "channel_until": {"general": "soon"},
+        },
+    ):
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with pytest.raises(MutedError):
+            load_muted(path)
+
+
+def test_muting_one_kind_keeps_the_others():
+    # Every with_*/without_* rebuilds the whole object: a peer mute
+    # must not silently drop the channel mutes, and vice versa.
+    muted = MutedConversations(
+        peers=frozenset({ALICE}),
+        groups=frozenset({GROUP_ID}),
+        channels=frozenset({"general"}),
+    )
+    assert muted.with_peer(BOB).channels == frozenset({"general"})
+    assert muted.with_group("dd" * 16).channels == frozenset({"general"})
+    assert muted.without_peer(ALICE).channels == frozenset({"general"})
+    assert muted.without_group(GROUP_ID).channels == frozenset({"general"})
+    assert muted.with_channel("other").peers == frozenset({ALICE})
+    assert muted.with_channel("other").groups == frozenset({GROUP_ID})
+    assert muted.without_channel("general").peers == frozenset({ALICE})
+
+
+def test_timed_channel_mute_expires():
+    muted = MutedConversations().with_channel("general", until=1000.0)
+    assert muted.is_muted_channel("general", now=999.0) is True
+    assert muted.muted_until_channel("general", now=999.0) == 1000.0
+    assert muted.is_muted_channel("general", now=1000.0) is False
+    assert muted.muted_until_channel("general", now=1000.0) is None
+    # A plain re-mute leaves the timed mute alone, like peers.
+    assert muted.with_channel("general").channel_until == {"general": 1000.0}
+    assert muted.without_channel("general").channels == frozenset()
+
+
+def test_with_channel_rejects_bad_values():
+    with pytest.raises(MutedError):
+        MutedConversations().with_channel("bad name!")
+    with pytest.raises(MutedError):
+        MutedConversations().with_channel("")
+
+
 def test_fail_open_helpers_return_empty_sets_on_corrupt_file(tmp_path, caplog):
     # An unread read must never break over a corrupt mutes file: the
     # conversations count as unmuted, and the warning surfaces it.
@@ -89,6 +175,7 @@ def test_fail_open_helpers_return_empty_sets_on_corrupt_file(tmp_path, caplog):
     path.write_text("{not json", encoding="utf-8")
     assert muted_peers_for(path) == frozenset()
     assert muted_groups_for(path) == frozenset()
+    assert muted_channels_for(path) == frozenset()
     assert "unusable" in caplog.text
 
 
@@ -473,6 +560,80 @@ def test_mute_rejects_bad_input(tmp_path, capsys):
     assert "error" in capsys.readouterr().err
     code = cli.main(["mute", "--data-dir", str(data_dir), "--peer", "nobody"])
     assert code != 0
+
+
+def _seed_joined_channel(tmp_path, name="general"):
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--name", "bob"]) == 0
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), name]) == 0
+    return data_dir
+
+
+def test_mute_channel_mutes_and_unmutes(tmp_path, capsys):
+    data_dir = _seed_joined_channel(tmp_path)
+    capsys.readouterr()
+
+    code = cli.main(["mute", "--data-dir", str(data_dir), "--channel", "general"])
+    assert code == 0
+    assert "Muted channel #general" in capsys.readouterr().out
+
+    code = cli.main(["mute", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["channels"] == ["general"]
+
+    code = cli.main(["mute", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "channel #general" in capsys.readouterr().out
+
+    code = cli.main(
+        ["mute", "--data-dir", str(data_dir), "--channel", "general", "--off"]
+    )
+    assert code == 0
+    assert "Unmuted channel #general" in capsys.readouterr().out
+
+
+def test_mute_channel_timed(tmp_path, capsys):
+    data_dir = _seed_joined_channel(tmp_path)
+    capsys.readouterr()
+    code = cli.main(
+        ["mute", "--data-dir", str(data_dir), "--channel", "general", "--for", "1h"]
+    )
+    assert code == 0
+    assert "Muted channel #general for" in capsys.readouterr().out
+    muted = load_muted(data_dir / "muted.json")
+    assert muted.is_muted_channel("general") is True
+    assert muted.muted_until_channel("general") is not None
+
+
+def test_mute_channel_requires_membership(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--name", "bob"]) == 0
+    code = cli.main(["mute", "--data-dir", str(data_dir), "--channel", "general"])
+    assert code == 1
+    assert "not a member" in capsys.readouterr().err
+
+
+def test_mute_channel_rejects_bad_input(tmp_path, capsys):
+    data_dir = _seed_joined_channel(tmp_path)
+    capsys.readouterr()
+    code = cli.main(["mute", "--data-dir", str(data_dir), "--channel", "bad name!"])
+    assert code == 1
+    assert "error" in capsys.readouterr().err
+    code = cli.main(
+        [
+            "mute",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--off",
+            "--for",
+            "1h",
+        ]
+    )
+    assert code == 1
+    assert "error" in capsys.readouterr().err
 
 
 # -- unread suppression ---------------------------------------------------

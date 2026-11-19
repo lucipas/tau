@@ -1874,6 +1874,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="GROUP",
         help="group id, id prefix or name",
     )
+    mute_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name (a joined channel)",
+    )
     mute.add_argument(
         "--off",
         action="store_true",
@@ -15121,17 +15126,34 @@ def cmd_pinned_conversations(args: argparse.Namespace) -> int:
 
 def cmd_mute(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    if getattr(args, "off", False) and args.peer is None and args.group is None:
-        print("error: --off needs a --peer or --group to unmute", file=sys.stderr)
+    channel = getattr(args, "channel", None)
+    if (
+        getattr(args, "off", False)
+        and args.peer is None
+        and args.group is None
+        and channel is None
+    ):
+        print(
+            "error: --off needs a --peer, --group or --channel to unmute",
+            file=sys.stderr,
+        )
         return _EXIT_ERROR
     for_duration = getattr(args, "for_duration", None)
-    if for_duration is not None and args.peer is None and args.group is None:
-        print("error: --for needs a --peer or --group to mute", file=sys.stderr)
+    if (
+        for_duration is not None
+        and args.peer is None
+        and args.group is None
+        and channel is None
+    ):
+        print(
+            "error: --for needs a --peer, --group or --channel to mute",
+            file=sys.stderr,
+        )
         return _EXIT_ERROR
     if getattr(args, "off", False) and for_duration is not None:
         print("error: --off and --for cannot be combined", file=sys.stderr)
         return _EXIT_ERROR
-    if args.peer is None and args.group is None:
+    if args.peer is None and args.group is None and channel is None:
         # No target lists what is muted, mirroring `tau archived`.
         muted = load_muted(config.muted_path)
         now = time.time()
@@ -15139,6 +15161,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
             payload: Dict[str, Any] = {
                 "peers": sorted(muted.peers),
                 "groups": sorted(muted.groups),
+                "channels": sorted(muted.channels),
             }
             peer_until = {
                 key: until
@@ -15154,11 +15177,18 @@ def cmd_mute(args: argparse.Namespace) -> int:
             }
             if group_until:
                 payload["group_until"] = group_until
+            channel_until = {
+                key: until
+                for key, until in sorted(muted.channel_until.items())
+                if key in muted.channels
+            }
+            if channel_until:
+                payload["channel_until"] = channel_until
             _emit(payload, True)
             return _EXIT_OK
         registry = PeerRegistry(config.peers_path)
         store = GroupStore(config.groups_path)
-        if not muted.peers and not muted.groups:
+        if not muted.peers and not muted.groups and not muted.channels:
             print("No muted conversations.")
             return _EXIT_OK
         for destination in sorted(muted.peers):
@@ -15184,8 +15214,33 @@ def cmd_mute(args: argparse.Namespace) -> int:
                 else ""
             )
             print(f"{label}{suffix}")
+        for channel_name in sorted(muted.channels):
+            until = muted.muted_until_channel(channel_name, now=now)
+            suffix = (
+                f" — muted for {_ago(until - now)} more"
+                if until is not None
+                else ""
+            )
+            print(f"channel #{channel_name}{suffix}")
         return _EXIT_OK
-    if args.group is not None:
+    if channel is not None:
+        # A channel mute is meaningless for a channel whose messages
+        # are not stored here, so muting requires membership — like
+        # a group mute requires the group to exist.
+        try:
+            name = clean_channel_name(channel)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        if name not in {m["channel"] for m in app.memberships()}:
+            print(f"error: not a member of #{name} — join it first", file=sys.stderr)
+            return _EXIT_ERROR
+        key = name
+        label = f"channel #{name}"
+        is_group = False
+        is_channel = True
+    elif args.group is not None:
         store = GroupStore(config.groups_path)
         group = store.find(args.group)
         key = group["id"]
@@ -15193,6 +15248,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
         lineage = group_lineage(group)
         label = f"group {group['name']} ({short_hash(key)})"
         is_group = True
+        is_channel = False
     else:
         inbox = Inbox(config.inbox_path)
         registry = PeerRegistry(config.peers_path)
@@ -15201,6 +15257,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else "unknown"
         label = f"conversation with {name} ({short_hash(key)})"
         is_group = False
+        is_channel = False
     seconds = None
     until = None
     if for_duration is not None:
@@ -15225,6 +15282,13 @@ def cmd_mute(args: argparse.Namespace) -> int:
                 updated = muted.without_group_lineage(lineage)
             else:
                 updated = muted.with_group_lineage(lineage, until=until)
+        elif is_channel:
+            previous = muted.is_muted_channel(key)
+            previous_until = muted.muted_until_channel(key)
+            if getattr(args, "off", False):
+                updated = muted.without_channel(key)
+            else:
+                updated = muted.with_channel(key, until=until)
         else:
             previous = muted.is_muted_peer(key)
             previous_until = muted.muted_until_peer(key)
@@ -15243,6 +15307,8 @@ def cmd_mute(args: argparse.Namespace) -> int:
     # off the previous state.
     if is_group:
         effective_until = updated.muted_until_group_lineage(lineage)
+    elif is_channel:
+        effective_until = updated.muted_until_channel(key)
     else:
         effective_until = updated.muted_until_peer(key)
     if _json_mode(args):
@@ -15250,6 +15316,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
             {
                 "target": key,
                 "group": is_group,
+                "channel": is_channel,
                 "muted": current,
                 "changed": changed,
                 "until": effective_until,

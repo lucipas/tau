@@ -6021,6 +6021,84 @@ def test_channel_unread_counts_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_mute_suppresses_unread_via_api(tmp_path):
+    import time
+
+    import RNS
+
+    from tau import cli
+    from tau.channels import (
+        create_message,
+        init_db as init_channel_db,
+        join_channel,
+        store_message,
+    )
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    source = init_channel_db(tmp_path / "source.sqlite3")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+        message = create_message(
+            source, bob, "general", "hello channels", name="bob", now=1000
+        )
+        # Received now — after joining — so it counts as unread.
+        store_message(conn, message, now=time.time())
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        _, _, status = _json(bridge, "/api/status")
+        assert _counts(status["unread"])["per_channel"] == {"general": 1}
+
+        def unread_events():
+            return [
+                event for event in bridge.bus.replay(0) if event["type"] == "unread"
+            ]
+
+        # Muting the channel darkens its badge and drops it from the total.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"channel": "general"},
+        )
+        assert status == 200
+        assert payload["mute"]["changed"] is True
+        assert _counts(payload["mute"]["unread"])["per_channel"] == {}
+        assert _counts(payload["mute"]["unread"])["total"] == 0
+        _, _, status = _json(bridge, "/api/status")
+        assert _counts(status["unread"])["per_channel"] == {}
+        _, _, payload = _json(bridge, "/api/channels")
+        assert payload["channels"][0]["unread"] == 0
+        assert payload["channels"][0]["muted"] is True
+
+        # Unmuting restores the count and names it as restored mail,
+        # like a DM or group unmute does.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"channel": "general", "muted": False},
+        )
+        assert status == 200
+        assert _counts(payload["mute"]["unread"])["per_channel"] == {"general": 1}
+        assert unread_events()[-1]["restored"] == [
+            {"target": "general", "unread": 1}
+        ]
+        _, _, payload = _json(bridge, "/api/channels")
+        assert payload["channels"][0]["unread"] == 1
+        assert payload["channels"][0]["muted"] is False
+    finally:
+        bridge.stop()
+
+
 def test_channel_send_with_expiry_via_api(tmp_path):
     from tau.channels import ChannelApp, join_channel
 
@@ -7430,7 +7508,7 @@ def test_muted_conversations_endpoints(node, tmp_path):
     try:
         status, _, payload = _json(bridge, "/api/messages/muted")
         assert status == 200
-        assert payload == {"peers": [], "groups": []}
+        assert payload == {"peers": [], "groups": [], "channels": []}
 
         status, _, payload = _json(
             bridge,
@@ -7449,7 +7527,7 @@ def test_muted_conversations_endpoints(node, tmp_path):
         assert payload["mute"]["unread"]["total"] == 0
         assert isinstance(payload["mute"]["unread"]["revision"], int)
         status, _, payload = _json(bridge, "/api/messages/muted")
-        assert payload == {"peers": [PEER_HASH], "groups": []}
+        assert payload == {"peers": [PEER_HASH], "groups": [], "channels": []}
 
         # Muting again is a no-op; the unread count for the muted
         # peer is already 0.
@@ -7473,7 +7551,37 @@ def test_muted_conversations_endpoints(node, tmp_path):
         assert payload["mute"]["muted"] is True
         status, _, payload = _json(bridge, "/api/messages/muted")
         assert payload["peers"] == [PEER_HASH]
+        assert payload["channels"] == []
         assert len(payload["groups"]) == 1
+
+        # A channel mute is keyed by name, with no store lookup.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"channel": "general"},
+        )
+        assert status == 200
+        assert payload["mute"]["target"] == "general"
+        assert payload["mute"]["channel"] is True
+        assert payload["mute"]["group"] is False
+        assert payload["mute"]["muted"] is True
+        assert payload["mute"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/messages/muted")
+        assert payload["channels"] == ["general"]
+
+        # Unmuting the channel drops it from the list.
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/mute",
+            method="POST",
+            body={"channel": "general", "muted": False},
+        )
+        assert status == 200
+        assert payload["mute"]["muted"] is False
+        assert payload["mute"]["changed"] is True
+        status, _, payload = _json(bridge, "/api/messages/muted")
+        assert payload["channels"] == []
 
         # Unmuting restores counting, including messages that arrived
         # while muted.
@@ -7597,10 +7705,14 @@ def test_muted_conversations_endpoint_rejects_bad_input(node, tmp_path):
         for body in (
             {},
             {"peer": "alice", "group": "crew"},
+            {"peer": "alice", "channel": "general"},
+            {"group": "crew", "channel": "general"},
             {"peer": "alice", "muted": "yes"},
             {"peer": "nobody"},
             {"peer": "  "},
             {"group": "nobody"},
+            {"channel": "  "},
+            {"channel": "bad name!"},
         ):
             status, _, payload = _json(
                 bridge, "/api/messages/mute", method="POST", body=body

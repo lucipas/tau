@@ -753,7 +753,7 @@ export async function deleteDraft(kind: "peer" | "group", target: string): Promi
 }
 
 export async function setMuted(
-  target: { peer: string } | { group: string },
+  target: { peer: string } | { group: string } | { channel: string },
   muted = true,
 ): Promise<unknown> {
   return post("/api/messages/mute", { ...target, muted });
