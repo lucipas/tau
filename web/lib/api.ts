@@ -691,6 +691,11 @@ export async function getTanFollowing(): Promise<TanAuthor[]> {
   return data.following;
 }
 
+export async function getTanFollowers(): Promise<TanAuthor[]> {
+  const data = await get<{ followers: TanAuthor[]; count: number }>("/api/tan/followers");
+  return data.followers;
+}
+
 export async function getTanAuthors(opts: {
   sort?: "recent" | "posts" | "name";
   limit?: number;

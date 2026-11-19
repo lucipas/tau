@@ -12,6 +12,7 @@ import pytest
 
 from tau.cli import main
 from tau.config import TauConfig
+from tau.follows import FollowListStore, build_follow_list
 from tau.identity import destination_hash, load_identity
 from tau.peers import Peer
 from tau.protocol import APP_NAME, ASPECT, MAX_MESSAGE_CHARS, ProtocolError, decode, encode
@@ -64,6 +65,8 @@ from tau.tangents.tan import (
     follow,
     follow_tag,
     followed_tags,
+    followers,
+    followers_from_lists,
     following,
     get_post,
     get_draft,
@@ -726,6 +729,83 @@ def test_follow_and_timeline(identities, tmp_path):
     assert unfollow(conn, bob_post["author"]) is True
     assert following(conn) == []
     assert timeline(conn, []) == []
+
+
+def test_followers_from_lists(identities):
+    alice, bob = identities
+    carol = RNS.Identity()
+    own = author_of(alice)
+    lists = {
+        author_of(bob): [own, "not-a-hash", author_of(carol)],
+        author_of(carol): [author_of(carol)],
+        "not-a-hash": [own],
+        own: [own],
+    }
+    assert followers_from_lists(lists, own) == [author_of(bob)]
+
+
+def test_followers_from_lists_ignores_non_list_values(identities):
+    alice, bob = identities
+    own = author_of(alice)
+    lists = {author_of(bob): "not-a-list", "also-bad": 42}
+    assert followers_from_lists(lists, own) == []
+
+
+def test_followers_records(identities, tmp_path):
+    from types import SimpleNamespace
+
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, bob, "from bob", name="bob", now=1000)
+    create_post(conn, carol, "from carol", name="carol", now=1001)
+    follow(conn, author_of(bob), name="bob")
+
+    class StubRegistry:
+        def __init__(self, names):
+            self._names = names
+
+        def get(self, author):
+            name = self._names.get(author)
+            return SimpleNamespace(display_name=name) if name else None
+
+    registry = StubRegistry({author_of(bob): "Bobby"})
+    lists = {
+        author_of(bob): [author_of(alice)],
+        author_of(carol): [author_of(alice)],
+    }
+    records = followers(conn, lists, author_of(alice), registry=registry)
+    # Most recently posting first; the registry name wins over the post name.
+    assert [record["author"] for record in records] == [
+        author_of(carol),
+        author_of(bob),
+    ]
+    assert records[0]["name"] == "carol"
+    assert records[0]["followed"] is False
+    assert records[0]["posts"] == 1
+    assert records[1]["name"] == "Bobby"
+    assert records[1]["followed"] is True
+    assert followers(conn, {}, author_of(alice)) == []
+
+
+def test_tan_app_followers_reads_stored_lists(identities, tmp_path):
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = TanApp(config, alice, name="alice", gossip=False)
+    conn = init_db(config.social_db_path)
+    try:
+        create_post(conn, bob, "from bob", name="bob", now=1000)
+    finally:
+        conn.close()
+    doc = build_follow_list(bob, authors=[author_of(alice)], version=1)
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(doc) is True
+    store.save()
+    records = app.followers()
+    assert [record["author"] for record in records] == [author_of(bob)]
+    assert records[0]["name"] == "bob"
+    assert records[0]["posts"] == 1
+    assert records[0]["followed"] is False
 
 
 def test_suggest_authors_ranks_followed_engagement(identities, tmp_path):

@@ -6099,6 +6099,35 @@ def following(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     ]
 
 
+def followers_from_lists(
+    follow_lists: Dict[str, Sequence[str]], own_author: str
+) -> List[str]:
+    """Authors whose stored follow list includes *own_author*, sorted.
+
+    The input maps a list author to the authors on their published,
+    signature-verified follow list — the shape
+    :meth:`TanApp._stored_follow_lists` returns.  Entries that are not
+    well-formed author hashes are skipped, and a list that names its
+    own author does not make that author their own follower.
+    """
+    own = _require_hex(own_author, AUTHOR_HEX_LENGTH, "own_author")
+    followers: Set[str] = set()
+    for list_author, authors in follow_lists.items():
+        if not isinstance(list_author, str) or not isinstance(authors, (list, tuple)):
+            continue
+        try:
+            list_author = _require_hex(list_author, AUTHOR_HEX_LENGTH, "author")
+        except PostError:
+            continue
+        if list_author == own:
+            continue
+        for entry in authors:
+            if isinstance(entry, str) and entry == own:
+                followers.add(list_author)
+                break
+    return sorted(followers)
+
+
 def suggest_authors(
     conn: sqlite3.Connection,
     *,
@@ -7764,6 +7793,55 @@ def count_authors(
     return int(row[0])
 
 
+def followers(
+    conn: sqlite3.Connection,
+    follow_lists: Dict[str, Sequence[str]],
+    own_author: str,
+    *,
+    registry: Any = None,
+) -> List[Dict[str, Any]]:
+    """One record per author who follows *own_author*.
+
+    A follower is an author whose latest stored, signature-verified
+    follow list names *own_author* (see :func:`followers_from_lists`).
+    Only stored lists are consulted — this never does network I/O, so
+    a follower whose list was never fetched does not appear yet.
+    Each record carries the display name (the peer registry's when it
+    knows the author, else the name on their most recent stored post),
+    the visible-post stats :func:`author_stats_many` returns, and
+    whether the viewer follows them back.  Records come back most
+    recently posting first, then by author hash, so the order is stable.
+    """
+    authors = followers_from_lists(follow_lists, own_author)
+    if not authors:
+        return []
+    stats = author_stats_many(conn, authors)
+    followed = {record["author"] for record in following(conn)}
+    records: List[Dict[str, Any]] = []
+    for author in authors:
+        name = ""
+        if registry is not None and hasattr(registry, "get"):
+            peer = registry.get(author)
+            if peer is not None:
+                name = getattr(peer, "display_name", "") or ""
+        if not name:
+            row = conn.execute(
+                "SELECT name FROM posts WHERE author = ? AND name != '' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (author,),
+            ).fetchone()
+            if row is not None:
+                name = str(row["name"])
+        record = dict(stats[author])
+        record["name"] = name
+        record["followed"] = author in followed
+        records.append(record)
+    records.sort(
+        key=lambda record: (-record["last_post"], record["author"])
+    )
+    return records
+
+
 def _int_or_none(value: Any) -> Optional[int]:
     """Return *value* as an int, or None when it is not integer-shaped.
 
@@ -8453,6 +8531,59 @@ class TanApp:
         conn = self.connect()
         try:
             return [record["author"] for record in following(conn)]
+        finally:
+            conn.close()
+
+    def _stored_follow_lists(self) -> Dict[str, List[str]]:
+        """Follow lists this node has already verified and stored.
+
+        Prefers the running node's store (it picks up lists fetched
+        since start); falls back to opening the store from the data
+        directory.  Anything missing or unreadable means no follower
+        is known yet — the caller sees an empty list rather than an
+        error, because a follower whose list was never fetched simply
+        has not been observed.
+        """
+        from ..follows import FollowListStore
+
+        store = getattr(self.node, "follow_list_store", None)
+        docs: List[Dict[str, Any]] = []
+        if store is not None:
+            try:
+                docs = store.all()
+            except Exception:
+                docs = []
+        if not docs:
+            path = getattr(self.config, "follow_lists_path", None)
+            if path is not None:
+                try:
+                    docs = FollowListStore(path).all()
+                except Exception:
+                    docs = []
+        lists: Dict[str, List[str]] = {}
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            author = doc.get("author")
+            authors = doc.get("authors")
+            if isinstance(author, str) and isinstance(authors, list):
+                lists[author] = [
+                    entry for entry in authors if isinstance(entry, str)
+                ]
+        return lists
+
+    def followers(self) -> List[Dict[str, Any]]:
+        """Authors who follow this node, from stored follow lists.
+
+        See :func:`followers` for the record shape.  Names come from
+        the attached node's peer registry when it knows the author.
+        """
+        conn = self.connect()
+        try:
+            registry = getattr(self.node, "registry", None)
+            return followers(
+                conn, self._stored_follow_lists(), self.author, registry=registry
+            )
         finally:
             conn.close()
 

@@ -127,6 +127,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/mentions replies to your own posts
     GET  /api/tan/thread    thread rooted at a post (``?ref=<hash-or-prefix>``)
     GET  /api/tan/following followed authors
+    GET  /api/tan/followers authors who follow this node
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
@@ -2658,6 +2659,38 @@ class WebBridge:
             return records
         finally:
             conn.close()
+
+    def tan_followers(self) -> List[Dict[str, Any]]:
+        """Authors who follow this node, from stored follow lists.
+
+        Uses the attached Tan app when the feed is enabled, so the
+        console sees the same lists the running node holds; otherwise
+        a throwaway app over the same stores, which never touches the
+        network.
+        """
+        from .tangents.tan import TanApp
+
+        app = self._tan_app()
+        throwaway = app is None
+        if throwaway:
+            from .identity import load_identity
+
+            identity = load_identity(self.node.config.identity_path)
+            if identity is None:
+                raise WebBridgeError("no identity; run `tau init` first")
+            app = TanApp(
+                self.node.config,
+                identity,
+                name=getattr(self.node.config, "name", None),
+            )
+            # Let the throwaway read the running node's live follow-list
+            # store, like the attached app does; detach it again after.
+            app.node = self.node
+        try:
+            return app.followers()
+        finally:
+            if throwaway:
+                app.node = None
 
     def tan_authors(
         self, *, sort: str = "recent", limit: int = 50, offset: int = 0
@@ -10955,6 +10988,12 @@ class _WebHandler(BaseHTTPRequestHandler):
                 records = self.bridge.tan_following()
                 self._send_json(
                     {"following": records, "count": len(records)}, head_only
+                )
+                return
+            if path == "/api/tan/followers":
+                records = self.bridge.tan_followers()
+                self._send_json(
+                    {"followers": records, "count": len(records)}, head_only
                 )
                 return
             if path == "/api/tan/authors":
