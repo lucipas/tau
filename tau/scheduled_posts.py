@@ -6,6 +6,13 @@ node serving with ``--social`` publishes due posts on its mail-loop
 pass.  A post whose publish time has come goes out at the next pass,
 about every 45 seconds.
 
+Polls queue the same way (``tau tan poll --delay 5m``): a queued entry
+carries ``kind`` ``"poll"`` with the question as its text and the fixed
+options alongside it, and the publish pass signs the poll at publish
+time, so its expiry clock still starts when it goes out.  Queue files
+written before polls could be scheduled carry no ``kind`` and load as
+posts, exactly as before.
+
 The queue lives in the data directory (``scheduled-posts.json``) so
 scheduled posts survive restarts.  A publish that fails keeps the
 entry queued and retries with exponential backoff (up to a limit) instead of dropping the
@@ -219,6 +226,31 @@ def _clean_duration(value: Any) -> float:
     return seconds
 
 
+def _clean_kind(value: Any) -> str:
+    if value not in ("post", "poll"):
+        raise ScheduledPostsError(f"not a scheduled entry kind: {value!r}")
+    return value
+
+
+def _clean_options(value: Any) -> Tuple[str, ...]:
+    # Lightweight shape check for the dataclass: the full option rules
+    # (distinct, normalised, length-capped) run at schedule time via
+    # ``_clean_poll_options`` and again when the poll is created, so a
+    # hand-built entry cannot slip a malformed list into the queue.
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ScheduledPostsError("scheduled poll options must be a list")
+    cleaned = []
+    for option in value:
+        if not isinstance(option, str) or not option.strip():
+            raise ScheduledPostsError(f"not a poll option: {option!r}")
+        cleaned.append(option)
+    if len(cleaned) > 8:
+        raise ScheduledPostsError("a scheduled poll has at most 8 options")
+    return tuple(cleaned)
+
+
 @dataclass(frozen=True)
 class ScheduledPost:
     """One queued Tan post, waiting for its publish time."""
@@ -249,6 +281,13 @@ class ScheduledPost:
     # expires.  Stored as a duration, not a timestamp: the clock starts
     # when the post is published, not when it is queued.
     expires_in: float = 0.0
+    # What the entry publishes as: ``"post"`` (the text is the post,
+    # optionally a reply) or ``"poll"`` (the text is the question and
+    # ``options`` carries its fixed choices).  Defaults to ``"post"``
+    # so queue files written before polls could be scheduled load
+    # unchanged.
+    kind: str = "post"
+    options: Tuple[str, ...] = ()
     # Image attachment descriptor (``{sha256, size, mime, name}``) for a
     # post scheduled with ``--image``; the bytes live pinned in the
     # local media store, never in the queue.  ``None`` means no image.
@@ -271,7 +310,20 @@ class ScheduledPost:
         object.__setattr__(self, "paused_at", _clean_retry_at(self.paused_at))
         object.__setattr__(self, "pending_peers", _clean_targets(list(self.pending_peers)))
         object.__setattr__(self, "expires_in", _clean_duration(self.expires_in))
+        object.__setattr__(self, "kind", _clean_kind(self.kind))
+        object.__setattr__(self, "options", _clean_options(self.options))
         object.__setattr__(self, "image", _clean_image(self.image))
+        if self.kind == "poll":
+            # A poll is a top-level entry: it has no reply target, and
+            # its options are fixed at schedule time.
+            if self.reply_to is not None:
+                raise ScheduledPostsError("a scheduled poll cannot be a reply")
+            if not 2 <= len(self.options) <= 8:
+                raise ScheduledPostsError("a scheduled poll needs 2-8 options")
+            if self.image is not None:
+                raise ScheduledPostsError("a scheduled poll cannot carry an image")
+        elif self.options:
+            raise ScheduledPostsError("a scheduled post cannot carry poll options")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -288,6 +340,8 @@ class ScheduledPost:
             "paused_at": self.paused_at,
             "pending_peers": list(self.pending_peers),
             "expires_in": self.expires_in,
+            "kind": self.kind,
+            "options": list(self.options),
             "image": self.image,
         }
 
@@ -309,6 +363,8 @@ class ScheduledPost:
             paused_at=_clean_retry_at(data.get("paused_at", 0.0)),
             pending_peers=_clean_targets(data.get("pending_peers")),
             expires_in=_clean_duration(data.get("expires_in", 0.0)),
+            kind=_clean_kind(data.get("kind", "post")),
+            options=_clean_options(data.get("options")),
             image=_clean_image(data.get("image")),
         )
 
@@ -451,6 +507,8 @@ def schedule_post(
     now: Optional[float] = None,
     name: Optional[str] = None,
     expires_in: float = 0.0,
+    kind: str = "post",
+    options: Optional[Sequence[str]] = None,
     image: Optional[Dict[str, Any]] = None,
 ) -> ScheduledPost:
     """Queue a post for *publish_at*; returns the stored entry.
@@ -461,6 +519,13 @@ def schedule_post(
     publish pass.  When *expires_in* is given the post disappears from
     display surfaces that long after it is published; it shares the
     delay cap — a post cannot outlive the furthest it may be queued.
+    With ``kind="poll"`` the text is the poll question and *options*
+    carries its fixed choices: a poll cannot be a reply, and the
+    question plus options get the same wire-size preflight an
+    immediate ``tau tan poll`` gets, so a poll that could never fit
+    the 8 KiB Tan request is refused here.  A poll cannot carry an
+    image: no side supports a scheduled poll with an attachment.
+
     When *image* is given — the ``{sha256, size, mime, name}``
     descriptor an immediate post carries — the attachment is stored on
     the entry and signed with the post at publish time; the bytes live
@@ -478,28 +543,53 @@ def schedule_post(
     # forever.  Refuse it here, before the entry is saved.  (Lazy
     # import: this module stays importable without Reticulum, which
     # ``tau.backup`` relies on.)
-    from .tangents.tan import PostError, check_post_text_fits
+    from .tangents.tan import PostError, check_poll_fits, check_post_text_fits
 
     clean_expires_in = _clean_duration(expires_in)
     if clean_expires_in > MAX_SCHEDULED_POST_DELAY:
         raise ScheduledPostsError(
             "expires_in must be at most 7d (the scheduled-post delay cap)"
         )
+    clean_kind = _clean_kind(kind)
+    clean_options: Tuple[str, ...] = ()
     clean_image = _clean_image(image)
-    if clean_image is not None and reply_to is not None:
-        raise ScheduledPostsError(
-            "an image can only be attached to a top-level post, not a reply"
-        )
-    try:
-        check_post_text_fits(
-            clean_text,
-            name=name,
-            reply_to=reply_to,
-            expires=clean_expires_in > 0,
-            image=clean_image,
-        )
-    except PostError as exc:
-        raise ScheduledPostsError(str(exc)) from exc
+    if clean_kind == "poll":
+        if reply_to is not None:
+            raise ScheduledPostsError("a scheduled poll cannot be a reply")
+        if clean_image is not None:
+            raise ScheduledPostsError("a scheduled poll cannot carry an image")
+        from .tangents.tan import _clean_poll_options
+
+        try:
+            clean_options = tuple(_clean_poll_options(list(options or [])))
+        except PostError as exc:
+            raise ScheduledPostsError(str(exc)) from exc
+        try:
+            check_poll_fits(
+                clean_text,
+                clean_options,
+                name=name,
+                expires=clean_expires_in > 0,
+            )
+        except PostError as exc:
+            raise ScheduledPostsError(str(exc)) from exc
+    else:
+        if options:
+            raise ScheduledPostsError("a scheduled post cannot carry poll options")
+        if clean_image is not None and reply_to is not None:
+            raise ScheduledPostsError(
+                "an image can only be attached to a top-level post, not a reply"
+            )
+        try:
+            check_post_text_fits(
+                clean_text,
+                name=name,
+                reply_to=reply_to,
+                expires=clean_expires_in > 0,
+                image=clean_image,
+            )
+        except PostError as exc:
+            raise ScheduledPostsError(str(exc)) from exc
     post = ScheduledPost(
         id=new_scheduled_post_id(),
         text=clean_text,
@@ -509,12 +599,45 @@ def schedule_post(
         publish_at=_clean_timestamp(publish_at, "publish_at"),
         created_at=now if now is not None else time.time(),
         expires_in=clean_expires_in,
+        kind=clean_kind,
+        options=clean_options,
         image=clean_image,
     )
     with scheduled_posts_lock(path):
         queue = load_scheduled_posts(path)
         save_scheduled_posts(path, queue.with_added(post))
     return post
+
+
+def schedule_poll(
+    path: Union[str, Path],
+    *,
+    question: str,
+    options: Sequence[str],
+    publish_at: float,
+    to: Optional[Sequence[str]] = None,
+    ttl: int = 3,
+    now: Optional[float] = None,
+    name: Optional[str] = None,
+    expires_in: float = 0.0,
+) -> ScheduledPost:
+    """Queue a poll for *publish_at*; returns the stored entry.
+
+    Thin wrapper over :func:`schedule_post` with ``kind="poll"``: the
+    question is the entry text and the options ride alongside it.
+    """
+    return schedule_post(
+        path,
+        text=question,
+        publish_at=publish_at,
+        to=to,
+        ttl=ttl,
+        now=now,
+        name=name,
+        expires_in=expires_in,
+        kind="poll",
+        options=options,
+    )
 
 
 def cancel_scheduled_post(
@@ -570,7 +693,10 @@ def publish_due_scheduled_posts(
     errors — the same bar as an immediate ``tau tan post``, where zero
     known peers still counts as published.  The signed post is created
     once and its hash saved before sending, so retries re-send the same
-    post.  Peers that already accepted it are not sent it again.
+    post.  Peers that already accepted it are not sent it again.  A
+    queued poll publishes the same way, through ``app.create_poll``
+    with the question and its fixed options, so its expiry clock also
+    starts at publish time.
 
     A failed attempt (exception or per-peer errors) keeps the entry
     queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
@@ -650,12 +776,19 @@ def publish_due_scheduled_posts(
                             if post.expires_in > 0
                             else None
                         )
-                        created = app.create_post(
-                            post.text,
-                            reply_to=post.reply_to,
-                            expires_at=expires_at,
-                            image=post.image,
-                        )
+                        if post.kind == "poll":
+                            created = app.create_poll(
+                                post.text,
+                                list(post.options),
+                                expires_at=expires_at,
+                            )
+                        else:
+                            created = app.create_post(
+                                post.text,
+                                reply_to=post.reply_to,
+                                expires_at=expires_at,
+                                image=post.image,
+                            )
                         # Persist the signed post's identity before sending, so
                         # a retry after a crash re-sends it rather than signing
                         # a second copy.

@@ -224,6 +224,7 @@ from .scheduled_posts import (
     ScheduledPostsError,
     cancel_scheduled_post,
     load_scheduled_posts,
+    schedule_poll,
     schedule_post,
 )
 from .scheduled_channel import (
@@ -3448,6 +3449,14 @@ def build_parser() -> argparse.ArgumentParser:
         "after this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — the "
         "expiry is signed with the poll",
     )
+    tan_poll.add_argument(
+        "--delay",
+        default=None,
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — needs a node "
+        "serving with --social to publish it",
+    )
     tan_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_poll.set_defaults(func=cmd_tan_poll)
@@ -6658,7 +6667,7 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
         _emit({"scheduled": [post.to_dict() for post in queue.posts]}, True)
         return _EXIT_OK
     if not queue.posts:
-        print("No Tan posts scheduled.")
+        print("No Tan posts or polls scheduled.")
         return _EXIT_OK
     now = time.time()
     for post in queue.posts:
@@ -6668,6 +6677,8 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
         else:
             when += f" (in {_ago(post.publish_at - now)})"
         print(f"{post.id}  {when}")
+        if post.kind == "poll":
+            print(f"  poll · {len(post.options)} options")
         if post.reply_to is not None:
             print(f"  in reply to {short_hash(post.reply_to)}")
         if post.to:
@@ -6676,6 +6687,9 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
             print(f"  image {post.image['name']} ({post.image['size']} bytes)")
         for line in post.text.splitlines() or [""]:
             print(f"  {line}")
+        if post.kind == "poll":
+            for index, option in enumerate(post.options, start=1):
+                print(f"    {index}. {option}")
     return _EXIT_OK
 
 
@@ -7134,6 +7148,52 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     expires_at = time.time() + expire_seconds if expire_text is not None else None
+
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled poll is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_POST_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if expires_at is not None and delay >= expire_seconds:
+            print(
+                "error: --delay must be shorter than --expire — the "
+                "poll would expire before it is published",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            scheduled = schedule_poll(
+                config.scheduled_posts_path,
+                question=question,
+                options=options,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+                expires_in=expire_seconds,
+            )
+        except ScheduledPostsError as exc:
+            raise NodeError(str(exc)) from exc
+        if json_output:
+            _emit({"scheduled": scheduled.to_dict()}, True)
+        else:
+            print(f"scheduled {scheduled.id} — asks in {_ago(delay)}")
+            print("  list it with `tau tan scheduled`; a node serving")
+            print("  with --social publishes it when the time comes.")
+        return _EXIT_OK
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)

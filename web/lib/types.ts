@@ -720,6 +720,10 @@ export interface ScheduledTanPost {
   next_attempt_at: number | null;
   paused_at: number | null;
   expires_in?: number;
+  /** "post" for a queued post, "poll" for a queued poll question. */
+  kind?: "post" | "poll";
+  /** Fixed poll choices; only present when kind is "poll". */
+  options?: string[];
   /** Image attachment descriptor, when the queued post carries one. */
   image?: { sha256: string; size: number; mime: string; name: string } | null;
   [key: string]: unknown;

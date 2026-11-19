@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TauContext } from "@/components/chrome/TauContext";
-import type { TanDraft, TanPost } from "@/lib/types";
+import type { ScheduledTanPost, TanDraft, TanPost } from "@/lib/types";
 import SocialSection from "./SocialSection";
 import { validateTanText } from "./social/TanComposer";
 import { fakeTau, mockFetch } from "./test-utils";
@@ -35,7 +35,7 @@ function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): Tan
 
 let calls: string[] = [];
 let timeline: TanPost[] = [];
-let scheduled: import("@/lib/types").ScheduledTanPost[] = [];
+let scheduled: ScheduledTanPost[] = [];
 let drafts: TanDraft[] = [];
 
 function makeDraft(id: number, text: string, extra: Partial<TanDraft> = {}): TanDraft {
@@ -243,6 +243,36 @@ describe("SocialSection", () => {
       expect(calls).toContain("GET /api/tan/search?q=mesh&limit=30"),
     );
     expect(await screen.findByText(/1 result for/)).toBeTruthy();
+  });
+
+  it("shows a scheduled poll with its options in the Scheduled tab", async () => {
+    scheduled = [
+      {
+        id: "a".repeat(16),
+        text: "pizza or tacos?",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+        kind: "poll",
+        options: ["Pizza", "Tacos"],
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("pizza or tacos?")).toBeTruthy();
+    expect(screen.getByText("Poll · 2 options")).toBeTruthy();
+    expect(screen.getByText("1. Pizza")).toBeTruthy();
+    expect(screen.getByText("2. Tacos")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Cancel scheduled poll" }),
+    ).toBeTruthy();
   });
 
   it("shows a scheduled post's attached image in the Scheduled tab", async () => {

@@ -64,6 +64,7 @@ import {
   repostTanPost,
   saveTanDraft,
   saveTanPost,
+  scheduleTanPoll,
   scheduleTanPost,
   searchTan,
   shareTanPost,
@@ -262,6 +263,7 @@ export interface UseTanComposerResult {
     opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } },
   ) => Promise<TanPost>;
   schedule: (text: string, sendIn: number, opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } }) => Promise<ScheduledTanPost>;
+  schedulePoll: (question: string, options: string[], sendIn: number, opts?: { expiresIn?: number }) => Promise<ScheduledTanPost>;
   poll: (question: string, options: string[], expiresIn?: number) => Promise<TanPost>;
   busy: boolean;
   error: string | null;
@@ -296,6 +298,8 @@ export function useTanComposer(): UseTanComposerResult {
       ),
     schedule: (text, sendIn, opts) =>
       run(() => scheduleTanPost(text, sendIn, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn, image: opts?.image })),
+    schedulePoll: (question, options, sendIn, opts) =>
+      run(() => scheduleTanPoll(question, options, sendIn, { expiresIn: opts?.expiresIn })),
     poll: (question, options, expiresIn) => run(() => createTanPoll(question, options, expiresIn)),
     busy,
     error,

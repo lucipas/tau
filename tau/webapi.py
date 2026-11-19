@@ -179,8 +179,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
-    POST /api/tan/schedule schedule a Tan post for later (optional "image" base64 data URL)
-    GET  /api/tan/scheduled queued Tan posts, soonest first
+    POST /api/tan/schedule schedule a Tan post — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL)
+    GET  /api/tan/scheduled queued Tan posts and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     GET  /api/tan/drafts   saved Tan post drafts, newest first
     POST /api/tan/drafts   save a Tan post draft
@@ -3668,6 +3668,7 @@ class WebBridge:
     def tan_schedule_post(
         self, text: str, *, reply_to: Optional[str] = None, send_in: float,
         expires_in: float = 0.0,
+        poll_options: Optional[List[str]] = None,
         image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
@@ -3680,14 +3681,21 @@ class WebBridge:
         decodes one — the bytes are stored pinned in the local media
         store at schedule time — and rides the queue entry until the
         publish pass attaches it.
+
+        With *poll_options* the entry is a poll instead: the text is
+        its question, the options ride alongside it, and a reply
+        target is refused — polls are top-level entries.  A poll
+        cannot carry an image.
         """
-        from .scheduled_posts import schedule_post
+        from .scheduled_posts import schedule_poll, schedule_post
         from .tangents.tan import MAX_GOSSIP_TTL, resolve_post
 
         if image is not None and reply_to is not None:
             raise ValueError(
                 "an image can only be attached to a top-level post, not a reply"
             )
+        if image is not None and poll_options is not None:
+            raise ValueError("a scheduled poll cannot carry an image")
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
             from .tangents.tan import image_attachment_from_data_url
@@ -3702,6 +3710,19 @@ class WebBridge:
             finally:
                 conn.close()
         config = self.node.config
+        if poll_options is not None:
+            post = schedule_poll(
+                config.scheduled_posts_path,
+                question=text,
+                options=poll_options,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                # Validate against the name the serving app publishes with
+                # (node.name, refreshed at startup), not the configured name.
+                name=getattr(self.node, "name", None),
+                expires_in=float(expires_in),
+            )
+            return post.to_dict()
         post = schedule_post(
             config.scheduled_posts_path,
             text=text,
@@ -14452,6 +14473,40 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                poll_options = body.get("poll_options")
+                if poll_options is not None:
+                    # A poll is a top-level entry: it cannot be a reply,
+                    # and its options are fixed at schedule time.
+                    if reply_to is not None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "a scheduled poll cannot be a reply"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if (
+                        not isinstance(poll_options, list)
+                        or not 2 <= len(poll_options) <= 8
+                        or any(
+                            not isinstance(option, str) or not option.strip()
+                            for option in poll_options
+                        )
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'poll_options' must be a list "
+                                    "of 2-8 non-empty strings"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 image = body.get("image")
                 if image is not None and not isinstance(image, str):
                     self._send_json(
@@ -14472,6 +14527,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else 0.0
                         ),
+                        poll_options=poll_options,
                         image=image,
                     )
                 except (ValueError, ProtocolError) as exc:
