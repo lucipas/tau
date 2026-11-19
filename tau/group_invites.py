@@ -289,9 +289,18 @@ def load_invites(path: Optional[Union[str, Path]]) -> Dict[str, Any]:
     for group_name, record in data["groups"].items():
         if not isinstance(record, dict):
             raise InviteError("invite record must be an object")
+        # The link is the last token minted for the group, so the
+        # console can show the current link without minting a fresh
+        # token on every view; a record written before links were
+        # stored simply has none.
         groups[_clean_group_name(group_name).casefold()] = {
             "mode": _clean_mode(record.get("mode")),
             "generation": _clean_generation(record.get("generation")),
+            "link": (
+                record.get("link")
+                if isinstance(record.get("link"), str)
+                else None
+            ),
         }
     return {"groups": groups}
 
@@ -351,7 +360,9 @@ def mint_invite(
     and the generation is kept: minting never invalidates older
     tokens for the same group, only :func:`revoke_invites` does.
     The store is keyed by the casefolded group name, so the record
-    survives the roster changes that retire the group's id.
+    survives the roster changes that retire the group's id.  The
+    minted link itself is stored too, so the console can show the
+    current link without minting a fresh token on every view.
     """
     group_name = _clean_group_name(group_name)
     mode = _clean_mode(mode)
@@ -363,25 +374,29 @@ def mint_invite(
             if isinstance(record, dict)
             else 0
         )
+        link = mint_invite_token(
+            identity,
+            group_name=group_name,
+            creator_hash=creator_hash,
+            mode=mode,
+            generation=generation,
+        )
         invites["groups"][group_name.casefold()] = {
             "mode": mode,
             "generation": generation,
+            "link": link,
         }
         save_invites(path, invites)
-    return mint_invite_token(
-        identity,
-        group_name=group_name,
-        creator_hash=creator_hash,
-        mode=mode,
-        generation=generation,
-    )
+    return link
 
 
 def revoke_invites(path: Union[str, Path], *, group_name: str) -> int:
     """Invalidate every invite minted for *group_name* so far.
 
     Bumps the stored generation; tokens carrying an older one no
-    longer verify.  Returns the new generation.
+    longer verify.  The stored link is dropped with it, so nothing
+    keeps advertising a token that no longer verifies.  Returns the
+    new generation.
     """
     group_name = _clean_group_name(group_name)
     with invites_lock(path):
@@ -417,6 +432,7 @@ def invite_status(
     return {
         "mode": _clean_mode(record.get("mode")),
         "generation": _clean_generation(record.get("generation")),
+        "link": record.get("link") if isinstance(record.get("link"), str) else None,
     }
 
 

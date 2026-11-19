@@ -6,18 +6,28 @@
 
 import { useEffect, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
-import { formatRelative, shortHash } from "@/lib/format";
+import UnreadChip from "@/components/chrome/UnreadChip";
+import { formatCountdown, formatRelative, shortHash } from "@/lib/format";
 import { getStatus } from "@/lib/api";
 import { useChannels } from "@/lib/use-channels";
+
+const SCHEDULE_OPTIONS: { label: string; seconds: number | undefined }[] = [
+  { label: "Send now", seconds: undefined },
+  { label: "In 5 minutes", seconds: 5 * 60 },
+  { label: "In 1 hour", seconds: 3600 },
+  { label: "Tomorrow", seconds: 86400 },
+];
 
 export default function ChannelsSection() {
   const channels = useChannels(30_000);
   const [joinName, setJoinName] = useState("");
   const [text, setText] = useState("");
+  const [sendIn, setSendIn] = useState<number | undefined>(undefined);
   const [searchText, setSearchText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [cancelling, setCancelling] = useState<string | null>(null);
   const [pollOpen, setPollOpen] = useState(false);
   const [pollQuestion, setPollQuestion] = useState("");
   const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
@@ -103,13 +113,30 @@ export default function ChannelsSection() {
     setSending(true);
     setError(null);
     try {
-      await channels.send(body, replyTo?.hash);
+      if (sendIn !== undefined) {
+        await channels.schedule(body, sendIn);
+        setSendIn(undefined);
+      } else {
+        await channels.send(body, replyTo?.hash);
+      }
       setText("");
       setReplyTo(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
+    }
+  }
+
+  async function handleCancelScheduled(id: string) {
+    setCancelling(id);
+    setError(null);
+    try {
+      await channels.cancelScheduled(id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCancelling(null);
     }
   }
 
@@ -298,7 +325,8 @@ export default function ChannelsSection() {
                   : "border-zinc-700 text-zinc-300 hover:bg-zinc-900"
               }`}
             >
-              #{c.channel}
+              {c.pinned ? "📌 " : ""}#{c.channel}
+              <UnreadChip count={c.unread} className="ml-1" />
             </button>
           ))}
         </div>
@@ -328,6 +356,13 @@ export default function ChannelsSection() {
               )}
             </h2>
             <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={() => void channels.pinConversation(channels.selected!, !selectedChannel?.pinned)}
+                className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+              >
+                {selectedChannel?.pinned ? "Unpin" : "Pin"}
+              </button>
               <button
                 type="button"
                 onClick={() => void handleSync()}
@@ -447,6 +482,33 @@ export default function ChannelsSection() {
           )}
 
           <div className="px-3 py-2 sm:px-4">
+            {channels.scheduled.length > 0 && (
+              <div className="mb-2 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2">
+                <p className="text-xs font-semibold text-zinc-400">
+                  Scheduled — publishes when the time comes
+                </p>
+                {channels.scheduled.map((s) => (
+                  <div key={s.id} className="mt-2 flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm whitespace-pre-wrap text-zinc-300">{s.text}</p>
+                      <p className="text-xs text-zinc-500">
+                        {s.publish_at * 1000 <= Date.now()
+                          ? "due — publishes on the next serve pass"
+                          : formatCountdown(s.publish_at)}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleCancelScheduled(s.id)}
+                      disabled={cancelling === s.id}
+                      className="shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+                    >
+                      {cancelling === s.id ? "Cancelling…" : "Cancel"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             {channels.pins.length > 0 && (
               <div className="mb-2 rounded-lg border border-amber-800/60 bg-amber-950/40 px-3 py-2">
                 <p className="text-xs font-bold uppercase tracking-wide text-amber-400">
@@ -747,6 +809,22 @@ export default function ChannelsSection() {
                   disabled={sending}
                   className="min-w-0 flex-1 rounded-full border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
                 />
+                <label className="flex shrink-0 items-center gap-1 text-xs text-zinc-400">
+                  <span aria-hidden="true">🕑</span>
+                  <select
+                    aria-label="Send later"
+                    value={sendIn === undefined ? "" : String(sendIn)}
+                    onChange={(e) => setSendIn(e.target.value ? Number(e.target.value) : undefined)}
+                    disabled={sending}
+                    className="rounded-md border border-zinc-700 bg-zinc-900 px-1.5 py-1 text-xs text-zinc-200 outline-none"
+                  >
+                    {SCHEDULE_OPTIONS.map((o) => (
+                      <option key={o.label} value={o.seconds === undefined ? "" : o.seconds}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <button
                   type="button"
                   onClick={() => setPollOpen(true)}
@@ -759,7 +837,7 @@ export default function ChannelsSection() {
                   disabled={sending || !text.trim()}
                   className="shrink-0 rounded-full bg-cyan-500 px-4 py-2 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
                 >
-                  {sending ? "…" : "Send"}
+                  {sending ? "…" : sendIn !== undefined ? "Schedule" : "Send"}
                 </button>
               </div>
             )}

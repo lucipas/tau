@@ -8,9 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildConversations,
   buildTraffic,
+  useBeaconFeed,
+  useBeacons,
   useTau,
 } from "./use-tau";
-import type { ChatMessage, Group, Peer, Snapshot } from "./types";
+import type { Beacon, ChatMessage, Group, Peer, Snapshot } from "./types";
 
 // ------------------------------------------------------------ fake socket --
 
@@ -99,7 +101,7 @@ function makeSnapshot(over: Partial<Snapshot> = {}): Snapshot {
     groups: [],
     messages: [makeMessage({ id: 1 })],
     counts: { messages: 1, peers: 1 },
-    unread: { per_peer: {}, per_group: {}, total: 0, revision: 1 },
+    unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1 },
     bridge: { version: "0.0.0", web: true, url: "http://127.0.0.1:8787/", notes_editable: true },
     social: { enabled: true, posts: 0 },
     ...over,
@@ -138,7 +140,7 @@ describe("useTau live socket", () => {
 
     const live = makeMessage({ id: 2, text: "second", sent_at: 1001 });
     await act(async () => {
-      ws.receive({ type: "message", message: live, unread: { per_peer: { ["a".repeat(32)]: 1 }, per_group: {}, total: 1, revision: 2 } });
+      ws.receive({ type: "message", message: live, unread: { per_peer: { ["a".repeat(32)]: 1 }, per_group: {}, per_channel: {}, total: 1, revision: 2 } });
     });
     expect(result.current.messages).toHaveLength(2);
     expect(result.current.messages[1].text).toBe("second");
@@ -218,7 +220,7 @@ describe("buildConversations", () => {
       makeMessage({ id: 2, peer: bob.destination, peer_name: "bob", sent_at: 2000 }),
       makeMessage({ id: 3, peer: alice.destination, peer_name: "alice", sent_at: 1500, group: group.id, group_name: "crew" }),
     ];
-    const unread = { per_peer: { [bob.destination]: 2 }, per_group: { [group.id]: 1 }, total: 3, revision: 1 };
+    const unread = { per_peer: { [bob.destination]: 2 }, per_group: { [group.id]: 1 }, per_channel: {}, total: 3, revision: 1 };
     const list = buildConversations(messages, [alice, bob], [group], unread);
     expect(list.map((c) => c.kind + ":" + c.key)).toEqual([
       `dm:${bob.destination}`,
@@ -237,6 +239,33 @@ describe("buildConversations", () => {
     expect(list[0].kind).toBe("group");
     expect(list[0].lastMessage).toBeNull();
   });
+
+  it("pinned conversations sort first, then by recency", () => {
+    const messages = [
+      makeMessage({ id: 1, peer: alice.destination, peer_name: "alice", sent_at: 1000 }),
+      makeMessage({ id: 2, peer: bob.destination, peer_name: "bob", sent_at: 2000 }),
+      makeMessage({ id: 3, peer: alice.destination, peer_name: "alice", sent_at: 1500, group: group.id, group_name: "crew" }),
+    ];
+    const pinnedAlice = { ...alice, pinned: true };
+    const list = buildConversations(messages, [pinnedAlice, bob], [group], null);
+    expect(list.map((c) => c.kind + ":" + c.key)).toEqual([
+      `dm:${alice.destination}`,
+      `dm:${bob.destination}`,
+      `group:${group.id}`,
+    ]);
+    expect(list[0].pinned).toBe(true);
+    expect(list[1].pinned).toBe(false);
+
+    // A pinned group jumps the newer DM too.
+    const pinnedGroup = { ...group, pinned: true };
+    const list2 = buildConversations(messages, [alice, bob], [pinnedGroup], null);
+    expect(list2.map((c) => c.kind + ":" + c.key)).toEqual([
+      `group:${group.id}`,
+      `dm:${bob.destination}`,
+      `dm:${alice.destination}`,
+    ]);
+    expect(list2[0].pinned).toBe(true);
+  });
 });
 
 describe("buildTraffic", () => {
@@ -253,5 +282,115 @@ describe("buildTraffic", () => {
     expect(rows[0].sent).toBe(1);
     expect(rows[0].received).toBe(2);
     expect(rows[0].files).toBe(1);
+  });
+});
+
+describe("useBeacons / useBeaconFeed", () => {
+  function makeBeacon(over: Partial<Beacon> = {}): Beacon {
+    return {
+      id: "aabbccdd",
+      target: "a".repeat(32),
+      target_kind: "dm",
+      target_name: "alice",
+      started_at: 1700000000,
+      expires_at: Date.now() / 1000 + 1800,
+      interval: 300,
+      coarse: false,
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      next_update_at: 1700000300,
+      updates_sent: 1,
+      stopped: false,
+      active: true,
+      expires_in_seconds: 1800,
+      ...over,
+    };
+  }
+
+  let posted: Array<{ url: string; body: unknown }> = [];
+
+  beforeEach(() => {
+    posted = [];
+    fetchImpl = async (url: string) => {
+      if (url.includes("/api/beacons/position")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) } as Response;
+      }
+      if (url.includes("/api/beacons")) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ beacons: [makeBeacon()], count: 1 }),
+        } as Response;
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify(makeSnapshot()) } as Response;
+    };
+    // The stubbed fetch above drops the request body; capture it
+    // through the init instead.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.includes("/api/beacons/position")) {
+          posted.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        }
+        return fetchImpl(url);
+      }),
+    );
+  });
+
+  afterEach(() => {
+    const nav = navigator as unknown as Record<string, unknown>;
+    if ("geolocation" in nav) delete nav.geolocation;
+  });
+
+  it("polls the beacons endpoint and reports the active list", async () => {
+    const { result } = renderHook(() => useBeacons(100000));
+    await waitFor(() => expect(result.current.beacons).toHaveLength(1));
+    expect(result.current.beacons[0].id).toBe("aabbccdd");
+    expect(result.current.loading).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("feeds active beacons from a geolocation watch", async () => {
+    const callbacks: Array<(pos: GeolocationPosition) => void> = [];
+    const watchPosition = vi.fn((cb: (pos: GeolocationPosition) => void) => {
+      callbacks.push(cb);
+      return callbacks.length;
+    });
+    const clearWatch = vi.fn();
+    Object.defineProperty(navigator, "geolocation", {
+      value: { watchPosition, clearWatch },
+      configurable: true,
+    });
+    const { unmount } = renderHook(() => useBeaconFeed());
+    await waitFor(() => expect(watchPosition).toHaveBeenCalled());
+    expect(callbacks).toHaveLength(1);
+    await act(async () => {
+      callbacks[0]({
+        coords: {
+          latitude: 34.06,
+          longitude: -83.87,
+          accuracy: 10,
+          altitude: null,
+          altitudeAccuracy: null,
+          heading: null,
+          speed: null,
+        },
+        timestamp: Date.now(),
+      } as GeolocationPosition);
+    });
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0].url).toBe("/api/beacons/position");
+    expect(posted[0].body).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87 });
+    unmount();
+    expect(clearWatch).toHaveBeenCalledWith(1);
+  });
+
+  it("does nothing without geolocation", async () => {
+    renderHook(() => useBeaconFeed());
+    // Give the beacons poll a chance to land; with no geolocation
+    // there is no watch to start and nothing to post.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(posted).toHaveLength(0);
   });
 });

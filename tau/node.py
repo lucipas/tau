@@ -69,6 +69,7 @@ from .group_invites import (
     resolve_join_request,
     verify_invite_link,
 )
+from .broadcasts import BroadcastStore
 from .groups import GroupStore, pinned_group
 from .group_polls import PostError, clean_poll_options
 from .identity import (
@@ -613,6 +614,9 @@ class TauNode:
         on_retract: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_edit: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_typing: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_beacon_update: Optional[
+            Callable[[Beacon, Dict[str, Any]], None]
+        ] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -622,6 +626,11 @@ class TauNode:
         self.mailbox = Mailbox(config.mailbox_path)
         self.inbox = Inbox(config.inbox_path)
         self.groups = GroupStore(getattr(config, "groups_path", None))
+        # Broadcast lists: named peer sets for one-to-many DMs, local
+        # state like groups — the console lists and sends them, and the
+        # store reloads from disk on list so a CLI-created list shows
+        # up without restarting the server.
+        self.broadcasts = BroadcastStore(getattr(config, "broadcasts_path", None))
         # Public profiles: the local one this node publishes (reloaded
         # from disk on every announce, so a one-shot `tau profile set`
         # reaches peers without a restart) and the received ones, keyed
@@ -669,6 +678,12 @@ class TauNode:
         self.on_retract = on_retract
         self.on_edit = on_edit
         self.on_typing = on_typing
+        # Called with the beacon and its send result after every
+        # beacon update goes out (first update and mail-loop ticks
+        # alike), so the console can record its own updates in its
+        # history like any other sent message; best effort, like
+        # the typing fan-out below.
+        self.on_beacon_update = on_beacon_update
         # Typing indicators, keyed by conversation — a peer hash for a
         # DM, ``"group:<id>"`` for a group — to ``{peer_hash: expires_at}``.
         # Ephemeral by design: nothing here is persisted, and an entry
@@ -4690,6 +4705,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled-post publish failed", exc_info=True)
             try:
+                self._publish_due_scheduled_channel_messages()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Scheduled channel-message publish failed", exc_info=True)
+            try:
                 self._send_due_beacon_updates()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Beacon update round failed", exc_info=True)
@@ -4729,6 +4748,36 @@ class TauNode:
         if result["published"]:
             log.info(
                 "Published %d scheduled Tan post(s)", result["published"]
+            )
+
+    def _publish_due_scheduled_channel_messages(self) -> None:
+        """Publish channel messages whose scheduled time has come.
+
+        Only when a channel app is attached (``tau serve --channels``):
+        without one there is no publisher, and the queue simply waits
+        for a serving node that has one.  A publish failure keeps the
+        entry queued — see ``tau.scheduled_channel`` — so this never
+        raises into the mail loop.
+        """
+        app = getattr(self, "channel_app", None)
+        if app is None:
+            return
+        from .scheduled_channel import publish_due_scheduled_channel_messages
+
+        try:
+            result = publish_due_scheduled_channel_messages(
+                self.config.scheduled_channel_messages_path,
+                app,
+                resolve_peer=self.resolve_peer,
+                should_stop=self._stop_event.is_set,
+            )
+        except Exception:  # pragma: no cover - defensive; helper logs
+            log.debug("Scheduled channel-message publish failed", exc_info=True)
+            return
+        if result["published"]:
+            log.info(
+                "Published %d scheduled channel message(s)",
+                result["published"],
             )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:
@@ -7645,7 +7694,19 @@ class TauNode:
                     save_beacons(self.config.beacons_path, stored)
         except BeaconsError as exc:  # pragma: no cover - disk failure
             log.warning("Could not persist beacon update: %s", exc)
+        self._publish_beacon_update(beacon, result)
         return result
+
+    def _publish_beacon_update(
+        self, beacon: Beacon, result: Dict[str, Any]
+    ) -> None:
+        """Fan one beacon update out to the console, best effort."""
+        if self.on_beacon_update is None:
+            return
+        try:
+            self.on_beacon_update(beacon, result)
+        except Exception:  # pragma: no cover - user callback
+            log.warning("on_beacon_update callback failed", exc_info=True)
 
     def _send_due_beacon_updates(self) -> None:
         """Send the beacon updates whose time has come.

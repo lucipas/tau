@@ -7,6 +7,7 @@
 import { useEffect } from "react";
 import { TauProvider, useTauContext } from "./TauContext";
 import { SECTIONS, useHash, type Section } from "./useHash";
+import { useBeaconFeed } from "@/lib/use-tau";
 import LeftNav from "./LeftNav";
 import RightSidebar from "./RightSidebar";
 import MobileTabBar from "./MobileTabBar";
@@ -16,6 +17,10 @@ function ShellInner({ children }: { children: React.ReactNode }) {
   const tau = useTauContext();
   const { section, navigate } = useHash();
   const unreadTotal = tau.unread?.total ?? 0;
+  // Live beacons keep feeding from the browser's geolocation even when
+  // the user leaves the chat tab (the feed lives in the shell, not the
+  // chat section, for exactly this reason).
+  useBeaconFeed();
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
