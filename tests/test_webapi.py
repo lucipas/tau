@@ -3103,6 +3103,131 @@ def test_api_groups_change_members_refuses_ambiguous_names(
     ]
 
 
+def test_api_groups_ban_removes_member_and_lists_banned(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH, OTHER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/ban",
+        method="POST",
+        body={"group": "weekend", "peer": OTHER_HASH},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # Banning a member is a roster change, so the successor id applies.
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert OTHER_HASH not in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+    assert payload["banned"] == [{"hash": OTHER_HASH, "name": "carol"}]
+    status, _, listed = _json(
+        bridge, "/api/groups/banned?group=weekend", method="GET"
+    )
+    assert status == 200
+    assert listed["count"] == 1
+    assert listed["banned"] == [{"hash": OTHER_HASH, "name": "carol"}]
+    # A banned peer cannot be re-added or approved.
+    status, _, refused = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "is banned" in refused["error"]["message"]
+
+
+def test_api_groups_unban_lifts_ban_without_readding(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    _json(
+        bridge,
+        "/api/groups/ban",
+        method="POST",
+        body={"group": "weekend", "peer": OTHER_HASH},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/unban",
+        method="POST",
+        body={"group": "weekend", "peer": OTHER_HASH},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["unbanned"] == {"hash": OTHER_HASH, "name": "carol"}
+    assert payload["was_banned"] is True
+    # The peer is not re-added to the roster by the unban.
+    assert OTHER_HASH not in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+    # Unbanning again says so instead of failing.
+    _, _, again = _json(
+        bridge,
+        "/api/groups/unban",
+        method="POST",
+        body={"group": "weekend", "peer": OTHER_HASH},
+    )
+    assert again["was_banned"] is False
+    _, _, listed = _json(bridge, "/api/groups/banned?group=weekend")
+    assert listed["count"] == 0
+
+
+def test_api_groups_ban_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    cases = [
+        (
+            "/api/groups/ban",
+            {"group": "weekend", "peer": "00" * 16},
+            "unknown peer",
+        ),
+        (
+            "/api/groups/ban",
+            {"group": "weekend"},
+            "field 'peer' is required",
+        ),
+        (
+            "/api/groups/ban",
+            {"group": "nope", "peer": OTHER_HASH},
+            "unknown group",
+        ),
+        (
+            "/api/groups/unban",
+            {"group": "weekend", "peer": "mallory"},
+            "unknown peer",
+        ),
+    ]
+    for path, body, message in cases:
+        status, _, payload = _json(bridge, path, method="POST", body=body)
+        assert status == 400, (path, body)
+        assert message in payload["error"]["message"], (path, body)
+
+
 def test_api_groups_learned_group_is_not_created_by_me(bridge, node, tmp_path):
     from tau.groups import GroupStore, derive_group_id
 

@@ -2472,6 +2472,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_remove_member.set_defaults(func=cmd_group_remove_member)
 
+    group_ban = group_sub.add_parser(
+        "ban",
+        parents=[common],
+        help="ban a peer from a group you created",
+    )
+    group_ban.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_ban.add_argument(
+        "peer", metavar="PEER", help="peer name or destination hash"
+    )
+    group_ban.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_ban.set_defaults(func=cmd_group_ban)
+
+    group_unban = group_sub.add_parser(
+        "unban",
+        parents=[common],
+        help="lift a ban on a group you created",
+    )
+    group_unban.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_unban.add_argument(
+        "peer", metavar="PEER", help="peer name or destination hash"
+    )
+    group_unban.set_defaults(func=cmd_group_unban)
+
+    group_banned = group_sub.add_parser(
+        "banned",
+        parents=[common],
+        help="list the peers banned from a group you created",
+    )
+    group_banned.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_banned.set_defaults(func=cmd_group_banned)
+
     group_invite = group_sub.add_parser(
         "invite",
         parents=[common],
@@ -16773,6 +16816,206 @@ def cmd_group_add_member(args: argparse.Namespace) -> int:
 
 def cmd_group_remove_member(args: argparse.Namespace) -> int:
     return _change_group_members(args, adding=False)
+
+
+def _describe_banned(group: Dict[str, Any], registry: PeerRegistry) -> List[Dict[str, str]]:
+    """A group's ban list with display names for output."""
+    entries = []
+    for banned_hash in group.get("banned") or []:
+        peer = registry.get(banned_hash)
+        entries.append(
+            {
+                "hash": banned_hash,
+                "name": peer.display_name if peer is not None else banned_hash[:8],
+            }
+        )
+    return entries
+
+
+def cmd_group_ban(args: argparse.Namespace) -> int:
+    """Ban a peer from a group this node created.
+
+    The peer is removed from the roster when they are a member and
+    recorded on the ban list either way, so they cannot be re-added
+    or approved through a join request afterwards.  Only the creator
+    can ban; the ban itself needs a running node only to resolve an
+    unknown peer — a member (or an already-banned peer) resolves
+    straight from the roster, like a removal.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        group = node.groups.find(args.group)
+        if not group["local"] or group["creator"] != own_hash:
+            raise NodeError("only the creator can ban members of a group")
+        members = list(group["members"])
+        banned = list(group.get("banned") or [])
+        fast = _roster_hash(args.peer, members + banned)
+        if fast is not None:
+            known = node.registry.get(fast)
+            peer = SimpleNamespace(
+                hexhash=fast,
+                display_name=(
+                    known.display_name if known is not None else fast[:8]
+                ),
+            )
+        else:
+            peer = node.resolve_peer(
+                args.peer,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+        previous_id = group["id"]
+        try:
+            new_group = node.groups.ban(
+                group["id"], peer.hexhash, created_by=own_hash
+            )
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    finally:
+        node.stop()
+
+    described = _describe_group(new_group, node.registry)
+    banned_entries = _describe_banned(new_group, node.registry)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": described,
+                "banned": banned_entries,
+                "previous_id": previous_id,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if previous_id != new_group["id"]:
+        print(
+            f"banned {peer.display_name} from group {new_group['name']}"
+            f" ({previous_id[:8]} -> {new_group['id'][:8]})"
+        )
+    else:
+        print(
+            f"banned {peer.display_name} from group {new_group['name']}"
+            f" ({new_group['id'][:8]})"
+        )
+    print("They cannot be re-added or approved through a join request.")
+    print("Lift it with `tau group unban`.")
+    return _EXIT_OK
+
+
+def _resolve_banned_peer(
+    target: str, banned: List[str], registry: PeerRegistry
+) -> str:
+    """Resolve an unban target to a banned hash.
+
+    A banned hash (full or unique prefix) needs no lookup; anything
+    else resolves through the registry, so a name works too.  A bare
+    hash for a peer the registry never saw is still usable — the ban
+    list is the authority, and unbanning a hash that is not banned
+    changes nothing.
+    """
+    cleaned = target.strip().lower()
+    if not cleaned:
+        raise NodeError("pass a peer name or destination hash")
+    matches = [entry for entry in banned if entry.startswith(cleaned)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise NodeError(
+            f"ambiguous peer: {target!r} matches several banned peers;"
+            " pass a longer hash prefix"
+        )
+    try:
+        peer = registry.resolve(target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is not None:
+        return peer.destination_hash.hex()
+    if len(cleaned) == 32:
+        try:
+            bytes.fromhex(cleaned)
+        except ValueError:
+            raise NodeError(f"unknown peer: {target!r}") from None
+        return cleaned
+    raise NodeError(f"unknown peer: {target!r}")
+
+
+def cmd_group_unban(args: argparse.Namespace) -> int:
+    """Lift a ban on a group this node created.
+
+    Needs no running node: the ban list is local creator state, and
+    the target resolves from the ban list or the registry.  The peer
+    is not re-added to the roster — they can join again afterwards,
+    but only through the normal paths.
+    """
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    own_hash = destination_hash(identity).hex()
+    if not group["local"] or group["creator"] != own_hash:
+        raise NodeError("only the creator can unban members of a group")
+    registry = PeerRegistry(config.peers_path)
+    resolved = _resolve_banned_peer(
+        args.peer, list(group.get("banned") or []), registry
+    )
+    was_banned = resolved in (group.get("banned") or [])
+    try:
+        new_group = store.unban(group["id"], resolved, created_by=own_hash)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_group(new_group, registry)
+    peer = registry.get(resolved)
+    name = peer.display_name if peer is not None else resolved[:8]
+    if _json_mode(args):
+        _emit(
+            {
+                "group": described,
+                "unbanned": {"hash": resolved, "name": name},
+                "was_banned": was_banned,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if was_banned:
+        print(f"unbanned {name} from group {new_group['name']} ({new_group['id'][:8]})")
+    else:
+        print(f"{name} was not banned from group {new_group['name']}.")
+    return _EXIT_OK
+
+
+def cmd_group_banned(args: argparse.Namespace) -> int:
+    """List the peers banned from a group this node created."""
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    registry = PeerRegistry(config.peers_path)
+    entries = _describe_banned(group, registry)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": _describe_group(group, registry),
+                "banned": entries,
+                "count": len(entries),
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not entries:
+        print(f"No banned peers in {group['name']} ({group['id'][:8]}).")
+        return _EXIT_OK
+    print(f"Banned from {group['name']} ({group['id'][:8]}):")
+    for entry in entries:
+        print(f"  {entry['name']} ({entry['hash'][:8]})")
+    return _EXIT_OK
 
 
 def cmd_group_invite(args: argparse.Namespace) -> int:

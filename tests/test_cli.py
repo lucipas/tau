@@ -1083,6 +1083,147 @@ def test_group_topic_flag_conflicts_rejected(tmp_path, capsys):
     )
 
 
+def test_parser_group_ban_arguments():
+    parser = cli.build_parser()
+    ban = parser.parse_args(["group", "ban", "weekend", "carol"])
+    assert ban.group_command == "ban"
+    assert ban.func is cli.cmd_group_ban
+    assert ban.group == "weekend"
+    assert ban.peer == "carol"
+
+    unban = parser.parse_args(["group", "unban", "weekend", "carol"])
+    assert unban.func is cli.cmd_group_unban
+
+    banned = parser.parse_args(["group", "banned", "weekend"])
+    assert banned.func is cli.cmd_group_banned
+    assert banned.group == "weekend"
+
+
+class _FakeBanNode:
+    """Stub TauNode for `tau group ban`: real stores, no Reticulum."""
+
+    def __init__(self, config, **kwargs):
+        from tau.groups import GroupStore
+        from tau.identity import destination_hash, load_identity
+        from tau.peers import PeerRegistry
+
+        self.config = config
+        self.groups = GroupStore(config.groups_path)
+        self.registry = PeerRegistry(config.peers_path)
+        identity = load_identity(config.identity_path)
+        self.destination_hexhash = destination_hash(identity).hex()
+        self.started = False
+
+    def start(self, **kwargs):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def resolve_peer(self, target, timeout=10.0):
+        peer = self.registry.resolve(target)
+        if peer is None:
+            from tau.node import NodeError
+
+            raise NodeError(f"unknown peer: {target}")
+        return peer
+
+
+def _seed_group_with_carol(data_dir, own_hash):
+    from tau.groups import GroupStore
+    from tau.peers import PeerRegistry
+
+    registry = PeerRegistry(data_dir / "peers.json")
+    registry.upsert(
+        bytes.fromhex("cd" * 16),
+        b"\x02" * 64,
+        name="carol",
+        now=1000.0,
+    )
+    registry.save()
+    store = GroupStore(data_dir / "groups.json")
+    # Three members, so banning carol does not hit the last-member rule.
+    return store.create(
+        "weekend", [own_hash, "cd" * 16, "ef" * 16], created_by=own_hash
+    )
+
+
+def test_group_ban_unban_banned(tmp_path, capsys, monkeypatch):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    group = _seed_group_with_carol(data_dir, own_hash)
+
+    monkeypatch.setattr(cli, "TauNode", _FakeBanNode)
+    base = ["group", "ban", "--data-dir", str(data_dir), "weekend"]
+    assert cli.main([*base, "carol"]) == 0
+    out = capsys.readouterr().out
+    assert "banned carol from group weekend" in out
+    assert "cannot be re-added" in out
+    banned_group = GroupStore(data_dir / "groups.json").get(group["id"])
+    assert banned_group is None  # the roster change minted a successor
+    stored = GroupStore(data_dir / "groups.json").list_groups()
+    assert len(stored) == 1
+    assert sorted(stored[0]["members"]) == sorted([own_hash, "ef" * 16])
+    assert stored[0]["banned"] == ["cd" * 16]
+
+    assert cli.main(["group", "banned", "--data-dir", str(data_dir), "weekend"]) == 0
+    out = capsys.readouterr().out
+    assert "Banned from weekend" in out
+    assert "carol" in out
+
+    # A banned peer cannot be re-added through the normal path.
+    assert (
+        cli.main(
+            [
+                "group",
+                "add-member",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "--peer",
+                "carol",
+            ]
+        )
+        == 1
+    )
+    assert "is banned" in capsys.readouterr().err
+
+    assert cli.main(["group", "unban", "--data-dir", str(data_dir), "weekend", "carol"]) == 0
+    assert "unbanned carol" in capsys.readouterr().out
+    assert (
+        GroupStore(data_dir / "groups.json").get(stored[0]["id"])["banned"] == []
+    )
+
+    # Unbanning a peer who is not banned says so instead of failing.
+    assert cli.main(["group", "unban", "--data-dir", str(data_dir), "weekend", "carol"]) == 0
+    assert "was not banned" in capsys.readouterr().out
+
+    # JSON mode for the ban list.
+    assert (
+        cli.main(
+            [
+                "group",
+                "banned",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+    assert payload["banned"] == []
+
+    # Banning the creator is refused.
+    assert cli.main([*base, own_hash]) == 1
+    assert "cannot ban the creator" in capsys.readouterr().err
+
+
 def test_status_text_output(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     code = cli.main(["status", "--data-dir", str(data_dir)])

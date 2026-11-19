@@ -363,6 +363,30 @@ export async function removeGroupMembers(group: string, members: string[]): Prom
   return post("/api/groups/remove-member", { group, members });
 }
 
+export interface GroupBannedEntry {
+  hash: string;
+  name: string;
+}
+
+export interface GroupBannedResult {
+  group: Group;
+  banned: GroupBannedEntry[];
+  previous_id?: string;
+  count?: number;
+}
+
+export async function banGroupMember(group: string, peer: string): Promise<GroupBannedResult> {
+  return post("/api/groups/ban", { group, peer });
+}
+
+export async function unbanGroupMember(group: string, peer: string): Promise<GroupBannedResult & { unbanned: GroupBannedEntry; was_banned: boolean }> {
+  return post("/api/groups/unban", { group, peer });
+}
+
+export async function getGroupBanned(group: string): Promise<GroupBannedResult> {
+  return get(`/api/groups/banned${query({ group })}`);
+}
+
 export async function approveJoinRequest(group: string, peer: string): Promise<unknown> {
   return post("/api/groups/approve-join", { group, peer });
 }

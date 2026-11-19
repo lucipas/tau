@@ -870,6 +870,20 @@ still refused with `not_sender`, and a creator claim the receiver
 cannot verify (no pinned roster for the group) fails closed the
 same way.
 
+A group creator can also ban a member: `tau group ban GROUP PEER`
+removes them from the roster (a roster change, so the successor
+group id applies) and records them on the group's ban list, so
+they cannot be re-added with `tau group add-member` or approved
+through a join request — including one sent with an invite link.
+`tau group unban GROUP PEER` lifts the ban without re-adding them,
+and `tau group banned GROUP` lists who is banned. The ban list is
+creator-local state, like the topic: it carries across roster
+changes and renames, so neither silently unbans anyone. A banned
+peer's messages to the group are rejected on receipt, because they
+are no longer on the roster. The web API mirrors the commands
+(`POST /api/groups/ban`, `POST /api/groups/unban`,
+`GET /api/groups/banned`); the console has no ban UI yet.
+
 Retracts are delivered live in v1, like reactions: the peer must be
 online. A DM still queued in the outbox is cancelled with
 `tau outbox cancel` instead; a queued group leg is cancelled by the
@@ -1139,6 +1153,8 @@ unlinked, and stall sync at the gap.
   is read-only for groups — composing from the console comes later.
   Manage groups with `tau group create NAME --peer ...`, `tau group list`,
   `tau group send GROUP TEXT`, `tau group add-member` / `remove-member`,
+  `tau group ban` / `unban` / `banned` (creator only; a banned peer cannot
+  be re-added or approved through a join request),
   `tau group rename GROUP NEW-NAME` (creator only; a rename is a successor
   group, so members learn the new name — and retire the old one — from the
   next message sent to it, and `tau messages --group` history spans the
