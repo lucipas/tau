@@ -7284,6 +7284,147 @@ def test_away_message_without_data_dir(bridge):
     assert payload["message"] == DEFAULT_AWAY_MESSAGE
 
 
+def test_drafts_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert status == 200
+        assert payload == {"drafts": [], "count": 0}
+
+        # Save a peer draft; the list resolves the peer's registry name.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "peer", "target": PEER_HASH, "text": "hello alice"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["draft"]["kind"] == "peer"
+        assert payload["draft"]["target"] == PEER_HASH
+        assert payload["draft"]["text"] == "hello alice"
+
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 1
+        assert payload["drafts"][0]["name"] == "alice"
+
+        # A group draft is keyed by group id and resolves the group name.
+        group_id = node.groups.list_groups()[0]["id"]
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "group", "target": group_id, "text": "hello crew"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 2
+        assert {d["kind"] for d in payload["drafts"]} == {"peer", "group"}
+        group_entry = [d for d in payload["drafts"] if d["kind"] == "group"][0]
+        assert group_entry["name"] == "crew"
+
+        # A draft for an unknown target still lists, with no name.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "peer", "target": OTHER_HASH, "text": "stranger"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 3
+        stranger = [d for d in payload["drafts"] if d["target"] == OTHER_HASH][0]
+        assert stranger["name"] is None
+
+        # Saving again overwrites the text (and re-sorts newest last).
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "peer", "target": PEER_HASH, "text": "hello again"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 3
+        peer_entry = [d for d in payload["drafts"] if d["target"] == PEER_HASH][0]
+        assert peer_entry["text"] == "hello again"
+
+        # Deleting removes the draft; deleting again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts/delete",
+            method="POST",
+            body={"kind": "peer", "target": PEER_HASH},
+        )
+        assert status == 200
+        assert payload == {"ok": True, "deleted": True}
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts/delete",
+            method="POST",
+            body={"kind": "peer", "target": PEER_HASH},
+        )
+        assert payload == {"ok": True, "deleted": False}
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload["count"] == 2
+    finally:
+        bridge.stop()
+
+
+def test_drafts_endpoints_reject_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body in (
+            {},
+            {"kind": "peer", "target": PEER_HASH},
+            {"kind": "peer", "text": "hi"},
+            {"kind": "bogus", "target": PEER_HASH, "text": "hi"},
+            {"kind": "peer", "target": "not-a-hash", "text": "hi"},
+            {"kind": "peer", "target": PEER_HASH, "text": "   "},
+            {"kind": "peer", "target": PEER_HASH, "text": 42},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/drafts", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+        for body in (
+            {},
+            {"kind": "peer"},
+            {"target": PEER_HASH},
+            {"kind": "bogus", "target": "general"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/drafts/delete", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "error" in payload
+    finally:
+        bridge.stop()
+
+
+def test_drafts_endpoints_without_data_dir(bridge):
+    # A dataless node has no drafts path: edits are refused, but the
+    # list still answers empty instead of failing the console poll.
+    status, _, payload = _json(bridge, "/api/drafts")
+    assert status == 200
+    assert payload == {"drafts": [], "count": 0}
+    status, _, payload = _json(
+        bridge,
+        "/api/drafts",
+        method="POST",
+        body={"kind": "peer", "target": PEER_HASH, "text": "hi"},
+    )
+    assert status == 503
+    status, _, payload = _json(
+        bridge,
+        "/api/drafts/delete",
+        method="POST",
+        body={"kind": "peer", "target": PEER_HASH},
+    )
+    assert status == 503
+
+
 def test_muted_conversations_endpoints(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:
