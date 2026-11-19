@@ -127,7 +127,11 @@ read cursor per sender, `tau messages` marks entries unread with `●` and
 advances the cursor when you read a conversation, and the console shows an
 unread badge next to each peer and the unread total in the tab title.
 Opening a peer in the console clears its badge; read receipts to the sender
-are a separate feature and do not exist yet.
+are a separate feature and do not exist yet. A single conversation can be
+muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
+`tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
+every night instead — while the window is active every conversation counts
+as unread 0, and the counts come back when it ends.
 
 The same bridge is the local integration point for scripts:
 
@@ -355,6 +359,9 @@ Global options may appear before or after the command:
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau send --to PEER TEXT --poll-options A B` | Ask a question with 2–8 options in a DM (the poll renders with its tally in `tau messages` and the console) |
+| `tau vote --to PEER POLL OPTION` | Vote on a DM poll (option number or exact text; one standing vote per voter, latest wins) |
+| `tau close-poll --to PEER POLL` | Close a DM poll you created (freezes the tally; only the creator can close it) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau doctor` | Check the local data directory's health (read-only; `--json` for scripting) |
@@ -409,12 +416,25 @@ Global options may appear before or after the command:
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message counts |
-| `tau channel send NAME TEXT` | Send a signed message to a joined channel |
+| `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message) |
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
 | `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
 | `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
+| `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
+| `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
+| `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
+| `tau channel topic NAME [TEXT]` | Show or set a channel's topic (any member may set it; newest wins; `--clear` removes it) |
+| `tau channel react NAME HASH EMOJI` | React to a stored channel message (one per reactor; `--clear` retracts yours) |
+| `tau channel edit NAME DIGEST NEW-TEXT` | Edit your own channel message (digest or hex prefix) |
+| `tau channel edits NAME` | List edit notices for a channel, newest first |
 | `tau channel read NAME` | Show stored messages for a channel, oldest first |
+| `tau channel pin NAME HASH` | Pin a stored message so it stays surfaced (and survives pruning) |
+| `tau channel unpin NAME HASH` | Drop the pin on a message in a channel |
+| `tau channel pins NAME` | List pinned messages for a channel, newest pin first |
+| `tau channel search NAME TEXT` | Search stored messages in a channel by keyword, newest first |
 | `tau channel sync [NAME]` | Pull missing history for a channel (or every joined channel) |
+| `tau channel retract NAME DIGEST` | Retract one of your own channel messages (signed notice, gossiped to peers) |
+| `tau channel retractions NAME` | List stored retract notices for a channel |
 
 Useful flags:
 

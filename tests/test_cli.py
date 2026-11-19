@@ -6946,6 +6946,275 @@ def _seed_group_poll_conversation(tmp_path, *, close=False):
     return data_dir, group
 
 
+def _seed_dm_poll_conversation(tmp_path, *, close=False):
+    """A DM with alice: one poll from her, one vote, maybe a close."""
+    from tau.peers import PeerRegistry
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    peer_identity = RNS.Identity()
+    peer_hash = destination_hash(peer_identity).hex()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "which day?",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "p" * 32,
+            "kind": "chat",
+            "direction": "in",
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "voted: Saturday",
+            "sent_at": 1002.0,
+            "received_at": 1003.0,
+            "id": "v" * 32,
+            "kind": "chat",
+            "direction": "in",
+            "poll_vote": {
+                "target": {"author": peer_hash, "sent_at": 1000.0},
+                "option": 0,
+            },
+        }
+    )
+    if close:
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": peer_hash,
+                "text": "closed the poll",
+                "sent_at": 1004.0,
+                "received_at": 1005.0,
+                "id": "c" * 31 + "1",
+                "kind": "chat",
+                "direction": "in",
+                "poll_close": {"author": peer_hash, "sent_at": 1000.0},
+            }
+        )
+    return data_dir, peer_hash
+
+
+def test_parser_dm_poll_vote_close_poll():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["send", "--to", "alice", "which day?", "--poll-options", "Saturday", "Sunday"]
+    )
+    assert args.func is cli.cmd_send
+    assert args.poll_options == ["Saturday", "Sunday"]
+    args = parser.parse_args(["vote", "--to", "alice", "pppp", "2"])
+    assert args.func is cli.cmd_vote
+    assert args.poll == "pppp"
+    assert args.option == "2"
+    args = parser.parse_args(["close-poll", "--to", "alice", "pppp"])
+    assert args.func is cli.cmd_close_poll
+
+
+def test_resolve_dm_poll(tmp_path):
+    data_dir, peer_hash = _seed_dm_poll_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    poll = cli._resolve_dm_poll(inbox, "pppp", peer_hash)
+    assert poll["text"] == "which day?"
+    # A vote record never resolves as the poll itself.
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_dm_poll(inbox, "vvvv", peer_hash)
+    # A plain message in the DM is not a poll either.
+    with pytest.raises(cli.NodeError, match="no poll"):
+        cli._resolve_dm_poll(inbox, "zzzz", peer_hash)
+
+
+def test_dm_send_posts_poll_options(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            "alice",
+            "which day?",
+            "--poll-options",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert node.send_kwargs[0]["poll_vote"] is None
+    assert "which day?" in capsys.readouterr().out
+
+
+def test_dm_send_rejects_one_option(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            "alice",
+            "which day?",
+            "--poll-options",
+            "Saturday",
+        ]
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_dm_vote_sends_target_and_option(tmp_path, capsys, monkeypatch):
+    data_dir, peer_hash = _seed_dm_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["vote", "--data-dir", str(data_dir), "--to", "alice", "pppp", "2"]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_vote"] == {
+        "target": {"author": peer_hash, "sent_at": 1000.0},
+        "option": 1,
+    }
+    assert "voted for 'Sunday'" in capsys.readouterr().out
+
+
+def test_dm_vote_accepts_option_text(tmp_path, capsys, monkeypatch):
+    data_dir, peer_hash = _seed_dm_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["vote", "--data-dir", str(data_dir), "--to", "alice", "pppp", "Saturday"]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert node.send_kwargs[0]["poll_vote"]["option"] == 0
+
+
+def test_dm_vote_rejects_closed_poll_and_bad_option(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _ = _seed_dm_poll_conversation(tmp_path / "closed", close=True)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["vote", "--data-dir", str(data_dir), "--to", "alice", "pppp", "1"]
+    )
+    assert code == 2
+    assert "this poll is closed" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+    data_dir, _ = _seed_dm_poll_conversation(tmp_path / "open")
+    code = cli.main(
+        ["vote", "--data-dir", str(data_dir), "--to", "alice", "pppp", "3"]
+    )
+    assert code == 2
+    assert "option must be a number 1-2" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_dm_close_poll_requires_creator(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_dm_poll_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["close-poll", "--data-dir", str(data_dir), "--to", "alice", "pppp"]
+    )
+    assert code == 2
+    assert "only the poll's creator can close it" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_dm_close_poll_happy_path(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    own_hash = _id_destination(data_dir, capsys)
+    from tau.peers import PeerRegistry
+
+    peer_identity = RNS.Identity()
+    peer_hash = destination_hash(peer_identity).hex()
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": peer_hash,
+            "text": "which day?",
+            "sent_at": 1001.0,
+            "received_at": 1001.0,
+            "id": "p" * 32,
+            "kind": "chat",
+            "direction": "out",
+            "leg_sent_at": 1000.0,
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    code = cli.main(
+        ["close-poll", "--data-dir", str(data_dir), "--to", "alice", "pppp"]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert node.send_kwargs[0]["poll_close"] == {
+        "author": own_hash,
+        "sent_at": 1000.0,
+    }
+    assert "closed the poll" in capsys.readouterr().out
+
+
+def test_dm_messages_renders_poll_tally_and_hides_votes(tmp_path, capsys):
+    data_dir, _ = _seed_dm_poll_conversation(tmp_path)
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "which day?" in out
+    assert "1. Saturday — 1 vote(s)" in out
+    assert "2. Sunday — 0 vote(s)" in out
+    assert "1 voter(s) total" in out
+    # The vote itself is not a chat message.
+    assert "voted: Saturday" not in out
+
+
 def test_parser_group_poll_vote_close_poll():
     parser = cli.build_parser()
     args = parser.parse_args(
@@ -7189,6 +7458,136 @@ def test_group_messages_renders_poll_tally_and_hides_votes(
     assert "1 voter(s) total" in out
     # The vote itself is not a chat message.
     assert "voted: Saturday" not in out
+
+
+def test_parser_channel_poll_vote_close_poll():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["channel", "poll", "general", "which day?", "Saturday", "Sunday"]
+    )
+    assert args.func is cli.cmd_channel_poll
+    assert args.options == ["Saturday", "Sunday"]
+    args = parser.parse_args(["channel", "vote", "general", "pppp", "2"])
+    assert args.func is cli.cmd_channel_vote
+    assert args.poll == "pppp"
+    assert args.option == "2"
+    args = parser.parse_args(["channel", "close-poll", "general", "pppp"])
+    assert args.func is cli.cmd_channel_close_poll
+
+
+def _seed_channel_poll_conversation(tmp_path):
+    """One node joined to #general with a posted channel poll."""
+    from tau.channels import channel_history, init_db as init_channel_db
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert (
+        cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    code = cli.main(
+        [
+            "channel",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    conn = init_channel_db(data_dir / "channels.sqlite3")
+    try:
+        poll = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+    return data_dir, poll
+
+
+def test_channel_poll_vote_close_round_trip(tmp_path, capsys):
+    data_dir, poll = _seed_channel_poll_conversation(tmp_path)
+    prefix = poll["hash"][:8]
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "channel",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+            "Sunday",
+        ]
+    )
+    assert code == 0
+    assert "voted for 'Sunday'" in capsys.readouterr().out
+
+    code = cli.main(["channel", "read", "--data-dir", str(data_dir), "general"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "which day?" in out
+    assert "1. Saturday — 0 votes" in out
+    assert "2. Sunday — 1 vote" in out
+    assert "your vote" in out
+    # The vote itself is not a chat message.
+    assert "voted: Sunday" not in out
+
+    code = cli.main(
+        [
+            "channel",
+            "close-poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+        ]
+    )
+    assert code == 0
+    assert "closed the poll" in capsys.readouterr().out
+
+    code = cli.main(["channel", "read", "--data-dir", str(data_dir), "general"])
+    assert code == 0
+    assert "closed" in capsys.readouterr().out
+
+    code = cli.main(
+        [
+            "channel",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+            "1",
+        ]
+    )
+    assert code == 2
+    assert "this poll is closed" in capsys.readouterr().err
+
+
+def test_channel_poll_rejects_one_option(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert (
+        cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    code = cli.main(
+        [
+            "channel",
+            "poll",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            "which day?",
+            "Saturday",
+        ]
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err
 
 
 def test_parser_group_send_wait():

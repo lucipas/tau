@@ -692,12 +692,16 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
 # vote names the poll by the same logical identity reactions and
 # retracts use — the group, the poll author's destination hash, and
 # the send time every leg of the poll shares — plus the chosen
-# option's index, and a close names the same identity.  The author
-# of a close must be the poll's author (checked where the tally is
-# derived, not on the wire: the wire only proves the sender is a
-# group member).  Like ``in_reply_to``, a malformed poll field is
-# dropped instead of rejecting the message — a poll from a newer
-# client must still read as a plain message on an older one.
+# option's index, and a close names the same identity.  A DM poll is
+# the same shape without the group: the poll's identity is the
+# author's destination hash and the send time, and the conversation
+# is the peer instead of the group.  The author of a close must be
+# the poll's author (checked where the tally is derived, not on the
+# wire: the wire only proves the sender is a group member, or — for a
+# DM — the conversation peer).  Like ``in_reply_to``, a malformed
+# poll field is dropped instead of rejecting the message — a poll
+# from a newer client must still read as a plain message on an older
+# one.
 MAX_GROUP_POLL_OPTIONS = 8
 MIN_GROUP_POLL_OPTIONS = 2
 MAX_GROUP_POLL_OPTION_CHARS = 100
@@ -1761,6 +1765,9 @@ def encode_message(
     location: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
     beacon: Optional[Dict[str, Any]] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a chat message for the ``/tau/message`` request.
 
@@ -1778,7 +1785,34 @@ def encode_message(
     with the pin, so the receiver can tell a live update from a
     one-off pin and show the beacon's expiry; a beacon without a
     pin is rejected, since an update that renders nowhere is noise.
+
+    ``poll_options`` makes this message a poll, exactly like a group
+    poll: the text is the question and the options ride alongside it
+    (validated structurally here; the 2-8 distinct, normalised rule
+    is enforced where a poll is created).  ``poll_vote`` casts a vote
+    for one option of the poll its target names, and ``poll_close``
+    closes that poll — the text of either still reads as a plain
+    message on a client that predates polls.  Only one of the three
+    may be set.
     """
+    if sum(
+        field is not None for field in (poll_options, poll_vote, poll_close)
+    ) > 1:
+        raise ProtocolError(
+            "a message can carry only one of poll_options, "
+            "poll_vote, poll_close"
+        )
+    cleaned_options = None
+    if poll_options is not None:
+        cleaned_options = _clean_group_poll_options_or_none(poll_options)
+        if cleaned_options is None:
+            raise ProtocolError("poll options must be a list of short strings")
+    cleaned_vote = None
+    if poll_vote is not None:
+        cleaned_vote = clean_group_poll_vote(poll_vote)
+    cleaned_close = None
+    if poll_close is not None:
+        cleaned_close = clean_group_poll_target(poll_close)
     payload = {
         "type": "message",
         "v": PROTOCOL_VERSION,
@@ -1795,6 +1829,12 @@ def encode_message(
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         payload["in_reply_to"] = reply_to
+    if cleaned_options is not None:
+        payload["poll_options"] = cleaned_options
+    if cleaned_vote is not None:
+        payload["poll_vote"] = cleaned_vote
+    if cleaned_close is not None:
+        payload["poll_close"] = cleaned_close
     cleaned_location = clean_location(location)
     if location is not None and cleaned_location is None:
         raise ProtocolError("location must have a latitude -90..90 and a longitude -180..180")
@@ -1822,6 +1862,20 @@ def parse_message(raw: Any) -> Dict[str, Any]:
     message_id = payload.get("id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         message_id = None
+    # A message carrying more than one poll field is contradictory —
+    # the sender cannot have meant both — so all of them are dropped
+    # and the message reads as plain chat instead of a half-poll,
+    # exactly like a group message.
+    parsed_options = _clean_group_poll_options_or_none(
+        payload.get("poll_options")
+    )
+    parsed_vote = _clean_group_poll_vote_or_none(payload.get("poll_vote"))
+    parsed_close = _clean_group_poll_target_or_none(payload.get("poll_close"))
+    if sum(
+        field is not None
+        for field in (parsed_options, parsed_vote, parsed_close)
+    ) > 1:
+        parsed_options = parsed_vote = parsed_close = None
     return {
         "text": text,
         "kind": kind_from_wire(payload),
@@ -1829,6 +1883,9 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         "id": message_id,
         "expires_at": _clean_expires_at(payload.get("expires_at")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
+        "poll_options": parsed_options,
+        "poll_vote": parsed_vote,
+        "poll_close": parsed_close,
         "location": clean_location(payload.get("location")),
         "beacon": clean_beacon(payload.get("beacon")),
     }

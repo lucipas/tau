@@ -11,6 +11,13 @@ use — the group, the poll author's destination hash, and the send
 time every leg of the poll shares — so a vote or close resolves
 against every member's copy of the poll, whatever leg id each holds.
 
+A DM poll is the same shape without the group: the poll is a DM
+whose text is the question, a vote is a DM carrying ``poll_vote``,
+and a close is a DM carrying ``poll_close``; the identity is the
+poll author's destination hash and the send time, and the
+conversation is the peer instead of the group.  The tally below is
+shared — only the conversation key differs.
+
 The tally is derived from stored messages, never stored: one
 standing vote per voter (the latest by send time, then arrival
 order), votes past the close are excluded, and only a close from the
@@ -56,6 +63,44 @@ def is_group_poll(record: Dict[str, Any]) -> bool:
     return True
 
 
+def is_dm_poll(record: Dict[str, Any]) -> bool:
+    """True when *record* is a DM poll with usable options.
+
+    A DM record is any record that is not a group record; its kind
+    is the message kind (``chat``, ``location``, ...), so the poll
+    field is what marks it.
+    """
+    if record.get("kind") == "group":
+        return False
+    try:
+        _clean_poll_options(record.get("poll_options"))
+    except PostError:
+        return False
+    return True
+
+
+def is_dm_poll_vote(record: Dict[str, Any]) -> bool:
+    """True when *record* is a vote cast on a DM poll."""
+    if record.get("kind") == "group":
+        return False
+    try:
+        clean_group_poll_vote(record.get("poll_vote"))
+    except ProtocolError:
+        return False
+    return True
+
+
+def is_dm_poll_close(record: Dict[str, Any]) -> bool:
+    """True when *record* closes a DM poll."""
+    if record.get("kind") == "group":
+        return False
+    try:
+        clean_group_poll_target(record.get("poll_close"))
+    except ProtocolError:
+        return False
+    return True
+
+
 def is_group_poll_vote(record: Dict[str, Any]) -> bool:
     """True when *record* is a vote cast on a group poll."""
     if record.get("kind") != "group":
@@ -87,9 +132,11 @@ def poll_identity(
     node's hash for one it sent; the send time is the legs' shared
     time (``leg_sent_at`` on a sent record, ``sent_at`` otherwise).
     Without ``own_hash`` a sent poll cannot be attributed, so it has
-    no identity here.
+    no identity here.  Group and DM polls share this identity: the
+    conversation (group id, or the peer) is the caller's filter, not
+    part of the identity.
     """
-    if record.get("kind") != "group":
+    if record.get("poll_options") is None:
         return None
     if record.get("direction") == "out":
         author = own_hash
@@ -137,25 +184,32 @@ def _record_author(
     return author.lower()
 
 
-def group_poll_tally(
+def _poll_tally(
     messages: Sequence[Dict[str, Any]],
     poll: Dict[str, Any],
     *,
     own_hash: Optional[str] = None,
+    is_vote: Any = None,
+    is_close: Any = None,
+    conversation_field: str = "group",
 ) -> Dict[str, Any]:
-    """Derive a group poll's tally from the group's stored messages.
+    """Derive a poll's tally from the conversation's stored messages.
 
-    ``messages`` is the group's history (any order); ``poll`` is the
-    poll record.  Returns the options, the vote count per option, the
-    total number of voters, whether the poll is closed, and one voter
-    record per standing vote — ``{\"author\", \"name\", \"option\",
-    \"voted_at\"}``, newest vote first — plus this node's own standing
-    vote under ``\"my_vote\"`` (an option index, or ``None``).
+    ``messages`` is the conversation's history (any order); ``poll``
+    is the poll record.  The conversation is the field that keys the
+    history — ``"group"`` for a group poll, ``"destination"`` (the
+    peer) for a DM poll — and ``is_vote`` / ``is_close`` pick the
+    vote and close records out of it.  Returns the options, the vote
+    count per option, the total number of voters, whether the poll is
+    closed, and one voter record per standing vote — ``{"author",
+    "name", "option", "voted_at"}``, newest vote first — plus this
+    node's own standing vote under ``"my_vote"`` (an option index,
+    or ``None``).
     """
     options = _clean_poll_options(poll.get("poll_options"))
     identity = poll_identity(poll, own_hash)
-    group_id = poll.get("group")
-    if identity is None or not isinstance(group_id, str):
+    conversation = poll.get(conversation_field)
+    if identity is None or not isinstance(conversation, str):
         return {
             "options": options,
             "counts": [0] * len(options),
@@ -170,7 +224,9 @@ def group_poll_tally(
     # close cutoff.  A close from anyone else is not a close.
     cutoff: Optional[float] = None
     for record in messages:
-        if record.get("group") != group_id or not is_group_poll_close(record):
+        if record.get(conversation_field) != conversation or not is_close(
+            record
+        ):
             continue
         target = record["poll_close"]
         if (target["author"], target["sent_at"]) != identity:
@@ -186,7 +242,9 @@ def group_poll_tally(
     # arrival order, wins — voting again changes your vote.
     standing: Dict[str, Dict[str, Any]] = {}
     for record in messages:
-        if record.get("group") != group_id or not is_group_poll_vote(record):
+        if record.get(conversation_field) != conversation or not is_vote(
+            record
+        ):
             continue
         vote = record["poll_vote"]
         target = vote["target"]
@@ -247,6 +305,50 @@ def group_poll_tally(
     }
 
 
+def group_poll_tally(
+    messages: Sequence[Dict[str, Any]],
+    poll: Dict[str, Any],
+    *,
+    own_hash: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Derive a group poll's tally from the group's stored messages.
+
+    ``messages`` is the group's history (any order); ``poll`` is the
+    poll record.  See :func:`_poll_tally` for the shape returned.
+    """
+    return _poll_tally(
+        messages,
+        poll,
+        own_hash=own_hash,
+        is_vote=is_group_poll_vote,
+        is_close=is_group_poll_close,
+        conversation_field="group",
+    )
+
+
+def dm_poll_tally(
+    messages: Sequence[Dict[str, Any]],
+    poll: Dict[str, Any],
+    *,
+    own_hash: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Derive a DM poll's tally from the conversation's stored messages.
+
+    ``messages`` is the DM history with the peer (any order); ``poll``
+    is the poll record.  The conversation key is the peer's
+    destination hash, which is ``destination`` on both sent and
+    received records.  See :func:`_poll_tally` for the shape returned.
+    """
+    return _poll_tally(
+        messages,
+        poll,
+        own_hash=own_hash,
+        is_vote=is_dm_poll_vote,
+        is_close=is_dm_poll_close,
+        conversation_field="destination",
+    )
+
+
 def attach_group_poll_tallies(
     messages: Sequence[Dict[str, Any]],
     *,
@@ -260,5 +362,22 @@ def attach_group_poll_tallies(
     for record in messages:
         if is_group_poll(record):
             record["poll"] = group_poll_tally(
+                messages, record, own_hash=own_hash
+            )
+
+
+def attach_dm_poll_tallies(
+    messages: Sequence[Dict[str, Any]],
+    *,
+    own_hash: Optional[str] = None,
+) -> None:
+    """Attach a ``poll`` tally to each DM-poll record, in place.
+
+    Vote and close records are left untouched — callers hide them
+    from listings and render the tally on the poll instead.
+    """
+    for record in messages:
+        if is_dm_poll(record):
+            record["poll"] = dm_poll_tally(
                 messages, record, own_hash=own_hash
             )
