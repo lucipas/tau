@@ -258,6 +258,21 @@ describe("POST endpoints", () => {
     });
   });
 
+  it("sends a DM with a location pin", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage(
+      { to: "alice" },
+      "",
+      { location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" } },
+    );
+    expect(captured[0].url).toBe("/api/messages");
+    expect(bodyOf(0)).toEqual({
+      to: "alice",
+      text: "",
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+    });
+  });
+
   it("sends a group message with the group key, not `to`", async () => {
     nextJson = { ok: true, message: {}, response: {} };
     await sendMessage({ group: "g123" }, "hi");

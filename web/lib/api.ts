@@ -453,6 +453,8 @@ export interface SendMessageOptions {
   sendIn?: number;
   /** Post `text` as a poll question with these options. */
   pollOptions?: string[];
+  /** Pin a place on the message: latitude -90..90, longitude -180..180. */
+  location?: { lat: number; lon: number; name?: string };
   timeout?: number;
 }
 
@@ -489,6 +491,7 @@ export async function sendMessage(
   if (opts.expiresIn !== undefined) body.expires_in = opts.expiresIn;
   if (opts.sendIn !== undefined) body.send_in = opts.sendIn;
   if (opts.pollOptions) body.poll_options = opts.pollOptions;
+  if (opts.location) body.location = opts.location;
   if (opts.timeout !== undefined) body.timeout = opts.timeout;
   return post("/api/messages", body);
 }

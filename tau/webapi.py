@@ -62,7 +62,9 @@ script) can read what arrives from the mesh and send messages back:
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
                            (one outbound entry per member; ``"reply_to"``,
                            ``"expires_in"`` and ``"send_in"`` work for DM and group sends;
-                           ``"poll_options"`` posts the text as a poll question)
+                           ``"poll_options"`` posts the text as a poll question;
+                           ``"location": {"lat": .., "lon": .., "name": ..}`` pins a place —
+                           a pin without text reads as the place name or the coordinates)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -384,6 +386,7 @@ from .protocol import (
     clean_location,
     clean_reaction,
     excerpt_hash,
+    location_default_text,
     normalize_message,
     sanitize_file_name,
     sanitize_name,
@@ -1838,6 +1841,7 @@ class WebBridge:
             poll_options=record.get("poll_options"),
             poll_vote=record.get("poll_vote"),
             poll_close=record.get("poll_close"),
+            location=record.get("location"),
             reject_removed_wire_id=True,
         )
         if message is None:
@@ -5372,6 +5376,7 @@ class WebBridge:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Send a DM from the console.
 
@@ -5386,11 +5391,27 @@ class WebBridge:
         it.  ``poll_vote`` and ``poll_close`` are the same send for a
         vote and a close (used by :meth:`send_dm_poll_vote` and
         :meth:`close_dm_poll`); at most one of the three may be set.
+
+        ``location`` pins a place on the message (``{"lat": ..,
+        "lon": .., "name": ..}``); a pin sent without its own text
+        reads as the place name (or the coordinates), exactly like
+        the CLI's ``--location``.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
+        cleaned_location: Optional[Dict[str, Any]] = None
+        if location is not None:
+            cleaned_location = clean_location(location)
+            if cleaned_location is None:
+                raise ValueError(
+                    "location must have a latitude -90..90 and a "
+                    "longitude -180..180"
+                )
         if not isinstance(text, str) or not text.strip():
-            raise ValueError("message text is required")
+            if cleaned_location is not None:
+                text = location_default_text(cleaned_location)
+            else:
+                raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
         if expires_at is not None:
@@ -5464,6 +5485,7 @@ class WebBridge:
             poll_options=cleaned_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            location=cleaned_location,
         )
         queued = bool(response.get("queued"))
         # Record the effective expiry (explicit or per-conversation
@@ -5496,6 +5518,7 @@ class WebBridge:
                 poll_options=cleaned_options,
                 poll_vote=poll_vote,
                 poll_close=poll_close,
+                location=cleaned_location,
             )
             if message is None:
                 # The send was retracted while its console record was
@@ -5555,6 +5578,7 @@ class WebBridge:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a message to every member of a group from the console.
 
@@ -5583,6 +5607,11 @@ class WebBridge:
         :meth:`close_group_poll`); at most one of the three may be
         set.
 
+        ``location`` pins a place on every leg (``{"lat": ..,
+        "lon": .., "name": ..}``); a pin sent without its own text
+        reads as the place name (or the coordinates), exactly like
+        the CLI's ``--location``.
+
         The group is resolved by id, id prefix, or exact name through
         ``GroupStore.find`` (unknown or ambiguous queries raise
         ``ValueError``).  One outbound feed entry is recorded per leg,
@@ -5600,8 +5629,19 @@ class WebBridge:
         """
         if not isinstance(group, str) or not group.strip():
             raise ValueError("target group is required")
+        cleaned_location: Optional[Dict[str, Any]] = None
+        if location is not None:
+            cleaned_location = clean_location(location)
+            if cleaned_location is None:
+                raise ValueError(
+                    "location must have a latitude -90..90 and a "
+                    "longitude -180..180"
+                )
         if not isinstance(text, str) or not text.strip():
-            raise ValueError("message text is required")
+            if cleaned_location is not None:
+                text = location_default_text(cleaned_location)
+            else:
+                raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
         if expires_at is not None:
@@ -5673,6 +5713,7 @@ class WebBridge:
             poll_options=cleaned_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            location=cleaned_location,
         )
         # Every leg shares one wire send time (the node's send_group_
         # message returns it): record that on each outbound entry, not
@@ -5727,6 +5768,7 @@ class WebBridge:
                     poll_options=cleaned_options,
                     poll_vote=poll_vote,
                     poll_close=poll_close,
+                    location=cleaned_location,
                 )
                 if message is None:
                     # This leg was retracted while its console record
@@ -11028,6 +11070,7 @@ class WebBridge:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
         save: bool = True,
         reject_removed_wire_id: bool = False,
     ) -> Optional[Dict[str, Any]]:
@@ -11110,6 +11153,14 @@ class WebBridge:
                 message["poll_vote"] = dict(poll_vote)
             if poll_close is not None:
                 message["poll_close"] = dict(poll_close)
+            # A location pin rides on the console entry so the feed
+            # can render it; a malformed pin drops instead of the
+            # entry, like a malformed poll field above.
+            cleaned_location = (
+                clean_location(location) if location is not None else None
+            )
+            if cleaned_location is not None:
+                message["location"] = cleaned_location
             self._next_message_id += 1
             self._messages.append(message)
         # A bulk caller (import mirroring) passes save=False and saves
@@ -14433,6 +14484,10 @@ class _WebHandler(BaseHTTPRequestHandler):
                 {"error": {"message": "field 'to' is required"}}, head_only, 400
             )
             return
+        if text is None and body.get("location") is not None:
+            # A pin without its own text: the bridge defaults it to
+            # the place name (or the coordinates), like the CLI.
+            text = ""
         if not isinstance(text, str):
             self._send_json(
                 {"error": {"message": "field 'text' is required"}}, head_only, 400
@@ -14509,6 +14564,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 send_after=send_after,
                 reply_to=reply_to,
                 poll_options=body.get("poll_options"),
+                location=body.get("location"),
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -14560,6 +14616,10 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
+        if text is None and body.get("location") is not None:
+            # A pin without its own text: the bridge defaults it to
+            # the place name (or the coordinates), like the CLI.
+            text = ""
         if not isinstance(text, str):
             self._send_json(
                 {"error": {"message": "field 'text' is required"}}, head_only, 400
@@ -14638,6 +14698,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 send_after=send_after,
                 reply_to=reply_to,
                 poll_options=body.get("poll_options"),
+                location=body.get("location"),
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown

@@ -1,5 +1,6 @@
 // Composer.tsx — chat composer: text, send-later scheduling, disappearing
-// expiry picker, file attach (≤10 MiB, enforced client-side), poll mode.
+// expiry picker, file attach (≤10 MiB, enforced client-side), poll mode,
+// location-pin mode (latitude/longitude + optional place name).
 
 "use client";
 
@@ -26,10 +27,26 @@ export function validatePoll(question: string, options: string[]): string | null
   return null;
 }
 
+/** A location pin is decimal degrees; the place name is at most 200 characters. */
+export function validateLocation(lat: string, lon: string, name: string): string | null {
+  if (lat.trim() === "") return "Latitude is required.";
+  const latitude = Number(lat);
+  if (!Number.isFinite(latitude)) return "Latitude must be a number.";
+  if (latitude < -90 || latitude > 90) return "Latitude must be between -90 and 90.";
+  if (lon.trim() === "") return "Longitude is required.";
+  const longitude = Number(lon);
+  if (!Number.isFinite(longitude)) return "Longitude must be a number.";
+  if (longitude < -180 || longitude > 180) return "Longitude must be between -180 and 180.";
+  if (name.trim().length > 200) return "A place name is at most 200 characters.";
+  return null;
+}
+
 export interface ComposerSendOptions {
   expiresIn?: number;
   sendIn?: number;
   pollOptions?: string[];
+  /** Pin a place on the message: latitude -90..90, longitude -180..180. */
+  location?: { lat: number; lon: number; name?: string };
   replyTo?: string;
 }
 
@@ -76,8 +93,11 @@ export default function Composer({
   onSendFile,
 }: ComposerProps) {
   const [text, setText] = useState("");
-  const [mode, setMode] = useState<"message" | "poll">("message");
+  const [mode, setMode] = useState<"message" | "poll" | "location">("message");
   const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
+  const [latitude, setLatitude] = useState("");
+  const [longitude, setLongitude] = useState("");
+  const [placeName, setPlaceName] = useState("");
   const [expiresIn, setExpiresIn] = useState<number | undefined>(undefined);
   const [sendIn, setSendIn] = useState<number | undefined>(undefined);
   const [file, setFile] = useState<File | null>(null);
@@ -96,7 +116,7 @@ export default function Composer({
     setText("");
   }
 
-  const canSend = !disabled && !sending && (mode === "poll" ? true : text.trim().length > 0 || file !== null);
+  const canSend = !disabled && !sending && (mode === "poll" || mode === "location" ? true : text.trim().length > 0 || file !== null);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -113,6 +133,32 @@ export default function Composer({
         });
         setText("");
         setPollOptions(["", ""]);
+        setMode("message");
+      } finally {
+        setSending(false);
+      }
+      return;
+    }
+    if (mode === "location") {
+      const problem = validateLocation(latitude, longitude, placeName);
+      if (problem) return setError(problem);
+      const name = placeName.trim();
+      setSending(true);
+      try {
+        await onSend(text.trim(), {
+          location: {
+            lat: Number(latitude),
+            lon: Number(longitude),
+            ...(name ? { name } : {}),
+          },
+          expiresIn,
+          sendIn,
+          replyTo: replyTo?.wire_id,
+        });
+        setText("");
+        setLatitude("");
+        setLongitude("");
+        setPlaceName("");
         setMode("message");
       } finally {
         setSending(false);
@@ -243,6 +289,47 @@ export default function Composer({
         />
       )}
 
+      {mode === "location" && (
+        <div className="mb-2 flex flex-col gap-2">
+          <div className="flex items-center gap-2">
+            <label className="w-20 shrink-0 text-xs font-semibold text-zinc-400" htmlFor="pin-latitude">
+              Latitude
+            </label>
+            <input
+              id="pin-latitude"
+              value={latitude}
+              onChange={(e) => setLatitude(e.target.value)}
+              placeholder="34.05"
+              inputMode="decimal"
+              aria-label="Latitude"
+              disabled={disabled}
+              className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500"
+            />
+            <label className="w-20 shrink-0 text-xs font-semibold text-zinc-400" htmlFor="pin-longitude">
+              Longitude
+            </label>
+            <input
+              id="pin-longitude"
+              value={longitude}
+              onChange={(e) => setLongitude(e.target.value)}
+              placeholder="-83.88"
+              inputMode="decimal"
+              aria-label="Longitude"
+              disabled={disabled}
+              className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500"
+            />
+          </div>
+          <input
+            value={placeName}
+            onChange={(e) => setPlaceName(e.target.value)}
+            placeholder="Place name (optional)"
+            aria-label="Place name"
+            disabled={disabled}
+            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500"
+          />
+        </div>
+      )}
+
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <input
           ref={fileRef}
@@ -273,6 +360,16 @@ export default function Composer({
             📊 Poll
           </button>
         )}
+        <button
+          type="button"
+          onClick={() => setMode((m) => (m === "location" ? "message" : "location"))}
+          aria-pressed={mode === "location"}
+          className={`rounded-full border px-3 py-1 text-xs font-medium ${
+            mode === "location" ? "border-cyan-500 bg-cyan-950 text-cyan-300" : "border-zinc-700 text-zinc-300 hover:bg-zinc-900"
+          }`}
+        >
+          📍 Pin
+        </button>
         <label className="flex items-center gap-1 text-xs text-zinc-400">
           <span aria-hidden="true">⏱</span>
           <select
@@ -310,7 +407,7 @@ export default function Composer({
           disabled={!canSend}
           className="ml-auto rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
         >
-          {sendIn !== undefined ? "Schedule" : editing ? "Save edit" : mode === "poll" ? "Post poll" : "Send"}
+          {sendIn !== undefined ? "Schedule" : editing ? "Save edit" : mode === "poll" ? "Post poll" : mode === "location" ? "Send pin" : "Send"}
         </button>
       </div>
 
