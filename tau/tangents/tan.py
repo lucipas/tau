@@ -91,6 +91,7 @@ is offline as long as any peer still has that author's posts cached.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -1216,6 +1217,69 @@ def store_media(
     if not pinned:
         _prune_media_store(directory, max_total_bytes=max_total_bytes)
     return target
+
+
+def detect_image_mime(data: bytes) -> Optional[str]:
+    """Detect a Tan image's MIME type from its magic bytes, or None.
+
+    The declared type is never trusted — the bytes decide — so a
+    mislabelled upload cannot smuggle another format past the post.
+    """
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def image_attachment_from_data_url(
+    value: Any, data_dir: Union[str, Path]
+) -> Dict[str, Any]:
+    """Decode a base64 data-URL image upload into a Tan attachment dict.
+
+    Validates the same way the CLI's ``_read_image`` does — JPEG, PNG,
+    GIF or WebP by magic bytes, 1 byte .. ``MAX_IMAGE_BYTES`` — then
+    stores the bytes pinned in the local media store, so the author can
+    serve them when a peer asks.  Returns the ``{sha256, size, mime,
+    name}`` descriptor the signed post carries; the bytes themselves
+    never go in the post.  Raises :class:`PostError` on bad input.
+    """
+    if not isinstance(value, str) or not value.startswith("data:"):
+        raise PostError("post image must be a base64 data URL")
+    try:
+        header, encoded = value[5:].split(",", 1)
+    except ValueError as exc:
+        raise PostError("post image must be a base64 data URL") from exc
+    if not header.endswith(";base64"):
+        raise PostError("post image must be a base64 data URL")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise PostError("post image is not valid base64") from exc
+    if len(data) < 1 or len(data) > MAX_IMAGE_BYTES:
+        raise PostError(
+            f"post image of {len(data)} bytes is outside the "
+            f"1..{MAX_IMAGE_BYTES} byte limit"
+        )
+    mime = detect_image_mime(data)
+    if mime is None:
+        raise PostError("post image must be a JPEG, PNG, GIF or WebP file")
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        store_media(data_dir, digest, data, pinned=True)
+    except TanError as exc:
+        raise PostError(str(exc)) from exc
+    ext = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/gif": "gif",
+        "image/webp": "webp",
+    }[mime]
+    return {"sha256": digest, "size": len(data), "mime": mime, "name": f"image.{ext}"}
 
 
 def _prune_media_store(directory: Path, *, max_total_bytes: int) -> None:

@@ -135,6 +135,27 @@ def test_beacons_stop_and_update_location():
         beacons.update_location(PEER_HASH, "dm", location=PIN, now=NOW + 130)
 
 
+def test_beacons_stop_by_id():
+    beacons, beacon = _beacons_with_one()
+    assert beacons.stop_by_id("00" * 8, NOW + 60) is None
+    stopped = beacons.stop_by_id(beacon.id, NOW + 60)
+    assert stopped is beacon
+    assert not beacon.is_active(NOW + 60)
+    # Stopping again is a no-op, not an error.
+    assert beacons.stop_by_id(beacon.id, NOW + 60) is None
+    # An expired beacon is already over, so it cannot be stopped.
+    expired = beacons.start(
+        target=GROUP_HASH,
+        target_kind="group",
+        target_name="crew",
+        location=PIN,
+        duration=60.0,
+        now=NOW,
+    )
+    assert beacons.stop_by_id(expired.id, NOW + 3600) is None
+    assert expired.stopped is False
+
+
 def test_beacons_start_validates_duration_and_interval():
     beacons = Beacons()
     with pytest.raises(BeaconsError):

@@ -1,8 +1,8 @@
 """Owner-controlled per-conversation disappearing-message defaults.
 
 The standing version of ``--expire``: instead of passing an expiry on
-every send, the owner sets a default once per conversation — a DM peer
-or a group — and every immediate message sent to that conversation
+every send, the owner sets a default once per conversation — a DM peer,
+a group, or a channel — and every immediate message sent to that conversation
 carries ``expires_at = now + default`` unless the send passes an
 explicit ``--expire`` (explicit wins) or is scheduled (a scheduled
 send takes no default, so it cannot expire before it is sent).
@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,14 @@ except ImportError:  # pragma: no cover - non-POSIX
 DISAPPEARING_FILE_MODE = 0o600
 
 MAX_DISAPPEARING_SECONDS = 7 * 24 * 60 * 60
+
+# Channel names, kept in sync with tau.channels.clean_channel_name.
+# This module cannot import channels (channels imports this module
+# for channel_default_for), so the rule is duplicated here rather
+# than shared: start alphanumerical, then letters, digits, dots,
+# dashes and underscores, at most 64 characters.
+_CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+MAX_CHANNEL_NAME_LENGTH = 64
 
 
 class DisappearingError(ValueError):
@@ -86,6 +95,27 @@ def _clean_group_id(value: Any) -> str:
     return cleaned
 
 
+def _clean_channel_name(value: Any) -> str:
+    # Channel keys in the defaults file are the cleaned channel name,
+    # exactly as tau.channels.clean_channel_name returns it.
+    if not isinstance(value, str):
+        raise DisappearingError("channel name must be a string")
+    name = value.strip()
+    if not name:
+        raise DisappearingError("channel name must not be empty")
+    if len(name) > MAX_CHANNEL_NAME_LENGTH:
+        raise DisappearingError(
+            "channel name is longer than "
+            f"{MAX_CHANNEL_NAME_LENGTH} characters"
+        )
+    if _CHANNEL_NAME_RE.fullmatch(name) is None:
+        raise DisappearingError(
+            "channel names start with a letter or digit and contain only "
+            "letters, digits, '.', '-' and '_'"
+        )
+    return name
+
+
 def _clean_defaults(values: Any, *, kind: str) -> Dict[str, float]:
     if not isinstance(values, dict):
         raise DisappearingError(f"{kind} disappearing defaults must be a JSON object")
@@ -96,6 +126,8 @@ def _clean_defaults(values: Any, *, kind: str) -> Dict[str, float]:
                 cleaned[clean_destination(key)] = _clean_seconds(seconds)
             except AllowListError as exc:
                 raise DisappearingError(str(exc)) from exc
+        elif kind == "channel":
+            cleaned[_clean_channel_name(key)] = _clean_seconds(seconds)
         else:
             cleaned[_clean_group_id(key)] = _clean_seconds(seconds)
     return cleaned
@@ -107,6 +139,7 @@ class DisappearingDefaults:
 
     peers: Mapping[str, float] = field(default_factory=dict)
     groups: Mapping[str, float] = field(default_factory=dict)
+    channels: Mapping[str, float] = field(default_factory=dict)
 
     def peer_default(self, destination: Optional[str]) -> Optional[float]:
         """Default seconds for a DM peer, or ``None`` when unset."""
@@ -126,30 +159,58 @@ class DisappearingDefaults:
         except DisappearingError:
             return None
 
+    def channel_default(self, channel: Optional[str]) -> Optional[float]:
+        """Default seconds for a channel, or ``None`` when unset."""
+        if channel is None:
+            return None
+        try:
+            return self.channels.get(_clean_channel_name(channel))
+        except DisappearingError:
+            return None
+
     def with_peer(self, destination: str, seconds: float) -> "DisappearingDefaults":
         peers = dict(self.peers)
         peers[clean_destination(destination)] = _clean_seconds(seconds)
-        return DisappearingDefaults(peers=peers, groups=self.groups)
+        return DisappearingDefaults(
+            peers=peers, groups=self.groups, channels=self.channels
+        )
 
     def without_peer(self, destination: str) -> "DisappearingDefaults":
         peers = dict(self.peers)
         peers.pop(clean_destination(destination), None)
-        return DisappearingDefaults(peers=peers, groups=self.groups)
+        return DisappearingDefaults(
+            peers=peers, groups=self.groups, channels=self.channels
+        )
 
     def with_group(self, group_id: str, seconds: float) -> "DisappearingDefaults":
         groups = dict(self.groups)
         groups[_clean_group_id(group_id)] = _clean_seconds(seconds)
-        return DisappearingDefaults(peers=self.peers, groups=groups)
+        return DisappearingDefaults(peers=self.peers, groups=groups, channels=self.channels)
 
     def without_group(self, group_id: str) -> "DisappearingDefaults":
         groups = dict(self.groups)
         groups.pop(_clean_group_id(group_id), None)
-        return DisappearingDefaults(peers=self.peers, groups=groups)
+        return DisappearingDefaults(peers=self.peers, groups=groups, channels=self.channels)
+
+    def with_channel(self, channel: str, seconds: float) -> "DisappearingDefaults":
+        channels = dict(self.channels)
+        channels[_clean_channel_name(channel)] = _clean_seconds(seconds)
+        return DisappearingDefaults(
+            peers=self.peers, groups=self.groups, channels=channels
+        )
+
+    def without_channel(self, channel: str) -> "DisappearingDefaults":
+        channels = dict(self.channels)
+        channels.pop(_clean_channel_name(channel), None)
+        return DisappearingDefaults(
+            peers=self.peers, groups=self.groups, channels=channels
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "peers": {key: self.peers[key] for key in sorted(self.peers)},
             "groups": {key: self.groups[key] for key in sorted(self.groups)},
+            "channels": {key: self.channels[key] for key in sorted(self.channels)},
         }
 
     @classmethod
@@ -158,12 +219,15 @@ class DisappearingDefaults:
             raise DisappearingError("disappearing defaults must be a JSON object")
         # A file that lost a section must not silently turn that side's
         # defaults off; the fail-open loader treats the file as corrupt
-        # instead.
+        # instead.  The channels section is the one exception: it did
+        # not exist before channel defaults, so a file written before
+        # them legitimately lacks it and reads as no channel defaults.
         if "peers" not in data or "groups" not in data:
             raise DisappearingError("peers and groups are required")
         return cls(
             peers=_clean_defaults(data.get("peers"), kind="peer"),
             groups=_clean_defaults(data.get("groups"), kind="group"),
+            channels=_clean_defaults(data.get("channels", {}), kind="channel"),
         )
 
 
@@ -253,6 +317,21 @@ def group_default_for(
     """Default seconds for a group, failing open on a corrupt file."""
     try:
         return load_disappearing_defaults(path).group_default(group_id)
+    except DisappearingError as exc:
+        log.warning(
+            "Disappearing defaults at %s are unusable (%s); sending without a default",
+            path,
+            exc,
+        )
+        return None
+
+
+def channel_default_for(
+    path: Optional[Union[str, Path]], channel: Optional[str]
+) -> Optional[float]:
+    """Default seconds for a channel, failing open on a corrupt file."""
+    try:
+        return load_disappearing_defaults(path).channel_default(channel)
     except DisappearingError as exc:
         log.warning(
             "Disappearing defaults at %s are unusable (%s); sending without a default",

@@ -27,6 +27,7 @@ export default function ChannelsSection() {
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [muting, setMuting] = useState(false);
   const [cancelling, setCancelling] = useState<string | null>(null);
   const [pollOpen, setPollOpen] = useState(false);
   const [pollQuestion, setPollQuestion] = useState("");
@@ -149,6 +150,19 @@ export default function ChannelsSection() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handleMute() {
+    if (!channels.selected) return;
+    setMuting(true);
+    setError(null);
+    try {
+      await channels.mute(channels.selected, !(selectedChannel?.muted ?? false));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMuting(false);
     }
   }
 
@@ -325,7 +339,12 @@ export default function ChannelsSection() {
                   : "border-zinc-700 text-zinc-300 hover:bg-zinc-900"
               }`}
             >
-              #{c.channel}
+              {c.pinned ? "📌 " : ""}#{c.channel}
+              {c.muted && (
+                <span title="Muted" aria-label="Muted channel">
+                  🔇{" "}
+                </span>
+              )}
               <UnreadChip count={c.unread} className="ml-1" />
             </button>
           ))}
@@ -356,6 +375,21 @@ export default function ChannelsSection() {
               )}
             </h2>
             <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={() => void handleMute()}
+                disabled={muting}
+                className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+              >
+                {muting ? "…" : selectedChannel?.muted ? "Unmute" : "Mute"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void channels.pinConversation(channels.selected!, !selectedChannel?.pinned)}
+                className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+              >
+                {selectedChannel?.pinned ? "Unpin" : "Pin"}
+              </button>
               <button
                 type="button"
                 onClick={() => void handleSync()}

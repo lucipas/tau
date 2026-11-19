@@ -66,10 +66,12 @@ export function fakeTau(overrides: Partial<UseTauResult> = {}): UseTauResult {
 export function stubBridgeFetch() {
   const handler = (url: string) => {
     if (url.includes("/api/messages/requests")) return { requests: [], count: 0 };
+    if (url.includes("/api/broadcasts")) return { broadcasts: [], count: 0 };
     if (url.includes("/api/outbox/held")) return { held: [], count: 0 };
     if (url.includes("/api/outbox")) return { outbox: [], count: 0, held_for_others: 0 };
     if (url.includes("/api/messages/muted")) return { peers: [], groups: [] };
     if (url.includes("/api/conversations/archived")) return { archived: [] };
+    if (url.includes("/api/drafts")) return { drafts: [], count: 0 };
     if (url.includes("/api/messages/read")) {
       return { ok: true, unread: makeUnread() };
     }

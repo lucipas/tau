@@ -7,31 +7,55 @@ import {
   ApiError,
   cancelScheduledChannelMessage,
   clearReaction,
+  createBroadcast,
+  deleteBroadcast,
   closeChannelPoll,
+  deleteDraft,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
+  getAwayMessage,
+  getBeacons,
+  getBroadcasts,
   getChannelMessages,
   getChannelPins,
   getChannelScheduled,
   getChannelTopic,
+  getDrafts,
+  getGroupInviteStatus,
   getMessages,
+  getOwnProfile,
+  getQuietHours,
   getTanThread,
   getTanTimeline,
+  joinGroupViaLink,
   markRead,
+  mintGroupInvite,
   pageFileUrl,
+  publishTanPost,
   pinChannelMessage,
   postChannelPoll,
   reactToChannelMessage,
   reactToMessage,
+  readFileAsDataUrl,
+  revokeGroupInvites,
   closeDmPoll,
+  saveDraft,
+  sendBroadcast,
   scheduleChannelMessage,
   searchChannelMessages,
   sendChannelMessage,
   sendMessage,
+  setAwayMessage,
   setChannelTopic,
+  setDisappearingDefault,
+  setOwnProfile,
+  setQuietHours,
+  startBeacon,
+  stopBeacon,
   tanMediaUrl,
   unpinChannelMessage,
+  updateBeaconPosition,
   voteChannelPoll,
   voteDmPoll,
   voteTanPoll,
@@ -119,6 +143,17 @@ describe("GET endpoints", () => {
     expect(captured[1].url).toBe("/api/channels/scheduled");
   });
 
+  it("lists message drafts", async () => {
+    nextJson = {
+      drafts: [{ kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" }],
+      count: 1,
+    };
+    const drafts = await getDrafts();
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].name).toBe("alice");
+  });
+
   it("posts a channel poll with question and options", async () => {
     nextJson = { ok: true, message: { hash: "p".repeat(64) } };
     const message = await postChannelPoll("general", "which day?", ["Saturday", "Sunday"]);
@@ -177,6 +212,30 @@ describe("GET endpoints", () => {
       reaction: "👍",
     });
   });
+
+  it("fetches the away message", async () => {
+    nextJson = {
+      enabled: false,
+      message: "I'm away right now. I'll reply when I'm back.",
+      since: null,
+      replied_to: [],
+      replied_count: 0,
+    };
+    await getAwayMessage();
+    expect(captured[0].url).toBe("/api/settings/away-message");
+  });
+
+  it("fetches the quiet-hours window", async () => {
+    nextJson = {
+      enabled: false,
+      start: "22:00",
+      end: "07:00",
+      active: false,
+      minutes_until_end: null,
+    };
+    await getQuietHours();
+    expect(captured[0].url).toBe("/api/settings/quiet-hours");
+  });
 });
 
 describe("POST endpoints", () => {
@@ -217,10 +276,43 @@ describe("POST endpoints", () => {
     });
   });
 
+  it("sends a DM with a location pin", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    await sendMessage(
+      { to: "alice" },
+      "",
+      { location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" } },
+    );
+    expect(captured[0].url).toBe("/api/messages");
+    expect(bodyOf(0)).toEqual({
+      to: "alice",
+      text: "",
+      location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+    });
+  });
+
   it("sends a group message with the group key, not `to`", async () => {
     nextJson = { ok: true, message: {}, response: {} };
     await sendMessage({ group: "g123" }, "hi");
     expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
+  });
+
+  it("saves and deletes a message draft", async () => {
+    nextJson = {
+      ok: true,
+      draft: { kind: "peer", target: "ab".repeat(16), text: "hi", updated_at: 100, name: "alice" },
+    };
+    const draft = await saveDraft("peer", "ab".repeat(16), "hi");
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ kind: "peer", target: "ab".repeat(16), text: "hi" });
+    expect(draft.text).toBe("hi");
+
+    nextJson = { ok: true, deleted: true };
+    const deleted = await deleteDraft("peer", "ab".repeat(16));
+    expect(captured[1].url).toBe("/api/drafts/delete");
+    expect(bodyOf(1)).toEqual({ kind: "peer", target: "ab".repeat(16) });
+    expect(deleted).toBe(true);
   });
 
   it("reacts and clears a reaction on the same route", async () => {
@@ -264,10 +356,64 @@ describe("POST endpoints", () => {
     expect(bodyOf(1)).toEqual({ to: "alice", poll: "wire1" });
   });
 
+  it("lists, starts, stops and feeds beacons on the beacon routes", async () => {
+    nextJson = { beacons: [], count: 0 };
+    await getBeacons();
+    expect(captured[0].url).toBe("/api/beacons");
+
+    nextJson = { ok: true, beacon: { id: "aabbccdd" }, update: {} };
+    await startBeacon(
+      { peer: "alice" },
+      { lat: 34.05, lon: -83.88, name: "Rock Springs Park", durationSeconds: 900, coarse: true },
+    );
+    expect(captured[1].url).toBe("/api/beacons/start");
+    expect(bodyOf(1)).toEqual({
+      peer: "alice",
+      lat: 34.05,
+      lon: -83.88,
+      name: "Rock Springs Park",
+      durationSeconds: 900,
+      coarse: true,
+    });
+
+    await startBeacon({ group: "ab".repeat(16) }, { lat: 34.05, lon: -83.88 });
+    expect(captured[2].url).toBe("/api/beacons/start");
+    expect(bodyOf(2)).toEqual({ group: "ab".repeat(16), lat: 34.05, lon: -83.88 });
+
+    await stopBeacon("aabbccdd");
+    expect(captured[3].url).toBe("/api/beacons/stop");
+    expect(bodyOf(3)).toEqual({ id: "aabbccdd" });
+
+    await updateBeaconPosition("aabbccdd", 34.06, -83.87);
+    expect(captured[4].url).toBe("/api/beacons/position");
+    expect(bodyOf(4)).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87 });
+
+    await updateBeaconPosition("aabbccdd", 34.06, -83.87, "Elsewhere");
+    expect(bodyOf(5)).toEqual({ id: "aabbccdd", lat: 34.06, lon: -83.87, name: "Elsewhere" });
+  });
+
   it("marks read with an empty body when no conversation is given", async () => {
     nextJson = { ok: true, unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1 } };
     await markRead();
     expect(bodyOf(0)).toEqual({});
+  });
+
+  it("sets a disappearing default for a channel by name", async () => {
+    nextJson = { ok: true };
+    await setDisappearingDefault({ channel: "general" }, 300);
+    expect(captured[0].url).toBe("/api/messages/disappearing");
+    expect(bodyOf(0)).toEqual({ channel: "general", seconds: 300 });
+    await setDisappearingDefault({ channel: "general" }, null);
+    expect(bodyOf(1)).toEqual({ channel: "general", seconds: null });
+  });
+
+  it("sends a channel message with an optional expiry", async () => {
+    nextJson = { ok: true, message: {} };
+    await sendChannelMessage("general", "ephemeral");
+    expect(captured[0].url).toBe("/api/channels/send");
+    expect(bodyOf(0)).toEqual({ channel: "general", text: "ephemeral" });
+    await sendChannelMessage("general", "ephemeral", undefined, 3600);
+    expect(bodyOf(1)).toEqual({ channel: "general", text: "ephemeral", expires_in: 3600 });
   });
 
   it("marks a channel read by name", async () => {
@@ -285,22 +431,50 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ author: "b".repeat(32) });
   });
 
-  it("sets a channel topic with channel and topic in the body", async () => {
-    nextJson = { ok: true, channel: "general", topic: {}, cleared: false };
-    await setChannelTopic("general", "monthly mesh meetup");
-    expect(captured[0].url).toBe("/api/channels/topic");
-    expect(captured[0].init?.method).toBe("POST");
-    expect(bodyOf(0)).toEqual({ channel: "general", topic: "monthly mesh meetup" });
+  it("fetches the own profile from /api/profile", async () => {
+    nextJson = {
+      author: null,
+      name: "testnode",
+      bio: "",
+      avatar: null,
+      links: [],
+      version: 0,
+      created_at: null,
+      published: false,
+    };
+    const profile = await getOwnProfile();
+    expect(captured[0].url).toBe("/api/profile");
+    expect(captured[0].init?.method).toBeUndefined();
+    expect(profile.name).toBe("testnode");
+    expect(profile.published).toBe(false);
   });
 
-  it("pins and unpins a channel message by hash", async () => {
-    nextJson = { ok: true };
-    await pinChannelMessage("general", "a".repeat(64));
-    expect(captured[0].url).toBe("/api/channels/pin");
-    expect(bodyOf(0)).toEqual({ channel: "general", hash: "a".repeat(64) });
-    await unpinChannelMessage("general", "a".repeat(64));
-    expect(captured[1].url).toBe("/api/channels/unpin");
-    expect(bodyOf(1)).toEqual({ channel: "general", hash: "a".repeat(64) });
+  it("publishes a profile patch to /api/profile", async () => {
+    nextJson = { ok: true, profile: { name: "Tester Two", version: 1 } };
+    await setOwnProfile({
+      name: "Tester Two",
+      bio: "mesh enjoyer",
+      avatar: "ab".repeat(32),
+      links: ["https://example.org"],
+    });
+    expect(captured[0].url).toBe("/api/profile");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      name: "Tester Two",
+      bio: "mesh enjoyer",
+      avatar: "ab".repeat(32),
+      links: ["https://example.org"],
+    });
+  });
+
+  it("sets the away message with only the changed fields", async () => {
+    nextJson = { ok: true, away_message: {} };
+    await setAwayMessage({ enabled: true, message: "back on Monday" });
+    expect(captured[0].url).toBe("/api/settings/away-message");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ enabled: true, message: "back on Monday" });
+    await setAwayMessage({ enabled: false });
+    expect(bodyOf(1)).toEqual({ enabled: false });
   });
 });
 
@@ -335,5 +509,41 @@ describe("URL helpers", () => {
     expect(eventsUrl()).toBe("/api/events");
     expect(eventsUrl(42)).toBe("/api/events?since=42");
     expect(wsUrl()).toBe("ws://example.com/ws");
+  });
+});
+
+describe("group invite links", () => {
+  it("fetches the invite status by group", async () => {
+    nextJson = { group: {}, mode: "open", generation: 0, link: null };
+    await getGroupInviteStatus("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite?group=abc123");
+    expect(captured[0].init?.method).toBeUndefined();
+  });
+
+  it("mints a link without a mode, or with one", async () => {
+    nextJson = { ok: true, link: "tau://invite/abc", mode: "open", generation: 0 };
+    await mintGroupInvite("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ group: "abc123" });
+
+    await mintGroupInvite("abc123", "closed");
+    expect(bodyOf(1)).toEqual({ group: "abc123", mode: "closed" });
+  });
+
+  it("revokes invites for a group", async () => {
+    nextJson = { ok: true, generation: 1 };
+    await revokeGroupInvites("abc123");
+    expect(captured[0].url).toBe("/api/groups/invite/revoke");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ group: "abc123" });
+  });
+
+  it("joins a group from a pasted link", async () => {
+    nextJson = { ok: true, status: "pending", group: { id: "abc123" } };
+    await joinGroupViaLink("tau://invite/abc");
+    expect(captured[0].url).toBe("/api/groups/join");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ link: "tau://invite/abc" });
   });
 });

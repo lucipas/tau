@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import Composer, { MAX_FILE_BYTES, validateFile, validatePoll } from "./Composer";
+import Composer, { MAX_FILE_BYTES, validateFile, validateLocation, validatePoll } from "./Composer";
 describe("validateFile", () => {
   it("accepts files at or under 10 MiB", () => {
     const ok = new File([new ArrayBuffer(MAX_FILE_BYTES)], "ok.bin");
@@ -22,6 +22,19 @@ describe("validatePoll", () => {
     expect(validatePoll("", ["a", "b"])).toMatch(/question/);
     expect(validatePoll("q?", ["only one", ""])).toMatch(/two options/);
     expect(validatePoll("q?", ["a", "b"])).toBeNull();
+  });
+});
+
+describe("validateLocation", () => {
+  it("requires coordinates in range and a short place name", () => {
+    expect(validateLocation("", "-83.88", "")).toMatch(/Latitude is required/);
+    expect(validateLocation("north", "-83.88", "")).toMatch(/must be a number/);
+    expect(validateLocation("91", "-83.88", "")).toMatch(/between -90 and 90/);
+    expect(validateLocation("34.05", "", "")).toMatch(/Longitude is required/);
+    expect(validateLocation("34.05", "181", "")).toMatch(/between -180 and 180/);
+    expect(validateLocation("34.05", "-83.88", "x".repeat(201))).toMatch(/at most 200/);
+    expect(validateLocation("34.05", "-83.88", "Rock Springs Park")).toBeNull();
+    expect(validateLocation("34.05", "-83.88", "")).toBeNull();
   });
 });
 
@@ -70,6 +83,27 @@ describe("Composer", () => {
     );
   });
 
+  it("validates location pins before sending", async () => {
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} onSendFile={() => undefined} />);
+    fireEvent.click(screen.getByRole("button", { name: "📍 Pin" }));
+    fireEvent.click(screen.getByText("Send pin"));
+    expect(screen.getByRole("alert").textContent).toMatch(/Latitude is required/);
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Latitude"), { target: { value: "34.05" } });
+    fireEvent.change(screen.getByLabelText("Longitude"), { target: { value: "-83.88" } });
+    fireEvent.change(screen.getByLabelText("Place name"), { target: { value: "Rock Springs Park" } });
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "meet here" } });
+    fireEvent.click(screen.getByText("Send pin"));
+    expect(onSend).toHaveBeenCalledWith(
+      "meet here",
+      expect.objectContaining({
+        location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+      }),
+    );
+  });
+
   it("passes the chosen disappearing expiry to onSend", async () => {
     const onSend = vi.fn();
     render(<Composer onSend={onSend} onSendFile={() => undefined} />);
@@ -77,5 +111,57 @@ describe("Composer", () => {
     fireEvent.change(screen.getByLabelText("Message"), { target: { value: "vanish soon" } });
     fireEvent.click(screen.getByText("Send"));
     expect(onSend).toHaveBeenCalledWith("vanish soon", expect.objectContaining({ expiresIn: 3600 }));
+  });
+
+  it("hides Save draft without an onSaveDraft handler", () => {
+    render(<Composer onSend={() => undefined} onSendFile={() => undefined} />);
+    expect(screen.queryByText("Save draft")).toBeNull();
+  });
+
+  it("saves a draft and clears the box", async () => {
+    const onSaveDraft = vi.fn().mockResolvedValue(undefined);
+    render(<Composer onSend={() => undefined} onSendFile={() => undefined} onSaveDraft={onSaveDraft} />);
+    const save = screen.getByText("Save draft") as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "park me" } });
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    expect(onSaveDraft).toHaveBeenCalledWith("park me");
+    await vi.waitFor(() =>
+      expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(""),
+    );
+  });
+
+  it("keeps the text when saving a draft fails", async () => {
+    const onSaveDraft = vi.fn().mockRejectedValue(new Error("boom"));
+    render(<Composer onSend={() => undefined} onSendFile={() => undefined} onSaveDraft={onSaveDraft} />);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "keep me" } });
+    fireEvent.click(screen.getByText("Save draft"));
+    await vi.waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/Save draft failed/));
+    expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("keep me");
+  });
+
+  it("pre-fills the box from a draft seed, but never clobbers typed text", () => {
+    const { rerender } = render(
+      <Composer onSend={() => undefined} onSendFile={() => undefined} />,
+    );
+    rerender(
+      <Composer
+        onSend={() => undefined}
+        onSendFile={() => undefined}
+        draftSeed={{ key: "dm:aa", text: "saved hello" }}
+      />,
+    );
+    expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("saved hello");
+
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "my own words" } });
+    rerender(
+      <Composer
+        onSend={() => undefined}
+        onSendFile={() => undefined}
+        draftSeed={{ key: "dm:bb", text: "another draft" }}
+      />,
+    );
+    expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("my own words");
   });
 });
