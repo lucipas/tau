@@ -21,6 +21,9 @@ Global options may appear before or after the command:
 | `tau send --to PEER [--to PEER ...] TEXT` | Send a message over an encrypted link (queued if the peer is offline; `--to` is repeatable) |
 | `tau send --to PEER --reply-to ID TEXT` | Reply to an earlier message in the conversation, quoting it |
 | `tau send --to PEER --location "LAT,LON [PLACE]"` | Pin a place on the message (static pin; without message text the place name — or the coordinates — becomes the text; the pin renders in `tau messages` and the console with an open-in-maps link; `tau beacon` shares live location as a series of these pins) |
+| `tau send --to PEER TEXT --poll-options A B` | Ask a question with 2–8 options in a DM (the poll renders with its tally in `tau messages` and the console) |
+| `tau vote --to PEER POLL OPTION` | Vote on a DM poll (option number or exact text; one standing vote per voter, latest wins) |
+| `tau close-poll --to PEER POLL` | Close a DM poll you created (freezes the tally; only the creator can close it) |
 | `tau beacon start PEER --location "LAT,LON [PLACE]"` | Share live location with a peer or group as periodic pin updates (default every 5 min for 1 h; `--group GROUP` for a group, `--coarse` rounds each update to ~1 km and drops the place name, `--location-file PATH` re-reads a JSON position file on every update, `--duration-mins N` and `--interval-mins N` tune the schedule; updates go out from the serving node, `tau serve`, and queue in the outbox when the peer is offline) |
 | `tau beacon stop PEER` | Stop sharing live location with a peer or group (`--group GROUP` for a group) |
 | `tau beacon update PEER --location "LAT,LON [PLACE]"` | Refresh a running beacon's position or position file (`--location-file PATH` to attach a file instead) |
@@ -51,6 +54,7 @@ Global options may appear before or after the command:
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
 | `tau messages delete ID` | Delete one stored direct message from the local inbox (full id or unique prefix) |
 | `tau messages unread PEER` | Mark a conversation unread again so it shows in the unread view (newest message only; `--all` for the whole conversation) |
+| `tau quiet-hours set --start 22:00 --end 07:00` | Silence the unread badge every day between two local times (an end earlier than the start means overnight; `tau quiet-hours off` turns it off keeping the window, `tau quiet-hours status` shows the window and whether it is quiet now; while quiet, every conversation counts as unread 0 and no message carries the unread marker — read cursors are untouched, so the counts come back when the window ends) |
 | `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
