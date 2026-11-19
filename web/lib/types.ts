@@ -315,10 +315,35 @@ export interface LocationPin {
 }
 
 export interface LiveBeacon {
-  latitude: number;
-  longitude: number;
-  expires_at?: number;
+  /** Beacon id (8 random bytes, hex). */
+  id: string;
+  /** Unix time the beacon stops sharing. */
+  expires_at: number;
+  /** Update sequence number, 1-based. */
+  seq: number;
   [key: string]: unknown;
+}
+
+/** A live beacon this node is sharing, as served by GET /api/beacons. */
+export interface Beacon {
+  id: string;
+  /** Destination hash of the DM peer, or the group id. */
+  target: string;
+  target_kind: "dm" | "group";
+  target_name: string;
+  started_at: number;
+  expires_at: number;
+  /** Seconds between updates. */
+  interval: number;
+  coarse: boolean;
+  location: { lat: number; lon: number; name?: string };
+  location_file?: string;
+  next_update_at: number;
+  updates_sent: number;
+  stopped: boolean;
+  /** Still sharing: not stopped and unexpired. */
+  active: boolean;
+  expires_in_seconds: number;
 }
 
 export interface GroupPollVote {

@@ -23,6 +23,14 @@ from tau import cli
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
 from tau.away import DEFAULT_AWAY_MESSAGE
 from tau.backup import MANIFEST_NAME, restore_backup
+from tau.beacons import (
+    BEACON_DEFAULT_DURATION,
+    BEACON_UPDATE_INTERVAL,
+    BeaconsError,
+    beacons_lock,
+    load_beacons,
+    save_beacons,
+)
 from tau.blocklist import BlockList, load_blocklist, save_blocklist
 from tau.config import TauConfig
 from tau.groups import GroupStore
@@ -31,6 +39,7 @@ from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.node import NodeError
 from tau.peers import AmbiguousPeer, Peer, PeerError
+from tau.protocol import location_default_text
 from tau.webapi import (
     SUBSCRIBER_QUEUE_SIZE,
     PeerForgetBlocked,
@@ -178,6 +187,7 @@ class FakeNode:
             allowlist_path=data_dir / "allowlist.json",
             blocklist_path=data_dir / "blocklist.json",
             ignored_groups_path=data_dir / "ignored-groups.json",
+            beacons_path=data_dir / "beacons.json",
         )
         self._allowlist = AllowList()
         self._allowlist_lock = threading.RLock()
@@ -200,6 +210,10 @@ class FakeNode:
         )
         self.sent = []
         self.group_sent = []
+        self.last_location = None
+        self.last_beacon = None
+        self.last_group_location = None
+        self.last_group_beacon = None
         self.group_reactions = []
         self.typing = []
         self.group_typing = []
@@ -337,18 +351,22 @@ class FakeNode:
         in_reply_to=None,
         expires_at=None,
         send_after=None,
+        kind=None,
+        location=None,
+        beacon=None,
         poll_options=None,
         poll_vote=None,
         poll_close=None,
-        location=None,
     ):
         self.sent.append((peer.name, text, in_reply_to))
         self.last_expires_at = expires_at
         self.last_send_after = send_after
+        self.last_kind = kind
+        self.last_location = location
+        self.last_beacon = beacon
         self.last_poll_options = poll_options
         self.last_poll_vote = poll_vote
         self.last_poll_close = poll_close
-        self.last_location = location
         # A distinct wire id per send, like the real node's generated id.
         wire_id = f"{len(self.sent):032d}"
         return {
@@ -362,17 +380,19 @@ class FakeNode:
     def send_group_message(
         self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
         expires_at=None, send_after=None, in_reply_to=None,
+        kind=None, location=None, beacon=None,
         poll_options=None, poll_vote=None, poll_close=None,
-        location=None,
     ):
         self.group_sent.append((group["name"], text))
         self.last_group_expires_at = expires_at
         self.last_group_send_after = send_after
         self.last_group_in_reply_to = in_reply_to
+        self.last_group_kind = kind
+        self.last_group_location = location
+        self.last_group_beacon = beacon
         self.last_group_poll_options = poll_options
         self.last_group_poll_vote = poll_vote
         self.last_group_poll_close = poll_close
-        self.last_group_location = location
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -419,6 +439,103 @@ class FakeNode:
             "sent_at": 1000.0,
             "results": results,
         }
+
+    def start_beacon(
+        self,
+        target,
+        location,
+        *,
+        group=False,
+        coarse=False,
+        duration=BEACON_DEFAULT_DURATION,
+        interval=BEACON_UPDATE_INTERVAL,
+        location_file=None,
+        timeout=20.0,
+        discover_timeout=None,
+        now=None,
+    ):
+        """Test stand-in for TauNode.start_beacon: same store, no network."""
+        import time as _time
+
+        now = _time.time() if now is None else now
+        if group:
+            self.groups.list_groups()
+            record = self.groups.find(target)
+            if record is None:
+                raise NodeError(f"unknown group: {target!r}")
+            target_hash = record["id"]
+            target_kind = "group"
+            target_name = record["name"]
+        else:
+            peer = self.resolve_peer(
+                target,
+                timeout=discover_timeout
+                if discover_timeout is not None
+                else min(timeout, 10.0),
+            )
+            target_hash = peer.hexhash
+            target_kind = "dm"
+            target_name = peer.display_name
+        try:
+            with beacons_lock(self.config.beacons_path):
+                beacons = load_beacons(self.config.beacons_path)
+                beacon = beacons.start(
+                    target=target_hash,
+                    target_kind=target_kind,
+                    target_name=target_name,
+                    location=location,
+                    coarse=coarse,
+                    duration=duration,
+                    interval=interval,
+                    location_file=location_file,
+                    now=now,
+                )
+                save_beacons(self.config.beacons_path, beacons)
+        except BeaconsError as exc:
+            raise NodeError(str(exc)) from exc
+        return beacon
+
+    def send_beacon_update(self, beacon, *, now=None):
+        """Test stand-in for TauNode.send_beacon_update: same sends, no network."""
+        import time as _time
+
+        now = _time.time() if now is None else now
+        try:
+            location = beacon.current_location()
+        except BeaconsError as exc:
+            raise NodeError(str(exc)) from exc
+        seq = beacon.updates_sent + 1
+        marker = beacon.wire_marker(seq)
+        text = location_default_text(location)
+        if beacon.target_kind == "group":
+            self.groups.list_groups()
+            record = self.groups.find(beacon.target)
+            if record is None:
+                raise NodeError(f"unknown group: {beacon.target!r}")
+            result = self.send_group_message(
+                record, text, location=location, beacon=marker, kind="location"
+            )
+        else:
+            peer = self.resolve_peer(beacon.target)
+            result = self.send_message(
+                peer, text, location=location, beacon=marker, kind="location"
+            )
+        beacon.updates_sent = seq
+        beacon.next_update_at = now + beacon.interval
+        try:
+            with beacons_lock(self.config.beacons_path):
+                stored = load_beacons(self.config.beacons_path)
+                current = stored.get(beacon.id)
+                if current is not None:
+                    current.updates_sent = seq
+                    current.next_update_at = beacon.next_update_at
+                    save_beacons(self.config.beacons_path, stored)
+        except BeaconsError:  # pragma: no cover - disk failure
+            pass
+        callback = getattr(self, "on_beacon_update", None)
+        if callable(callback):
+            callback(beacon, result)
+        return result
 
     def approve_join_request(self, group, peer):
         """Test stand-in for TauNode.approve_join_request."""
@@ -14243,6 +14360,313 @@ def test_typing_event_reaches_the_bus(bridge, node):
     assert event["type"] == "typing"
     assert event["peer"] == PEER_HASH
     assert event["state"] == "start"
+
+
+# ------------------------------------------------------------------ beacons
+
+BEACON_PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+BEACON_PIN_2 = {"lat": 34.06, "lon": -83.87}
+
+
+def _start_beacon(bridge, **body):
+    return _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", **BEACON_PIN, **body},
+    )
+
+
+def test_beacons_endpoint_lists_active_beacons(bridge, node):
+    status, _, payload = _json(bridge, "/api/beacons")
+    assert status == 200
+    assert payload == {"beacons": [], "count": 0}
+
+    status, _, started = _start_beacon(bridge, duration_seconds=900)
+    assert status == 200
+    beacon = started["beacon"]
+    assert beacon["target"] == PEER_HASH
+    assert beacon["target_kind"] == "dm"
+    assert beacon["active"] is True
+    assert beacon["updates_sent"] == 1
+
+    status, _, payload = _json(bridge, "/api/beacons")
+    assert status == 200
+    assert payload["count"] == 1
+    assert payload["beacons"][0]["id"] == beacon["id"]
+
+
+def test_beacon_start_sends_first_update_and_records_it(bridge, node, tmp_path):
+    status, _, payload = _start_beacon(bridge, duration_seconds=900)
+    assert status == 200
+    beacon = payload["beacon"]
+    # The first update goes out at once, as a location message with
+    # the beacon marker — and the sender's thread shows it.
+    assert node.sent[0][1] == "Rock Springs Park"
+    assert node.last_location == BEACON_PIN
+    assert node.last_beacon == {
+        "id": beacon["id"],
+        "expires_at": beacon["expires_at"],
+        "seq": 1,
+    }
+    assert node.last_kind == "location"
+    # The browser feeds positions through a file the mail loop
+    # re-reads; it starts life holding the start position.
+    position_file = tmp_path / "beacon-positions" / f"{beacon['id']}.json"
+    assert position_file.is_file()
+    assert json.loads(position_file.read_text(encoding="utf-8")) == BEACON_PIN
+    status, _, listed = _json(bridge, "/api/messages")
+    entries = [m for m in listed["messages"] if m.get("beacon")]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["direction"] == "out"
+    assert entry["peer"] == PEER_HASH
+    assert entry["location"] == BEACON_PIN
+    assert entry["beacon"] == {
+        "id": beacon["id"],
+        "expires_at": beacon["expires_at"],
+        "seq": 1,
+    }
+
+
+def test_beacon_start_records_one_entry_for_a_group(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "group": group_id,
+            "lat": 34.05,
+            "lon": -83.88,
+            "duration_seconds": 900,
+        },
+    )
+    assert status == 200
+    beacon = payload["beacon"]
+    assert beacon["target_kind"] == "group"
+    assert node.last_group_location == {"lat": 34.05, "lon": -83.88}
+    assert node.last_group_beacon["id"] == beacon["id"]
+    # One entry for the update, not one per leg: a group beacon
+    # must not spam the sender's thread once per member.
+    status, _, listed = _json(bridge, "/api/messages")
+    entries = [m for m in listed["messages"] if m.get("beacon")]
+    assert len(entries) == 1
+    assert entries[0]["group"] == group_id
+    assert entries[0]["peer"] is None
+    assert entries[0]["sent_at"] == 1000.0
+
+
+def test_beacon_start_rejects_bad_requests(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", "lat": 91.0, "lon": -83.88},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", "lat": 34.05, "lon": -83.88, "duration_seconds": 30},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={
+            "peer": "alice",
+            "lat": 34.05,
+            "lon": -83.88,
+            "duration_seconds": 99999,
+        },
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"lat": 34.05, "lon": -83.88},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", "group": "ab" * 16, "lat": 34.05, "lon": -83.88},
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "alice", "lat": 34.05, "lon": -83.88, "coarse": "yes"},
+    )
+    assert status == 400
+    assert node.sent == []
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/start",
+        method="POST",
+        body={"peer": "nobody", "lat": 34.05, "lon": -83.88},
+    )
+    assert status == 502
+
+
+def test_beacon_position_feeds_the_beacon(bridge, node, tmp_path):
+    _, _, started = _start_beacon(bridge, duration_seconds=900)
+    beacon_id = started["beacon"]["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": beacon_id, **BEACON_PIN_2},
+    )
+    assert status == 200
+    assert payload["beacon"]["location"] == BEACON_PIN_2
+    position_file = tmp_path / "beacon-positions" / f"{beacon_id}.json"
+    assert json.loads(position_file.read_text(encoding="utf-8")) == BEACON_PIN_2
+    # The next tick sends the fed position, not the start one.
+    beacon = load_beacons(node.config.beacons_path).get(beacon_id)
+    node.send_beacon_update(beacon)
+    assert node.last_location == BEACON_PIN_2
+    assert node.last_beacon["seq"] == 2
+
+
+def test_beacon_position_rejects_unknown_stopped_and_bad(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": "00" * 8, "lat": 34.05, "lon": -83.88},
+    )
+    assert status == 400
+    _, _, started = _start_beacon(bridge, duration_seconds=900)
+    beacon_id = started["beacon"]["id"]
+    status, _, payload = _json(
+        bridge, "/api/beacons/stop", method="POST", body={"id": beacon_id}
+    )
+    assert status == 200
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": beacon_id, "lat": 34.05, "lon": -83.88},
+    )
+    assert status == 400
+    assert "not running" in payload["error"]["message"]
+    _, _, started = _start_beacon(bridge, duration_seconds=900)
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": started["beacon"]["id"], "lat": 91.0, "lon": -83.88},
+    )
+    assert status == 400
+
+
+def test_beacon_position_refuses_a_foreign_position_file(bridge, node, tmp_path):
+    # A beacon the CLI started with its own --location-file keeps
+    # that file: the console must not clobber a GPS writer it
+    # does not own.
+    foreign = tmp_path / "gps.json"
+    foreign.write_text(
+        json.dumps({"lat": 34.05, "lon": -83.88}), encoding="utf-8"
+    )
+    beacon = node.start_beacon(
+        "alice",
+        dict(BEACON_PIN),
+        location_file=str(foreign),
+        duration=900.0,
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/beacons/position",
+        method="POST",
+        body={"id": beacon.id, "lat": 34.06, "lon": -83.87},
+    )
+    assert status == 400
+    assert "another writer" in payload["error"]["message"]
+    assert json.loads(foreign.read_text(encoding="utf-8")) == {
+        "lat": 34.05,
+        "lon": -83.88,
+    }
+
+
+def test_beacon_stop_stops_and_drops_the_position_file(bridge, node, tmp_path):
+    _, _, started = _start_beacon(bridge, duration_seconds=900)
+    beacon_id = started["beacon"]["id"]
+    position_file = tmp_path / "beacon-positions" / f"{beacon_id}.json"
+    assert position_file.is_file()
+    status, _, payload = _json(
+        bridge, "/api/beacons/stop", method="POST", body={"id": beacon_id}
+    )
+    assert status == 200
+    assert payload["beacon"]["stopped"] is True
+    assert payload["beacon"]["active"] is False
+    assert not position_file.exists()
+    # Stopping again is a no-op the API reports, not a silent ok.
+    status, _, payload = _json(
+        bridge, "/api/beacons/stop", method="POST", body={"id": beacon_id}
+    )
+    assert status == 400
+    status, _, payload = _json(
+        bridge, "/api/beacons/stop", method="POST", body={"id": "00" * 8}
+    )
+    assert status == 400
+    status, _, payload = _json(bridge, "/api/beacons/stop", method="POST", body={})
+    assert status == 400
+
+
+def test_record_inbound_attaches_location_and_beacon(bridge):
+    message = bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "Rock Springs Park",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "00" * 16,
+            "location": dict(BEACON_PIN),
+            "beacon": {"id": "aa" * 8, "expires_at": 4600.0, "seq": 3},
+        }
+    )
+    assert message is not None
+    assert message["location"] == BEACON_PIN
+    assert message["beacon"] == {"id": "aa" * 8, "expires_at": 4600.0, "seq": 3}
+    # A malformed marker drops instead of the message.
+    message = bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "Rock Springs Park",
+            "sent_at": 1002.0,
+            "received_at": 1003.0,
+            "id": "11" * 16,
+            "location": dict(BEACON_PIN),
+            "beacon": {"id": "not-a-beacon"},
+        }
+    )
+    assert message is not None
+    assert message["location"] == BEACON_PIN
+    assert "beacon" not in message
+
+
+def test_beacon_update_event_reaches_the_bus(bridge, node):
+    # The bridge chains the node's on_beacon_update callback, so a
+    # mail-loop tick lands in the console history as a live event.
+    beacon = node.start_beacon("alice", dict(BEACON_PIN), duration=900.0)
+    subscriber = bridge.bus.subscribe()
+    try:
+        node.on_beacon_update(beacon, {"id": "00" * 16, "queued": False})
+        event = subscriber.get(timeout=5)
+    finally:
+        bridge.bus.unsubscribe(subscriber)
+    assert event["type"] == "message"
+    assert event["message"]["beacon"]["id"] == beacon.id
+    assert event["message"]["location"] == BEACON_PIN
 
 
 def test_react_endpoint_fans_out_to_group_members(bridge, node):

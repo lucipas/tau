@@ -79,6 +79,14 @@ script) can read what arrives from the mesh and send messages back:
                            or retract ``{"target": "<wire id>", "clear": true}``
     POST /api/typing       typing ``{"peer": "<hash>", "state": "start"|"stop"}``
                            or ``{"group": "<id>", "state": "start"|"stop"}``
+    GET  /api/beacons      live beacons this node is sharing, active first
+    POST /api/beacons/start start a live beacon ``{"peer": "<name or hash>", "lat": ..,
+                           "lon": .., "name": "..", "duration_seconds": 3600,
+                           "coarse": false}`` (or ``"group"`` for a group);
+                           the browser feeds fresh positions afterwards
+    POST /api/beacons/stop stop a live beacon ``{"id": "<beacon id>"}``
+    POST /api/beacons/position feed a beacon a fresh position
+                           ``{"id": "<beacon id>", "lat": .., "lon": .., "name": ".."}``
     POST /api/messages/delete delete ``{"id": <console message id>}`` from
                            the console history (and the node inbox, when the
                            message carries a wire id)
@@ -305,6 +313,15 @@ from .dm_requests import (
 )
 from .away import AwayError, AwayState, away_lock, load_away, save_away
 from .backup import BackupError, create_backup
+from .beacons import (
+    BEACON_DEFAULT_DURATION,
+    BEACON_MAX_DURATION,
+    Beacon,
+    BeaconsError,
+    beacons_lock,
+    load_beacons,
+    save_beacons,
+)
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
@@ -392,7 +409,7 @@ from .protocol import (
     sanitize_name,
     short_hash,
 )
-from .util import atomic_write_json, read_json
+from .util import atomic_write_json, ensure_dir, read_json
 
 log = logging.getLogger(__name__)
 
@@ -1249,6 +1266,26 @@ class WebBridge:
 
         node.on_typing = _on_typing
 
+        # Beacon updates arrive on the same node callback pattern:
+        # chain any callback the node already has, then record the
+        # update in the console history like any other sent message
+        # (see :meth:`record_beacon_update`).  The callback runs in
+        # the mail loop for later updates as well as for the first
+        # one, so the sender's thread shows every update, not just
+        # the one the start call sent.
+        previous_on_beacon_update = getattr(node, "on_beacon_update", None)
+
+        def _on_beacon_update(
+            beacon: Beacon, result: Dict[str, Any]
+        ) -> None:
+            try:
+                if callable(previous_on_beacon_update):
+                    previous_on_beacon_update(beacon, result)
+            finally:
+                self.record_beacon_update(beacon, result)
+
+        node.on_beacon_update = _on_beacon_update
+
         # Edits arrive on the same node callback pattern: chain any edit
         # callback the node already has, then update the console history
         # entry the edit targets.
@@ -1850,6 +1887,24 @@ class WebBridge:
             # landed, and appending now would resurrect it after a
             # successful retraction.
             return None
+        # A location pin and a live-beacon marker ride on the entry
+        # so the feed can render the pin with its map link and tell
+        # a live update from a one-off pin; a malformed value drops
+        # instead of the entry (the message is still readable).
+        # The append itself carries neither (see
+        # :meth:`_append_message`), so they are attached here and
+        # saved, like the reaction overlay below.
+        attached = False
+        location = clean_location(record.get("location"))
+        if location is not None and message.get("location") != location:
+            message["location"] = location
+            attached = True
+        marker = clean_beacon(record.get("beacon"))
+        if marker is not None and message.get("beacon") != marker:
+            message["beacon"] = marker
+            attached = True
+        if attached:
+            self._save_messages()
         # An edit that overtook this callback was buffered by record_edit;
         # apply it now so the appended entry shows the current text.
         if isinstance(wire_id, str) and peer_hash:
@@ -5806,6 +5861,267 @@ class WebBridge:
                 self._publish_message_updated(message)
             messages.append(message)
         return messages, response
+
+    # -- live location beacons ------------------------------------------
+
+    def _beacons_path(self) -> Optional[Path]:
+        """This node's beacons path, or ``None`` for a dataless node."""
+        path = getattr(self.node.config, "beacons_path", None)
+        return Path(path) if path is not None else None
+
+    def _beacon_position_path(self, beacon_id: str) -> Optional[Path]:
+        """Where this beacon's browser-fed position file lives.
+
+        One file per beacon under ``beacon-positions/`` next to
+        ``beacons.json``: the serving node's mail loop re-reads it
+        on every tick, so the browser's geolocation moves the beacon
+        without the bridge touching the beacon store each time.  A
+        beacon the CLI started with its own ``--location-file`` keeps
+        that file instead — the console never writes into a file
+        another writer owns (see :meth:`update_beacon_position`).
+        """
+        base = self._beacons_path()
+        if base is None:
+            return None
+        return base.parent / "beacon-positions" / f"{beacon_id}.json"
+
+    @staticmethod
+    def _beacon_summary(
+        beacon: Beacon, now: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """A beacon as JSON: its schedule, position and live state."""
+        now = time.time() if now is None else now
+        summary = beacon.to_dict()
+        summary["active"] = beacon.is_active(now)
+        summary["expires_in_seconds"] = max(0.0, beacon.expires_at - now)
+        return summary
+
+    def list_beacons(self) -> Dict[str, Any]:
+        """Every beacon this node owns, active first, with live state."""
+        path = self._beacons_path()
+        if path is None:
+            return {"beacons": [], "count": 0}
+        with beacons_lock(path):
+            stored = load_beacons(path)
+            now = time.time()
+            summaries = [
+                self._beacon_summary(beacon, now)
+                for beacon in sorted(
+                    stored.beacons.values(),
+                    key=lambda b: (not b.is_active(now), b.started_at),
+                )
+            ]
+        return {"beacons": summaries, "count": len(summaries)}
+
+    def start_beacon(
+        self,
+        target: str,
+        location: Dict[str, Any],
+        *,
+        group: bool = False,
+        coarse: bool = False,
+        duration: float = BEACON_DEFAULT_DURATION,
+    ) -> Dict[str, Any]:
+        """Start a live beacon from the console and send its first update.
+
+        Mirrors ``tau beacon start`` (see :func:`tau.cli._beacon_start_local`):
+        the beacon is stored, its first update goes out at once, and
+        later updates go out from the mail loop.  The browser feeds
+        fresh positions afterwards through :meth:`update_beacon_position`,
+        which writes the position file the tick re-reads — so the
+        beacon follows the sender instead of repeating its start
+        position.  ``duration`` is seconds (60s..8h, default 1h).
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer or group is required")
+        cleaned = clean_location(location)
+        if cleaned is None:
+            raise ValueError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(duration)
+        ):
+            raise ValueError("duration_seconds must be a number")
+        duration = float(duration)
+        if not 60.0 <= duration <= BEACON_MAX_DURATION:
+            raise ValueError(
+                "duration_seconds must be between 60 and "
+                f"{int(BEACON_MAX_DURATION)}"
+            )
+        beacon = self.node.start_beacon(
+            target.strip(),
+            cleaned,
+            group=bool(group),
+            coarse=bool(coarse),
+            duration=duration,
+        )
+        # The position file is written before the first update, so
+        # the update already reads through it; a failure here only
+        # logs — the beacon still runs from its start position, and
+        # the next position feed attaches the file then.
+        position_path = self._beacon_position_path(beacon.id)
+        if position_path is not None:
+            try:
+                ensure_dir(position_path.parent)
+                atomic_write_json(position_path, cleaned, mode=0o600)
+                beacon.location_file = str(position_path)
+                path = self._beacons_path()
+                if path is not None:
+                    with beacons_lock(path):
+                        stored = load_beacons(path)
+                        current = stored.get(beacon.id)
+                        if current is not None:
+                            current.location_file = str(position_path)
+                            save_beacons(path, stored)
+            except (OSError, BeaconsError) as exc:
+                log.warning(
+                    "Could not attach a position file to beacon %s: %s",
+                    beacon.id,
+                    exc,
+                )
+        update = self.node.send_beacon_update(beacon)
+        return {"beacon": self._beacon_summary(beacon), "update": update}
+
+    def stop_beacon(self, beacon_id: str) -> Dict[str, Any]:
+        """Stop a live beacon by id.
+
+        An unknown id, or a beacon already stopped or expired,
+        raises ``ValueError``: a stop the caller cannot see taking
+        effect must not read as a success.
+        """
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            raise ValueError("field 'id' is required")
+        path = self._beacons_path()
+        if path is None:
+            raise ValueError(f"unknown beacon: {beacon_id.strip()!r}")
+        beacon_id = beacon_id.strip()
+        with beacons_lock(path):
+            stored = load_beacons(path)
+            stopped = stored.stop_by_id(beacon_id)
+            if stopped is None:
+                raise ValueError(f"unknown beacon: {beacon_id!r}")
+            save_beacons(path, stored)
+        # A console-fed position file is stale once the beacon stops;
+        # drop it.  A CLI beacon's own --location-file is never
+        # under beacon-positions/, so it is left alone.
+        position_path = self._beacon_position_path(beacon_id)
+        if position_path is not None and position_path.is_file():
+            try:
+                position_path.unlink()
+            except OSError:
+                pass
+        return {"beacon": self._beacon_summary(stopped)}
+
+    def update_beacon_position(
+        self, beacon_id: str, location: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Feed a running beacon a fresh position from the browser.
+
+        Writes the beacon's position file (creating the console's
+        own one when the beacon has none yet), so the next mail-loop
+        tick sends the new position.  A beacon whose position comes
+        from another writer's file is refused: the console must not
+        clobber a GPS writer it does not own.
+        """
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            raise ValueError("field 'id' is required")
+        cleaned = clean_location(location)
+        if cleaned is None:
+            raise ValueError(
+                "location must have a latitude -90..90 and a longitude -180..180"
+            )
+        path = self._beacons_path()
+        if path is None:
+            raise ValueError(f"unknown beacon: {beacon_id.strip()!r}")
+        beacon_id = beacon_id.strip()
+        position_path = self._beacon_position_path(beacon_id)
+        if position_path is None:
+            raise ValueError("this node has no beacons store")
+        with beacons_lock(path):
+            stored = load_beacons(path)
+            beacon = stored.get(beacon_id)
+            if beacon is None:
+                raise ValueError(f"unknown beacon: {beacon_id!r}")
+            if not beacon.is_active():
+                raise ValueError("beacon is not running")
+            owned = (
+                beacon.location_file is None
+                or Path(beacon.location_file) == position_path
+            )
+            if not owned:
+                raise ValueError(
+                    "this beacon's position comes from another writer"
+                )
+            ensure_dir(position_path.parent)
+            atomic_write_json(position_path, cleaned, mode=0o600)
+            beacon.location = cleaned
+            beacon.location_file = str(position_path)
+            save_beacons(path, stored)
+        return {"beacon": self._beacon_summary(beacon)}
+
+    def record_beacon_update(
+        self, beacon: Beacon, result: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Record one beacon update in the console history.
+
+        Called from the node's ``on_beacon_update`` callback, so the
+        first update and every mail-loop tick alike land in the
+        sender's thread as a live location entry — one entry per
+        update, not one per leg, so a group beacon does not spam the
+        thread once per member.  The entry carries the pin and the
+        beacon marker, so the feed renders it with its map link and
+        live countdown, exactly like a received update.
+        """
+        try:
+            location = beacon.current_location()
+        except BeaconsError as exc:
+            log.warning("Beacon update has no valid position: %s", exc)
+            return None
+        marker = beacon.wire_marker(beacon.updates_sent)
+        text = location_default_text(location)
+        is_group = beacon.target_kind == "group"
+        legs = result.get("results") if isinstance(result, dict) else None
+        if is_group and isinstance(legs, list):
+            queued = all(bool(leg.get("queued")) for leg in legs) if legs else False
+            delivered = any(bool(leg.get("delivered")) for leg in legs)
+            status = "queued" if queued else "delivered" if delivered else "failed"
+            sent_at = result.get("sent_at")
+            if not isinstance(sent_at, (int, float)) or isinstance(
+                sent_at, bool
+            ):
+                sent_at = time.time()
+        else:
+            status = "queued" if result.get("queued") else "delivered"
+            sent_at = time.time()
+        wire_id = result.get("id") if isinstance(result.get("id"), str) else None
+        with self._send_lock:
+            message = self._append_message(
+                direction="out",
+                peer=None if is_group else beacon.target,
+                peer_name=beacon.target_name
+                or short_hash(beacon.target),
+                text=text,
+                sent_at=float(sent_at),
+                received_at=time.time(),
+                status=status,
+                group=beacon.target if is_group else None,
+                group_name=beacon.target_name if is_group else None,
+                wire_id=wire_id if not is_group else None,
+            )
+            if message is None:
+                return None
+            # The append carries no pin or marker (see
+            # :meth:`_append_message`), so they are attached here
+            # and saved, like the reaction overlay in
+            # :meth:`record_inbound`.
+            message["location"] = location
+            message["beacon"] = marker
+            self._save_messages()
+        self.bus.publish({"type": "message", "message": message})
+        return message
 
     def _resolve_group_poll_record(
         self, group_id: str, ref: Any
@@ -11536,6 +11852,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                     {"requests": requests, "count": len(requests)}, head_only
                 )
                 return
+            if path == "/api/beacons":
+                try:
+                    beacons = self.bridge.list_beacons()
+                except BeaconsError as exc:
+                    # A damaged beacons file is a server fault, not a
+                    # bad request: answer with its message instead of
+                    # a 500 traceback on every console poll.
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                self._send_json(beacons, head_only)
+                return
             if path == "/api/conversations/archived":
                 try:
                     result = self.bridge.archived_conversations()
@@ -12246,6 +12575,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/typing":
                 self._handle_typing(body, head_only)
+                return
+            if path == "/api/beacons/start":
+                self._handle_beacon_start(body, head_only)
+                return
+            if path == "/api/beacons/stop":
+                self._handle_beacon_stop(body, head_only)
+                return
+            if path == "/api/beacons/position":
+                self._handle_beacon_position(body, head_only)
                 return
             if path == "/api/messages/delete":
                 self._handle_delete_message(body, head_only)
@@ -14934,6 +15272,109 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
             return
         self._send_json(result, head_only)
+
+    def _handle_beacon_start(self, body: Dict[str, Any], head_only: bool) -> None:
+        peer = body.get("peer")
+        group = body.get("group")
+        if peer is not None and group is not None:
+            self._send_json(
+                {"error": {"message": "pass 'peer' or 'group', not both"}},
+                head_only,
+                400,
+            )
+            return
+        if peer is None and group is None:
+            self._send_json(
+                {"error": {"message": "pass 'peer' or 'group'"}},
+                head_only,
+                400,
+            )
+            return
+        target = peer if peer is not None else group
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'peer'/'group' is required"}},
+                head_only,
+                400,
+            )
+            return
+        coarse = body.get("coarse", False)
+        if not isinstance(coarse, bool):
+            self._send_json(
+                {"error": {"message": "field 'coarse' must be true or false"}},
+                head_only,
+                400,
+            )
+            return
+        location: Dict[str, Any] = {"lat": body.get("lat"), "lon": body.get("lon")}
+        if isinstance(body.get("name"), str):
+            location["name"] = body["name"]
+        try:
+            started = self.bridge.start_beacon(
+                target.strip(),
+                location,
+                group=group is not None,
+                coarse=coarse,
+                duration=body.get("duration_seconds", BEACON_DEFAULT_DURATION),
+            )
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except (BeaconsError, MailboxError, OSError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, **started}, head_only)
+
+    def _handle_beacon_stop(self, body: Dict[str, Any], head_only: bool) -> None:
+        beacon_id = body.get("id")
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            self._send_json(
+                {"error": {"message": "field 'id' is required"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            stopped = self.bridge.stop_beacon(beacon_id.strip())
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except (BeaconsError, OSError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, **stopped}, head_only)
+
+    def _handle_beacon_position(
+        self, body: Dict[str, Any], head_only: bool
+    ) -> None:
+        beacon_id = body.get("id")
+        if not isinstance(beacon_id, str) or not beacon_id.strip():
+            self._send_json(
+                {"error": {"message": "field 'id' is required"}},
+                head_only,
+                400,
+            )
+            return
+        location: Dict[str, Any] = {"lat": body.get("lat"), "lon": body.get("lon")}
+        if isinstance(body.get("name"), str):
+            location["name"] = body["name"]
+        try:
+            updated = self.bridge.update_beacon_position(
+                beacon_id.strip(), location
+            )
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except (BeaconsError, OSError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, **updated}, head_only)
 
     def _handle_bundle_export(self, body: Dict[str, Any], head_only: bool) -> None:
         include_tan = body.get("include_tan", False)

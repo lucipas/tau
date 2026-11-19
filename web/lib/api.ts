@@ -17,6 +17,7 @@ import type {
   AllowList,
   ApiErrorBody,
   AwayMessageSettings,
+  Beacon,
   BlockResult,
   BroadcastList,
   BroadcastSendResponse,
@@ -440,6 +441,51 @@ export async function voteDmPoll(
 
 export async function closeDmPoll(peer: string, poll: string): Promise<DmPollActionResult> {
   return post("/api/dm/close-poll", { to: peer, poll });
+}
+
+// --------------------------------------------------------------- beacons --
+
+/** Live beacons this node is sharing, active first. */
+export async function getBeacons(): Promise<{ beacons: Beacon[]; count: number }> {
+  return get("/api/beacons");
+}
+
+export interface StartBeaconOptions {
+  lat: number;
+  lon: number;
+  name?: string;
+  /** Seconds the beacon runs (60..28800, default 3600). */
+  durationSeconds?: number;
+  /** Round updates to ~1 km and drop the place name. */
+  coarse?: boolean;
+}
+
+/** Start a live beacon; the first update goes out at once. */
+export async function startBeacon(
+  target: { peer?: string; group?: string },
+  opts: StartBeaconOptions,
+): Promise<{ beacon: Beacon; update: unknown }> {
+  return post("/api/beacons/start", { ...target, ...opts });
+}
+
+/** Stop a live beacon by id. */
+export async function stopBeacon(id: string): Promise<{ beacon: Beacon }> {
+  return post("/api/beacons/stop", { id });
+}
+
+/** Feed a running beacon a fresh position from the browser's geolocation. */
+export async function updateBeaconPosition(
+  id: string,
+  lat: number,
+  lon: number,
+  name?: string,
+): Promise<{ beacon: Beacon }> {
+  return post("/api/beacons/position", {
+    id,
+    lat,
+    lon,
+    ...(name !== undefined ? { name } : {}),
+  });
 }
 
 // -------------------------------------------------------------- messages --
