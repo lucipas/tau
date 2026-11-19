@@ -529,6 +529,7 @@ export default function ChatSection() {
             loading={outbox.loading}
             error={outbox.error}
             onCancel={(target) => void outbox.cancel(target)}
+            onEdit={(target, patch) => void outbox.edit(target, patch)}
             onRetry={(target) => void outbox.retry(target)}
             onDropHeld={(target) => void outbox.dropHeld(target)}
           />

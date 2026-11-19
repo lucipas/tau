@@ -163,6 +163,7 @@ The same bridge is the local integration point for scripts:
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
+| `/api/outbox/edit` | POST | edit a scheduled message before it sends (`{"target": "<message id or prefix>", "text": ..., "send_in": <seconds from now>}`) |
 | `/api/bundle/export` | POST | build a signed sneakernet bundle `{"include_tan": true}` |
 | `/api/bundle/import` | POST | merge a bundle document (the signed JSON) into this node |
 | `/api/outbox/retry` | POST | retry queued mail now, ignoring backoff (`{"target": "<message id or prefix>"}` for one entry; omit it to retry everything) |
@@ -398,6 +399,7 @@ Global options may appear before or after the command:
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
+| `tau outbox edit ID [--text TEXT] [--delay DURATION]` | Edit a scheduled DM or group message before it sends (text and/or send time; group edits update every leg) |
 | `tau id` | Show this node's name, destination hash, and LXMF delivery address |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |

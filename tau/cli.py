@@ -1631,6 +1631,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     outbox_cancel.set_defaults(func=cmd_outbox_cancel)
 
+    outbox_edit = outbox_sub.add_parser(
+        "edit",
+        parents=[common],
+        help="edit a scheduled message before it sends",
+    )
+    outbox_edit.add_argument(
+        "target", metavar="ID", help="message id or unique id prefix"
+    )
+    outbox_edit.add_argument(
+        "--text",
+        metavar="TEXT",
+        default=None,
+        help="replacement text for the scheduled message",
+    )
+    outbox_edit.add_argument(
+        "--delay",
+        metavar="DURATION",
+        default=None,
+        help="move the send time to this long from now (e.g. 30s, 5m, 2h, "
+        "7d; at most 29d23h — the 30d mail TTL less an hour of delivery slack)",
+    )
+    outbox_edit.set_defaults(func=cmd_outbox_edit)
+
     outbox_retry = outbox_sub.add_parser(
         "retry",
         parents=[common],
@@ -19205,6 +19228,62 @@ def cmd_outbox_cancel(args: argparse.Namespace) -> int:
             "note: sealed copies already held by other peers may still be"
             " delivered; cancelling stops this node's future attempts."
         )
+    return _EXIT_OK
+
+
+def cmd_outbox_edit(args: argparse.Namespace) -> int:
+    text = getattr(args, "text", None)
+    delay_text = getattr(args, "delay", None)
+    if text is None and delay_text is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    send_after = None
+    if delay_text is not None:
+        try:
+            delay = _parse_duration(delay_text, flag="--delay")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entries = mailbox.edit_scheduled_outbox(
+            args.target, text=text, send_after=send_after
+        )
+    except MailboxError as exc:
+        raise NodeError(str(exc)) from exc
+    entry = entries[0]
+    peer = registry.get(entry.to)
+    name = peer.display_name if peer is not None else entry.to_name
+    if _json_mode(args):
+        _emit(
+            {
+                "edited": [item.to_dict() for item in entries],
+                "legs": len(entries),
+            },
+            True,
+        )
+    else:
+        print(
+            f"edited {entry.id[:8]} — scheduled for "
+            f"{name or entry.to_hex}"
+        )
+        if len(entries) > 1:
+            print(f"  ({len(entries)} legs of the group message updated)")
+        if send_after is not None:
+            print(f"  now sends in {_ago(send_after - time.time())}")
     return _EXIT_OK
 
 

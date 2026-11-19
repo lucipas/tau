@@ -136,6 +136,10 @@ script) can read what arrives from the mesh and send messages back:
                            the block-list
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    POST /api/outbox/edit   edit a scheduled message before it sends
+                           ``{"target": "<message id or prefix>", "text": ...,
+                           "send_in": <seconds from now>}`` — at least one
+                           of "text" / "send_in" is required
     GET  /api/backup       download a backup archive of the data directory
     GET  /api/doctor       health verdicts for the data directory (``tau doctor``)
     POST /api/bundle/export build a signed sneakernet bundle
@@ -8077,6 +8081,96 @@ class WebBridge:
         self._clear_scheduled_mark(entry.id)
         return described
 
+    def edit_outbox(
+        self,
+        target: str,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or send time of a scheduled outbox entry.
+
+        The console counterpart of ``tau outbox edit``: ``send_in`` is
+        seconds from now, mirroring the send path.  At least one of
+        *text* / *send_in* is required; the mailbox enforces the rest
+        (still scheduled, plain text, new time in the future and within
+        the delay cap).  A group edit rewrites every leg of the message
+        and reports the leg count.  The console's queued record for each
+        edited entry is updated in place, so the bubble shows the new
+        text and countdown without a refresh.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("message id is required")
+        if text is None and send_in is None:
+            raise ValueError(
+                "nothing to change — pass a new text and/or a new send time"
+            )
+        if text is not None and not isinstance(text, str):
+            raise ValueError("text must be a string")
+        send_after = None
+        if send_in is not None:
+            if not _valid_send_in(send_in):
+                raise ValueError(
+                    "send_in must be a number of seconds "
+                    "(0 < send_in <= 29d23h)"
+                )
+            send_after = time.time() + float(send_in)
+        with self.node.mailbox.transaction():
+            # Resolve first so an unknown id or ambiguous prefix stays a
+            # MailboxError (404 at the route); the edit below only raises
+            # MailboxError for state refusals, which become ValueError
+            # (400) here.
+            self.node.mailbox.resolve_outbox(target.strip())
+            try:
+                entries = self.node.mailbox.edit_scheduled_outbox(
+                    target.strip(), text=text, send_after=send_after
+                )
+            except MailboxError as exc:
+                raise ValueError(str(exc)) from exc
+            described = [
+                self._describe_outbox_entry(entry) for entry in entries
+            ]
+        self._update_scheduled_records(
+            [entry.id for entry in entries],
+            text=entries[0].text if text is not None else None,
+            send_after=send_after,
+        )
+        return {"edited": described, "legs": len(described)}
+
+    def _update_scheduled_records(
+        self,
+        mail_ids: List[str],
+        *,
+        text: Optional[str] = None,
+        send_after: Optional[float] = None,
+    ) -> None:
+        """Rewrite a queued console record after an outbox edit.
+
+        Matches on ``mail_id`` — or any of a group record's ``leg_ids``,
+        since a group send keeps one bubble for all its legs — and
+        updates the text and/or the "sends in ..." countdown, then
+        publishes ``message_updated`` so live tabs re-render in place.
+        """
+        wanted = set(mail_ids)
+        updated = []
+        with self._lock:
+            for message in self._messages:
+                if message.get("direction") != "out":
+                    continue
+                ids = {message.get("mail_id")} | set(
+                    message.get("leg_ids") or []
+                )
+                if not (ids & wanted):
+                    continue
+                if text is not None:
+                    message["text"] = text
+                if send_after is not None:
+                    message["send_after"] = send_after
+                updated.append(dict(message))
+            if updated:
+                self._save_messages()
+        for message in updated:
+            self._publish_message_updated(message)
+
     def _clear_scheduled_mark(self, mail_id: str) -> None:
         """Drop the "sends in ..." mark from console entries for a cancelled send.
 
@@ -11751,12 +11845,13 @@ def _valid_send_in(value: Any) -> bool:
 
     The cap mirrors the CLI's ``tau send --delay`` limit: a scheduled
     message must leave at least an hour of delivery window before the
-    30-day mail TTL. Huge JSON integers overflow ``float()``, so the
-    conversion is guarded here instead of raising past the 400 response.
+    30-day mail TTL. Huge JSON integers overflow ``float()`` and
+    non-numeric values raise ``ValueError``, so the conversion is
+    guarded here instead of raising past the 400 response.
     """
     try:
         seconds = float(value)
-    except OverflowError:
+    except (OverflowError, ValueError):
         return False
     return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL - 3600.0
 
@@ -13061,6 +13156,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
+                return
+            if path == "/api/outbox/edit":
+                self._handle_outbox_edit(body, head_only)
                 return
             if path == "/api/settings":
                 self._handle_settings(body, head_only)
@@ -15942,6 +16040,64 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 404)
             return
         self._send_json({"ok": True, "cancelled": cancelled}, head_only)
+
+    def _handle_outbox_edit(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target") or body.get("id")
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        text = body.get("text")
+        send_in = body.get("send_in")
+        if text is None and send_in is None:
+            self._send_json(
+                {
+                    "error": {
+                        "message": "nothing to change — pass 'text' and/or "
+                        "'send_in'"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        if text is not None and (
+            not isinstance(text, str) or not text.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'text' must be a non-empty string"}},
+                head_only,
+                400,
+            )
+            return
+        if send_in is not None and not _valid_send_in(send_in):
+            self._send_json(
+                {
+                    "error": {
+                        "message": "field 'send_in' must be a number of "
+                        "seconds (0 < send_in <= 29d23h)"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.edit_outbox(
+                target.strip(),
+                text=text,
+                send_in=send_in,
+            )
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except MailboxError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        self._send_json({"ok": True, **result}, head_only)
 
     def _handle_settings(self, body: Dict[str, Any], head_only: bool) -> None:
         setting = body.get("setting")
