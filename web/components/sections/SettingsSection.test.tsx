@@ -139,7 +139,9 @@ describe("SettingsSection", () => {
     fireEvent.change(depth, { target: { value: "1" } });
     await waitFor(() => expect(calls).toContain("POST /api/settings"));
     await waitFor(() => expect(depth.value).toBe("1"));
-    const notice = await screen.findByRole("status");
+    const notice = await screen.findByText(
+      /Tan sync now pulls followed authors only/,
+    );
     expect(notice.textContent).toMatch(/followed authors only/);
   });
 
