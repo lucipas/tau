@@ -268,6 +268,10 @@ tau tan post --to alice "direct delivery"
 tau tan post --delay 8h "good morning, mesh"
 tau tan scheduled
 
+# Schedule a post with a photo attached — the image is stored with the
+# queue entry and signed with the post when it publishes
+tau tan post --image sunrise.jpg --delay 8h "good morning, mesh"
+
 # Show every cached post, or one author's chain
 tau tan timeline --all
 tau tan timeline --author alice

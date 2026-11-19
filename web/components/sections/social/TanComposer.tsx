@@ -3,8 +3,9 @@
 //
 // An attached image is read as a base64 data URL and published with the
 // post (the bridge validates and stores it); replies and polls cannot
-// carry an image, and neither can a scheduled post yet, so the picker
-// is hidden for those and the submit guards them. Max length is a
+// carry an image, so the picker is hidden for those and the submit
+// guards them. A scheduled post can carry one — it rides the queue
+// entry until the publish pass attaches it. Max length is a
 // client-side guard only.
 
 "use client";
@@ -106,9 +107,6 @@ export default function TanComposer({
     }
     const problem = validateTanText(text);
     if (problem) return setError(problem);
-    if (file && sendIn !== undefined) {
-      return setError("Images can't be scheduled yet — post now or remove the image.");
-    }
     if (file && file.size > TAN_MAX_IMAGE_BYTES) {
       return setError("That image is larger than the 2 MB limit.");
     }
@@ -124,7 +122,7 @@ export default function TanComposer({
         }
       }
       if (sendIn !== undefined) {
-        await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn });
+        await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn, image });
       } else {
         await composer.publish(text.trim(), {
           replyTo: replyTo ?? undefined,

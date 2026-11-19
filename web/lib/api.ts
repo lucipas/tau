@@ -950,6 +950,7 @@ export async function scheduleTanPost(
     reply_to: opts.replyTo,
     send_in: sendIn,
     expires_in: opts.expiresIn ?? 0,
+    image: opts.image?.dataUrl,
   });
 }
 

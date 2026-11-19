@@ -35,9 +35,11 @@ function makePost(hash: string, text: string, extra: Partial<TanPost> = {}): Tan
 
 let calls: string[] = [];
 let timeline: TanPost[] = [];
+let scheduled: import("@/lib/types").ScheduledTanPost[] = [];
 
 beforeEach(() => {
   timeline = [makePost("h1".padEnd(64, "0"), "hello #mesh @bob")];
+  scheduled = [];
   const router = mockFetch((url) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
@@ -48,7 +50,7 @@ beforeEach(() => {
     if (url.includes("/api/tan/saved")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/hidden")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/pinned")) return { posts: [], count: 0, next_offset: null };
-    if (url.includes("/api/tan/scheduled")) return { scheduled: [], count: 0 };
+    if (url.includes("/api/tan/scheduled")) return { scheduled, count: scheduled.length };
     if (url.includes("/api/tan/muted-keywords")) return { muted_keywords: [], count: 0 };
     if (url.includes("/api/tan/muted-tags")) return { muted_tags: [], count: 0 };
     if (url.includes("/api/tan/muted")) return { muted: [], count: 0 };
@@ -162,5 +164,34 @@ describe("SocialSection", () => {
       expect(calls).toContain("GET /api/tan/search?q=mesh&limit=30"),
     );
     expect(await screen.findByText(/1 result for/)).toBeTruthy();
+  });
+
+  it("shows a scheduled post's attached image in the Scheduled tab", async () => {
+    scheduled = [
+      {
+        id: "a".repeat(16),
+        text: "morning photo",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 300,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+        image: {
+          sha256: "b".repeat(64),
+          size: 72,
+          mime: "image/png",
+          name: "photo.png",
+        },
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("morning photo")).toBeTruthy();
+    expect(screen.getByText(/image: photo\.png/)).toBeTruthy();
   });
 });

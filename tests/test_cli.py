@@ -9751,6 +9751,9 @@ def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     assert cli.main([*base, "--image", str(big)]) == 1
     png = tmp_path / "photo.png"
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
+    # --image with --delay is allowed now (see
+    # test_tan_post_image_with_delay_schedules); --delay still cannot
+    # combine with --no-publish, which is what this rejects.
     assert cli.main([*base, "--image", str(png), "--delay", "5m"]) == 2
     # A reply cannot carry an image: post first, then reply to it.
     assert cli.main([*base, "--image", str(png)]) == 0
@@ -9765,6 +9768,54 @@ def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     assert (
         cli.main([*base, "--image", str(png), "--reply-to", post_hash]) == 2
     )
+
+
+def test_tan_post_image_with_delay_schedules(tmp_path, capsys):
+    import hashlib
+    import json
+
+    from tau.config import TauConfig
+
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    png = tmp_path / "photo.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    digest = hashlib.sha256(png.read_bytes()).hexdigest()
+    assert (
+        cli.main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--image",
+                str(png),
+                "--delay",
+                "5m",
+                "morning photo",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    # The queued entry carries the attachment descriptor, and the
+    # bytes are pinned in the media store for the publish pass.
+    config = TauConfig.resolve(data_dir=data_dir)
+    queue = json.loads(config.scheduled_posts_path.read_text())
+    assert queue["posts"][0]["image"] == {
+        "sha256": digest,
+        "size": len(png.read_bytes()),
+        "mime": "image/png",
+        "name": "photo.png",
+    }
+    from tau.tangents.tan import media_path
+
+    assert media_path(data_dir, digest) is not None
+    assert cli.main(["tan", "scheduled", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "photo.png" in out
 
 
 def test_tan_media_rejects_unknown_image(tmp_path, capsys):
