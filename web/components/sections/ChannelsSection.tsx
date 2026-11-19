@@ -4,11 +4,13 @@
 
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import UnreadChip from "@/components/chrome/UnreadChip";
+import { useHash } from "../chrome/useHash";
 import { formatCountdown, formatRelative, shortHash } from "@/lib/format";
-import { getStatus } from "@/lib/api";
+import { deleteDraft, getDrafts, getStatus, saveDraft } from "@/lib/api";
+import type { MessageDraft } from "@/lib/types";
 import { useChannels } from "@/lib/use-channels";
 
 const SCHEDULE_OPTIONS: { label: string; seconds: number | undefined }[] = [
@@ -49,6 +51,64 @@ export default function ChannelsSection() {
   const [editingHash, setEditingHash] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
+
+  // Saved message drafts (``tau draft save --channel``): a draft for
+  // the selected channel pre-fills the composer, and sending the
+  // message closes the draft, like ``draft send``.
+  const [drafts, setDrafts] = useState<MessageDraft[]>([]);
+  const [pendingSeed, setPendingSeed] = useState<{ key: string; text: string } | null>(null);
+  const [draftSeedKey, setDraftSeedKey] = useState<string | null>(null);
+  const [savingDraft, setSavingDraft] = useState(false);
+
+  // The channel named by `#channels?channel=<name>` — set when a
+  // channel draft is opened from the chat sidebar. The shell mounts
+  // one section at a time, so a fresh mount here reads it.
+  const { channel: hashChannel } = useHash();
+
+  useEffect(() => {
+    if (hashChannel && hashChannel !== channels.selected) {
+      channels.select(hashChannel);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hashChannel]);
+
+  const refreshDrafts = useCallback(async () => {
+    try {
+      setDrafts(await getDrafts());
+    } catch {
+      // Drafts are advisory; the channel list works without them.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshDrafts();
+  }, [refreshDrafts]);
+
+  // A channel with a saved draft loads it into the composer when
+  // opened; a channel without one clears the seed. The mark of which
+  // seed was already applied is cleared only on a channel switch:
+  // clearing it on every drafts refresh would undo the save path's
+  // consumed mark and pour a just-saved draft back into the box.
+  const selectedChannelName = channels.selected;
+  const selectedDraftKey = selectedChannelName ? `channel:${selectedChannelName}` : null;
+  useEffect(() => {
+    setDraftSeedKey(null);
+    setPendingSeed(null);
+  }, [selectedDraftKey]);
+  useEffect(() => {
+    if (!selectedDraftKey || !selectedChannelName) return;
+    const draft = drafts.find(
+      (d) => d.kind === "channel" && d.target === selectedChannelName,
+    );
+    setPendingSeed(draft ? { key: selectedDraftKey, text: draft.text } : null);
+  }, [selectedDraftKey, selectedChannelName, drafts]);
+
+  // A saved draft pre-fills the box when its channel opens — but
+  // never clobbers text the user already typed into this composer.
+  if (pendingSeed && draftSeedKey !== pendingSeed.key) {
+    setDraftSeedKey(pendingSeed.key);
+    if (text.trim() === "") setText(pendingSeed.text);
+  }
 
   useEffect(() => {
     let live = true;
@@ -110,7 +170,8 @@ export default function ChannelsSection() {
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
     const body = text.trim();
-    if (!body || !channels.selected) return;
+    const channel = channels.selected;
+    if (!body || !channel) return;
     setSending(true);
     setError(null);
     try {
@@ -122,10 +183,35 @@ export default function ChannelsSection() {
       }
       setText("");
       setReplyTo(null);
+      // A sent message closes the draft it was loaded from, like
+      // `draft send` — but only when the send actually went through.
+      if (pendingSeed && pendingSeed.key === selectedDraftKey) {
+        await deleteDraft("channel", channel).catch(() => undefined);
+        void refreshDrafts();
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
+    }
+  }
+
+  async function handleSaveDraft() {
+    if (!channels.selected || !text.trim() || savingDraft) return;
+    setSavingDraft(true);
+    setError(null);
+    try {
+      await saveDraft("channel", channels.selected, text.trim());
+      setText("");
+      // Mark the just-saved draft consumed, so the seed effect does
+      // not pour it straight back into the cleared box once the
+      // drafts refresh lands.
+      if (selectedDraftKey) setDraftSeedKey(selectedDraftKey);
+      void refreshDrafts();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingDraft(false);
     }
   }
 
@@ -858,6 +944,14 @@ export default function ChannelsSection() {
                   className="shrink-0 rounded-full border border-zinc-700 px-3 py-2 text-sm font-semibold text-zinc-300 hover:bg-zinc-900"
                 >
                   Poll
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSaveDraft()}
+                  disabled={sending || savingDraft || !text.trim()}
+                  className="shrink-0 rounded-full border border-zinc-700 px-3 py-2 text-sm font-semibold text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+                >
+                  {savingDraft ? "Saving…" : "Save draft"}
                 </button>
                 <button
                   type="submit"

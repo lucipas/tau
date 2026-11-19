@@ -483,4 +483,174 @@ describe("ChannelsSection", () => {
     expect(await screen.findByRole("button", { name: "React 👍 (2)" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "React 🎉 (1)" })).toBeTruthy();
   });
+
+  it("saves the composer text as a channel draft", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    await screen.findAllByText("hello channel");
+    fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
+      target: { value: "park me" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(calls).toContain("POST /api/drafts"));
+    // The box clears once the save lands, and the just-saved draft
+    // does not pour straight back in.
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Message #mesh-general") as HTMLInputElement).value,
+      ).toBe(""),
+    );
+  });
+
+  it("saving a draft does not pour it back into the composer", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [];
+    calls = mockFetch((url, method) => {
+      if (url.includes("/api/drafts/delete")) return { ok: true, deleted: true };
+      if (url.includes("/api/drafts")) {
+        if (method === "POST") {
+          saved.push({
+            kind: "channel",
+            target: "mesh-general",
+            text: "park me",
+            updated_at: 100,
+            name: "mesh-general",
+          });
+          return { ok: true, draft: saved[0] };
+        }
+        return { drafts: saved, count: saved.length };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900, unread: 0 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    const input = await screen.findByLabelText("Message #mesh-general");
+    fireEvent.change(input, { target: { value: "park me" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(calls).toContain("POST /api/drafts"));
+    // The box clears on save; give the drafts refresh time to land
+    // the just-saved draft back in the list, then confirm it did not
+    // re-fill the box.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect((input as HTMLInputElement).value).toBe("");
+  });
+
+  it("opens the channel named by the hash and loads its saved draft", async () => {
+    window.location.hash = "#channels?channel=mesh-general";
+    calls = mockFetch((url, method) => {
+      if (url.includes("/api/drafts/delete")) return { ok: true, deleted: true };
+      if (url.includes("/api/drafts")) {
+        return {
+          drafts: [
+            {
+              kind: "channel",
+              target: "mesh-general",
+              text: "parked hello",
+              updated_at: 100,
+              name: "mesh-general",
+            },
+          ],
+          count: 1,
+        };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900, unread: 0 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    try {
+      render(<ChannelsSection />);
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("deletes the channel draft after the seeded message is sent", async () => {
+    window.location.hash = "#channels?channel=mesh-general";
+    calls = mockFetch((url, method) => {
+      if (url.includes("/api/drafts/delete")) return { ok: true, deleted: true };
+      if (url.includes("/api/drafts")) {
+        return {
+          drafts: [
+            {
+              kind: "channel",
+              target: "mesh-general",
+              text: "parked hello",
+              updated_at: 100,
+              name: "mesh-general",
+            },
+          ],
+          count: 1,
+        };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900, unread: 0 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    try {
+      render(<ChannelsSection />);
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts/delete"));
+    } finally {
+      window.location.hash = "";
+    }
+  });
 });

@@ -7488,6 +7488,45 @@ def test_drafts_endpoints(node, tmp_path):
         bridge.stop()
 
 
+def test_drafts_channel_endpoint(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A channel draft is keyed by the channel name, and the list
+        # resolves its name to the target itself — no registry lookup.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "channel", "target": "general", "text": "hello channel"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["draft"]["kind"] == "channel"
+        assert payload["draft"]["target"] == "general"
+        assert payload["draft"]["text"] == "hello channel"
+
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert status == 200
+        assert payload["count"] == 1
+        entry = payload["drafts"][0]
+        assert entry["kind"] == "channel"
+        assert entry["name"] == "general"
+
+        # Deleting a channel draft works the same as the other kinds.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts/delete",
+            method="POST",
+            body={"kind": "channel", "target": "general"},
+        )
+        assert status == 200
+        assert payload == {"ok": True, "deleted": True}
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload == {"drafts": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
 def test_drafts_endpoints_reject_bad_input(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:

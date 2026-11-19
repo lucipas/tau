@@ -729,9 +729,9 @@ export async function getDrafts(): Promise<MessageDraft[]> {
   return data.drafts ?? [];
 }
 
-/** Save (or overwrite) the draft for one peer or group conversation. */
+/** Save (or overwrite) the draft for one peer, group, or channel conversation. */
 export async function saveDraft(
-  kind: "peer" | "group",
+  kind: "peer" | "group" | "channel",
   target: string,
   text: string,
 ): Promise<MessageDraft> {
@@ -743,8 +743,8 @@ export async function saveDraft(
   return data.draft;
 }
 
-/** Discard the draft for one peer or group conversation. */
-export async function deleteDraft(kind: "peer" | "group", target: string): Promise<boolean> {
+/** Discard the draft for one peer, group, or channel conversation. */
+export async function deleteDraft(kind: "peer" | "group" | "channel", target: string): Promise<boolean> {
   const data = await post<{ ok: boolean; deleted: boolean }>("/api/drafts/delete", {
     kind,
     target,

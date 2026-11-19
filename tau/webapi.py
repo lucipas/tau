@@ -105,8 +105,8 @@ script) can read what arrives from the mesh and send messages back:
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
     GET  /api/drafts       saved message drafts (``tau draft save``)
-    POST /api/drafts       save a message draft ``{"kind": "peer"|"group",
-                           "target": "<hash>", "text": "..."}``
+    POST /api/drafts       save a message draft ``{"kind": "peer"|"group"|"channel",
+                           "target": "<hash | id | name>", "text": "..."}``
     POST /api/drafts/delete discard a message draft ``{"kind", "target"}``
     GET  /api/messages/muted muted DM conversations, groups and channels
     POST /api/messages/mute mute ``{"peer": "<name or hash>"}``,
@@ -9234,7 +9234,8 @@ class WebBridge:
         The console resolves a draft's conversation from its own lists,
         but a draft for a peer with no messages yet is in none of them,
         so the name is resolved here too: the peer's registry name, the
-        group name, or ``None`` when neither is known.  A dataless node
+        group name, the channel name itself (a channel draft is keyed
+        by its name), or ``None`` when neither is known.  A dataless node
         has no drafts file and answers empty instead of failing the
         console poll.
         """
@@ -9254,18 +9255,24 @@ class WebBridge:
         drafts = []
         for draft in store.list_drafts():
             entry = dict(draft)
-            entry["name"] = names.get(draft["target"])
+            if draft.get("kind") == "channel":
+                # A channel draft is keyed by the channel name, so the
+                # name is the target itself — no registry lookup applies.
+                entry["name"] = draft["target"]
+            else:
+                entry["name"] = names.get(draft["target"])
             drafts.append(entry)
         return {"drafts": drafts, "count": len(drafts)}
 
     def save_draft(self, *, kind: Any, target: Any, text: Any) -> Dict[str, Any]:
         """Save (or overwrite) the draft for one conversation.
 
-        *kind* is ``"peer"`` or ``"group"`` and *target* is the peer
-        destination hash or group id — the console passes the
-        conversation key straight through, so no name resolution runs
-        here.  A bad kind, target or text is a :class:`ValueError`; a
-        failed write and a dataless node are :class:`WebBridgeError`.
+        *kind* is ``"peer"``, ``"group"`` or ``"channel"`` and *target*
+        is the peer destination hash, group id, or channel name — the
+        console passes the conversation key straight through, so no
+        name resolution runs here.  A bad kind, target or text is a
+        :class:`ValueError`; a failed write and a dataless node are
+        :class:`WebBridgeError`.
         """
         path = self._drafts_path()
         if path is None:

@@ -449,8 +449,8 @@ export interface MutedConversations {
 
 /** One unsent message parked for a peer or a group (``tau draft save``). */
 export interface MessageDraft {
-  kind: "peer" | "group";
-  /** Peer destination hash or group id. */
+  kind: "peer" | "group" | "channel";
+  /** Peer destination hash, group id, or channel name. */
   target: string;
   text: string;
   updated_at: number;
