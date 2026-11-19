@@ -131,7 +131,10 @@ are a separate feature and do not exist yet. A single conversation can be
 muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
 `tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
 every night instead — while the window is active every conversation counts
-as unread 0, and the counts come back when it ends.
+as unread 0, and the counts come back when it ends. The Chat tab has a
+search box above the conversation list: it searches stored DM and group
+messages by keyword (`/api/messages/search`) and opening a result jumps
+to that conversation.
 
 The same bridge is the local integration point for scripts:
 
