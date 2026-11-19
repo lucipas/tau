@@ -1847,6 +1847,37 @@ def test_send_group_edit_defers_scheduled_legs(tmp_path, monkeypatch):
     assert node.inbox.list_messages(direction="out")[0]["text"] == "fixed here"
 
 
+def test_send_group_edit_keeps_poll_options_on_scheduled_requeue(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message(
+        "crew",
+        "which day?",
+        poll_options=["Saturday", "Sunday"],
+        send_after=send_after,
+    )
+    assert all(result.get("queued") for result in response["results"])
+    sent_at = response["sent_at"]
+    record = node.inbox.list_messages(direction="out")[0]
+
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("no live edit may go out for a scheduled leg")
+        ),
+    )
+    edit = node.send_group_edit(
+        "crew", record["id"], "which weekend?", target_sent_at=sent_at
+    )
+
+    assert edit["ok"] is True
+    legs = node.mailbox.outbox_list()
+    assert len(legs) == 2
+    assert all(leg.text == "which weekend?" for leg in legs)
+    assert all(leg.poll_options == ["Saturday", "Sunday"] for leg in legs)
+
+
 def test_send_group_edit_skips_live_edit_when_scheduled_requeue_fails(
     tmp_path, monkeypatch
 ):

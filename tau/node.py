@@ -8959,6 +8959,9 @@ class TauNode:
                             location=entry.location,
                             beacon=entry.beacon,
                             edited_at=float(payload["sent_at"]),
+                            poll_options=entry.poll_options,
+                            poll_vote=entry.poll_vote,
+                            poll_close=entry.poll_close,
                         )
                         requeued.append(entry.id)
                         if entry.is_scheduled():
@@ -8990,6 +8993,9 @@ class TauNode:
                                     location=entry.location,
                                     beacon=entry.beacon,
                                     edited_at=entry.edited_at,
+                                    poll_options=entry.poll_options,
+                                    poll_vote=entry.poll_vote,
+                                    poll_close=entry.poll_close,
                                 )
                             except MailboxError:
                                 # Restore failed too: the leg itself is
