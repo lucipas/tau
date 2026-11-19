@@ -338,6 +338,7 @@ class FakeNode:
         poll_options=None,
         poll_vote=None,
         poll_close=None,
+        location=None,
     ):
         self.sent.append((peer.name, text, in_reply_to))
         self.last_expires_at = expires_at
@@ -345,6 +346,7 @@ class FakeNode:
         self.last_poll_options = poll_options
         self.last_poll_vote = poll_vote
         self.last_poll_close = poll_close
+        self.last_location = location
         # A distinct wire id per send, like the real node's generated id.
         wire_id = f"{len(self.sent):032d}"
         return {
@@ -359,6 +361,7 @@ class FakeNode:
         self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
         expires_at=None, send_after=None, in_reply_to=None,
         poll_options=None, poll_vote=None, poll_close=None,
+        location=None,
     ):
         self.group_sent.append((group["name"], text))
         self.last_group_expires_at = expires_at
@@ -367,6 +370,7 @@ class FakeNode:
         self.last_group_poll_options = poll_options
         self.last_group_poll_vote = poll_vote
         self.last_group_poll_close = poll_close
+        self.last_group_location = location
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -13340,6 +13344,95 @@ def test_dm_send_with_poll_options_posts_poll(bridge, node):
     assert node.last_poll_options == ["Tea", "Coffee"]
     assert node.last_poll_vote is None
     assert node.last_poll_close is None
+
+
+PIN = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def test_dm_send_with_location_pins_place(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "meet here", "location": dict(PIN)},
+    )
+    assert status == 200
+    assert node.last_location == PIN
+    assert payload["message"]["location"] == PIN
+    assert payload["message"]["text"] == "meet here"
+
+
+def test_dm_send_location_without_text_defaults_to_place_name(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "location": dict(PIN)},
+    )
+    assert status == 200
+    assert node.sent[-1][1] == "Rock Springs Park"
+    assert payload["message"]["text"] == "Rock Springs Park"
+    assert payload["message"]["location"] == PIN
+
+
+def test_dm_send_location_without_text_or_name_defaults_to_coordinates(
+    bridge, node
+):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "location": {"lat": 34.05, "lon": -83.88}},
+    )
+    assert status == 200
+    assert node.sent[-1][1] == "📍 34.05, -83.88"
+    assert payload["message"]["location"] == {"lat": 34.05, "lon": -83.88}
+
+
+def test_dm_send_with_bad_location_is_400(bridge, node):
+    for bad in ({"lat": 91, "lon": 0}, {"lat": 34.05}, "34.05,-83.88"):
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            body={"to": "alice", "text": "meet here", "location": bad},
+        )
+        assert status == 400
+        assert "latitude" in payload["error"]["message"]
+    assert node.sent == []
+
+
+def test_group_send_with_location_pins_place(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "meet here", "location": dict(PIN)},
+    )
+    assert status == 200
+    assert node.last_group_location == PIN
+    assert payload["messages"]
+    assert all(m["location"] == PIN for m in payload["messages"])
+
+
+def test_inbound_location_pin_is_recorded(bridge, node):
+    pin = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "meet here",
+        "kind": "chat",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-pin",
+        "location": dict(PIN),
+    }
+    node.inbox.append(dict(pin))
+    bridge.record_inbound(dict(pin), publish=False)
+    entry = next(
+        entry for entry in bridge.messages() if entry.get("wire_id") == "wire-pin"
+    )
+    assert entry["location"] == PIN
+    assert entry["text"] == "meet here"
 
 
 def test_dm_poll_vote_endpoint_votes_by_number_and_text(bridge, node):

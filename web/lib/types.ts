@@ -267,9 +267,12 @@ export interface ReplyRef {
 }
 
 export interface LocationPin {
-  latitude: number;
-  longitude: number;
-  label?: string;
+  /** Decimal degrees, -90..90. */
+  lat: number;
+  /** Decimal degrees, -180..180. */
+  lon: number;
+  /** Optional place name, at most 200 characters. */
+  name?: string;
   [key: string]: unknown;
 }
 

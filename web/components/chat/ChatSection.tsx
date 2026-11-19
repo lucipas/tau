@@ -191,6 +191,7 @@ export default function ChatSection() {
         expiresIn: opts.expiresIn,
         sendIn: opts.sendIn,
         pollOptions: opts.pollOptions,
+        location: opts.location,
       };
       setReplyTo(null);
       await run("Send failed", () => sendMessage(target, text, sendOpts));
