@@ -6016,13 +6016,6 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if getattr(args, "delay", None) is not None:
-            print(
-                "error: --image cannot be combined with --delay — "
-                "scheduled posts cannot carry an attachment yet",
-                file=sys.stderr,
-            )
-            return 2
         image = _read_image(args.image, config.data_dir)
 
     location = None
@@ -6078,6 +6071,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
                 expires_in=expire_seconds,
+                image=image,
             )
         except ScheduledPostsError as exc:
             raise NodeError(str(exc)) from exc
@@ -6687,6 +6681,8 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
             print(f"  in reply to {short_hash(post.reply_to)}")
         if post.to:
             print(f"  to {', '.join(post.to)}")
+        if post.image is not None:
+            print(f"  image {post.image['name']} ({post.image['size']} bytes)")
         for line in post.text.splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK

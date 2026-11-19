@@ -30,7 +30,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-from .protocol import ProtocolError, normalize_message
+from .protocol import ProtocolError, normalize_message, sanitize_file_name
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -116,6 +116,66 @@ def _clean_targets(value: Any) -> Tuple[str, ...]:
     return tuple(cleaned)
 
 
+def _clean_image(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate a queued post's image attachment: ``{sha256, size, mime, name}``.
+
+    The same shape :func:`tau.tangents.tan._clean_image` validates for
+    an immediate post, re-checked here so a hand-edited queue file
+    cannot smuggle a bad descriptor into the publish pass.  The bytes
+    themselves are never in the queue — only the descriptor; they live
+    pinned in the local media store from schedule time.  ``None`` means
+    no image (and is what old queue files without the field load as).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ScheduledPostsError("scheduled post image must be an object")
+    sha256 = value.get("sha256")
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        raise ScheduledPostsError(
+            "scheduled post image sha256 must be a 64 character hex digest"
+        )
+    try:
+        bytes.fromhex(sha256)
+    except ValueError as exc:
+        raise ScheduledPostsError(
+            "scheduled post image sha256 must be a 64 character hex digest"
+        ) from exc
+    size = value.get("size")
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise ScheduledPostsError("scheduled post image size must be an integer")
+    # Lazy import: this module stays importable without Reticulum, which
+    # ``tau.backup`` relies on — the same reason schedule_post imports
+    # its Tan helpers lazily.
+    from .tangents.tan import IMAGE_MIME_TYPES, MAX_IMAGE_BYTES
+
+    if size < 1 or size > MAX_IMAGE_BYTES:
+        raise ScheduledPostsError(
+            f"scheduled post image of {size} bytes exceeds the "
+            f"{MAX_IMAGE_BYTES} byte limit"
+        )
+    mime = value.get("mime")
+    if mime not in IMAGE_MIME_TYPES:
+        raise ScheduledPostsError(
+            "scheduled post image mime must be one of: " + ", ".join(IMAGE_MIME_TYPES)
+        )
+    name = value.get("name")
+    if (
+        not isinstance(name, str)
+        or not sanitize_file_name(name)
+        or sanitize_file_name(name) != name
+    ):
+        raise ScheduledPostsError(
+            "scheduled post image name must be a safe bare file name"
+        )
+    return {
+        "sha256": sha256.lower(),
+        "size": size,
+        "mime": mime,
+        "name": name,
+    }
+
+
 def _clean_ttl(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ScheduledPostsError(f"not a gossip TTL: {value!r}")
@@ -189,6 +249,10 @@ class ScheduledPost:
     # expires.  Stored as a duration, not a timestamp: the clock starts
     # when the post is published, not when it is queued.
     expires_in: float = 0.0
+    # Image attachment descriptor (``{sha256, size, mime, name}``) for a
+    # post scheduled with ``--image``; the bytes live pinned in the
+    # local media store, never in the queue.  ``None`` means no image.
+    image: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -207,6 +271,7 @@ class ScheduledPost:
         object.__setattr__(self, "paused_at", _clean_retry_at(self.paused_at))
         object.__setattr__(self, "pending_peers", _clean_targets(list(self.pending_peers)))
         object.__setattr__(self, "expires_in", _clean_duration(self.expires_in))
+        object.__setattr__(self, "image", _clean_image(self.image))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -223,6 +288,7 @@ class ScheduledPost:
             "paused_at": self.paused_at,
             "pending_peers": list(self.pending_peers),
             "expires_in": self.expires_in,
+            "image": self.image,
         }
 
     @classmethod
@@ -243,6 +309,7 @@ class ScheduledPost:
             paused_at=_clean_retry_at(data.get("paused_at", 0.0)),
             pending_peers=_clean_targets(data.get("pending_peers")),
             expires_in=_clean_duration(data.get("expires_in", 0.0)),
+            image=_clean_image(data.get("image")),
         )
 
 
@@ -384,6 +451,7 @@ def schedule_post(
     now: Optional[float] = None,
     name: Optional[str] = None,
     expires_in: float = 0.0,
+    image: Optional[Dict[str, Any]] = None,
 ) -> ScheduledPost:
     """Queue a post for *publish_at*; returns the stored entry.
 
@@ -393,6 +461,12 @@ def schedule_post(
     publish pass.  When *expires_in* is given the post disappears from
     display surfaces that long after it is published; it shares the
     delay cap — a post cannot outlive the furthest it may be queued.
+    When *image* is given — the ``{sha256, size, mime, name}``
+    descriptor an immediate post carries — the attachment is stored on
+    the entry and signed with the post at publish time; the bytes live
+    pinned in the local media store, never in the queue.  An image is
+    top-level-only, the same rule as an immediate post, so it is
+    refused with a reply target.
     """
     try:
         clean_text = normalize_message(text)
@@ -411,12 +485,18 @@ def schedule_post(
         raise ScheduledPostsError(
             "expires_in must be at most 7d (the scheduled-post delay cap)"
         )
+    clean_image = _clean_image(image)
+    if clean_image is not None and reply_to is not None:
+        raise ScheduledPostsError(
+            "an image can only be attached to a top-level post, not a reply"
+        )
     try:
         check_post_text_fits(
             clean_text,
             name=name,
             reply_to=reply_to,
             expires=clean_expires_in > 0,
+            image=clean_image,
         )
     except PostError as exc:
         raise ScheduledPostsError(str(exc)) from exc
@@ -429,6 +509,7 @@ def schedule_post(
         publish_at=_clean_timestamp(publish_at, "publish_at"),
         created_at=now if now is not None else time.time(),
         expires_in=clean_expires_in,
+        image=clean_image,
     )
     with scheduled_posts_lock(path):
         queue = load_scheduled_posts(path)
@@ -573,6 +654,7 @@ def publish_due_scheduled_posts(
                             post.text,
                             reply_to=post.reply_to,
                             expires_at=expires_at,
+                            image=post.image,
                         )
                         # Persist the signed post's identity before sending, so
                         # a retry after a crash re-sends it rather than signing

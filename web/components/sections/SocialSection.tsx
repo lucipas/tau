@@ -926,8 +926,12 @@ function ScheduledView({
       {scheduled.map((s) => (
         <div key={s.id} className="border-b border-zinc-800 px-4 py-3">
           <p className="text-sm whitespace-pre-wrap text-zinc-200">{s.text}</p>
+          {/* No thumbnail here: a queued post's image stays private
+              until the post is published (see tan_media), so the
+              media route 404s for it — the name is the attachment. */}
           <p className="mt-1 text-xs text-zinc-500">
             Publishes {formatDateTime(s.publish_at)}
+            {s.image ? ` · image: ${s.image.name}` : ""}
             {s.paused_at ? " · paused" : ""}
             {s.attempts > 0 ? ` · ${s.attempts} attempt${s.attempts === 1 ? "" : "s"}` : ""}
           </p>

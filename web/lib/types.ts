@@ -720,6 +720,8 @@ export interface ScheduledTanPost {
   next_attempt_at: number | null;
   paused_at: number | null;
   expires_in?: number;
+  /** Image attachment descriptor, when the queued post carries one. */
+  image?: { sha256: string; size: number; mime: string; name: string } | null;
   [key: string]: unknown;
 }
 

@@ -766,6 +766,7 @@ def check_post_text_fits(
     name: Optional[str] = None,
     reply_to: Optional[str] = None,
     expires: bool = False,
+    image: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Raise PostError if *text* cannot fit a Tan request once encoded.
 
@@ -777,7 +778,9 @@ def check_post_text_fits(
     will carry, so a text that passes here always fits; one that fails
     is rejected before it is stored.  When *expires* is true the post
     will also carry a float ``expires_at`` instead of ``null``, so a
-    widest-possible timestamp stands in for it.
+    widest-possible timestamp stands in for it.  When *image* is given
+    the attachment rides in the estimate too — its descriptor is
+    ~150 bytes of JSON, enough to push a borderline text over budget.
     """
     try:
         clean_text = normalize_message(text)
@@ -802,6 +805,7 @@ def check_post_text_fits(
             "expires_at": (
                 now + MAX_TAN_POST_EXPIRY + 0.123456789 if expires else None
             ),
+            **({"image": _clean_image(image)} if image is not None else {}),
         }
     )
 

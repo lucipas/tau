@@ -179,7 +179,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
-    POST /api/tan/schedule schedule a Tan post for later
+    POST /api/tan/schedule schedule a Tan post for later (optional "image" base64 data URL)
     GET  /api/tan/scheduled queued Tan posts, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
     GET  /api/tan/drafts   saved Tan post drafts, newest first
@@ -3668,17 +3668,33 @@ class WebBridge:
     def tan_schedule_post(
         self, text: str, *, reply_to: Optional[str] = None, send_in: float,
         expires_in: float = 0.0,
+        image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
 
         Scheduling needs no attached Tan app — the queue file is the
         same one the CLI writes, and the serving node publishes due
         entries when it has an app. Only the reply target needs the
-        store, resolved the same way :meth:`tan_post` resolves it.
+        store, resolved the same way :meth:`tan_post` resolves it.  An
+        *image* data URL is decoded the same way :meth:`tan_post`
+        decodes one — the bytes are stored pinned in the local media
+        store at schedule time — and rides the queue entry until the
+        publish pass attaches it.
         """
         from .scheduled_posts import schedule_post
         from .tangents.tan import MAX_GOSSIP_TTL, resolve_post
 
+        if image is not None and reply_to is not None:
+            raise ValueError(
+                "an image can only be attached to a top-level post, not a reply"
+            )
+        image_attachment: Optional[Dict[str, Any]] = None
+        if image is not None:
+            from .tangents.tan import image_attachment_from_data_url
+
+            image_attachment = image_attachment_from_data_url(
+                image, Path(self._tan_db_path()).parent
+            )
         if reply_to is not None:
             conn = self._tan_conn()
             try:
@@ -3696,6 +3712,7 @@ class WebBridge:
             # (node.name, refreshed at startup), not the configured name.
             name=getattr(self.node, "name", None),
             expires_in=float(expires_in),
+            image=image_attachment,
         )
         return post.to_dict()
 
@@ -14449,6 +14466,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                image = body.get("image")
+                if image is not None and not isinstance(image, str):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'image' must be a base64 data URL"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
                     scheduled = self.bridge.tan_schedule_post(
                         text,
@@ -14457,6 +14486,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else 0.0
                         ),
+                        image=image,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

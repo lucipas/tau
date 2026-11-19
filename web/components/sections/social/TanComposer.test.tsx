@@ -1,6 +1,6 @@
-// TanComposer.test.tsx — image attach publishes with the post; replies,
-// polls and scheduled posts cannot carry one. The composer prop is a fake,
-// so no fetch stub is needed.
+// TanComposer.test.tsx — image attach publishes with the post, and a
+// scheduled post can carry one too; replies and polls cannot. The
+// composer prop is a fake, so no fetch stub is needed.
 
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -97,18 +97,27 @@ describe("TanComposer image attach", () => {
     expect(attach.getAttribute("title")).toMatch(/Polls can't carry an image/);
   });
 
-  it("refuses to schedule a post with an image attached", async () => {
+  it("schedules a post with an image attached", async () => {
     const composer = makeComposer();
-    render(<TanComposer composer={composer} />);
+    const onPosted = vi.fn();
+    render(<TanComposer composer={composer} onPosted={onPosted} />);
     pickImage();
     typePost("later with pic");
     fireEvent.change(screen.getByLabelText("Send later"), {
       target: { value: "300" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Schedule" }));
-    expect((await screen.findByRole("alert")).textContent).toMatch(/can't be scheduled/);
+    await waitFor(() =>
+      expect(composer.schedule).toHaveBeenCalledWith(
+        "later with pic",
+        300,
+        expect.objectContaining({
+          image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+        }),
+      ),
+    );
     expect(composer.publish).not.toHaveBeenCalled();
-    expect(composer.schedule).not.toHaveBeenCalled();
+    expect(onPosted).toHaveBeenCalled();
   });
 
   it("refuses an image over the 2 MB limit", async () => {

@@ -48,6 +48,7 @@ import {
   sendBroadcast,
   scheduleChannelMessage,
   scheduleChannelPoll,
+  scheduleTanPost,
   searchChannelMessages,
   sendChannelMessage,
   sendMessage,
@@ -374,6 +375,22 @@ describe("POST endpoints", () => {
       text: "which day?",
       poll_options: ["Saturday", "Sunday"],
       send_in: 300,
+    });
+  });
+
+  it("schedules a Tan post with an image data URL", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleTanPost("later with pic", 300, {
+      image: { dataUrl: "data:image/png;base64,aGVsbG8=" },
+    });
+    expect(captured[0].url).toBe("/api/tan/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      text: "later with pic",
+      reply_to: undefined,
+      send_in: 300,
+      expires_in: 0,
+      image: "data:image/png;base64,aGVsbG8=",
     });
   });
 

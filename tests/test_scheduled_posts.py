@@ -160,6 +160,80 @@ def test_schedule_post_accepts_long_text_that_fits(tmp_path):
     assert load_scheduled_posts(path).posts[0].id == post.id
 
 
+def _image() -> dict:
+    return {
+        "sha256": "a" * 64,
+        "size": 72,
+        "mime": "image/png",
+        "name": "photo.png",
+    }
+
+
+def test_schedule_post_with_image_round_trips(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="morning", publish_at=1000.0, now=900.0, image=_image()
+    )
+    assert post.image == _image()
+    assert load_scheduled_posts(path).posts[0].image == _image()
+    assert load_scheduled_posts(path).posts[0].to_dict()["image"] == _image()
+
+
+def test_schedule_post_without_image_loads_as_none(tmp_path):
+    # Old queue files predate the image field: they load with no image.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="plain", publish_at=1000.0, now=900.0)
+    assert post.image is None
+    stored = post.to_dict()
+    del stored["image"]
+    path.write_text(json.dumps({"posts": [stored]}))
+    assert load_scheduled_posts(path).posts[0].image is None
+
+
+def test_schedule_post_rejects_image_on_reply(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="top-level"):
+        schedule_post(
+            path,
+            text="reply",
+            publish_at=1000.0,
+            now=900.0,
+            reply_to="b" * 64,
+            image=_image(),
+        )
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_bad_image(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    bad_images = [
+        {"sha256": "zz" * 32, "size": 72, "mime": "image/png", "name": "photo.png"},
+        {"sha256": "a" * 64, "size": 0, "mime": "image/png", "name": "photo.png"},
+        {"sha256": "a" * 64, "size": 72, "mime": "image/tiff", "name": "photo.png"},
+        {"sha256": "a" * 64, "size": 72, "mime": "image/png", "name": "../photo.png"},
+        "not-an-object",
+    ]
+    for bad in bad_images:
+        with pytest.raises(ScheduledPostsError):
+            schedule_post(path, text="x", publish_at=1000.0, now=900.0, image=bad)
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_rejects_text_that_only_fits_without_image(tmp_path):
+    # The image descriptor is ~130 bytes of JSON inside the 8 KiB Tan
+    # request: 1,860 four-byte characters fit on their own (the first
+    # failure without an image is 1,891) but not with one attached
+    # (the first failure with an image is 1,858).  Refuse at schedule
+    # time, instead of failing every publish attempt forever.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="😀" * 1860, publish_at=1000.0, now=900.0)
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        schedule_post(
+            path, text="😀" * 1860, publish_at=1000.0, now=900.0, image=_image()
+        )
+    assert len(load_scheduled_posts(path).posts) == 1
+
+
 def test_cancel_scheduled_post_end_to_end(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
@@ -179,12 +253,13 @@ class _FakeTanApp:
         self.published = []
         self.fail_publish = fail_publish
 
-    def create_post(self, text, *, reply_to=None, expires_at=None):
+    def create_post(self, text, *, reply_to=None, expires_at=None, image=None):
         post = {
             "hash": "c" * 64,
             "text": text,
             "reply_to": reply_to,
             "expires_at": expires_at,
+            "image": image,
         }
         self.created.append(post)
         return post
@@ -218,6 +293,20 @@ def test_publish_due_publishes_and_removes_only_due(tmp_path):
     queue = load_scheduled_posts(path)
     assert all(post.id != due.id for post in queue.posts)
     assert len(queue) == 1
+
+
+def test_publish_due_attaches_scheduled_image(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(
+        path, text="morning", publish_at=1000.0, now=900.0, image=_image()
+    )
+    app = _FakeTanApp()
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert app.created[0]["image"] == _image()
+    assert app.published[0][0]["image"] == _image()
+    assert load_scheduled_posts(path).posts == ()
 
 
 def test_publish_due_keeps_failed_posts_queued(tmp_path):
