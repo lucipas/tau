@@ -29,6 +29,7 @@ import {
   postChannelPoll,
   reactToChannelMessage,
   scheduleChannelMessage,
+  scheduleChannelPoll,
   searchChannelMessages,
   sendChannelMessage,
   setChannelTopic,
@@ -73,6 +74,11 @@ export interface UseChannelsResult {
   pinConversation: (channel: string, pinned?: boolean) => Promise<void>;
   send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
   schedule: (text: string, sendIn: number) => Promise<ScheduledChannelMessage>;
+  schedulePoll: (
+    question: string,
+    options: string[],
+    sendIn: number,
+  ) => Promise<ScheduledChannelMessage>;
   cancelScheduled: (id: string) => Promise<void>;
   poll: (question: string, options: string[]) => Promise<ChannelMessage>;
   vote: (poll: string, option: number) => Promise<ChannelMessage>;
@@ -254,6 +260,12 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     schedule: async (text, sendIn) => {
       if (!selected) throw new Error("no channel selected");
       const entry = await scheduleChannelMessage(selected, text, sendIn);
+      await refreshMessages(selected);
+      return entry;
+    },
+    schedulePoll: async (question, options, sendIn) => {
+      if (!selected) throw new Error("no channel selected");
+      const entry = await scheduleChannelPoll(selected, question, options, sendIn);
       await refreshMessages(selected);
       return entry;
     },

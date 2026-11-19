@@ -463,9 +463,10 @@ Global options may appear before or after the command:
 | `tau channel list` | List joined channels with cached message and unread counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message; `--expire 30s` makes it a disappearing message, purged from members' stores after the duration; a per-channel default from `tau disappearing --channel` fills the expiry in when no `--expire` is passed) |
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
-| `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
-| `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
+| `tau channel scheduled [NAME]` | List queued channel messages and polls, soonest first |
+| `tau channel cancel-scheduled ID` | Drop a queued channel message or poll before it publishes |
 | `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
+| `tau channel poll NAME "QUESTION" OPT... --delay 5m` | Queue a poll to ask later (a serving node with --channels publishes it) |
 | `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
 | `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
 | `tau channel topic NAME [TEXT]` | Show or set a channel's topic (any member may set it; newest wins; `--clear` removes it) |

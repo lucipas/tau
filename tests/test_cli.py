@@ -10363,6 +10363,12 @@ def test_parser_channel_scheduled_arguments():
     assert send.func is cli.cmd_channel_send
     assert send.delay == "5m"
 
+    poll = parser.parse_args(
+        ["channel", "poll", "general", "which day?", "Saturday", "Sunday", "--delay", "5m"]
+    )
+    assert poll.func is cli.cmd_channel_poll
+    assert poll.delay == "5m"
+
     listed = parser.parse_args(["channel", "scheduled"])
     assert listed.func is cli.cmd_channel_scheduled
     assert listed.channel is None
@@ -10403,7 +10409,7 @@ def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
 
     code = _run_channel(tmp_path, "scheduled")
     assert code == 0
-    assert "No channel messages scheduled." in capsys.readouterr().out
+    assert "No channel messages or polls scheduled." in capsys.readouterr().out
 
 
 def test_channel_send_delay_json_round_trip(tmp_path, capsys):
@@ -10461,3 +10467,156 @@ def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):
     code = _run_channel(tmp_path, "send", "other", "hi", "--delay", "5m")
     assert code == 2
     assert "not a member of channel 'other'" in capsys.readouterr().err
+
+
+def test_channel_poll_delay_schedules_lists_and_cancels(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "5m",
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert "asks in 5m" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "which day?" in out
+    assert "poll · 2 options" in out
+    assert "1. Saturday" in out
+    assert "2. Sunday" in out
+    entry_id = out.split()[0]
+
+    code = _run_channel(tmp_path, "cancel-scheduled", entry_id[:8])
+    assert code == 0
+    assert "cancelled" in capsys.readouterr().out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    assert "No channel messages or polls scheduled." in capsys.readouterr().out
+
+
+def test_channel_poll_delay_json_round_trip(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "channel",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+            "poll",
+            "general",
+            "which day?",
+            "Saturday",
+            "Sunday",
+            "--delay",
+            "5m",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"]["kind"] == "poll"
+    assert payload["scheduled"]["text"] == "which day?"
+    assert payload["scheduled"]["options"] == ["Saturday", "Sunday"]
+    assert payload["scheduled"]["publish_at"] > time.time()
+
+    code = cli.main(
+        ["channel", "--data-dir", str(tmp_path / "node"), "--json", "scheduled"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["scheduled"]) == 1
+    assert payload["scheduled"][0]["kind"] == "poll"
+
+
+def test_channel_poll_delay_rejects_bad_combinations(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "5m",
+        "--no-publish",
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-publish" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "soon",
+    )
+    assert code == 2
+    assert "invalid --delay duration" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "8d",
+    )
+    assert code == 2
+    assert "--delay duration must be at most 1w" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "5m",
+    )
+    assert code == 0  # sanity: the valid case still queues
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "other",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "5m",
+    )
+    assert code == 2
+    assert "not a member of channel 'other'" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path, "poll", "general", "which day?", "Saturday", "--delay", "5m"
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err

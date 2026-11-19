@@ -37,8 +37,23 @@ beforeEach(() => {
             next_attempt_at: 0,
             paused_at: 0,
           },
+          {
+            id: "cd34ef56ab78ab12",
+            channel: "mesh-general",
+            text: "pizza or tacos?",
+            publish_at: Math.floor(Date.now() / 1000) + 3600,
+            created_at: 1000,
+            to: [],
+            ttl: 3,
+            message_hash: null,
+            attempts: 0,
+            next_attempt_at: 0,
+            paused_at: 0,
+            kind: "poll",
+            options: ["Pizza", "Tacos"],
+          },
         ],
-        count: 1,
+        count: 2,
       };
     }
     if (url.includes("/api/channels/topic")) {
@@ -284,11 +299,22 @@ describe("ChannelsSection", () => {
     render(<ChannelsSection />);
     fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByText("morning hello")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    // One Cancel per scheduled entry (message + poll).
+    const cancelButtons = screen.getAllByRole("button", { name: "Cancel" });
+    expect(cancelButtons.length).toBe(2);
+    fireEvent.click(cancelButtons[0]);
     await waitFor(() =>
       expect(calls).toContain("POST /api/channels/cancel-scheduled"),
     );
+  });
+
+  it("shows a scheduled poll with its options", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    expect(await screen.findByText("pizza or tacos?")).toBeTruthy();
+    expect(screen.getByText("Poll · 2 options")).toBeTruthy();
+    expect(screen.getByText("1. Pizza")).toBeTruthy();
+    expect(screen.getByText("2. Tacos")).toBeTruthy();
   });
 
   it("schedules a message when Send later is picked", async () => {
@@ -340,6 +366,30 @@ describe("ChannelsSection", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Post poll" }));
     await waitFor(() => expect(calls).toContain("POST /api/channels/poll"));
+  });
+
+  it("schedules a poll when Send later is picked in the poll form", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Poll" }));
+    fireEvent.change(screen.getByLabelText("Poll question"), {
+      target: { value: "pizza or tacos?" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 1"), {
+      target: { value: "Pizza" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 2"), {
+      target: { value: "Tacos" },
+    });
+    fireEvent.change(screen.getByLabelText("Send later"), {
+      target: { value: "300" },
+    });
+    expect(screen.getByRole("button", { name: "Schedule poll" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Schedule poll" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/channels/schedule"),
+    );
+    expect(calls).not.toContain("POST /api/channels/poll");
   });
 
   it("shows the channel topic and saves an edited one", async () => {

@@ -16,6 +16,7 @@ from tau.scheduled_channel import (
     publish_due_scheduled_channel_messages,
     save_scheduled_channel_messages,
     schedule_channel_message,
+    schedule_channel_poll,
 )
 
 
@@ -145,6 +146,127 @@ def test_schedule_accepts_long_text_that_fits(tmp_path):
     assert load_scheduled_channel_messages(path).messages[0].id == entry.id
 
 
+def test_schedule_poll_round_trip(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_poll(
+        path,
+        channel="general",
+        question="which day?",
+        options=["Saturday", "Sunday"],
+        publish_at=2000.0,
+        to=["alice"],
+        ttl=2,
+        now=1000.0,
+    )
+    queue = load_scheduled_channel_messages(path)
+    assert len(queue) == 1
+    assert queue.messages[0] == entry
+    assert entry.kind == "poll"
+    assert entry.text == "which day?"
+    assert entry.options == ("Saturday", "Sunday")
+    assert entry.to == ("alice",)
+    assert entry.ttl == 2
+    assert entry.publish_at == 2000.0
+
+
+def test_schedule_poll_rejects_bad_options(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    for options in (
+        ["only-one"],
+        ["a", "b", "c", "d", "e", "f", "g", "h", "i"],
+        ["Saturday", "saturday"],
+        ["Saturday", "  "],
+    ):
+        with pytest.raises(ScheduledChannelError):
+            schedule_channel_poll(
+                path,
+                channel="general",
+                question="which day?",
+                options=options,
+                publish_at=2000.0,
+                now=1000.0,
+            )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_message_rejects_poll_options(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="cannot carry poll options"):
+        schedule_channel_message(
+            path,
+            channel="general",
+            text="hi",
+            publish_at=1000.0,
+            now=900.0,
+            kind="message",
+            options=["a", "b"],
+        )
+    with pytest.raises(ScheduledChannelError, match="needs 2-8 options"):
+        schedule_channel_poll(
+            path,
+            channel="general",
+            question="which day?",
+            options=["only-one"],
+            publish_at=2000.0,
+            now=1000.0,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_schedule_poll_rejects_options_that_cannot_fit_the_wire(tmp_path):
+    # A 1,900-emoji question fits on its own, but eight 100-char
+    # options on top of it overflow the 8 KiB publish envelope once
+    # encoded: refuse at schedule time, instead of failing every
+    # publish attempt forever.  (Options are capped at 100 chars
+    # each, so the overflow needs the question plus the options.)
+    path = tmp_path / "scheduled-channel-messages.json"
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_poll(
+            path,
+            channel="general",
+            question="😀" * 1900,
+            options=["😀" * 99 + str(i) for i in range(8)],
+            publish_at=2000.0,
+            now=1000.0,
+        )
+    assert load_scheduled_channel_messages(path).messages == ()
+
+
+def test_queue_without_kind_loads_as_message(tmp_path):
+    # Queue files written before polls could be scheduled carry no
+    # kind or options: they load as plain messages, exactly as before.
+    path = tmp_path / "scheduled-channel-messages.json"
+    import json
+
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "id": "a" * 16,
+                        "channel": "general",
+                        "text": "old hello",
+                        "publish_at": 1000.0,
+                        "created_at": 900.0,
+                        "to": [],
+                        "ttl": 3,
+                        "message_hash": None,
+                        "attempts": 0,
+                        "next_attempt_at": 0.0,
+                        "paused_at": 0.0,
+                        "pending_peers": [],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    entry = load_scheduled_channel_messages(path).messages[0]
+    assert entry.kind == "message"
+    assert entry.options == ()
+    assert entry.text == "old hello"
+
+
 def test_cancel_scheduled_channel_message_end_to_end(tmp_path):
     path = tmp_path / "scheduled-channel-messages.json"
     entry = schedule_channel_message(
@@ -178,13 +300,15 @@ class _FakeChannelApp:
         self.fail_publish = fail_publish
         self.fail_with_errors = fail_with_errors
 
-    def send(self, channel, text, *, publish=False):
+    def send(self, channel, text, *, publish=False, poll_options=None):
         message = {
             "hash": "c" * 64,
             "channel": channel,
             "text": text,
             "created_at": 2000.0,
         }
+        if poll_options is not None:
+            message["poll_options"] = list(poll_options)
         self.created.append(message)
         self.stored[message["hash"]] = message
         return message
@@ -225,6 +349,29 @@ def test_publish_due_publishes_and_removes_only_due(tmp_path):
     queue = load_scheduled_channel_messages(path)
     assert all(entry.id != due.id for entry in queue.messages)
     assert len(queue) == 1
+
+
+def test_publish_due_publishes_a_scheduled_poll(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    poll = schedule_channel_poll(
+        path,
+        channel="general",
+        question="which day?",
+        options=["Saturday", "Sunday"],
+        publish_at=1000.0,
+        now=900.0,
+    )
+    app = _FakeChannelApp()
+
+    result = publish_due_scheduled_channel_messages(path, app, now=2000.0)
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 1
+    assert app.created[0]["text"] == "which day?"
+    assert app.created[0]["poll_options"] == ["Saturday", "Sunday"]
+    assert app.published[0][0]["poll_options"] == ["Saturday", "Sunday"]
+    queue = load_scheduled_channel_messages(path)
+    assert all(entry.id != poll.id for entry in queue.messages)
+    assert len(queue) == 0
 
 
 def test_publish_due_keeps_failed_messages_queued(tmp_path):
