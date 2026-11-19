@@ -32,6 +32,7 @@ function groupConv(overrides: Partial<Group> = {}): Conversation {
     unread: 0,
     muted: false,
     archived: false,
+    pinned: false,
   };
 }
 

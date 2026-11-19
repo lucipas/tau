@@ -16,6 +16,7 @@ from tau.config import TauConfig
 from tau.disappearing import (
     DisappearingDefaults,
     DisappearingError,
+    channel_default_for,
     group_default_for,
     load_disappearing_defaults,
     peer_default_for,
@@ -64,6 +65,7 @@ def test_save_load_roundtrip_and_mode(tmp_path):
     assert loaded.to_dict() == {
         "peers": {ALICE: 3600.0},
         "groups": {GROUP_ID: 60.0},
+        "channels": {},
     }
 
 
@@ -396,6 +398,17 @@ def test_parser_disappearing_arguments():
     args = parser.parse_args(["disappearing", "--peer", "alice"])
     assert args.duration is None
     assert args.off is False
+    args = parser.parse_args(["disappearing", "--channel", "general", "30m"])
+    assert args.command == "disappearing"
+    assert args.channel == "general"
+    assert args.duration == "30m"
+    assert args.off is False
+    args = parser.parse_args(["disappearing", "--channel", "general", "--off"])
+    assert args.channel == "general"
+    assert args.off is True
+    with pytest.raises(SystemExit):
+        # --peer and --channel are mutually exclusive.
+        parser.parse_args(["disappearing", "--peer", "alice", "--channel", "general"])
 
 
 def test_resolve_inbox_peer_prefers_alias_over_name(tmp_path):
@@ -549,5 +562,112 @@ def test_disappearing_rejects_bad_input(tmp_path, capsys):
     assert code == 1
     code = cli.main(
         ["disappearing", "--data-dir", str(data_dir), "--peer", "nobody", "1h"]
+    )
+    assert code != 0
+
+# -- channels ---------------------------------------------------------------
+
+
+def test_channel_defaults_roundtrip(tmp_path):
+    path = tmp_path / "disappearing.json"
+    saved = save_disappearing_defaults(
+        path,
+        DisappearingDefaults(channels={"general": 300.0, "meetup": 60.0}),
+    )
+    assert saved == path
+    loaded = load_disappearing_defaults(path)
+    assert loaded.channels == {"general": 300.0, "meetup": 60.0}
+    assert loaded.channel_default("general") == 300.0
+    assert loaded.channel_default("missing") is None
+    assert loaded.channel_default(None) is None
+    assert loaded.to_dict()["channels"] == {"general": 300.0, "meetup": 60.0}
+
+
+def test_old_file_without_channels_section_still_loads(tmp_path):
+    path = tmp_path / "disappearing.json"
+    path.write_text(
+        json.dumps({"peers": {ALICE: 3600.0}, "groups": {GROUP_ID: 60.0}}),
+        encoding="utf-8",
+    )
+    loaded = load_disappearing_defaults(path)
+    assert loaded.channels == {}
+    assert loaded.peers == {ALICE: 3600.0}
+    assert loaded.groups == {GROUP_ID: 60.0}
+
+
+def test_channel_defaults_reject_bad_names_and_values(tmp_path):
+    defaults = DisappearingDefaults()
+    with pytest.raises(DisappearingError):
+        defaults.with_channel("has space", 60.0)
+    with pytest.raises(DisappearingError):
+        defaults.with_channel("general", 0)
+    with pytest.raises(DisappearingError):
+        defaults.with_channel("general", 8 * 24 * 3600)
+    path = tmp_path / "disappearing.json"
+    path.write_text(
+        json.dumps(
+            {"peers": {}, "groups": {}, "channels": {"general": "1h"}}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(DisappearingError):
+        load_disappearing_defaults(path)
+
+
+def test_peer_and_group_edits_keep_channel_defaults(tmp_path):
+    # with_peer / with_group / without_* rebuild the dataclass: a
+    # channel default must survive an unrelated edit, not silently
+    # reset when the file is re-saved.
+    defaults = DisappearingDefaults(channels={"general": 300.0})
+    assert defaults.with_peer(ALICE, 60).channels == {"general": 300.0}
+    assert defaults.with_group(GROUP_ID, 60).channels == {"general": 300.0}
+    assert defaults.without_peer(ALICE).channels == {"general": 300.0}
+    assert defaults.with_channel("meetup", 60).channels == {
+        "general": 300.0,
+        "meetup": 60.0,
+    }
+    assert defaults.without_channel("general").channels == {}
+    assert defaults.without_channel("missing").channels == {"general": 300.0}
+
+
+def test_channel_default_for_fails_open_on_corrupt_file(tmp_path, caplog):
+    path = tmp_path / "disappearing.json"
+    path.write_text("{not json", encoding="utf-8")
+    assert channel_default_for(path, "general") is None
+    assert channel_default_for(None, "general") is None
+
+
+def test_disappearing_channel_roundtrip(tmp_path, capsys):
+    data_dir, _ = _seed_two_peers(tmp_path)
+    code = cli.main(
+        ["disappearing", "--data-dir", str(data_dir), "--channel", "general", "5m"]
+    )
+    assert code == 0
+    assert "disappear after 5m" in capsys.readouterr().out
+    defaults = load_disappearing_defaults(data_dir / "disappearing.json")
+    assert defaults.channel_default("general") == 300.0
+
+    code = cli.main(
+        ["disappearing", "--data-dir", str(data_dir), "--channel", "general"]
+    )
+    assert code == 0
+    assert "disappear after 5m" in capsys.readouterr().out
+
+    code = cli.main(
+        [
+            "disappearing",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--off",
+        ]
+    )
+    assert code == 0
+    defaults = load_disappearing_defaults(data_dir / "disappearing.json")
+    assert defaults.channel_default("general") is None
+
+    code = cli.main(
+        ["disappearing", "--data-dir", str(data_dir), "--channel", "bad name!", "5m"]
     )
     assert code != 0

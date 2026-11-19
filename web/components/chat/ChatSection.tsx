@@ -31,6 +31,7 @@ import {
 import type { ChatMessage } from "@/lib/types";
 import {
   buildConversations,
+  useBroadcasts,
   useConversations,
   useOutbox,
   usePeerActions,
@@ -38,7 +39,9 @@ import {
 } from "@/lib/use-tau";
 import { useHash } from "../chrome/useHash";
 import { useTauContext } from "../chrome/TauContext";
+import BroadcastsPanel from "./BroadcastsPanel";
 import ConversationList from "./ConversationList";
+import MessageSearch from "./MessageSearch";
 import OutboxPanel from "./OutboxPanel";
 import ThreadView from "./ThreadView";
 import type { MessageAction } from "./MessageBubble";
@@ -87,6 +90,7 @@ export default function ChatSection() {
   const { peer: selectedPeer, group: selectedGroup, navigate } = useHash();
   const actions = usePeerActions();
   const outbox = useOutbox();
+  const broadcasts = useBroadcasts();
 
   const [mutedPeers, setMutedPeers] = useState<Set<string>>(new Set());
   const [mutedGroups, setMutedGroups] = useState<Set<string>>(new Set());
@@ -94,6 +98,9 @@ export default function ChatSection() {
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editing, setEditing] = useState<ChatMessage | null>(null);
   const [showOutbox, setShowOutbox] = useState(false);
+  const [showBroadcasts, setShowBroadcasts] = useState(false);
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchReset, setSearchReset] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [showJoin, setShowJoin] = useState(false);
   const [joinLink, setJoinLink] = useState("");
@@ -207,6 +214,15 @@ export default function ChatSection() {
   }
 
   const handleBack = useCallback(() => navigate("chat"), [navigate]);
+
+  const handleOpenSearchResult = useCallback(
+    (message: ChatMessage) => {
+      if (message.group) navigate("chat", { group: message.group });
+      else if (message.peer) navigate("chat", { peer: message.peer });
+      setSearchReset((n) => n + 1);
+    },
+    [navigate],
+  );
 
   async function run(label: string, fn: () => Promise<unknown>) {
     setError(null);
@@ -367,6 +383,17 @@ export default function ChatSection() {
             </button>
             <button
               type="button"
+              aria-expanded={showBroadcasts}
+              onClick={() => setShowBroadcasts((v) => !v)}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
+            >
+              Broadcasts
+              {broadcasts.broadcasts.length > 0
+                ? ` (${broadcasts.broadcasts.length})`
+                : ""}
+            </button>
+            <button
+              type="button"
               aria-expanded={showOutbox}
               onClick={() => setShowOutbox((v) => !v)}
               className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
@@ -403,6 +430,17 @@ export default function ChatSection() {
             {joinResult && <p className="mt-1 text-xs text-zinc-400">{joinResult}</p>}
           </div>
         )}
+        {showBroadcasts && (
+          <BroadcastsPanel
+            broadcasts={broadcasts.broadcasts}
+            peers={tau.peers}
+            loading={broadcasts.loading}
+            error={broadcasts.error}
+            onCreate={(name, members) => broadcasts.create(name, members)}
+            onDelete={(name) => broadcasts.remove(name)}
+            onSend={(name, text) => broadcasts.send(name, text)}
+          />
+        )}
         {showOutbox && (
           <OutboxPanel
             outbox={outbox.outbox}
@@ -414,21 +452,28 @@ export default function ChatSection() {
             onDropHeld={(target) => void outbox.dropHeld(target)}
           />
         )}
-        <div className="min-h-0 flex-1">
-          <ConversationList
-            conversations={conversations}
-            archived={archivedConvs}
-            dmRequests={dmRequests}
-            selectedKey={selectedKey}
-            onSelect={handleSelect}
-            onAcceptRequest={(req) => {
-              void run("Accept failed", () => acceptDmRequest(req.id)).then(() => void refreshRequests());
-            }}
-            onDeclineRequest={(req) => {
-              void run("Decline failed", () => declineDmRequest(req.id)).then(() => void refreshRequests());
-            }}
-          />
-        </div>
+        <MessageSearch
+          onOpen={handleOpenSearchResult}
+          onActiveChange={setSearchActive}
+          resetToken={searchReset}
+        />
+        {!searchActive && (
+          <div className="min-h-0 flex-1">
+            <ConversationList
+              conversations={conversations}
+              archived={archivedConvs}
+              dmRequests={dmRequests}
+              selectedKey={selectedKey}
+              onSelect={handleSelect}
+              onAcceptRequest={(req) => {
+                void run("Accept failed", () => acceptDmRequest(req.id)).then(() => void refreshRequests());
+              }}
+              onDeclineRequest={(req) => {
+                void run("Decline failed", () => declineDmRequest(req.id)).then(() => void refreshRequests());
+              }}
+            />
+          </div>
+        )}
       </div>
 
       <div className={`min-w-0 flex-1 flex-col ${selected ? "flex" : "hidden lg:flex"}`}>

@@ -3,7 +3,7 @@
 // DM: peer info, ping, safety number + verify flow (the safety number is
 // shown first; verification happens only after a separate "Numbers match"
 // confirm — never automatically), block/unblock, forget, alias, note,
-// archive, mute, disappearing default, mark unread/read.
+// archive, mute, pin, disappearing default, mark unread/read.
 // Group: members, topic, mute, mark unread/read, leave.
 
 "use client";
@@ -451,6 +451,9 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
       </div>
 
       <div className="mt-3 flex flex-wrap gap-2">
+        <ActionButton disabled={busy === "pin"} onClick={() => void run("pin", () => actions.pin(target, !conversation.pinned))}>
+          {conversation.pinned ? "Unpin" : "Pin"}
+        </ActionButton>
         <ActionButton disabled={busy === "mute"} onClick={() => void run("mute", () => actions.mute(target, !conversation.muted))}>
           {conversation.muted ? "Unmute" : "Mute"}
         </ActionButton>
