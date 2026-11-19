@@ -16,7 +16,11 @@
 import type {
   AllowList,
   ApiErrorBody,
+  AwayMessageSettings,
+  Beacon,
   BlockResult,
+  BroadcastList,
+  BroadcastSendResponse,
   Channel,
   ChannelMessage,
   ChannelTopic,
@@ -32,13 +36,16 @@ import type {
   MeshPage,
   MeshRow,
   MutedConversations,
+  MessageDraft,
   NodeSettings,
   Outbox,
   OutboxRetryResult,
+  OwnProfile,
   PageList,
   Peer,
   PeerInfo,
   PingResult,
+  QuietHoursSettings,
   SafetyNumberResult,
   ScheduledChannelMessage,
   ScheduledTanPost,
@@ -240,10 +247,10 @@ export async function getSettings(): Promise<NodeSettings> {
   return get("/api/settings");
 }
 
-/** `setting` is "accept_files" | "send_read_receipts"; value must be boolean. */
+/** `setting` is "accept_files" | "send_read_receipts" | "tan_sync_depth"; boolean settings take a boolean, tan_sync_depth takes 1 or 2. */
 export async function updateSetting(
-  setting: "accept_files" | "send_read_receipts",
-  value: boolean,
+  setting: "accept_files" | "send_read_receipts" | "tan_sync_depth",
+  value: boolean | number,
 ): Promise<NodeSettings> {
   const data = await post<{ ok: boolean; settings: NodeSettings }>("/api/settings", {
     setting,
@@ -303,6 +310,33 @@ export async function deleteGroup(group: string): Promise<{ id: string; name: st
   return post("/api/groups/delete", { group });
 }
 
+// ---------------------------------------------------------- broadcasts --
+// One message, many private DMs: a send fans out as an ordinary DM per
+// member, so recipients never see each other or the list.
+
+export async function getBroadcasts(): Promise<BroadcastList[]> {
+  const data = await get<{ broadcasts: BroadcastList[]; count: number }>("/api/broadcasts");
+  return data.broadcasts ?? [];
+}
+
+export async function createBroadcast(
+  name: string,
+  members: string[],
+): Promise<{ ok: boolean; broadcast: BroadcastList }> {
+  return post("/api/broadcasts", { name, members });
+}
+
+export async function deleteBroadcast(broadcast: string): Promise<{ ok: boolean; name: string }> {
+  return post("/api/broadcasts/delete", { broadcast });
+}
+
+export async function sendBroadcast(
+  broadcast: string,
+  text: string,
+): Promise<BroadcastSendResponse> {
+  return post("/api/broadcasts/send", { broadcast, text });
+}
+
 export async function leaveGroup(group: string): Promise<{ id: string; name: string; already_left?: boolean; also_left?: string[] }> {
   return post("/api/groups/leave", { group });
 }
@@ -343,6 +377,39 @@ export async function setGroupTopic(group: string, topic?: string, clear = false
   return post("/api/groups/topic", clear ? { group, clear: true } : { group, topic });
 }
 
+/** An invite link for a group this node created, with its stored state. */
+export interface GroupInviteStatus {
+  group: Group;
+  mode: "open" | "closed";
+  generation: number;
+  link: string | null;
+}
+
+export async function getGroupInviteStatus(group: string): Promise<GroupInviteStatus> {
+  return get(`/api/groups/invite${query({ group })}`);
+}
+
+export async function mintGroupInvite(
+  group: string,
+  mode?: "open" | "closed",
+): Promise<GroupInviteStatus> {
+  return post("/api/groups/invite", mode === undefined ? { group } : { group, mode });
+}
+
+export async function revokeGroupInvites(group: string): Promise<{ group: Group; generation: number }> {
+  return post("/api/groups/invite/revoke", { group });
+}
+
+export interface GroupJoinResult {
+  status: "added" | "already_member" | "pending" | "queued";
+  /** The joined group when added, the group name when queued. */
+  group: Group | string;
+}
+
+export async function joinGroupViaLink(link: string): Promise<GroupJoinResult> {
+  return post("/api/groups/join", { link });
+}
+
 /** Voting/closing a group poll returns the sent vote/close legs + node response. */
 export interface GroupPollActionResult {
   ok: boolean;
@@ -377,6 +444,51 @@ export async function closeDmPoll(peer: string, poll: string): Promise<DmPollAct
   return post("/api/dm/close-poll", { to: peer, poll });
 }
 
+// --------------------------------------------------------------- beacons --
+
+/** Live beacons this node is sharing, active first. */
+export async function getBeacons(): Promise<{ beacons: Beacon[]; count: number }> {
+  return get("/api/beacons");
+}
+
+export interface StartBeaconOptions {
+  lat: number;
+  lon: number;
+  name?: string;
+  /** Seconds the beacon runs (60..28800, default 3600). */
+  durationSeconds?: number;
+  /** Round updates to ~1 km and drop the place name. */
+  coarse?: boolean;
+}
+
+/** Start a live beacon; the first update goes out at once. */
+export async function startBeacon(
+  target: { peer?: string; group?: string },
+  opts: StartBeaconOptions,
+): Promise<{ beacon: Beacon; update: unknown }> {
+  return post("/api/beacons/start", { ...target, ...opts });
+}
+
+/** Stop a live beacon by id. */
+export async function stopBeacon(id: string): Promise<{ beacon: Beacon }> {
+  return post("/api/beacons/stop", { id });
+}
+
+/** Feed a running beacon a fresh position from the browser's geolocation. */
+export async function updateBeaconPosition(
+  id: string,
+  lat: number,
+  lon: number,
+  name?: string,
+): Promise<{ beacon: Beacon }> {
+  return post("/api/beacons/position", {
+    id,
+    lat,
+    lon,
+    ...(name !== undefined ? { name } : {}),
+  });
+}
+
 // -------------------------------------------------------------- messages --
 
 export interface SendMessageOptions {
@@ -388,6 +500,8 @@ export interface SendMessageOptions {
   sendIn?: number;
   /** Post `text` as a poll question with these options. */
   pollOptions?: string[];
+  /** Pin a place on the message: latitude -90..90, longitude -180..180. */
+  location?: { lat: number; lon: number; name?: string };
   timeout?: number;
 }
 
@@ -424,6 +538,7 @@ export async function sendMessage(
   if (opts.expiresIn !== undefined) body.expires_in = opts.expiresIn;
   if (opts.sendIn !== undefined) body.send_in = opts.sendIn;
   if (opts.pollOptions) body.poll_options = opts.pollOptions;
+  if (opts.location) body.location = opts.location;
   if (opts.timeout !== undefined) body.timeout = opts.timeout;
   return post("/api/messages", body);
 }
@@ -562,12 +677,83 @@ export async function setDisappearingDefault(
   return post("/api/messages/disappearing", { ...target, seconds });
 }
 
+/** This node's published public profile (or the node-name default). */
+export async function getOwnProfile(): Promise<OwnProfile> {
+  return get("/api/profile");
+}
+
+/** Publish a new profile version; omitted fields keep their stored value. */
+export async function setOwnProfile(patch: {
+  name?: string;
+  bio?: string;
+  avatar?: string | null;
+  links?: string[];
+}): Promise<{ ok: boolean; profile: OwnProfile & { changed: boolean } }> {
+  return post("/api/profile", patch);
+}
+
+export async function getAwayMessage(): Promise<AwayMessageSettings> {
+  return get("/api/settings/away-message");
+}
+
+/** Set the away auto-reply; omitted fields keep their stored value. */
+export async function setAwayMessage(patch: {
+  enabled?: boolean;
+  message?: string;
+}): Promise<{ ok: boolean; away_message: AwayMessageSettings }> {
+  return post("/api/settings/away-message", patch);
+}
+
+/** The quiet-hours window, plus whether it is quiet right now. */
+export async function getQuietHours(): Promise<QuietHoursSettings> {
+  return get("/api/settings/quiet-hours");
+}
+
+/** Set the quiet-hours window; omitted fields keep their stored value. */
+export async function setQuietHours(patch: {
+  enabled?: boolean;
+  start?: string;
+  end?: string;
+}): Promise<{ ok: boolean; quiet_hours: QuietHoursSettings }> {
+  return post("/api/settings/quiet-hours", patch);
+}
+
+
 export async function getMutedConversations(): Promise<MutedConversations> {
   return get("/api/messages/muted");
 }
 
+/** Saved message drafts, oldest first (``tau draft save``). */
+export async function getDrafts(): Promise<MessageDraft[]> {
+  const data = await get<{ drafts: MessageDraft[]; count: number }>("/api/drafts");
+  return data.drafts ?? [];
+}
+
+/** Save (or overwrite) the draft for one peer or group conversation. */
+export async function saveDraft(
+  kind: "peer" | "group",
+  target: string,
+  text: string,
+): Promise<MessageDraft> {
+  const data = await post<{ ok: boolean; draft: MessageDraft }>("/api/drafts", {
+    kind,
+    target,
+    text,
+  });
+  return data.draft;
+}
+
+/** Discard the draft for one peer or group conversation. */
+export async function deleteDraft(kind: "peer" | "group", target: string): Promise<boolean> {
+  const data = await post<{ ok: boolean; deleted: boolean }>("/api/drafts/delete", {
+    kind,
+    target,
+  });
+  return data.deleted;
+}
+
 export async function setMuted(
-  target: { peer: string } | { group: string },
+  target: { peer: string } | { group: string } | { channel: string },
   muted = true,
 ): Promise<unknown> {
   return post("/api/messages/mute", { ...target, muted });
@@ -689,6 +875,11 @@ export async function getTanThread(ref: string): Promise<TanPost[]> {
 export async function getTanFollowing(): Promise<TanAuthor[]> {
   const data = await get<{ following: TanAuthor[]; count: number }>("/api/tan/following");
   return data.following;
+}
+
+export async function getTanFollowers(): Promise<TanAuthor[]> {
+  const data = await get<{ followers: TanAuthor[]; count: number }>("/api/tan/followers");
+  return data.followers;
 }
 
 export async function getTanAuthors(opts: {
@@ -821,6 +1012,8 @@ export interface PublishTanOptions {
   replyTo?: string;
   /** Post lifetime in seconds (0 < n <= 7 days). */
   expiresIn?: number;
+  /** Image to attach, as a base64 data URL (top-level posts only). */
+  image?: { dataUrl: string };
 }
 
 export async function publishTanPost(
@@ -831,6 +1024,20 @@ export async function publishTanPost(
     text,
     reply_to: opts.replyTo,
     expires_in: opts.expiresIn,
+    image: opts.image?.dataUrl,
+  });
+}
+
+/** Largest image a Tan post may carry, in bytes (mirrors MAX_IMAGE_BYTES). */
+export const TAN_MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+
+/** Read a picked file as a base64 data URL for upload. */
+export function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("Could not read the image file."));
+    reader.readAsDataURL(file);
   });
 }
 

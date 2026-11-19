@@ -7,7 +7,7 @@
 //   useTanThread(ref)  — thread view rooted at one post.
 //   useTanComposer()   — publish / schedule / poll composer actions.
 //   useTanLists()      — saved / hidden / pinned / scheduled / following /
-//                        muted lists and tag follows.
+//                        followers / muted lists and tag follows.
 //
 // Posts arrive from /api/tan/timeline (following by default, `all=1` for
 // everything cached) with bridge annotations: likes/liked/own, quotes,
@@ -26,6 +26,7 @@ import {
   followTanAuthor,
   followTanTag,
   getTanAuthors,
+  getTanFollowers,
   getTanFollowing,
   getTanHidden,
   getTanLikers,
@@ -242,7 +243,10 @@ export function useTanThread(ref: string | null): UseTanThreadResult {
 // ------------------------------------------------------------- composer ---
 
 export interface UseTanComposerResult {
-  publish: (text: string, opts?: { replyTo?: string; expiresIn?: number }) => Promise<TanPost>;
+  publish: (
+    text: string,
+    opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } },
+  ) => Promise<TanPost>;
   schedule: (text: string, sendIn: number, opts?: { replyTo?: string; expiresIn?: number }) => Promise<ScheduledTanPost>;
   poll: (question: string, options: string[], expiresIn?: number) => Promise<TanPost>;
   busy: boolean;
@@ -269,7 +273,13 @@ export function useTanComposer(): UseTanComposerResult {
 
   return {
     publish: (text, opts) =>
-      run(() => publishTanPost(text, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn })),
+      run(() =>
+        publishTanPost(text, {
+          replyTo: opts?.replyTo,
+          expiresIn: opts?.expiresIn,
+          image: opts?.image,
+        }),
+      ),
     schedule: (text, sendIn, opts) =>
       run(() => scheduleTanPost(text, sendIn, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn })),
     poll: (question, options, expiresIn) => run(() => createTanPoll(question, options, expiresIn)),
@@ -283,6 +293,7 @@ export function useTanComposer(): UseTanComposerResult {
 export interface UseTanListsResult {
   tags: TanTag[];
   following: TanAuthor[];
+  followers: TanAuthor[];
   suggestions: TanAuthor[];
   saved: TanPost[];
   hidden: TanPost[];
@@ -304,10 +315,11 @@ export interface UseTanListsResult {
   authors: (sort?: "recent" | "posts" | "name", limit?: number, offset?: number) => Promise<{ authors: TanAuthor[]; total: number }>;
 }
 
-/** Discover + library lists: tags, following, suggestions, saved/hidden/pinned. */
+/** Discover + library lists: tags, following, followers, suggestions, saved/hidden/pinned. */
 export function useTanLists(): UseTanListsResult {
   const [tags, setTags] = useState<TanTag[]>([]);
   const [following, setFollowing] = useState<TanAuthor[]>([]);
+  const [followers, setFollowers] = useState<TanAuthor[]>([]);
   const [suggestions, setSuggestions] = useState<TanAuthor[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [hidden, setHidden] = useState<TanPost[]>([]);
@@ -320,9 +332,10 @@ export function useTanLists(): UseTanListsResult {
 
   const refresh = useCallback(async () => {
     try {
-      const [t, f, s, sv, h, p, sc, ma, mk, mt] = await Promise.all([
+      const [t, f, fw, s, sv, h, p, sc, ma, mk, mt] = await Promise.all([
         getTanTags(),
         getTanFollowing(),
+        getTanFollowers(),
         getTanSuggestions(),
         getTanSaved(),
         getTanHidden(),
@@ -334,6 +347,7 @@ export function useTanLists(): UseTanListsResult {
       ]);
       setTags(t);
       setFollowing(f);
+      setFollowers(fw);
       setSuggestions(s);
       setSaved(sv.posts);
       setHidden(h.posts);
@@ -362,6 +376,7 @@ export function useTanLists(): UseTanListsResult {
   return {
     tags,
     following,
+    followers,
     suggestions,
     saved,
     hidden,

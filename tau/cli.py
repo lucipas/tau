@@ -66,6 +66,7 @@ from .config import (
     parse_host_port,
     send_read_receipts_enabled,
     set_node_setting,
+    tan_sync_depth,
     write_node_metadata,
     write_rns_config,
 )
@@ -289,6 +290,7 @@ from .tangents.tan import (
     follow,
     follow_tag,
     followed_tags,
+    followers,
     following,
     find_post_by_image,
     get_draft,
@@ -1729,6 +1731,20 @@ def build_parser() -> argparse.ArgumentParser:
     config_receipts.set_defaults(func=cmd_config)
     config_cmd.set_defaults(func=cmd_config)
 
+    config_depth = config_sub.add_parser(
+        "tan-sync-depth",
+        parents=[common],
+        help="how many hops of the follow graph Tan sync reaches (1 or 2, default 2)",
+    )
+    config_depth.add_argument(
+        "depth",
+        nargs="?",
+        choices=["1", "2"],
+        help="1 = followed authors only, 2 = plus the authors they follow",
+    )
+    config_depth.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
     block = subparsers.add_parser(
         "block",
         parents=[common],
@@ -1873,6 +1889,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="GROUP",
         help="group id, id prefix or name",
+    )
+    mute_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name (a joined channel)",
     )
     mute.add_argument(
         "--off",
@@ -3593,6 +3614,13 @@ def build_parser() -> argparse.ArgumentParser:
         "following", parents=[common], help="list followed authors"
     )
     tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_followers = tan_sub.add_parser(
+        "followers",
+        parents=[common],
+        help="list authors who follow you, from stored follow lists",
+    )
+    tan_followers.set_defaults(func=cmd_tan_followers)
 
     tan_publish_follows = tan_sub.add_parser(
         "publish-follows",
@@ -7646,6 +7674,55 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
             print(
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s)"
+            )
+    return _EXIT_OK
+
+
+def cmd_tan_followers(args: argparse.Namespace) -> int:
+    """List the authors who follow this node.
+
+    Followers are derived from the peers' signed follow lists this
+    node has already verified and stored — the same lists the sync
+    depth uses — so this never does network I/O.  A follower whose
+    list was never fetched does not appear yet; fetch it first with
+    ``tau tan follows-of`` or a sync.
+    """
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    own_author = destination_hash(identity).hex()
+    store = FollowListStore(config.follow_lists_path)
+    lists = {
+        doc["author"]: doc["authors"]
+        for doc in store.all()
+        if isinstance(doc, dict)
+        and isinstance(doc.get("author"), str)
+        and isinstance(doc.get("authors"), list)
+    }
+    registry = PeerRegistry(config.peers_path)
+    conn = init_db(config.social_db_path)
+    try:
+        records = followers(conn, lists, own_author, registry=registry)
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"followers": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print(
+                "No followers yet — nobody with a stored follow list "
+                "follows you. Try `tau tan sync` to fetch follow lists."
+            )
+        for record in records:
+            name = record.get("name") or "unknown"
+            followed = "following" if record.get("followed") else ""
+            print(
+                f"{name:<20} {short_hash(record['author']):<10} "
+                f"{record.get('posts', 0)} post(s)  {followed}".rstrip()
             )
     return _EXIT_OK
 
@@ -15180,17 +15257,34 @@ def cmd_pinned_conversations(args: argparse.Namespace) -> int:
 
 def cmd_mute(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    if getattr(args, "off", False) and args.peer is None and args.group is None:
-        print("error: --off needs a --peer or --group to unmute", file=sys.stderr)
+    channel = getattr(args, "channel", None)
+    if (
+        getattr(args, "off", False)
+        and args.peer is None
+        and args.group is None
+        and channel is None
+    ):
+        print(
+            "error: --off needs a --peer, --group or --channel to unmute",
+            file=sys.stderr,
+        )
         return _EXIT_ERROR
     for_duration = getattr(args, "for_duration", None)
-    if for_duration is not None and args.peer is None and args.group is None:
-        print("error: --for needs a --peer or --group to mute", file=sys.stderr)
+    if (
+        for_duration is not None
+        and args.peer is None
+        and args.group is None
+        and channel is None
+    ):
+        print(
+            "error: --for needs a --peer, --group or --channel to mute",
+            file=sys.stderr,
+        )
         return _EXIT_ERROR
     if getattr(args, "off", False) and for_duration is not None:
         print("error: --off and --for cannot be combined", file=sys.stderr)
         return _EXIT_ERROR
-    if args.peer is None and args.group is None:
+    if args.peer is None and args.group is None and channel is None:
         # No target lists what is muted, mirroring `tau archived`.
         muted = load_muted(config.muted_path)
         now = time.time()
@@ -15198,6 +15292,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
             payload: Dict[str, Any] = {
                 "peers": sorted(muted.peers),
                 "groups": sorted(muted.groups),
+                "channels": sorted(muted.channels),
             }
             peer_until = {
                 key: until
@@ -15213,11 +15308,18 @@ def cmd_mute(args: argparse.Namespace) -> int:
             }
             if group_until:
                 payload["group_until"] = group_until
+            channel_until = {
+                key: until
+                for key, until in sorted(muted.channel_until.items())
+                if key in muted.channels
+            }
+            if channel_until:
+                payload["channel_until"] = channel_until
             _emit(payload, True)
             return _EXIT_OK
         registry = PeerRegistry(config.peers_path)
         store = GroupStore(config.groups_path)
-        if not muted.peers and not muted.groups:
+        if not muted.peers and not muted.groups and not muted.channels:
             print("No muted conversations.")
             return _EXIT_OK
         for destination in sorted(muted.peers):
@@ -15243,8 +15345,33 @@ def cmd_mute(args: argparse.Namespace) -> int:
                 else ""
             )
             print(f"{label}{suffix}")
+        for channel_name in sorted(muted.channels):
+            until = muted.muted_until_channel(channel_name, now=now)
+            suffix = (
+                f" — muted for {_ago(until - now)} more"
+                if until is not None
+                else ""
+            )
+            print(f"channel #{channel_name}{suffix}")
         return _EXIT_OK
-    if args.group is not None:
+    if channel is not None:
+        # A channel mute is meaningless for a channel whose messages
+        # are not stored here, so muting requires membership — like
+        # a group mute requires the group to exist.
+        try:
+            name = clean_channel_name(channel)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        if name not in {m["channel"] for m in app.memberships()}:
+            print(f"error: not a member of #{name} — join it first", file=sys.stderr)
+            return _EXIT_ERROR
+        key = name
+        label = f"channel #{name}"
+        is_group = False
+        is_channel = True
+    elif args.group is not None:
         store = GroupStore(config.groups_path)
         group = store.find(args.group)
         key = group["id"]
@@ -15252,6 +15379,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
         lineage = group_lineage(group)
         label = f"group {group['name']} ({short_hash(key)})"
         is_group = True
+        is_channel = False
     else:
         inbox = Inbox(config.inbox_path)
         registry = PeerRegistry(config.peers_path)
@@ -15260,6 +15388,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else "unknown"
         label = f"conversation with {name} ({short_hash(key)})"
         is_group = False
+        is_channel = False
     seconds = None
     until = None
     if for_duration is not None:
@@ -15284,6 +15413,13 @@ def cmd_mute(args: argparse.Namespace) -> int:
                 updated = muted.without_group_lineage(lineage)
             else:
                 updated = muted.with_group_lineage(lineage, until=until)
+        elif is_channel:
+            previous = muted.is_muted_channel(key)
+            previous_until = muted.muted_until_channel(key)
+            if getattr(args, "off", False):
+                updated = muted.without_channel(key)
+            else:
+                updated = muted.with_channel(key, until=until)
         else:
             previous = muted.is_muted_peer(key)
             previous_until = muted.muted_until_peer(key)
@@ -15302,6 +15438,8 @@ def cmd_mute(args: argparse.Namespace) -> int:
     # off the previous state.
     if is_group:
         effective_until = updated.muted_until_group_lineage(lineage)
+    elif is_channel:
+        effective_until = updated.muted_until_channel(key)
     else:
         effective_until = updated.muted_until_peer(key)
     if _json_mode(args):
@@ -15309,6 +15447,7 @@ def cmd_mute(args: argparse.Namespace) -> int:
             {
                 "target": key,
                 "group": is_group,
+                "channel": is_channel,
                 "muted": current,
                 "changed": changed,
                 "until": effective_until,
@@ -19421,9 +19560,33 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("  its messages as delivered, never read")
         return _EXIT_OK
 
+    if command == "tan-sync-depth":
+        depth_arg = getattr(args, "depth", None)
+        if depth_arg is None:
+            depth = tan_sync_depth(config.data_dir)
+            if json_output:
+                _emit({"tan_sync_depth": depth}, True)
+            else:
+                print(f"Tan sync depth: {depth}")
+                print("  1 = followed authors only")
+                print("  2 = plus the authors they follow (default)")
+            return _EXIT_OK
+        depth = int(depth_arg)
+        set_node_setting(config.data_dir, "tan_sync_depth", depth)
+        if json_output:
+            _emit({"tan_sync_depth": depth}, True)
+        else:
+            print(f"Tan sync depth: {depth}")
+            if depth == 1:
+                print("  sync pulls followed authors only")
+            else:
+                print("  sync also pulls the authors they follow")
+        return _EXIT_OK
+
     settings = {
         "accept_files": accept_files_enabled(config.data_dir),
         "send_read_receipts": send_read_receipts_enabled(config.data_dir),
+        "tan_sync_depth": tan_sync_depth(config.data_dir),
     }
     if json_output:
         _emit(settings, True)
@@ -19433,8 +19596,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"Settings ({config.data_dir / 'node.json'}):")
         print(f"  accept files: {accept_state}")
         print(f"  send read receipts: {receipts_state}")
+        print(f"  tan sync depth: {settings['tan_sync_depth']}")
         print("  change with: tau config accept-files on|off")
         print("  change with: tau config read-receipts on|off")
+        print("  change with: tau config tan-sync-depth 1|2")
     return _EXIT_OK
 
 

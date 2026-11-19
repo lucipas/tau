@@ -1563,6 +1563,24 @@ def test_unread_counts_messages_received_since_join(identities, tmp_path):
     assert channel_unread_counts(conn) == {"general": 2, "other": 1}
 
 
+def test_unread_counts_excludes_muted_channels(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    source = init_db(tmp_path / "source.sqlite3")
+    _join_at(conn, "general", 1000)
+    store_message(conn, _store_from(identities, source, bob, "general", "one", 1001), now=1001)
+    _join_at(conn, "other", 1000)
+    store_message(conn, _store_from(identities, source, bob, "other", "elsewhere", 1002), now=1002)
+
+    assert channel_unread_counts(conn, exclude_channels=["general"]) == {"other": 1}
+    assert channel_unread_counts(conn, exclude_channels=["general", "other"]) == {}
+    # Excluding a channel that has nothing unread changes nothing.
+    assert channel_unread_counts(conn, exclude_channels=["missing"]) == {
+        "general": 1,
+        "other": 1,
+    }
+
+
 def test_unread_counts_empty_without_messages(tmp_path):
     conn = init_db(tmp_path / "channels.sqlite3")
     _join_at(conn, "general", 1000)
@@ -1666,6 +1684,43 @@ def test_app_unread_counts_excludes_own_and_blocked_messages(identities, tmp_pat
     marked = app.mark_read("general")
     assert marked["cleared"] == 0
     assert app.unread_counts() == {}
+
+
+def test_app_unread_counts_excludes_muted_channels(identities, tmp_path):
+    from tau.muted import MutedConversations, save_muted
+
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    app.join("general")
+    app.send("general", "my own post", publish=False)
+
+    source = init_db(tmp_path / "source.sqlite3")
+    conn = app.connect()
+    try:
+        store_message(
+            conn,
+            _store_from(identities, source, bob, "general", "hi", 1001),
+            now=time.time(),
+        )
+    finally:
+        conn.close()
+    assert app.unread_counts() == {"general": 1}
+
+    save_muted(
+        config.muted_path,
+        MutedConversations(channels=frozenset({"general"})),
+    )
+    assert app.unread_counts() == {}
+
+    # Unmuting restores the count: the read cursor never moved.
+    save_muted(config.muted_path, MutedConversations())
+    assert app.unread_counts() == {"general": 1}
+
+    # A corrupt mutes file fails open — the channel counts as unmuted
+    # rather than breaking the whole read.
+    config.muted_path.write_text("{not json", encoding="utf-8")
+    assert app.unread_counts() == {"general": 1}
 
 
 def test_cli_channel_list_shows_unread_and_mark_read_clears(tmp_path, capsys):

@@ -128,10 +128,12 @@ advances the cursor when you read a conversation, and the console shows an
 unread badge next to each peer and the unread total in the tab title.
 Opening a peer in the console clears its badge; read receipts to the sender
 are a separate feature and do not exist yet. A single conversation can be
-muted with `tau mute --peer alice` (or for a while with `--for 1h`), and
-pinned to the top of the list with `tau pin-conversation --peer alice`
-(`--group NAME` pins a group, `--channel NAME` a joined channel),
-and `tau quiet-hours set --start 22:00 --end 07:00` silences the whole badge
+muted with `tau mute --peer alice` (or for a while with `--for 1h`), and a
+channel with `tau mute --channel general` — muted conversations still
+receive messages, they just never light the badge — and pinned to the top
+of the list with `tau pin-conversation --peer alice` (`--group NAME` pins
+a group, `--channel NAME` a joined channel). `tau quiet-hours set
+--start 22:00 --end 07:00` silences the whole badge
 every night instead — while the window is active every conversation counts
 as unread 0, and the counts come back when it ends. The Chat tab has a
 search box above the conversation list: it searches stored DM and group
@@ -255,6 +257,11 @@ tau tan timeline --json
 `tau serve --social --social-sync-interval 60` also pulls the public timeline
 from known peers every minute, so a long-running node keeps its cache fresh.
 
+Sync reaches two hops into the follow graph by default: it pulls followed
+authors plus the authors they follow (their published follow lists are fetched
+over `/tau/follows` when missing). `tau config tan-sync-depth 1` pulls followed
+authors only; the console Settings page has the same switch.
+
 Useful flags:
 
 ```bash
@@ -287,6 +294,11 @@ tau tan top --author alice
 # Follow by destination hash or by a unique hash prefix
 tau tan follow 5c04c868
 tau tan following
+
+# See who follows you, from the signed follow lists this node has
+# fetched and stored (a follower whose list was never fetched does
+# not appear yet — sync first)
+tau tan followers
 
 # Hide a word or phrase from your local views (whole-word match,
 # case-insensitive; entries keep syncing, so unmuting restores them)
@@ -421,6 +433,7 @@ Global options may appear before or after the command:
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan followers` | List authors who follow you (from stored follow lists) |
 | `tau tan authors` | List every author in the local Tan store |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
@@ -493,6 +506,8 @@ tau outbox
 # Broadcast lists: one message, many private DMs (no shared group)
 tau broadcast create team --peer alice --peer bob
 tau broadcast send team "meet at noon"
+# The web console has the same lists: Chat → Broadcasts, for
+# creating a list, sending to it, and deleting it.
 
 # Read back messages this node received (newest first)
 tau messages

@@ -44,6 +44,19 @@ beforeEach(() => {
     if (url.includes("/api/tan/thread")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/tags")) return { tags: [{ tag: "mesh", count: 5 }], count: 1 };
     if (url.includes("/api/tan/following")) return { following: [], count: 0 };
+    if (url.includes("/api/tan/followers"))
+      return {
+        followers: [
+          {
+            author: "b".repeat(64),
+            name: "bob",
+            posts: 2,
+            followed: false,
+            last_post: 1000,
+          },
+        ],
+        count: 1,
+      };
     if (url.includes("/api/tan/suggest")) return { suggestions: [], count: 0 };
     if (url.includes("/api/tan/saved")) return { posts: [], count: 0, next_offset: null };
     if (url.includes("/api/tan/hidden")) return { posts: [], count: 0, next_offset: null };
@@ -119,6 +132,15 @@ describe("SocialSection", () => {
     await waitFor(() =>
       expect(calls).toContain("GET /api/tan/timeline?limit=30&all=1"),
     );
+  });
+
+  it("shows followers with a follow-back button", async () => {
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Followers" }));
+    await waitFor(() => expect(calls).toContain("GET /api/tan/followers"));
+    expect(await screen.findByText("bob")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Follow" })).toBeTruthy();
   });
 
   it("liking a post posts to /api/tan/like", async () => {

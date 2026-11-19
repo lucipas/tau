@@ -2557,6 +2557,10 @@ def test_parser_tan_follow_list_arguments():
     cached = parser.parse_args(["tan", "follows-of", "alice", "--cached"])
     assert cached.cached is True
 
+    followers = parser.parse_args(["tan", "followers"])
+    assert followers.tan_command == "followers"
+    assert followers.func is cli.cmd_tan_followers
+
 
 def test_tan_publish_follows_end_to_end(tmp_path, capsys):
     from tau.follows import load_local_follow_list
@@ -2670,6 +2674,116 @@ def test_tan_follows_of_unknown_peer(tmp_path, capsys):
     )
     assert code == 1
     assert "no peer matches" in capsys.readouterr().err
+
+
+def test_tan_followers_lists_stored_followers(tmp_path, capsys):
+    from tau.follows import FollowListStore, build_follow_list
+    from tau.tangents.tan import create_post, init_db
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    owner = load_identity(config.identity_path)
+    owner_author = destination_hash(owner).hex()
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=100.0,
+    )
+    registry.save()
+    conn = init_db(config.social_db_path)
+    try:
+        create_post(conn, peer_identity, "hello from alice", name="alice", now=1000)
+    finally:
+        conn.close()
+    doc = build_follow_list(
+        peer_identity, authors=[owner_author], version=1, updated_at=1000.0
+    )
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+
+    code = cli.main(["tan", "followers", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "1 post(s)" in out
+
+    code = cli.main(["tan", "followers", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["followers"][0]["author"] == destination_hash(peer_identity).hex()
+    assert payload["followers"][0]["name"] == "alice"
+    assert payload["followers"][0]["posts"] == 1
+    assert payload["followers"][0]["followed"] is False
+
+
+def test_tan_followers_empty_when_no_list_names_you(tmp_path, capsys):
+    from tau.follows import FollowListStore, build_follow_list
+
+    data_dir = _init_owner_node(tmp_path, capsys)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    peer_identity = RNS.Identity()
+    doc = build_follow_list(
+        peer_identity,
+        authors=[destination_hash(RNS.Identity()).hex()],
+        version=1,
+        updated_at=1000.0,
+    )
+    store = FollowListStore(config.follow_lists_path)
+    assert store.store(doc) is True
+    assert store.save() is True
+
+    code = cli.main(["tan", "followers", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No followers yet" in capsys.readouterr().out
+
+    code = cli.main(["tan", "followers", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"followers": [], "count": 0}
+
+
+def test_tan_followers_needs_identity(tmp_path, capsys):
+    code = cli.main(["tan", "followers", "--data-dir", str(tmp_path / "empty")])
+    assert code == 1
+    assert "no identity" in capsys.readouterr().err
+
+
+def test_config_tan_sync_depth_show_set_and_list(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    # Default is 2 (per #467) on a fresh node.
+    code = cli.main(["config", "tan-sync-depth", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Tan sync depth: 2" in capsys.readouterr().out
+
+    code = cli.main(
+        ["config", "tan-sync-depth", "1", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "Tan sync depth: 1" in capsys.readouterr().out
+
+    code = cli.main(
+        ["config", "tan-sync-depth", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == {"tan_sync_depth": 1}
+
+    # The plain listing shows the depth alongside the other settings.
+    code = cli.main(["config", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "tan sync depth: 1" in out
+    assert "tau config tan-sync-depth 1|2" in out
+
+
+def test_config_tan_sync_depth_rejects_bad_value(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    with pytest.raises(SystemExit):
+        cli.main(["config", "tan-sync-depth", "3", "--data-dir", str(data_dir)])
 
 
 def test_peers_show_includes_profile(tmp_path, capsys):

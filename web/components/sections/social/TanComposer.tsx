@@ -1,14 +1,17 @@
 // TanComposer.tsx — the Social composer: text post, poll mode, schedule
 // (send later), disappearing expiry, and image attach.
 //
-// The bridge has no Tan image-upload endpoint (api.ts only fetches cached
-// media), so an attached file is shown with an honest note and the text
-// posts without it. Max length is a client-side guard only.
+// An attached image is read as a base64 data URL and published with the
+// post (the bridge validates and stores it); replies and polls cannot
+// carry an image, and neither can a scheduled post yet, so the picker
+// is hidden for those and the submit guards them. Max length is a
+// client-side guard only.
 
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { validatePoll } from "@/components/chat/Composer";
+import { TAN_MAX_IMAGE_BYTES, readFileAsDataUrl } from "@/lib/api";
 import type { UseTanComposerResult } from "@/lib/use-tan";
 
 export const TAN_MAX_CHARS = 2000;
@@ -63,6 +66,15 @@ export default function TanComposer({
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // Replies cannot carry an image: drop a picked file the moment the
+  // composer becomes a reply, instead of failing on submit.
+  useEffect(() => {
+    if (replyTo) {
+      setFile(null);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }, [replyTo]);
+
   function reset() {
     setText("");
     setPollOptions(["", ""]);
@@ -94,11 +106,31 @@ export default function TanComposer({
     }
     const problem = validateTanText(text);
     if (problem) return setError(problem);
+    if (file && sendIn !== undefined) {
+      return setError("Images can't be scheduled yet — post now or remove the image.");
+    }
+    if (file && file.size > TAN_MAX_IMAGE_BYTES) {
+      return setError("That image is larger than the 2 MB limit.");
+    }
     try {
+      let image: { dataUrl: string } | undefined;
+      if (file) {
+        try {
+          image = { dataUrl: await readFileAsDataUrl(file) };
+        } catch (err) {
+          return setError(
+            err instanceof Error ? err.message : "Could not read the image file.",
+          );
+        }
+      }
       if (sendIn !== undefined) {
         await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn });
       } else {
-        await composer.publish(text.trim(), { replyTo: replyTo ?? undefined, expiresIn });
+        await composer.publish(text.trim(), {
+          replyTo: replyTo ?? undefined,
+          expiresIn,
+          image,
+        });
       }
       reset();
       onPosted?.();
@@ -206,15 +238,26 @@ export default function TanComposer({
         <button
           type="button"
           onClick={() => fileRef.current?.click()}
-          disabled={composer.busy}
-          title="Attach an image"
+          disabled={composer.busy || mode === "poll" || !!replyTo}
+          title={
+            replyTo
+              ? "Replies can't carry an image"
+              : mode === "poll"
+                ? "Polls can't carry an image"
+                : "Attach an image"
+          }
           className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
         >
           🖼 Attach
         </button>
         <button
           type="button"
-          onClick={() => setMode((m) => (m === "poll" ? "post" : "poll"))}
+          onClick={() => {
+            // Polls cannot carry an image: drop a picked file rather
+            // than silently posting the poll without it.
+            if (mode === "post") setFile(null);
+            setMode(mode === "poll" ? "post" : "poll");
+          }}
           aria-pressed={mode === "poll"}
           disabled={composer.busy}
           className={`rounded-full border px-3 py-1 text-xs font-medium ${
@@ -279,8 +322,8 @@ export default function TanComposer({
 
       {file && (
         <p className="mt-2 text-xs text-zinc-400">
-          Attached: <span className="text-zinc-200">{file.name}</span> — the bridge has no Tan
-          image upload yet, so the text posts without the image.
+          Attached: <span className="text-zinc-200">{file.name}</span>{" "}
+          <span className="text-zinc-500">({Math.max(1, Math.round(file.size / 1024))} KB)</span>
           <button
             type="button"
             onClick={() => {
