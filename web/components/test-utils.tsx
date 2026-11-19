@@ -40,7 +40,7 @@ export function makeMessage(overrides: Partial<ChatMessage> & { id: number }): C
 }
 
 export function makeUnread(overrides: Partial<UnreadCounts> = {}): UnreadCounts {
-  return { per_peer: {}, per_group: {}, total: 0, revision: 1, ...overrides };
+  return { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1, ...overrides };
 }
 
 export function fakeTau(overrides: Partial<UseTauResult> = {}): UseTauResult {

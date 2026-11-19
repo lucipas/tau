@@ -10,6 +10,8 @@ import pytest
 import RNS
 
 from tau import cli
+from tau.channels import init_db as init_channel_db
+from tau.channels import join_channel
 from tau.config import TauConfig
 from tau.drafts import MAX_DRAFTS, DraftStore
 from tau.groups import GroupStore
@@ -47,6 +49,18 @@ def _seed_group(tmp_path, name="crew"):
     return data_dir, str(group["id"])
 
 
+def _seed_channel(tmp_path, name="general"):
+    """A data dir with one joined channel; returns (data_dir, name)."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        join_channel(conn, name)
+    finally:
+        conn.close()
+    return data_dir, name
+
+
 def _draft_main(data_dir, *argv):
     return cli.main(["draft", "--data-dir", str(data_dir), *argv])
 
@@ -79,6 +93,35 @@ def test_store_save_get_overwrite_and_delete(tmp_path):
     assert len(store) == 1
 
 
+def test_store_channel_draft_keyed_by_name(tmp_path):
+    store = DraftStore(tmp_path / "drafts.json")
+    # A channel draft is keyed by the channel name, not a hash: a
+    # 32-hex string is a legal channel name, so it must store as one.
+    saved = store.save("channel", "general", "hello channel")
+    assert saved["kind"] == "channel"
+    assert saved["target"] == "general"
+    assert store.get("channel", "general")["text"] == "hello channel"
+
+    # Overwriting keeps one draft per channel.
+    store.save("channel", "general", "second try")
+    assert len(store) == 1
+    assert store.get("channel", "general")["text"] == "second try"
+
+    # A channel draft is a separate conversation from a peer draft,
+    # even when the peer hash happens to look like a channel name.
+    store.save("peer", ALICE_HASH, "hello alice")
+    assert len(store) == 2
+    assert store.delete("channel", "general") is True
+    assert store.get("channel", "general") is None
+
+    # A corrupt channel entry (bad name) is dropped on reload, like a
+    # corrupt peer entry.
+    raw = json.loads((tmp_path / "drafts.json").read_text())
+    raw["drafts"].append({"kind": "channel", "target": "bad name!", "text": "bad"})
+    (tmp_path / "drafts.json").write_text(json.dumps(raw))
+    assert len(DraftStore(tmp_path / "drafts.json")) == 1
+
+
 def test_store_rejects_bad_text_kind_and_target(tmp_path):
     store = DraftStore(tmp_path / "drafts.json")
     with pytest.raises(ValueError):
@@ -86,7 +129,9 @@ def test_store_rejects_bad_text_kind_and_target(tmp_path):
     with pytest.raises(ValueError):
         store.save("peer", ALICE_HASH, "x" * (MAX_MESSAGE_CHARS + 1))
     with pytest.raises(ValueError):
-        store.save("channel", ALICE_HASH, "hello")
+        store.save("channel", "bad name!", "hello")
+    with pytest.raises(ValueError):
+        store.save("channel", "x" * 65, "hello")
     with pytest.raises(ValueError):
         store.save("peer", "not-a-hash", "hello")
     assert len(store) == 0
@@ -181,6 +226,45 @@ def test_cli_save_group_draft(tmp_path, capsys):
     assert "group crew" in out and "agenda?" in out
     assert _draft_main(data_dir, "show", "--group", group_id) == 0
     assert capsys.readouterr().out.strip() == "agenda?"
+
+
+def test_cli_save_list_show_delete_channel_draft(tmp_path, capsys):
+    data_dir, _ = _seed_channel(tmp_path)
+
+    assert _draft_main(data_dir, "save", "--channel", "general", "announcement?") == 0
+    out = capsys.readouterr().out
+    assert "draft saved for general" in out
+    assert "announcement?" in out
+
+    assert _draft_main(data_dir, "list") == 0
+    out = capsys.readouterr().out
+    assert "channel general" in out and "announcement?" in out
+
+    assert _draft_main(data_dir, "show", "--channel", "general") == 0
+    assert capsys.readouterr().out.strip() == "announcement?"
+
+    assert _draft_main(data_dir, "save", "--channel", "general", "revised") == 0
+    capsys.readouterr()
+    assert _draft_main(data_dir, "show", "--channel", "general") == 0
+    assert capsys.readouterr().out.strip() == "revised"
+
+    assert _draft_main(data_dir, "delete", "--channel", "general") == 0
+    assert "deleted draft for general" in capsys.readouterr().out
+    assert _draft_main(data_dir, "list") == 0
+    assert "No drafts yet" in capsys.readouterr().out
+
+
+def test_cli_save_channel_draft_requires_membership(tmp_path, capsys):
+    data_dir, _ = _seed_channel(tmp_path)
+
+    assert _draft_main(data_dir, "save", "--channel", "random", "hi") != 0
+    assert "not a member of channel 'random'" in capsys.readouterr().err
+
+    assert _draft_main(data_dir, "save", "--channel", "bad name!", "hi") != 0
+    assert "channel name" in capsys.readouterr().err
+
+    assert _draft_main(data_dir, "list") == 0
+    assert "No drafts yet" in capsys.readouterr().out
 
 
 def test_cli_unknown_peer_group_and_missing_draft(tmp_path, capsys):
@@ -286,6 +370,43 @@ def test_cli_send_group_draft_uses_group_path(tmp_path, capsys, monkeypatch):
 
     assert _draft_main(data_dir, "list") == 0
     assert "No drafts yet" in capsys.readouterr().out
+
+
+def test_cli_send_channel_draft_uses_channel_path(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_channel(tmp_path)
+    assert _draft_main(data_dir, "save", "--channel", "general", "channel hello") == 0
+    capsys.readouterr()
+
+    calls: list = []
+
+    def _fake_channel_send(args):
+        calls.append((args.channel, args.message))
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_channel_send", _fake_channel_send)
+    assert _draft_main(data_dir, "send", "--channel", "general") == 0
+    assert "sent draft to general" in capsys.readouterr().out
+    assert calls == [("general", "channel hello")]
+
+    assert _draft_main(data_dir, "list") == 0
+    assert "No drafts yet" in capsys.readouterr().out
+
+
+def test_cli_send_channel_draft_failure_keeps_draft(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_channel(tmp_path)
+    assert _draft_main(data_dir, "save", "--channel", "general", "still here") == 0
+    capsys.readouterr()
+
+    def _failing_channel_send(args):
+        return 2
+
+    monkeypatch.setattr(cli, "cmd_channel_send", _failing_channel_send)
+    assert _draft_main(data_dir, "send", "--channel", "general") != 0
+    assert "kept" in capsys.readouterr().err
+
+    assert _draft_main(data_dir, "list") == 0
+    out = capsys.readouterr().out
+    assert "channel general" in out and "still here" in out
 
 
 def test_cli_send_group_failure_keeps_draft(tmp_path, capsys, monkeypatch):
