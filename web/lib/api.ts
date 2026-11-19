@@ -1397,12 +1397,16 @@ export async function scheduleChannelPoll(
   options: string[],
   sendIn: number,
 ): Promise<ScheduledChannelMessage> {
-  return post("/api/channels/schedule", {
-    channel,
-    text: question,
-    poll_options: options,
-    send_in: sendIn,
-  });
+  const data = await post<{ ok: boolean; scheduled: ScheduledChannelMessage }>(
+    "/api/channels/schedule",
+    {
+      channel,
+      text: question,
+      poll_options: options,
+      send_in: sendIn,
+    },
+  );
+  return data.scheduled;
 }
 
 export async function cancelScheduledChannelMessage(id: string): Promise<unknown> {

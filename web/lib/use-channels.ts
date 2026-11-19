@@ -267,6 +267,8 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       if (!selected) throw new Error("no channel selected");
       const entry = await scheduleChannelPoll(selected, question, options, sendIn);
       await refreshMessages(selected);
+      // refreshTopic also reloads the Scheduled list, so the new poll shows now.
+      await refreshTopic(selected);
       return entry;
     },
     cancelScheduled: async (id) => {

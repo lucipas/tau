@@ -470,7 +470,7 @@ Global options may appear before or after the command:
 | `tau channel scheduled [NAME]` | List queued channel messages and polls, soonest first |
 | `tau channel cancel-scheduled ID` | Drop a queued channel message or poll before it publishes |
 | `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
-| `tau channel poll NAME "QUESTION" OPT... --delay 5m` | Queue a poll to ask later (a serving node with --channels publishes it) |
+| `tau channel poll NAME "QUESTION" OPT... --delay 5m` | Queue a poll to ask later (a serving node with --channels publishes it). Restart any node serving with `--channels` on this version before queuing polls: an older node reads a queued poll as a plain message and publishes only the question |
 | `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
 | `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
 | `tau channel topic NAME [TEXT]` | Show or set a channel's topic (any member may set it; newest wins; `--clear` removes it) |
