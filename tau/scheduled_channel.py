@@ -472,6 +472,94 @@ def cancel_scheduled_channel_message(
     return message
 
 
+def edit_scheduled_channel_message(
+    path: Union[str, Path],
+    prefix: str,
+    *,
+    text: Optional[str] = None,
+    publish_at: Optional[float] = None,
+    name: Optional[str] = None,
+    now: Optional[float] = None,
+) -> ScheduledChannelMessage:
+    """Change the text and/or publish time of one queued channel message.
+
+    At least one of *text* / *publish_at* must be given.  The new text
+    gets the same validation as scheduling does (``normalize_message``
+    plus the wire-size preflight against the entry's channel), so an
+    edit cannot queue a message that could never be published.  A new
+    publish time must be in the future and within the 7-day queue cap.
+
+    An entry whose publish already created the signed message (it has
+    a stored ``message_hash``) cannot be edited: the text is already
+    signed, so changing it would orphan the stored copy.  Cancel it
+    instead.  Everything else about the entry — channel, targets, TTL,
+    retry state — is left untouched.  The queue stays ordered soonest
+    first, so a later publish time moves the entry down the list.
+    """
+    if text is None and publish_at is None:
+        raise ScheduledChannelError(
+            "nothing to change — pass a new text and/or a new publish time"
+        )
+    at = now if now is not None else time.time()
+    clean_text: Optional[str] = None
+    if text is not None:
+        clean_text = _clean_text(text)
+    clean_publish_at: Optional[float] = None
+    if publish_at is not None:
+        clean_publish_at = _clean_timestamp(publish_at, "publish_at")
+        if clean_publish_at <= at:
+            raise ScheduledChannelError("publish time must be in the future")
+        if clean_publish_at - at > MAX_SCHEDULED_CHANNEL_DELAY:
+            raise ScheduledChannelError(
+                "publish time must be within 7d (the scheduled-channel delay cap)"
+            )
+    with scheduled_channel_messages_lock(path):
+        queue = load_scheduled_channel_messages(path)
+        message = queue.resolve(prefix)
+        if message.message_hash is not None:
+            raise ScheduledChannelError(
+                "that message was already created — cancel it instead of editing it"
+            )
+        if clean_text is not None:
+            # Lazy import: this module stays importable without
+            # Reticulum, which ``tau.backup`` relies on.
+            from .channels import ChannelError, _check_wire_size, sanitize_name
+
+            envelope = {
+                # Placeholder author/key at their real lengths
+                # (destination hash 32 hex, RNS public key 128 hex):
+                # a shorter placeholder would admit a message that
+                # only fails once signed.
+                "channel": message.channel,
+                "author": "0" * 32,
+                "key": "0" * 128,
+                "name": sanitize_name(name or "anonymous"),
+                "text": clean_text,
+                "created_at": (
+                    clean_publish_at
+                    if clean_publish_at is not None
+                    else message.publish_at
+                ),
+            }
+            try:
+                _check_wire_size(envelope)
+            except ChannelError as exc:
+                raise ScheduledChannelError(str(exc)) from exc
+        edited = replace(
+            message,
+            text=clean_text if clean_text is not None else message.text,
+            publish_at=(
+                clean_publish_at if clean_publish_at is not None else message.publish_at
+            ),
+        )
+        replaced = queue.with_replaced(edited)
+        ordered = ScheduledChannelMessages(
+            messages=tuple(sorted(replaced.messages, key=lambda m: m.publish_at))
+        )
+        save_scheduled_channel_messages(path, ordered)
+    return edited
+
+
 class _PassPaused(Exception):
     """Internal: the publish pass ends early — node stopping, or the
     pass budget elapsed.  Raised instead of recording a publish

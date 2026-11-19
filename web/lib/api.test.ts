@@ -10,6 +10,7 @@ import {
   createBroadcast,
   deleteBroadcast,
   closeChannelPoll,
+  editScheduledChannelMessage,
   deleteDraft,
   eventsUrl,
   fetchTanMedia,
@@ -344,6 +345,18 @@ describe("POST endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/cancel-scheduled");
     expect(captured[0].init?.method).toBe("POST");
     expect(bodyOf(0)).toEqual({ id: "abc123" });
+  });
+
+  it("edits a scheduled channel message's text and time", async () => {
+    nextJson = { ok: true, edited: { id: "abc123", text: "fixed" } };
+    const edited = await editScheduledChannelMessage("abc123", {
+      text: "fixed",
+      sendIn: 3600,
+    });
+    expect(captured[0].url).toBe("/api/channels/edit-scheduled");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: "abc123", text: "fixed", sendIn: 3600 });
+    expect(edited.text).toBe("fixed");
   });
 
   it("votes and closes a DM poll on the DM routes", async () => {

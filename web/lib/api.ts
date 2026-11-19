@@ -1306,6 +1306,17 @@ export async function cancelScheduledChannelMessage(id: string): Promise<unknown
   return post("/api/channels/cancel-scheduled", { id });
 }
 
+export async function editScheduledChannelMessage(
+  id: string,
+  patch: { text?: string; sendIn?: number },
+): Promise<ScheduledChannelMessage> {
+  const data = await post<{ ok: boolean; edited: ScheduledChannelMessage }>(
+    "/api/channels/edit-scheduled",
+    { id, ...patch },
+  );
+  return data.edited;
+}
+
 /** Pull missing history for one channel, or every joined channel when omitted. */
 export async function syncChannels(channel?: string, limit = 20): Promise<unknown> {
   return post("/api/channels/sync", channel ? { channel, limit } : { limit });

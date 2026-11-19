@@ -18,6 +18,15 @@ const SCHEDULE_OPTIONS: { label: string; seconds: number | undefined }[] = [
   { label: "Tomorrow", seconds: 86400 },
 ];
 
+// Send-time choices when editing a queued message: "Keep time" leaves
+// the publish time alone, the rest move it from now.
+const EDIT_SCHEDULE_OPTIONS: { label: string; seconds: number | undefined }[] = [
+  { label: "Keep time", seconds: undefined },
+  { label: "In 5 minutes", seconds: 5 * 60 },
+  { label: "In 1 hour", seconds: 3600 },
+  { label: "Tomorrow", seconds: 86400 },
+];
+
 export default function ChannelsSection() {
   const channels = useChannels(30_000);
   const [joinName, setJoinName] = useState("");
@@ -29,6 +38,14 @@ export default function ChannelsSection() {
   const [syncing, setSyncing] = useState(false);
   const [muting, setMuting] = useState(false);
   const [cancelling, setCancelling] = useState<string | null>(null);
+  // The scheduled message being edited, if any, with its draft text
+  // and an optional new send time (undefined keeps the current time).
+  const [editingScheduled, setEditingScheduled] = useState<string | null>(null);
+  const [editScheduledText, setEditScheduledText] = useState("");
+  const [editScheduledSendIn, setEditScheduledSendIn] = useState<
+    number | undefined
+  >(undefined);
+  const [savingScheduledEdit, setSavingScheduledEdit] = useState(false);
   const [pollOpen, setPollOpen] = useState(false);
   const [pollQuestion, setPollQuestion] = useState("");
   const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
@@ -138,6 +155,33 @@ export default function ChannelsSection() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setCancelling(null);
+    }
+  }
+
+  async function handleSaveScheduledEdit(id: string, originalText: string) {
+    const body = editScheduledText.trim();
+    if (!body) return;
+    // An unchanged save makes no request — just close the form.
+    if (body === originalText && editScheduledSendIn === undefined) {
+      setEditingScheduled(null);
+      return;
+    }
+    setSavingScheduledEdit(true);
+    setError(null);
+    try {
+      await channels.editScheduled(id, {
+        ...(body !== originalText ? { text: body } : {}),
+        ...(editScheduledSendIn !== undefined
+          ? { sendIn: editScheduledSendIn }
+          : {}),
+      });
+      setEditingScheduled(null);
+      setEditScheduledText("");
+      setEditScheduledSendIn(undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingScheduledEdit(false);
     }
   }
 
@@ -517,21 +561,99 @@ export default function ChannelsSection() {
                 {channels.scheduled.map((s) => (
                   <div key={s.id} className="mt-2 flex items-start gap-2">
                     <div className="min-w-0 flex-1">
-                      <p className="text-sm whitespace-pre-wrap text-zinc-300">{s.text}</p>
-                      <p className="text-xs text-zinc-500">
-                        {s.publish_at * 1000 <= Date.now()
-                          ? "due — publishes on the next serve pass"
-                          : formatCountdown(s.publish_at)}
-                      </p>
+                      {editingScheduled === s.id ? (
+                        <div>
+                          <textarea
+                            value={editScheduledText}
+                            onChange={(e) => setEditScheduledText(e.target.value)}
+                            rows={2}
+                            aria-label="Edit scheduled message"
+                            className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500"
+                          />
+                          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                            <select
+                              value={
+                                editScheduledSendIn === undefined
+                                  ? ""
+                                  : String(editScheduledSendIn)
+                              }
+                              onChange={(e) =>
+                                setEditScheduledSendIn(
+                                  e.target.value === ""
+                                    ? undefined
+                                    : Number(e.target.value),
+                                )
+                              }
+                              aria-label="New send time"
+                              className="rounded-full border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 outline-none focus:border-cyan-500"
+                            >
+                              {EDIT_SCHEDULE_OPTIONS.map((o) => (
+                                <option
+                                  key={o.label}
+                                  value={o.seconds === undefined ? "" : o.seconds}
+                                >
+                                  {o.label}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => void handleSaveScheduledEdit(s.id, s.text)}
+                              disabled={
+                                savingScheduledEdit || !editScheduledText.trim()
+                              }
+                              className="rounded-full bg-cyan-500 px-3 py-1 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                            >
+                              {savingScheduledEdit ? "Saving…" : "Save"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingScheduled(null);
+                                setEditScheduledText("");
+                                setEditScheduledSendIn(undefined);
+                              }}
+                              className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <p className="text-sm whitespace-pre-wrap text-zinc-300">{s.text}</p>
+                          <p className="text-xs text-zinc-500">
+                            {s.publish_at * 1000 <= Date.now()
+                              ? "due — publishes on the next serve pass"
+                              : formatCountdown(s.publish_at)}
+                          </p>
+                        </>
+                      )}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => void handleCancelScheduled(s.id)}
-                      disabled={cancelling === s.id}
-                      className="shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
-                    >
-                      {cancelling === s.id ? "Cancelling…" : "Cancel"}
-                    </button>
+                    {editingScheduled !== s.id && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingScheduled(s.id);
+                            setEditScheduledText(s.text);
+                            setEditScheduledSendIn(undefined);
+                          }}
+                          aria-label="Edit scheduled message"
+                          className="shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-900"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleCancelScheduled(s.id)}
+                          disabled={cancelling === s.id}
+                          className="shrink-0 rounded-full border border-zinc-700 px-2 py-0.5 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+                        >
+                          {cancelling === s.id ? "Cancelling…" : "Cancel"}
+                        </button>
+                      </>
+                    )}
                   </div>
                 ))}
               </div>

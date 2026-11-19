@@ -229,6 +229,7 @@ from .scheduled_channel import (
     MAX_SCHEDULED_CHANNEL_DELAY,
     ScheduledChannelError,
     cancel_scheduled_channel_message,
+    edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     schedule_channel_message,
 )
@@ -4118,6 +4119,25 @@ def build_parser() -> argparse.ArgumentParser:
         "target", metavar="ID", help="scheduled message id or unique id prefix"
     )
     channel_cancel_scheduled.set_defaults(func=cmd_channel_cancel_scheduled)
+
+    channel_edit_scheduled = channel_sub.add_parser(
+        "edit-scheduled",
+        parents=[common],
+        help="change a queued channel message's text and/or publish time",
+    )
+    channel_edit_scheduled.add_argument(
+        "target", metavar="ID", help="scheduled message id or unique id prefix"
+    )
+    channel_edit_scheduled.add_argument(
+        "--text", default=None, help="replacement message text"
+    )
+    channel_edit_scheduled.add_argument(
+        "--delay",
+        default=None,
+        metavar="DURATION",
+        help="publish in DURATION (e.g. 30s, 5m, 2h, 7d); at most 7d",
+    )
+    channel_edit_scheduled.set_defaults(func=cmd_channel_edit_scheduled)
     channel_topic = channel_sub.add_parser(
         "topic",
         parents=[common],
@@ -9123,6 +9143,46 @@ def cmd_channel_cancel_scheduled(args: argparse.Namespace) -> int:
         print(f"cancelled {entry.id} — it will not be published")
         if deleted_local:
             print("  also removed the stored message from the local channel")
+    return _EXIT_OK
+
+
+def cmd_channel_edit_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    if getattr(args, "text", None) is None and getattr(args, "delay", None) is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    publish_at = None
+    if getattr(args, "delay", None) is not None:
+        try:
+            delay = _parse_duration(
+                args.delay,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_CHANNEL_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        publish_at = time.time() + delay
+    try:
+        entry = edit_scheduled_channel_message(
+            config.scheduled_channel_messages_path,
+            args.target,
+            text=getattr(args, "text", None),
+            publish_at=publish_at,
+            name=config.name,
+        )
+    except ScheduledChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    if json_output:
+        _emit({"edited": entry.to_dict()}, True)
+    else:
+        print(f"edited {entry.id} — publishes {_stamp(entry.publish_at)}")
+        for line in entry.text.splitlines() or [""]:
+            print(f"  {line}")
     return _EXIT_OK
 
 

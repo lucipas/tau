@@ -430,6 +430,7 @@ Global options may appear before or after the command:
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
 | `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
 | `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
+| `tau channel edit-scheduled ID [--text TEXT] [--delay DURATION]` | Change a queued channel message's text and/or publish time |
 | `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
 | `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
 | `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
