@@ -9781,8 +9781,13 @@ def test_tan_post_with_location_stores_place(tmp_path, capsys):
     ]
     assert cli.main([*base, "--location", "34.05,-83.88 Rock Springs Park"]) == 0
     out = capsys.readouterr().out
-    assert "Rock Springs Park" in out
-    assert "openstreetmap.org" in out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
     from tau.tangents.tan import feed, init_db
 
     conn = init_db(data_dir / "tan.sqlite3")
@@ -9799,8 +9804,11 @@ def test_tan_post_with_location_stores_place(tmp_path, capsys):
     # The timeline prints the pin with its map link.
     assert cli.main(["tan", "timeline", "--data-dir", str(data_dir)]) == 0
     out = capsys.readouterr().out
-    assert "Rock Springs Park" in out
-    assert "openstreetmap.org" in out
+    assert "📍 Rock Springs Park — 34.05, -83.88" in out
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
     # And --json carries the place through.
     assert cli.main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
     out = capsys.readouterr().out
