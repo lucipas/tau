@@ -46,6 +46,7 @@ DM_REQUESTS_FILE_NAME = "dm-requests.json"
 INVITES_FILE_NAME = "invites.json"
 JOIN_REQUESTS_FILE_NAME = "join-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
+SCHEDULED_CHANNEL_MESSAGES_FILE_NAME = "scheduled-channel-messages.json"
 PROFILE_FILE_NAME = "profile.json"
 PROFILES_FILE_NAME = "profiles.json"
 BEACONS_FILE_NAME = "beacons.json"
@@ -99,6 +100,7 @@ class TauConfig:
     invites_path: Path
     join_requests_path: Path
     scheduled_posts_path: Path
+    scheduled_channel_messages_path: Path
     profile_path: Path
     profiles_path: Path
     beacons_path: Path
@@ -158,6 +160,8 @@ class TauConfig:
             invites_path=base / INVITES_FILE_NAME,
             join_requests_path=base / JOIN_REQUESTS_FILE_NAME,
             scheduled_posts_path=base / SCHEDULED_POSTS_FILE_NAME,
+            scheduled_channel_messages_path=base
+            / SCHEDULED_CHANNEL_MESSAGES_FILE_NAME,
             profile_path=base / PROFILE_FILE_NAME,
             profiles_path=base / PROFILES_FILE_NAME,
             beacons_path=base / BEACONS_FILE_NAME,
