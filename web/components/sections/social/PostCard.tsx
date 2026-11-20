@@ -131,6 +131,16 @@ export default function PostCard({
   const [shareOpen, setShareOpen] = useState(false);
   const [shareKind, setShareKind] = useState<"peer" | "channel">("peer");
   const [shareTarget, setShareTarget] = useState("");
+
+  // A channel picked earlier can leave the joined list on a poll
+  // (joined elsewhere, then left): the select then has no matching
+  // option, so treat the stored target as empty instead of letting
+  // Share send to a channel the node is no longer in. The server
+  // would refuse it anyway, but the picker should not offer it.
+  const effectiveShareTarget =
+    shareKind === "channel" && !channels.includes(shareTarget)
+      ? ""
+      : shareTarget;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -512,7 +522,7 @@ export default function PostCard({
               </div>
               <select
                 id={`share-${shown.hash.slice(0, 8)}`}
-                value={shareTarget}
+                value={effectiveShareTarget}
                 onChange={(e) => setShareTarget(e.target.value)}
                 className="min-w-0 flex-1 rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 outline-none"
               >
@@ -533,14 +543,14 @@ export default function PostCard({
               </select>
               <button
                 type="button"
-                disabled={busy || !shareTarget}
+                disabled={busy || !effectiveShareTarget}
                 onClick={() =>
                   void run(async () => {
                     await actions.share(
                       shown.hash,
                       shareKind === "peer"
-                        ? { to: shareTarget }
-                        : { channel: shareTarget },
+                        ? { to: effectiveShareTarget }
+                        : { channel: effectiveShareTarget },
                     );
                     setShareOpen(false);
                   })

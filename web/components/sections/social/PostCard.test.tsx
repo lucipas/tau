@@ -109,6 +109,39 @@ describe("PostCard share picker", () => {
     );
   });
 
+  it("disables Share when the picked channel leaves the joined list", async () => {
+    const actions = makeActions();
+    const { rerender } = render(
+      <PostCard
+        post={makePost()}
+        actions={actions}
+        peers={[{ destination: "c".repeat(64), name: "bob" }]}
+        channels={["general"]}
+      />,
+    );
+    openSharePicker();
+    fireEvent.click(screen.getByRole("button", { name: "Channel" }));
+    fireEvent.change(screen.getByLabelText("Share with"), {
+      target: { value: "general" },
+    });
+    expect(
+      screen.getByRole("button", { name: "Share" }) as HTMLButtonElement,
+    ).toHaveProperty("disabled", false);
+    // The joined list refreshes on a poll; the channel is gone now.
+    rerender(
+      <PostCard
+        post={makePost()}
+        actions={actions}
+        peers={[{ destination: "c".repeat(64), name: "bob" }]}
+        channels={[]}
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: "Share" }) as HTMLButtonElement,
+    ).toHaveProperty("disabled", true);
+    expect(actions.share).not.toHaveBeenCalled();
+  });
+
   it("switching back to Peer clears the channel choice", async () => {
     const actions = makeActions();
     render(
