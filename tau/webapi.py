@@ -346,6 +346,7 @@ from .beacons import (
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
+    ANNOUNCE_INTERVAL_MAX,
     ARCHIVED_FILE_NAME,
     AWAY_FILE_NAME,
     DISAPPEARING_FILE_NAME,

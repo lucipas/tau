@@ -61,6 +61,7 @@ from .bundle import (
 )
 from .config import (
     ANNOUNCE_INTERVAL_DEFAULT,
+    ANNOUNCE_INTERVAL_MAX,
     TauConfig,
     accept_files_enabled,
     announce_interval,
