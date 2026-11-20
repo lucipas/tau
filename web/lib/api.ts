@@ -1453,6 +1453,25 @@ export async function scheduleChannelMessage(
   return post("/api/channels/schedule", { channel, text, send_in: sendIn });
 }
 
+/** Queue a channel poll for later: the question plus its fixed options. */
+export async function scheduleChannelPoll(
+  channel: string,
+  question: string,
+  options: string[],
+  sendIn: number,
+): Promise<ScheduledChannelMessage> {
+  const data = await post<{ ok: boolean; scheduled: ScheduledChannelMessage }>(
+    "/api/channels/schedule",
+    {
+      channel,
+      text: question,
+      poll_options: options,
+      send_in: sendIn,
+    },
+  );
+  return data.scheduled;
+}
+
 export async function cancelScheduledChannelMessage(id: string): Promise<unknown> {
   return post("/api/channels/cancel-scheduled", { id });
 }

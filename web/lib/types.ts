@@ -848,6 +848,10 @@ export interface ScheduledChannelMessage {
   attempts: number;
   next_attempt_at: number | null;
   paused_at: number | null;
+  /** "message" for a queued message, "poll" for a queued poll question. */
+  kind?: "message" | "poll";
+  /** Fixed poll choices; only present when kind is "poll". */
+  options?: string[];
   [key: string]: unknown;
 }
 

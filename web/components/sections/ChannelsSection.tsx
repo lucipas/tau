@@ -388,7 +388,12 @@ export default function ChannelsSection() {
     setSending(true);
     setError(null);
     try {
-      await channels.poll(question, options);
+      if (sendIn !== undefined) {
+        await channels.schedulePoll(question, options, sendIn);
+        setSendIn(undefined);
+      } else {
+        await channels.poll(question, options);
+      }
       setPollQuestion("");
       setPollOptions(["", ""]);
       setPollOpen(false);
@@ -793,7 +798,18 @@ export default function ChannelsSection() {
                         </div>
                       ) : (
                         <>
+                          {s.kind === "poll" && (
+                            <p className="text-xs font-semibold text-zinc-400">
+                              Poll · {(s.options ?? []).length} options
+                            </p>
+                          )}
                           <p className="text-sm whitespace-pre-wrap text-zinc-300">{s.text}</p>
+                          {s.kind === "poll" &&
+                            (s.options ?? []).map((option, i) => (
+                              <p key={i} className="text-xs text-zinc-500">
+                                {i + 1}. {option}
+                              </p>
+                            ))}
                           <p className="text-xs text-zinc-500">
                             {s.publish_at * 1000 <= Date.now()
                               ? "due — publishes on the next serve pass"
@@ -1104,12 +1120,28 @@ export default function ChannelsSection() {
                       + Option
                     </button>
                   )}
+                  <label className="flex shrink-0 items-center gap-1 text-xs text-zinc-400">
+                    <span aria-hidden="true">🕑</span>
+                    <select
+                      aria-label="Send later"
+                      value={sendIn === undefined ? "" : String(sendIn)}
+                      onChange={(e) => setSendIn(e.target.value ? Number(e.target.value) : undefined)}
+                      disabled={sending}
+                      className="rounded-md border border-zinc-700 bg-zinc-900 px-1.5 py-1 text-xs text-zinc-200 outline-none"
+                    >
+                      {SCHEDULE_OPTIONS.map((o) => (
+                        <option key={o.label} value={o.seconds === undefined ? "" : o.seconds}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   <button
                     type="submit"
                     disabled={sending}
                     className="shrink-0 rounded-full bg-cyan-500 px-4 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
                   >
-                    {sending ? "…" : "Post poll"}
+                    {sending ? "…" : sendIn !== undefined ? "Schedule poll" : "Post poll"}
                   </button>
                   <button
                     type="button"

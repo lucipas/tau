@@ -236,6 +236,7 @@ from .scheduled_channel import (
     edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     schedule_channel_message,
+    schedule_channel_poll,
 )
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
@@ -4496,6 +4497,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-publish",
         action="store_true",
         help="store locally without contacting peers",
+    )
+    channel_poll.add_argument(
+        "--delay",
+        default=None,
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — needs a node "
+        "serving with --channels to publish it",
     )
     channel_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     channel_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
@@ -9238,6 +9247,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
+                disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
             raise NodeError(str(exc)) from exc
@@ -9699,9 +9709,9 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
         return _EXIT_OK
     if not entries:
         if channel_filter is not None:
-            print(f"No channel messages scheduled for #{channel_filter}.")
+            print(f"No channel messages or polls scheduled for #{channel_filter}.")
         else:
-            print("No channel messages scheduled.")
+            print("No channel messages or polls scheduled.")
         return _EXIT_OK
     now = time.time()
     for entry in entries:
@@ -9711,10 +9721,15 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
         else:
             when += f" (in {_ago(entry.publish_at - now)})"
         print(f"{entry.id}  #{entry.channel}  {when}")
+        if entry.kind == "poll":
+            print(f"  poll · {len(entry.options)} options")
         if entry.to:
             print(f"  to {', '.join(entry.to)}")
         for line in entry.text.splitlines() or [""]:
             print(f"  {line}")
+        if entry.kind == "poll":
+            for index, option in enumerate(entry.options, start=1):
+                print(f"    {index}. {option}")
     return _EXIT_OK
 
 
@@ -9973,6 +9988,58 @@ def cmd_channel_poll(args: argparse.Namespace) -> int:
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled poll is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_CHANNEL_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        # Refuse to queue for a channel we have not joined: the
+        # publish pass would fail every attempt the same way.
+        conn = init_channel_db(config.channels_db_path)
+        try:
+            member = is_channel_member(conn, name)
+        finally:
+            conn.close()
+        if not member:
+            print(
+                f"error: not a member of channel {name!r}; join it first",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            entry = schedule_channel_poll(
+                config.scheduled_channel_messages_path,
+                channel=name,
+                question=args.question,
+                options=options,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+                disappearing_path=config.disappearing_path,
+            )
+        except ScheduledChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        if _json_mode(args):
+            _emit({"scheduled": entry.to_dict()}, True)
+        else:
+            print(f"scheduled {entry.id} — asks in {_ago(delay)}")
+            print("  list it with `tau channel scheduled`; a node serving")
+            print("  with --channels publishes it when the time comes.")
+        return _EXIT_OK
     try:
         result = _send_channel_poll_message(
             args, config, name, args.question, poll_options=options

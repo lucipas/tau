@@ -229,9 +229,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?}``; ``expires_in`` seconds, at most 30d)
-    POST /api/channels/schedule  schedule a channel message for later
-    GET  /api/channels/scheduled  queued channel messages, soonest first
-    POST /api/channels/cancel-scheduled  cancel a queued channel message
+    POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later
+    GET  /api/channels/scheduled  queued channel messages and polls, soonest first
+    POST /api/channels/cancel-scheduled  cancel a queued channel message or poll
     POST /api/channels/edit-scheduled  edit a queued channel message's text/time
     POST /api/channels/poll  post a poll (``{"channel", "question", "options": [...]}``)
     POST /api/channels/vote  vote on a poll (``{"channel", "poll", "option"}``)
@@ -4707,7 +4707,8 @@ class WebBridge:
         )
 
     def channel_schedule(
-        self, channel: str, text: str, *, send_in: float
+        self, channel: str, text: str, *, send_in: float,
+        poll_options: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Queue a channel message for later, like ``tau channel send --delay``.
 
@@ -4716,9 +4717,12 @@ class WebBridge:
         entries when it has an app.  Membership is checked up front so
         a message for a channel never joined is refused here, not on
         every publish pass.
+
+        With *poll_options* the entry is a poll instead: the text is
+        its question and the options ride alongside it.
         """
         from .channels import clean_channel_name, is_member
-        from .scheduled_channel import schedule_channel_message
+        from .scheduled_channel import schedule_channel_message, schedule_channel_poll
 
         name = clean_channel_name(channel)
         conn = self._channel_conn()
@@ -4729,12 +4733,24 @@ class WebBridge:
         if not member:
             raise ValueError(f"not a member of channel {name!r}; join it first")
         config = self.node.config
+        if poll_options is not None:
+            entry = schedule_channel_poll(
+                config.scheduled_channel_messages_path,
+                channel=name,
+                question=text,
+                options=poll_options,
+                publish_at=time.time() + float(send_in),
+                name=getattr(self.node, "name", None),
+                disappearing_path=config.disappearing_path,
+            )
+            return entry.to_dict()
         entry = schedule_channel_message(
             config.scheduled_channel_messages_path,
             channel=name,
             text=text,
             publish_at=time.time() + float(send_in),
             name=getattr(self.node, "name", None),
+            disappearing_path=config.disappearing_path,
         )
         return entry.to_dict()
 
@@ -15601,9 +15617,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                poll_options = body.get("poll_options")
+                if poll_options is not None:
+                    # A poll is a top-level entry: its options are fixed
+                    # at schedule time.
+                    if (
+                        not isinstance(poll_options, list)
+                        or not 2 <= len(poll_options) <= 8
+                        or any(
+                            not isinstance(option, str) or not option.strip()
+                            for option in poll_options
+                        )
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'poll_options' must be a list "
+                                    "of 2-8 non-empty strings"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     scheduled = self.bridge.channel_schedule(
-                        channel, text, send_in=float(send_in)
+                        channel, text, send_in=float(send_in),
+                        poll_options=poll_options,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
