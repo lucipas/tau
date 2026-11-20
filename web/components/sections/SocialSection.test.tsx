@@ -137,6 +137,7 @@ beforeEach(() => {
     if (url.includes("/api/tan/muted")) return { muted: [], count: 0 };
     if (url.includes("/api/tan/followed-tags")) return { followed_tags: [], count: 0 };
     if (url.includes("/api/tan/authors")) return { authors: [], count: 0, total: 0 };
+    if (url.includes("/api/channels")) return { channels: [], count: 0 };
     if (url.includes("/api/tan/likes")) return { target: "x", likers: [], count: 0, total: 0 };
     if (url.includes("/api/tan/drafts")) {
       if (method === "POST" && url.includes("/delete")) {

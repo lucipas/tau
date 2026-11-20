@@ -1233,10 +1233,10 @@ export async function repostTanPost(target: string): Promise<unknown> {
   return post("/api/tan/repost", { target });
 }
 
-/** Share a post with a peer (`to`) or into a group (`group`). */
+/** Share a post with a peer (`to`), into a group (`group`), or into a channel (`channel`). */
 export async function shareTanPost(
   target: string,
-  dest: { to: string } | { group: string },
+  dest: { to: string } | { group: string } | { channel: string },
   timeout = 20,
 ): Promise<unknown> {
   return post("/api/tan/share", { target, ...dest, timeout });

@@ -200,7 +200,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/vote     vote on a Tan poll (signed vote entry on your chain)
     POST /api/tan/poll     ask a Tan poll question (signed poll entry on your chain)
     POST /api/tan/repost   repost a post (signed repost entry on your chain)
-    POST /api/tan/share    share a post with a peer or a group (sends it as a message)
+    POST /api/tan/share    share a post with a peer, a group, or a channel (sends it as a message)
     POST /api/tan/delete   delete one of your own posts
     POST /api/tan/edit     edit one of your own posts
     POST /api/tan/follow   follow an author
@@ -4020,9 +4020,10 @@ class WebBridge:
         *,
         to: Optional[str] = None,
         group: Optional[str] = None,
+        channel: Optional[str] = None,
         timeout: float = 20.0,
     ) -> Dict[str, Any]:
-        """Share a Tan post with a peer or into a group, from the console.
+        """Share a Tan post with a peer, into a group, or into a channel, from the console.
 
         Mirrors :meth:`forward_message`: the shared text is the post
         rendered by :func:`tau.tangents.tan.share_text` — author, text,
@@ -4030,12 +4031,13 @@ class WebBridge:
         inline on any transport with no protocol change.  Delivery
         reuses :meth:`send_message` wholesale for a peer target — or
         :meth:`send_group_message` for a group target, fanning out one
-        leg per member.  Either way the share is a new message, so it
-        carries no expiry, kind, or reply chain from the post, and the
-        new outbound entry appears in the feed like any other send.  A
-        repost shares its original; a post by a blocked author is
-        refused, matching the CLI.  Exactly one of ``to`` and ``group``
-        is required.
+        leg per member, or :meth:`channel_send` for a channel target.
+        Either way the share is a new message, so it carries no expiry,
+        kind, or reply chain from the post, and the new outbound entry
+        appears in the feed like any other send.  A repost shares its
+        original; a post by a blocked author is refused, matching the
+        CLI.  Exactly one of ``to``, ``group``, and ``channel`` is
+        required.
         """
         if to is not None and (not isinstance(to, str) or not to.strip()):
             raise ValueError("target peer is required")
@@ -4043,8 +4045,14 @@ class WebBridge:
             not isinstance(group, str) or not group.strip()
         ):
             raise ValueError("target group is required")
-        if (to is None) == (group is None):
-            raise ValueError("exactly one of 'to' and 'group' is required")
+        if channel is not None and (
+            not isinstance(channel, str) or not channel.strip()
+        ):
+            raise ValueError("target channel is required")
+        if sum(target is not None for target in (to, group, channel)) != 1:
+            raise ValueError(
+                "exactly one of 'to', 'group', and 'channel' is required"
+            )
         app = self._tan_app()
         if app is None:
             raise WebBridgeError(
@@ -4108,6 +4116,9 @@ class WebBridge:
             if not label:
                 label = short_hash(author) if author else "unknown"
         shared = share_text(post, label)
+        if channel is not None:
+            record = self.channel_send(channel.strip(), shared)
+            return {"ok": True, "message": record}
         if group is not None:
             messages, response = self.send_group_message(
                 group.strip(), shared, timeout=timeout
@@ -17203,6 +17214,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         to = body.get("to")
         group = body.get("group")
+        channel = body.get("channel")
         if to is not None and (not isinstance(to, str) or not to.strip()):
             self._send_json(
                 {"error": {"message": "field 'to' must be a peer name"}},
@@ -17219,11 +17231,20 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
-        if (to is None) == (group is None):
+        if channel is not None and (
+            not isinstance(channel, str) or not channel.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'channel' must be a channel name"}},
+                head_only,
+                400,
+            )
+            return
+        if sum(value is not None for value in (to, group, channel)) != 1:
             self._send_json(
                 {
                     "error": {
-                        "message": "exactly one of 'to' and 'group' is required"
+                        "message": "exactly one of 'to', 'group', and 'channel' is required"
                     }
                 },
                 head_only,
@@ -17237,6 +17258,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 to=to.strip() if isinstance(to, str) else None,
                 timeout=timeout,
                 group=group.strip() if isinstance(group, str) else None,
+                channel=channel.strip() if isinstance(channel, str) else None,
             )
         except WebBridgeError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 503)
