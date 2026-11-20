@@ -1124,7 +1124,7 @@ def test_send_group_message_allowed_for_creator_when_announcements_only(
         assert parse_group_message(payload)["group_announcements_only"] is True
 
 
-def test_deliver_entry_skips_queued_post_when_group_goes_announcements_only(
+def test_deliver_entry_drops_queued_post_when_group_goes_announcements_only(
     tmp_path, monkeypatch
 ):
     node, group, alice, bob = _group_reaction_node(tmp_path)
@@ -1148,8 +1148,9 @@ def test_deliver_entry_skips_queued_post_when_group_goes_announcements_only(
     )
     assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
     assert calls == []
-    # The leg stays queued until its TTL (the user can cancel it).
-    assert node.mailbox.get_outbox("bob-leg-1") is not None
+    # The leg is not deliverable ever again: it leaves the outbox now
+    # instead of being re-checked and re-logged on every sweep until TTL.
+    assert node.mailbox.get_outbox("bob-leg-1") is None
 
 
 def test_deliver_entry_carries_announcements_flag_on_retry(
