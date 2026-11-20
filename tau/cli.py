@@ -233,8 +233,10 @@ from .scheduled_channel import (
     MAX_SCHEDULED_CHANNEL_DELAY,
     ScheduledChannelError,
     cancel_scheduled_channel_message,
+    edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     schedule_channel_message,
+    schedule_channel_poll,
 )
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
@@ -1651,6 +1653,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     outbox_cancel.set_defaults(func=cmd_outbox_cancel)
 
+    outbox_edit = outbox_sub.add_parser(
+        "edit",
+        parents=[common],
+        help="edit a scheduled message before it sends",
+    )
+    outbox_edit.add_argument(
+        "target", metavar="ID", help="message id or unique id prefix"
+    )
+    outbox_edit.add_argument(
+        "--text",
+        metavar="TEXT",
+        default=None,
+        help="replacement text for the scheduled message",
+    )
+    outbox_edit.add_argument(
+        "--delay",
+        metavar="DURATION",
+        default=None,
+        help="move the send time to this long from now (e.g. 30s, 5m, 2h, "
+        "7d; at most 29d23h — the 30d mail TTL less an hour of delivery slack)",
+    )
+    outbox_edit.set_defaults(func=cmd_outbox_edit)
+
     outbox_retry = outbox_sub.add_parser(
         "retry",
         parents=[common],
@@ -2687,6 +2712,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail instead of queueing the poll when a member is offline",
     )
+    group_poll.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
     group_poll.set_defaults(func=cmd_group_poll)
 
     group_vote = group_sub.add_parser(
@@ -3242,6 +3274,24 @@ def build_parser() -> argparse.ArgumentParser:
         "target", metavar="ID", help="scheduled post id or unique id prefix"
     )
     tan_cancel_scheduled.set_defaults(func=cmd_tan_cancel_scheduled)
+
+    tan_edit_scheduled = tan_sub.add_parser(
+        "edit-scheduled",
+        parents=[common],
+        help="change the text and/or publish time of a queued Tan post",
+    )
+    tan_edit_scheduled.add_argument(
+        "target", metavar="ID", help="scheduled post id or unique id prefix"
+    )
+    tan_edit_scheduled.add_argument(
+        "--text", default=None, help="replacement text for the queued post"
+    )
+    tan_edit_scheduled.add_argument(
+        "--delay",
+        default=None,
+        help="publish this far from now, like 30m or 2h (at most 7d)",
+    )
+    tan_edit_scheduled.set_defaults(func=cmd_tan_edit_scheduled)
 
     tan_quote = tan_sub.add_parser(
         "quote",
@@ -4274,6 +4324,25 @@ def build_parser() -> argparse.ArgumentParser:
         "target", metavar="ID", help="scheduled message id or unique id prefix"
     )
     channel_cancel_scheduled.set_defaults(func=cmd_channel_cancel_scheduled)
+
+    channel_edit_scheduled = channel_sub.add_parser(
+        "edit-scheduled",
+        parents=[common],
+        help="change a queued channel message's text and/or publish time",
+    )
+    channel_edit_scheduled.add_argument(
+        "target", metavar="ID", help="scheduled message id or unique id prefix"
+    )
+    channel_edit_scheduled.add_argument(
+        "--text", default=None, help="replacement message text"
+    )
+    channel_edit_scheduled.add_argument(
+        "--delay",
+        default=None,
+        metavar="DURATION",
+        help="publish in DURATION (e.g. 30s, 5m, 2h, 7d); at most 7d",
+    )
+    channel_edit_scheduled.set_defaults(func=cmd_channel_edit_scheduled)
     channel_topic = channel_sub.add_parser(
         "topic",
         parents=[common],
@@ -4442,6 +4511,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-publish",
         action="store_true",
         help="store locally without contacting peers",
+    )
+    channel_poll.add_argument(
+        "--delay",
+        default=None,
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — needs a node "
+        "serving with --channels to publish it",
     )
     channel_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     channel_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
@@ -6762,6 +6839,48 @@ def cmd_tan_cancel_scheduled(args: argparse.Namespace) -> int:
         print(f"cancelled {post.id} — it will not be published")
         if deleted_local:
             print("  also removed the stored post from the local feed")
+    return _EXIT_OK
+
+
+def cmd_tan_edit_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    if getattr(args, "text", None) is None and getattr(args, "delay", None) is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    publish_at = None
+    if getattr(args, "delay", None) is not None:
+        try:
+            delay = _parse_duration(
+                args.delay,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_POST_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        publish_at = time.time() + delay
+    from .scheduled_posts import edit_scheduled_post
+
+    try:
+        post = edit_scheduled_post(
+            config.scheduled_posts_path,
+            args.target,
+            text=getattr(args, "text", None),
+            publish_at=publish_at,
+            name=config.name,
+        )
+    except ScheduledPostsError as exc:
+        raise NodeError(str(exc)) from exc
+    if json_output:
+        _emit({"edited": post.to_dict()}, True)
+    else:
+        print(f"edited {post.id} — publishes {_stamp(post.publish_at)}")
+        for line in post.text.splitlines() or [""]:
+            print(f"  {line}")
     return _EXIT_OK
 
 
@@ -9142,6 +9261,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
+                disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
             raise NodeError(str(exc)) from exc
@@ -9603,9 +9723,9 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
         return _EXIT_OK
     if not entries:
         if channel_filter is not None:
-            print(f"No channel messages scheduled for #{channel_filter}.")
+            print(f"No channel messages or polls scheduled for #{channel_filter}.")
         else:
-            print("No channel messages scheduled.")
+            print("No channel messages or polls scheduled.")
         return _EXIT_OK
     now = time.time()
     for entry in entries:
@@ -9615,10 +9735,15 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
         else:
             when += f" (in {_ago(entry.publish_at - now)})"
         print(f"{entry.id}  #{entry.channel}  {when}")
+        if entry.kind == "poll":
+            print(f"  poll · {len(entry.options)} options")
         if entry.to:
             print(f"  to {', '.join(entry.to)}")
         for line in entry.text.splitlines() or [""]:
             print(f"  {line}")
+        if entry.kind == "poll":
+            for index, option in enumerate(entry.options, start=1):
+                print(f"    {index}. {option}")
     return _EXIT_OK
 
 
@@ -9657,6 +9782,46 @@ def cmd_channel_cancel_scheduled(args: argparse.Namespace) -> int:
         print(f"cancelled {entry.id} — it will not be published")
         if deleted_local:
             print("  also removed the stored message from the local channel")
+    return _EXIT_OK
+
+
+def cmd_channel_edit_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    if getattr(args, "text", None) is None and getattr(args, "delay", None) is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    publish_at = None
+    if getattr(args, "delay", None) is not None:
+        try:
+            delay = _parse_duration(
+                args.delay,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_CHANNEL_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        publish_at = time.time() + delay
+    try:
+        entry = edit_scheduled_channel_message(
+            config.scheduled_channel_messages_path,
+            args.target,
+            text=getattr(args, "text", None),
+            publish_at=publish_at,
+            name=config.name,
+        )
+    except ScheduledChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    if json_output:
+        _emit({"edited": entry.to_dict()}, True)
+    else:
+        print(f"edited {entry.id} — publishes {_stamp(entry.publish_at)}")
+        for line in entry.text.splitlines() or [""]:
+            print(f"  {line}")
     return _EXIT_OK
 
 
@@ -9837,6 +10002,58 @@ def cmd_channel_poll(args: argparse.Namespace) -> int:
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled poll is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_CHANNEL_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        # Refuse to queue for a channel we have not joined: the
+        # publish pass would fail every attempt the same way.
+        conn = init_channel_db(config.channels_db_path)
+        try:
+            member = is_channel_member(conn, name)
+        finally:
+            conn.close()
+        if not member:
+            print(
+                f"error: not a member of channel {name!r}; join it first",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            entry = schedule_channel_poll(
+                config.scheduled_channel_messages_path,
+                channel=name,
+                question=args.question,
+                options=options,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+                disappearing_path=config.disappearing_path,
+            )
+        except ScheduledChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        if _json_mode(args):
+            _emit({"scheduled": entry.to_dict()}, True)
+        else:
+            print(f"scheduled {entry.id} — asks in {_ago(delay)}")
+            print("  list it with `tau channel scheduled`; a node serving")
+            print("  with --channels publishes it when the time comes.")
+        return _EXIT_OK
     try:
         result = _send_channel_poll_message(
             args, config, name, args.question, poll_options=options
@@ -17866,12 +18083,16 @@ def _send_group_poll_message(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    send_after: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Fan one group poll, vote, or close out, like ``cmd_group_send``.
 
-    Polls carry no expiry, schedule, quote, or wait — the same two
-    routes as a plain group send (the serving node, else a one-shot
-    local node) with the poll payload attached.
+    Polls carry no expiry, quote, or wait — the same two routes as a
+    plain group send (the serving node, else a one-shot local node)
+    with the poll payload attached.  ``send_after`` schedules a poll
+    the way it schedules a plain group message: the poll is queued
+    with a not-before time and publishes with its options intact once
+    the time arrives.
     """
     if _send_routes_via_running_node(config):
         return _send_group_via_running_node(
@@ -17879,7 +18100,7 @@ def _send_group_poll_message(
             config,
             text,
             expires_at=None,
-            send_after=None,
+            send_after=send_after,
             wait=0.0,
             poll_options=poll_options,
             poll_vote=poll_vote,
@@ -17890,7 +18111,7 @@ def _send_group_poll_message(
         config,
         text,
         expires_at=None,
-        send_after=None,
+        send_after=send_after,
         wait=0.0,
         poll_options=poll_options,
         poll_vote=poll_vote,
@@ -17915,9 +18136,19 @@ def _report_group_poll_send(
         if result.get("delivered"):
             print(f"delivered to {name}")
         elif result.get("queued"):
-            print(f"queued for {name} — they are unreachable right now")
+            if result.get("send_after"):
+                print(
+                    f"scheduled for {name}"
+                    f" — sends in {_ago(result['send_after'] - time.time())}"
+                )
+            else:
+                print(f"queued for {name} — they are unreachable right now")
         else:
             print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+    queued = [result for result in results if result.get("queued")]
+    if queued and all(result.get("send_after") for result in queued):
+        print("  it will be delivered at its scheduled time;")
+        print("  check `tau outbox` for the queue, or just leave a node serving")
     return _EXIT_ERROR if failed else _EXIT_OK
 
 
@@ -18168,6 +18399,15 @@ def cmd_close_poll(args: argparse.Namespace) -> int:
 
 
 def cmd_group_poll(args: argparse.Namespace) -> int:
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None and getattr(args, "no_queue", False):
+        # Reject the conflict before doing anything else, like
+        # ``cmd_group_send``: a scheduled poll is queued by definition.
+        print(
+            "error: --delay cannot be combined with --no-queue",
+            file=sys.stderr,
+        )
+        return 2
     config = _make_config(args)
     try:
         options = clean_poll_options(list(args.options))
@@ -18178,9 +18418,21 @@ def cmd_group_poll(args: argparse.Namespace) -> int:
     if group is None:
         print(f"error: unknown group: {args.group!r}", file=sys.stderr)
         return 2
+    send_after = None
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
     try:
         response = _send_group_poll_message(
-            args, config, args.question, poll_options=options
+            args, config, args.question, poll_options=options,
+            send_after=send_after,
         )
     except (NodeError, MailboxError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -18189,12 +18441,15 @@ def cmd_group_poll(args: argparse.Namespace) -> int:
     results = response.get("results") or []
     if results:
         poll_id = str(results[0].get("id") or "")
+    verb = "scheduled for" if send_after is not None else "posted to"
     summary = (
-        f"poll posted to {group['name']}"
+        f"poll {verb} {group['name']}"
         + (f" #{_safe_id_prefix(poll_id)}" if poll_id else "")
         + ": "
         + args.question
     )
+    if send_after is not None:
+        response["send_after"] = send_after
     return _report_group_poll_send(args, response, summary)
 
 
@@ -19924,6 +20179,62 @@ def cmd_outbox_cancel(args: argparse.Namespace) -> int:
             "note: sealed copies already held by other peers may still be"
             " delivered; cancelling stops this node's future attempts."
         )
+    return _EXIT_OK
+
+
+def cmd_outbox_edit(args: argparse.Namespace) -> int:
+    text = getattr(args, "text", None)
+    delay_text = getattr(args, "delay", None)
+    if text is None and delay_text is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    send_after = None
+    if delay_text is not None:
+        try:
+            delay = _parse_duration(delay_text, flag="--delay")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entries = mailbox.edit_scheduled_outbox(
+            args.target, text=text, send_after=send_after
+        )
+    except MailboxError as exc:
+        raise NodeError(str(exc)) from exc
+    entry = entries[0]
+    peer = registry.get(entry.to)
+    name = peer.display_name if peer is not None else entry.to_name
+    if _json_mode(args):
+        _emit(
+            {
+                "edited": [item.to_dict() for item in entries],
+                "legs": len(entries),
+            },
+            True,
+        )
+    else:
+        print(
+            f"edited {entry.id[:8]} — scheduled for "
+            f"{name or entry.to_hex}"
+        )
+        if len(entries) > 1:
+            print(f"  ({len(entries)} legs of the group message updated)")
+        if send_after is not None:
+            print(f"  now sends in {_ago(send_after - time.time())}")
     return _EXIT_OK
 
 

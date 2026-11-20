@@ -15,6 +15,12 @@ message — the same failure direction as the outbox: never lose a
 queued message silently.  Cancelling removes the entry before it
 goes out.
 
+Polls queue the same way (``tau channel poll --delay 5m``): a queued
+entry carries ``kind`` ``"poll"`` with the question as its text and
+the fixed options alongside it, and the publish pass signs the poll
+at publish time.  Queue files written before polls could be
+scheduled carry no ``kind`` and load as messages, exactly as before.
+
 Entries are validated on load the way the other small JSON stores
 are: a malformed file raises rather than silently dropping queued
 messages, and the mail-loop publisher treats a corrupt queue as
@@ -166,6 +172,31 @@ def _clean_retry_at(value: Any) -> float:
     return stamp
 
 
+def _clean_kind(value: Any) -> str:
+    if value not in ("message", "poll"):
+        raise ScheduledChannelError(f"not a scheduled entry kind: {value!r}")
+    return value
+
+
+def _clean_options(value: Any) -> Tuple[str, ...]:
+    # Lightweight shape check for the dataclass: the full option rules
+    # (distinct, normalised, length-capped) run at schedule time via
+    # ``_clean_poll_options`` and again when the poll is created, so a
+    # hand-built entry cannot slip a malformed list into the queue.
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ScheduledChannelError("scheduled poll options must be a list")
+    cleaned = []
+    for option in value:
+        if not isinstance(option, str) or not option.strip():
+            raise ScheduledChannelError(f"not a poll option: {option!r}")
+        cleaned.append(option)
+    if len(cleaned) > 8:
+        raise ScheduledChannelError("a scheduled poll has at most 8 options")
+    return tuple(cleaned)
+
+
 @dataclass(frozen=True)
 class ScheduledChannelMessage:
     """One queued channel message, waiting for its publish time."""
@@ -193,6 +224,12 @@ class ScheduledChannelMessage:
     # Destination hashes that still owe delivery after a partial
     # failure; empty means "all of ``to`` (or every peer)".
     pending_peers: Tuple[str, ...] = ()
+    # What the entry publishes as: ``"message"`` (the text is the
+    # message) or ``"poll"`` (the text is the question and ``options``
+    # carries its fixed choices).  Defaults to ``"message"`` so queue
+    # files written before polls could be scheduled load unchanged.
+    kind: str = "message"
+    options: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -210,6 +247,17 @@ class ScheduledChannelMessage:
         object.__setattr__(self, "next_attempt_at", _clean_retry_at(self.next_attempt_at))
         object.__setattr__(self, "paused_at", _clean_retry_at(self.paused_at))
         object.__setattr__(self, "pending_peers", _clean_targets(list(self.pending_peers)))
+        object.__setattr__(self, "kind", _clean_kind(self.kind))
+        object.__setattr__(self, "options", _clean_options(self.options))
+        if self.kind == "poll":
+            # A poll is a top-level entry: its options are fixed at
+            # schedule time.
+            if not 2 <= len(self.options) <= 8:
+                raise ScheduledChannelError("a scheduled poll needs 2-8 options")
+        elif self.options:
+            raise ScheduledChannelError(
+                "a scheduled channel message cannot carry poll options"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -225,6 +273,8 @@ class ScheduledChannelMessage:
             "next_attempt_at": self.next_attempt_at,
             "paused_at": self.paused_at,
             "pending_peers": list(self.pending_peers),
+            "kind": self.kind,
+            "options": list(self.options),
         }
 
     @classmethod
@@ -244,6 +294,8 @@ class ScheduledChannelMessage:
             next_attempt_at=_clean_retry_at(data.get("next_attempt_at", 0.0)),
             paused_at=_clean_retry_at(data.get("paused_at", 0.0)),
             pending_peers=_clean_targets(data.get("pending_peers")),
+            kind=_clean_kind(data.get("kind", "message")),
+            options=_clean_options(data.get("options")),
         )
 
 
@@ -389,6 +441,62 @@ def scheduled_channel_messages_lock(path: Union[str, Path]) -> Iterator[None]:
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _preflight_envelope(
+    *,
+    channel: str,
+    text: str,
+    created_at: float,
+    name: Optional[str] = None,
+) -> None:
+    """Measure *text* against the wire budget with the envelope the
+    publish pass measures.
+
+    The publish pass signs the message through
+    ``channels._normalize_message``, which adds ``v``, ``expires_at``
+    and ``reply_to`` to the body before ``_check_wire_size`` measures
+    it — so the preflight must carry those fields too, at their real
+    encoded sizes (an empty reply), or a replacement near the budget
+    would pass here and then fail the definitive check on every
+    publish attempt, leaving the entry queued for failed retries.
+
+    The expiry is measured at its largest: publishing fills in a
+    numeric expiry from the channel's disappearing-message default
+    (``ChannelApp.send``), and that default can be set or changed
+    after scheduling, so the preflight assumes an expiry is present
+    and uses the longest allowed one (``created_at`` plus the 30-day
+    cap).  A float encodes at a fixed size, so this covers any
+    default the channel may carry by publish time.
+    """
+    # Lazy import: this module stays importable without Reticulum,
+    # which ``tau.backup`` relies on.
+    from .channels import (
+        CHANNEL_VERSION,
+        MAX_CHANNEL_EXPIRE_SECONDS,
+        ChannelError,
+        _check_wire_size,
+        sanitize_name,
+    )
+
+    envelope = {
+        # Placeholder author/key at their real lengths (destination
+        # hash 32 hex, RNS public key 128 hex): a shorter placeholder
+        # would admit a message that only fails once signed.
+        "v": CHANNEL_VERSION,
+        "channel": channel,
+        "author": "0" * 32,
+        "key": "0" * 128,
+        "name": sanitize_name(name or "anonymous"),
+        "text": text,
+        "created_at": created_at,
+        "expires_at": created_at + MAX_CHANNEL_EXPIRE_SECONDS,
+        "reply_to": "",
+    }
+    try:
+        _check_wire_size(envelope)
+    except ChannelError as exc:
+        raise ScheduledChannelError(str(exc)) from exc
+
+
 def schedule_channel_message(
     path: Union[str, Path],
     *,
@@ -399,6 +507,9 @@ def schedule_channel_message(
     ttl: int = 3,
     now: Optional[float] = None,
     name: Optional[str] = None,
+    kind: str = "message",
+    options: Optional[Sequence[str]] = None,
+    disappearing_path: Optional[Union[str, Path]] = None,
 ) -> ScheduledChannelMessage:
     """Queue a channel message for *publish_at*; returns the stored entry.
 
@@ -412,24 +523,69 @@ def schedule_channel_message(
     every publish attempt forever.  The real envelope is measured
     again when the message is created, so a long display name can
     still only shrink the margin, never grow it past the check here.
+
+    The measured envelope carries the expiry the publish pass will
+    actually apply: the channel's disappearing default (resolved from
+    *disappearing_path*) when one is set, and no expiry at all when
+    the channel has none — a channel without a default publishes a
+    message with no ``expires_at``, so sizing one in would reject a
+    poll that fits.  When no disappearing path is given, no default
+    is assumed.
+
+    With ``kind="poll"`` the text is the poll question and *options*
+    carries its fixed choices: the question plus options get the same
+    wire-size preflight an immediate ``tau channel poll`` gets, so a
+    poll that could never fit is refused here.
     """
     clean_channel = _clean_channel(channel)
     clean_text = _clean_text(text)
     # Lazy import: this module stays importable without Reticulum,
     # which ``tau.backup`` relies on.
-    from .channels import ChannelError, _check_wire_size, sanitize_name
+    from .channels import (
+        CHANNEL_VERSION,
+        ChannelError,
+        _check_wire_size,
+        sanitize_name,
+    )
+    from .disappearing import channel_default_for
 
+    clean_kind = _clean_kind(kind)
+    clean_options: Tuple[str, ...] = ()
+    if clean_kind == "poll":
+        from .tangents.tan import _clean_poll_options
+
+        try:
+            clean_options = tuple(_clean_poll_options(list(options or [])))
+        except ValueError as exc:
+            raise ScheduledChannelError(str(exc)) from exc
+    elif options:
+        raise ScheduledChannelError(
+            "a scheduled channel message cannot carry poll options"
+        )
     envelope = {
         # Placeholder author/key at their real lengths (destination
         # hash 32 hex, RNS public key 128 hex): a shorter placeholder
-        # would admit a message that only fails once signed.
+        # would admit a message that only fails once signed.  The
+        # remaining signed fields are carried at their real shape too:
+        # the version and an empty reply target.  An expiry rides
+        # only when the channel has a disappearing default — the
+        # publish pass applies that same default, and a channel
+        # without one publishes with no expiry at all, so sizing
+        # one in here would reject a poll that fits on the wire.
+        "v": CHANNEL_VERSION,
         "channel": clean_channel,
         "author": "0" * 32,
         "key": "0" * 128,
         "name": sanitize_name(name or "anonymous"),
         "text": clean_text,
         "created_at": publish_at,
+        "reply_to": "",
     }
+    default_expire = channel_default_for(disappearing_path, clean_channel)
+    if default_expire is not None:
+        envelope["expires_at"] = publish_at + default_expire
+    if clean_kind == "poll":
+        envelope["poll_options"] = list(clean_options)
     try:
         _check_wire_size(envelope)
     except ChannelError as exc:
@@ -442,11 +598,47 @@ def schedule_channel_message(
         ttl=_clean_ttl(ttl),
         publish_at=_clean_timestamp(publish_at, "publish_at"),
         created_at=now if now is not None else time.time(),
+        kind=clean_kind,
+        options=clean_options,
     )
     with scheduled_channel_messages_lock(path):
         queue = load_scheduled_channel_messages(path)
         save_scheduled_channel_messages(path, queue.with_added(message))
     return message
+
+
+def schedule_channel_poll(
+    path: Union[str, Path],
+    *,
+    channel: str,
+    question: str,
+    options: Sequence[str],
+    publish_at: float,
+    to: Optional[Sequence[str]] = None,
+    ttl: int = 3,
+    now: Optional[float] = None,
+    name: Optional[str] = None,
+    disappearing_path: Optional[Union[str, Path]] = None,
+) -> ScheduledChannelMessage:
+    """Queue a poll for *publish_at*; returns the stored entry.
+
+    Thin wrapper over :func:`schedule_channel_message` with
+    ``kind="poll"``: the question is the entry text and the options
+    ride alongside it.
+    """
+    return schedule_channel_message(
+        path,
+        channel=channel,
+        text=question,
+        publish_at=publish_at,
+        to=to,
+        ttl=ttl,
+        now=now,
+        name=name,
+        kind="poll",
+        options=options,
+        disappearing_path=disappearing_path,
+    )
 
 
 def cancel_scheduled_channel_message(
@@ -470,6 +662,87 @@ def cancel_scheduled_channel_message(
             on_cancel(message)
         save_scheduled_channel_messages(path, queue.with_removed(message.id))
     return message
+
+
+def edit_scheduled_channel_message(
+    path: Union[str, Path],
+    prefix: str,
+    *,
+    text: Optional[str] = None,
+    publish_at: Optional[float] = None,
+    name: Optional[str] = None,
+    now: Optional[float] = None,
+) -> ScheduledChannelMessage:
+    """Change the text and/or publish time of one queued channel message.
+
+    At least one of *text* / *publish_at* must be given.  The
+    resulting entry gets the same validation as scheduling does
+    (``normalize_message`` plus the wire-size preflight against the
+    entry's channel, measured with the full normalized envelope the
+    publish pass measures), so an edit cannot queue a message that
+    could never be published — a time-only edit re-checks the stored
+    text too.  A new publish time must be in the future and within
+    the 7-day queue cap.
+
+    An entry whose publish already created the signed message (it has
+    a stored ``message_hash``) cannot be edited: the text is already
+    signed, so changing it would orphan the stored copy.  Cancel it
+    instead.  Everything else about the entry — channel, targets, TTL,
+    retry state — is left untouched.  The queue stays ordered soonest
+    first, so a later publish time moves the entry down the list.
+    """
+    if text is None and publish_at is None:
+        raise ScheduledChannelError(
+            "nothing to change — pass a new text and/or a new publish time"
+        )
+    at = now if now is not None else time.time()
+    clean_text: Optional[str] = None
+    if text is not None:
+        clean_text = _clean_text(text)
+    clean_publish_at: Optional[float] = None
+    if publish_at is not None:
+        clean_publish_at = _clean_timestamp(publish_at, "publish_at")
+        if clean_publish_at <= at:
+            raise ScheduledChannelError("publish time must be in the future")
+        if clean_publish_at - at > MAX_SCHEDULED_CHANNEL_DELAY:
+            raise ScheduledChannelError(
+                "publish time must be within 7d (the scheduled-channel delay cap)"
+            )
+    with scheduled_channel_messages_lock(path):
+        queue = load_scheduled_channel_messages(path)
+        message = queue.resolve(prefix)
+        if message.message_hash is not None:
+            raise ScheduledChannelError(
+                "that message was already created — cancel it instead of editing it"
+            )
+        # The preflight measures the resulting entry — text and
+        # publish time — against the same envelope the publish pass
+        # measures, so an edit cannot queue a message that could never
+        # be published.  A time-only edit re-checks the stored text
+        # against the full normalized shape too.
+        _preflight_envelope(
+            channel=message.channel,
+            text=clean_text if clean_text is not None else message.text,
+            created_at=(
+                clean_publish_at
+                if clean_publish_at is not None
+                else message.publish_at
+            ),
+            name=name,
+        )
+        edited = replace(
+            message,
+            text=clean_text if clean_text is not None else message.text,
+            publish_at=(
+                clean_publish_at if clean_publish_at is not None else message.publish_at
+            ),
+        )
+        replaced = queue.with_replaced(edited)
+        ordered = ScheduledChannelMessages(
+            messages=tuple(sorted(replaced.messages, key=lambda m: m.publish_at))
+        )
+        save_scheduled_channel_messages(path, ordered)
+    return edited
 
 
 class _PassPaused(Exception):
@@ -503,7 +776,8 @@ def publish_due_scheduled_channel_messages(
     send``, where zero known peers still counts as published.  The
     signed message is created once and its hash saved before sending,
     so retries re-send the same message.  Peers that already accepted
-    it are not sent it again.
+    it are not sent it again.  A queued poll publishes the same way,
+    through ``app.send`` with its question and fixed options.
 
     A failed attempt (exception or per-peer errors) keeps the entry
     queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
@@ -587,7 +861,14 @@ def publish_due_scheduled_channel_messages(
                                 message.id,
                             )
                         created = app.send(
-                            message.channel, message.text, publish=False
+                            message.channel,
+                            message.text,
+                            publish=False,
+                            poll_options=(
+                                list(message.options)
+                                if message.kind == "poll"
+                                else None
+                            ),
                         )
                         # Persist the signed message's identity before
                         # sending, so a retry after a crash re-sends it

@@ -1665,6 +1665,114 @@ class Mailbox:
             self.save()
             return True
 
+    def edit_scheduled_outbox(
+        self,
+        ref: str,
+        *,
+        text: Optional[str] = None,
+        send_after: Optional[float] = None,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
+    ) -> List[OutboxEntry]:
+        """Change the text and/or send time of a still-scheduled outbox entry.
+
+        At least one of *text* / *send_after* must be given.  The new text
+        gets the same validation as sending (``normalize_message``), so an
+        edit cannot queue a message that could never be sent.  A new send
+        time must be in the future, within the same 29d23h cap as
+        ``tau send --delay`` (the 30d mail TTL less an hour of delivery
+        slack), and before the message's own expiry when one is set.
+
+        Only an entry still waiting on its not-before time can be edited:
+        a due, retry-queued, or already-attempted entry is refused —
+        cancel or retry it instead.  Poll/vote/close/beacon legs are
+        refused too: their payload is not plain text.  A scheduled group
+        message fans out to one leg per member, so the edit applies to
+        every leg sharing the message's (group_id, wire send time) and
+        returns them all — members still receive identical text.  A leg
+        already delivered keeps its original text (it left the outbox,
+        exactly like a sealed copy of a cancelled message); the edit
+        reports how many legs it changed, so the caller can say so.
+
+        The edit is safe to make this late: a still-scheduled entry has
+        no sealed relay copy yet (scheduled entries are excluded from
+        relay bundles), and the payload is built from the entry at
+        delivery time, so the new text is what goes out.  The logical
+        send time is left untouched, so reactions and retracts still
+        name the message; ``edited_at`` is not set — the recipient never
+        saw the original text, so there is nothing to mark as edited.
+        """
+        if text is None and send_after is None:
+            raise MailboxError(
+                "nothing to change — pass a new text and/or a new send time"
+            )
+        at = now if now is not None else time.time()
+        clean_text: Optional[str] = None
+        if text is not None:
+            try:
+                clean_text = normalize_message(text)
+            except ProtocolError as exc:
+                raise MailboxError(str(exc)) from exc
+        clean_send_after: Optional[float] = None
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise MailboxError("send time must be a number of epoch seconds")
+            clean_send_after = float(send_after)
+            if not math.isfinite(clean_send_after):
+                raise MailboxError("send time must be a finite number")
+            if clean_send_after <= at:
+                raise MailboxError("send time must be in the future")
+            if clean_send_after - at > MAX_MAIL_TTL - 3600.0:
+                raise MailboxError(
+                    "send time must be at most 29d23h from now (the 30d "
+                    "mail TTL less an hour of delivery slack)"
+                )
+        with self._transaction(timeout=timeout):
+            entry = self.resolve_outbox(ref)
+            if not entry.is_scheduled(at):
+                raise MailboxError(
+                    "that message is no longer scheduled — cancel it or "
+                    "retry it instead of editing it"
+                )
+            if (
+                entry.poll_options is not None
+                or entry.poll_vote is not None
+                or entry.poll_close is not None
+                or entry.beacon is not None
+            ):
+                raise MailboxError(
+                    "that queued message is a poll or beacon update, not "
+                    "plain text — cancel it instead of editing it"
+                )
+            if (
+                entry.message_expires_at is not None
+                and clean_send_after is not None
+                and clean_send_after >= entry.message_expires_at
+            ):
+                raise MailboxError(
+                    "send time must be before the message expiry — the "
+                    "message would expire before it is sent"
+                )
+            if entry.group_id is not None:
+                sent_at = entry.wire_sent_at
+                targets = [
+                    other
+                    for other in self._outbox.values()
+                    if other.group_id == entry.group_id
+                    and other.wire_sent_at == sent_at
+                ]
+            else:
+                targets = [entry]
+            for target in targets:
+                if clean_text is not None:
+                    target.text = clean_text
+                if clean_send_after is not None:
+                    target.send_after = clean_send_after
+            self.save()
+            return list(targets)
+
     def record_attempt(
         self,
         message_id: str,

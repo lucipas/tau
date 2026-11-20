@@ -163,6 +163,7 @@ The same bridge is the local integration point for scripts:
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
+| `/api/outbox/edit` | POST | edit a scheduled message before it sends (`{"target": "<message id or prefix>", "text": ..., "send_in": <seconds from now>}`) |
 | `/api/bundle/export` | POST | build a signed sneakernet bundle `{"include_tan": true}` |
 | `/api/bundle/import` | POST | merge a bundle document (the signed JSON) into this node |
 | `/api/outbox/retry` | POST | retry queued mail now, ignoring backoff (`{"target": "<message id or prefix>"}` for one entry; omit it to retry everything) |
@@ -274,6 +275,8 @@ tau tan post --to alice "direct delivery"
 # Schedule a post for the morning crowd (publishes while serving with --social)
 tau tan post --delay 8h "good morning, mesh"
 tau tan scheduled
+# Fix a typo or move a queued post: at least one of --text / --delay is required
+tau tan edit-scheduled ab12cd34 --text "good morning, mesh!" --delay 2h
 
 # Schedule a repost or a quote the same way (the queue publishes them
 # through the same --social pass; a scheduled repost carries no text)
@@ -431,6 +434,7 @@ Global options may appear before or after the command:
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
+| `tau outbox edit ID [--text TEXT] [--delay DURATION]` | Edit a scheduled DM or group message before it sends (text and/or send time; group edits update every leg) |
 | `tau id` | Show this node's name, destination hash, and LXMF delivery address |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |
@@ -443,6 +447,7 @@ Global options may appear before or after the command:
 | `tau tan post --location "LAT,LON [NAME]" TEXT` | Attach a place to a post (signed with it; not with `--delay` or `--reply-to`) |
 | `tau tan scheduled` | List Tan posts, reposts, quotes and polls queued for later publishing |
 | `tau tan cancel-scheduled ID` | Drop a queued Tan post, repost, quote or poll before it publishes |
+| `tau tan edit-scheduled ID [--text TEXT] [--delay DURATION]` | Change a queued post's text and/or publish time |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan poll TEXT --option A --option B` | Ask a question with options (signed poll entry on your chain) |
@@ -478,9 +483,11 @@ Global options may appear before or after the command:
 | `tau channel list` | List joined channels with cached message and unread counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message; `--expire 30s` makes it a disappearing message, purged from members' stores after the duration; a per-channel default from `tau disappearing --channel` fills the expiry in when no `--expire` is passed) |
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
-| `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
-| `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
+| `tau channel scheduled [NAME]` | List queued channel messages and polls, soonest first |
+| `tau channel cancel-scheduled ID` | Drop a queued channel message or poll before it publishes |
+| `tau channel edit-scheduled ID [--text TEXT] [--delay DURATION]` | Change a queued channel message's text and/or publish time |
 | `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
+| `tau channel poll NAME "QUESTION" OPT... --delay 5m` | Queue a poll to ask later (a serving node with --channels publishes it). Restart any node serving with `--channels` on this version before queuing polls: an older node reads a queued poll as a plain message and publishes only the question |
 | `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
 | `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
 | `tau channel topic NAME [TEXT]` | Show or set a channel's topic (any member may set it; newest wins; `--clear` removes it) |

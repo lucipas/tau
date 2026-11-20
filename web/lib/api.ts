@@ -39,6 +39,7 @@ import type {
   MessageDraft,
   NodeSettings,
   Outbox,
+  OutboxEntry,
   OutboxRetryResult,
   OwnProfile,
   PageList,
@@ -756,9 +757,9 @@ export async function getDrafts(): Promise<MessageDraft[]> {
   return data.drafts ?? [];
 }
 
-/** Save (or overwrite) the draft for one peer or group conversation. */
+/** Save (or overwrite) the draft for one peer, group, or channel conversation. */
 export async function saveDraft(
-  kind: "peer" | "group",
+  kind: "peer" | "group" | "channel",
   target: string,
   text: string,
 ): Promise<MessageDraft> {
@@ -770,8 +771,8 @@ export async function saveDraft(
   return data.draft;
 }
 
-/** Discard the draft for one peer or group conversation. */
-export async function deleteDraft(kind: "peer" | "group", target: string): Promise<boolean> {
+/** Discard the draft for one peer, group, or channel conversation. */
+export async function deleteDraft(kind: "peer" | "group" | "channel", target: string): Promise<boolean> {
   const data = await post<{ ok: boolean; deleted: boolean }>("/api/drafts/delete", {
     kind,
     target,
@@ -817,6 +818,13 @@ export async function getOutbox(): Promise<Outbox> {
 
 export async function cancelOutbox(target: string): Promise<unknown> {
   return post("/api/outbox/cancel", { target });
+}
+
+export async function editOutbox(
+  target: string,
+  patch: { text?: string; send_in?: number },
+): Promise<{ ok: boolean; edited: OutboxEntry[]; legs: number }> {
+  return post("/api/outbox/edit", { target, ...patch });
 }
 
 export async function retryOutbox(target?: string): Promise<OutboxRetryResult> {
@@ -1157,6 +1165,21 @@ export async function cancelScheduledTanPost(id: string): Promise<unknown> {
   return post("/api/tan/cancel-scheduled", { id });
 }
 
+export async function editScheduledTanPost(
+  id: string,
+  opts: { text?: string; sendIn?: number },
+): Promise<ScheduledTanPost> {
+  const data = await post<{ ok: boolean; scheduled: ScheduledTanPost }>(
+    "/api/tan/edit-scheduled",
+    {
+      id,
+      text: opts.text,
+      send_in: opts.sendIn,
+    },
+  );
+  return data.scheduled;
+}
+
 /** Saved Tan post drafts, newest first. */
 export async function getTanDrafts(): Promise<TanDraft[]> {
   const data = await get<{ drafts: TanDraft[]; count: number }>("/api/tan/drafts");
@@ -1430,8 +1453,41 @@ export async function scheduleChannelMessage(
   return post("/api/channels/schedule", { channel, text, send_in: sendIn });
 }
 
+/** Queue a channel poll for later: the question plus its fixed options. */
+export async function scheduleChannelPoll(
+  channel: string,
+  question: string,
+  options: string[],
+  sendIn: number,
+): Promise<ScheduledChannelMessage> {
+  const data = await post<{ ok: boolean; scheduled: ScheduledChannelMessage }>(
+    "/api/channels/schedule",
+    {
+      channel,
+      text: question,
+      poll_options: options,
+      send_in: sendIn,
+    },
+  );
+  return data.scheduled;
+}
+
 export async function cancelScheduledChannelMessage(id: string): Promise<unknown> {
   return post("/api/channels/cancel-scheduled", { id });
+}
+
+export async function editScheduledChannelMessage(
+  id: string,
+  patch: { text?: string; sendIn?: number },
+): Promise<ScheduledChannelMessage> {
+  const body: { id: string; text?: string; send_in?: number } = { id };
+  if (patch.text !== undefined) body.text = patch.text;
+  if (patch.sendIn !== undefined) body.send_in = patch.sendIn;
+  const data = await post<{ ok: boolean; edited: ScheduledChannelMessage }>(
+    "/api/channels/edit-scheduled",
+    body,
+  );
+  return data.edited;
 }
 
 /** Pull missing history for one channel, or every joined channel when omitted. */

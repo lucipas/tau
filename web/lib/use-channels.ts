@@ -17,6 +17,7 @@ import {
   cancelScheduledChannelMessage,
   closeChannelPoll,
   editChannelMessage,
+  editScheduledChannelMessage,
   getChannelMessages,
   getChannelPins,
   getChannelScheduled,
@@ -29,6 +30,7 @@ import {
   postChannelPoll,
   reactToChannelMessage,
   scheduleChannelMessage,
+  scheduleChannelPoll,
   searchChannelMessages,
   sendChannelMessage,
   setChannelTopic,
@@ -73,7 +75,16 @@ export interface UseChannelsResult {
   pinConversation: (channel: string, pinned?: boolean) => Promise<void>;
   send: (text: string, replyTo?: string) => Promise<ChannelMessage>;
   schedule: (text: string, sendIn: number) => Promise<ScheduledChannelMessage>;
+  schedulePoll: (
+    question: string,
+    options: string[],
+    sendIn: number,
+  ) => Promise<ScheduledChannelMessage>;
   cancelScheduled: (id: string) => Promise<void>;
+  editScheduled: (
+    id: string,
+    patch: { text?: string; sendIn?: number },
+  ) => Promise<void>;
   poll: (question: string, options: string[]) => Promise<ChannelMessage>;
   vote: (poll: string, option: number) => Promise<ChannelMessage>;
   closePoll: (poll: string) => Promise<ChannelMessage>;
@@ -257,8 +268,20 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
       await refreshMessages(selected);
       return entry;
     },
+    schedulePoll: async (question, options, sendIn) => {
+      if (!selected) throw new Error("no channel selected");
+      const entry = await scheduleChannelPoll(selected, question, options, sendIn);
+      await refreshMessages(selected);
+      // refreshTopic also reloads the Scheduled list, so the new poll shows now.
+      await refreshTopic(selected);
+      return entry;
+    },
     cancelScheduled: async (id) => {
       await cancelScheduledChannelMessage(id);
+      await refreshMessages(selected);
+    },
+    editScheduled: async (id, patch) => {
+      await editScheduledChannelMessage(id, patch);
       await refreshMessages(selected);
     },
     poll: async (question, options) => {

@@ -5121,6 +5121,15 @@ def test_parser_outbox_subcommands():
     assert cancelled.target == "abcdef12"
     assert cancelled.func is cli.cmd_outbox_cancel
 
+    edited = parser.parse_args(
+        ["outbox", "edit", "abcdef12", "--text", "fixed", "--delay", "1h"]
+    )
+    assert edited.outbox_command == "edit"
+    assert edited.target == "abcdef12"
+    assert edited.text == "fixed"
+    assert edited.delay == "1h"
+    assert edited.func is cli.cmd_outbox_edit
+
     retried = parser.parse_args(["outbox", "retry", "abcdef12"])
     assert retried.outbox_command == "retry"
     assert retried.target == "abcdef12"
@@ -5367,6 +5376,127 @@ def test_outbox_cancel_ambiguous_prefix_is_an_error(tmp_path, capsys):
     assert code == 1
     assert "2 queued messages match prefix" in capsys.readouterr().err
     assert len(Mailbox(config.mailbox_path).outbox_list()) == 2
+
+
+def test_outbox_edit_scheduled_entry_round_trip(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="see you soon",
+        message_id="cc" + "11" * 15,
+        send_after=time.time() + 7200.0,
+    )
+
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            entry.id[:8],
+            "--text",
+            "see you at noon",
+            "--delay",
+            "2h",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited cc111111" in out
+    assert "now sends in " in out
+    stored = Mailbox(config.mailbox_path).get_outbox(entry.id)
+    assert stored.text == "see you at noon"
+    assert abs(stored.send_after - (time.time() + 7200.0)) < 5.0
+
+
+def test_outbox_edit_json_reports_legs(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="later",
+        message_id="cc" + "22" * 15,
+        send_after=time.time() + 7200.0,
+    )
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+            entry.id,
+            "--text",
+            "much later, reworded",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["legs"] == 1
+    assert payload["edited"][0]["id"] == entry.id
+    assert payload["edited"][0]["text"] == "much later, reworded"
+
+
+def test_outbox_edit_needs_a_change(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="later",
+        message_id="cc" + "33" * 15,
+        send_after=time.time() + 7200.0,
+    )
+    code = cli.main(
+        ["outbox", "edit", "--data-dir", str(data_dir), entry.id]
+    )
+    assert code == 2
+    assert "nothing to change" in capsys.readouterr().err
+    assert Mailbox(config.mailbox_path).get_outbox(entry.id).text == "later"
+
+
+def test_outbox_edit_refuses_not_scheduled(tmp_path, capsys):
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16, text="now", message_id="cc" + "44" * 15
+    )
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            entry.id,
+            "--text",
+            "too late",
+        ]
+    )
+    assert code == 1
+    assert "no longer scheduled" in capsys.readouterr().err
+    assert Mailbox(config.mailbox_path).get_outbox(entry.id).text == "now"
 
 
 class _FakeRetryNode:
@@ -7543,6 +7673,100 @@ def test_group_poll_rejects_one_option(tmp_path, capsys, monkeypatch):
     assert code == 2
     assert "a poll needs 2-8 options" in capsys.readouterr().err
     assert _FakeGroupSendNode.instances == []
+
+
+def test_parser_group_poll_delay():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["group", "poll", "--delay", "2h", "weekend", "which day?", "Sat", "Sun"]
+    )
+    assert args.func is cli.cmd_group_poll
+    assert args.delay == "2h"
+
+
+def _run_group_poll(tmp_path, monkeypatch, argv):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    return (
+        cli.main(["group", "poll", "--data-dir", str(data_dir), *argv]),
+        group,
+    )
+
+
+def test_group_poll_delay_schedules_without_delivery(
+    tmp_path, capsys, monkeypatch
+):
+    before = time.time()
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "2h", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_options"] == ["Saturday", "Sunday"]
+    send_after = node.send_kwargs[0]["send_after"]
+    assert before + 7200 <= send_after <= time.time() + 7200
+    out = capsys.readouterr().out
+    assert "poll scheduled for weekend" in out
+    assert "scheduled for alice" in out
+    assert "scheduled for bob" in out
+    assert "sends in" in out
+    assert "it will be delivered at its scheduled time" in out
+
+
+def test_group_poll_delay_json_reports_send_after(tmp_path, capsys, monkeypatch):
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--json", "--delay", "5m", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["send_after"] is not None
+    assert payload["send_after"] > time.time()
+    assert all(result.get("send_after") for result in payload["results"])
+
+
+def test_group_poll_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        [
+            "--delay",
+            "5m",
+            "--no-queue",
+            "weekend",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ],
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "soon", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 1
+    assert "invalid --delay duration" in capsys.readouterr().err
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "30d", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 2
+    assert "--delay must be at most 29d23h" in capsys.readouterr().err
+    # 29d fits and queues.
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "29d", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 0
 
 
 def test_group_vote_sends_target_and_option(tmp_path, capsys, monkeypatch):
@@ -10559,6 +10783,12 @@ def test_parser_channel_scheduled_arguments():
     assert send.func is cli.cmd_channel_send
     assert send.delay == "5m"
 
+    poll = parser.parse_args(
+        ["channel", "poll", "general", "which day?", "Saturday", "Sunday", "--delay", "5m"]
+    )
+    assert poll.func is cli.cmd_channel_poll
+    assert poll.delay == "5m"
+
     listed = parser.parse_args(["channel", "scheduled"])
     assert listed.func is cli.cmd_channel_scheduled
     assert listed.channel is None
@@ -10569,6 +10799,14 @@ def test_parser_channel_scheduled_arguments():
     cancelled = parser.parse_args(["channel", "cancel-scheduled", "abcdef"])
     assert cancelled.func is cli.cmd_channel_cancel_scheduled
     assert cancelled.target == "abcdef"
+
+    edited = parser.parse_args(
+        ["channel", "edit-scheduled", "abcdef", "--text", "fixed", "--delay", "2h"]
+    )
+    assert edited.func is cli.cmd_channel_edit_scheduled
+    assert edited.target == "abcdef"
+    assert edited.text == "fixed"
+    assert edited.delay == "2h"
 
 
 def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
@@ -10593,13 +10831,32 @@ def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
     assert code == 0
     assert "morning hello" in capsys.readouterr().out
 
+    code = _run_channel(
+        tmp_path, "edit-scheduled", entry_id[:8], "--text", "morning, mesh!"
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited" in out
+    assert "morning, mesh!" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "morning, mesh!" in out
+    assert "morning hello" not in out
+
+    # Neither --text nor --delay is a usage error, not a crash.
+    code = _run_channel(tmp_path, "edit-scheduled", entry_id[:8])
+    assert code == 2
+    assert "nothing to change" in capsys.readouterr().err
+
     code = _run_channel(tmp_path, "cancel-scheduled", entry_id[:8])
     assert code == 0
     assert "cancelled" in capsys.readouterr().out
 
     code = _run_channel(tmp_path, "scheduled")
     assert code == 0
-    assert "No channel messages scheduled." in capsys.readouterr().out
+    assert "No channel messages or polls scheduled." in capsys.readouterr().out
 
 
 def test_channel_send_delay_json_round_trip(tmp_path, capsys):
@@ -10657,3 +10914,156 @@ def test_channel_send_delay_rejects_bad_combinations(tmp_path, capsys):
     code = _run_channel(tmp_path, "send", "other", "hi", "--delay", "5m")
     assert code == 2
     assert "not a member of channel 'other'" in capsys.readouterr().err
+
+
+def test_channel_poll_delay_schedules_lists_and_cancels(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "5m",
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    assert "asks in 5m" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "which day?" in out
+    assert "poll · 2 options" in out
+    assert "1. Saturday" in out
+    assert "2. Sunday" in out
+    entry_id = out.split()[0]
+
+    code = _run_channel(tmp_path, "cancel-scheduled", entry_id[:8])
+    assert code == 0
+    assert "cancelled" in capsys.readouterr().out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    assert "No channel messages or polls scheduled." in capsys.readouterr().out
+
+
+def test_channel_poll_delay_json_round_trip(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "channel",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+            "poll",
+            "general",
+            "which day?",
+            "Saturday",
+            "Sunday",
+            "--delay",
+            "5m",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"]["kind"] == "poll"
+    assert payload["scheduled"]["text"] == "which day?"
+    assert payload["scheduled"]["options"] == ["Saturday", "Sunday"]
+    assert payload["scheduled"]["publish_at"] > time.time()
+
+    code = cli.main(
+        ["channel", "--data-dir", str(tmp_path / "node"), "--json", "scheduled"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["scheduled"]) == 1
+    assert payload["scheduled"][0]["kind"] == "poll"
+
+
+def test_channel_poll_delay_rejects_bad_combinations(tmp_path, capsys):
+    _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "5m",
+        "--no-publish",
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-publish" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "soon",
+    )
+    assert code == 2
+    assert "invalid --delay duration" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "8d",
+    )
+    assert code == 2
+    assert "--delay duration must be at most 1w" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "general",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "5m",
+    )
+    assert code == 0  # sanity: the valid case still queues
+    capsys.readouterr()
+
+    code = _run_channel(
+        tmp_path,
+        "poll",
+        "other",
+        "which day?",
+        "Saturday",
+        "Sunday",
+        "--delay",
+        "5m",
+    )
+    assert code == 2
+    assert "not a member of channel 'other'" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path, "poll", "general", "which day?", "Saturday", "--delay", "5m"
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err

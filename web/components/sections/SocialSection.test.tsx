@@ -53,6 +53,17 @@ function makeDraft(id: number, text: string, extra: Partial<TanDraft> = {}): Tan
 }
 
 let lists: { name: string; created_at: number; members: number }[] = [];
+let listMembers: { author: string; name: string; added_at: number; posts?: number }[] = [];
+/** Per-list members, keyed by list name; falls back to `listMembers`. */
+let membersByList: Record<
+  string,
+  { author: string; name: string; added_at: number; posts?: number }[]
+> = {};
+/** When set, members requests for `list` wait for `promise` before resolving. */
+let membersHold: { list: string; promise: Promise<void> } | null = null;
+/** When set, POST /api/tan/lists/remove waits for this promise. */
+let removeHold: Promise<void> | null = null;
+let following: { author: string; name: string; posts: number }[] = [];
 
 function makeScheduled(
   id: string,
@@ -82,13 +93,27 @@ beforeEach(() => {
     makeDraft(2, "agreed", { reply_to: "h1".padEnd(64, "0"), expires_in: 3600 }),
   ];
   lists = [];
+  listMembers = [];
+  membersByList = {};
+  membersHold = null;
+  removeHold = null;
+  following = [];
   const router = mockFetch((url, method) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
+    if (url.includes("/api/tan/lists/members")) {
+      const name = new URL(url, "http://test").searchParams.get("name") ?? "";
+      const members = membersByList[name] ?? listMembers;
+      const payload = { name, members, count: members.length };
+      if (membersHold && membersHold.list === name) {
+        return membersHold.promise.then(() => payload);
+      }
+      return payload;
+    }
     if (url.includes("/api/tan/lists")) return { lists, count: lists.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/thread")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/tags")) return { tags: [{ tag: "mesh", count: 5 }], count: 1 };
-    if (url.includes("/api/tan/following")) return { following: [], count: 0 };
+    if (url.includes("/api/tan/following")) return { following, count: following.length };
     if (url.includes("/api/tan/followers"))
       return {
         followers: [
@@ -121,6 +146,9 @@ beforeEach(() => {
         return { ok: true, draft: makeDraft(99, "saved draft") };
       }
       return { drafts, count: drafts.length };
+    }
+    if (url.includes("/api/tan/lists/remove") && method === "POST" && removeHold) {
+      return removeHold.then(() => ({ ok: true }));
     }
     return { ok: true };
   });
@@ -199,6 +227,126 @@ describe("SocialSection", () => {
     expect((select as HTMLSelectElement).value).toBe("Friends");
   });
 
+  it("manages Tan lists from the Lists tab: create, members, add, remove, delete", async () => {
+    lists = [{ name: "Friends", created_at: 1000, members: 1 }];
+    listMembers = [{ author: "c".repeat(64), name: "carol", added_at: 1000, posts: 2 }];
+    following = [{ author: "d".repeat(64), name: "dave", posts: 1 }];
+    renderSocial();
+    await screen.findByText(/hello/);
+
+    // The header hint is a Manage button, not a CLI pointer.
+    fireEvent.click(screen.getByRole("button", { name: "Manage lists" }));
+    expect(await screen.findByText("Tan lists")).toBeTruthy();
+
+    // Create posts to /api/tan/lists.
+    fireEvent.change(screen.getByLabelText("New list name"), {
+      target: { value: "Mesh crew" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create list" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists"));
+
+    // Expanding a list loads its members.
+    fireEvent.click(screen.getByRole("button", { name: "Members" }));
+    await waitFor(() =>
+      expect(calls).toContain("GET /api/tan/lists/members?name=Friends"),
+    );
+    expect(await screen.findByText("carol")).toBeTruthy();
+
+    // Adding by name posts to /api/tan/lists/add.
+    fireEvent.change(screen.getByLabelText("Author name or hash to add to Friends"), {
+      target: { value: "dave" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add member" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists/add"));
+
+    // Removing a member posts to /api/tan/lists/remove.
+    fireEvent.click(screen.getByRole("button", { name: "Remove carol from Friends" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists/remove"));
+
+    // Deleting needs a confirm step, then posts to /api/tan/lists/delete.
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(calls).not.toContain("POST /api/tan/lists/delete");
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists/delete"));
+  });
+
+  it("the Lists tab offers followed authors in the add-member picker", async () => {
+    lists = [{ name: "Friends", created_at: 1000, members: 0 }];
+    following = [{ author: "d".repeat(64), name: "dave", posts: 1 }];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Lists" }));
+    fireEvent.click(screen.getByRole("button", { name: "Members" }));
+    const select = await screen.findByLabelText("Add a followed author to Friends");
+    expect(select.textContent).toContain("dave");
+    fireEvent.change(select, { target: { value: "d".repeat(64) } });
+    fireEvent.click(screen.getByRole("button", { name: "Add member" }));
+    await waitFor(() => expect(calls).toContain("POST /api/tan/lists/add"));
+  });
+
+  it("a slow list load never lands under the list opened after it", async () => {
+    lists = [
+      { name: "Friends", created_at: 1000, members: 1 },
+      { name: "Mesh crew", created_at: 1001, members: 1 },
+    ];
+    membersByList = {
+      Friends: [{ author: "c".repeat(64), name: "carol", added_at: 1000, posts: 2 }],
+      "Mesh crew": [{ author: "d".repeat(64), name: "dave", added_at: 1001, posts: 1 }],
+    };
+    // Hold Friends' members response back until the test releases it.
+    let release!: () => void;
+    membersHold = {
+      list: "Friends",
+      promise: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    };
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Lists" }));
+    const membersButtons = await screen.findAllByRole("button", { name: "Members" });
+    // Open Friends, then switch to Mesh crew before Friends' response arrives.
+    fireEvent.click(membersButtons[0]);
+    fireEvent.click(membersButtons[1]);
+    expect(await screen.findByText("dave")).toBeTruthy();
+    // Let the stale Friends response land: it must not appear under Mesh crew.
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await waitFor(() => expect(screen.getByText("dave")).toBeTruthy());
+    expect(screen.queryByText("carol")).toBeNull();
+  });
+
+  it("a pending remove never hides the list opened after it", async () => {
+    lists = [
+      { name: "Friends", created_at: 1000, members: 1 },
+      { name: "Mesh crew", created_at: 1001, members: 1 },
+    ];
+    membersByList = {
+      Friends: [{ author: "c".repeat(64), name: "carol", added_at: 1000, posts: 2 }],
+      "Mesh crew": [{ author: "d".repeat(64), name: "dave", added_at: 1001, posts: 1 }],
+    };
+    // Hold the remove request back until the test releases it.
+    let releaseRemove!: () => void;
+    removeHold = new Promise<void>((resolve) => {
+      releaseRemove = resolve;
+    });
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Lists" }));
+    const membersButtons = await screen.findAllByRole("button", { name: "Members" });
+    fireEvent.click(membersButtons[0]);
+    expect(await screen.findByText("carol")).toBeTruthy();
+    // Start removing carol, then switch to Mesh crew before it finishes.
+    fireEvent.click(screen.getByRole("button", { name: "Remove carol from Friends" }));
+    fireEvent.click(membersButtons[1]);
+    expect(await screen.findByText("dave")).toBeTruthy();
+    // Let the stale remove's reload run: Mesh crew's panel must stay open.
+    releaseRemove();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await waitFor(() => expect(screen.getByText("dave")).toBeTruthy());
+    expect(screen.queryByText("carol")).toBeNull();
+  });
+
   it("shows followers with a follow-back button", async () => {
     renderSocial();
     await screen.findByText(/hello/);
@@ -263,6 +411,64 @@ describe("SocialSection", () => {
       expect(calls).toContain("GET /api/tan/search?q=mesh&limit=30"),
     );
     expect(await screen.findByText(/1 result for/)).toBeTruthy();
+  });
+
+  it("edits a scheduled post's text from the Scheduled tab", async () => {
+    scheduled = [
+      {
+        id: "ab12cd34ef56ab12",
+        text: "hello later",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("hello later")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Edit scheduled post"), {
+      target: { value: "hello sooner" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/tan/edit-scheduled"),
+    );
+  });
+
+  it("saving an unchanged scheduled post makes no request", async () => {
+    scheduled = [
+      {
+        id: "ab12cd34ef56ab12",
+        text: "hello later",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("hello later")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Edit scheduled post")).toBeNull(),
+    );
+    expect(calls).not.toContain("POST /api/tan/edit-scheduled");
   });
 
   it("shows a scheduled poll with its options in the Scheduled tab", async () => {

@@ -10,8 +10,10 @@ import {
   createBroadcast,
   deleteBroadcast,
   closeChannelPoll,
+  editScheduledChannelMessage,
   deleteDraft,
   deleteTanDraft,
+  editScheduledTanPost,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
@@ -44,9 +46,11 @@ import {
   revokeGroupInvites,
   saveTanDraft,
   closeDmPoll,
+  editOutbox,
   saveDraft,
   sendBroadcast,
   scheduleChannelMessage,
+  scheduleChannelPoll,
   scheduleTanPoll,
   scheduleTanPost,
   scheduleTanQuote,
@@ -326,6 +330,21 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
   });
 
+  it("edits a scheduled outbox message with text and/or send_in", async () => {
+    nextJson = { ok: true, edited: [], legs: 1 };
+    await editOutbox("aa".repeat(16), { text: "reworded", send_in: 3600 });
+    expect(captured[0].url).toBe("/api/outbox/edit");
+    expect(bodyOf(0)).toEqual({
+      target: "aa".repeat(16),
+      text: "reworded",
+      send_in: 3600,
+    });
+
+    nextJson = { ok: true, edited: [], legs: 1 };
+    await editOutbox("bb".repeat(16), { send_in: 300 });
+    expect(bodyOf(1)).toEqual({ target: "bb".repeat(16), send_in: 300 });
+  });
+
   it("saves and deletes a message draft", async () => {
     nextJson = {
       ok: true,
@@ -344,6 +363,25 @@ describe("POST endpoints", () => {
     expect(deleted).toBe(true);
   });
 
+  it("saves and deletes a channel draft", async () => {
+    nextJson = {
+      ok: true,
+      draft: { kind: "channel", target: "general", text: "hi all", updated_at: 100, name: "general" },
+    };
+    const draft = await saveDraft("channel", "general", "hi all");
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ kind: "channel", target: "general", text: "hi all" });
+    expect(draft.kind).toBe("channel");
+    expect(draft.name).toBe("general");
+
+    nextJson = { ok: true, deleted: true };
+    const deleted = await deleteDraft("channel", "general");
+    expect(captured[1].url).toBe("/api/drafts/delete");
+    expect(bodyOf(1)).toEqual({ kind: "channel", target: "general" });
+    expect(deleted).toBe(true);
+  });
+
   it("reacts and clears a reaction on the same route", async () => {
     nextJson = { ok: true };
     await reactToMessage("wire9", "👍");
@@ -359,12 +397,37 @@ describe("POST endpoints", () => {
     expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
   });
 
+  it("edits a scheduled Tan post's text and time", async () => {
+    nextJson = { ok: true, scheduled: { id: "abc123", text: "edited" } };
+    const edited = await editScheduledTanPost("abc123", {
+      text: "edited",
+      sendIn: 3600,
+    });
+    expect(captured[0].url).toBe("/api/tan/edit-scheduled");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: "abc123", text: "edited", send_in: 3600 });
+    expect(edited).toEqual({ id: "abc123", text: "edited" });
+  });
+
   it("schedules a channel message with send_in seconds", async () => {
     nextJson = { ok: true, scheduled: {} };
     await scheduleChannelMessage("general", "later", 300);
     expect(captured[0].url).toBe("/api/channels/schedule");
     expect(captured[0].init?.method).toBe("POST");
     expect(bodyOf(0)).toEqual({ channel: "general", text: "later", send_in: 300 });
+  });
+
+  it("schedules a channel poll with its options", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleChannelPoll("general", "which day?", ["Saturday", "Sunday"], 300);
+    expect(captured[0].url).toBe("/api/channels/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      channel: "general",
+      text: "which day?",
+      poll_options: ["Saturday", "Sunday"],
+      send_in: 300,
+    });
   });
 
 it("schedules a Tan repost or quote with kind and target_post", async () => {
@@ -423,6 +486,26 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
     expect(captured[0].url).toBe("/api/channels/cancel-scheduled");
     expect(captured[0].init?.method).toBe("POST");
     expect(bodyOf(0)).toEqual({ id: "abc123" });
+  });
+
+  it("edits a scheduled channel message's text and time", async () => {
+    nextJson = { ok: true, edited: { id: "abc123", text: "fixed" } };
+    const edited = await editScheduledChannelMessage("abc123", {
+      text: "fixed",
+      sendIn: 3600,
+    });
+    expect(captured[0].url).toBe("/api/channels/edit-scheduled");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: "abc123", text: "fixed", send_in: 3600 });
+    expect(edited.text).toBe("fixed");
+  });
+
+  it("edits only a scheduled channel message's time", async () => {
+    nextJson = { ok: true, edited: { id: "abc123", text: "later" } };
+    await editScheduledChannelMessage("abc123", { sendIn: 1800 });
+    expect(captured[0].url).toBe("/api/channels/edit-scheduled");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: "abc123", send_in: 1800 });
   });
 
   it("votes and closes a DM poll on the DM routes", async () => {

@@ -449,8 +449,8 @@ export interface MutedConversations {
 
 /** One unsent message parked for a peer or a group (``tau draft save``). */
 export interface MessageDraft {
-  kind: "peer" | "group";
-  /** Peer destination hash or group id. */
+  kind: "peer" | "group" | "channel";
+  /** Peer destination hash, group id, or channel name. */
   target: string;
   text: string;
   updated_at: number;
@@ -498,6 +498,14 @@ export interface OutboxEntry {
   sent_at: number | null;
   edited_at: number | null;
   group?: OutboxGroup;
+  /** Poll this leg carries, if any — the API only includes it when set. */
+  poll_options?: string[];
+  poll_vote?: Record<string, unknown>;
+  poll_close?: Record<string, unknown>;
+  /** Live-beacon marker this leg carries, if any. */
+  beacon?: Record<string, unknown>;
+  /** Static location pin this leg carries, if any. */
+  location?: Record<string, unknown>;
   read_at?: number | null;
 }
 
@@ -840,6 +848,10 @@ export interface ScheduledChannelMessage {
   attempts: number;
   next_attempt_at: number | null;
   paused_at: number | null;
+  /** "message" for a queued message, "poll" for a queued poll question. */
+  kind?: "message" | "poll";
+  /** Fixed poll choices; only present when kind is "poll". */
+  options?: string[];
   [key: string]: unknown;
 }
 
