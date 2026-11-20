@@ -5508,6 +5508,14 @@ def _node_callbacks(args: argparse.Namespace):
                 f"{record.get('name')} ({record.get('size')} bytes)",
                 flush=True,
             )
+            forwarded_from = clean_forwarded_from_or_none(
+                record.get("forwarded_from")
+            )
+            if forwarded_from is not None:
+                print(
+                    f"  forwarded from {forwarded_from['name']}",
+                    flush=True,
+                )
             print(f"  saved to {record.get('path')}", flush=True)
 
     return on_peer, on_message, on_file
