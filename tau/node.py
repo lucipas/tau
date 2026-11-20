@@ -7850,6 +7850,102 @@ class TauNode:
             "results": results,
         }
 
+    def send_broadcast_file(
+        self,
+        broadcast: Union[str, Dict[str, Any]],
+        path: Union[str, Path],
+        *,
+        timeout: float = _FILE_TRANSFER_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan a file out to every member of a broadcast list.
+
+        *broadcast* is a list name or a broadcast record.  Each leg
+        is one ``send_file`` transfer (its own transfer id and
+        ``/tau/file`` offer, hash verified by the receiver, 10 MiB
+        limit) — the same fan-out as :meth:`send_group_file`, except
+        each member gets an ordinary one-to-one file transfer and no
+        list metadata ever reaches a recipient, exactly as
+        ``tau broadcast send`` sends ordinary DMs.  Files are direct
+        links only in v1, like ``send_file``: a member that cannot be
+        reached or refuses the offer is a failed leg, not a queued
+        one.  Each leg is bounded by ``timeout`` — the per-leg
+        deadline discipline from ``send_group_file``, so one slow
+        member cannot consume another member's window.  The file is
+        read once up front, so every leg carries the same bytes even
+        if the file changes mid-fan-out.  Returns a per-member result
+        list: ``delivered`` (with the transfer id, name, size and
+        sha256) or an ``error`` for that leg.
+        """
+        if isinstance(broadcast, str):
+            broadcast = self.broadcasts.find(broadcast)
+        # Read the file once, before any leg is sent, so a missing or
+        # oversized file fails cleanly up front rather than aborting
+        # the fan-out partway through.
+        data, name, digest = _read_file_payload(path)
+        own_hash = self.destination_hexhash
+        members = [m for m in broadcast["members"] if m != own_hash]
+        results: List[Dict[str, Any]] = []
+        for member in members:
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            found = self.registry.get(bytes.fromhex(member))
+            peer_name = found.display_name if found is not None else ""
+            if budget <= 0.0:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer_name,
+                        "ok": False,
+                        "error": "not attempted: broadcast send time limit reached",
+                    }
+                )
+                continue
+            leg_discover = (
+                min(discover_timeout, budget)
+                if discover_timeout is not None
+                else None
+            )
+            try:
+                sent = self._send_file_bytes(
+                    member,
+                    data,
+                    name,
+                    digest,
+                    timeout=budget,
+                    discover_timeout=leg_discover,
+                    deadline=deadline,
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer_name,
+                        "delivered": True,
+                        "id": sent["id"],
+                        "name": sent["name"],
+                        "size": sent["size"],
+                        "sha256": sent["sha256"],
+                    }
+                )
+            except NodeError as exc:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer_name,
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
+        # Aggregate success only when every leg was delivered; a
+        # failed leg is a failed fan-out (there is no queue for files).
+        all_ok = all(r.get("delivered") for r in results)
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "broadcast": broadcast["name"],
+            "results": results,
+        }
+
     def send_file(
         self,
         target: Union[str, bytes, Peer],

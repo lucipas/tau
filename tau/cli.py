@@ -3075,6 +3075,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     broadcast_send.set_defaults(func=cmd_broadcast_send)
 
+    broadcast_send_file = broadcast_sub.add_parser(
+        "send-file",
+        parents=[common],
+        help="send a file to every member of a broadcast list, as a private DM each",
+    )
+    broadcast_send_file.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_send_file.add_argument(
+        "path", type=Path, help="local file to send (at most 10 MiB)"
+    )
+    broadcast_send_file.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="how long each member's transfer may take (default 300)",
+    )
+    broadcast_send_file.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_send_file.set_defaults(func=cmd_broadcast_send_file)
+
     tan = subparsers.add_parser(
         "tan",
         parents=[common],
@@ -18846,6 +18873,52 @@ def cmd_broadcast_send(args: argparse.Namespace) -> int:
     # queueing, and output.
     args.to = list(broadcast["members"])
     return cmd_send(args)
+
+
+def cmd_broadcast_send_file(args: argparse.Namespace) -> int:
+    """Send a file to every member of a broadcast list, as a private DM each.
+
+    Mirrors :func:`cmd_group_send_file`: one ``/tau/file`` offer +
+    RNS Resource transfer per member, each with its own transfer id,
+    and no list metadata ever reaches a recipient.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        response = node.send_broadcast_file(
+            args.broadcast,
+            args.path,
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+    finally:
+        node.stop()
+
+    failed_legs = [
+        r for r in response["results"] if not r.get("delivered")
+    ]
+    exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if _json_mode(args):
+        _emit(response, True)
+        return exit_code
+    if not response["results"]:
+        print(
+            f"broadcast list {response['broadcast']} has no other members"
+            " — nothing to send to."
+        )
+        return _EXIT_OK
+    for result in response["results"]:
+        name = result.get("to_name") or result["to"][:8]
+        if result.get("delivered"):
+            print(
+                f"delivered {result['name']} ({result['size']} bytes) to {name}"
+            )
+        else:
+            print(
+                f"failed for {name}: {result.get('error') or 'unknown error'}"
+            )
+    return exit_code
 
 
 def cmd_note(args: argparse.Namespace) -> int:
