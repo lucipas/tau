@@ -5954,6 +5954,23 @@ class TauNode:
         # which the post-delivery removal would then delete.  The
         # fresh read also carries the edit's timestamp, so the
         # recipient initializes its edit ordering state from it.
+        if getattr(fresh, "reaction", None) is not None or (
+            getattr(fresh, "kind", None) == "reaction"
+        ):
+            # A queued reaction re-sends its pre-signed bytes, not a
+            # text payload — so it is dispatched before the group-message
+            # encoding and the announcements-only post check, which only
+            # apply to posts.  The version check still guards the send.
+            if not self._queued_version_matches(
+                entry.id,
+                text=fresh.text,
+                edited_at=fresh.edited_at,
+                timeout=_remaining(deadline),
+            ):
+                return False
+            return self._deliver_queued_reaction(
+                peer, fresh, timeout, deadline=deadline
+            )
         send_text = fresh.text
         send_edited_at = fresh.edited_at
         if fresh.group_id is not None:
@@ -9576,28 +9593,28 @@ class TauNode:
                     # the member is heard from again.
                     try:
                         entry = self.mailbox.enqueue(
-                        to=bytes.fromhex(member),
-                        text=token or "reaction cleared",
-                        to_name=peer.display_name if peer is not None else "",
-                        group={
-                            "id": group["id"],
-                            "name": group["name"],
-                            "creator": group["creator"],
-                            "members": group["members"],
-                        },
-                        sent_at=sent_at,
-                        reaction={
-                            "target": target_id,
-                            "token": token,
-                            "reaction_id": reaction_id,
-                            "sent_at": sent_at,
-                            "target_author": target_author,
-                            "target_sent_at": target_sent_at,
-                            "payload_b64": base64.b64encode(
-                                payload_bytes
-                            ).decode("ascii"),
-                        },
-                    )
+                            to=bytes.fromhex(member),
+                            text=token or "reaction cleared",
+                            to_name=peer.display_name if peer is not None else "",
+                            group={
+                                "id": group["id"],
+                                "name": group["name"],
+                                "creator": group["creator"],
+                                "members": group["members"],
+                            },
+                            sent_at=sent_at,
+                            reaction={
+                                "target": target_id,
+                                "token": token,
+                                "reaction_id": reaction_id,
+                                "sent_at": sent_at,
+                                "target_author": target_author,
+                                "target_sent_at": target_sent_at,
+                                "payload_b64": base64.b64encode(
+                                    payload_bytes
+                                ).decode("ascii"),
+                            },
+                        )
                     except MailboxError as qexc:
                         # A full outbox must not abort the fan-out: the
                         # legs already delivered still need their local
