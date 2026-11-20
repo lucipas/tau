@@ -551,6 +551,7 @@ tau outbox
 # Broadcast lists: one message, many private DMs (no shared group)
 tau broadcast create team --peer alice --peer bob
 tau broadcast send team "meet at noon"
+tau broadcast send-file team photo.png
 # The web console has the same lists: Chat → Broadcasts, for
 # creating a list, sending to it, and deleting it.
 

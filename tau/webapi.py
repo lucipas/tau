@@ -55,6 +55,10 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/broadcasts/delete delete ``{"broadcast": "<name>"}``
     POST /api/broadcasts/send send ``{"broadcast": "<name>", "text": "..."}`` —
                            one DM per member, per-member results in reply
+    POST /api/broadcasts/send-file send a file to a broadcast list
+                           ``{"broadcast": "<name>", "name": "...", "data": "<base64>"}``
+                           (optional ``"timeout"`` seconds, default 300;
+                           one outbound entry per member)
     GET  /api/messages     recent inbound/outbound messages
                            (``?pinned=1`` lists pinned messages only,
                            across the whole console log)
@@ -6881,6 +6885,75 @@ class WebBridge:
         self.bus.publish({"type": "message", "message": message})
         return message, response
 
+    def _record_file_legs(
+        self,
+        *,
+        response: Dict[str, Any],
+        clean_name: str,
+        data: bytes,
+        digest: str,
+        sent_at: float,
+        group: Optional[str] = None,
+        group_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Record one outbound feed entry per file fan-out leg.
+
+        The shared recording loop for :meth:`send_group_file` and
+        :meth:`send_broadcast_file`: each leg becomes an outbound file
+        entry to that member, carrying its own delivery status and the
+        file metadata (name, size, SHA-256) — the same shape as a peer
+        file send, so the feed renders both alike.  A failed leg
+        carries no wire id: the recipient never saw that file, so no
+        reply may be quoted against it.  A leg retracted while its
+        console record was still in flight is omitted instead: the leg
+        went out on the wire, so the response still reports it, but
+        there is no record to show.  Group legs additionally carry
+        the group id/name badge; broadcast legs carry none, because
+        no list metadata ever reaches a recipient.
+        """
+        messages: List[Dict[str, Any]] = []
+        for result in response.get("results") or []:
+            member = str(result.get("to") or "")
+            peer_name = result.get("to_name") or (
+                short_hash(member) if member else "unknown"
+            )
+            delivered = bool(result.get("delivered"))
+            status = "delivered" if delivered else "failed"
+            # A failed leg carries no wire id: the recipient never saw
+            # that file, so no reply may be quoted against it.
+            wire_id = (
+                result.get("id")
+                if delivered and isinstance(result.get("id"), str)
+                else None
+            )
+            with self._send_lock:
+                message = self._append_message(
+                    direction="out",
+                    peer=member or None,
+                    peer_name=peer_name,
+                    text=f"Sent file: {clean_name} ({len(data)} bytes)",
+                    sent_at=sent_at,
+                    received_at=time.time(),
+                    status=status,
+                    group=group,
+                    group_name=group_name,
+                    wire_id=wire_id,
+                    file={
+                        "name": clean_name,
+                        "size": len(data),
+                        "sha256": digest,
+                    },
+                )
+                if message is None:
+                    # This leg was retracted while its console record
+                    # was still in flight: the leg went out on the
+                    # wire, so the response still reports it, but
+                    # there is no record to show.
+                    continue
+            self.bus.publish({"type": "message", "message": message})
+            messages.append(message)
+        return messages
+
     def send_group_file(
         self,
         group: str,
@@ -6940,47 +7013,85 @@ class WebBridge:
             response = self.node.send_group_file(
                 group_record, staged, timeout=timeout
             )
-        messages: List[Dict[str, Any]] = []
-        for result in response.get("results") or []:
-            member = str(result.get("to") or "")
-            peer_name = result.get("to_name") or (
-                short_hash(member) if member else "unknown"
+        messages = self._record_file_legs(
+            response=response,
+            clean_name=clean_name,
+            data=data,
+            digest=digest,
+            sent_at=sent_at,
+            group=group_record["id"],
+            group_name=group_record.get("name") or "",
+        )
+        return messages, response
+
+    def send_broadcast_file(
+        self,
+        broadcast: str,
+        name: str,
+        data: bytes,
+        *,
+        timeout: float = 300.0,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Send a file to every member of a broadcast list from the console.
+
+        Mirrors :meth:`send_group_file`: the bytes are staged in a
+        temporary directory under the sanitised file name —
+        ``TauNode.send_broadcast_file`` takes a path — and the staging
+        directory is removed once the fan-out finishes or fails.  One
+        outbound feed entry is recorded per leg, each an ordinary
+        one-to-one file entry to that member (no list metadata is
+        stored on the entry, because none ever reaches a recipient),
+        carrying its own delivery status and the file metadata (name,
+        size, SHA-256) — the same shape as a peer file send, so the
+        feed renders both alike.  A leg the member explicitly refused,
+        or that could not be reached, is recorded as ``failed`` rather
+        than silently dropped, so the sender sees which members did
+        not get the file.  A leg retracted while its console record
+        was still in flight is omitted instead: the leg went out on
+        the wire, so the response still reports it, but there is no
+        record to show.
+
+        The list is resolved by exact name (case-insensitive) through
+        ``BroadcastStore.find`` (an unknown list raises
+        ``ValueError``).  Files are direct links only in v1, so a
+        refused or unreachable member fails fast instead of queueing,
+        and there is no outbox id on any leg.
+        """
+        if not isinstance(broadcast, str) or not broadcast.strip():
+            raise ValueError("target broadcast list is required")
+        clean_name = sanitize_file_name(name)
+        if not clean_name:
+            raise ValueError(f"file name {name!r} is not usable")
+        if len(clean_name.encode("utf-8")) > 255:
+            raise ValueError("file name is too long (more than 255 bytes)")
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError("file data must be bytes")
+        data = bytes(data)
+        if len(data) < 1 or len(data) > MAX_FILE_BYTES:
+            raise ValueError(
+                f"file of {len(data)} bytes is outside the "
+                f"1..{MAX_FILE_BYTES} byte limit"
             )
-            delivered = bool(result.get("delivered"))
-            status = "delivered" if delivered else "failed"
-            # A failed leg carries no wire id: the recipient never saw
-            # that file, so no reply may be quoted against it.
-            wire_id = (
-                result.get("id")
-                if delivered and isinstance(result.get("id"), str)
-                else None
+        # Reload the persisted store first: a list created or deleted
+        # by another process (``tau broadcast``) must be seen by this
+        # send.
+        self.node.broadcasts.list_broadcasts()
+        broadcast_record = self.node.broadcasts.find(broadcast.strip())
+        digest = hashlib.sha256(data).hexdigest()
+        sent_at = time.time()
+        with tempfile.TemporaryDirectory(prefix="tau-send-file-") as staging:
+            staged = Path(staging) / clean_name
+            staged.write_bytes(data)
+            response = self.node.send_broadcast_file(
+                broadcast_record, staged, timeout=timeout
             )
-            with self._send_lock:
-                message = self._append_message(
-                    direction="out",
-                    peer=member or None,
-                    peer_name=peer_name,
-                    text=f"Sent file: {clean_name} ({len(data)} bytes)",
-                    sent_at=sent_at,
-                    received_at=time.time(),
-                    status=status,
-                    group=group_record["id"],
-                    group_name=group_record.get("name") or "",
-                    wire_id=wire_id,
-                    file={
-                        "name": clean_name,
-                        "size": len(data),
-                        "sha256": digest,
-                    },
-                )
-                if message is None:
-                    # This leg was retracted while its console record
-                    # was still in flight: the leg went out on the
-                    # wire, so the response still reports it, but
-                    # there is no record to show.
-                    continue
-            self.bus.publish({"type": "message", "message": message})
-            messages.append(message)
+        messages = self._record_file_legs(
+            response=response,
+            clean_name=clean_name,
+            data=data,
+            digest=digest,
+            sent_at=sent_at,
+        )
         return messages, response
 
     def react(
@@ -13409,7 +13520,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             # base64 image, and an import carries a whole message history
             # or a whole signed chain, so each gets a larger body cap than
             # a chat message or a single action.
-            if path in ("/api/send-file", "/api/groups/send-file", "/api/tan/posts"):
+            if path in ("/api/send-file", "/api/groups/send-file", "/api/broadcasts/send-file", "/api/tan/posts"):
                 limit = MAX_FILE_BODY_BYTES
             elif path in ("/api/messages/import", "/api/tan/import"):
                 limit = MAX_IMPORT_BYTES
@@ -13424,6 +13535,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/groups/send-file":
                 self._handle_send_group_file(body, head_only)
+                return
+            if path == "/api/broadcasts/send-file":
+                self._handle_send_broadcast_file(body, head_only)
                 return
             if path == "/api/react":
                 self._handle_react(body, head_only)
@@ -16535,6 +16649,70 @@ class _WebHandler(BaseHTTPRequestHandler):
             # group and an ambiguous query; only the unknown case is
             # a 404, the ambiguous one stays a 400.
             status = 404 if str(exc).startswith("unknown group:") else 400
+            self._send_json({"error": {"message": str(exc)}}, head_only, status)
+            return
+        except (ProtocolError, NodeError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(
+            {
+                "ok": bool(response.get("ok", True)),
+                "messages": messages,
+                "response": response,
+            },
+            head_only,
+        )
+
+    def _handle_send_broadcast_file(self, body: Dict[str, Any], head_only: bool) -> None:
+        broadcast = body.get("broadcast")
+        name = body.get("name")
+        data = body.get("data")
+        timeout = body.get("timeout", 300.0)
+        if not isinstance(broadcast, str) or not broadcast.strip():
+            self._send_json(
+                {"error": {"message": "field 'broadcast' is required"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(name, str) or not name.strip():
+            self._send_json(
+                {"error": {"message": "field 'name' is required"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(data, str):
+            self._send_json(
+                {"error": {"message": "field 'data' must be base64"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            timeout = 300.0
+        # Clamp before float(): huge ints would overflow float() otherwise.
+        timeout = float(max(1, min(timeout, 300)))
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (ValueError, base64.binascii.Error):
+            self._send_json(
+                {"error": {"message": "field 'data' must be valid base64"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            messages, response = self.bridge.send_broadcast_file(
+                broadcast.strip(),
+                name,
+                raw,
+                timeout=timeout,
+            )
+        except ValueError as exc:
+            # BroadcastStore.find raises ValueError for an unknown
+            # list; only that case is a 404.
+            status = 404 if str(exc).startswith("unknown broadcast list:") else 400
             self._send_json({"error": {"message": str(exc)}}, head_only, status)
             return
         except (ProtocolError, NodeError) as exc:
