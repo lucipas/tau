@@ -5121,6 +5121,15 @@ def test_parser_outbox_subcommands():
     assert cancelled.target == "abcdef12"
     assert cancelled.func is cli.cmd_outbox_cancel
 
+    edited = parser.parse_args(
+        ["outbox", "edit", "abcdef12", "--text", "fixed", "--delay", "1h"]
+    )
+    assert edited.outbox_command == "edit"
+    assert edited.target == "abcdef12"
+    assert edited.text == "fixed"
+    assert edited.delay == "1h"
+    assert edited.func is cli.cmd_outbox_edit
+
     retried = parser.parse_args(["outbox", "retry", "abcdef12"])
     assert retried.outbox_command == "retry"
     assert retried.target == "abcdef12"
@@ -5367,6 +5376,127 @@ def test_outbox_cancel_ambiguous_prefix_is_an_error(tmp_path, capsys):
     assert code == 1
     assert "2 queued messages match prefix" in capsys.readouterr().err
     assert len(Mailbox(config.mailbox_path).outbox_list()) == 2
+
+
+def test_outbox_edit_scheduled_entry_round_trip(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="see you soon",
+        message_id="cc" + "11" * 15,
+        send_after=time.time() + 7200.0,
+    )
+
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            entry.id[:8],
+            "--text",
+            "see you at noon",
+            "--delay",
+            "2h",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited cc111111" in out
+    assert "now sends in " in out
+    stored = Mailbox(config.mailbox_path).get_outbox(entry.id)
+    assert stored.text == "see you at noon"
+    assert abs(stored.send_after - (time.time() + 7200.0)) < 5.0
+
+
+def test_outbox_edit_json_reports_legs(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="later",
+        message_id="cc" + "22" * 15,
+        send_after=time.time() + 7200.0,
+    )
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+            entry.id,
+            "--text",
+            "much later, reworded",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["legs"] == 1
+    assert payload["edited"][0]["id"] == entry.id
+    assert payload["edited"][0]["text"] == "much later, reworded"
+
+
+def test_outbox_edit_needs_a_change(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="later",
+        message_id="cc" + "33" * 15,
+        send_after=time.time() + 7200.0,
+    )
+    code = cli.main(
+        ["outbox", "edit", "--data-dir", str(data_dir), entry.id]
+    )
+    assert code == 2
+    assert "nothing to change" in capsys.readouterr().err
+    assert Mailbox(config.mailbox_path).get_outbox(entry.id).text == "later"
+
+
+def test_outbox_edit_refuses_not_scheduled(tmp_path, capsys):
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16, text="now", message_id="cc" + "44" * 15
+    )
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            entry.id,
+            "--text",
+            "too late",
+        ]
+    )
+    assert code == 1
+    assert "no longer scheduled" in capsys.readouterr().err
+    assert Mailbox(config.mailbox_path).get_outbox(entry.id).text == "now"
 
 
 class _FakeRetryNode:
@@ -10006,6 +10136,9 @@ def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     assert cli.main([*base, "--image", str(big)]) == 1
     png = tmp_path / "photo.png"
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
+    # --image with --delay is allowed now (see
+    # test_tan_post_image_with_delay_schedules); --delay still cannot
+    # combine with --no-publish, which is what this rejects.
     assert cli.main([*base, "--image", str(png), "--delay", "5m"]) == 2
     # A reply cannot carry an image: post first, then reply to it.
     assert cli.main([*base, "--image", str(png)]) == 0
@@ -10020,6 +10153,54 @@ def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     assert (
         cli.main([*base, "--image", str(png), "--reply-to", post_hash]) == 2
     )
+
+
+def test_tan_post_image_with_delay_schedules(tmp_path, capsys):
+    import hashlib
+    import json
+
+    from tau.config import TauConfig
+
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    png = tmp_path / "photo.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    digest = hashlib.sha256(png.read_bytes()).hexdigest()
+    assert (
+        cli.main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--image",
+                str(png),
+                "--delay",
+                "5m",
+                "morning photo",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    # The queued entry carries the attachment descriptor, and the
+    # bytes are pinned in the media store for the publish pass.
+    config = TauConfig.resolve(data_dir=data_dir)
+    queue = json.loads(config.scheduled_posts_path.read_text())
+    assert queue["posts"][0]["image"] == {
+        "sha256": digest,
+        "size": len(png.read_bytes()),
+        "mime": "image/png",
+        "name": "photo.png",
+    }
+    from tau.tangents.tan import media_path
+
+    assert media_path(data_dir, digest) is not None
+    assert cli.main(["tan", "scheduled", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "photo.png" in out
 
 
 def test_tan_post_with_location_stores_place(tmp_path, capsys):
@@ -10374,6 +10555,14 @@ def test_parser_channel_scheduled_arguments():
     assert cancelled.func is cli.cmd_channel_cancel_scheduled
     assert cancelled.target == "abcdef"
 
+    edited = parser.parse_args(
+        ["channel", "edit-scheduled", "abcdef", "--text", "fixed", "--delay", "2h"]
+    )
+    assert edited.func is cli.cmd_channel_edit_scheduled
+    assert edited.target == "abcdef"
+    assert edited.text == "fixed"
+    assert edited.delay == "2h"
+
 
 def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
     _init_node(tmp_path, "node", "alice")
@@ -10396,6 +10585,25 @@ def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
     code = _run_channel(tmp_path, "scheduled", "general")
     assert code == 0
     assert "morning hello" in capsys.readouterr().out
+
+    code = _run_channel(
+        tmp_path, "edit-scheduled", entry_id[:8], "--text", "morning, mesh!"
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited" in out
+    assert "morning, mesh!" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "morning, mesh!" in out
+    assert "morning hello" not in out
+
+    # Neither --text nor --delay is a usage error, not a crash.
+    code = _run_channel(tmp_path, "edit-scheduled", entry_id[:8])
+    assert code == 2
+    assert "nothing to change" in capsys.readouterr().err
 
     code = _run_channel(tmp_path, "cancel-scheduled", entry_id[:8])
     assert code == 0

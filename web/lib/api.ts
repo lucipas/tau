@@ -39,6 +39,7 @@ import type {
   MessageDraft,
   NodeSettings,
   Outbox,
+  OutboxEntry,
   OutboxRetryResult,
   OwnProfile,
   PageList,
@@ -52,6 +53,7 @@ import type {
   SendResult,
   Snapshot,
   TanAuthor,
+  TanDraft,
   TanList,
   TanListMember,
   TanPost,
@@ -755,9 +757,9 @@ export async function getDrafts(): Promise<MessageDraft[]> {
   return data.drafts ?? [];
 }
 
-/** Save (or overwrite) the draft for one peer or group conversation. */
+/** Save (or overwrite) the draft for one peer, group, or channel conversation. */
 export async function saveDraft(
-  kind: "peer" | "group",
+  kind: "peer" | "group" | "channel",
   target: string,
   text: string,
 ): Promise<MessageDraft> {
@@ -769,8 +771,8 @@ export async function saveDraft(
   return data.draft;
 }
 
-/** Discard the draft for one peer or group conversation. */
-export async function deleteDraft(kind: "peer" | "group", target: string): Promise<boolean> {
+/** Discard the draft for one peer, group, or channel conversation. */
+export async function deleteDraft(kind: "peer" | "group" | "channel", target: string): Promise<boolean> {
   const data = await post<{ ok: boolean; deleted: boolean }>("/api/drafts/delete", {
     kind,
     target,
@@ -816,6 +818,13 @@ export async function getOutbox(): Promise<Outbox> {
 
 export async function cancelOutbox(target: string): Promise<unknown> {
   return post("/api/outbox/cancel", { target });
+}
+
+export async function editOutbox(
+  target: string,
+  patch: { text?: string; send_in?: number },
+): Promise<{ ok: boolean; edited: OutboxEntry[]; legs: number }> {
+  return post("/api/outbox/edit", { target, ...patch });
 }
 
 export async function retryOutbox(target?: string): Promise<OutboxRetryResult> {
@@ -1108,11 +1117,91 @@ export async function scheduleTanPost(
     reply_to: opts.replyTo,
     send_in: sendIn,
     expires_in: opts.expiresIn ?? 0,
+    image: opts.image?.dataUrl,
+  });
+}
+
+/** Queue a Tan poll for later: the question plus its fixed options. */
+export async function scheduleTanPoll(
+  question: string,
+  options: string[],
+  sendIn: number,
+  opts: { expiresIn?: number } = {},
+): Promise<ScheduledTanPost> {
+  return post("/api/tan/schedule", {
+    text: question,
+    poll_options: options,
+    send_in: sendIn,
+    expires_in: opts.expiresIn ?? 0,
+  });
+}
+
+export async function scheduleTanRepost(
+  target: string,
+  sendIn: number,
+): Promise<ScheduledTanPost> {
+  return post("/api/tan/schedule", {
+    kind: "repost",
+    target_post: target,
+    send_in: sendIn,
+  });
+}
+
+/** Queue a quote of a post for later: the comment plus the quoted post. */
+export async function scheduleTanQuote(
+  target: string,
+  text: string,
+  sendIn: number,
+): Promise<ScheduledTanPost> {
+  return post("/api/tan/schedule", {
+    kind: "quote",
+    target_post: target,
+    text,
+    send_in: sendIn,
   });
 }
 
 export async function cancelScheduledTanPost(id: string): Promise<unknown> {
   return post("/api/tan/cancel-scheduled", { id });
+}
+
+export async function editScheduledTanPost(
+  id: string,
+  opts: { text?: string; sendIn?: number },
+): Promise<ScheduledTanPost> {
+  const data = await post<{ ok: boolean; scheduled: ScheduledTanPost }>(
+    "/api/tan/edit-scheduled",
+    {
+      id,
+      text: opts.text,
+      send_in: opts.sendIn,
+    },
+  );
+  return data.scheduled;
+}
+
+/** Saved Tan post drafts, newest first. */
+export async function getTanDrafts(): Promise<TanDraft[]> {
+  const data = await get<{ drafts: TanDraft[]; count: number }>("/api/tan/drafts");
+  return data.drafts;
+}
+
+/** Save a Tan post draft (plain text plus optional reply and expiry). */
+export async function saveTanDraft(
+  text: string,
+  opts: PublishTanOptions = {},
+): Promise<TanDraft> {
+  const data = await post<{ ok: boolean; draft: TanDraft }>("/api/tan/drafts", {
+    text,
+    reply_to: opts.replyTo,
+    expires_in: opts.expiresIn,
+  });
+  return data.draft;
+}
+
+/** Discard a saved Tan post draft without publishing it. */
+export async function deleteTanDraft(id: number): Promise<unknown> {
+  return post("/api/tan/drafts/delete", { id });
 }
 
 export async function quoteTanPost(target: string, text: string): Promise<TanPost> {
@@ -1366,6 +1455,20 @@ export async function scheduleChannelMessage(
 
 export async function cancelScheduledChannelMessage(id: string): Promise<unknown> {
   return post("/api/channels/cancel-scheduled", { id });
+}
+
+export async function editScheduledChannelMessage(
+  id: string,
+  patch: { text?: string; sendIn?: number },
+): Promise<ScheduledChannelMessage> {
+  const body: { id: string; text?: string; send_in?: number } = { id };
+  if (patch.text !== undefined) body.text = patch.text;
+  if (patch.sendIn !== undefined) body.send_in = patch.sendIn;
+  const data = await post<{ ok: boolean; edited: ScheduledChannelMessage }>(
+    "/api/channels/edit-scheduled",
+    body,
+  );
+  return data.edited;
 }
 
 /** Pull missing history for one channel, or every joined channel when omitted. */

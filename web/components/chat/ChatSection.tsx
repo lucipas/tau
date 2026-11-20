@@ -91,9 +91,9 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
-/** The drafts list key for one conversation: `dm:<hash>` or `group:<id>`. */
-function draftKeyFor(kind: "peer" | "group", target: string): string {
-  return `${kind === "group" ? "group" : "dm"}:${target}`;
+/** The drafts list key for one conversation: `dm:<hash>`, `group:<id>` or `channel:<name>`. */
+function draftKeyFor(kind: "peer" | "group" | "channel", target: string): string {
+  return `${kind === "group" ? "group" : kind === "channel" ? "channel" : "dm"}:${target}`;
 }
 
 export default function ChatSection() {
@@ -230,6 +230,12 @@ export default function ChatSection() {
 
   const handleOpenDraft = useCallback(
     (draft: MessageDraft) => {
+      if (draft.kind === "channel") {
+        // Channel drafts open in the channels section, which seeds its
+        // own composer from the draft — no pending seed crosses sections.
+        navigate("channels", { channel: draft.target });
+        return;
+      }
       if (draft.kind === "group") navigate("chat", { group: draft.target });
       else navigate("chat", { peer: draft.target });
       setPendingSeed({ key: draftKeyFor(draft.kind, draft.target), text: draft.text });
@@ -553,6 +559,7 @@ export default function ChatSection() {
             loading={outbox.loading}
             error={outbox.error}
             onCancel={(target) => void outbox.cancel(target)}
+            onEdit={(target, patch) => void outbox.edit(target, patch)}
             onRetry={(target) => void outbox.retry(target)}
             onDropHeld={(target) => void outbox.dropHeld(target)}
           />

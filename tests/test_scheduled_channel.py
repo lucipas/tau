@@ -12,6 +12,7 @@ from tau.scheduled_channel import (
     ScheduledChannelMessage,
     ScheduledChannelMessages,
     cancel_scheduled_channel_message,
+    edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     publish_due_scheduled_channel_messages,
     save_scheduled_channel_messages,
@@ -166,6 +167,179 @@ def test_cancel_runs_on_cancel_under_the_lock(tmp_path):
     seen = []
     cancel_scheduled_channel_message(path, entry.id, on_cancel=seen.append)
     assert seen == [entry]
+
+
+def test_edit_scheduled_channel_message_text_only(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path,
+        channel="general",
+        text="later",
+        publish_at=2000.0,
+        to=["alice"],
+        ttl=2,
+        now=1000.0,
+    )
+    edited = edit_scheduled_channel_message(
+        path, entry.id[:8], text="fixed typo", now=1500.0
+    )
+    assert edited.id == entry.id
+    assert edited.text == "fixed typo"
+    assert edited.publish_at == 2000.0
+    # Channel, targets, TTL and retry state are untouched.
+    assert edited.channel == "general"
+    assert edited.to == ("alice",)
+    assert edited.ttl == 2
+    assert edited.attempts == 0
+    assert load_scheduled_channel_messages(path).messages[0].text == "fixed typo"
+
+
+def test_edit_scheduled_channel_message_time_only(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="later", publish_at=2000.0, now=1000.0
+    )
+    edited = edit_scheduled_channel_message(
+        path, entry.id, publish_at=3000.0, now=1500.0
+    )
+    assert edited.text == "later"
+    assert edited.publish_at == 3000.0
+
+
+def test_edit_scheduled_channel_message_text_and_time_reorders(tmp_path):
+    # The queue stays soonest first: moving the sooner message later
+    # swaps the list order.
+    path = tmp_path / "scheduled-channel-messages.json"
+    first = schedule_channel_message(
+        path, channel="general", text="first", publish_at=2000.0, now=1000.0
+    )
+    second = schedule_channel_message(
+        path, channel="general", text="second", publish_at=3000.0, now=1000.0
+    )
+    edited = edit_scheduled_channel_message(
+        path, first.id, text="first, moved", publish_at=4000.0, now=1500.0
+    )
+    assert edited.text == "first, moved"
+    assert [entry.id for entry in load_scheduled_channel_messages(path).messages] == [
+        second.id,
+        first.id,
+    ]
+
+
+def test_edit_scheduled_channel_message_requires_a_change(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="later", publish_at=2000.0, now=1000.0
+    )
+    with pytest.raises(ScheduledChannelError, match="nothing to change"):
+        edit_scheduled_channel_message(path, entry.id, now=1500.0)
+    assert load_scheduled_channel_messages(path).messages[0].text == "later"
+
+
+def test_edit_scheduled_channel_message_unknown_and_ambiguous(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    save_scheduled_channel_messages(
+        path,
+        ScheduledChannelMessages(
+            messages=(
+                _message("ab" * 8, publish_at=2000.0),
+                _message("ab" + "cd" * 7, publish_at=3000.0),
+            )
+        ),
+    )
+    with pytest.raises(ScheduledChannelError, match="no scheduled channel message"):
+        edit_scheduled_channel_message(path, "ff" * 8, text="nope", now=1500.0)
+    with pytest.raises(ScheduledChannelError, match="ambiguous"):
+        edit_scheduled_channel_message(path, "ab", text="nope", now=1500.0)
+    assert len(load_scheduled_channel_messages(path)) == 2
+
+
+def test_edit_scheduled_channel_message_refuses_already_created(tmp_path):
+    # A publish attempt already signed the message (message_hash set):
+    # changing the text would orphan the stored copy — cancel instead.
+    path = tmp_path / "scheduled-channel-messages.json"
+    save_scheduled_channel_messages(
+        path,
+        ScheduledChannelMessages(
+            messages=(_message(publish_at=2000.0, message_hash="f" * 64),)
+        ),
+    )
+    with pytest.raises(ScheduledChannelError, match="already created"):
+        edit_scheduled_channel_message(
+            path, "a" * 16, text="too late", publish_at=3000.0, now=1500.0
+        )
+    assert load_scheduled_channel_messages(path).messages[0].text == "hello mesh"
+
+
+def test_edit_scheduled_channel_message_rejects_bad_text(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="later", publish_at=2000.0, now=1000.0
+    )
+    with pytest.raises(ScheduledChannelError):
+        edit_scheduled_channel_message(path, entry.id, text="   ", now=1500.0)
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(
+            path, entry.id, text="😀" * 2000, now=1500.0
+        )
+    assert load_scheduled_channel_messages(path).messages[0].text == "later"
+
+
+def test_edit_rejects_text_that_creation_would_reject(tmp_path):
+    # 1,920 four-byte characters pass the old preflight envelope,
+    # which omits the v / expires_at / reply_to fields the publish
+    # pass adds — but fail the full normalized envelope, so the same
+    # text is refused at schedule time too.  The edit must refuse it
+    # as well, or the entry would sit queued for failed retries.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="later", publish_at=2000.0, now=1000.0
+    )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path, channel="general", text="😀" * 1920, publish_at=2000.0, now=1000.0
+        )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(
+            path, entry.id, text="😀" * 1920, now=1500.0
+        )
+    assert load_scheduled_channel_messages(path).messages[0].text == "later"
+
+
+def test_edit_rejects_text_that_only_fits_without_an_expiry(tmp_path):
+    # Disappearing-message boundary: 1,918 four-byte characters fit
+    # the normalized envelope with a null expiry, but overflow once
+    # publishing attaches the numeric expiry from the channel's
+    # disappearing-message default — and that default can be set
+    # after scheduling.  The preflight measures the largest expiry,
+    # so scheduling and editing both refuse the text up front.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="later", publish_at=2000.0, now=1000.0
+    )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path, channel="general", text="😀" * 1918, publish_at=2000.0, now=1000.0
+        )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(
+            path, entry.id, text="😀" * 1918, now=1500.0
+        )
+    assert load_scheduled_channel_messages(path).messages[0].text == "later"
+
+
+def test_edit_scheduled_channel_message_rejects_bad_time(tmp_path):
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="later", publish_at=2000.0, now=1000.0
+    )
+    with pytest.raises(ScheduledChannelError, match="in the future"):
+        edit_scheduled_channel_message(path, entry.id, publish_at=1400.0, now=1500.0)
+    with pytest.raises(ScheduledChannelError, match="within 7d"):
+        edit_scheduled_channel_message(
+            path, entry.id, publish_at=1500.0 + 7 * 24 * 60 * 60 + 1, now=1500.0
+        )
+    assert load_scheduled_channel_messages(path).messages[0].publish_at == 2000.0
 
 
 class _FakeChannelApp:

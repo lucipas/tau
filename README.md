@@ -163,6 +163,7 @@ The same bridge is the local integration point for scripts:
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
+| `/api/outbox/edit` | POST | edit a scheduled message before it sends (`{"target": "<message id or prefix>", "text": ..., "send_in": <seconds from now>}`) |
 | `/api/bundle/export` | POST | build a signed sneakernet bundle `{"include_tan": true}` |
 | `/api/bundle/import` | POST | merge a bundle document (the signed JSON) into this node |
 | `/api/outbox/retry` | POST | retry queued mail now, ignoring backoff (`{"target": "<message id or prefix>"}` for one entry; omit it to retry everything) |
@@ -274,6 +275,20 @@ tau tan post --to alice "direct delivery"
 # Schedule a post for the morning crowd (publishes while serving with --social)
 tau tan post --delay 8h "good morning, mesh"
 tau tan scheduled
+# Fix a typo or move a queued post: at least one of --text / --delay is required
+tau tan edit-scheduled ab12cd34 --text "good morning, mesh!" --delay 2h
+
+# Schedule a repost or a quote the same way (the queue publishes them
+# through the same --social pass; a scheduled repost carries no text)
+tau tan repost POST --delay 8h
+tau tan quote POST "this, tomorrow" --delay 8h
+
+# Schedule a poll the same way — it is asked when the time comes
+tau tan poll --delay 2h "pizza or tacos?" --option Pizza --option Tacos
+
+# Schedule a post with a photo attached — the image is stored with the
+# queue entry and signed with the post when it publishes
+tau tan post --image sunrise.jpg --delay 8h "good morning, mesh"
 
 # Attach a place to a post — the place is signed with it, and the
 # timeline and console show it with an open-in-maps link
@@ -419,6 +434,7 @@ Global options may appear before or after the command:
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
+| `tau outbox edit ID [--text TEXT] [--delay DURATION]` | Edit a scheduled DM or group message before it sends (text and/or send time; group edits update every leg) |
 | `tau id` | Show this node's name, destination hash, and LXMF delivery address |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |
@@ -426,12 +442,16 @@ Global options may appear before or after the command:
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan post --delay 5m TEXT` | Queue a post to publish in 5 minutes (needs `tau serve --social` running) |
+| `tau tan repost POST --delay 5m` | Queue a repost to publish in 5 minutes (needs `tau serve --social` running) |
+| `tau tan quote POST TEXT --delay 5m` | Queue a quote to publish in 5 minutes (needs `tau serve --social` running) |
 | `tau tan post --location "LAT,LON [NAME]" TEXT` | Attach a place to a post (signed with it; not with `--delay` or `--reply-to`) |
-| `tau tan scheduled` | List Tan posts queued for later publishing |
-| `tau tan cancel-scheduled ID` | Drop a queued Tan post before it publishes |
+| `tau tan scheduled` | List Tan posts, reposts, quotes and polls queued for later publishing |
+| `tau tan cancel-scheduled ID` | Drop a queued Tan post, repost, quote or poll before it publishes |
+| `tau tan edit-scheduled ID [--text TEXT] [--delay DURATION]` | Change a queued post's text and/or publish time |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan poll TEXT --option A --option B` | Ask a question with options (signed poll entry on your chain) |
+| `tau tan poll TEXT --option A --option B --delay 2h` | Queue a poll to ask in 2 hours (needs `tau serve --social` running) |
 | `tau tan vote POLL OPTION` | Vote for one option of a poll (option number or exact text) |
 | `tau tan results POLL` | Show a poll's question, options and current tally |
 | `tau tan repost POST` | Repost a post to your followers (signed entry on your chain) |
@@ -465,6 +485,7 @@ Global options may appear before or after the command:
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
 | `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
 | `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
+| `tau channel edit-scheduled ID [--text TEXT] [--delay DURATION]` | Change a queued channel message's text and/or publish time |
 | `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
 | `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
 | `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
@@ -1002,6 +1023,11 @@ The web console shows the same counts with a ♥ toggle on every post
 same way: `tau tan save` keeps a post to read later (local only, never
 published), and the console has a Saved view with a save toggle on every
 post (`GET /api/tan/saved`, `POST /api/tan/save` / `POST /api/tan/unsave`).
+Drafts work the same way too: `tau tan draft` parks a half-written post
+(local only, never published), and the console composer has a Save draft
+button with a Drafts view to edit or delete it (`GET /api/tan/drafts`,
+`POST /api/tan/drafts`, `POST /api/tan/drafts/delete`) — posting a loaded
+draft publishes it and drops the draft, mirroring `publish-draft`.
 
 ### Admission rules
 

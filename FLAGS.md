@@ -103,6 +103,7 @@ Global options may appear before or after the command:
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan poll TEXT --option A --option B` | Ask a question with options (signed poll entry on your chain) |
+| `tau tan poll TEXT --option A --option B --delay 2h` | Queue a poll to ask in 2 hours (needs `tau serve --social` running) |
 | `tau tan vote POLL OPTION` | Vote for one option of a poll (option number or exact text) |
 | `tau tan results POLL` | Show a poll's question, options and current tally |
 | `tau tan delete POST` | Delete one of your own posts |
