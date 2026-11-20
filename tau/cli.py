@@ -14233,7 +14233,7 @@ def _forward_file_send_peers(
                 timeout=file_timeout,
                 discover_timeout=discover_timeout,
             )
-        except (NodeError, ValueError, OSError) as exc:
+        except (NodeError, PeerError, ValueError, OSError) as exc:
             results.append({"target": target, "ok": False, "error": str(exc)})
             continue
         results.append({"target": target, "delivered": True, **sent})
