@@ -54,6 +54,13 @@ function makeDraft(id: number, text: string, extra: Partial<TanDraft> = {}): Tan
 
 let lists: { name: string; created_at: number; members: number }[] = [];
 let listMembers: { author: string; name: string; added_at: number; posts?: number }[] = [];
+/** Per-list members, keyed by list name; falls back to `listMembers`. */
+let membersByList: Record<
+  string,
+  { author: string; name: string; added_at: number; posts?: number }[]
+> = {};
+/** When set, members requests for `list` wait for `promise` before resolving. */
+let membersHold: { list: string; promise: Promise<void> } | null = null;
 let following: { author: string; name: string; posts: number }[] = [];
 
 function makeScheduled(
@@ -85,11 +92,20 @@ beforeEach(() => {
   ];
   lists = [];
   listMembers = [];
+  membersByList = {};
+  membersHold = null;
   following = [];
   const router = mockFetch((url, method) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
-    if (url.includes("/api/tan/lists/members"))
-      return { name: "Friends", members: listMembers, count: listMembers.length };
+    if (url.includes("/api/tan/lists/members")) {
+      const name = new URL(url, "http://test").searchParams.get("name") ?? "";
+      const members = membersByList[name] ?? listMembers;
+      const payload = { name, members, count: members.length };
+      if (membersHold && membersHold.list === name) {
+        return membersHold.promise.then(() => payload);
+      }
+      return payload;
+    }
     if (url.includes("/api/tan/lists")) return { lists, count: lists.length };
     if (url.includes("/api/tan/search")) return { posts: timeline, count: timeline.length };
     if (url.includes("/api/tan/thread")) return { posts: timeline, count: timeline.length };
@@ -260,6 +276,38 @@ describe("SocialSection", () => {
     fireEvent.change(select, { target: { value: "d".repeat(64) } });
     fireEvent.click(screen.getByRole("button", { name: "Add member" }));
     await waitFor(() => expect(calls).toContain("POST /api/tan/lists/add"));
+  });
+
+  it("a slow list load never lands under the list opened after it", async () => {
+    lists = [
+      { name: "Friends", created_at: 1000, members: 1 },
+      { name: "Mesh crew", created_at: 1001, members: 1 },
+    ];
+    membersByList = {
+      Friends: [{ author: "c".repeat(64), name: "carol", added_at: 1000, posts: 2 }],
+      "Mesh crew": [{ author: "d".repeat(64), name: "dave", added_at: 1001, posts: 1 }],
+    };
+    // Hold Friends' members response back until the test releases it.
+    let release!: () => void;
+    membersHold = {
+      list: "Friends",
+      promise: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    };
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Lists" }));
+    const membersButtons = await screen.findAllByRole("button", { name: "Members" });
+    // Open Friends, then switch to Mesh crew before Friends' response arrives.
+    fireEvent.click(membersButtons[0]);
+    fireEvent.click(membersButtons[1]);
+    expect(await screen.findByText("dave")).toBeTruthy();
+    // Let the stale Friends response land: it must not appear under Mesh crew.
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await waitFor(() => expect(screen.getByText("dave")).toBeTruthy());
+    expect(screen.queryByText("carol")).toBeNull();
   });
 
   it("shows followers with a follow-back button", async () => {

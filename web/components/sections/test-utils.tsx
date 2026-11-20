@@ -91,7 +91,7 @@ export function mockFetch(
     vi.fn(async (url: string, init?: RequestInit) => {
       const method = init?.method ?? "GET";
       calls.push(`${method} ${url}`);
-      const payload = handler(url, method);
+      const payload = await handler(url, method);
       return {
         ok: true,
         status: 200,

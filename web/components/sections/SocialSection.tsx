@@ -6,7 +6,7 @@
 
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import { useTauContext } from "@/components/chrome/TauContext";
 import {
@@ -768,6 +768,10 @@ function ListsView({
   const [newName, setNewName] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [members, setMembers] = useState<TanListMember[]>([]);
+  /** Which list the rows in `members` belong to; null until the first load. */
+  const [membersFor, setMembersFor] = useState<string | null>(null);
+  /** Monotonic load id: a response is applied only if no newer load started. */
+  const loadSeq = useRef(0);
   const [membersLoading, setMembersLoading] = useState(false);
   const [membersError, setMembersError] = useState<string | null>(null);
   const [addPick, setAddPick] = useState("");
@@ -776,14 +780,23 @@ function ListsView({
   const [error, setError] = useState<string | null>(null);
 
   async function loadMembers(name: string) {
+    // Invalidate any earlier load: its response must not land under this list.
+    const seq = ++loadSeq.current;
+    // Clear the previous list's rows at once, so they never render under
+    // the newly expanded list while its own load is in flight.
+    setMembersFor(name);
+    setMembers([]);
     setMembersLoading(true);
     setMembersError(null);
     try {
-      setMembers(await lists.listMembers(name));
+      const loaded = await lists.listMembers(name);
+      if (loadSeq.current !== seq) return;
+      setMembers(loaded);
     } catch (err) {
+      if (loadSeq.current !== seq) return;
       setMembersError(err instanceof Error ? err.message : String(err));
     } finally {
-      setMembersLoading(false);
+      if (loadSeq.current === seq) setMembersLoading(false);
     }
   }
 
@@ -945,7 +958,7 @@ function ListsView({
             )}
           </div>
 
-          {expanded === l.name && (
+          {expanded === l.name && membersFor === l.name && (
             <div className="mt-3">
               {membersLoading && <p className="py-2 text-sm text-zinc-500">Loading members…</p>}
               {membersError && (
