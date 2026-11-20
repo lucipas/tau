@@ -80,6 +80,97 @@ def test_resolve_unknown_peer_without_identity_data(tmp_path):
         node.resolve_peer(b"\x00" * 16)
 
 
+def _make_self_destination():
+    identity = RNS.Identity()
+    destination_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    return identity, destination_hash
+
+
+def test_resolve_peer_refuses_own_hash(tmp_path):
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.resolve_peer(own_hash)
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.resolve_peer(own_hash.hex())
+    self_peer = Peer(
+        destination_hash=own_hash,
+        name="tester",
+        public_key=identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.resolve_peer(self_peer)
+    assert node.registry.get(own_hash) is None
+
+
+def test_wait_for_peer_refuses_own_hash_without_recall(tmp_path, monkeypatch):
+    # The circular loop: Reticulum remembers the node's own announced
+    # identity, so recalling the node's own hash succeeds and the
+    # registry gains the node as its own peer. The guard must fire
+    # before any path request or recall happens.
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    recalled = []
+    monkeypatch.setattr(
+        RNS.Identity,
+        "recall",
+        staticmethod(lambda dest_hash: recalled.append(dest_hash) or identity),
+    )
+    requested = []
+    monkeypatch.setattr(
+        RNS.Transport,
+        "request_path",
+        staticmethod(lambda dest_hash: requested.append(dest_hash)),
+    )
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.wait_for_peer(own_hash, timeout=0.1)
+    assert recalled == []
+    assert requested == []
+    assert node.registry.get(own_hash) is None
+
+
+def test_drop_self_peer_purges_registry_and_persists(tmp_path):
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    node.registry.upsert(
+        own_hash, identity.get_public_key(), name="tester", now=time.time()
+    )
+    other = make_peer()
+    node.registry.upsert(
+        other.destination_hash, other.public_key, name=other.name, now=time.time()
+    )
+    assert len(node.registry) == 2
+
+    node._drop_self_peer()
+
+    assert node.registry.self_hash == own_hash
+    assert node.registry.get(own_hash) is None
+    assert node.registry.get(other.destination_hash) is not None
+    reloaded = PeerRegistry(node.config.peers_path)
+    assert reloaded.get(own_hash) is None
+    assert reloaded.get(other.destination_hash) is not None
+
+
+def test_send_message_to_self_never_enters_outbox(tmp_path):
+    # The resolve guard raises before delivery, but send_message's
+    # NodeError fallback re-derives the target hash and queues the
+    # send — a self-targeted send must be rejected there too, never
+    # queued for store-and-forward to our own hash (Qodo Fixer, #623).
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    node.reticulum = SimpleNamespace()  # started, so the queue fallback is live
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.send_message(own_hash.hex(), "hello self")
+    assert node.mailbox.outbox_list() == []
+    assert node.registry.get(own_hash) is None
+
+
 def test_info_requires_start(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(NodeError):

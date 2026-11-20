@@ -16,7 +16,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import RNS
 
@@ -48,6 +48,7 @@ from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import (
     TauConfig,
     accept_files_enabled,
+    announce_interval,
     send_read_receipts_enabled,
     tcp_listen_endpoints,
     write_rns_config,
@@ -724,6 +725,7 @@ class TauNode:
         self._foreign_announces: Dict[str, Dict[str, Any]] = {}
         self._foreign_announces_lock = threading.Lock()
         self._mail_thread: Optional[threading.Thread] = None
+        self._scheduled_files_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
         self._mail_round_threads: Set[threading.Thread] = set()
         self._mail_rounds_lock = threading.Lock()
@@ -1056,6 +1058,8 @@ class TauNode:
         )
         self.destination.set_link_established_callback(self._on_incoming_link)
 
+        self._drop_self_peer()
+
         handlers = {
             REQUEST_PING: self._handle_ping,
             REQUEST_INFO: self._handle_info,
@@ -1087,7 +1091,12 @@ class TauNode:
         self._stop_event.clear()
         self._started_at = time.time()
 
-        if self.config.announce_interval > 0:
+        if self.config.announce_interval > 0 or getattr(
+            self.config, "announce_interval_live", False
+        ):
+            # A live loop also starts when the saved interval is 0:
+            # the setting may be switched on later, and the loop
+            # idles until then instead of needing a restart.
             self._announce_thread = threading.Thread(
                 target=self._announce_loop,
                 name="tau-announce",
@@ -1431,6 +1440,15 @@ class TauNode:
                 # join() rejects threads whose start() failed or was never called.
                 if worker.ident is not None:
                     worker.join()
+        # The mail loop spawns the scheduled-file worker and returns,
+        # so join it after the mail thread: a transfer in flight must
+        # finish (and update the queue) before links are torn down and
+        # the instance lock is released, or a replacement node could
+        # attempt the same queued file.
+        worker = self._scheduled_files_thread
+        if worker is not None and worker is not threading.current_thread():
+            if worker.ident is not None:
+                worker.join()
 
     def _release_instance_lock(self) -> None:
         lock, self._instance_lock = self._instance_lock, None
@@ -1453,16 +1471,56 @@ class TauNode:
         )
 
     def _announce_loop(self) -> None:
-        interval = max(1.0, float(self.config.announce_interval))
+        # Waits run in short slices so that a live change to the saved
+        # setting (see below) takes effect promptly rather than after
+        # the whole previous delay has elapsed.
+        slice_seconds = 5.0
+        last_announce = time.monotonic()
         while not self._stop_event.is_set():
+            # A serve started without --announce-interval follows the
+            # saved setting, so a change made on the CLI or in the
+            # console takes effect without a restart. A serve started
+            # with an explicit flag keeps that flag for its run. A live
+            # interval of 0 idles here until the setting is switched
+            # back on.
+            live = getattr(self.config, "announce_interval_live", False)
+            seen: Optional[float] = None
+            if live:
+                seen = announce_interval(self.config.data_dir)
+                if seen == 0:
+                    last_announce = time.monotonic()
+                    if self._stop_event.wait(slice_seconds):
+                        break
+                    continue
+                interval = max(1.0, seen)
+            else:
+                interval = max(1.0, float(self.config.announce_interval))
             # Jitter keeps a room full of nodes from announcing in lockstep.
             delay = interval * (0.9 + 0.2 * random.random())
-            if self._stop_event.wait(delay):
-                break
+            deadline = last_announce + delay
+            changed = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._stop_event.wait(min(remaining, slice_seconds)):
+                    return
+                if live and announce_interval(self.config.data_dir) != seen:
+                    # Setting changed mid-wait: recompute from the last
+                    # announce time under the new interval.
+                    changed = True
+                    break
+            if changed:
+                continue
+            # Re-check right before announcing so a 0 saved meanwhile
+            # suppresses this announce.
+            if live and announce_interval(self.config.data_dir) != seen:
+                continue
             try:
                 self.announce()
             except Exception:  # pragma: no cover - network dependent
                 log.warning("Periodic announce failed", exc_info=True)
+            last_announce = time.monotonic()
 
     def _on_announce(
         self,
@@ -1747,6 +1805,23 @@ class TauNode:
             if len(raw) == DESTINATION_HASH_BYTES:
                 owed.add(raw)
         return owed
+
+    def _drop_self_peer(self) -> None:
+        """Drop this node's own destination from the peer registry.
+
+        The node's own hash can reach the registry indirectly — a list
+        naming it, a recalled own identity (see :meth:`wait_for_peer`),
+        or a stale ``peers.json`` — so the registry records the node's
+        own hash as its self-filter and any self entry already present
+        is purged on start, before the mail loop or an announce can
+        act on it. A node that has never listed itself is untouched.
+        """
+        if self.destination is None:
+            return
+        self.registry.self_hash = self.destination.hash
+        if self.registry.remove(self.destination.hash) is not None:
+            log.info("Dropped this node from its own peer registry")
+            self._save_peers(force=True)
 
     def _save_peers(self, *, force: bool = False) -> None:
         if self.registry.path is None:
@@ -4725,6 +4800,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled channel-message publish failed", exc_info=True)
             try:
+                self._publish_due_scheduled_files()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Scheduled file send failed", exc_info=True)
+            try:
                 self._send_due_beacon_updates()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Beacon update round failed", exc_info=True)
@@ -4795,6 +4874,131 @@ class TauNode:
                 "Published %d scheduled channel message(s)",
                 result["published"],
             )
+
+    def _publish_due_scheduled_files(self) -> None:
+        """Send files whose scheduled time has come, on a worker thread.
+
+        A file transfer can take minutes, so the pass never runs on
+        the mail-loop thread and never holds the queue lock across a
+        send (see ``tau.scheduled_files``).  At most one pass runs at
+        a time: a pass still working when the next mail loop comes
+        around is left alone, and the next pass picks up whatever is
+        still due.  A failed send keeps the entry queued — see
+        ``tau.scheduled_files`` — so this never raises into the mail
+        loop.
+        """
+        thread = self._scheduled_files_thread
+        if thread is not None and thread.is_alive():
+            return
+        from .scheduled_files import publish_due_scheduled_files
+
+        def _run() -> None:
+            try:
+                result = publish_due_scheduled_files(
+                    self.config.scheduled_files_path,
+                    self.config.scheduled_files_dir,
+                    self._send_scheduled_file,
+                    should_stop=self._stop_event.is_set,
+                )
+            except Exception:  # pragma: no cover - defensive; helper logs
+                log.debug("Scheduled-file send pass failed", exc_info=True)
+                return
+            if result["published"]:
+                log.info("Sent %d scheduled file(s)", result["published"])
+
+        thread = threading.Thread(target=_run, name="scheduled-files", daemon=True)
+        self._scheduled_files_thread = thread
+        thread.start()
+
+    def _send_scheduled_file(self, entry: Any, staged_path: Path) -> None:
+        """One scheduled file transfer: DM via ``send_file``, group
+        via ``send_group_file``.
+
+        The staged bytes are re-read and checked against the queue
+        entry's descriptor first, so a staged copy that was replaced
+        or corrupted after scheduling never goes out under the wrong
+        name or hash.  The transfer uses the limits the user set at
+        schedule time (``--timeout`` / ``--discover-timeout``).
+
+        A group file resolves its group by the id pinned at schedule
+        time, and refuses to send when the roster no longer matches
+        the snapshot — a roster change or name reuse must never
+        redirect the file to members who were not in the group when
+        it was queued; the entry stays queued instead.  A fan-out
+        that reaches only some members raises :class:`PartialSend`
+        carrying the delivered ones, so the retry sends only to the
+        members still owed.
+        """
+        from .scheduled_files import PartialSend, ScheduledFileError
+
+        try:
+            data, name, digest = _read_file_payload(staged_path)
+        except NodeError as exc:
+            raise ScheduledFileError(str(exc)) from exc
+        descriptor = entry.file
+        if (
+            digest != descriptor["sha256"]
+            or name != descriptor["name"]
+            or len(data) != descriptor["size"]
+        ):
+            raise ScheduledFileError(
+                f"scheduled file {entry.id} staged bytes do not match "
+                "their descriptor"
+            )
+        if entry.kind == "group":
+            if not entry.group_id or not entry.group_members:
+                raise NodeError(
+                    f"scheduled file {entry.id} has no roster snapshot; "
+                    "cancel it and schedule it again"
+                )
+            try:
+                group = self.groups.find(entry.group_id)
+            except ValueError as exc:
+                raise NodeError(
+                    f"scheduled file {entry.id} group no longer exists; "
+                    "it stays queued until cancelled"
+                ) from exc
+            if sorted(group["members"]) != sorted(entry.group_members):
+                raise NodeError(
+                    f"scheduled file {entry.id} group roster changed "
+                    "since scheduling; it stays queued until cancelled"
+                )
+            result = self.send_group_file(
+                group,
+                staged_path,
+                timeout=entry.timeout,
+                discover_timeout=entry.discover_timeout,
+                only=list(entry.pending_members) or None,
+            )
+            if not result.get("ok"):
+                delivered = tuple(
+                    leg["to"]
+                    for leg in result.get("results") or []
+                    if leg.get("delivered")
+                )
+                failed = [
+                    leg
+                    for leg in result.get("results") or []
+                    if not leg.get("delivered")
+                ]
+                detail = "; ".join(
+                    f"{leg.get('to_name') or (leg.get('to') or '')[:8]}: "
+                    f"{leg.get('error') or 'unknown error'}"
+                    for leg in failed
+                )
+                raise PartialSend(
+                    f"scheduled file {entry.id} failed for "
+                    f"{len(failed)} member(s)"
+                    + (f": {detail}" if detail else ""),
+                    delivered_members=delivered,
+                )
+            return
+        self.send_file(
+            entry.target,
+            staged_path,
+            timeout=entry.timeout,
+            discover_timeout=entry.discover_timeout,
+        )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:
         """Ask a few known peers for their peers, outside the mail lock.
@@ -6251,6 +6455,8 @@ class TauNode:
         is known, a path request is sent and the call waits for the announce.
         """
         if isinstance(target, Peer):
+            if self._is_self(target.destination_hash):
+                raise NodeError("cannot resolve this node as a peer")
             return target
 
         try:
@@ -6258,6 +6464,8 @@ class TauNode:
         except PeerError:
             raise
         if peer is not None:
+            if self._is_self(peer.destination_hash):
+                raise NodeError("cannot resolve this node as a peer")
             return peer
 
         if self.destination is None:
@@ -6275,10 +6483,26 @@ class TauNode:
 
         return self.wait_for_peer(dest_hash, timeout=timeout)
 
+    def _is_self(self, destination_hash: bytes) -> bool:
+        """True when *destination_hash* is this node's own destination.
+
+        The destination may be a bare stand-in with only a hexhash
+        (see the group tests): a missing ``hash`` simply never matches.
+        """
+        if self.destination is None:
+            return False
+        own = getattr(self.destination, "hash", None)
+        return own is not None and destination_hash == own
+
     def wait_for_peer(self, dest_hash: bytes, *, timeout: float = 10.0) -> Peer:
         """Wait for an announce that reveals the identity behind a hash."""
         if len(dest_hash) != 16:
             raise NodeError("destination hash must be 16 bytes")
+        if self._is_self(dest_hash):
+            # Reticulum remembers the node's own announced identity, so
+            # recalling the node's own hash would succeed and register
+            # the node as its own peer — the circular loop behind #618.
+            raise NodeError("cannot resolve this node as a peer")
         deadline = time.time() + max(0.0, timeout)
         try:
             RNS.Transport.request_path(dest_hash)
@@ -6796,7 +7020,9 @@ class TauNode:
                 if peer is not None
                 else self._target_hash(target)
             )
-            if dest_hash is None:
+            if dest_hash is None or self._is_self(dest_hash):
+                # A self-targeted send is rejected, never queued for
+                # store-and-forward to our own hash.
                 if peer is not None:
                     self.mailbox.discard_sent(message_id)
                 raise
@@ -7849,6 +8075,7 @@ class TauNode:
         *,
         timeout: float = _FILE_TRANSFER_TIMEOUT,
         discover_timeout: Optional[float] = None,
+        only: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Fan a file out to every member of a group except this node.
 
@@ -7862,7 +8089,10 @@ class TauNode:
         ``send_group_message``, so one slow member cannot consume
         another member's window.  The file is read once up front, so
         every leg carries the same bytes even if the file changes
-        mid-fan-out.  Returns a per-member result list:
+        mid-fan-out.  With *only* set, legs go only to those member
+        hashes — a scheduled retry's still-owed members, so a partial
+        fan-out never redelivers to members who already received the
+        file.  Returns a per-member result list:
         ``delivered`` (with the transfer id, name, size and sha256)
         or an ``error`` for that leg.
         """
@@ -7874,6 +8104,9 @@ class TauNode:
         data, name, digest = _read_file_payload(path)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
+        if only is not None:
+            wanted = set(only)
+            members = [m for m in members if m in wanted]
         results, all_ok = self._fan_out_file(
             members,
             data,

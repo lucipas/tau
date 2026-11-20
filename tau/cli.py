@@ -60,8 +60,11 @@ from .bundle import (
     serialize_bundle,
 )
 from .config import (
+    ANNOUNCE_INTERVAL_DEFAULT,
+    ANNOUNCE_INTERVAL_MAX,
     TauConfig,
     accept_files_enabled,
+    announce_interval,
     load_node_name,
     parse_host_port,
     send_read_receipts_enabled,
@@ -238,6 +241,18 @@ from .scheduled_channel import (
     schedule_channel_message,
     schedule_channel_poll,
 )
+from .scheduled_files import (
+    ScheduledFile,
+    ScheduledFileError,
+    _schedule_file_locked,
+    cancel_scheduled_file,
+    load_scheduled_files,
+    new_scheduled_file_id,
+    read_file_payload,
+    remove_staged_file,
+    scheduled_files_lock,
+    stage_file,
+)
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
@@ -375,7 +390,7 @@ from .channels import (
 
 log = logging.getLogger(__name__)
 
-DEFAULT_ANNOUNCE_INTERVAL = 300.0
+DEFAULT_ANNOUNCE_INTERVAL = ANNOUNCE_INTERVAL_DEFAULT
 
 _EXIT_OK = 0
 _EXIT_ERROR = 1
@@ -500,9 +515,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--announce-interval",
         type=float,
-        default=DEFAULT_ANNOUNCE_INTERVAL,
+        default=None,
         metavar="SECONDS",
-        help="periodic announce interval (default: %(default)s, 0 disables)",
+        help="periodic announce interval in seconds (default: the saved "
+        "setting — see `tau config announce-interval` — 300 when unset; "
+        "0 disables automatic announces)",
     )
     serve.add_argument(
         "--no-announce",
@@ -689,7 +706,7 @@ def build_parser() -> argparse.ArgumentParser:
     forward = subparsers.add_parser(
         "forward",
         parents=[common],
-        help="forward a stored message to a peer or a group",
+        help="forward a stored message to a peer, a group, or a channel",
     )
     forward_target = forward.add_mutually_exclusive_group(required=True)
     forward_target.add_argument(
@@ -703,6 +720,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|ID",
         help="group name or id: forward into the group instead of to a peer",
     )
+    forward_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name: forward into the channel instead of to a peer",
+    )
     forward.add_argument(
         "message",
         metavar="ID|PREFIX",
@@ -712,7 +734,11 @@ def build_parser() -> argparse.ArgumentParser:
     forward.add_argument(
         "--discover-timeout",
         type=float,
-        default=10.0,
+        # SUPPRESS, not 10.0: every send path defaults a missing value
+        # to 10s, but `cmd_forward` must be able to tell an explicitly
+        # passed value from the default — a channel forward refuses
+        # the flag instead of silently ignoring it.
+        default=argparse.SUPPRESS,
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
@@ -727,6 +753,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    forward.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the forward: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
     )
     forward.set_defaults(func=cmd_forward)
 
@@ -751,6 +784,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long the whole transfer may take (default 300)",
     )
     send_file.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the file: stage it now and send it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack; needs a node "
+        "serving at send time)",
+    )
+    send_file.add_argument(
         "--discover-timeout",
         type=float,
         default=10.0,
@@ -758,6 +799,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     send_file.set_defaults(func=cmd_send_file)
+
+    # Files queued with `--delay` wait here until a serving node
+    # sends them: list them, or drop one before it goes out.
+    scheduled_files = subparsers.add_parser(
+        "scheduled-files",
+        parents=[common],
+        help="list files scheduled to send later",
+    )
+    scheduled_files_sub = scheduled_files.add_subparsers(
+        dest="scheduled_files_command", metavar="SCHEDULED_FILES_COMMAND"
+    )
+    scheduled_files_cancel = scheduled_files_sub.add_parser(
+        "cancel",
+        parents=[common],
+        help="drop a scheduled file before it sends",
+    )
+    scheduled_files_cancel.add_argument(
+        "target",
+        metavar="ID",
+        help="scheduled file id or unique prefix (see `tau scheduled-files`)",
+    )
+    scheduled_files_cancel.set_defaults(func=cmd_cancel_scheduled_file)
+    scheduled_files.set_defaults(func=cmd_scheduled_files)
 
     # A note is a message to self that never leaves the machine, so it
     # gets its own subcommand instead of overloading `send --to <self>`
@@ -1780,6 +1844,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="1 = followed authors only, 2 = plus the authors they follow",
     )
     config_depth.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    config_announce = config_sub.add_parser(
+        "announce-interval",
+        parents=[common],
+        help="how often this node re-announces itself (seconds, 0 disables, default 300)",
+    )
+    config_announce.add_argument(
+        "seconds",
+        nargs="?",
+        type=_announce_interval_value,
+        help="re-announce every SECONDS seconds; 0 sends no automatic announces",
+    )
+    config_announce.set_defaults(func=cmd_config)
     config_cmd.set_defaults(func=cmd_config)
 
     block = subparsers.add_parser(
@@ -2842,6 +2920,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=300.0,
         metavar="SECONDS",
         help="how long each member's transfer may take (default 300)",
+    )
+    group_send_file.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the file: stage it now and send it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack; needs a node "
+        "serving at send time)",
     )
     group_send_file.add_argument(
         "--discover-timeout",
@@ -4247,6 +4333,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="store locally without contacting peers",
     )
     channel_send.add_argument(
+        "--location",
+        default=None,
+        metavar='"LAT,LON [PLACE]"',
+        help="pin a place on the message (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park"); without message text the '
+        "place name (or the coordinates) becomes the text",
+    )
+    channel_send.add_argument(
         "--delay",
         metavar="DURATION",
         help="schedule the message: queue it now and publish it after "
@@ -5016,7 +5110,10 @@ def _lookalike_map(
 
 
 def _make_config(
-    args: argparse.Namespace, *, announce_interval: float = DEFAULT_ANNOUNCE_INTERVAL
+    args: argparse.Namespace,
+    *,
+    announce_interval: float = DEFAULT_ANNOUNCE_INTERVAL,
+    announce_interval_live: bool = False,
 ) -> TauConfig:
     return TauConfig.resolve(
         data_dir=getattr(args, "data_dir", None),
@@ -5024,6 +5121,7 @@ def _make_config(
         name=getattr(args, "name", None),
         rns_loglevel=_rns_log_level(args),
         announce_interval=announce_interval,
+        announce_interval_live=announce_interval_live,
     )
 
 
@@ -5067,6 +5165,7 @@ def _message_text_with_location(
     if (
         location is not None
         and getattr(args, "message", None) is None
+        and getattr(args, "text", None) is None
         and getattr(args, "file", None) is None
         and sys.stdin.isatty()
     ):
@@ -5829,6 +5928,7 @@ def _publish_local_channel_message(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = ChannelApp(
@@ -5850,6 +5950,7 @@ def _publish_local_channel_message(
         poll_vote=poll_vote,
         poll_close=poll_close,
         reply_to=reply_to,
+        location=location,
     )
     published = publisher.publish(
         message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
@@ -6062,6 +6163,7 @@ def _publish_local_post(
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            location=location,
         )
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = TanApp(
@@ -9221,7 +9323,24 @@ def cmd_channel_mark_read(args: argparse.Namespace) -> int:
 
 
 def cmd_channel_send(args: argparse.Namespace) -> int:
-    text = _read_message(args)
+    # Validate the pin before reading the message, so an invalid
+    # --location fails at once instead of blocking on stdin.
+    location = _location_from_args(args)
+    if location is not None and getattr(args, "reply_to", None):
+        print(
+            "error: --location can only be attached to a top-level message, "
+            "not a reply",
+            file=sys.stderr,
+        )
+        return 2
+    if location is not None and getattr(args, "delay", None) is not None:
+        print(
+            "error: --location cannot be combined with --delay — "
+            "scheduled channel messages cannot carry a location pin yet",
+            file=sys.stderr,
+        )
+        return 2
+    text = _message_text_with_location(args, location)
     config = _make_config(args)
     json_output = _json_mode(args)
     try:
@@ -9301,6 +9420,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 text,
                 expires_at=expires_at,
                 reply_to=getattr(args, "reply_to", None),
+                location=location,
             )
         except ChannelError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -9322,6 +9442,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
                 expires_at=expires_at,
+                location=location,
             )
             message, published = result["message"], result["published"]
         else:
@@ -9342,6 +9463,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
                     expires_at=expires_at,
+                    location=location,
                 )
                 message, published = result["message"], result["published"]
             finally:
@@ -9351,6 +9473,11 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         _emit({"message": message, "published": published}, True)
     else:
         print(f"sent to #{name} {short_hash(message['hash'])}")
+        pin = clean_location(message.get("location"))
+        if pin is not None:
+            label = pin.get("name") or "Location"
+            print(f"  📍 {label} — {pin['lat']}, {pin['lon']}")
+            print(f"  {location_maps_url(pin)}")
         if message.get("expires_at") is not None:
             print(
                 "  disappears in "
@@ -10795,15 +10922,30 @@ def cmd_bundle_inspect(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _serve_announce_config(args: argparse.Namespace) -> TauConfig:
+    """Resolve the announce interval for `tau serve` (see #619).
+
+    An explicit --announce-interval pins the value for the run; with
+    no flag the saved setting applies, live — the announce loop
+    re-reads it each cycle.
+    """
+    flag_interval = getattr(args, "announce_interval", None)
+    if flag_interval is None:
+        probe = _make_config(args)
+        return _make_config(
+            args,
+            announce_interval=announce_interval(probe.data_dir),
+            announce_interval_live=True,
+        )
+    return _make_config(args, announce_interval=max(0.0, float(flag_interval)))
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     if getattr(args, "lxmf_propagation", False) and not getattr(
         args, "lxmf", False
     ):
         raise NodeError("--lxmf-propagation requires --lxmf")
-    interval = max(
-        0.0, float(getattr(args, "announce_interval", DEFAULT_ANNOUNCE_INTERVAL))
-    )
-    config = _make_config(args, announce_interval=interval)
+    config = _serve_announce_config(args)
 
     bridge = None
     web_settings = None
@@ -13836,15 +13978,16 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
-    """Forward a stored message to another peer or into a group, attributed
-    to its sender.
+    """Forward a stored message to another peer, into a group, or into
+    a channel, attributed to its sender.
 
     The forwarded text is the original prefixed with one attribution
     line, so the recipient sees who said it on any transport with no
     protocol change.  Delivery reuses :func:`cmd_send` wholesale for a
-    peer target — or :func:`cmd_group_send` for a group target, fanning
-    out one leg per member.  Either way the forward is a new message,
-    so it carries no expiry, kind, or reply chain from the original.
+    peer target — :func:`cmd_group_send` for a group target, fanning
+    out one leg per member, or :func:`cmd_channel_send` for a channel
+    target.  Either way the forward is a new message, so it carries no
+    expiry, kind, or reply chain from the original.
     """
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -13907,15 +14050,164 @@ def cmd_forward(args: argparse.Namespace) -> int:
     # `cmd_send` reads its text from `args.message`; hand it the
     # attributed text and let it own delivery, queueing, and output.
     # A group target takes the group-send path instead: the same
-    # attributed text, fanned out one leg per member.
+    # attributed text, fanned out one leg per member.  A channel
+    # target takes the channel-send path the same way.
     args.message = forwarded
     if getattr(args, "group", None):
         return cmd_group_send(args)
+    if getattr(args, "channel", None):
+        # `--no-queue`, `--wait`, and `--discover-timeout` only mean
+        # something for peer/group delivery; the channel-send path
+        # never reads them, so refuse them here instead of silently
+        # ignoring them.
+        if getattr(args, "no_queue", False):
+            raise NodeError("--no-queue does not apply to a channel forward")
+        if getattr(args, "wait", None) is not None:
+            raise NodeError("--wait does not apply to a channel forward")
+        if getattr(args, "discover_timeout", None) is not None:
+            raise NodeError(
+                "--discover-timeout does not apply to a channel forward"
+            )
+        # `cmd_channel_send` reads `args.to` as a publish restriction
+        # ("publish only to these peers"); the forward's own `--to`
+        # is a peer target, unset on this branch by the parser, but
+        # clear it explicitly so the two meanings can never mix.
+        args.to = None
+        return cmd_channel_send(args)
     return cmd_send(args)
+
+
+def _queue_file_for_later(
+    config: Any,
+    *,
+    target: str,
+    kind: str,
+    path: Path,
+    send_after: float,
+    group_id: Optional[str] = None,
+    group_members: Tuple[str, ...] = (),
+    timeout: float = 300.0,
+    discover_timeout: float = 10.0,
+) -> ScheduledFile:
+    """Stage *path* and queue it for *target* at *send_after*.
+
+    Reads and validates the file first (same 1..10 MiB limit and safe
+    name an immediate send enforces), stages the bytes under a fresh
+    queue id, then records the queue entry.  Staging and the queue
+    commit happen under the scheduled-files lock, so a crash or a
+    backup cannot slip between them and leave orphaned staged bytes
+    no queue entry owns.  A queue write that fails after staging
+    removes the staged bytes again under the same lock hold, so a
+    failed schedule never leaves an orphaned staged file behind — a
+    removal that itself fails is logged, not hidden behind the
+    original error.
+    """
+    try:
+        data, name, digest = read_file_payload(path)
+    except ScheduledFileError as exc:
+        raise NodeError(str(exc)) from exc
+    entry_id = new_scheduled_file_id()
+    with scheduled_files_lock(config.scheduled_files_path):
+        stage_file(config.scheduled_files_dir, entry_id, name, data)
+        try:
+            return _schedule_file_locked(
+                config.scheduled_files_path,
+                ScheduledFile(
+                    id=entry_id,
+                    target=target,
+                    kind=kind,
+                    file={"sha256": digest, "size": len(data), "name": name},
+                    publish_at=send_after,
+                    created_at=time.time(),
+                    group_id=group_id,
+                    group_members=group_members,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                ),
+            )
+        except ScheduledFileError as exc:
+            try:
+                remove_staged_file(config.scheduled_files_dir, entry_id)
+            except OSError as cleanup_exc:
+                log.warning(
+                    "Scheduled file %s could not be queued (%s) and its "
+                    "staged bytes could not be removed (%s)",
+                    entry_id,
+                    exc,
+                    cleanup_exc,
+                )
+            raise NodeError(str(exc)) from exc
+        except Exception:
+            try:
+                remove_staged_file(config.scheduled_files_dir, entry_id)
+            except OSError as cleanup_exc:  # pragma: no cover - best effort
+                log.warning(
+                    "Scheduled file %s could not be queued and its staged "
+                    "bytes could not be removed (%s)",
+                    entry_id,
+                    cleanup_exc,
+                )
+            raise
+
+
+def _print_scheduled_file(entry: ScheduledFile, *, delay: float) -> None:
+    destination = (
+        f"group {entry.target}" if entry.kind == "group" else entry.target
+    )
+    print(
+        f"scheduled {entry.file['name']} ({entry.file['size']} bytes) "
+        f"for {destination} — sends in {_ago(delay)}"
+    )
+    print(f"  id:      {entry.id}")
+    print("  a node serving will send it at its scheduled time;")
+    print(
+        "  list it with `tau scheduled-files`, cancel it with "
+        "`tau scheduled-files cancel <id>`"
+    )
+
+
+def _emit_scheduled_file(entry: ScheduledFile) -> None:
+    _emit(
+        {
+            "scheduled": True,
+            "id": entry.id,
+            "to": entry.target,
+            "kind": entry.kind,
+            "name": entry.file["name"],
+            "size": entry.file["size"],
+            "sha256": entry.file["sha256"],
+            "send_after": entry.publish_at,
+        },
+        True,
+    )
 
 
 def cmd_send_file(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        entry = _queue_file_for_later(
+            config,
+            target=args.to,
+            kind="dm",
+            path=args.path,
+            send_after=time.time() + delay,
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+        if _json_mode(args):
+            _emit_scheduled_file(entry)
+        else:
+            _print_scheduled_file(entry, delay=delay)
+        return _EXIT_OK
     node = TauNode(config, name=config.name)
     node.start()
     last_percent = -1
@@ -13949,6 +14241,68 @@ def cmd_send_file(args: argparse.Namespace) -> int:
     )
     print(f"  id:     {response['id']}")
     print(f"  sha256: {response['sha256']}")
+    return _EXIT_OK
+
+
+def cmd_scheduled_files(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        queue = load_scheduled_files(config.scheduled_files_path)
+    except ScheduledFileError as exc:
+        raise NodeError(str(exc)) from exc
+    entries = queue.files
+    if _json_mode(args):
+        _emit({"scheduled": [entry.to_dict() for entry in entries]}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No files scheduled.")
+        return _EXIT_OK
+    now = time.time()
+    for entry in entries:
+        when = _stamp(entry.publish_at)
+        if entry.publish_at <= now:
+            when += " (due — sends on the next serve pass)"
+        else:
+            when += f" (in {_ago(entry.publish_at - now)})"
+        destination = (
+            f"group {entry.target}" if entry.kind == "group" else entry.target
+        )
+        print(
+            f"{entry.id}  {destination}  {entry.file['name']} "
+            f"({entry.file['size']} bytes)  {when}"
+        )
+        if entry.attempts:
+            if entry.next_attempt_at > now:
+                print(
+                    f"  {entry.attempts} failed attempt(s); "
+                    f"next try in {_ago(entry.next_attempt_at - now)}"
+                )
+            else:
+                print(f"  {entry.attempts} failed attempt(s)")
+    return _EXIT_OK
+
+
+def cmd_cancel_scheduled_file(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+
+    def _delete_staged(entry: ScheduledFile) -> None:
+        # Dropping only the queue entry would leave the staged bytes
+        # behind; a later schedule reuses the id space, never the
+        # bytes, so delete them with the entry.
+        remove_staged_file(config.scheduled_files_dir, entry.id)
+
+    try:
+        entry = cancel_scheduled_file(
+            config.scheduled_files_path,
+            args.target,
+            on_cancel=_delete_staged,
+        )
+    except ScheduledFileError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit({"cancelled": entry.to_dict()}, True)
+    else:
+        print(f"cancelled {entry.id} — {entry.file['name']} will not be sent")
     return _EXIT_OK
 
 
@@ -18618,6 +18972,37 @@ def _report_group_reaction(
 
 def cmd_group_send_file(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        # Resolve the group without starting a node: scheduling only
+        # needs the group to exist.  The name is stored for display
+        # and the id plus roster snapshot pin the delivery target, so
+        # a later roster change or name reuse cannot redirect the file.
+        group = GroupStore(config.groups_path).find(args.group)
+        entry = _queue_file_for_later(
+            config,
+            target=group["name"],
+            kind="group",
+            path=args.path,
+            send_after=time.time() + delay,
+            group_id=group["id"],
+            group_members=tuple(sorted(group["members"])),
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+        if _json_mode(args):
+            _emit_scheduled_file(entry)
+        else:
+            _print_scheduled_file(entry, delay=delay)
+        return _EXIT_OK
     node = TauNode(config, name=config.name)
     node.start()
     try:
@@ -20508,6 +20893,25 @@ def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
         raise AllowListError(f"unknown peer or destination: {value!r}") from None
 
 
+def _announce_interval_value(text: str) -> float:
+    """Parse the `tau config announce-interval` argument (see #619)."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid announce interval: {text!r}"
+        ) from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            "announce interval must be 0 or more seconds"
+        )
+    if value > ANNOUNCE_INTERVAL_MAX:
+        raise argparse.ArgumentTypeError(
+            f"announce interval must be at most {ANNOUNCE_INTERVAL_MAX:g} seconds"
+        )
+    return value
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Show or change this node's own settings (stored in node.json)."""
     config = _make_config(args)
@@ -20563,23 +20967,58 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("  sync also pulls the authors they follow")
         return _EXIT_OK
 
+    if command == "announce-interval":
+        seconds_arg = getattr(args, "seconds", None)
+        if seconds_arg is None:
+            interval = announce_interval(config.data_dir)
+            if json_output:
+                _emit({"announce_interval": interval}, True)
+            else:
+                if interval == 0:
+                    print("Announce interval: off")
+                    print("  automatic announces are disabled")
+                else:
+                    print(f"Announce interval: {interval:g} seconds")
+                    print("  0 disables automatic announces (default 300)")
+            return _EXIT_OK
+        interval = float(seconds_arg)
+        set_node_setting(config.data_dir, "announce_interval", interval)
+        if json_output:
+            _emit({"announce_interval": interval}, True)
+        else:
+            if interval == 0:
+                print("Announce interval: off")
+                print("  this node announces only on startup (or when asked)")
+            else:
+                print(f"Announce interval: {interval:g} seconds")
+                print("  a running `tau serve` picks this up at its next cycle")
+        return _EXIT_OK
+
     settings = {
         "accept_files": accept_files_enabled(config.data_dir),
         "send_read_receipts": send_read_receipts_enabled(config.data_dir),
         "tan_sync_depth": tan_sync_depth(config.data_dir),
+        "announce_interval": announce_interval(config.data_dir),
     }
     if json_output:
         _emit(settings, True)
     else:
         accept_state = "on" if settings["accept_files"] else "off"
         receipts_state = "on" if settings["send_read_receipts"] else "off"
+        interval_state = (
+            "off"
+            if settings["announce_interval"] == 0
+            else f"{settings['announce_interval']:g} seconds"
+        )
         print(f"Settings ({config.data_dir / 'node.json'}):")
         print(f"  accept files: {accept_state}")
         print(f"  send read receipts: {receipts_state}")
         print(f"  tan sync depth: {settings['tan_sync_depth']}")
+        print(f"  announce interval: {interval_state}")
         print("  change with: tau config accept-files on|off")
         print("  change with: tau config read-receipts on|off")
         print("  change with: tau config tan-sync-depth 1|2")
+        print("  change with: tau config announce-interval <seconds>")
     return _EXIT_OK
 
 

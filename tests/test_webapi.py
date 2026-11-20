@@ -6399,6 +6399,93 @@ def test_channel_send_with_expiry_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_send_with_location_via_api(tmp_path):
+    from tau.channels import ChannelApp, join_channel
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    # Attach a real channel app so sends work; its node points at the
+    # fake so gossip has nowhere to go (delivered 0, no raise).
+    app = ChannelApp(node.config, node.identity, name="tester", gossip=False)
+    app.node = node
+    node.channel_app = app
+    app.join("general")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet here",
+                "location": {
+                    "lat": 34.05,
+                    "lon": -83.88,
+                    "name": "Rock Springs Park",
+                },
+            },
+        )
+        assert status == 200
+        assert payload["message"]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
+        # The stored message carries the pin into history.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert payload["messages"][0]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
+        # A malformed pin is a 400 before the bridge is touched.
+        for bad in (
+            {"lat": 91, "lon": 0},
+            {"lat": 34.05},
+            "34.05,-83.88",
+            42,
+        ):
+            status, _, payload = _json(
+                bridge,
+                "/api/channels/send",
+                method="POST",
+                body={"channel": "general", "text": "nope", "location": bad},
+            )
+            assert status == 400, bad
+            assert "error" in payload
+
+        # A pin cannot ride on a reply.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        parent = payload["messages"][0]
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "see you",
+                "reply_to": parent["hash"],
+                "location": {"lat": 34.05, "lon": -83.88},
+            },
+        )
+        assert status == 400
+        assert "top-level" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_pages_via_api(tmp_path):
     from types import SimpleNamespace
 
@@ -11938,6 +12025,7 @@ def test_settings_defaults(node, tmp_path):
             "accept_files": False,
             "send_read_receipts": True,
             "tan_sync_depth": 2,
+            "announce_interval": 300.0,
         }
         assert not (tmp_path / "node.json").exists()
     finally:
@@ -11960,6 +12048,7 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
                 "accept_files": True,
                 "send_read_receipts": True,
                 "tan_sync_depth": 2,
+                "announce_interval": 300.0,
             },
         }
 
@@ -11975,6 +12064,7 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 2,
+            "announce_interval": 300.0,
         }
 
         # The depth setting takes 1 or 2 and keeps the others too.
@@ -11989,12 +12079,14 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 1,
+            "announce_interval": 300.0,
         }
         status, _, payload = _json(bridge, "/api/settings")
         assert payload == {
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 1,
+            "announce_interval": 300.0,
         }
         stored = json.loads(
             (tmp_path / "node.json").read_text(encoding="utf-8")
@@ -12002,6 +12094,41 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
         assert stored["accept_files"] is True
         assert stored["send_read_receipts"] is False
         assert stored["tan_sync_depth"] == 1
+    finally:
+        bridge.stop()
+
+
+def test_settings_announce_interval_update_and_disable(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A number of seconds persists and keeps the other settings.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "announce_interval", "value": 60},
+        )
+        assert status == 200
+        assert payload["settings"] == {
+            "accept_files": False,
+            "send_read_receipts": True,
+            "tan_sync_depth": 2,
+            "announce_interval": 60.0,
+        }
+
+        # 0 disables automatic announces.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "announce_interval", "value": 0},
+        )
+        assert status == 200
+        assert payload["settings"]["announce_interval"] == 0.0
+        stored = json.loads(
+            (tmp_path / "node.json").read_text(encoding="utf-8")
+        )
+        assert stored["announce_interval"] == 0.0
     finally:
         bridge.stop()
 
@@ -12020,6 +12147,26 @@ def test_settings_update_rejects_bad_input(node, tmp_path):
             ({"setting": "tan_sync_depth", "value": 0}, "must be 1 or 2"),
             ({"setting": "tan_sync_depth", "value": True}, "must be 1 or 2"),
             ({"setting": "tan_sync_depth", "value": "2"}, "must be 1 or 2"),
+            (
+                {"setting": "announce_interval", "value": -1},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": True},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": "60"},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": 10**400},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": 1e308},
+                "must be 0 or more seconds",
+            ),
         ]:
             status, _, payload = _json(
                 bridge, "/api/settings", method="POST", body=body

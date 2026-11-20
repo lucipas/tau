@@ -545,6 +545,7 @@ export interface NodeSettings {
   accept_files: boolean;
   send_read_receipts: boolean;
   tan_sync_depth: number;
+  announce_interval: number;
 }
 
 export interface AllowList {
@@ -820,6 +821,8 @@ export interface ChannelMessage {
   reactions?: ChannelReaction[];
   /** Digest of the parent message when this message is a reply. */
   reply_to?: string;
+  /** Static location pin on a top-level message, if any. */
+  location?: LocationPin;
   /** Present when the author edited this message; the text shown is the latest edit. */
   edited?: boolean;
   edited_at?: number;

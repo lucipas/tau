@@ -779,6 +779,7 @@ def test_cli_config_read_receipts(tmp_path, capsys):
         "accept_files": False,
         "send_read_receipts": False,
         "tan_sync_depth": 2,
+        "announce_interval": 300.0,
     }
 
     assert (
