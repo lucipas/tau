@@ -659,6 +659,7 @@ export async function forwardMessage(
           "the message was forwarded but the file did not reach all members",
         );
       }
+      throw new Error("the message could not be forwarded");
     }
   }
   return result;
