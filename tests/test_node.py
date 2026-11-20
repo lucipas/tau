@@ -12,7 +12,13 @@ import pytest
 from tau.config import TauConfig
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox, MailboxError
-from tau.node import NodeError, NotAllowedError, TauNode, _AnnounceHandler
+from tau.node import (
+    AnnouncementsOnlyError,
+    NodeError,
+    NotAllowedError,
+    TauNode,
+    _AnnounceHandler,
+)
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import APP_NAME, ASPECT, build_announce, parse_message
 
@@ -1039,6 +1045,292 @@ def test_send_group_vote_carries_target_and_option(tmp_path, monkeypatch):
         limit=None, group=group["id"], direction=None
     )
     assert stored[0]["poll_vote"] == {"target": target, "option": 1}
+
+
+def test_send_group_message_refused_when_announcements_only_for_member(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    # The creator's message pins the setting on this member's node.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=100.0,
+        announcements_only=True,
+    )
+    assert node.groups.get(group["id"])["announcements_only"] is True
+    with pytest.raises(NodeError, match="announcements-only"):
+        node.send_group_message("crew", "hello?")
+    with pytest.raises(NodeError, match="announcements-only"):
+        node.send_group_message(
+            "crew", "which day?", poll_options=["Saturday", "Sunday"]
+        )
+    # A vote is not a post: it still goes out.
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_message(
+        "crew",
+        "voted",
+        poll_vote={
+            "target": {"author": alice.hexhash, "sent_at": 100.0},
+            "option": 0,
+        },
+    )
+    assert response["ok"] is True
+    assert len(payloads) == 2
+
+
+def test_send_group_file_refused_when_announcements_only_for_member(tmp_path):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=100.0,
+        announcements_only=True,
+    )
+    path = tmp_path / "note.txt"
+    path.write_text("hello", encoding="utf-8")
+    with pytest.raises(NodeError, match="announcements-only"):
+        node.send_group_file("crew", path)
+
+
+def test_send_group_message_allowed_for_creator_when_announcements_only(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import parse_group_message
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    own = node.destination.hexhash
+    mine = node.groups.create(
+        "mine", [own, alice.hexhash, bob.hexhash], created_by=own
+    )
+    node.groups.set_announcements_only(mine["id"], True, created_by=own)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_message("mine", "announcement")
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert parse_group_message(payload)["group_announcements_only"] is True
+
+
+def test_deliver_entry_skips_queued_post_when_group_goes_announcements_only(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+    # The creator restricts the group after the leg was queued.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=200.0,
+        announcements_only=True,
+    )
+    calls = []
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: calls.append(args) or {"ok": True},
+    )
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    assert calls == []
+    # The leg stays queued until its TTL (the user can cancel it).
+    assert node.mailbox.get_outbox("bob-leg-1") is not None
+    # The skip is recorded as a failed attempt, so the backoff moves
+    # the leg out of the sweep's way instead of re-checking it every
+    # round while it stays queued.
+    skipped = node.mailbox.get_outbox("bob-leg-1")
+    assert skipped.attempts == 1
+    assert skipped.next_attempt_at is not None
+    assert skipped.next_attempt_at > time.time()
+
+
+def test_skip_paces_restricted_leg_once_per_sweep(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+    # The creator restricts the group after the leg was queued.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=200.0,
+        announcements_only=True,
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True},
+    )
+    # The direct skip records the attempt.
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    assert node.mailbox.get_outbox("bob-leg-1").attempts == 1
+    # The deposit loop visits the same leg once per holder peer in the
+    # sweep — those visits must not record again, or one sweep would
+    # compound the backoff without a network attempt and delay the leg
+    # for up to an hour after the creator lifts the restriction.
+    assert node._deposit_entry(alice, snapshot, timeout=1.0) is False
+    assert node._deposit_entry(alice, snapshot, timeout=1.0) is False
+    assert node.mailbox.get_outbox("bob-leg-1").attempts == 1
+
+
+def test_deliver_entry_drops_queued_group_leg_when_peer_refuses_not_allowed(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+
+    def refused(*args, **kwargs):
+        raise AnnouncementsOnlyError(
+            "peer rejected the request: group is announcements-only: "
+            "only the creator can post"
+        )
+
+    monkeypatch.setattr(node, "_request", refused)
+    # A group leg refused as announcements-only is a policy refusal,
+    # like not-a-member: the group will not take this post, so the leg
+    # is dropped instead of held until its TTL.
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    assert node.mailbox.get_outbox("bob-leg-1") is None
+
+
+def test_deliver_entry_keeps_queued_group_leg_when_peer_refuses_allow_list(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+
+    def refused(*args, **kwargs):
+        raise NotAllowedError(
+            "peer rejected the request: sender is not on this node's "
+            "allow-list"
+        )
+
+    monkeypatch.setattr(node, "_request", refused)
+    # An allow-list refusal is changeable — the recipient may allow-list
+    # the sender later — so the leg must stay queued for retry instead
+    # of being dropped with the announcements-only refusals.
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    kept = node.mailbox.get_outbox("bob-leg-1")
+    assert kept is not None
+    assert kept.attempts == 1
+
+
+def test_request_maps_announcements_only_to_its_own_error(tmp_path):
+    from tau.protocol import response_error
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+
+    class _Receipt:
+        def get_response(self):
+            return response_error(
+                "announcements_only",
+                "group is announcements-only: only the creator can post",
+            )
+
+        def get_response_time(self):
+            return 0.004
+
+    class _Link:
+        def request(
+            self, path, payload, *, response_callback, failed_callback, **kwargs
+        ):
+            response_callback(_Receipt())
+            return object()
+
+    # The refusal maps to the distinct error, and that error is still
+    # a NotAllowedError for every existing refusal handler.
+    with pytest.raises(AnnouncementsOnlyError, match="announcements-only"):
+        node._request_on_link(_Link(), "/tau/group", b"{}", 1.0)
+    with pytest.raises(NotAllowedError):
+        node._request_on_link(_Link(), "/tau/group", b"{}", 1.0)
+
+
+def test_deliver_entry_drop_on_not_allowed_is_bounded_by_deadline(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+
+    def refused(*args, **kwargs):
+        raise AnnouncementsOnlyError(
+            "peer rejected the request: group is announcements-only: "
+            "only the creator can post"
+        )
+
+    monkeypatch.setattr(node, "_request", refused)
+    seen = {}
+    real_remove = node._remove_queued_version
+
+    def recording_remove(message_id, *, text, edited_at, timeout=None):
+        seen["timeout"] = timeout
+        return real_remove(
+            message_id, text=text, edited_at=edited_at, timeout=timeout
+        )
+
+    monkeypatch.setattr(node, "_remove_queued_version", recording_remove)
+    assert (
+        node._deliver_entry(
+            bob, snapshot, timeout=1.0, deadline=time.monotonic() + 1.0
+        )
+        is False
+    )
+    assert node.mailbox.get_outbox("bob-leg-1") is None
+    # The removal is bounded by the remaining delivery deadline, so a
+    # mailbox lock held by another process cannot stall the flush
+    # after the budget has expired.
+    assert seen["timeout"] is not None
+    assert seen["timeout"] <= 1.0
+
+
+def test_deliver_entry_carries_announcements_flag_on_retry(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import parse_group_message
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    own = node.destination.hexhash
+    mine = node.groups.create(
+        "mine", [own, alice.hexhash, bob.hexhash], created_by=own
+    )
+    node.groups.set_announcements_only(mine["id"], True, created_by=own)
+    _group_leg_entry(node, mine, bob, text="announcement", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+    calls = []
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: calls.append(args) or {"ok": True},
+    )
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is True
+    assert len(calls) == 1
+    parsed = parse_group_message(calls[0][2])
+    assert parsed["group_announcements_only"] is True
 
 
 def test_send_group_poll_scheduled_queues_poll_payload(tmp_path):

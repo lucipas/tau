@@ -58,6 +58,7 @@ def make_offer(
     data=b"hello file",
     transfer_id="a" * 32,
     forwarded_from=None,
+    group=None,
 ):
     return build_file_offer(
         identity,
@@ -67,6 +68,7 @@ def make_offer(
         size=len(data),
         sha256=hashlib.sha256(data).hexdigest(),
         forwarded_from=forwarded_from,
+        group=group,
     )
 
 
@@ -308,6 +310,22 @@ def test_file_offer_omits_forwarded_from_when_absent():
     assert "forwarded_from" not in parsed
 
 
+def test_file_offer_roundtrip_carries_group():
+    identity = sender_identity()
+    raw = make_offer(identity, group="ab" * 16)
+    parsed = parse_file_offer(
+        raw, remote_identity=identity, expected_recipient=RECIPIENT_HASH
+    )
+    assert parsed["group"] == "ab" * 16
+
+
+def test_file_offer_omits_group_when_absent():
+    identity = sender_identity()
+    raw = make_offer(identity)
+    parsed = parse_file_offer(raw, remote_identity=identity)
+    assert "group" not in parsed
+
+
 def test_file_offer_rejects_malformed_forwarded_from():
     identity = sender_identity()
     for bad in (
@@ -393,6 +411,41 @@ def test_handle_file_refuses_non_allowlisted_sender_even_when_on(tmp_path):
     response = handle_offer(node, identity, make_offer(identity))
     assert response["ok"] is False
     assert response["error"]["code"] == "not_allowed"
+
+
+def test_handle_file_refuses_member_file_when_group_is_announcements_only(
+    tmp_path,
+):
+    from tau.groups import derive_group_id
+
+    node = make_node(tmp_path)
+    set_node_setting(tmp_path, "accept_files", True)
+    identity = sender_identity()
+    creator = sender_identity()
+    creator_hash = sender_hash(creator)
+    members = [RECIPIENT_HASH, creator_hash, sender_hash(identity)]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+    node.groups.record(
+        group_id,
+        "weekend",
+        members,
+        creator=creator_hash,
+        sender=creator_hash,
+        sent_at=100.0,
+        announcements_only=True,
+    )
+    # A member's file to an announcements-only group is refused before
+    # any bytes move — the receiver enforces group policy itself
+    # instead of trusting the sender's send-side refusal.
+    response = handle_offer(node, identity, make_offer(identity, group=group_id))
+    assert response["ok"] is False
+    assert response["error"]["code"] == "announcements_only"
+    assert "announcements-only" in response["error"]["message"]
+    assert node._pending_file_offers == {}
+    # The creator's file to the same group is still accepted.
+    response = handle_offer(node, creator, make_offer(creator, group=group_id))
+    assert response["ok"] is True
+    assert "a" * 32 in node._pending_file_offers
 
 
 def test_handle_file_rejects_an_invalid_offer(tmp_path):
@@ -499,6 +552,56 @@ def test_resource_advertised_rejects_other_senders_and_unidentified_links(
     )
     assert not node._on_resource_advertised(advertisement, sender_link(None))
     assert not node._on_resource_advertised(advertisement)
+
+
+def test_resource_concluded_drops_member_file_when_group_turns_announcements_only(
+    tmp_path,
+):
+    from tau.groups import derive_group_id
+
+    received = []
+    node = make_node(tmp_path)
+    node.on_file = received.append
+    set_node_setting(tmp_path, "accept_files", True)
+    identity = sender_identity()
+    creator = sender_identity()
+    creator_hash = sender_hash(creator)
+    members = [RECIPIENT_HASH, creator_hash, sender_hash(identity)]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+    # The group starts open, so the member's offer is accepted...
+    node.groups.record(
+        group_id,
+        "weekend",
+        members,
+        creator=creator_hash,
+        sender=creator_hash,
+        sent_at=100.0,
+    )
+    response = handle_offer(node, identity, make_offer(identity, group=group_id))
+    assert response["ok"] is True
+    assert "a" * 32 in node._pending_file_offers
+    # ...then the creator switches it to announcements-only while the
+    # bytes are still in flight.  The completed transfer must not be
+    # recorded — the offer-time check alone is not enough.
+    node.groups.record(
+        group_id,
+        "weekend",
+        members,
+        creator=creator_hash,
+        sender=creator_hash,
+        sent_at=200.0,
+        announcements_only=True,
+    )
+    resource = SimpleNamespace(
+        status=RNS.Resource.COMPLETE,
+        metadata="a" * 32,
+        data=b"hello file",
+    )
+    node._on_resource_concluded(resource, sender_link(identity))
+
+    saved = tmp_path / "files" / sender_hash(identity) / "notes.txt"
+    assert not saved.exists()
+    assert received == []
 
 
 def test_resource_concluded_saves_verified_file_and_records_it(tmp_path):

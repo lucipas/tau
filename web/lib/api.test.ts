@@ -62,6 +62,7 @@ import {
   setAwayMessage,
   setChannelTopic,
   setDisappearingDefault,
+  setGroupAnnouncements,
   setOwnProfile,
   setQuietHours,
   startBeacon,
@@ -851,5 +852,20 @@ describe("group invite links", () => {
     expect(captured[0].url).toBe("/api/groups/join");
     expect(captured[0].init?.method).toBe("POST");
     expect(bodyOf(0)).toEqual({ link: "tau://invite/abc" });
+  });
+
+  it("switches a group to announcements-only, or back", async () => {
+    nextJson = {
+      ok: true,
+      group: { id: "abc123", announcements_only: true },
+    };
+    const result = await setGroupAnnouncements("abc123", true);
+    expect(captured[0].url).toBe("/api/groups/announcements");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ group: "abc123", announcements_only: true });
+    expect(result.group.announcements_only).toBe(true);
+
+    await setGroupAnnouncements("abc123", false);
+    expect(bodyOf(1)).toEqual({ group: "abc123", announcements_only: false });
   });
 });

@@ -1418,6 +1418,70 @@ def test_group_topic_flag_conflicts_rejected(tmp_path, capsys):
     )
 
 
+def test_parser_group_announcements_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["group", "announcements", "weekend", "on"])
+    assert args.group_command == "announcements"
+    assert args.group == "weekend"
+    assert args.state == "on"
+
+    shown = parser.parse_args(["group", "announcements", "weekend"])
+    assert shown.state is None
+
+    off = parser.parse_args(["group", "announcements", "weekend", "off"])
+    assert off.state == "off"
+
+
+def test_group_announcements_set_show_and_clear(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    base = ["group", "announcements", "--data-dir", str(data_dir), "weekend"]
+    assert cli.main(base) == 0
+    assert "is open" in capsys.readouterr().out
+
+    assert cli.main([*base, "on"]) == 0
+    out = capsys.readouterr().out
+    assert "announcements-only" in out
+    assert "next message" in out
+    # The CLI wrote through its own store instance: re-read from disk.
+    assert (
+        GroupStore(data_dir / "groups.json")
+        .get(group["id"])["announcements_only"]
+        is True
+    )
+
+    assert cli.main([*base, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["group"]["announcements_only"] is True
+
+    assert cli.main(["group", "list", "--data-dir", str(data_dir)]) == 0
+    assert "[announcements-only]" in capsys.readouterr().out
+
+    assert cli.main([*base, "off"]) == 0
+    assert "is open again" in capsys.readouterr().out
+    assert (
+        GroupStore(data_dir / "groups.json")
+        .get(group["id"])["announcements_only"]
+        is False
+    )
+
+    # A group this node did not create refuses the change.
+    store.create("other", ["cd" * 16, "ef" * 16], created_by="cd" * 16)
+    assert (
+        cli.main(
+            ["group", "announcements", "--data-dir", str(data_dir), "other", "on"]
+        )
+        == 1
+    )
+    assert "only the creator" in capsys.readouterr().err
+
+
 def test_parser_group_ban_arguments():
     parser = cli.build_parser()
     ban = parser.parse_args(["group", "ban", "weekend", "carol"])

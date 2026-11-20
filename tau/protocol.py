@@ -461,6 +461,8 @@ def encode_group_message(
     sent_at: Optional[float] = None,
     group_topic: Optional[str] = None,
     group_topic_sent_at: Optional[float] = None,
+    group_announcements_only: Optional[bool] = None,
+    group_announcements_sent_at: Optional[float] = None,
     renamed_from: Optional[List[str]] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
@@ -484,6 +486,12 @@ def encode_group_message(
     sender's clock, so the recipient judges the topic by its own
     timestamp rather than the message's send time; ``None`` omits it
     and the recipient falls back to ``sent_at``.
+    ``group_announcements_only`` rides along when given: ``True``
+    means only the group's creator may post, ``False`` lifts it;
+    ``None`` omits it, for senders that predate announcements-only
+    groups.  ``group_announcements_sent_at`` is the time the setting
+    was changed on the sender's clock, judged the same way as the
+    topic's timestamp.
     the id it claims.  ``renamed_from`` carries the group's rename
     lineage (predecessor ids, newest first) when the group was renamed:
     a member that still holds a predecessor learns from this message
@@ -555,6 +563,21 @@ def encode_group_message(
             topic_at = None
         if topic_at is not None and math.isfinite(topic_at):
             payload["group_topic_sent_at"] = topic_at
+    if group_announcements_only is not None:
+        payload["group_announcements_only"] = bool(group_announcements_only)
+        # The stamp always rides with the flag: a group that was
+        # never toggled has no stamp, so it rides as 0.0 — older
+        # than any real change, so a later toggle still wins and a
+        # queued copy can never overwrite one (see
+        # GroupStore.record).  Omitting it broke the wire contract
+        # the flag's presence promises.
+        try:
+            announcements_at = float(group_announcements_sent_at)
+        except (TypeError, ValueError, OverflowError):
+            announcements_at = None
+        if announcements_at is None or not math.isfinite(announcements_at):
+            announcements_at = 0.0
+        payload["group_announcements_sent_at"] = announcements_at
     if message_id:
         payload["id"] = message_id
     lineage = _clean_renamed_from(renamed_from)
@@ -637,6 +660,29 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
             topic_sent_at = None
         if topic_sent_at is not None and not math.isfinite(topic_sent_at):
             topic_sent_at = None
+    # ``None`` — the field absent, or non-boolean — means the sender
+    # predates announcements-only groups (or sent garbage): the local
+    # setting is left alone.  A present boolean is authoritative.
+    raw_announcements = payload.get("group_announcements_only")
+    announcements_only = (
+        bool(raw_announcements) if isinstance(raw_announcements, bool) else None
+    )
+    raw_announcements_at = payload.get("group_announcements_sent_at")
+    announcements_sent_at = None
+    if (
+        announcements_only is not None
+        and isinstance(raw_announcements_at, (int, float))
+        and not isinstance(raw_announcements_at, bool)
+    ):
+        try:
+            announcements_sent_at = float(raw_announcements_at)
+        except OverflowError:
+            announcements_sent_at = None
+        if (
+            announcements_sent_at is not None
+            and not math.isfinite(announcements_sent_at)
+        ):
+            announcements_sent_at = None
     raw_edited_at = payload.get("edited_at")
     edited_at = None
     if (
@@ -676,6 +722,8 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "members": members,
         "group_topic": topic,
         "group_topic_sent_at": topic_sent_at,
+        "group_announcements_only": announcements_only,
+        "group_announcements_sent_at": announcements_sent_at,
         "renamed_from": _clean_renamed_from(payload.get("renamed_from")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),
@@ -2084,6 +2132,7 @@ def build_file_offer(
     sha256: str,
     sent_at: Optional[float] = None,
     forwarded_from: Optional[Dict[str, Any]] = None,
+    group: Optional[str] = None,
 ) -> bytes:
     """Encode a signed file offer for the ``/tau/file`` request.
 
@@ -2107,6 +2156,13 @@ def build_file_offer(
     forwarder said so, the same trust as the old ``Forwarded from``
     text prefix.  Peers that predate this field ignore it; the file
     itself still arrives fine.
+
+    ``group`` names the group this file is posted to, when it is one:
+    it rides inside the signed payload, so the receiver can enforce
+    group policy — an announcements-only group refuses a member's
+    file — before any bytes move, instead of trusting the sender's
+    word that the send side already refused it.  Absent on direct
+    and broadcast files.
     """
     clean_name = sanitize_file_name(name)
     if not clean_name:
@@ -2138,6 +2194,8 @@ def build_file_offer(
     }
     if forwarded_from is not None:
         payload["forwarded_from"] = _clean_forwarded_from(forwarded_from)
+    if group is not None:
+        payload["group"] = _clean_hexhash(group, "group")
     signature = sender_identity.sign(encode(payload))
     if signature is None:  # pragma: no cover - identity without private keys
         raise ProtocolError("sender identity cannot sign")
@@ -2247,6 +2305,12 @@ def parse_file_offer(
         result["forwarded_from"] = _clean_forwarded_from(
             payload.get("forwarded_from")
         )
+    if payload.get("group") is not None:
+        # Inside the signed payload, so a tampered group id fails the
+        # signature check above; a malformed one is still a malformed
+        # offer.  Absent on offers that are not group files, and on
+        # offers from older peers.
+        result["group"] = _clean_hexhash(payload.get("group"), "group")
     return result
 
 

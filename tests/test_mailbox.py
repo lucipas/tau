@@ -1632,6 +1632,106 @@ def test_seal_and_open_carries_location():
     assert open_message(recipient, plain)["location"] is None
 
 
+def test_seal_and_open_carries_announcements_setting():
+    sender, recipient = make_identity_pair()
+    group = {
+        "id": "ab" * 16,
+        "name": "weekend",
+        "creator": "cd" * 16,
+        "members": ["ab" * 16, "cd" * 16],
+        "announcements_only": True,
+        "announcements_sent_at": 4300.0,
+    }
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-ann",
+        text="announcement",
+        sent_at=4242.0,
+        group=group,
+    )
+    message = open_message(recipient, blob)
+    assert message["group"]["announcements_only"] is True
+    assert message["group"]["announcements_sent_at"] == 4300.0
+    # A sealed copy without the setting carries none, like a plain message.
+    plain = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-plain-ann",
+        text="hello",
+        sent_at=4242.0,
+        group={k: v for k, v in group.items() if not k.startswith("announcements")},
+    )
+    assert "announcements_only" not in open_message(recipient, plain)["group"]
+
+
+def test_seal_and_open_announcements_flag_always_carries_a_stamp():
+    # A group that was never toggled has no stamp, so the flag rides
+    # with 0.0 inside the sealed envelope too — the same wire
+    # contract as the direct path.
+    sender, recipient = make_identity_pair()
+    group = {
+        "id": "ab" * 16,
+        "name": "weekend",
+        "creator": "cd" * 16,
+        "members": ["ab" * 16, "cd" * 16],
+        "announcements_only": False,
+    }
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-ann-stamp",
+        text="open again",
+        sent_at=4242.0,
+        group=group,
+    )
+    message = open_message(recipient, blob)
+    assert message["group"]["announcements_only"] is False
+    assert message["group"]["announcements_sent_at"] == 0.0
+
+
+def test_seal_and_open_carries_poll_vote():
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-vote",
+        text="voted: Sunday",
+        sent_at=4242.0,
+        poll_vote={
+            "target": {"author": "cd" * 16, "sent_at": 4200.0},
+            "option": 1,
+        },
+    )
+    message = open_message(recipient, blob)
+    assert message["poll_vote"] == {
+        "target": {"author": "cd" * 16, "sent_at": 4200.0},
+        "option": 1,
+    }
+    # A contradictory envelope drops all poll fields, like the
+    # direct path: a vote and a close cannot both be true.
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-vote-close",
+        text="voted: Sunday",
+        sent_at=4242.0,
+        poll_vote={
+            "target": {"author": "cd" * 16, "sent_at": 4200.0},
+            "option": 1,
+        },
+        poll_close={"author": "cd" * 16, "sent_at": 4200.0},
+    )
+    message = open_message(recipient, blob)
+    assert "poll_vote" not in message
+    assert "poll_close" not in message
+
+
 def test_seal_and_open_default_kind_is_chat():
     sender, recipient = make_identity_pair()
     blob = seal_message(

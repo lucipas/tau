@@ -71,6 +71,13 @@ export default function ThreadView({
   const thread = filterMessagesForConversation(messages, conversation);
   const listRef = useRef<HTMLDivElement>(null);
   const pinnedCount = thread.filter((m) => m.pinned).length;
+  // Announcements-only groups admit posts only from the creator; a
+  // member still reads, reacts and votes — the composer is the only
+  // thing locked.
+  const announcementsLocked =
+    conversation.kind === "group" &&
+    Boolean(conversation.group?.announcements_only) &&
+    !conversation.group?.created_by_me;
 
   useEffect(() => {
     const el = listRef.current;
@@ -97,7 +104,7 @@ export default function ThreadView({
             {typingName
               ? `${typingName} is typing…`
               : conversation.kind === "group"
-                ? `${conversation.group?.members.length ?? 0} members${conversation.group?.topic ? ` · ${conversation.group.topic}` : ""}`
+                ? `${conversation.group?.members.length ?? 0} members${conversation.group?.topic ? ` · ${conversation.group.topic}` : ""}${conversation.group?.announcements_only ? " · Announcements only" : ""}`
                 : conversation.peer?.blocked
                   ? "Blocked"
                   : conversation.peer?.verified
@@ -151,6 +158,12 @@ export default function ThreadView({
         )}
       </div>
 
+      {announcementsLocked && (
+        <p className="px-4 pb-1 text-center text-xs text-zinc-500">
+          Only the creator can post here — you can still react, vote, and edit your own
+          messages.
+        </p>
+      )}
       <Composer
         placeholder={`Message ${conversation.name}…`}
         replyTo={replyTo}
@@ -158,6 +171,10 @@ export default function ThreadView({
         editing={editing}
         onCancelEdit={() => onEditingChange?.(null)}
         allowPoll
+        // Locked for new posts, but an edit of your own earlier message
+        // still goes through — the send path allows it, and the composer
+        // is the edit's only submit button.
+        disabled={announcementsLocked && !editing}
         draftSeed={draftSeed}
         onSaveDraft={onSaveDraft}
         onSend={onSend}

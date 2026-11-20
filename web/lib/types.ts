@@ -205,6 +205,8 @@ export interface Group {
   members: GroupMember[];
   created_at: number;
   topic: string;
+  /** True when only the group's creator can post. Absent on older payloads: reads as open. */
+  announcements_only?: boolean;
   created_by_me: boolean;
   can_leave: boolean;
   ignored: boolean;

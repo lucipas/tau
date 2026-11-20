@@ -7,6 +7,7 @@ store-and-forward outbox.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import threading
@@ -32,6 +33,8 @@ from tau.protocol import (
     clean_group_topic,
     decode,
     derive_group_id,
+    edit_dict,
+    encode,
     encode_group_message,
     generate_group_id,
     parse_group_message,
@@ -327,6 +330,77 @@ def test_group_message_roundtrip_with_topic_sent_at():
     assert legacy["group_topic_sent_at"] is None
 
 
+def test_group_message_roundtrip_with_announcements_only():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    parsed = parse_group_message(
+        encode_group_message(
+            "announcements only from now on",
+            message_id="gm-a1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+            sent_at=123.0,
+            group_announcements_only=True,
+            group_announcements_sent_at=120.0,
+        )
+    )
+    assert parsed["group_announcements_only"] is True
+    assert parsed["group_announcements_sent_at"] == 120.0
+    # Lifting the restriction is a present False, not an absent field.
+    lifted = parse_group_message(
+        encode_group_message(
+            "open again",
+            message_id="gm-a2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+            group_announcements_only=False,
+        )
+    )
+    assert lifted["group_announcements_only"] is False
+    # A sender that predates announcements-only groups omits the field:
+    # the local setting must be left alone, so parse reports None.
+    legacy = parse_group_message(
+        encode_group_message(
+            "hi all",
+            message_id="gm-a3",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+        )
+    )
+    assert legacy["group_announcements_only"] is None
+    assert legacy["group_announcements_sent_at"] is None
+
+
+def test_group_message_announcements_flag_always_carries_a_stamp():
+    # A group that was never toggled has no stamp, so the flag rides
+    # with 0.0 — older than any real change, so a later toggle still
+    # wins and a queued copy can never overwrite one.  The flag
+    # without its stamp broke the wire contract the flag's presence
+    # promises.
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    for only in (False, True):
+        parsed = parse_group_message(
+            encode_group_message(
+                "open again",
+                message_id=f"gm-stamp-{int(only)}",
+                group_id=group_id,
+                group_name="weekend",
+                creator=OWN_HASH,
+                members=members,
+                group_announcements_only=only,
+            )
+        )
+        assert parsed["group_announcements_only"] is only
+        assert parsed["group_announcements_sent_at"] == 0.0
+
+
 def test_clean_group_topic_truncates_and_collapses():
     assert clean_group_topic("  planning   the  meetup ") == "planning the meetup"
     assert clean_group_topic("hello\n") == "hello"
@@ -602,6 +676,171 @@ def test_group_store_topic_survives_roster_change(tmp_path):
     assert grown["topic"] == "planning the meetup"
     assert grown["topic_sent_at"] == with_topic["topic_sent_at"]
     assert store.get(grown["id"])["topic"] == "planning the meetup"
+
+
+def test_group_store_set_announcements_only(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert group["announcements_only"] is False
+    updated = store.set_announcements_only(
+        group["id"], True, created_by=OWN_HASH
+    )
+    assert updated["announcements_only"] is True
+    assert updated["announcements_sent_at"] is not None
+    # Setting the same value again is a no-op returning the record.
+    assert (
+        store.set_announcements_only(group["id"], True, created_by=OWN_HASH)
+        == updated
+    )
+    # Lifting, and the change survives a reload.
+    lifted = store.set_announcements_only(
+        group["id"], False, created_by=OWN_HASH
+    )
+    assert lifted["announcements_only"] is False
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(group["id"])["announcements_only"] is False
+    # Only the creator can change it; a learned group is refused too.
+    with pytest.raises(ValueError, match="only the creator"):
+        store.set_announcements_only(
+            group["id"], True, created_by=OTHER_HASH
+        )
+    with pytest.raises(ValueError, match="unknown group"):
+        store.set_announcements_only(
+            generate_group_id(), True, created_by=OWN_HASH
+        )
+
+
+def test_group_store_announcements_survives_roster_change_and_rename(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    with_setting = store.set_announcements_only(
+        group["id"], True, created_by=OWN_HASH
+    )
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert grown["announcements_only"] is True
+    assert grown["announcements_sent_at"] == with_setting["announcements_sent_at"]
+    # A rename is the same group continuing: it must not silently
+    # re-open a group the creator restricted.
+    renamed = store.rename(grown["id"], "weekend-plans", created_by=OWN_HASH)
+    assert renamed["announcements_only"] is True
+    assert renamed["announcements_sent_at"] == with_setting["announcements_sent_at"]
+    assert store.get(renamed["id"])["announcements_only"] is True
+
+
+def test_group_store_record_announcements_pinning(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    # First sighting from the creator carries the setting.
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        announcements_only=True,
+    )
+    assert pinned is not None and pinned["announcements_only"] is True
+    assert pinned["announcements_sent_at"] == 100.0
+    # A member-carried message cannot set (or forge) the setting.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OTHER_HASH,
+            sent_at=150.0,
+            announcements_only=False,
+        )["announcements_only"]
+        is True
+    )
+    # A sender that predates the feature leaves the setting alone.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=200.0,
+        )["announcements_only"]
+        is True
+    )
+    # A newer creator message lifts it; a stale queued copy does not
+    # re-impose it.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=300.0,
+            announcements_only=False,
+        )["announcements_only"]
+        is False
+    )
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=250.0,
+            announcements_only=True,
+        )["announcements_only"]
+        is False
+    )
+    # A retried copy sent at 310 carries a setting made at 330: the
+    # setting is judged by its own timestamp, not the message's.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=310.0,
+            announcements_only=True,
+            announcements_sent_at=330.0,
+        )["announcements_only"]
+        is True
+    )
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=320.0,
+            announcements_only=False,
+            announcements_sent_at=315.0,
+        )["announcements_only"]
+        is True
+    )
+
+
+def test_group_store_record_without_announcements_reads_open(tmp_path):
+    # Records written before the field existed, and records with a
+    # non-boolean value, read as open — never as restricted.
+    path = tmp_path / "groups.json"
+    store = GroupStore(path)
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    raw = json.loads(path.read_text())
+    raw["groups"][0].pop("announcements_only", None)
+    raw["groups"][0].pop("announcements_sent_at", None)
+    path.write_text(json.dumps(raw))
+    assert GroupStore(path).get(group["id"])["announcements_only"] is False
+    raw = json.loads(path.read_text())
+    raw["groups"][0]["announcements_only"] = "yes"
+    path.write_text(json.dumps(raw))
+    assert GroupStore(path).get(group["id"])["announcements_only"] is False
 
 
 def test_group_store_ban_removes_member_and_records_ban(tmp_path):
@@ -2624,6 +2863,486 @@ def test_group_message_delivered_and_group_pinned(tmp_path):
     assert pinned["creator"] == sender_hash
 
 
+def test_group_message_from_member_dropped_when_announcements_only(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    # The creator switches the group to announcements-only; their own
+    # announcement lands and pins the setting.
+    response = post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )
+    assert response["ok"] is True
+    assert node.groups.get(group_id)["announcements_only"] is True
+    assert len(received) == 1
+
+    # A member's post is refused and never stored or shown.  The
+    # refusal carries its own code, so a sender can tell a group
+    # policy refusal — final for the queued leg — from an allow-list
+    # denial, which the recipient may lift later.
+    response = post(member, "can I post?", message_id="gm-a2", sent_at=110.0)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "announcements_only"
+    assert "announcements-only" in response["error"]["message"]
+    assert len(received) == 1
+    assert [entry["text"] for entry in node.inbox.list_messages()] == [
+        "announcements only from now on"
+    ]
+
+    # A member's vote is not a post: it still lands.
+    poll = post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )
+    assert poll["ok"] is True
+    vote = post(
+        member,
+        "voted: Sunday",
+        message_id="gm-vote",
+        sent_at=130.0,
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+    assert vote["ok"] is True
+    assert received[-1]["poll_vote"] == {
+        "target": {"author": creator_hash, "sent_at": 120.0},
+        "option": 1,
+    }
+
+    # The creator's next post still lands.
+    response = post(
+        creator, "the plan is set", message_id="gm-a3", sent_at=140.0
+    )
+    assert response["ok"] is True
+    assert len(received) == 4
+    # list_messages() is newest first.
+    assert [entry["text"] for entry in node.inbox.list_messages()] == [
+        "the plan is set",
+        "voted: Sunday",
+        "which day?",
+        "announcements only from now on",
+    ]
+
+
+def test_group_message_member_vote_with_smuggled_post_is_stripped(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    # The creator switches the group to announcements-only, then opens
+    # a poll.
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    assert post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )["ok"] is True
+    # A member's vote rides with a smuggled post, a pin and a quote.
+    # The vote lands — but only as a vote: the text is rewritten to
+    # the canonical rendering and the pin and quote are dropped, or
+    # the vote exemption smuggles a post into the group.
+    vote = post(
+        member,
+        "free pizza at my place, ignore the announcement",
+        message_id="gm-vote",
+        sent_at=130.0,
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+        location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+        in_reply_to={"id": "a" * 32, "excerpt": "0123456789abcdef"},
+    )
+    assert vote["ok"] is True
+    stored = received[-1]
+    assert stored["poll_vote"] == {
+        "target": {"author": creator_hash, "sent_at": 120.0},
+        "option": 1,
+    }
+    assert stored["text"] == "voted: Sunday"
+    assert stored.get("location") is None
+    assert stored.get("in_reply_to") is None
+    entry = node.inbox.list_messages(group=group_id)[0]
+    assert entry["text"] == "voted: Sunday"
+    assert entry.get("location") is None
+    assert entry.get("in_reply_to") is None
+
+
+def test_relayed_group_vote_keeps_poll_vote_in_announcements_only_group(
+    tmp_path,
+):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.identity = RNS.Identity()
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    assert post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )["ok"] is True
+    # The member's vote reaches the node as a sealed envelope held by
+    # a relay: the envelope must carry the vote, or the recipient
+    # reads it as a plain post and drops it.
+    blob = seal_message(
+        member,
+        sender_name="member",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="gm-vote",
+        text="free pizza at my place",
+        sent_at=130.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": creator_hash,
+            "members": members,
+            "announcements_only": True,
+            "announcements_sent_at": 100.0,
+        },
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+    message = open_message(node.identity, blob)
+    assert message["poll_vote"] == {
+        "target": {"author": creator_hash, "sent_at": 120.0},
+        "option": 1,
+    }
+    assert node._deliver_collected(message) is True
+    stored = node.inbox.list_messages(group=group_id)[0]
+    assert stored["poll_vote"] == {
+        "target": {"author": creator_hash, "sent_at": 120.0},
+        "option": 1,
+    }
+    assert stored["text"] == "voted: Sunday"
+
+
+def _announcements_vote_fixture(tmp_path):
+    """Node + group where the creator toggled announcements-only and opened a poll."""
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    assert post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )["ok"] is True
+    return node, received, post, creator, member, creator_hash, member_hash, group_id
+
+
+def _signed_group_edit(
+    sender, target, text, message_id, *, sent_at, group, target_author, target_sent_at
+):
+    """A signed group edit payload, as send_group_edit builds it."""
+    payload = edit_dict(
+        target,
+        text,
+        message_id=message_id,
+        sent_at=sent_at,
+        group=group,
+        target_author=target_author,
+        target_sent_at=target_sent_at,
+    )
+    payload["sig"] = base64.b64encode(sender.sign(encode(payload))).decode("ascii")
+    return encode(payload)
+
+
+def _member_vote(post, member, member_hash, creator_hash):
+    return post(
+        member,
+        "free pizza at my place, ignore the announcement",
+        message_id="gm-vote",
+        sent_at=130.0,
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+
+
+def test_group_edit_of_member_vote_keeps_canonical_text(tmp_path):
+    node, received, post, creator, member, creator_hash, member_hash, group_id = (
+        _announcements_vote_fixture(tmp_path)
+    )
+    assert _member_vote(post, member, member_hash, creator_hash)["ok"] is True
+    assert received[-1]["text"] == "voted: Sunday"
+    # The member edits their vote with a smuggled post.  The edit is
+    # accepted — but the stored text stays the canonical vote rendering.
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-vote",
+            "free pizza at my place, ignore the announcement",
+            "gm-edit-1",
+            sent_at=140.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=130.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is True
+    entry = node.inbox.list_messages(group=group_id)[0]
+    assert entry["text"] == "voted: Sunday"
+    assert entry["edited_at"] == 140.0
+
+
+def test_pending_group_edit_of_member_vote_keeps_canonical_text(tmp_path):
+    node, received, post, creator, member, creator_hash, member_hash, group_id = (
+        _announcements_vote_fixture(tmp_path)
+    )
+    # The member's edit arrives BEFORE the vote: it is planted as a
+    # pending edit, not applied to any copy yet.
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-vote",
+            "free pizza at my place, ignore the announcement",
+            "gm-edit-1",
+            sent_at=140.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=130.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is False
+    # The vote lands afterwards: the pending edit must not replace the
+    # canonical vote text the copy was sanitized to.
+    assert _member_vote(post, member, member_hash, creator_hash)["ok"] is True
+    assert received[-1]["text"] == "voted: Sunday"
+    entry = node.inbox.list_messages(group=group_id)[0]
+    assert entry["text"] == "voted: Sunday"
+
+
+def test_relayed_group_vote_with_pending_edit_keeps_canonical_text(tmp_path):
+    node, received, post, creator, member, creator_hash, member_hash, group_id = (
+        _announcements_vote_fixture(tmp_path)
+    )
+    node.identity = RNS.Identity()
+    # The edit is planted before the sealed copy arrives.
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-vote",
+            "free pizza at my place, ignore the announcement",
+            "gm-edit-1",
+            sent_at=140.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=130.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is False
+    blob = seal_message(
+        member,
+        sender_name="member",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="gm-vote",
+        text="free pizza at my place",
+        sent_at=130.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": creator_hash,
+            "members": [OWN_HASH, creator_hash, member_hash],
+            "announcements_only": True,
+            "announcements_sent_at": 100.0,
+        },
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+    message = open_message(node.identity, blob)
+    assert node._deliver_collected(message) is True
+    stored = node.inbox.list_messages(group=group_id)[0]
+    assert stored["text"] == "voted: Sunday"
+
+
+def test_group_edit_of_ordinary_message_still_applies_when_announcements_only(
+    tmp_path,
+):
+    # An ordinary message sent before the restriction keeps its edits:
+    # only a vote or close is pinned to the canonical rendering.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    # The member's ordinary message lands before the restriction.
+    assert post(
+        member, "typo here", message_id="gm-plain", sent_at=90.0
+    )["ok"] is True
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-plain",
+            "fixed here",
+            "gm-edit-2",
+            sent_at=150.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=90.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is True
+    entries = {
+        entry["id"]: entry
+        for entry in node.inbox.list_messages(group=group_id)
+    }
+    assert entries["gm-plain"]["text"] == "fixed here"
+
+
 def test_group_message_with_reply_stores_reference(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
@@ -3951,6 +4670,7 @@ def _stub_group_send_file(node, *, fail_for=()):
         discover_timeout=None,
         deadline=None,
         forwarded_from=None,
+        group=None,
     ):
         calls.append(
             (target, name, timeout, discover_timeout, data, deadline, forwarded_from)
