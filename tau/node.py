@@ -6835,7 +6835,9 @@ class TauNode:
                 if peer is not None
                 else self._target_hash(target)
             )
-            if dest_hash is None:
+            if dest_hash is None or self._is_self(dest_hash):
+                # A self-targeted send is rejected, never queued for
+                # store-and-forward to our own hash.
                 if peer is not None:
                     self.mailbox.discard_sent(message_id)
                 raise
