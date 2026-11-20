@@ -8792,7 +8792,7 @@ def test_parser_forward_arguments():
     assert args.command == "forward"
     assert args.to == ["bob"]
     assert args.message == "abcdef12"
-    assert args.timeout == 20.0
+    assert args.timeout is None
     assert args.wait is None
     assert args.no_queue is False
 
@@ -9332,12 +9332,12 @@ def test_forward_file_to_group_fans_out(tmp_path, capsys, monkeypatch):
         ]
     )
     assert code == 0
-    text_node = _FakeGroupSendNode.instances[0]
-    group, text, _ = text_node.sent[0]
+    assert len(_FakeGroupSendNode.instances) == 1
+    node = _FakeGroupSendNode.instances[0]
+    group, text, _ = node.sent[0]
     assert group["name"] == "weekend"
     assert text == "Forwarded from alice:\nphoto.jpg"
-    file_node = _FakeGroupSendNode.instances[1]
-    assert file_node.group_files_sent == [
+    assert node.group_files_sent == [
         ("weekend", "photo.jpg", b"photo-bytes!")
     ]
     out = capsys.readouterr().out
@@ -11691,6 +11691,17 @@ def test_channel_poll_delay_rejects_bad_combinations(tmp_path, capsys):
         "Saturday",
         "Sunday",
         "--delay",
+        "5m",
+    )
+    assert code == 2
+    assert "not a member of channel 'other'" in capsys.readouterr().err
+
+    code = _run_channel(
+        tmp_path, "poll", "general", "which day?", "Saturday", "--delay", "5m"
+    )
+    assert code == 2
+    assert "a poll needs 2-8 options" in capsys.readouterr().err
+"--delay",
         "5m",
     )
     assert code == 2

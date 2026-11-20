@@ -281,8 +281,8 @@ def _read_file_payload(path: Union[str, Path]) -> Tuple[bytes, str, str]:
 
 def resolve_received_file(
     record: Dict[str, Any], files_dir: Union[str, Path]
-) -> Path:
-    """Return the verified on-disk path of a stored received-file record.
+) -> bytes:
+    """Return the verified bytes of a stored received-file record.
 
     The record carries the path the bytes were saved to when the file
     arrived (``files/<sender>/<name>``), plus the name, size, and
@@ -292,6 +292,8 @@ def resolve_received_file(
     outside it), the file must exist, and its size and hash must still
     match the record — a moved, deleted, or edited file is an error
     before anything is sent, never a silent forward of the wrong bytes.
+    The bytes are returned rather than the path, so the caller sends
+    exactly what was verified instead of reading the path a second time.
     """
     name = record.get("name")
     if not isinstance(name, str) or sanitize_file_name(name) != name:
