@@ -265,6 +265,64 @@ describe("SocialSection", () => {
     expect(await screen.findByText(/1 result for/)).toBeTruthy();
   });
 
+  it("edits a scheduled post's text from the Scheduled tab", async () => {
+    scheduled = [
+      {
+        id: "ab12cd34ef56ab12",
+        text: "hello later",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("hello later")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Edit scheduled post"), {
+      target: { value: "hello sooner" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/tan/edit-scheduled"),
+    );
+  });
+
+  it("saving an unchanged scheduled post makes no request", async () => {
+    scheduled = [
+      {
+        id: "ab12cd34ef56ab12",
+        text: "hello later",
+        reply_to: null,
+        to: [],
+        ttl: 3,
+        publish_at: Math.floor(Date.now() / 1000) + 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        post_hash: null,
+        attempts: 0,
+        next_attempt_at: null,
+        paused_at: null,
+      },
+    ];
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+    expect(await screen.findByText("hello later")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Edit scheduled post")).toBeNull(),
+    );
+    expect(calls).not.toContain("POST /api/tan/edit-scheduled");
+  });
+
   it("shows a scheduled poll with its options in the Scheduled tab", async () => {
     scheduled = [
       {

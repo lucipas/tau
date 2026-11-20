@@ -11,6 +11,7 @@ import Avatar from "@/components/chrome/Avatar";
 import { useTauContext } from "@/components/chrome/TauContext";
 import {
   cancelScheduledTanPost,
+  editScheduledTanPost,
   getTanFollowedTags,
 } from "@/lib/api";
 import { formatDateTime, formatDuration, formatRelative, shortHash } from "@/lib/format";
@@ -23,7 +24,7 @@ import {
   type TanFeedMode,
 } from "@/lib/use-tan";
 import PostCard, { type ReactorKind } from "./social/PostCard";
-import TanComposer from "./social/TanComposer";
+import TanComposer, { SCHEDULE_OPTIONS } from "./social/TanComposer";
 
 type LibraryView = "saved" | "hidden" | "pinned" | "scheduled" | "drafts" | "muted";
 type View = "feed" | "discover" | "followers" | LibraryView;
@@ -592,6 +593,10 @@ export default function SocialSection() {
                 await cancelScheduledTanPost(id);
                 await lists.refresh();
               }}
+              onEdit={async (id, opts) => {
+                await editScheduledTanPost(id, opts);
+                await lists.refresh();
+              }}
             />
           )}
           {view === "drafts" && (
@@ -909,10 +914,56 @@ function LibraryList({
 function ScheduledView({
   scheduled,
   onCancel,
+  onEdit,
 }: {
   scheduled: ReturnType<typeof useTanLists>["scheduled"];
   onCancel: (id: string) => Promise<void>;
+  onEdit: (
+    id: string,
+    opts: { text?: string; sendIn?: number },
+  ) => Promise<void>;
 }) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [editSendIn, setEditSendIn] = useState<number | undefined>(undefined);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const startEditing = (s: (typeof scheduled)[number]) => {
+    setEditingId(s.id);
+    setEditText(s.text);
+    setEditSendIn(undefined);
+    setEditError(null);
+  };
+
+  const saveEdit = async (s: (typeof scheduled)[number]) => {
+    const textChanged = editText.trim() !== s.text;
+    const timeChanged = editSendIn !== undefined;
+    if (!textChanged && !timeChanged) {
+      setEditingId(null);
+      return;
+    }
+    if (!editText.trim()) {
+      setEditError("The post text cannot be empty.");
+      return;
+    }
+    setSaving(true);
+    setEditError(null);
+    try {
+      await onEdit(s.id, {
+        ...(textChanged ? { text: editText.trim() } : {}),
+        ...(timeChanged ? { sendIn: editSendIn } : {}),
+      });
+      setEditingId(null);
+    } catch (err) {
+      setEditError(
+        err instanceof Error ? err.message : "Editing the post failed.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div>
       <h2 className="border-b border-zinc-800 px-4 py-3 text-sm font-bold text-zinc-100">
@@ -926,6 +977,65 @@ function ScheduledView({
       )}
       {scheduled.map((s) => (
         <div key={s.id} className="border-b border-zinc-800 px-4 py-3">
+          {editingId === s.id ? (
+            <div>
+              <textarea
+                value={editText}
+                onChange={(e) => setEditText(e.target.value)}
+                aria-label="Edit scheduled post"
+                rows={3}
+                disabled={saving}
+                className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+              />
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-1 text-xs text-zinc-400">
+                  <span aria-hidden="true">🕑</span>
+                  <select
+                    aria-label="Send later"
+                    value={editSendIn === undefined ? "" : String(editSendIn)}
+                    onChange={(e) =>
+                      setEditSendIn(
+                        e.target.value ? Number(e.target.value) : undefined,
+                      )
+                    }
+                    disabled={saving}
+                    className="rounded-md border border-zinc-700 bg-zinc-900 px-1.5 py-1 text-xs text-zinc-200 outline-none"
+                  >
+                    <option value="">Keep current time</option>
+                    {SCHEDULE_OPTIONS.filter((o) => o.seconds !== undefined).map(
+                      (o) => (
+                        <option key={o.label} value={o.seconds}>
+                          {o.label}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void saveEdit(s)}
+                  disabled={saving}
+                  className="rounded-full bg-cyan-500 px-3 py-1 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                >
+                  {saving ? "Saving…" : "Save"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditingId(null)}
+                  disabled={saving}
+                  className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+              {editError && (
+                <p role="alert" className="mt-2 text-xs text-red-400">
+                  {editError}
+                </p>
+              )}
+            </div>
+          ) : (
+            <>
           {s.kind === "repost" && (
             <p className="text-xs font-semibold text-emerald-400">
               Repost · {shortHash(s.target_post ?? "")}
@@ -962,20 +1072,33 @@ function ScheduledView({
             {s.paused_at ? " · paused" : ""}
             {s.attempts > 0 ? ` · ${s.attempts} attempt${s.attempts === 1 ? "" : "s"}` : ""}
           </p>
-          <button
-            type="button"
-            onClick={() => void onCancel(s.id)}
-            className="mt-2 rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
-          >
-            Cancel scheduled{" "}
-            {s.kind === "repost"
-              ? "repost"
-              : s.kind === "quote"
-                ? "quote"
-                : s.kind === "poll"
-                  ? "poll"
-                  : "post"}
-          </button>
+          <div className="mt-2 flex gap-2">
+            {s.kind !== "repost" && (
+              <button
+                type="button"
+                onClick={() => startEditing(s)}
+                className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+              >
+                Edit
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void onCancel(s.id)}
+              className="rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
+            >
+              Cancel scheduled{" "}
+              {s.kind === "repost"
+                ? "repost"
+                : s.kind === "quote"
+                  ? "quote"
+                  : s.kind === "poll"
+                    ? "poll"
+                    : "post"}
+            </button>
+          </div>
+            </>
+          )}
         </div>
       ))}
     </div>

@@ -12,6 +12,7 @@ import {
   closeChannelPoll,
   deleteDraft,
   deleteTanDraft,
+  editScheduledTanPost,
   eventsUrl,
   fetchTanMedia,
   fileUrl,
@@ -357,6 +358,18 @@ describe("POST endpoints", () => {
     await voteTanPoll("posthash", 2);
     expect(captured[0].url).toBe("/api/tan/vote");
     expect(bodyOf(0)).toEqual({ target: "posthash", option: 2 });
+  });
+
+  it("edits a scheduled Tan post's text and time", async () => {
+    nextJson = { ok: true, scheduled: { id: "abc123", text: "edited" } };
+    const edited = await editScheduledTanPost("abc123", {
+      text: "edited",
+      sendIn: 3600,
+    });
+    expect(captured[0].url).toBe("/api/tan/edit-scheduled");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: "abc123", text: "edited", send_in: 3600 });
+    expect(edited).toEqual({ id: "abc123", text: "edited" });
   });
 
   it("schedules a channel message with send_in seconds", async () => {

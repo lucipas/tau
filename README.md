@@ -274,6 +274,8 @@ tau tan post --to alice "direct delivery"
 # Schedule a post for the morning crowd (publishes while serving with --social)
 tau tan post --delay 8h "good morning, mesh"
 tau tan scheduled
+# Fix a typo or move a queued post: at least one of --text / --delay is required
+tau tan edit-scheduled ab12cd34 --text "good morning, mesh!" --delay 2h
 
 # Schedule a repost or a quote the same way (the queue publishes them
 # through the same --social pass; a scheduled repost carries no text)
@@ -443,6 +445,7 @@ Global options may appear before or after the command:
 | `tau tan post --location "LAT,LON [NAME]" TEXT` | Attach a place to a post (signed with it; not with `--delay` or `--reply-to`) |
 | `tau tan scheduled` | List Tan posts, reposts, quotes and polls queued for later publishing |
 | `tau tan cancel-scheduled ID` | Drop a queued Tan post, repost, quote or poll before it publishes |
+| `tau tan edit-scheduled ID [--text TEXT] [--delay DURATION]` | Change a queued post's text and/or publish time |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan poll TEXT --option A --option B` | Ask a question with options (signed poll entry on your chain) |
