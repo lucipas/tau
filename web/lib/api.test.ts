@@ -362,6 +362,25 @@ describe("POST endpoints", () => {
     expect(deleted).toBe(true);
   });
 
+  it("saves and deletes a channel draft", async () => {
+    nextJson = {
+      ok: true,
+      draft: { kind: "channel", target: "general", text: "hi all", updated_at: 100, name: "general" },
+    };
+    const draft = await saveDraft("channel", "general", "hi all");
+    expect(captured[0].url).toBe("/api/drafts");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ kind: "channel", target: "general", text: "hi all" });
+    expect(draft.kind).toBe("channel");
+    expect(draft.name).toBe("general");
+
+    nextJson = { ok: true, deleted: true };
+    const deleted = await deleteDraft("channel", "general");
+    expect(captured[1].url).toBe("/api/drafts/delete");
+    expect(bodyOf(1)).toEqual({ kind: "channel", target: "general" });
+    expect(deleted).toBe(true);
+  });
+
   it("reacts and clears a reaction on the same route", async () => {
     nextJson = { ok: true };
     await reactToMessage("wire9", "👍");
