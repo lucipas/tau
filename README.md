@@ -830,10 +830,17 @@ override a newer one or resurrect a retraction. Reactions render under
 the message in `tau messages` and in the web console, and `POST
 /api/react` sends one from the console's API.
 
-Reactions are delivered live in v1: the peer must be online, because the
-sealed-mail path is text-shaped throughout and cannot carry a reaction
-envelope yet. Queueing reactions for offline peers is a follow-up. A
-reaction whose target this node has never seen is still stored (the target
+Reactions queue for offline peers like messages do: when the peer (or
+a group member) cannot be reached, the reaction is stored in the
+outbox and the mail sweep delivers the same pre-signed bytes when
+they are heard from again, on the same backoff and 7-day TTL as a
+queued message. The local copy is recorded on delivery, not at queue
+time, so your own reaction only ever shows once it has landed, and
+`tau react --no-queue` keeps the old fail-fast behavior. An explicit
+refusal (allow-list, block-list, not-a-member) is final and is never
+queued. Reactions ride direct delivery only: a holder cannot carry
+one, and a queued reaction is never sealed into a bundle. A reaction
+whose target this node has never seen is still stored (the target
 may arrive later over a relay), but it is only rendered under a message the
 inbox actually holds.
 

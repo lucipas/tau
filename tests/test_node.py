@@ -715,6 +715,173 @@ def test_send_group_reaction_rejects_unknown_and_solo_groups(tmp_path):
         node.send_group_reaction(solo, "m-1", "👍")
 
 
+def _reaction_node(tmp_path):
+    """A node with a signing identity, started enough to queue."""
+    import types
+
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    node.identity = identity
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    node.destination = types.SimpleNamespace(hexhash=own_hash)
+    node.reticulum = object()  # started enough to queue
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    return node, peer
+
+
+def test_send_reaction_queues_for_offline_peer(tmp_path, monkeypatch):
+    from tau.protocol import REQUEST_REACT, parse_reaction
+
+    node, peer = _reaction_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_reaction("alice", "m-1", "👍")
+
+    assert response["queued"] is True
+    assert response["id"]
+    assert response["target"] == "m-1"
+    # The local copy is recorded on delivery, not at queue time.
+    assert node.inbox.reactions_for("m-1") == []
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "reaction"
+    assert entry.to == peer.destination_hash
+    assert entry.reaction["target"] == "m-1"
+    assert entry.reaction["token"] == "👍"
+    assert entry.reaction["reaction_id"] == response["id"]
+    # The retry re-sends the identical signed bytes.
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        sent["payload"] = payload
+        assert path == REQUEST_REACT
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(peer, entry, 1.0) is True
+    payload = parse_reaction(sent["payload"])
+    assert payload["target"] == "m-1"
+    assert payload["reaction"] == "👍"
+    assert payload["id"] == response["id"]
+    assert node.mailbox.outbox_list() == []
+    stored = node.inbox.reactions_for("m-1")
+    assert len(stored) == 1
+    assert stored[0]["id"] == response["id"]
+    assert stored[0]["reaction"] == "👍"
+
+
+def test_send_reaction_no_queue_raises_for_offline_peer(tmp_path, monkeypatch):
+    node, _ = _reaction_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    with pytest.raises(NodeError, match="no route to peer"):
+        node.send_reaction("alice", "m-1", "👍", queue=False)
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_reaction_refusal_is_not_queued(tmp_path, monkeypatch):
+    node, _ = _reaction_node(tmp_path)
+
+    def denied(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", denied)
+    with pytest.raises(NotAllowedError):
+        node.send_reaction("alice", "m-1", "👍")
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.reactions_for("m-1") == []
+
+
+def test_send_group_reaction_queues_unreachable_legs(tmp_path, monkeypatch):
+    from tau.protocol import REQUEST_REACT, parse_reaction
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NodeError("no route to peer")
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_reaction("crew", "m-1", "👍")
+
+    assert response["ok"] is False
+    assert response["queued"] == 1
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    assert by_to[bob.hexhash].get("queued") is True
+    assert by_to[bob.hexhash].get("queued_id")
+    # One delivered leg is enough for the local copy, recorded once.
+    assert len(node.inbox.reactions_for("m-1")) == 1
+    # The queued leg is one outbox entry with the group context.
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "reaction"
+    assert entry.group_id == group["id"]
+    assert entry.to == bob.destination_hash
+    assert entry.reaction["reaction_id"] == response["id"]
+    # The sweep delivers it with the same signed bytes, and the local
+    # copy stays exactly one: the second leg does not fan out twice.
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        sent["payload"] = payload
+        assert path == REQUEST_REACT
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(bob, entry, 1.0) is True
+    assert parse_reaction(sent["payload"])["id"] == response["id"]
+    assert node.mailbox.outbox_list() == []
+    assert len(node.inbox.reactions_for("m-1")) == 1
+
+
+def test_deliver_queued_reaction_drops_refused_leg(tmp_path, monkeypatch):
+    node, peer = _reaction_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_reaction("alice", "m-1", "👍")
+    entry = node.mailbox.outbox_list()[0]
+
+    def refused(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", refused)
+    assert node._deliver_entry(peer, entry, 1.0) is False
+    # A refusal is final: the leg is dropped, not held until its TTL.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.reactions_for("m-1") == []
+
+
+def test_queued_reaction_is_never_deposited(tmp_path, monkeypatch):
+    node, peer = _reaction_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_reaction("alice", "m-1", "👍")
+    entry = node.mailbox.outbox_list()[0]
+    # No sealed copy is ever left with a holder for a reaction.
+    assert node._deposit_entry(peer, entry, 1.0) is False
+    assert len(node.mailbox.outbox_list()) == 1
+
+
 def _typing_node(tmp_path):
     """A node with a destination stand-in and a known alice identity."""
     import types

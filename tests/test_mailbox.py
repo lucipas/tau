@@ -138,6 +138,105 @@ def test_enqueue_rejects_invalid_kind(tmp_path):
         box.enqueue(to=BOB, text="hello", kind="has space")
 
 
+def _reaction_payload(**overrides):
+    payload = {
+        "target": "m-1",
+        "token": "👍",
+        "reaction_id": "r-1",
+        "sent_at": 1000.0,
+        "payload_b64": base64.b64encode(b"signed-reaction-bytes").decode("ascii"),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_enqueue_reaction_entry_round_trips(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(
+        to=BOB,
+        text="👍",
+        to_name="bob",
+        now=1000.0,
+        reaction=_reaction_payload(),
+    )
+    assert entry.kind == "reaction"
+    assert entry.reaction["target"] == "m-1"
+    assert entry.reaction["token"] == "👍"
+    assert entry.reaction["reaction_id"] == "r-1"
+    assert entry.reaction["payload_b64"] == _reaction_payload()["payload_b64"]
+
+    reloaded = Mailbox(path)
+    again = reloaded.outbox_list()[0]
+    assert again.kind == "reaction"
+    assert again.reaction == entry.reaction
+
+
+def test_enqueue_reaction_forces_reaction_kind(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB, text="👍", kind="chat", reaction=_reaction_payload()
+    )
+    assert entry.kind == "reaction"
+
+
+def test_enqueue_reaction_rejects_invalid_payload(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError):
+        box.enqueue(to=BOB, text="👍", reaction={"target": "m-1"})
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="👍",
+            reaction=_reaction_payload(payload_b64="!!!not-base64"),
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB, text="👍", reaction=_reaction_payload(target_author="xyz")
+        )
+
+
+def test_enqueue_reaction_rejects_combined_fields(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="👍",
+            reaction=_reaction_payload(),
+            poll_options=["a", "b"],
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="👍",
+            reaction=_reaction_payload(),
+            location={"lat": 1.0, "lon": 2.0},
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="👍",
+            reaction=_reaction_payload(),
+            in_reply_to={"id": "m-0", "excerpt": "00" * 8},
+        )
+
+
+def test_reload_drops_corrupt_reaction_but_keeps_reaction_kind(tmp_path):
+    # A hand-edited or corrupt payload must never turn the entry into
+    # a text message: the kind stays "reaction" so delivery drops it
+    # instead of sending the display text as chat.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="👍", now=1000.0, reaction=_reaction_payload())
+    raw = json.loads(path.read_text())
+    raw["outbox"][0]["reaction"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+
+    entry = Mailbox(path).outbox_list()[0]
+    assert entry.kind == "reaction"
+    assert entry.reaction is None
+
+
 def test_outbox_entry_without_kind_loads_as_chat(tmp_path):
     path = tmp_path / "mailbox.json"
     box = Mailbox(path)
