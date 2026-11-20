@@ -4423,6 +4423,7 @@ def _stub_group_send_file(node, *, fail_for=()):
         discover_timeout=None,
         deadline=None,
         forwarded_from=None,
+        group=None,
     ):
         calls.append(
             (target, name, timeout, discover_timeout, data, deadline, forwarded_from)
