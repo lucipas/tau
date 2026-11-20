@@ -466,6 +466,15 @@ class NotAMemberError(NodeError):
     """
 
 
+class PeerRejectedError(NodeError):
+    """Raised when a peer answers a request with an explicit error code.
+
+    The peer received the request and rejected it (for example an
+    invalid edit or a storage failure), which is not a transport
+    failure: such a rejection must not be queued for retry.
+    """
+
+
 class DeliveryDeferredError(NodeError):
     """A relayed delivery failed transiently and must be retried later.
 
@@ -5946,16 +5955,16 @@ class TauNode:
             response = self._request(
                 peer, REQUEST_DM_EDIT, payload_bytes, timeout, deadline=deadline
             )
-        except (PeerRefusedError, NotAMemberError) as exc:
-            # A refusal is final: the peer will not take this edit, so
-            # stop retrying rather than holding the leg until its TTL.
+        except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
+            # A refusal or rejection is final: the peer will not take
+            # this edit, so stop retrying rather than holding the leg
+            # until its TTL.
             log.warning("Dropping queued edit %s: %s", entry.id, exc)
             self._drop_queued_edit(entry, deadline=deadline)
             if entry.group_id is not None:
-                for sibling in self._queued_edit_siblings(
-                    edit["edit_id"], exclude=entry.id
-                ):
-                    self.mailbox.remove_outbox(sibling.id)
+                self._drop_queued_edit_siblings(
+                    edit["edit_id"], exclude=entry.id, deadline=deadline
+                )
             return False
         except NodeError as exc:
             try:
@@ -10401,18 +10410,29 @@ class TauNode:
                         "rtt": response.get("_rtt"),
                     }
                 )
-            except (NotAllowedError, NotAMemberError) as exc:
-                # The member is online and explicitly refused; an
-                # edit has no outbox to queue into, so the leg
-                # is simply reported as failed.
+            except (
+                NotAllowedError,
+                NotAMemberError,
+                PeerRefusedError,
+                PeerRejectedError,
+            ) as exc:
+                # The member is online and explicitly refused or
+                # rejected the edit; an edit has no outbox to queue
+                # into for that, so the leg is reported as failed.
+                if isinstance(exc, NotAllowedError):
+                    refusal = "not_allowed"
+                elif isinstance(exc, NotAMemberError):
+                    refusal = "not_a_member"
+                elif isinstance(exc, PeerRefusedError):
+                    refusal = "refused"
+                else:
+                    refusal = "rejected"
                 results.append(
                     {
                         "to": member,
                         "to_name": peer.display_name if peer is not None else "",
                         "ok": False,
-                        "error": "not_allowed"
-                        if isinstance(exc, NotAllowedError)
-                        else "not_a_member",
+                        "error": refusal,
                         "id": edit_id,
                     }
                 )
@@ -10422,34 +10442,50 @@ class TauNode:
                     # sweep delivers the same signed edit when the
                     # member is heard from again.  A newer edit
                     # supersedes a still-queued one for this message.
+                    # The new leg goes in first, so a full or failed
+                    # outbox leaves the older queued legs in place.
+                    try:
+                        entry = self.mailbox.enqueue(
+                            to=bytes.fromhex(member),
+                            text=cleaned,
+                            to_name=peer.display_name if peer is not None else "",
+                            group={
+                                "id": group["id"],
+                                "name": group["name"],
+                                "creator": group["creator"],
+                                "members": group["members"],
+                            },
+                            sent_at=float(payload["sent_at"]),
+                            edited_at=float(payload["sent_at"]),
+                            edit={
+                                "target": target_id,
+                                "text": cleaned,
+                                "edit_id": edit_id,
+                                "sent_at": float(payload["sent_at"]),
+                                "target_author": own_hash,
+                                "target_sent_at": float(target_sent_at),
+                                "payload_b64": base64.b64encode(
+                                    payload_bytes
+                                ).decode("ascii"),
+                            },
+                        )
+                    except MailboxError as qexc:
+                        results.append(
+                            {
+                                "to": member,
+                                "to_name": peer.display_name
+                                if peer is not None
+                                else "",
+                                "ok": False,
+                                "error": f"{exc}; could not queue: {qexc}",
+                                "id": edit_id,
+                            }
+                        )
+                        continue
                     self._cancel_queued_edits(
                         target_id,
                         group_id=group["id"],
                         exclude_edit_id=edit_id,
-                    )
-                    entry = self.mailbox.enqueue(
-                        to=bytes.fromhex(member),
-                        text=cleaned,
-                        to_name=peer.display_name if peer is not None else "",
-                        group={
-                            "id": group["id"],
-                            "name": group["name"],
-                            "creator": group["creator"],
-                            "members": group["members"],
-                        },
-                        sent_at=float(payload["sent_at"]),
-                        edited_at=float(payload["sent_at"]),
-                        edit={
-                            "target": target_id,
-                            "text": cleaned,
-                            "edit_id": edit_id,
-                            "sent_at": float(payload["sent_at"]),
-                            "target_author": own_hash,
-                            "target_sent_at": float(target_sent_at),
-                            "payload_b64": base64.b64encode(
-                                payload_bytes
-                            ).decode("ascii"),
-                        },
                     )
                     results.append(
                         {
@@ -10578,9 +10614,10 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             response = self._request(peer, REQUEST_DM_EDIT, payload_bytes, timeout)
-        except PeerRefusedError:
-            # An explicit refusal (allow-list, block-list) is final:
-            # queueing it would deliver to a peer that already said no.
+        except (PeerRefusedError, NotAMemberError, PeerRejectedError):
+            # An explicit refusal (allow-list, block-list, not a member)
+            # or a peer rejection is final: queueing it would deliver
+            # to a peer that already said no.
             raise
         except NodeError:
             if not queue or not self.started:
@@ -10592,27 +10629,30 @@ class TauNode:
             )
             if dest_hash is None or self._is_self(dest_hash):
                 raise
-            # A newer edit supersedes a still-queued one for this
-            # message: the older leg is dropped before the new one
-            # queues, so the sweep never spends a send on text the
-            # editor has already replaced.
+            # The new leg is queued first, so a full or failed outbox
+            # leaves an older queued edit in place.  Once it is in,
+            # the older leg is dropped so the sweep never spends a
+            # send on text the editor has already replaced.
+            try:
+                entry = self.mailbox.enqueue(
+                    to=dest_hash,
+                    text=cleaned,
+                    to_name=peer.display_name if peer is not None else "",
+                    sent_at=float(payload["sent_at"]),
+                    edited_at=float(payload["sent_at"]),
+                    edit={
+                        "target": target_id,
+                        "text": cleaned,
+                        "edit_id": edit_id,
+                        "sent_at": float(payload["sent_at"]),
+                        "payload_b64": base64.b64encode(payload_bytes).decode(
+                            "ascii"
+                        ),
+                    },
+                )
+            except MailboxError as qexc:
+                raise NodeError(f"could not queue edit: {qexc}") from qexc
             self._cancel_queued_edits(target_id, exclude_edit_id=edit_id)
-            entry = self.mailbox.enqueue(
-                to=dest_hash,
-                text=cleaned,
-                to_name=peer.display_name if peer is not None else "",
-                sent_at=float(payload["sent_at"]),
-                edited_at=float(payload["sent_at"]),
-                edit={
-                    "target": target_id,
-                    "text": cleaned,
-                    "edit_id": edit_id,
-                    "sent_at": float(payload["sent_at"]),
-                    "payload_b64": base64.b64encode(payload_bytes).decode(
-                        "ascii"
-                    ),
-                },
-            )
             return {
                 "ok": False,
                 "queued": True,
@@ -11577,7 +11617,7 @@ class TauNode:
                 raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
-            raise NodeError(f"peer rejected the request: {message}")
+            raise PeerRejectedError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
         return decoded
