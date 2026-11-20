@@ -9,6 +9,7 @@ import pytest
 import RNS
 
 from tau import cli
+from tau.blocklist import BlockList, save_blocklist
 from tau.config import TauConfig
 from tau.groups import GroupStore
 from tau.identity import destination_hash
@@ -382,6 +383,20 @@ def test_cli_add_rejects_file_message(tmp_path, capsys):
     assert "no text" in capsys.readouterr().err
 
 
+def test_cli_add_rejects_note(tmp_path, capsys):
+    data_dir, peer_hash = _seed_peer(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    inbox = Inbox(config.inbox_path)
+    note = inbox.add_note(
+        "buy milk", sender_name="owner", destination=peer_hash
+    )
+    assert (
+        _remind_main(data_dir, "add", str(note["id"]), "--in", "1h")
+        == cli._EXIT_ERROR
+    )
+    assert "private note" in capsys.readouterr().err
+
+
 def test_cli_cancel_unknown(tmp_path, capsys):
     data_dir, _peer_hash = _seed_peer(tmp_path)
     assert _remind_main(data_dir, "cancel", "deadbeef") == cli._EXIT_ERROR
@@ -437,8 +452,89 @@ def test_fire_due_marks_unread_and_consumes(tmp_path, caplog):
     assert result["fired"][0]["text"] == "meet at noon?"
     assert result["dropped"] == []
     assert inbox.unread_counts()["total"] == 1
-    assert "Reminder from alice: meet at noon?" in caplog.text
+    assert "Reminder from alice:" in caplog.text
+    assert "meet at noon?" in caplog.text
     assert len(ReminderStore(config.reminders_path)) == 1
+
+
+def test_fire_prints_full_text(tmp_path, caplog, capsys):
+    # The log line carries a truncated preview; the full stored text
+    # goes to stdout, so a multiline or long reminder is not lost.
+    config, message_id, peer_hash = _seed_inbox_message(
+        tmp_path, text="first line\nsecond line\n" + "x" * 200
+    )
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id=message_id,
+        kind="peer",
+        target=peer_hash,
+        text="first line\nsecond line\n" + "x" * 200,
+        sender="alice",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    inbox = Inbox(config.inbox_path)
+    with caplog.at_level("INFO", logger="tau.reminders"):
+        result = fire_due_reminders(config.reminders_path, inbox, now=2000.0)
+    assert len(result["fired"]) == 1
+    assert "Reminder from alice: first line" in caplog.text
+    printed = capsys.readouterr().out
+    assert "Reminder from alice:" in printed
+    assert "first line" in printed
+    assert "second line" in printed
+    assert "x" * 200 in printed
+
+
+def test_cli_add_refuses_sent_message(tmp_path, capsys):
+    # A reminder re-pings by marking a received message unread; a
+    # conversation with nothing received has nothing to light up.
+    data_dir, peer_hash = _seed_peer(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        _record(
+            id="sent-1",
+            text="did you get the file?",
+            destination=peer_hash,
+            direction="out",
+        )
+    )
+    assert (
+        _remind_main(data_dir, "add", "sent-1", "--in", "1h") == cli._EXIT_ERROR
+    )
+    assert "cannot remind on a message you sent" in capsys.readouterr().err
+
+
+def test_fire_drops_unmarkable_reminder(tmp_path):
+    # A reminder set before sent messages were refused (or on a
+    # conversation with no received history) is dropped, not fired:
+    # there is no unread entry to create.
+    data_dir, peer_hash = _seed_peer(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        _record(
+            id="sent-1",
+            text="did you get the file?",
+            destination=peer_hash,
+            direction="out",
+        )
+    )
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id="sent-1",
+        kind="peer",
+        target=peer_hash,
+        text="did you get the file?",
+        sender="you",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    result = fire_due_reminders(config.reminders_path, inbox, now=2000.0)
+    assert result["fired"] == []
+    assert len(result["dropped"]) == 1
+    assert inbox.unread_counts()["total"] == 0
+    assert len(ReminderStore(config.reminders_path)) == 0
 
 
 def test_fire_drops_reminder_for_deleted_message(tmp_path):
@@ -459,6 +555,95 @@ def test_fire_drops_reminder_for_deleted_message(tmp_path):
     assert result["fired"] == []
     assert len(result["dropped"]) == 1
     assert len(ReminderStore(config.reminders_path)) == 0
+
+
+def test_fire_sees_delete_from_another_process(tmp_path):
+    # The serving node's inbox holds a stale in-memory copy; the
+    # firing pass must reload before deciding the message is there.
+    config, message_id, peer_hash = _seed_inbox_message(tmp_path)
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id=message_id,
+        kind="peer",
+        target=peer_hash,
+        text="meet at noon?",
+        sender="alice",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    serving_inbox = Inbox(config.inbox_path)
+    cli_inbox = Inbox(config.inbox_path)
+    cli_inbox.delete(message_id)
+    result = fire_due_reminders(config.reminders_path, serving_inbox, now=2000.0)
+    assert result["fired"] == []
+    assert len(result["dropped"]) == 1
+    assert len(ReminderStore(config.reminders_path)) == 0
+
+
+def test_fire_skips_cancelled_reminder(tmp_path):
+    # A reminder cancelled by another process before the pass runs
+    # is simply absent from the freshly loaded store — it never fires.
+    config, message_id, peer_hash = _seed_inbox_message(tmp_path)
+    store = ReminderStore(config.reminders_path)
+    reminder = store.add(
+        message_id=message_id,
+        kind="peer",
+        target=peer_hash,
+        text="meet at noon?",
+        sender="alice",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    ReminderStore(config.reminders_path).cancel(reminder["id"])
+    inbox = Inbox(config.inbox_path)
+    result = fire_due_reminders(config.reminders_path, inbox, now=2000.0)
+    assert result == {"fired": [], "dropped": []}
+
+
+def test_fire_drops_blocked_sender_reminder(tmp_path, caplog, capsys):
+    # A reminder whose sender is blocked by fire time is dropped
+    # without showing its text anywhere.
+    config, message_id, peer_hash = _seed_inbox_message(tmp_path)
+    store = ReminderStore(config.reminders_path)
+    store.add(
+        message_id=message_id,
+        kind="peer",
+        target=peer_hash,
+        text="meet at noon?",
+        sender="alice",
+        due_at=1500.0,
+        now=1000.0,
+    )
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({peer_hash}))
+    )
+    inbox = Inbox(config.inbox_path)
+    with caplog.at_level("INFO", logger="tau.reminders"):
+        result = fire_due_reminders(
+            config.reminders_path,
+            inbox,
+            blocklist_path=config.blocklist_path,
+            now=2000.0,
+        )
+    assert result["fired"] == []
+    assert len(result["dropped"]) == 1
+    assert "meet at noon?" not in caplog.text
+    assert "meet at noon?" not in capsys.readouterr().out
+    assert len(ReminderStore(config.reminders_path)) == 0
+
+
+def test_list_hides_blocked_sender(tmp_path, capsys):
+    config, message_id, peer_hash = _seed_inbox_message(tmp_path)
+    assert _remind_main(config.data_dir, "add", message_id, "--in", "1h") == 0
+    capsys.readouterr()
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({peer_hash}))
+    )
+    assert _remind_main(config.data_dir, "list") == 0
+    assert "No reminders yet" in capsys.readouterr().out
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset()))
+    assert _remind_main(config.data_dir, "list") == 0
+    assert "meet at noon?" in capsys.readouterr().out
 
 
 def test_fire_group_reminder(tmp_path):
