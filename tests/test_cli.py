@@ -8246,6 +8246,14 @@ def test_parser_forward_arguments():
     assert channel.channel == "general"
     assert channel.message == "abcdef12"
 
+    # --discover-timeout is SUPPRESS: absent unless explicitly given,
+    # so the channel branch can tell a passed value from the default.
+    assert not hasattr(channel, "discover_timeout")
+    explicit = parser.parse_args(
+        ["forward", "--to", "bob", "--discover-timeout", "2", "abcdef12"]
+    )
+    assert explicit.discover_timeout == 2.0
+
     with pytest.raises(SystemExit):
         parser.parse_args(["forward", "abcdef12"])
     with pytest.raises(SystemExit):
@@ -8343,6 +8351,35 @@ def test_forward_to_channel_publishes_attributed_text(
     out = capsys.readouterr().out
     assert "Forwarded from alice:" in out
     assert "original thought" in out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--no-queue"],
+        ["--wait", "30"],
+        ["--discover-timeout", "2"],
+    ],
+)
+def test_forward_to_channel_refuses_peer_only_flags(
+    tmp_path, capsys, argv
+):
+    # Peer/group delivery flags are refused on a channel forward
+    # instead of being silently ignored by the channel-send path.
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            *argv,
+            "aaaa",
+        ]
+    )
+    assert code == 1
+    assert "does not apply to a channel forward" in capsys.readouterr().err
 
 
 def test_forward_to_group_fans_out_attributed_text(

@@ -716,7 +716,11 @@ def build_parser() -> argparse.ArgumentParser:
     forward.add_argument(
         "--discover-timeout",
         type=float,
-        default=10.0,
+        # SUPPRESS, not 10.0: every send path defaults a missing value
+        # to 10s, but `cmd_forward` must be able to tell an explicitly
+        # passed value from the default — a channel forward refuses
+        # the flag instead of silently ignoring it.
+        default=argparse.SUPPRESS,
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
@@ -13818,6 +13822,18 @@ def cmd_forward(args: argparse.Namespace) -> int:
     if getattr(args, "group", None):
         return cmd_group_send(args)
     if getattr(args, "channel", None):
+        # `--no-queue`, `--wait`, and `--discover-timeout` only mean
+        # something for peer/group delivery; the channel-send path
+        # never reads them, so refuse them here instead of silently
+        # ignoring them.
+        if getattr(args, "no_queue", False):
+            raise NodeError("--no-queue does not apply to a channel forward")
+        if getattr(args, "wait", None) is not None:
+            raise NodeError("--wait does not apply to a channel forward")
+        if getattr(args, "discover_timeout", None) is not None:
+            raise NodeError(
+                "--discover-timeout does not apply to a channel forward"
+            )
         # `cmd_channel_send` reads `args.to` as a publish restriction
         # ("publish only to these peers"); the forward's own `--to`
         # is a peer target, unset on this branch by the parser, but
