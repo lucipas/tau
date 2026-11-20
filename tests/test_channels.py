@@ -1451,7 +1451,12 @@ def test_cli_channel_send_with_location(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "sent to #general" in out
     assert "Rock Springs Park" in out
-    assert "openstreetmap.org" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
 
     conn = init_db(data_dir / "channels.sqlite3")
     try:
