@@ -156,6 +156,21 @@ def test_drop_self_peer_purges_registry_and_persists(tmp_path):
     assert reloaded.get(other.destination_hash) is not None
 
 
+def test_send_message_to_self_never_enters_outbox(tmp_path):
+    # The resolve guard raises before delivery, but send_message's
+    # NodeError fallback re-derives the target hash and queues the
+    # send — a self-targeted send must be rejected there too, never
+    # queued for store-and-forward to our own hash (Qodo Fixer, #623).
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    node.reticulum = SimpleNamespace()  # started, so the queue fallback is live
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.send_message(own_hash.hex(), "hello self")
+    assert node.mailbox.outbox_list() == []
+    assert node.registry.get(own_hash) is None
+
+
 def test_info_requires_start(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(NodeError):
