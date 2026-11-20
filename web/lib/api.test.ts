@@ -759,31 +759,27 @@ describe("forwardMessage", () => {
     expect(result).toEqual({ ok: true, message: {}, response: {} });
   });
 
-  it("rejects when the attribution went out but the file leg failed", async () => {
-    // The bridge reports a partial file forward as HTTP 200 with
+  it("rejects when the file leg failed", async () => {
+    // The bridge reports a failed file forward as HTTP 200 with
     // ok: false and file_error: the picker must show the failure
     // instead of closing on a success flag.
     nextJson = {
       ok: false,
-      message: {},
-      response: {},
       file_error: "no path to alice",
     };
     await expect(forwardMessage(1, { to: "alice" })).rejects.toThrow(
-      "the message was forwarded but the file did not send: no path to alice",
+      "the file could not be forwarded: no path to alice",
     );
   });
 
   it("rejects when a group file forward missed some members", async () => {
     nextJson = {
       ok: false,
-      messages: [],
-      response: { ok: true },
       file_messages: [],
       file_response: { ok: false, results: [] },
     };
     await expect(forwardMessage(1, { group: "crew" })).rejects.toThrow(
-      "the message was forwarded but the file did not reach all members",
+      "the file did not reach all members",
     );
   });
 });

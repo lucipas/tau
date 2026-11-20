@@ -648,6 +648,49 @@ def test_pin_file_record(tmp_path):
     assert [item["id"] for item in inbox.list_messages(pinned_only=True)] == ["f1"]
 
 
+def test_file_record_keeps_forwarded_from(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "notes.txt",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "notes.txt",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+            "forwarded_from": {"hash": "cd" * 16, "name": "carol"},
+        }
+    )
+    assert inbox.list_messages()[0]["forwarded_from"] == {
+        "hash": "cd" * 16,
+        "name": "carol",
+    }
+
+
+def test_file_record_drops_malformed_forwarded_from(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "notes.txt",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "notes.txt",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+            "forwarded_from": {"hash": "not-a-hash", "name": "carol"},
+        }
+    )
+    assert "forwarded_from" not in inbox.list_messages()[0]
+
+
 def test_export_import_preserves_pin(tmp_path):
     source = Inbox(tmp_path / "source.json")
     source.append(_record(id="one", text="first"))

@@ -2042,6 +2042,38 @@ def sanitize_file_name(name: Any) -> str:
     return cleaned[:MAX_FILE_NAME_LENGTH]
 
 
+def _clean_forwarded_from(value: Any) -> Dict[str, str]:
+    """Normalise a ``forwarded_from`` attribution, or raise.
+
+    The attribution names the file's original sender: a destination
+    hash plus the display name the forwarder knew them by.  A
+    malformed attribution is a malformed offer — reject it outright
+    instead of storing a half-usable claim.
+    """
+    if not isinstance(value, dict):
+        raise ProtocolError("forwarded_from must be an object")
+    name = value.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ProtocolError("forwarded_from must name its sender")
+    return {
+        "hash": _clean_hexhash(value.get("hash"), "forwarded_from.hash"),
+        "name": sanitize_name(name),
+    }
+
+
+def clean_forwarded_from_or_none(value: Any) -> Optional[Dict[str, str]]:
+    """Normalise a stored ``forwarded_from`` attribution, or ``None``.
+
+    The lenient twin of :func:`_clean_forwarded_from`, for records
+    read back from disk: a hand-edited or half-written attribution
+    is dropped instead of failing the whole record.
+    """
+    try:
+        return _clean_forwarded_from(value)
+    except ProtocolError:
+        return None
+
+
 def build_file_offer(
     sender_identity: Any,
     *,
@@ -2051,6 +2083,7 @@ def build_file_offer(
     size: int,
     sha256: str,
     sent_at: Optional[float] = None,
+    forwarded_from: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a signed file offer for the ``/tau/file`` request.
 
@@ -2064,6 +2097,16 @@ def build_file_offer(
     itself follows as an RNS Resource whose metadata is the transfer
     id, and the receiver re-checks the hash once the bytes are
     assembled.
+
+    ``forwarded_from`` names the file's original sender when this
+    transfer is a forward (``{"hash": <destination hash>, "name":
+    <display name>}``): it rides inside the signed payload, so the
+    attribution travels with the file instead of as a separate text
+    leg that can arrive out of order or not at all.  It is the
+    forwarder's claim, not proof of origin — the signature proves the
+    forwarder said so, the same trust as the old ``Forwarded from``
+    text prefix.  Peers that predate this field ignore it; the file
+    itself still arrives fine.
     """
     clean_name = sanitize_file_name(name)
     if not clean_name:
@@ -2093,6 +2136,8 @@ def build_file_offer(
         "from": sender_hash,
         "from_key": sender_identity.get_public_key().hex(),
     }
+    if forwarded_from is not None:
+        payload["forwarded_from"] = _clean_forwarded_from(forwarded_from)
     signature = sender_identity.sign(encode(payload))
     if signature is None:  # pragma: no cover - identity without private keys
         raise ProtocolError("sender identity cannot sign")
@@ -2186,7 +2231,7 @@ def parse_file_offer(
         raise ProtocolError(f"could not verify file offer: {exc}") from exc
     if not verified:
         raise ProtocolError("file offer signature does not verify")
-    return {
+    result: Dict[str, Any] = {
         "id": transfer_id,
         "to": to,
         "name": name,
@@ -2195,6 +2240,14 @@ def parse_file_offer(
         "sent_at": sent_at,
         "from": claimed_from.lower(),
     }
+    if payload.get("forwarded_from") is not None:
+        # Inside the signed payload, so a tampered attribution fails
+        # the signature check above; a malformed one is still a
+        # malformed offer.  Absent on offers from older peers.
+        result["forwarded_from"] = _clean_forwarded_from(
+            payload.get("forwarded_from")
+        )
+    return result
 
 
 def _clean_hexhash(value: Any, field: str) -> str:

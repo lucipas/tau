@@ -57,6 +57,7 @@ def make_offer(
     name="notes.txt",
     data=b"hello file",
     transfer_id="a" * 32,
+    forwarded_from=None,
 ):
     return build_file_offer(
         identity,
@@ -65,6 +66,7 @@ def make_offer(
         name=name,
         size=len(data),
         sha256=hashlib.sha256(data).hexdigest(),
+        forwarded_from=forwarded_from,
     )
 
 
@@ -283,6 +285,63 @@ def test_file_offer_rejects_bad_hash():
         )
 
 
+def test_file_offer_roundtrip_carries_forwarded_from():
+    identity = sender_identity()
+    original = sender_identity()
+    raw = make_offer(
+        identity,
+        forwarded_from={"hash": sender_hash(original), "name": "carol"},
+    )
+    parsed = parse_file_offer(
+        raw, remote_identity=identity, expected_recipient=RECIPIENT_HASH
+    )
+    assert parsed["forwarded_from"] == {
+        "hash": sender_hash(original),
+        "name": "carol",
+    }
+
+
+def test_file_offer_omits_forwarded_from_when_absent():
+    identity = sender_identity()
+    raw = make_offer(identity)
+    parsed = parse_file_offer(raw, remote_identity=identity)
+    assert "forwarded_from" not in parsed
+
+
+def test_file_offer_rejects_malformed_forwarded_from():
+    identity = sender_identity()
+    for bad in (
+        {"hash": "not-a-hash", "name": "carol"},
+        {"hash": "a" * 32, "name": "   "},
+        {"hash": "a" * 32},
+        "carol",
+    ):
+        with pytest.raises(ProtocolError, match="forwarded_from"):
+            build_file_offer(
+                identity,
+                transfer_id="b" * 32,
+                to=RECIPIENT_HASH,
+                name="ok.txt",
+                size=4,
+                sha256="0" * 64,
+                forwarded_from=bad,
+            )
+
+
+def test_file_offer_parse_rejects_tampered_forwarded_from():
+    identity = sender_identity()
+    raw = bytearray(
+        make_offer(
+            identity, forwarded_from={"hash": "a" * 32, "name": "carol"}
+        )
+    )
+    payload = json.loads(bytes(raw))
+    payload["forwarded_from"]["name"] = "mallory"
+    tampered = json.dumps(payload).encode()
+    with pytest.raises(ProtocolError, match="signature does not verify"):
+        parse_file_offer(tampered, remote_identity=identity)
+
+
 def test_announce_advertises_the_file_capability():
     from tau.protocol import build_announce, parse_announce
 
@@ -470,6 +529,43 @@ def test_resource_concluded_saves_verified_file_and_records_it(tmp_path):
     assert entries[0]["kind"] == "file"
     assert entries[0]["sha256"] == hashlib.sha256(b"hello file").hexdigest()
     assert "a" * 32 not in node._pending_file_offers
+
+
+def test_resource_concluded_records_forwarded_from(tmp_path):
+    received = []
+    node = make_node(tmp_path)
+    node.on_file = received.append
+    set_node_setting(tmp_path, "accept_files", True)
+    identity = sender_identity()
+    original = sender_identity()
+    handle_offer(
+        node,
+        identity,
+        make_offer(
+            identity,
+            data=b"hello file",
+            forwarded_from={"hash": sender_hash(original), "name": "carol"},
+        ),
+    )
+
+    resource = SimpleNamespace(
+        status=RNS.Resource.COMPLETE,
+        metadata="a" * 32,
+        data=b"hello file",
+    )
+    node._on_resource_concluded(resource, sender_link(identity))
+
+    assert len(received) == 1
+    assert received[0]["forwarded_from"] == {
+        "hash": sender_hash(original),
+        "name": "carol",
+    }
+    entries = node.inbox.list_messages()
+    assert len(entries) == 1
+    assert entries[0]["forwarded_from"] == {
+        "hash": sender_hash(original),
+        "name": "carol",
+    }
 
 
 def test_resource_concluded_reads_file_backed_data(tmp_path):

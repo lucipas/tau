@@ -482,8 +482,11 @@ def _stub_broadcast_send_file(node, *, fail_for=()):
         timeout=300.0,
         discover_timeout=None,
         deadline=None,
+        forwarded_from=None,
     ):
-        calls.append((target, name, timeout, discover_timeout, data, deadline))
+        calls.append(
+            (target, name, timeout, discover_timeout, data, deadline, forwarded_from)
+        )
         member = target if isinstance(target, str) else target.hexhash
         if member in fail_for:
             raise NodeError("unreachable")

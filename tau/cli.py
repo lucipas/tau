@@ -270,6 +270,7 @@ from .protocol import (
     PROTOCOL_VERSION,
     ProtocolError,
     clean_beacon,
+    clean_forwarded_from_or_none,
     clean_in_reply_to,
     clean_location,
     clean_reaction,
@@ -5507,6 +5508,14 @@ def _node_callbacks(args: argparse.Namespace):
                 f"{record.get('name')} ({record.get('size')} bytes)",
                 flush=True,
             )
+            forwarded_from = clean_forwarded_from_or_none(
+                record.get("forwarded_from")
+            )
+            if forwarded_from is not None:
+                print(
+                    f"  forwarded from {forwarded_from['name']}",
+                    flush=True,
+                )
             print(f"  saved to {record.get('path')}", flush=True)
 
     return on_peer, on_message, on_file
@@ -11120,6 +11129,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         "name": record.get("name"),
                         "size": record.get("size"),
                         "sha256": record.get("sha256"),
+                        **(
+                            {"forwarded_from": record["forwarded_from"]}
+                            if isinstance(record.get("forwarded_from"), dict)
+                            else {}
+                        ),
                     },
                 }
             )
@@ -14124,10 +14138,11 @@ def cmd_forward(args: argparse.Namespace) -> int:
     it carries no expiry, kind, or reply chain from the original.
     """
     config = _make_config(args)
-    # `--timeout` defaults to None: the text legs use the send
-    # default (20s) while a file leg uses the send-file default
+    # `--timeout` defaults to None: a text forward uses the send
+    # default (20s) while a file forward uses the send-file default
     # (300s) — a file transfer outlasts a text send.  An explicit
-    # --timeout applies to both legs.
+    # --timeout applies to both legs of a text forward, and to the
+    # file leg of a file forward.
     file_timeout = getattr(args, "timeout", None)
     if file_timeout is None:
         args.timeout = 20.0
@@ -14184,9 +14199,23 @@ def cmd_forward(args: argparse.Namespace) -> int:
             label = peer.display_name
     if record.get("kind") == "file":
         # A file record carries no text: forward the stored bytes
-        # instead, with the file name as the attributed line.
+        # instead, with the original sender named in the file offer
+        # itself.  A record that arrived already forwarded keeps its
+        # original sender; otherwise the sender of this record is
+        # the original.
+        forwarded_from = clean_forwarded_from_or_none(
+            record.get("forwarded_from")
+        )
+        if forwarded_from is None:
+            sender_hash = record.get("destination")
+            if isinstance(sender_hash, str) and sender_hash:
+                forwarded_from = {"hash": sender_hash, "name": label}
         return _forward_file(
-            args, config, record, label, file_timeout=file_timeout
+            args,
+            config,
+            record,
+            file_timeout=file_timeout,
+            forwarded_from=forwarded_from,
         )
     if not text:
         raise NodeError("cannot forward a message with no text to send")
@@ -14235,34 +14264,29 @@ def _forward_file(
     args: argparse.Namespace,
     config: Any,
     record: Dict[str, Any],
-    label: str,
     *,
     file_timeout: float = 300.0,
+    forwarded_from: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Forward a stored received file to a peer or into a group.
 
-    The recipient first gets the usual attribution as a text DM —
-    ``Forwarded from <name>:`` naming the file — then the file itself
-    as a fresh one-to-one transfer, reusing the send-file paths.  The
-    stored bytes are verified against the record before anything is
-    sent, so a missing or altered file fails cleanly up front.  A file
-    leg that fails does not roll back attribution text already sent,
-    and a failed leg is reported per recipient, like
-    ``tau group send-file``.  Scheduling is not supported in v1: a
-    delayed file forward would need the attribution text scheduled
-    alongside the staged bytes.
+    The file itself carries the attribution: the offer names the
+    original sender in ``forwarded_from``, so the recipient's file
+    record shows who sent it first — no separate text leg that could
+    arrive out of order or not at all.  The stored bytes are verified
+    against the record before anything is sent, so a missing or
+    altered file fails cleanly up front.  A failed leg is reported
+    per recipient, like ``tau group send-file``.  Scheduling is not
+    supported in v1: a delayed file forward would need the staged
+    bytes scheduled alongside the offer.
 
-    Both legs run on ONE node when no node is serving: the text leg
-    and the file leg share the process's single Reticulum instance —
-    starting a second node after the first stopped fails, because
-    Reticulum cannot be reinitialised in the same process.  When a
-    node is serving, the text leg goes through it on its socket and
-    the file leg starts the first local node, like ``tau send-file``.
-    The verified bytes are staged once under their own name and the
-    file legs send from there, never from the mutable stored path, so
-    a change to the stored file between verification and delivery
-    cannot swap in different bytes.  ``--json`` emits ONE combined
-    document with the text and file results, not one per leg.
+    The file leg starts the first local node, like ``tau send-file``:
+    with no text leg left, there is nothing to route through a
+    serving node.  The verified bytes are staged once under their own
+    name and the file legs send from there, never from the mutable
+    stored path, so a change to the stored file between verification
+    and delivery cannot swap in different bytes.  ``--json`` emits
+    the file result document.
 
     A file forward only targets a peer or a group: the broadcast and
     channel targets take their text through the broadcast / channel
@@ -14284,22 +14308,25 @@ def _forward_file(
             file=sys.stderr,
         )
         return 2
-    # Validate --wait the same way `cmd_send` does, before sending.
-    wait = float(getattr(args, "wait", None) or 0.0)
-    if not math.isfinite(wait):
-        print("error: --wait must be a finite number of seconds", file=sys.stderr)
+    if getattr(args, "wait", None) is not None:
+        # --wait bounded the old attribution text leg; a file leg is
+        # a direct transfer with no queue to wait on, so there is
+        # nothing left for it to apply to.
+        print(
+            "error: --wait cannot be used when forwarding a file",
+            file=sys.stderr,
+        )
         return 2
-    if wait < 0:
-        print("error: --wait must not be negative", file=sys.stderr)
-        return 2
-    if getattr(args, "wait", None) is not None and getattr(args, "no_queue", False):
-        print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
+    if forwarded_from is None:
+        print(
+            "error: cannot forward a file: the sender is unknown",
+            file=sys.stderr,
+        )
         return 2
     _path, data = resolve_received_file(record, config.files_dir)
     name = str(record["name"])
     size = len(data)
     digest = hashlib.sha256(data).hexdigest()
-    forwarded = f"Forwarded from {label}:\n{name}"
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
     targets = args.to if isinstance(args.to, list) else [args.to]
     # Stage the verified bytes once: the file legs send from here,
@@ -14315,10 +14342,9 @@ def _forward_file(
                 name,
                 size,
                 digest,
-                forwarded,
+                forwarded_from,
                 file_timeout=file_timeout,
                 discover_timeout=discover_timeout,
-                wait=wait,
             )
         return _forward_file_to_peers(
             args,
@@ -14327,11 +14353,69 @@ def _forward_file(
             name,
             size,
             digest,
-            forwarded,
+            forwarded_from,
             targets,
             file_timeout=file_timeout,
             discover_timeout=discover_timeout,
-            wait=wait,
+        )
+
+
+def _record_forwarded_file(
+    node: Any,
+    *,
+    name: str,
+    size: int,
+    forwarded_from: Dict[str, Any],
+    results: List[Dict[str, Any]],
+    group: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Leave a local trace of a file forward in the forwarder's history.
+
+    A file leg stores nothing locally, so without this a CLI file
+    forward vanishes from ``tau messages``: the old attribution text
+    leg used to leave the trace.  The record is local only — nothing
+    is sent — and mirrors how text sends record: one record per
+    delivered peer leg, one record for a whole group fan-out.
+    """
+    delivered = [r for r in results if r.get("delivered")]
+    if not delivered:
+        return
+    origin = forwarded_from["name"]
+    text = f"Forwarded {name} ({size} bytes) — originally from {origin}"
+    if group is not None:
+        node._record_sent(
+            {
+                "from": node.name,
+                "destination": "",
+                "text": text,
+                "kind": "group",
+                "group": group["id"],
+                "group_name": group["name"],
+                "sent_at": time.time(),
+                "received_at": time.time(),
+                "id": delivered[0].get("id"),
+                "leg_ids": [
+                    r.get("id") for r in delivered if isinstance(r.get("id"), str)
+                ],
+                "direction": "out",
+            }
+        )
+        return
+    for result in delivered:
+        destination = result.get("to")
+        if not isinstance(destination, str) or not destination:
+            continue
+        node._record_sent(
+            {
+                "from": node.name,
+                "destination": destination,
+                "text": text,
+                "kind": "chat",
+                "sent_at": time.time(),
+                "received_at": time.time(),
+                "id": result.get("id"),
+                "direction": "out",
+            }
         )
 
 
@@ -14342,53 +14426,38 @@ def _forward_file_to_peers(
     name: str,
     size: int,
     digest: str,
-    forwarded: str,
+    forwarded_from: Dict[str, Any],
     targets: List[str],
     *,
     file_timeout: float,
     discover_timeout: float,
-    wait: float,
 ) -> int:
-    """Forward a stored file to peers: attribution text, then the file.
+    """Forward a stored file to peers: one file leg each.
 
-    Both legs share one node when no node is serving (see
-    :func:`_forward_file`); when one is serving, the text leg goes
-    through it and the file leg starts the first local node.
+    The file leg starts the first local node in the process, like
+    ``tau send-file`` — there is no text leg left to route through a
+    serving node.  Each leg carries the original sender in its offer.
     """
-    reply_ids: Dict[str, str] = {}
-    if _send_routes_via_running_node(config):
-        log.info("forwarding via the running node")
-        text_results = _send_via_running_node(
-            args, config, forwarded, targets, None, reply_ids, wait=wait
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        file_results = _forward_file_send_peers(
+            node,
+            targets,
+            staged,
+            file_timeout,
+            discover_timeout,
+            forwarded_from=forwarded_from,
         )
-        node = TauNode(config, name=config.name)
-        node.start()
-        try:
-            file_results = _forward_file_send_peers(
-                node, targets, staged, file_timeout, discover_timeout
-            )
-        finally:
-            node.stop()
-    else:
-        log.info("forwarding via a local one-shot node")
-        node = TauNode(config, name=config.name)
-        node.start()
-        try:
-            text_results = _send_via_local_node(
-                args,
-                config,
-                forwarded,
-                targets,
-                None,
-                reply_ids,
-                wait=wait,
-                node=node,
-            )
-            file_results = _forward_file_send_peers(
-                node, targets, staged, file_timeout, discover_timeout
-            )
-        finally:
-            node.stop()
+        _record_forwarded_file(
+            node,
+            name=name,
+            size=size,
+            forwarded_from=forwarded_from,
+            results=file_results,
+        )
+    finally:
+        node.stop()
     file_payload = {
         "name": name,
         "size": size,
@@ -14399,14 +14468,8 @@ def _forward_file_to_peers(
         result for result in file_results if not result.get("delivered")
     ]
     if _json_mode(args):
-        _emit({"text": _send_results_json(text_results), "file": file_payload}, True)
-        text_failed = any(
-            not r.get("ok", True)
-            or (r.get("waited") is not None and r.get("delivered") is False)
-            for r in text_results
-        )
-        return _EXIT_ERROR if (text_failed or failed_files) else _EXIT_OK
-    text_rc = _report_send_results(args, text_results, reply_ids, None)
+        _emit({"file": file_payload}, True)
+        return _EXIT_ERROR if failed_files else _EXIT_OK
     for result in file_results:
         if result.get("delivered"):
             print(
@@ -14418,7 +14481,7 @@ def _forward_file_to_peers(
                 f"failed to forward {name} to {result['target']}: "
                 f"{result.get('error') or 'unknown error'}"
             )
-    return _EXIT_ERROR if (text_rc != _EXIT_OK or failed_files) else _EXIT_OK
+    return _EXIT_ERROR if failed_files else _EXIT_OK
 
 
 def _forward_file_send_peers(
@@ -14427,6 +14490,8 @@ def _forward_file_send_peers(
     staged: Path,
     file_timeout: float,
     discover_timeout: float,
+    *,
+    forwarded_from: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Send the staged file to each peer, reporting per-recipient results."""
     results: List[Dict[str, Any]] = []
@@ -14437,6 +14502,7 @@ def _forward_file_send_peers(
                 staged,
                 timeout=file_timeout,
                 discover_timeout=discover_timeout,
+                forwarded_from=forwarded_from,
             )
         except (NodeError, PeerError, ValueError, OSError) as exc:
             results.append({"target": target, "ok": False, "error": str(exc)})
@@ -14452,83 +14518,50 @@ def _forward_file_to_group(
     name: str,
     size: int,
     digest: str,
-    forwarded: str,
+    forwarded_from: Dict[str, Any],
     *,
     file_timeout: float,
     discover_timeout: float,
-    wait: float,
 ) -> int:
-    """Forward a stored file into a group: attribution text, then the file.
+    """Forward a stored file into a group: one file leg per member.
 
-    Both legs share one node when no node is serving (see
-    :func:`_forward_file`); when one is serving, the text leg goes
-    through it and the file leg starts the first local node.
+    The file leg starts the first local node in the process, like
+    ``tau send-file`` — there is no text leg left to route through a
+    serving node.  Each leg carries the original sender in its offer.
     """
-    if _send_routes_via_running_node(config):
-        log.info("forwarding via the running node")
-        text_response = _send_group_via_running_node(
-            args,
-            config,
-            forwarded,
-            expires_at=None,
-            send_after=None,
-            wait=wait,
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        group = node.groups.find(args.group)
+        file_response = node.send_group_file(
+            group,
+            staged,
+            timeout=file_timeout,
+            discover_timeout=discover_timeout,
+            forwarded_from=forwarded_from,
         )
-        node = TauNode(config, name=config.name)
-        node.start()
-        try:
-            group = node.groups.find(args.group)
-            file_response = node.send_group_file(
-                group,
-                staged,
-                timeout=file_timeout,
-                discover_timeout=discover_timeout,
-            )
-        finally:
-            node.stop()
-    else:
-        log.info("forwarding via a local one-shot node")
-        delivered_ids: Set[str] = set()
-        node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
-        node.start()
-        try:
-            text_response = _send_group_via_local_node(
-                args,
-                config,
-                forwarded,
-                expires_at=None,
-                send_after=None,
-                wait=wait,
-                node=node,
-                delivered_ids=delivered_ids,
-            )
-            group = node.groups.find(args.group)
-            file_response = node.send_group_file(
-                group,
-                staged,
-                timeout=file_timeout,
-                discover_timeout=discover_timeout,
-            )
-        finally:
-            node.stop()
+        _record_forwarded_file(
+            node,
+            name=name,
+            size=size,
+            forwarded_from=forwarded_from,
+            results=file_response.get("results") or [],
+            group=group,
+        )
+    finally:
+        node.stop()
     failed_legs = [
         result for result in file_response["results"] if not result.get("delivered")
     ]
     if _json_mode(args):
-        _emit({"text": text_response, "file": file_response}, True)
-        text_failed = any(
-            (not r.get("delivered") and not r.get("queued"))
-            or (r.get("waited") is not None and r.get("delivered") is False)
-            for r in text_response["results"]
-        )
-        return _EXIT_ERROR if (text_failed or failed_legs) else _EXIT_OK
-    text_rc = _report_group_send_results(args, text_response, None, None)
+        _emit({"file": file_response}, True)
+        return _EXIT_ERROR if failed_legs else _EXIT_OK
     if not file_response["results"]:
         print(
             f"group {file_response['name']} has no other members"
             " — nothing to send to."
         )
-        return text_rc
+        return _EXIT_OK
     for result in file_response["results"]:
         member_name = result.get("to_name") or result["to"][:8]
         if result.get("delivered"):
@@ -14541,7 +14574,8 @@ def _forward_file_to_group(
                 f"failed to forward {name} to {member_name}: "
                 f"{result.get('error') or 'unknown error'}"
             )
-    return _EXIT_ERROR if (text_rc != _EXIT_OK or failed_legs) else _EXIT_OK
+    return _EXIT_ERROR if failed_legs else _EXIT_OK
+
 
 def _queue_file_for_later(
     config: Any,
@@ -15502,6 +15536,11 @@ def _print_message_entry(
     edited_suffix = " (edited)" if entry.get("edited_at") else ""
     print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}{edited_suffix}")
     if entry.get("kind") == "file":
+        forwarded_from = clean_forwarded_from_or_none(
+            entry.get("forwarded_from")
+        )
+        if forwarded_from is not None:
+            print(f"  forwarded from {forwarded_from['name']}")
         print(
             f"  file: {entry.get('name')} "
             f"({entry.get('size')} bytes, "

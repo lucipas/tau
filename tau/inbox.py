@@ -45,6 +45,7 @@ from .protocol import (
     _clean_group_poll_options_or_none,
     _clean_group_poll_target_or_none,
     _clean_group_poll_vote_or_none,
+    clean_forwarded_from_or_none,
     clean_in_reply_to,
     clean_beacon,
     clean_location,
@@ -594,6 +595,9 @@ def _valid_file_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "direction": "in",
         "seq": seq,
     }
+    forwarded_from = clean_forwarded_from_or_none(raw.get("forwarded_from"))
+    if forwarded_from is not None:
+        record["forwarded_from"] = forwarded_from
     if raw.get("pinned"):
         record["pinned"] = True
     return record
