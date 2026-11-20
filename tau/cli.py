@@ -20896,7 +20896,10 @@ def _edit_group_message(
             {
                 "target": target["id"],
                 "group": group_id,
-                "ok": bool(response.get("ok")),
+                # Success matches the exit status: queued legs are
+                # accepted for delivery, so they do not fail the edit.
+                "ok": not failed and not response.get("local_errors"),
+                "queued": sum(1 for r in results if r.get("queued")),
                 "cancelled_queued": response.get("cancelled_queued") or [],
                 "results": results,
                 "id": response.get("id"),
