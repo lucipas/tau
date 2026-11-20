@@ -254,6 +254,29 @@ def _remaining(deadline: Optional[float]) -> Optional[float]:
     return max(0.0, deadline - time.monotonic())
 
 
+def _group_announcements_blocks_post(
+    group: Dict[str, Any],
+    own_hash: str,
+    *,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when *own_hash* may not post to *group* right now.
+
+    An announcements-only group admits posts only from its creator.
+    Poll votes and poll closes are not posts — members keep voting —
+    and reactions, retracts and edits travel on separate request
+    types, so they are unaffected.  A group with no recorded setting
+    reads as open.
+    """
+    return bool(
+        group.get("announcements_only")
+        and (group.get("creator") or "").lower() != (own_hash or "").lower()
+        and poll_vote is None
+        and poll_close is None
+    )
+
+
 def _read_file_payload(path: Union[str, Path]) -> Tuple[bytes, str, str]:
     """Read and validate a file for sending; returns ``(data, name, sha256)``.
 
@@ -2916,6 +2939,7 @@ class TauNode:
         *,
         sent_at: Optional[float] = None,
         topic_sent_at: Optional[float] = None,
+        announcements_sent_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -2957,6 +2981,8 @@ class TauNode:
             sent_at=sent_at,
             topic=group.get("topic"),
             topic_sent_at=topic_sent_at,
+            announcements_only=group.get("announcements_only"),
+            announcements_sent_at=announcements_sent_at,
             renamed_from=group.get("renamed_from"),
         )
 
@@ -3042,10 +3068,12 @@ class TauNode:
                 "creator": message["creator"],
                 "members": message["members"],
                 "topic": message.get("group_topic"),
+                "announcements_only": message.get("group_announcements_only"),
                 "renamed_from": message.get("renamed_from") or [],
             },
             sent_at=message.get("sent_at"),
             topic_sent_at=message.get("group_topic_sent_at"),
+            announcements_sent_at=message.get("group_announcements_sent_at"),
         )
         if group is None:
             log.info(
@@ -3056,6 +3084,28 @@ class TauNode:
             )
             return response_error(
                 "not_a_member", "sender or recipient is not a group member"
+            )
+        if (
+            group.get("announcements_only")
+            and caller_hash.lower() != (group.get("creator") or "").lower()
+            and message.get("poll_vote") is None
+            and message.get("poll_close") is None
+        ):
+            # Announcements-only is enforced on receipt as well as on
+            # send: a member's post must not land even from a client
+            # that never learned the setting (or chose to ignore it).
+            # Votes and poll closes are not posts — members keep
+            # voting — and reactions, retracts and edits travel on
+            # separate request types, so they are unaffected.
+            log.info(
+                "Group message from %s dropped: group %s is "
+                "announcements-only and the sender is not its creator",
+                caller_hash or "anonymous",
+                message["group"],
+            )
+            return response_error(
+                "not_allowed",
+                "group is announcements-only: only the creator can post",
             )
 
         # Store-and-forward retries and relay copies can deliver the same
@@ -5446,6 +5496,35 @@ class TauNode:
             float(topic_at) if isinstance(topic_at, (int, float)) else None,
         )
 
+    def _current_group_announcements(
+        self, group_id: Optional[str]
+    ) -> Optional[Tuple[bool, Optional[float]]]:
+        """The announcements setting a queued group message should carry,
+        with the time it was set (``None`` when unknown).
+
+        Read from the store at delivery time, so a setting changed
+        after queueing travels with the retry.  Returns ``None`` when
+        the group is gone or the store cannot be read: the retry then
+        carries no setting, and the recipient keeps its own, rather
+        than treating it as a lift.
+        """
+        if not group_id:
+            return None
+        try:
+            # find() reloads from disk, so a setting changed by
+            # another process (``tau group announcements`` while
+            # serving) is seen.
+            group = self.groups.find(group_id)
+        except (ValueError, OSError):  # unknown group, or unreadable store
+            return None
+        if group is None:
+            return None
+        ann_at = group.get("announcements_sent_at")
+        return (
+            bool(group.get("announcements_only", False)),
+            float(ann_at) if isinstance(ann_at, (int, float)) else None,
+        )
+
     def _deliver_entry(
         self,
         peer: Peer,
@@ -5516,11 +5595,37 @@ class TauNode:
             # the recipient keeps its own rather than being cleared.
             current = self._current_group_topic(fresh.group_id)
             topic, topic_at = current if current is not None else (None, None)
+            # Re-read the announcements setting at retry time, like the
+            # topic: a setting changed after queueing travels with the
+            # retry.  A queued member post is not delivered once the
+            # group has gone announcements-only — it stays queued until
+            # its TTL, like any undeliverable leg.  Votes and poll
+            # closes are not posts, so they still go out.
+            announcements = self._current_group_announcements(fresh.group_id)
+            ann_only, ann_at = (
+                announcements if announcements is not None else (None, None)
+            )
+            if (
+                ann_only
+                and self.destination_hexhash.lower()
+                != (fresh.group_creator or "").lower()
+                and fresh.poll_vote is None
+                and fresh.poll_close is None
+            ):
+                log.info(
+                    "Skipping queued group message %s: group %s is "
+                    "announcements-only and this node is not its creator",
+                    entry.id,
+                    fresh.group_id,
+                )
+                return False
             try:
                 payload = encode_group_message(
                     send_text,
                     group_topic=topic,
                     group_topic_sent_at=topic_at,
+                    group_announcements_only=ann_only,
+                    group_announcements_sent_at=ann_at,
                     edited_at=send_edited_at,
                     **group_kwargs,
                 )
@@ -5787,6 +5892,28 @@ class TauNode:
                     return False
         except TimeoutError:
             return False
+        if fresh.group_id is not None:
+            # Do not leave a sealed copy with a holder for a member
+            # post queued before the group went announcements-only:
+            # the recipient drops it on receipt, so depositing it only
+            # spends the holder's quota.  Votes and poll closes are not
+            # posts, so they still deposit.
+            announcements = self._current_group_announcements(fresh.group_id)
+            if (
+                announcements is not None
+                and announcements[0]
+                and self.destination_hexhash.lower()
+                != (fresh.group_creator or "").lower()
+                and fresh.poll_vote is None
+                and fresh.poll_close is None
+            ):
+                log.info(
+                    "Skipping deposit of queued group message %s: group %s "
+                    "is announcements-only and this node is not its creator",
+                    entry.id,
+                    fresh.group_id,
+                )
+                return False
         if self.identity is None:
             return False
         recipient = self.registry.get(entry.to)
@@ -5827,6 +5954,14 @@ class TauNode:
             current = self._current_group_topic(fresh.group_id)
             if current is not None:
                 sealed_group["topic"], sealed_group["topic_sent_at"] = current
+            # The announcements setting rides the same way, so a
+            # relayed copy pins it exactly like a direct one.
+            announcements = self._current_group_announcements(fresh.group_id)
+            if announcements is not None:
+                (
+                    sealed_group["announcements_only"],
+                    sealed_group["announcements_sent_at"],
+                ) = announcements
         try:
             blob = seal_message(
                 self.identity,
@@ -6292,12 +6427,31 @@ class TauNode:
                 group,
                 sent_at=message.get("sent_at"),
                 topic_sent_at=group.get("topic_sent_at"),
+                announcements_sent_at=group.get("announcements_sent_at"),
             )
             if pinned is None:
                 log.info(
                     "Relayed group message from %s rejected: sender or "
                     "node not on the roster, or the roster changed",
                     sender or "unknown",
+                )
+                return False
+            if (
+                pinned.get("announcements_only")
+                and (sender or "").lower() != (pinned.get("creator") or "").lower()
+                and message.get("poll_vote") is None
+                and message.get("poll_close") is None
+            ):
+                # Same rule as the live path: a member's post to an
+                # announcements-only group does not land, even from a
+                # holder.  (Sealed envelopes carry no poll fields
+                # today, so the vote exemption is for symmetry with
+                # the live path, not a case that can fire yet.)
+                log.info(
+                    "Dropping relayed group message from %s: group %s is "
+                    "announcements-only and the sender is not its creator",
+                    sender or "unknown",
+                    pinned["id"],
                 )
                 return False
         record = {
@@ -7352,6 +7506,15 @@ class TauNode:
             raise NodeError(
                 "group record has no creator; delete it and re-create it"
             )
+        if _group_announcements_blocks_post(
+            group,
+            self.destination_hexhash,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+        ):
+            raise NodeError(
+                "group is announcements-only: only the creator can post"
+            )
         normalized = normalize_message(text)
         if sum(
             field is not None
@@ -7460,6 +7623,8 @@ class TauNode:
                 members=list(group["members"]),
                 group_topic=group.get("topic", ""),
                 group_topic_sent_at=group.get("topic_sent_at"),
+                group_announcements_only=group.get("announcements_only", False),
+                group_announcements_sent_at=group.get("announcements_sent_at"),
                 renamed_from=group.get("renamed_from") or None,
                 in_reply_to=reply_to,
                 expires_at=expires_at,
@@ -7578,6 +7743,8 @@ class TauNode:
                 members=list(group["members"]),
                 group_topic=group.get("topic", ""),
                 group_topic_sent_at=group.get("topic_sent_at"),
+                group_announcements_only=group.get("announcements_only", False),
+                group_announcements_sent_at=group.get("announcements_sent_at"),
                 renamed_from=group.get("renamed_from") or None,
                 in_reply_to=reply_to,
                 expires_at=expires_at,
@@ -8193,6 +8360,12 @@ class TauNode:
         """
         if isinstance(group, str):
             group = self.groups.find(group)
+        if _group_announcements_blocks_post(
+            group, self.destination_hexhash
+        ):
+            raise NodeError(
+                "group is announcements-only: only the creator can post"
+            )
         # Read the file once, before any leg is sent, so a missing or
         # oversized file fails cleanly up front rather than aborting
         # the fan-out partway through.

@@ -15,6 +15,7 @@ import {
   mintGroupInvite,
   revokeGroupInvites,
   setDisappearingDefault,
+  setGroupAnnouncements,
   type GroupInviteStatus,
 } from "@/lib/api";
 import { formatAge, formatDateTime, truncatedHash } from "@/lib/format";
@@ -257,6 +258,28 @@ export default function PeerPanel({ conversation }: { conversation: Conversation
       {isGroup && conversation.group && (
         <div>
           {conversation.group.topic && <Row label="Topic">{conversation.group.topic}</Row>}
+          <Row label="Posting">
+            {conversation.group.announcements_only ? "Creator only" : "Everyone"}
+          </Row>
+          {conversation.group.created_by_me && (
+            <div className="mt-2">
+              <ActionButton
+                disabled={busy === "announcements"}
+                onClick={() =>
+                  void run("announcements", () =>
+                    setGroupAnnouncements(
+                      conversation.key,
+                      !conversation.group?.announcements_only,
+                    ),
+                  )
+                }
+              >
+                {conversation.group.announcements_only
+                  ? "Open posting to everyone"
+                  : "Make announcements-only"}
+              </ActionButton>
+            </div>
+          )}
           <Row label="Members">{conversation.group.members.length}</Row>
           <ul className="mt-2 flex flex-col gap-1.5">
             {conversation.group.members.map((m) => (

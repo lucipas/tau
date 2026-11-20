@@ -1632,6 +1632,41 @@ def test_seal_and_open_carries_location():
     assert open_message(recipient, plain)["location"] is None
 
 
+def test_seal_and_open_carries_announcements_setting():
+    sender, recipient = make_identity_pair()
+    group = {
+        "id": "ab" * 16,
+        "name": "weekend",
+        "creator": "cd" * 16,
+        "members": ["ab" * 16, "cd" * 16],
+        "announcements_only": True,
+        "announcements_sent_at": 4300.0,
+    }
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-ann",
+        text="announcement",
+        sent_at=4242.0,
+        group=group,
+    )
+    message = open_message(recipient, blob)
+    assert message["group"]["announcements_only"] is True
+    assert message["group"]["announcements_sent_at"] == 4300.0
+    # A sealed copy without the setting carries none, like a plain message.
+    plain = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-plain-ann",
+        text="hello",
+        sent_at=4242.0,
+        group={k: v for k, v in group.items() if not k.startswith("announcements")},
+    )
+    assert "announcements_only" not in open_message(recipient, plain)["group"]
+
+
 def test_seal_and_open_default_kind_is_chat():
     sender, recipient = make_identity_pair()
     blob = seal_message(

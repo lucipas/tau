@@ -207,6 +207,22 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
             return None
         if not math.isfinite(topic_sent_at):
             return None
+    # Whether only the creator may post, and the sent_at of the
+    # creator message that last pinned it (None when never set).  Same
+    # staleness rule as the topic: only a creator message stamps it,
+    # so a queued copy sent before a newer setting cannot overwrite
+    # the newer one.  A non-boolean value is not a setting at all —
+    # the group reads as open, like a record written before this
+    # field existed.
+    announcements_only = raw.get("announcements_only") is True
+    announcements_sent_at = raw.get("announcements_sent_at")
+    if announcements_sent_at is not None:
+        try:
+            announcements_sent_at = float(announcements_sent_at)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(announcements_sent_at):
+            return None
     # Rename lineage: predecessor ids, newest first.  The lineage is
     # not part of the id derivation, so a stored record with a malformed
     # entry keeps only the usable ids instead of dropping the group.
@@ -260,6 +276,8 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         "roster_sent_at": roster_sent_at,
         "topic": clean_group_topic(raw.get("topic")),
         "topic_sent_at": topic_sent_at,
+        "announcements_only": announcements_only,
+        "announcements_sent_at": announcements_sent_at,
         "renamed_from": renamed_from,
         "banned": banned,
     }
@@ -624,10 +642,12 @@ class GroupStore:
                 "created_by": existing["creator"],
                 "local": True,
                 # A roster change is the same group continuing: the
-                # topic, the rename lineage, and the ban list carry
-                # into the successor.
+                # topic, the announcements setting, the rename
+                # lineage, and the ban list carry into the successor.
                 "topic": existing.get("topic", ""),
                 "topic_sent_at": existing.get("topic_sent_at"),
+                "announcements_only": existing.get("announcements_only", False),
+                "announcements_sent_at": existing.get("announcements_sent_at"),
                 "renamed_from": existing.get("renamed_from") or [],
                 "banned": banned,
             }
@@ -840,6 +860,44 @@ class GroupStore:
                 raise
         return dict(self._groups[group_id.lower()])
 
+    def set_announcements_only(
+        self, group_id: str, value: bool, *, created_by: str
+    ) -> Dict[str, Any]:
+        """Switch a group this node created to (or from) announcements-only.
+
+        Only the creator can change it, mirroring roster changes and
+        the topic: a member, or the creator of a learned group, is
+        refused.  The local clock stamps the change, so the next
+        message the creator sends carries a newer ``sent_at`` and
+        recipients accept it over any older setting they hold.
+
+        Raises :class:`ValueError` when the group is unknown or was
+        not created by this node, and :class:`OSError` when the write
+        fails (the store is left as it was on disk).
+        """
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            if not existing["local"] or existing["creator"] != created_by.lower():
+                raise ValueError(
+                    "only the creator can change a group's announcements setting"
+                )
+            if existing.get("announcements_only", False) == bool(value):
+                return dict(existing)
+            snapshot = self._snapshot()
+            self._groups[existing["id"]] = {
+                **existing,
+                "announcements_only": bool(value),
+                "announcements_sent_at": time.time(),
+            }
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+        return dict(self._groups[group_id.lower()])
+
     def rename(
         self, group_id: str, new_name: str, *, created_by: str
     ) -> Dict[str, Any]:
@@ -887,9 +945,17 @@ class GroupStore:
                     "created_by": existing["creator"],
                     "local": True,
                     "roster_sent_at": existing.get("roster_sent_at"),
-                    # A rename is the same group continuing: the ban
-                    # list carries into the successor, so renaming
-                    # cannot silently unban anyone.
+                    # A rename is the same group continuing: the
+                    # announcements setting carries into the successor,
+                    # so renaming cannot silently re-open a group the
+                    # creator restricted — and the ban list carries
+                    # too, so renaming cannot silently unban anyone.
+                    "announcements_only": existing.get(
+                        "announcements_only", False
+                    ),
+                    "announcements_sent_at": existing.get(
+                        "announcements_sent_at"
+                    ),
                     "banned": existing.get("banned") or [],
                     # The successor remembers the newest predecessors,
                     # newest first, so a member that missed an
@@ -937,6 +1003,8 @@ class GroupStore:
         sent_at: Optional[float] = None,
         topic: Optional[str] = None,
         topic_sent_at: Optional[float] = None,
+        announcements_only: Optional[bool] = None,
+        announcements_sent_at: Optional[float] = None,
         renamed_from: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
@@ -1003,6 +1071,13 @@ class GroupStore:
         message re-reads the current topic, whose set time can postdate
         the queued message's send time, so the topic is judged by its
         own timestamp, not the message's.
+
+        ``announcements_only`` is the announcements setting the
+        message carried, or ``None`` when the sender predates it: it
+        is pinned only from the creator, judged by
+        ``announcements_sent_at`` exactly like the topic — a queued
+        creator copy sent before a newer setting was made must not
+        overwrite it.
         """
         if sent_at is not None:
             try:
@@ -1026,6 +1101,24 @@ class GroupStore:
                 topic_sent_at = None
         if topic_sent_at is None:
             topic_sent_at = sent_at
+        # Normalize the carried announcements setting the same way the
+        # wire does: a non-boolean value is not a setting at all, and a
+        # present boolean is authoritative.  A retried message re-reads
+        # the current setting, whose set time can postdate the queued
+        # message's send time; the setting is judged by that.
+        if not isinstance(announcements_only, bool):
+            announcements_only = None
+        if announcements_sent_at is not None:
+            try:
+                announcements_sent_at = float(announcements_sent_at)
+            except (TypeError, ValueError, OverflowError):
+                announcements_sent_at = None
+            if announcements_sent_at is not None and not math.isfinite(
+                announcements_sent_at
+            ):
+                announcements_sent_at = None
+        if announcements_sent_at is None:
+            announcements_sent_at = sent_at
         candidate = _valid_group(
             {
                 "id": group_id,
@@ -1060,6 +1153,12 @@ class GroupStore:
                 # one from a member keeps "" — members cannot set it.
                 candidate["topic"] = topic
                 candidate["topic_sent_at"] = topic_sent_at
+            if announcements_only is not None:
+                # A first sighting from the creator carries the
+                # announcements setting; one from a member keeps
+                # False — members cannot set it.
+                candidate["announcements_only"] = announcements_only
+                candidate["announcements_sent_at"] = announcements_sent_at
         with self._transaction():
             existing = self._groups.get(candidate["id"])
             restored = False
@@ -1208,6 +1307,49 @@ class GroupStore:
                         topic_sent_at = (
                             None if best_at == float("-inf") else best_at
                         )
+                    # The announcements setting is judged independently
+                    # of the roster, exactly like the topic: a
+                    # successor whose message omits the setting, or
+                    # carries an older one, must not wipe a newer
+                    # setting a predecessor already holds.
+                    best_announcements = None
+                    best_ann_at = float("-inf")
+                    for other in superseded:
+                        if other.get("announcements_only") is None:
+                            continue
+                        other_at = other.get("announcements_sent_at")
+                        other_key = (
+                            other_at
+                            if isinstance(other_at, (int, float))
+                            else float("-inf")
+                        )
+                        if (
+                            best_announcements is None
+                            or other_key > best_ann_at
+                        ):
+                            best_announcements = other["announcements_only"]
+                            best_ann_at = other_key
+                    cand_ann_at = (
+                        announcements_sent_at
+                        if isinstance(announcements_sent_at, (int, float))
+                        else float("-inf")
+                    )
+                    if best_announcements is not None and (
+                        announcements_only is None
+                        or cand_ann_at < best_ann_at
+                    ):
+                        candidate["announcements_only"] = best_announcements
+                        candidate["announcements_sent_at"] = (
+                            None
+                            if best_ann_at == float("-inf")
+                            else best_ann_at
+                        )
+                        announcements_only = best_announcements
+                        announcements_sent_at = (
+                            None
+                            if best_ann_at == float("-inf")
+                            else best_ann_at
+                        )
             # A group named in both lists is replaced once: a
             # predecessor that also shares the successor's name
             # (a rename back) must not be deleted twice or counted
@@ -1271,6 +1413,30 @@ class GroupStore:
                         updates["topic"] = topic
                         if topic_sent_at is not None:
                             updates["topic_sent_at"] = topic_sent_at
+                if creator_authorized and announcements_only is not None:
+                    # Only the creator sets the announcements flag, and
+                    # a queued copy sent before the setting now held
+                    # must not overwrite it — the same staleness rule
+                    # as the topic above.
+                    existing_ann_at = existing.get("announcements_sent_at")
+                    stale = (
+                        existing_ann_at is not None
+                        and announcements_sent_at is not None
+                        and announcements_sent_at < existing_ann_at
+                    )
+                    if not stale and (
+                        existing.get("announcements_only", False)
+                        != announcements_only
+                        or (
+                            announcements_sent_at is not None
+                            and announcements_sent_at != existing_ann_at
+                        )
+                    ):
+                        updates["announcements_only"] = announcements_only
+                        if announcements_sent_at is not None:
+                            updates["announcements_sent_at"] = (
+                                announcements_sent_at
+                            )
                 if updates:
                     self._groups[existing["id"]] = {**existing, **updates}
                     refreshed = True

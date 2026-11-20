@@ -2978,6 +2978,26 @@ def seal_message(
                     topic_at = None
             if topic_at is not None:
                 inner["group"]["topic_sent_at"] = topic_at
+        # The announcements setting is covered by the signature too.
+        # Present True/False is authoritative; absent means the sender
+        # predates announcements-only groups.
+        group_announcements = group.get("announcements_only")
+        if isinstance(group_announcements, bool):
+            inner["group"]["announcements_only"] = group_announcements
+            ann_at = group.get("announcements_sent_at")
+            if isinstance(ann_at, bool) or not isinstance(
+                ann_at, (int, float)
+            ):
+                ann_at = None
+            else:
+                try:
+                    ann_at = float(ann_at)
+                except OverflowError:
+                    ann_at = None
+                if ann_at is not None and not math.isfinite(ann_at):
+                    ann_at = None
+            if ann_at is not None:
+                inner["group"]["announcements_sent_at"] = ann_at
     if expires_at is not None:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
             raise MailboxError("expires_at must be a finite number")
@@ -3323,6 +3343,26 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
                     topic_at = None
             if topic_at is not None:
                 result["group"]["topic_sent_at"] = topic_at
+        # The announcements setting rides the same way: a present
+        # boolean is authoritative; absent means the sender predates
+        # announcements-only groups and the local setting is left alone.
+        group_announcements = group_raw.get("announcements_only")
+        if isinstance(group_announcements, bool):
+            result["group"]["announcements_only"] = group_announcements
+            ann_at = group_raw.get("announcements_sent_at")
+            if isinstance(ann_at, bool) or not isinstance(
+                ann_at, (int, float)
+            ):
+                ann_at = None
+            else:
+                try:
+                    ann_at = float(ann_at)
+                except OverflowError:
+                    ann_at = None
+                if ann_at is not None and not math.isfinite(ann_at):
+                    ann_at = None
+            if ann_at is not None:
+                result["group"]["announcements_sent_at"] = ann_at
     return result
 
 

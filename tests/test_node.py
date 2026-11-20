@@ -1041,6 +1041,142 @@ def test_send_group_vote_carries_target_and_option(tmp_path, monkeypatch):
     assert stored[0]["poll_vote"] == {"target": target, "option": 1}
 
 
+def test_send_group_message_refused_when_announcements_only_for_member(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    # The creator's message pins the setting on this member's node.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=100.0,
+        announcements_only=True,
+    )
+    assert node.groups.get(group["id"])["announcements_only"] is True
+    with pytest.raises(NodeError, match="announcements-only"):
+        node.send_group_message("crew", "hello?")
+    with pytest.raises(NodeError, match="announcements-only"):
+        node.send_group_message(
+            "crew", "which day?", poll_options=["Saturday", "Sunday"]
+        )
+    # A vote is not a post: it still goes out.
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_message(
+        "crew",
+        "voted",
+        poll_vote={
+            "target": {"author": alice.hexhash, "sent_at": 100.0},
+            "option": 0,
+        },
+    )
+    assert response["ok"] is True
+    assert len(payloads) == 2
+
+
+def test_send_group_file_refused_when_announcements_only_for_member(tmp_path):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=100.0,
+        announcements_only=True,
+    )
+    path = tmp_path / "note.txt"
+    path.write_text("hello", encoding="utf-8")
+    with pytest.raises(NodeError, match="announcements-only"):
+        node.send_group_file("crew", path)
+
+
+def test_send_group_message_allowed_for_creator_when_announcements_only(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import parse_group_message
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    own = node.destination.hexhash
+    mine = node.groups.create(
+        "mine", [own, alice.hexhash, bob.hexhash], created_by=own
+    )
+    node.groups.set_announcements_only(mine["id"], True, created_by=own)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_message("mine", "announcement")
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    for payload in payloads:
+        assert parse_group_message(payload)["group_announcements_only"] is True
+
+
+def test_deliver_entry_skips_queued_post_when_group_goes_announcements_only(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+    # The creator restricts the group after the leg was queued.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=200.0,
+        announcements_only=True,
+    )
+    calls = []
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: calls.append(args) or {"ok": True},
+    )
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    assert calls == []
+    # The leg stays queued until its TTL (the user can cancel it).
+    assert node.mailbox.get_outbox("bob-leg-1") is not None
+
+
+def test_deliver_entry_carries_announcements_flag_on_retry(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import parse_group_message
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    own = node.destination.hexhash
+    mine = node.groups.create(
+        "mine", [own, alice.hexhash, bob.hexhash], created_by=own
+    )
+    node.groups.set_announcements_only(mine["id"], True, created_by=own)
+    _group_leg_entry(node, mine, bob, text="announcement", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+    calls = []
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: calls.append(args) or {"ok": True},
+    )
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is True
+    assert len(calls) == 1
+    parsed = parse_group_message(calls[0][2])
+    assert parsed["group_announcements_only"] is True
+
+
 def test_send_group_poll_scheduled_queues_poll_payload(tmp_path):
     node, group, _, _ = _group_reaction_node(tmp_path)
     send_after = time.time() + 3600.0

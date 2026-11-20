@@ -461,6 +461,8 @@ def encode_group_message(
     sent_at: Optional[float] = None,
     group_topic: Optional[str] = None,
     group_topic_sent_at: Optional[float] = None,
+    group_announcements_only: Optional[bool] = None,
+    group_announcements_sent_at: Optional[float] = None,
     renamed_from: Optional[List[str]] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
@@ -484,6 +486,12 @@ def encode_group_message(
     sender's clock, so the recipient judges the topic by its own
     timestamp rather than the message's send time; ``None`` omits it
     and the recipient falls back to ``sent_at``.
+    ``group_announcements_only`` rides along when given: ``True``
+    means only the group's creator may post, ``False`` lifts it;
+    ``None`` omits it, for senders that predate announcements-only
+    groups.  ``group_announcements_sent_at`` is the time the setting
+    was changed on the sender's clock, judged the same way as the
+    topic's timestamp.
     the id it claims.  ``renamed_from`` carries the group's rename
     lineage (predecessor ids, newest first) when the group was renamed:
     a member that still holds a predecessor learns from this message
@@ -555,6 +563,15 @@ def encode_group_message(
             topic_at = None
         if topic_at is not None and math.isfinite(topic_at):
             payload["group_topic_sent_at"] = topic_at
+    if group_announcements_only is not None:
+        payload["group_announcements_only"] = bool(group_announcements_only)
+    if group_announcements_sent_at is not None:
+        try:
+            announcements_at = float(group_announcements_sent_at)
+        except (TypeError, ValueError, OverflowError):
+            announcements_at = None
+        if announcements_at is not None and math.isfinite(announcements_at):
+            payload["group_announcements_sent_at"] = announcements_at
     if message_id:
         payload["id"] = message_id
     lineage = _clean_renamed_from(renamed_from)
@@ -637,6 +654,29 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
             topic_sent_at = None
         if topic_sent_at is not None and not math.isfinite(topic_sent_at):
             topic_sent_at = None
+    # ``None`` — the field absent, or non-boolean — means the sender
+    # predates announcements-only groups (or sent garbage): the local
+    # setting is left alone.  A present boolean is authoritative.
+    raw_announcements = payload.get("group_announcements_only")
+    announcements_only = (
+        bool(raw_announcements) if isinstance(raw_announcements, bool) else None
+    )
+    raw_announcements_at = payload.get("group_announcements_sent_at")
+    announcements_sent_at = None
+    if (
+        announcements_only is not None
+        and isinstance(raw_announcements_at, (int, float))
+        and not isinstance(raw_announcements_at, bool)
+    ):
+        try:
+            announcements_sent_at = float(raw_announcements_at)
+        except OverflowError:
+            announcements_sent_at = None
+        if (
+            announcements_sent_at is not None
+            and not math.isfinite(announcements_sent_at)
+        ):
+            announcements_sent_at = None
     raw_edited_at = payload.get("edited_at")
     edited_at = None
     if (
@@ -676,6 +716,8 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "members": members,
         "group_topic": topic,
         "group_topic_sent_at": topic_sent_at,
+        "group_announcements_only": announcements_only,
+        "group_announcements_sent_at": announcements_sent_at,
         "renamed_from": _clean_renamed_from(payload.get("renamed_from")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),

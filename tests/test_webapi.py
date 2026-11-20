@@ -3019,6 +3019,94 @@ def test_api_groups_topic_refuses_non_creator(bridge, node, tmp_path):
     assert listed["groups"][0]["topic"] == ""
 
 
+def test_api_groups_announcements_set_and_clear(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    assert created["announcements_only"] is False
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/announcements",
+        method="POST",
+        body={"group": "weekend", "announcements_only": True},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # Switching the setting keeps the id.
+    assert payload["group"]["id"] == created["id"]
+    assert payload["group"]["announcements_only"] is True
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["announcements_only"] is True
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/announcements",
+        method="POST",
+        body={"group": "weekend", "announcements_only": False},
+    )
+    assert status == 200
+    assert payload["group"]["id"] == created["id"]
+    assert payload["group"]["announcements_only"] is False
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["announcements_only"] is False
+
+
+def test_api_groups_announcements_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    cases = [
+        ({}, "field 'group' is required"),
+        ({"group": "weekend"}, "field 'announcements_only' must be true or false"),
+        (
+            {"group": "weekend", "announcements_only": "yes"},
+            "field 'announcements_only' must be true or false",
+        ),
+        ({"group": "missing", "announcements_only": True}, "unknown group"),
+    ]
+    for body, message in cases:
+        status, _, payload = _json(
+            bridge, "/api/groups/announcements", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["announcements_only"] is False
+
+
+def test_api_groups_announcements_refuses_non_creator(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    node.groups.create(
+        "weekend", [PEER_HASH, OTHER_HASH], created_by=PEER_HASH
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/announcements",
+        method="POST",
+        body={"group": "weekend", "announcements_only": True},
+    )
+    assert status == 400
+    assert (
+        "only the creator can change a group's announcements setting"
+        in payload["error"]["message"]
+    )
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["groups"][0]["announcements_only"] is False
+
+
 def _add_carol_to_registry(node):
     node.registry._peers.append(
         Peer(

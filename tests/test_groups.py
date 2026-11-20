@@ -327,6 +327,53 @@ def test_group_message_roundtrip_with_topic_sent_at():
     assert legacy["group_topic_sent_at"] is None
 
 
+def test_group_message_roundtrip_with_announcements_only():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    parsed = parse_group_message(
+        encode_group_message(
+            "announcements only from now on",
+            message_id="gm-a1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+            sent_at=123.0,
+            group_announcements_only=True,
+            group_announcements_sent_at=120.0,
+        )
+    )
+    assert parsed["group_announcements_only"] is True
+    assert parsed["group_announcements_sent_at"] == 120.0
+    # Lifting the restriction is a present False, not an absent field.
+    lifted = parse_group_message(
+        encode_group_message(
+            "open again",
+            message_id="gm-a2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+            group_announcements_only=False,
+        )
+    )
+    assert lifted["group_announcements_only"] is False
+    # A sender that predates announcements-only groups omits the field:
+    # the local setting must be left alone, so parse reports None.
+    legacy = parse_group_message(
+        encode_group_message(
+            "hi all",
+            message_id="gm-a3",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+        )
+    )
+    assert legacy["group_announcements_only"] is None
+    assert legacy["group_announcements_sent_at"] is None
+
+
 def test_clean_group_topic_truncates_and_collapses():
     assert clean_group_topic("  planning   the  meetup ") == "planning the meetup"
     assert clean_group_topic("hello\n") == "hello"
@@ -602,6 +649,171 @@ def test_group_store_topic_survives_roster_change(tmp_path):
     assert grown["topic"] == "planning the meetup"
     assert grown["topic_sent_at"] == with_topic["topic_sent_at"]
     assert store.get(grown["id"])["topic"] == "planning the meetup"
+
+
+def test_group_store_set_announcements_only(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert group["announcements_only"] is False
+    updated = store.set_announcements_only(
+        group["id"], True, created_by=OWN_HASH
+    )
+    assert updated["announcements_only"] is True
+    assert updated["announcements_sent_at"] is not None
+    # Setting the same value again is a no-op returning the record.
+    assert (
+        store.set_announcements_only(group["id"], True, created_by=OWN_HASH)
+        == updated
+    )
+    # Lifting, and the change survives a reload.
+    lifted = store.set_announcements_only(
+        group["id"], False, created_by=OWN_HASH
+    )
+    assert lifted["announcements_only"] is False
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(group["id"])["announcements_only"] is False
+    # Only the creator can change it; a learned group is refused too.
+    with pytest.raises(ValueError, match="only the creator"):
+        store.set_announcements_only(
+            group["id"], True, created_by=OTHER_HASH
+        )
+    with pytest.raises(ValueError, match="unknown group"):
+        store.set_announcements_only(
+            generate_group_id(), True, created_by=OWN_HASH
+        )
+
+
+def test_group_store_announcements_survives_roster_change_and_rename(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    with_setting = store.set_announcements_only(
+        group["id"], True, created_by=OWN_HASH
+    )
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert grown["announcements_only"] is True
+    assert grown["announcements_sent_at"] == with_setting["announcements_sent_at"]
+    # A rename is the same group continuing: it must not silently
+    # re-open a group the creator restricted.
+    renamed = store.rename(grown["id"], "weekend-plans", created_by=OWN_HASH)
+    assert renamed["announcements_only"] is True
+    assert renamed["announcements_sent_at"] == with_setting["announcements_sent_at"]
+    assert store.get(renamed["id"])["announcements_only"] is True
+
+
+def test_group_store_record_announcements_pinning(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    # First sighting from the creator carries the setting.
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        announcements_only=True,
+    )
+    assert pinned is not None and pinned["announcements_only"] is True
+    assert pinned["announcements_sent_at"] == 100.0
+    # A member-carried message cannot set (or forge) the setting.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OTHER_HASH,
+            sent_at=150.0,
+            announcements_only=False,
+        )["announcements_only"]
+        is True
+    )
+    # A sender that predates the feature leaves the setting alone.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=200.0,
+        )["announcements_only"]
+        is True
+    )
+    # A newer creator message lifts it; a stale queued copy does not
+    # re-impose it.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=300.0,
+            announcements_only=False,
+        )["announcements_only"]
+        is False
+    )
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=250.0,
+            announcements_only=True,
+        )["announcements_only"]
+        is False
+    )
+    # A retried copy sent at 310 carries a setting made at 330: the
+    # setting is judged by its own timestamp, not the message's.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=310.0,
+            announcements_only=True,
+            announcements_sent_at=330.0,
+        )["announcements_only"]
+        is True
+    )
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=320.0,
+            announcements_only=False,
+            announcements_sent_at=315.0,
+        )["announcements_only"]
+        is True
+    )
+
+
+def test_group_store_record_without_announcements_reads_open(tmp_path):
+    # Records written before the field existed, and records with a
+    # non-boolean value, read as open — never as restricted.
+    path = tmp_path / "groups.json"
+    store = GroupStore(path)
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    raw = json.loads(path.read_text())
+    raw["groups"][0].pop("announcements_only", None)
+    raw["groups"][0].pop("announcements_sent_at", None)
+    path.write_text(json.dumps(raw))
+    assert GroupStore(path).get(group["id"])["announcements_only"] is False
+    raw = json.loads(path.read_text())
+    raw["groups"][0]["announcements_only"] = "yes"
+    path.write_text(json.dumps(raw))
+    assert GroupStore(path).get(group["id"])["announcements_only"] is False
 
 
 def test_group_store_ban_removes_member_and_records_ban(tmp_path):
@@ -2622,6 +2834,93 @@ def test_group_message_delivered_and_group_pinned(tmp_path):
     assert pinned is not None and pinned["members"] == sorted(members)
     assert pinned["name"] == "weekend"
     assert pinned["creator"] == sender_hash
+
+
+def test_group_message_from_member_dropped_when_announcements_only(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    # The creator switches the group to announcements-only; their own
+    # announcement lands and pins the setting.
+    response = post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )
+    assert response["ok"] is True
+    assert node.groups.get(group_id)["announcements_only"] is True
+    assert len(received) == 1
+
+    # A member's post is refused and never stored or shown.
+    response = post(member, "can I post?", message_id="gm-a2", sent_at=110.0)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+    assert "announcements-only" in response["error"]["message"]
+    assert len(received) == 1
+    assert [entry["text"] for entry in node.inbox.list_messages()] == [
+        "announcements only from now on"
+    ]
+
+    # A member's vote is not a post: it still lands.
+    poll = post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )
+    assert poll["ok"] is True
+    vote = post(
+        member,
+        "voted: Sunday",
+        message_id="gm-vote",
+        sent_at=130.0,
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+    assert vote["ok"] is True
+    assert received[-1]["poll_vote"] == {
+        "target": {"author": creator_hash, "sent_at": 120.0},
+        "option": 1,
+    }
+
+    # The creator's next post still lands.
+    response = post(
+        creator, "the plan is set", message_id="gm-a3", sent_at=140.0
+    )
+    assert response["ok"] is True
+    assert len(received) == 4
+    # list_messages() is newest first.
+    assert [entry["text"] for entry in node.inbox.list_messages()] == [
+        "the plan is set",
+        "voted: Sunday",
+        "which day?",
+        "announcements only from now on",
+    ]
 
 
 def test_group_message_with_reply_stores_reference(tmp_path):

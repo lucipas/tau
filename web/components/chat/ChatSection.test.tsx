@@ -126,3 +126,69 @@ describe("ChatSection drafts", () => {
     await waitFor(() => expect(box.value).toBe("resume me"));
   });
 });
+
+describe("ChatSection announcements-only", () => {
+  it("locks the composer for a member of an announcements-only group", async () => {
+    const GROUP_ID = "c".repeat(32);
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          groups: [
+            {
+              id: GROUP_ID,
+              name: "crew",
+              members: [{ hash: "b".repeat(32), name: "bob" }],
+              created_at: 1700000000,
+              topic: "",
+              announcements_only: true,
+              created_by_me: false,
+              can_leave: true,
+              ignored: false,
+            },
+          ],
+          messages: [
+            makeMessage({ id: 1, group: GROUP_ID, text: "announcement" }),
+          ],
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(true);
+    expect(screen.getByText(/Only the creator can post here/)).toBeTruthy();
+  });
+
+  it("leaves the composer open for the creator of an announcements-only group", async () => {
+    const GROUP_ID = "c".repeat(32);
+    window.location.hash = `#chat?group=${GROUP_ID}`;
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          groups: [
+            {
+              id: GROUP_ID,
+              name: "crew",
+              members: [{ hash: "b".repeat(32), name: "bob" }],
+              created_at: 1700000000,
+              topic: "",
+              announcements_only: true,
+              created_by_me: true,
+              can_leave: false,
+              ignored: false,
+            },
+          ],
+          messages: [
+            makeMessage({ id: 1, group: GROUP_ID, text: "announcement" }),
+          ],
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(false);
+    expect(screen.queryByText(/Only the creator can post here/)).toBeNull();
+  });
+});

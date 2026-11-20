@@ -405,6 +405,13 @@ export async function setGroupTopic(group: string, topic?: string, clear = false
   return post("/api/groups/topic", clear ? { group, clear: true } : { group, topic });
 }
 
+export async function setGroupAnnouncements(
+  group: string,
+  announcementsOnly: boolean,
+): Promise<{ group: Group }> {
+  return post("/api/groups/announcements", { group, announcements_only: announcementsOnly });
+}
+
 /** An invite link for a group this node created, with its stored state. */
 export interface GroupInviteStatus {
   group: Group;

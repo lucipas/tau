@@ -33,6 +33,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/groups/banned banned peers for a group (``?group=...``)
     POST /api/groups/rename rename ``{"group": "<id | prefix | name>", "name": "<new name>"}``
     POST /api/groups/topic set or clear the topic ``{"group": "...", "topic": "..."}`` / ``{"group": "...", "clear": true}``
+    POST /api/groups/announcements switch announcements-only ``{"group": "...", "announcements_only": true|false}``
     GET  /api/groups/join-requests pending join requests for groups this node created
     POST /api/groups/approve-join approve ``{"group": "<name>", "peer": "<hash>"}``
     POST /api/groups/deny-join deny ``{"group": "<name>", "peer": "<hash>"}``
@@ -10880,6 +10881,7 @@ class WebBridge:
             "members": members,
             "created_at": group["created_at"],
             "topic": group.get("topic", ""),
+            "announcements_only": bool(group.get("announcements_only", False)),
             # A group reads as pinned when any id in its rename
             # lineage is pinned, like a mute — the pin follows the
             # conversation across a rename.
@@ -11540,6 +11542,34 @@ class WebBridge:
             raise ValueError("only the creator can change a group's topic")
         updated = self.node.groups.set_topic(
             group["id"], "" if clear else topic, created_by=own_hash
+        )
+        # The id is unchanged, so the ignore flag must carry over too.
+        ignored = load_ignored_group_ids(
+            getattr(self.node.config, "ignored_groups_path", None)
+        )
+        return {"group": self._describe_group(updated, ignored)}
+
+    def set_group_announcements(
+        self, query: str, *, announcements_only: bool
+    ) -> Dict[str, Any]:
+        """Switch a group to (or from) announcements-only from the console.
+
+        Mirrors ``tau group announcements``: only the group's creator
+        can change it, and the setting is local state until the next
+        group message carries it to the members.  The id does not change.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        if not isinstance(announcements_only, bool):
+            raise ValueError("field 'announcements_only' must be true or false")
+        group = self.node.groups.find(query.strip())
+        own_hash = self.node.destination_hexhash
+        if not group["local"] or group["creator"] != own_hash:
+            raise ValueError(
+                "only the creator can change a group's announcements setting"
+            )
+        updated = self.node.groups.set_announcements_only(
+            group["id"], announcements_only, created_by=own_hash
         )
         # The id is unchanged, so the ignore flag must carry over too.
         ignored = load_ignored_group_ids(
@@ -14611,6 +14641,40 @@ class _WebHandler(BaseHTTPRequestHandler):
                 try:
                     updated = self.bridge.set_group_topic(
                         target.strip(), topic=topic, clear=clear
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **updated}, head_only)
+                return
+            if path == "/api/groups/announcements":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                announcements_only = body.get("announcements_only")
+                if not isinstance(announcements_only, bool):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'announcements_only' must be true or false"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    updated = self.bridge.set_group_announcements(
+                        target.strip(),
+                        announcements_only=announcements_only,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

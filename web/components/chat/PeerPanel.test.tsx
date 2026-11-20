@@ -221,3 +221,46 @@ describe("PeerPanel invite links", () => {
     expect(calls.filter((c) => c.includes("/api/groups/invite"))).toEqual([]);
   });
 });
+
+describe("PeerPanel announcements-only", () => {
+  it("shows the posting state and offers the toggle to the creator", async () => {
+    const { calls } = mockFetch((url, method) => {
+      if (url.includes("/api/groups/announcements")) {
+        return { ok: true, group: { ...groupConv().group, announcements_only: true } };
+      }
+      if (url.includes("/api/groups/invite")) {
+        return { mode: "open", generation: 0, link: null };
+      }
+      return { ok: true };
+    });
+    renderPanel(groupConv());
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.getByText("Everyone")).toBeTruthy();
+    fireEvent.click(screen.getByText("Make announcements-only"));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/groups/announcements"),
+    );
+  });
+
+  it("offers to open posting again when the group is announcements-only", async () => {
+    mockFetch((url) => {
+      if (url.includes("/api/groups/invite")) {
+        return { mode: "open", generation: 0, link: null };
+      }
+      return { ok: true };
+    });
+    renderPanel(groupConv({ announcements_only: true }));
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.getByText("Creator only")).toBeTruthy();
+    expect(screen.getByText("Open posting to everyone")).toBeTruthy();
+  });
+
+  it("shows the state with no toggle for a group this node did not create", async () => {
+    mockFetch(() => ({ ok: true }));
+    renderPanel(groupConv({ created_by_me: false, announcements_only: true }));
+    await waitFor(() => expect(screen.getByText("Members")).toBeTruthy());
+    expect(screen.getByText("Creator only")).toBeTruthy();
+    expect(screen.queryByText("Make announcements-only")).toBeNull();
+    expect(screen.queryByText("Open posting to everyone")).toBeNull();
+  });
+});
