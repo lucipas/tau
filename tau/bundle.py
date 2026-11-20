@@ -168,6 +168,9 @@ def build_bundle(
                 location=entry.location if group is None else None,
                 kind=getattr(entry, "kind", None) if group is None else None,
                 edited_at=entry.edited_at,
+                poll_options=entry.poll_options,
+                poll_vote=entry.poll_vote,
+                poll_close=entry.poll_close,
             )
         except MailboxError as exc:
             skipped.append({"id": entry.id, "reason": str(exc)})

@@ -1150,6 +1150,31 @@ def test_deliver_entry_skips_queued_post_when_group_goes_announcements_only(
     assert calls == []
     # The leg stays queued until its TTL (the user can cancel it).
     assert node.mailbox.get_outbox("bob-leg-1") is not None
+    # The skip is recorded as a failed attempt, so the backoff moves
+    # the leg out of the sweep's way instead of re-checking it every
+    # round while it stays queued.
+    skipped = node.mailbox.get_outbox("bob-leg-1")
+    assert skipped.attempts == 1
+    assert skipped.next_attempt_at is not None
+    assert skipped.next_attempt_at > time.time()
+
+
+def test_deliver_entry_drops_queued_group_leg_when_peer_refuses_not_allowed(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+
+    def refused(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", refused)
+    # A group leg refused as not-allowed is a policy refusal, like
+    # not-a-member: the group will not take this post, so the leg is
+    # dropped instead of held until its TTL.
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    assert node.mailbox.get_outbox("bob-leg-1") is None
 
 
 def test_deliver_entry_carries_announcements_flag_on_retry(

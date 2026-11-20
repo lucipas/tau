@@ -374,6 +374,30 @@ def test_group_message_roundtrip_with_announcements_only():
     assert legacy["group_announcements_sent_at"] is None
 
 
+def test_group_message_announcements_flag_always_carries_a_stamp():
+    # A group that was never toggled has no stamp, so the flag rides
+    # with 0.0 — older than any real change, so a later toggle still
+    # wins and a queued copy can never overwrite one.  The flag
+    # without its stamp broke the wire contract the flag's presence
+    # promises.
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    for only in (False, True):
+        parsed = parse_group_message(
+            encode_group_message(
+                "open again",
+                message_id=f"gm-stamp-{int(only)}",
+                group_id=group_id,
+                group_name="weekend",
+                creator=OWN_HASH,
+                members=members,
+                group_announcements_only=only,
+            )
+        )
+        assert parsed["group_announcements_only"] is only
+        assert parsed["group_announcements_sent_at"] == 0.0
+
+
 def test_clean_group_topic_truncates_and_collapses():
     assert clean_group_topic("  planning   the  meetup ") == "planning the meetup"
     assert clean_group_topic("hello\n") == "hello"
@@ -2921,6 +2945,155 @@ def test_group_message_from_member_dropped_when_announcements_only(tmp_path):
         "which day?",
         "announcements only from now on",
     ]
+
+
+def test_group_message_member_vote_with_smuggled_post_is_stripped(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    # The creator switches the group to announcements-only, then opens
+    # a poll.
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    assert post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )["ok"] is True
+    # A member's vote rides with a smuggled post, a pin and a quote.
+    # The vote lands — but only as a vote: the text is rewritten to
+    # the canonical rendering and the pin and quote are dropped, or
+    # the vote exemption smuggles a post into the group.
+    vote = post(
+        member,
+        "free pizza at my place, ignore the announcement",
+        message_id="gm-vote",
+        sent_at=130.0,
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+        location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+        in_reply_to={"id": "a" * 32, "excerpt": "0123456789abcdef"},
+    )
+    assert vote["ok"] is True
+    stored = received[-1]
+    assert stored["poll_vote"] == {
+        "target": {"author": creator_hash, "sent_at": 120.0},
+        "option": 1,
+    }
+    assert stored["text"] == "voted: Sunday"
+    assert stored.get("location") is None
+    assert stored.get("in_reply_to") is None
+    entry = node.inbox.list_messages(group=group_id)[0]
+    assert entry["text"] == "voted: Sunday"
+    assert entry.get("location") is None
+    assert entry.get("in_reply_to") is None
+
+
+def test_relayed_group_vote_keeps_poll_vote_in_announcements_only_group(
+    tmp_path,
+):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.identity = RNS.Identity()
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    assert post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )["ok"] is True
+    # The member's vote reaches the node as a sealed envelope held by
+    # a relay: the envelope must carry the vote, or the recipient
+    # reads it as a plain post and drops it.
+    blob = seal_message(
+        member,
+        sender_name="member",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="gm-vote",
+        text="free pizza at my place",
+        sent_at=130.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": creator_hash,
+            "members": members,
+            "announcements_only": True,
+            "announcements_sent_at": 100.0,
+        },
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+    message = open_message(node.identity, blob)
+    assert message["poll_vote"] == {
+        "target": {"author": creator_hash, "sent_at": 120.0},
+        "option": 1,
+    }
+    assert node._deliver_collected(message) is True
+    stored = node.inbox.list_messages(group=group_id)[0]
+    assert stored["poll_vote"] == {
+        "target": {"author": creator_hash, "sent_at": 120.0},
+        "option": 1,
+    }
+    assert stored["text"] == "voted: Sunday"
 
 
 def test_group_message_with_reply_stores_reference(tmp_path):

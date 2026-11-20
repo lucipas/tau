@@ -67,6 +67,8 @@ from .protocol import (
     MAX_MAIL_TTL,
     ProtocolError,
     _clean_group_poll_options_or_none,
+    _clean_group_poll_target_or_none,
+    _clean_group_poll_vote_or_none,
     clean_beacon,
     clean_group_poll_target,
     clean_group_poll_vote,
@@ -2875,6 +2877,9 @@ def seal_message(
     beacon: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
     edited_at: Optional[float] = None,
+    poll_options: Optional[List[str]] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
@@ -2895,6 +2900,12 @@ def seal_message(
     travels inside the same signed envelope, so a relayed copy still
     recognises the update as live — and a beacon without a pin is
     rejected, like a direct one.
+    ``poll_options`` / ``poll_vote`` / ``poll_close`` (at most one)
+    mark the envelope as a poll, a vote, or a close; they travel
+    inside the same signed envelope, so a relayed vote still counts
+    exactly like a direct one — without them a member's queued vote
+    to an announcements-only group arrives as a plain post and the
+    recipient drops it.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -2980,7 +2991,10 @@ def seal_message(
                 inner["group"]["topic_sent_at"] = topic_at
         # The announcements setting is covered by the signature too.
         # Present True/False is authoritative; absent means the sender
-        # predates announcements-only groups.
+        # predates announcements-only groups.  The stamp always rides
+        # with the flag — 0.0 when the group was never toggled, older
+        # than any real change, so a later toggle still wins (see
+        # GroupStore.record and encode_group_message).
         group_announcements = group.get("announcements_only")
         if isinstance(group_announcements, bool):
             inner["group"]["announcements_only"] = group_announcements
@@ -2996,8 +3010,9 @@ def seal_message(
                     ann_at = None
                 if ann_at is not None and not math.isfinite(ann_at):
                     ann_at = None
-            if ann_at is not None:
-                inner["group"]["announcements_sent_at"] = ann_at
+            inner["group"]["announcements_sent_at"] = (
+                ann_at if ann_at is not None else 0.0
+            )
     if expires_at is not None:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
             raise MailboxError("expires_at must be a finite number")
@@ -3037,6 +3052,24 @@ def seal_message(
         if cleaned_location is None:
             raise MailboxError("a beacon update must carry a location pin")
         inner["beacon"] = cleaned_beacon
+    # At most one poll field may ride: a message carrying more than
+    # one is contradictory, so all of them are dropped and the
+    # envelope reads as plain chat — the same rule the direct path
+    # applies (see parse_group_message).
+    cleaned_options = _clean_group_poll_options_or_none(poll_options)
+    cleaned_vote = _clean_group_poll_vote_or_none(poll_vote)
+    cleaned_close = _clean_group_poll_target_or_none(poll_close)
+    if sum(
+        field is not None
+        for field in (cleaned_options, cleaned_vote, cleaned_close)
+    ) > 1:
+        cleaned_options = cleaned_vote = cleaned_close = None
+    if cleaned_options is not None:
+        inner["poll_options"] = cleaned_options
+    if cleaned_vote is not None:
+        inner["poll_vote"] = cleaned_vote
+    if cleaned_close is not None:
+        inner["poll_close"] = cleaned_close
     canonical = encode(inner)
     signature = sender_identity.sign(canonical)
     if signature is None:  # pragma: no cover - identity without private keys
@@ -3272,6 +3305,28 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "location": clean_location(payload.get("location")),
         "beacon": clean_beacon(payload.get("beacon")),
     }
+    # Poll fields ride the same way: a sealed vote that lost them
+    # would arrive as a plain post and be dropped by an
+    # announcements-only recipient.  The same >1 rule as the direct
+    # path applies — contradictory poll fields all drop.
+    sealed_options = _clean_group_poll_options_or_none(
+        payload.get("poll_options")
+    )
+    sealed_vote = _clean_group_poll_vote_or_none(payload.get("poll_vote"))
+    sealed_close = _clean_group_poll_target_or_none(
+        payload.get("poll_close")
+    )
+    if sum(
+        field is not None
+        for field in (sealed_options, sealed_vote, sealed_close)
+    ) > 1:
+        sealed_options = sealed_vote = sealed_close = None
+    if sealed_options is not None:
+        result["poll_options"] = sealed_options
+    if sealed_vote is not None:
+        result["poll_vote"] = sealed_vote
+    if sealed_close is not None:
+        result["poll_close"] = sealed_close
     group_raw = payload.get("group")
     if group_raw is not None:
         if not isinstance(group_raw, dict):

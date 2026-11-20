@@ -565,13 +565,19 @@ def encode_group_message(
             payload["group_topic_sent_at"] = topic_at
     if group_announcements_only is not None:
         payload["group_announcements_only"] = bool(group_announcements_only)
-    if group_announcements_sent_at is not None:
+        # The stamp always rides with the flag: a group that was
+        # never toggled has no stamp, so it rides as 0.0 — older
+        # than any real change, so a later toggle still wins and a
+        # queued copy can never overwrite one (see
+        # GroupStore.record).  Omitting it broke the wire contract
+        # the flag's presence promises.
         try:
             announcements_at = float(group_announcements_sent_at)
         except (TypeError, ValueError, OverflowError):
             announcements_at = None
-        if announcements_at is not None and math.isfinite(announcements_at):
-            payload["group_announcements_sent_at"] = announcements_at
+        if announcements_at is None or not math.isfinite(announcements_at):
+            announcements_at = 0.0
+        payload["group_announcements_sent_at"] = announcements_at
     if message_id:
         payload["id"] = message_id
     lineage = _clean_renamed_from(renamed_from)
@@ -2126,6 +2132,7 @@ def build_file_offer(
     sha256: str,
     sent_at: Optional[float] = None,
     forwarded_from: Optional[Dict[str, Any]] = None,
+    group: Optional[str] = None,
 ) -> bytes:
     """Encode a signed file offer for the ``/tau/file`` request.
 
@@ -2149,6 +2156,13 @@ def build_file_offer(
     forwarder said so, the same trust as the old ``Forwarded from``
     text prefix.  Peers that predate this field ignore it; the file
     itself still arrives fine.
+
+    ``group`` names the group this file is posted to, when it is one:
+    it rides inside the signed payload, so the receiver can enforce
+    group policy — an announcements-only group refuses a member's
+    file — before any bytes move, instead of trusting the sender's
+    word that the send side already refused it.  Absent on direct
+    and broadcast files.
     """
     clean_name = sanitize_file_name(name)
     if not clean_name:
@@ -2180,6 +2194,8 @@ def build_file_offer(
     }
     if forwarded_from is not None:
         payload["forwarded_from"] = _clean_forwarded_from(forwarded_from)
+    if group is not None:
+        payload["group"] = _clean_hexhash(group, "group")
     signature = sender_identity.sign(encode(payload))
     if signature is None:  # pragma: no cover - identity without private keys
         raise ProtocolError("sender identity cannot sign")
@@ -2289,6 +2305,12 @@ def parse_file_offer(
         result["forwarded_from"] = _clean_forwarded_from(
             payload.get("forwarded_from")
         )
+    if payload.get("group") is not None:
+        # Inside the signed payload, so a tampered group id fails the
+        # signature check above; a malformed one is still a malformed
+        # offer.  Absent on offers that are not group files, and on
+        # offers from older peers.
+        result["group"] = _clean_hexhash(payload.get("group"), "group")
     return result
 
 

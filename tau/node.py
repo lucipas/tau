@@ -72,7 +72,7 @@ from .group_invites import (
 )
 from .broadcasts import BroadcastStore
 from .groups import GroupStore, pinned_group
-from .group_polls import PostError, clean_poll_options
+from .group_polls import PostError, clean_poll_options, is_group_poll, poll_identity
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -268,6 +268,12 @@ def _group_announcements_blocks_post(
     and reactions, retracts and edits travel on separate request
     types, so they are unaffected.  A group with no recorded setting
     reads as open.
+
+    The exemption covers the vote itself, not whatever rides with
+    it: a vote marker must not smuggle a post past the receive
+    check, so the receive paths strip a member's vote down to the
+    vote before storing it (see
+    :meth:`TauNode._announcements_vote_text`).
     """
     return bool(
         group.get("announcements_only")
@@ -3107,6 +3113,26 @@ class TauNode:
                 "not_allowed",
                 "group is announcements-only: only the creator can post",
             )
+        if (
+            group.get("announcements_only")
+            and (caller_hash or "").lower() != (group.get("creator") or "").lower()
+            and (
+                message.get("poll_vote") is not None
+                or message.get("poll_close") is not None
+            )
+        ):
+            # A member's vote or close is not a post, so it passes —
+            # but only as a vote: strip whatever text, pin or quote
+            # rode with the marker before the record is built, or the
+            # exemption smuggles a post into the group.
+            message["text"] = self._announcements_vote_text(
+                group["id"],
+                message.get("poll_vote"),
+                message.get("poll_close"),
+            )
+            message["location"] = None
+            message["beacon"] = None
+            message["in_reply_to"] = None
 
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
@@ -3371,6 +3397,35 @@ class TauNode:
                 "this node does not accept files "
                 "(see `tau config accept-files on`)",
             )
+        if not media_fetch and offer.get("group") is not None:
+            # The offer names its group inside the signed payload, so
+            # the receiver can enforce group policy itself instead of
+            # trusting the sender's send-side refusal: a member's file
+            # to an announcements-only group is refused here, before
+            # any bytes move.  An unknown group cannot be checked, so
+            # it is accepted — the group may simply predate this
+            # node's copy of it.  Media fetches skip this: they are
+            # answers to an explicit request, not group posts.
+            try:
+                named_group = self.groups.find(offer["group"])
+            except (ValueError, OSError):
+                named_group = None
+            if (
+                named_group is not None
+                and named_group.get("announcements_only")
+                and sender_hash.lower()
+                != (named_group.get("creator") or "").lower()
+            ):
+                log.info(
+                    "File offer from %s refused: group %s is "
+                    "announcements-only and the sender is not its creator",
+                    sender_hash[:8],
+                    named_group["id"][:8],
+                )
+                return response_error(
+                    "not_allowed",
+                    "group is announcements-only: only the creator can post",
+                )
         self._prune_file_offers()
         with self._file_offers_lock:
             pending = list(self._pending_file_offers.values())
@@ -5525,6 +5580,55 @@ class TauNode:
             float(ann_at) if isinstance(ann_at, (int, float)) else None,
         )
 
+    def _announcements_vote_text(
+        self,
+        group_id: str,
+        poll_vote: Optional[Dict[str, Any]],
+        poll_close: Optional[Dict[str, Any]],
+    ) -> str:
+        """Display text for a member's vote or close in an announcements-only group.
+
+        A vote is not a post, but its marker must not smuggle one
+        in: a member can attach a valid vote to arbitrary text, a
+        pin, or a quote, and the receive check lets the marker
+        through.  So the stored copy is rewritten to the vote
+        itself — the canonical ``voted: <option>`` rendering when
+        the poll is known locally (and ``closed the poll`` for a
+        close), empty when it is not — and the pin and quote are
+        dropped by the caller.  The tally reads ``poll_vote`` /
+        ``poll_close``, never this text, so the vote still counts
+        exactly like a direct one.
+        """
+        if poll_close is not None:
+            return "closed the poll"
+        if poll_vote is None:
+            return ""
+        target = poll_vote.get("target") or {}
+        author = target.get("author")
+        sent_at = target.get("sent_at")
+        if not isinstance(author, str) or not isinstance(sent_at, (int, float)):
+            return ""
+        try:
+            history = self.inbox.list_messages(
+                limit=None, group=group_id, direction=None
+            )
+        except Exception:
+            return ""
+        for record in history:
+            if not is_group_poll(record):
+                continue
+            identity = poll_identity(record, self.destination_hexhash)
+            if identity is None:
+                continue
+            if identity[0] != author.lower() or identity[1] != float(sent_at):
+                continue
+            options = record.get("poll_options") or []
+            option = poll_vote.get("option")
+            if isinstance(option, int) and 0 <= option < len(options):
+                return f"voted: {options[option]}"
+            return ""
+        return ""
+
     def _deliver_entry(
         self,
         peer: Peer,
@@ -5618,6 +5722,26 @@ class TauNode:
                     entry.id,
                     fresh.group_id,
                 )
+                # A skip that records nothing leaves next_attempt_at
+                # untouched, so the sweep re-checks this leg every
+                # round until its TTL.  Record the skip as a failed
+                # attempt, so the backoff moves it out of the way
+                # while the leg stays queued for a later lift.
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id,
+                        error=(
+                            "group is announcements-only: only the creator "
+                            "can post"
+                        ),
+                        timeout=_remaining(deadline),
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record skipped delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
                 return False
             try:
                 payload = encode_group_message(
@@ -5736,6 +5860,19 @@ class TauNode:
             if isinstance(exc, PeerRefusedError) or not self._still_queued(
                 entry.id, timeout=_remaining(deadline)
             ):
+                # A group leg refused as not-allowed is a policy
+                # refusal, like not-a-member: the group will not take
+                # this post, so drop the leg instead of holding it
+                # until its TTL.  (A non-group refusal still records
+                # an attempt below and stays queued.)
+                if isinstance(exc, NotAllowedError) and entry.group_id is not None:
+                    log.warning(
+                        "Dropping queued group message %s: %s", entry.id, exc
+                    )
+                    self._remove_queued_version(
+                        entry.id, text=send_text, edited_at=send_edited_at
+                    )
+                    return False
                 # A cancel may have landed while the direct request was in
                 # flight; do not start a fresh send for a cancelled entry.
                 try:
@@ -5913,6 +6050,25 @@ class TauNode:
                     entry.id,
                     fresh.group_id,
                 )
+                # Same as the delivery skip: record the skip as a
+                # failed attempt, so the backoff moves the leg out of
+                # the sweep's way while it stays queued for a later
+                # lift, instead of re-checking it every round.
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id,
+                        error=(
+                            "group is announcements-only: only the creator "
+                            "can post"
+                        ),
+                        timeout=_remaining(deadline),
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record skipped deposit attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
                 return False
         if self.identity is None:
             return False
@@ -5977,6 +6133,9 @@ class TauNode:
                 beacon=fresh.beacon,
                 kind=getattr(fresh, "kind", None),
                 edited_at=fresh.edited_at,
+                poll_options=fresh.poll_options,
+                poll_vote=fresh.poll_vote,
+                poll_close=fresh.poll_close,
             )
             payload = build_mail_store(
                 to=fresh.to_hex,
@@ -6444,9 +6603,7 @@ class TauNode:
             ):
                 # Same rule as the live path: a member's post to an
                 # announcements-only group does not land, even from a
-                # holder.  (Sealed envelopes carry no poll fields
-                # today, so the vote exemption is for symmetry with
-                # the live path, not a case that can fire yet.)
+                # holder.
                 log.info(
                     "Dropping relayed group message from %s: group %s is "
                     "announcements-only and the sender is not its creator",
@@ -6454,6 +6611,25 @@ class TauNode:
                     pinned["id"],
                 )
                 return False
+            if (
+                pinned.get("announcements_only")
+                and (sender or "").lower() != (pinned.get("creator") or "").lower()
+                and (
+                    message.get("poll_vote") is not None
+                    or message.get("poll_close") is not None
+                )
+            ):
+                # Same as the live path: a member's vote or close
+                # passes, but only as a vote — strip whatever text,
+                # pin or quote rode with the marker.
+                message["text"] = self._announcements_vote_text(
+                    pinned["id"],
+                    message.get("poll_vote"),
+                    message.get("poll_close"),
+                )
+                message["location"] = None
+                message["beacon"] = None
+                message["in_reply_to"] = None
         record = {
             "from": message["from_name"],
             "destination": message["from"],
@@ -6476,6 +6652,12 @@ class TauNode:
             record["location"] = message["location"]
         if message.get("beacon") is not None:
             record["beacon"] = message["beacon"]
+        if message.get("poll_options") is not None:
+            record["poll_options"] = message["poll_options"]
+        if message.get("poll_vote") is not None:
+            record["poll_vote"] = message["poll_vote"]
+        if message.get("poll_close") is not None:
+            record["poll_close"] = message["poll_close"]
         if message.get("edited_at") is not None:
             # A relayed copy of an edited leg carries the edit's send
             # time inside its signed envelope: the record starts life
@@ -8252,6 +8434,7 @@ class TauNode:
         discover_timeout: Optional[float],
         limit_label: str,
         forwarded_from: Optional[Dict[str, Any]] = None,
+        group_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], bool]:
         """Fan already-read file bytes out to *members*, one transfer each.
 
@@ -8303,6 +8486,7 @@ class TauNode:
                     discover_timeout=leg_discover,
                     deadline=deadline,
                     forwarded_from=forwarded_from,
+                    group=group_id,
                 )
                 results.append(
                     {
@@ -8384,6 +8568,7 @@ class TauNode:
             discover_timeout=discover_timeout,
             limit_label="group send",
             forwarded_from=forwarded_from,
+            group_id=group["id"],
         )
         return {
             "ok": all_ok,
@@ -8495,13 +8680,17 @@ class TauNode:
         progress_callback: Optional[Callable[[float], None]] = None,
         deadline: Optional[float] = None,
         forwarded_from: Optional[Dict[str, Any]] = None,
+        group: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Send already-read file bytes to a peer over an RNS Resource.
 
         The shared transfer body for ``send_file`` and
         ``send_group_file``: the fan-out reads the file once so every
         leg carries identical bytes.  ``deadline`` bounds the whole
-        transfer — see ``send_file``.
+        transfer — see ``send_file``.  ``group`` names the group the
+        file is posted to, when it is one: it rides inside the signed
+        offer, so the receiver can enforce group policy before any
+        bytes move.
         """
         if self.identity is None:
             raise NodeError("node has not been started")
@@ -8525,6 +8714,7 @@ class TauNode:
             size=len(data),
             sha256=digest,
             forwarded_from=forwarded_from,
+            group=group,
         )
         link = self._open_link(peer, min(timeout, 30.0), deadline=deadline)
         try:
