@@ -932,12 +932,22 @@ the edit is newer than the last one applied, so a replayed older edit
 cannot rewind a newer one and a retried edit is safe. The stored text is
 replaced and the message is marked edited (`edited_at`); `tau messages`
 shows an `(edited)` marker, and only the latest text is kept — there is
-no edit history. A group message is refused: group messages have a
-different id on every member's copy, so one edit cannot name them all.
+no edit history. A group message fans out instead: the same signed edit
+goes to every member, carrying the signed group context (group, author,
+shared send time) so each member resolves its own copy even though legs
+carry different wire ids.
 
-Edits are delivered live in v1, like reactions: the peer must be online.
-A peer running a version that predates edits rejects the unknown path,
-so an edit to an old peer fails instead of silently succeeding.
+An offline peer queues the edit instead of failing: the signed bytes
+wait in the outbox and the mail sweep delivers them when the peer is
+heard from again, and the sender's own copies update on delivery — for
+a group edit, when the last queued leg for it delivers, so the local
+copies only ever change on a full fan-out. A newer edit of the same
+message supersedes a still-queued one. Refusals never queue (allow-list,
+block-list, not a member), and `tau edit --no-queue` keeps the fail-fast
+behaviour. Queued edits ride direct delivery only: no sealed-relay copy,
+no bundle export, no LXMF. A peer running a version that predates edits
+rejects the unknown path, so an edit to an old peer fails instead of
+silently succeeding.
 
 ### Sneakernet bundles
 

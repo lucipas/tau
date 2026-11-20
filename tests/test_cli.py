@@ -10593,9 +10593,13 @@ def test_parser_edit_arguments():
     assert args.command == "edit"
     assert args.target == "abcdef12"
     assert args.text == "fixed text"
+    assert args.no_queue is False
 
     from_stdin = parser.parse_args(["edit", "abcdef12"])
     assert from_stdin.text is None
+
+    no_queue = parser.parse_args(["edit", "--no-queue", "abcdef12", "fixed"])
+    assert no_queue.no_queue is True
 
 
 def test_edit_sends_to_the_message_recipient(tmp_path, capsys, monkeypatch):
@@ -10609,7 +10613,35 @@ def test_edit_sends_to_the_message_recipient(tmp_path, capsys, monkeypatch):
     assert "edited your message to alice" in out
     node = _FakeReactNode.instances[0]
     assert node.started is False
-    assert node.edited == [(recipient_hash.hex(), "m-1", "fixed here")]
+    assert node.edited == [(recipient_hash.hex(), "m-1", "fixed here", True)]
+
+
+def test_edit_queues_for_offline_peer(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    monkeypatch.setattr(_FakeReactNode, "edit_queued", True)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "fixed here"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "queued" in out
+    assert "reachable" in out
+    node = _FakeReactNode.instances[0]
+    assert node.edited == [(sender_hash.hex(), "m-1", "fixed here", True)]
+
+
+def test_edit_no_queue_flag_passes_through(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["edit", "--no-queue", "--data-dir", str(data_dir), "m-1", "fixed here"]
+    )
+    assert code == 0
+    node = _FakeReactNode.instances[0]
+    assert node.edited == [(sender_hash.hex(), "m-1", "fixed here", False)]
 
 
 def test_edit_json(tmp_path, capsys, monkeypatch):
@@ -11165,8 +11197,9 @@ def test_edit_sends_group_edit_to_every_member(
             timeout=20.0,
             discover_timeout=None,
             target_sent_at=None,
+            queue=True,
         ):
-            self.sent.append((group, message_id, text, target_sent_at))
+            self.sent.append((group, message_id, text, target_sent_at, queue))
             return {
                 "ok": True,
                 "group": group,
@@ -11194,7 +11227,127 @@ def test_edit_sends_group_edit_to_every_member(
     assert "alice" in out
     node = _FakeRetractNode.instances[0]
     assert node.started is False
-    assert node.sent == [("ab" * 16, "m-10", "group fixed", 100.0)]
+    assert node.sent == [("ab" * 16, "m-10", "group fixed", 100.0, True)]
+
+
+def test_edit_group_reports_queued_leg(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_sent_group_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    bob_identity = RNS.Identity()
+    bob_hash = destination_hash(bob_identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        bob_hash, bob_identity.get_public_key(), name="bob", now=100.0
+    )
+    registry.save()
+
+    class _QueuedLegNode(_FakeRetractNode):
+        def send_group_edit(
+            self,
+            group,
+            message_id,
+            text,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+            queue=True,
+        ):
+            self.sent.append((group, message_id, text, target_sent_at, queue))
+            return {
+                "ok": False,
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": [],
+                "queued": 1,
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "edited": True,
+                        "id": "e-1",
+                    },
+                    {
+                        "to": bob_hash.hex(),
+                        "to_name": "bob",
+                        "queued": True,
+                        "queued_id": "q-1",
+                        "id": "e-1",
+                    },
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _QueuedLegNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "group fixed"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited your group message" in out
+    assert "edit queued for bob" in out
+    node = _FakeRetractNode.instances[0]
+    assert node.sent == [("ab" * 16, "m-10", "group fixed", 100.0, True)]
+
+
+def test_edit_group_all_queued_reports_queued(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_sent_group_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    bob_identity = RNS.Identity()
+    bob_hash = destination_hash(bob_identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        bob_hash, bob_identity.get_public_key(), name="bob", now=100.0
+    )
+    registry.save()
+
+    class _AllQueuedNode(_FakeRetractNode):
+        def send_group_edit(
+            self,
+            group,
+            message_id,
+            text,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+            queue=True,
+        ):
+            self.sent.append((group, message_id, text, target_sent_at, queue))
+            return {
+                "ok": False,
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": [],
+                "queued": 2,
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "queued": True,
+                        "queued_id": "q-1",
+                        "id": "e-1",
+                    },
+                    {
+                        "to": bob_hash.hex(),
+                        "to_name": "bob",
+                        "queued": True,
+                        "queued_id": "q-2",
+                        "id": "e-1",
+                    },
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _AllQueuedNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "group fixed"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edit queued for alice" in out
+    assert "edit queued for bob" in out
 
 
 def test_edit_reports_deferred_scheduled_member(
@@ -11212,8 +11365,9 @@ def test_edit_reports_deferred_scheduled_member(
             timeout=20.0,
             discover_timeout=None,
             target_sent_at=None,
+            queue=True,
         ):
-            self.sent.append((group, message_id, text, target_sent_at))
+            self.sent.append((group, message_id, text, target_sent_at, queue))
             return {
                 "ok": True,
                 "group": group,
@@ -11258,8 +11412,9 @@ def test_edit_keeps_group_copy_when_a_member_is_unreachable(
             timeout=20.0,
             discover_timeout=None,
             target_sent_at=None,
+            queue=True,
         ):
-            self.sent.append((group, message_id, text, target_sent_at))
+            self.sent.append((group, message_id, text, target_sent_at, queue))
             return {
                 "ok": False,
                 "group": group,
@@ -11311,8 +11466,9 @@ def test_edit_reports_when_the_local_copy_could_not_update(
             timeout=20.0,
             discover_timeout=None,
             target_sent_at=None,
+            queue=True,
         ):
-            self.sent.append((group, message_id, text, target_sent_at))
+            self.sent.append((group, message_id, text, target_sent_at, queue))
             return {
                 "ok": False,
                 "local_errors": ["sent copy not updated: disk full"],
@@ -11450,6 +11606,8 @@ class _FakeReactNode:
     instances = []
     # Tests may override the fan-out results (monkeypatch restores it).
     group_results = None
+    # Tests may force the DM path to report a queued edit.
+    edit_queued = False
     # The local node's identity hash, as TauNode.destination_hexhash.
     destination_hexhash = "ef" * 16
 
@@ -11520,9 +11678,24 @@ class _FakeReactNode:
         }
 
     def send_edit(
-        self, target, message_id, text, *, timeout=20.0, discover_timeout=None
+        self,
+        target,
+        message_id,
+        text,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        queue=True,
     ):
-        self.edited.append((target, message_id, text))
+        self.edited.append((target, message_id, text, queue))
+        if type(self).edit_queued:
+            return {
+                "ok": False,
+                "queued": True,
+                "target": message_id,
+                "id": "e-1",
+                "queued_id": "q-1",
+            }
         return {"ok": True, "edited": True, "target": message_id, "id": "e-1"}
 
 

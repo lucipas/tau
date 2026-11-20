@@ -303,6 +303,77 @@ def _is_hex(value: str) -> bool:
     return True
 
 
+def clean_queued_edit(raw: Any) -> Optional[Dict[str, Any]]:
+    """Validate one queued edit, or ``None`` when it is unusable.
+
+    A queued edit is the pre-signed ``/tau/dm/edit`` payload a retry
+    re-sends verbatim: the target wire id, the replacement text, the
+    signed edit id and send time, the group context (author and send
+    time of the edited copy, when the target is a group message), and
+    the signed bytes as base64.  A corrupt value drops the edit — the
+    entry keeps kind "edit" and ``_deliver_entry`` drops it instead of
+    ever sending the display text as chat.
+    """
+    if not isinstance(raw, dict):
+        return None
+    target = raw.get("target")
+    if not isinstance(target, str) or not target or len(target) > 64:
+        return None
+    text = raw.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    edit_id = raw.get("edit_id")
+    if not isinstance(edit_id, str) or not edit_id:
+        return None
+    sent_at = raw.get("sent_at")
+    if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+        return None
+    try:
+        sent_at = float(sent_at)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(sent_at):
+        return None
+    payload_b64 = raw.get("payload_b64")
+    if not isinstance(payload_b64, str) or not payload_b64:
+        return None
+    try:
+        base64.b64decode(payload_b64, validate=True)
+    except Exception:
+        return None
+    target_author = raw.get("target_author")
+    if target_author is not None and (
+        not isinstance(target_author, str)
+        or len(target_author) != 32
+        or not _is_hex(target_author)
+    ):
+        return None
+    target_sent_at = raw.get("target_sent_at")
+    if target_sent_at is not None:
+        if isinstance(target_sent_at, bool) or not isinstance(
+            target_sent_at, (int, float)
+        ):
+            return None
+        try:
+            target_sent_at = float(target_sent_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(target_sent_at):
+            return None
+    cleaned: Dict[str, Any] = {
+        "target": target,
+        "text": text,
+        "edit_id": edit_id,
+        "sent_at": sent_at,
+        "payload_b64": payload_b64,
+    }
+    if target_author is not None:
+        cleaned["target_author"] = target_author.lower()
+    if target_sent_at is not None:
+        cleaned["target_sent_at"] = target_sent_at
+    return cleaned
+
+
 class MailboxError(RuntimeError):
     """Raised when a mailbox or sealed-message operation fails."""
 
@@ -379,6 +450,15 @@ class OutboxEntry:
     poll_options: Optional[List[str]] = None
     poll_vote: Optional[Dict[str, Any]] = None
     poll_close: Optional[Dict[str, Any]] = None
+    # Queued-edit context: when present, this entry is an edit of a DM
+    # or group message, not chat — a retry re-sends the same pre-signed
+    # ``/tau/dm/edit`` bytes (see ``TauNode.send_edit``), so the edit
+    # id and signed send time never change across retries.  The
+    # entry's ``text`` is the replacement text; ``kind`` is "edit",
+    # and an edit entry never carries poll, location, beacon or reply
+    # fields.  Shape: {"target", "text", "edit_id", "sent_at",
+    # "target_author"?, "target_sent_at"?, "payload_b64"}.
+    edit: Optional[Dict[str, Any]] = None
 
     @property
     def to_hex(self) -> str:
@@ -469,6 +549,8 @@ class OutboxEntry:
             payload["poll_vote"] = dict(self.poll_vote)
         if self.poll_close is not None:
             payload["poll_close"] = dict(self.poll_close)
+        if self.edit is not None:
+            payload["edit"] = dict(self.edit)
         return payload
 
     @classmethod
@@ -609,6 +691,10 @@ class OutboxEntry:
             for field in (poll_options, poll_vote, poll_close)
         ) > 1:
             poll_options = poll_vote = poll_close = None
+        # A corrupt edit drops the payload but keeps kind "edit", so
+        # the entry is dropped at delivery instead of ever sending its
+        # display text as chat.
+        edit = clean_queued_edit(raw.get("edit"))
         # A corrupt pin on an already-queued entry must not make the
         # outbox unreadable; the message still delivers, just without it.
         location = clean_location(raw.get("location"))
@@ -651,6 +737,7 @@ class OutboxEntry:
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            edit=edit,
         )
 
 
@@ -1380,6 +1467,7 @@ class Mailbox:
         poll_options: Optional[List[str]] = None,
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
+        edit: Optional[Dict[str, Any]] = None,
     ) -> OutboxEntry:
         """Queue *text* for delivery to destination *to*.
 
@@ -1407,6 +1495,12 @@ class Mailbox:
         ``poll_options`` / ``poll_vote`` / ``poll_close`` mark this
         entry as one of a group or DM poll: a retry re-sends the same poll
         payload instead of plain chat.  At most one may be set.
+
+        ``edit`` marks this entry as a queued edit (see
+        ``OutboxEntry.edit``): a retry re-sends the same pre-signed
+        ``/tau/dm/edit`` bytes.  An edit entry carries no poll,
+        location, beacon or reply fields, and its kind is forced to
+        "edit" however the caller tagged it.
         """
         if sum(
             field is not None
@@ -1416,6 +1510,23 @@ class Mailbox:
                 "an outbox entry can carry only one of poll_options, "
                 "poll_vote, poll_close"
             )
+        clean_edit: Optional[Dict[str, Any]] = None
+        if edit is not None:
+            clean_edit = clean_queued_edit(edit)
+            if clean_edit is None:
+                raise MailboxError("invalid queued edit")
+            if (
+                poll_options is not None
+                or poll_vote is not None
+                or poll_close is not None
+                or location is not None
+                or beacon is not None
+                or in_reply_to is not None
+            ):
+                raise MailboxError(
+                    "a queued edit cannot carry poll, location, "
+                    "beacon or reply fields"
+                )
         clean_options: Optional[List[str]] = None
         if poll_options is not None:
             clean_options = _clean_group_poll_options_or_none(poll_options)
@@ -1439,7 +1550,11 @@ class Mailbox:
             raise MailboxError("destination hash must be 16 bytes")
         timestamp = now if now is not None else time.time()
         clean_text = normalize_message(text)
-        clean_kind = normalize_message_kind(kind)
+        clean_kind = (
+            "edit"
+            if clean_edit is not None
+            else normalize_message_kind(kind)
+        )
         entry_id = message_id or generate_message_id()
         group_id: Optional[str] = None
         group_name = ""
@@ -1584,6 +1699,7 @@ class Mailbox:
                 poll_options=clean_options,
                 poll_vote=clean_vote,
                 poll_close=clean_close,
+                edit=clean_edit,
             )
             self._outbox[entry.id] = entry
             self.save()

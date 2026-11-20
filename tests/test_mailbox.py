@@ -138,6 +138,111 @@ def test_enqueue_rejects_invalid_kind(tmp_path):
         box.enqueue(to=BOB, text="hello", kind="has space")
 
 
+def _edit_payload(**overrides):
+    payload = {
+        "target": "m-1",
+        "text": "fixed here",
+        "edit_id": "e-1",
+        "sent_at": 1000.0,
+        "payload_b64": base64.b64encode(b"signed-edit-bytes").decode("ascii"),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_enqueue_edit_entry_round_trips(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(
+        to=BOB,
+        text="fixed here",
+        to_name="bob",
+        now=1000.0,
+        sent_at=1000.0,
+        edited_at=1000.0,
+        edit=_edit_payload(),
+    )
+    assert entry.kind == "edit"
+    assert entry.edit["target"] == "m-1"
+    assert entry.edit["text"] == "fixed here"
+    assert entry.edit["edit_id"] == "e-1"
+    assert entry.edit["payload_b64"] == _edit_payload()["payload_b64"]
+
+    reloaded = Mailbox(path)
+    again = reloaded.outbox_list()[0]
+    assert again.kind == "edit"
+    assert again.edit == entry.edit
+
+
+def test_enqueue_edit_forces_edit_kind(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB, text="fixed here", kind="chat", edit=_edit_payload()
+    )
+    assert entry.kind == "edit"
+
+
+def test_enqueue_edit_rejects_invalid_payload(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError):
+        box.enqueue(to=BOB, text="fixed here", edit={"target": "m-1"})
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="fixed here",
+            edit=_edit_payload(payload_b64="!!!not-base64"),
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB, text="fixed here", edit=_edit_payload(target_author="xyz")
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB, text="fixed here", edit=_edit_payload(text="   ")
+        )
+
+
+def test_enqueue_edit_rejects_combined_fields(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="fixed here",
+            edit=_edit_payload(),
+            poll_options=["a", "b"],
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="fixed here",
+            edit=_edit_payload(),
+            location={"lat": 1.0, "lon": 2.0},
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="fixed here",
+            edit=_edit_payload(),
+            in_reply_to={"id": "m-0", "excerpt": "00" * 8},
+        )
+
+
+def test_reload_drops_corrupt_edit_but_keeps_edit_kind(tmp_path):
+    # A hand-edited or corrupt payload must never turn the entry into
+    # a text message: the kind stays "edit" so delivery drops it
+    # instead of sending the display text as chat.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="fixed here", now=1000.0, edit=_edit_payload())
+    raw = json.loads(path.read_text())
+    raw["outbox"][0]["edit"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+
+    entry = Mailbox(path).outbox_list()[0]
+    assert entry.kind == "edit"
+    assert entry.edit is None
+
+
 def test_outbox_entry_without_kind_loads_as_chat(tmp_path):
     path = tmp_path / "mailbox.json"
     box = Mailbox(path)

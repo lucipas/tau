@@ -1246,6 +1246,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
+    edit.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing when the peer is offline",
+    )
     edit.set_defaults(func=cmd_edit)
 
     ping = subparsers.add_parser(
@@ -13136,6 +13141,7 @@ def _edit_local_message(
     text: str,
     timeout: float = 20.0,
     discover_timeout: Optional[float] = None,
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Edit one DM on the running node, for the local send server."""
     return node.send_edit(
@@ -13144,6 +13150,7 @@ def _edit_local_message(
         text,
         timeout=float(timeout),
         discover_timeout=discover_timeout,
+        queue=bool(queue),
     )
 
 
@@ -13157,6 +13164,7 @@ def _edit_group_local_message(
     timeout: float = 20.0,
     leg_timeout: Optional[float] = None,
     discover_timeout: Optional[float] = None,
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Edit one group message on the running node, for the local send server.
 
@@ -13174,6 +13182,7 @@ def _edit_group_local_message(
         timeout=float(leg_timeout if leg_timeout is not None else timeout),
         discover_timeout=discover_timeout,
         target_sent_at=float(target_sent_at),
+        queue=bool(queue),
     )
 
 
@@ -13599,6 +13608,7 @@ def _edit_group_via_running_node(
     *,
     timeout: float,
     discover_timeout: Optional[float],
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Edit a group message through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -13616,6 +13626,7 @@ def _edit_group_via_running_node(
             target_sent_at=target_sent_at,
             leg_timeout=timeout,
             discover_timeout=discover_timeout,
+            queue=queue,
         )
     except LocalIPCUnavailable as exc:
         raise NodeError(
@@ -13679,6 +13690,7 @@ def _edit_via_running_node(
     *,
     timeout: float,
     discover_timeout: Optional[float],
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Edit through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -13693,6 +13705,7 @@ def _edit_via_running_node(
             text=text,
             timeout=timeout,
             discover_timeout=discover_timeout,
+            queue=queue,
         )
     except LocalIPCUnavailable as exc:
         raise NodeError(
@@ -15096,6 +15109,10 @@ def _resolve_reply_target(
         # to the group send, so it must not resolve as a direct reply.
         if entry.group_id is not None:
             continue
+        # A queued edit is not a message: its id names an edit, so it
+        # must not resolve as a reply target either.
+        if getattr(entry, "kind", None) == "edit":
+            continue
         if entry.id.lower().startswith(value):
             candidates.setdefault(
                 entry.id, {"id": entry.id, "text": entry.text}
@@ -15160,6 +15177,10 @@ def _resolve_group_reply_target(
         if entry.group_id != group_id:
             continue
         if entry.id in covered_ids:
+            continue
+        # A queued edit is not a message: its id names an edit, so it
+        # must not resolve as a reply target.
+        if getattr(entry, "kind", None) == "edit":
             continue
         if entry.id.lower().startswith(value):
             candidates.setdefault(
@@ -20817,6 +20838,7 @@ def _edit_group_message(
         )
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    queue = not getattr(args, "no_queue", False)
     via_running_node = _send_routes_via_running_node(config)
     if via_running_node:
         # A serving node owns the data directory: edit through it
@@ -20832,14 +20854,14 @@ def _edit_group_message(
                 float(leg_sent_at),
                 timeout=timeout,
                 discover_timeout=discover_timeout,
+                queue=queue,
             )
         except NodeError as exc:
-            # Edits ride the live link only in v1 — there is no
-            # outbox queue for them yet — so an unreachable member is
-            # a plain failure, not a silent queue.
+            # With queueing on, a transport failure returns queued
+            # legs instead of raising; only a refusal or a
+            # --no-queue failure reaches here.
             raise NodeError(
-                f"could not deliver group edit: {exc} "
-                "(edits need the members online in v1)"
+                f"could not deliver group edit: {exc}"
             ) from exc
     else:
         node = TauNode(config, name=config.name)
@@ -20853,20 +20875,22 @@ def _edit_group_message(
                     timeout=timeout,
                     discover_timeout=discover_timeout,
                     target_sent_at=float(leg_sent_at),
+                    queue=queue,
                 )
             except NodeError as exc:
-                # Edits ride the live link only in v1 — there is no
-                # outbox queue for them yet — so an unreachable member
-                # is a plain failure, not a silent queue.
+                # With queueing on, a transport failure returns queued
+                # legs instead of raising; only a refusal or a
+                # --no-queue failure reaches here.
                 raise NodeError(
-                    f"could not deliver group edit: {exc} "
-                    "(edits need the members online in v1)"
+                    f"could not deliver group edit: {exc}"
                 ) from exc
         finally:
             node.stop()
 
     results = response.get("results") or []
-    failed = [r for r in results if not r.get("delivered")]
+    failed = [
+        r for r in results if not r.get("delivered") and not r.get("queued")
+    ]
     if _json_mode(args):
         _emit(
             {
@@ -20904,6 +20928,8 @@ def _edit_group_message(
                         f"{_safe_id_prefix(str(target['id']))} "
                         "(unknown message, or a newer edit already applied)"
                     )
+            elif result.get("queued"):
+                print(f"edit queued for {name}")
             else:
                 print(
                     f"could not edit for {name}: "
@@ -21147,6 +21173,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         )
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    queue = not getattr(args, "no_queue", False)
     if _send_routes_via_running_node(config):
         # A serving node owns the data directory: edit through it
         # instead of starting a second Reticulum instance on the same
@@ -21160,15 +21187,13 @@ def cmd_edit(args: argparse.Namespace) -> int:
                 cleaned,
                 timeout=timeout,
                 discover_timeout=discover_timeout,
+                queue=queue,
             )
         except NodeError as exc:
-            # Edits ride the live link only in v1 — there is no
-            # outbox queue for them yet — so an unreachable peer is a
-            # plain failure, not a silent queue.
-            raise NodeError(
-                f"could not deliver edit: {exc} "
-                "(edits need the peer online in v1)"
-            ) from exc
+            # With queueing on, a transport failure returns a queued
+            # result instead of raising; only a refusal or a
+            # --no-queue failure reaches here.
+            raise NodeError(f"could not deliver edit: {exc}") from exc
     else:
         node = TauNode(config, name=config.name)
         node.start()
@@ -21180,20 +21205,37 @@ def cmd_edit(args: argparse.Namespace) -> int:
                     cleaned,
                     timeout=timeout,
                     discover_timeout=discover_timeout,
+                    queue=queue,
                 )
             except NodeError as exc:
-                # Edits ride the live link only in v1 — there is no
-                # outbox queue for them yet — so an unreachable peer is a
-                # plain failure, not a silent queue.
-                raise NodeError(
-                    f"could not deliver edit: {exc} "
-                    "(edits need the peer online in v1)"
-                ) from exc
+                # With queueing on, an unreachable peer returns a queued
+                # result instead of raising; only a refusal or a
+                # --no-queue failure reaches here.
+                raise NodeError(f"could not deliver edit: {exc}") from exc
         finally:
             node.stop()
 
     peer = registry.get(author)
     name = peer.display_name if peer is not None else target.get("from") or author
+    if response.get("queued"):
+        if _json_mode(args):
+            _emit(
+                {
+                    "target": target["id"],
+                    "to": author,
+                    "to_name": name,
+                    "text": cleaned,
+                    "queued": True,
+                    "queued_id": response.get("queued_id"),
+                    "id": response.get("id"),
+                },
+                True,
+            )
+        else:
+            print(
+                f"edit queued — will deliver when {name} is reachable"
+            )
+        return _EXIT_OK
     if _json_mode(args):
         _emit(
             {
