@@ -61,6 +61,8 @@ let membersByList: Record<
 > = {};
 /** When set, members requests for `list` wait for `promise` before resolving. */
 let membersHold: { list: string; promise: Promise<void> } | null = null;
+/** When set, POST /api/tan/lists/remove waits for this promise. */
+let removeHold: Promise<void> | null = null;
 let following: { author: string; name: string; posts: number }[] = [];
 
 function makeScheduled(
@@ -94,6 +96,7 @@ beforeEach(() => {
   listMembers = [];
   membersByList = {};
   membersHold = null;
+  removeHold = null;
   following = [];
   const router = mockFetch((url, method) => {
     if (url.includes("/api/tan/timeline")) return { posts: timeline, count: timeline.length };
@@ -143,6 +146,9 @@ beforeEach(() => {
         return { ok: true, draft: makeDraft(99, "saved draft") };
       }
       return { drafts, count: drafts.length };
+    }
+    if (url.includes("/api/tan/lists/remove") && method === "POST" && removeHold) {
+      return removeHold.then(() => ({ ok: true }));
     }
     return { ok: true };
   });
@@ -305,6 +311,37 @@ describe("SocialSection", () => {
     expect(await screen.findByText("dave")).toBeTruthy();
     // Let the stale Friends response land: it must not appear under Mesh crew.
     release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await waitFor(() => expect(screen.getByText("dave")).toBeTruthy());
+    expect(screen.queryByText("carol")).toBeNull();
+  });
+
+  it("a pending remove never hides the list opened after it", async () => {
+    lists = [
+      { name: "Friends", created_at: 1000, members: 1 },
+      { name: "Mesh crew", created_at: 1001, members: 1 },
+    ];
+    membersByList = {
+      Friends: [{ author: "c".repeat(64), name: "carol", added_at: 1000, posts: 2 }],
+      "Mesh crew": [{ author: "d".repeat(64), name: "dave", added_at: 1001, posts: 1 }],
+    };
+    // Hold the remove request back until the test releases it.
+    let releaseRemove!: () => void;
+    removeHold = new Promise<void>((resolve) => {
+      releaseRemove = resolve;
+    });
+    renderSocial();
+    await screen.findByText(/hello/);
+    fireEvent.click(screen.getByRole("button", { name: "Lists" }));
+    const membersButtons = await screen.findAllByRole("button", { name: "Members" });
+    fireEvent.click(membersButtons[0]);
+    expect(await screen.findByText("carol")).toBeTruthy();
+    // Start removing carol, then switch to Mesh crew before it finishes.
+    fireEvent.click(screen.getByRole("button", { name: "Remove carol from Friends" }));
+    fireEvent.click(membersButtons[1]);
+    expect(await screen.findByText("dave")).toBeTruthy();
+    // Let the stale remove's reload run: Mesh crew's panel must stay open.
+    releaseRemove();
     await new Promise((resolve) => setTimeout(resolve, 0));
     await waitFor(() => expect(screen.getByText("dave")).toBeTruthy());
     expect(screen.queryByText("carol")).toBeNull();

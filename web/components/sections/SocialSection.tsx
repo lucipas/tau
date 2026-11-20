@@ -767,6 +767,9 @@ function ListsView({
 }) {
   const [newName, setNewName] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
+  /** Synchronous mirror of `expanded`: async callbacks read this, not the
+   *  state captured in their closure, to know which list is open now. */
+  const expandedRef = useRef<string | null>(null);
   const [members, setMembers] = useState<TanListMember[]>([]);
   /** Which list the rows in `members` belong to; null until the first load. */
   const [membersFor, setMembersFor] = useState<string | null>(null);
@@ -780,6 +783,10 @@ function ListsView({
   const [error, setError] = useState<string | null>(null);
 
   async function loadMembers(name: string) {
+    // A reload for a list the user has already left must not touch the
+    // member state: it would clear the newly expanded list's rows and
+    // leave its panel hidden. The list reloads when it is reopened.
+    if (expandedRef.current !== name) return;
     // Invalidate any earlier load: its response must not land under this list.
     const seq = ++loadSeq.current;
     // Clear the previous list's rows at once, so they never render under
@@ -802,9 +809,11 @@ function ListsView({
 
   function toggleMembers(name: string) {
     if (expanded === name) {
+      expandedRef.current = null;
       setExpanded(null);
       return;
     }
+    expandedRef.current = name;
     setExpanded(name);
     setAddPick("");
     setAddText("");
@@ -831,7 +840,10 @@ function ListsView({
     try {
       await onDeleteList(name);
       setConfirmDelete(null);
-      if (expanded === name) setExpanded(null);
+      if (expanded === name) {
+        expandedRef.current = null;
+        setExpanded(null);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
