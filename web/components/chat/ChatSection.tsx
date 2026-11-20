@@ -342,7 +342,19 @@ export default function ChatSection() {
       if (editing) {
         const id = editing.id;
         setEditing(null);
-        await run("Edit failed", () => editMessage(id, text));
+        setEditNotice(null);
+        let queued = false;
+        const ok = await run("Edit failed", async () => {
+          const response = (await editMessage(id, text)) as { queued?: boolean } | null;
+          queued = response?.queued === true;
+        });
+        // A queued edit is accepted but not yet delivered: the message
+        // keeps its old text here until the outbox delivers it.
+        if (ok && queued) {
+          setEditNotice(
+            "Edit queued — the peer is offline. It goes out when they are reachable, and the message keeps its old text until then.",
+          );
+        }
         return;
       }
       const target = selected.kind === "group" ? { group: selected.key } : { to: selected.key };
@@ -599,6 +611,14 @@ export default function ChatSection() {
           <p role="alert" className="border-b border-red-900/60 bg-red-950/60 px-3 py-1.5 text-xs text-red-300">
             {error}
             <button type="button" onClick={() => setError(null)} className="ml-2 underline">
+              Dismiss
+            </button>
+          </p>
+        )}
+        {editNotice && (
+          <p role="status" className="border-b border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300">
+            {editNotice}
+            <button type="button" onClick={() => setEditNotice(null)} className="ml-2 underline">
               Dismiss
             </button>
           </p>
