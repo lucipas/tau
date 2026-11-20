@@ -18723,7 +18723,9 @@ def test_forward_message_endpoint_forwards_received_file(
     assert status == 200
     assert payload["ok"] is True
     assert "message" not in payload
-    assert payload["file_message"]["text"] == "Sent file: photo.jpg (12 bytes)"
+    assert payload["file_message"]["text"] == (
+        "Forwarded from alice:\nSent file: photo.jpg (12 bytes)"
+    )
     assert payload["file_response"]["name"] == "photo.jpg"
     assert payload["file_response"]["size"] == 12
     # One leg only: no attribution text goes out, and the offer names
@@ -18756,8 +18758,8 @@ def test_forward_message_endpoint_forwards_received_file_to_group(
     assert payload["ok"] is True
     assert "messages" not in payload
     assert [entry["text"] for entry in payload["file_messages"]] == [
-        "Sent file: photo.jpg (12 bytes)",
-        "Sent file: photo.jpg (12 bytes)",
+        "Forwarded from alice:\nSent file: photo.jpg (12 bytes)",
+        "Forwarded from alice:\nSent file: photo.jpg (12 bytes)",
     ]
     assert payload["file_response"]["ok"] is True
     assert node.group_sent == []
