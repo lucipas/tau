@@ -285,6 +285,27 @@ def test_edit_scheduled_channel_message_rejects_bad_text(tmp_path):
     assert load_scheduled_channel_messages(path).messages[0].text == "later"
 
 
+def test_edit_rejects_text_that_creation_would_reject(tmp_path):
+    # 1,920 four-byte characters pass the old preflight envelope,
+    # which omits the v / expires_at / reply_to fields the publish
+    # pass adds — but fail the full normalized envelope, so the same
+    # text is refused at schedule time too.  The edit must refuse it
+    # as well, or the entry would sit queued for failed retries.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="later", publish_at=2000.0, now=1000.0
+    )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path, channel="general", text="😀" * 1920, publish_at=2000.0, now=1000.0
+        )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(
+            path, entry.id, text="😀" * 1920, now=1500.0
+        )
+    assert load_scheduled_channel_messages(path).messages[0].text == "later"
+
+
 def test_edit_scheduled_channel_message_rejects_bad_time(tmp_path):
     path = tmp_path / "scheduled-channel-messages.json"
     entry = schedule_channel_message(

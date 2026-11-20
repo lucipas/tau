@@ -355,8 +355,16 @@ describe("POST endpoints", () => {
     });
     expect(captured[0].url).toBe("/api/channels/edit-scheduled");
     expect(captured[0].init?.method).toBe("POST");
-    expect(bodyOf(0)).toEqual({ id: "abc123", text: "fixed", sendIn: 3600 });
+    expect(bodyOf(0)).toEqual({ id: "abc123", text: "fixed", send_in: 3600 });
     expect(edited.text).toBe("fixed");
+  });
+
+  it("edits only a scheduled channel message's time", async () => {
+    nextJson = { ok: true, edited: { id: "abc123", text: "later" } };
+    await editScheduledChannelMessage("abc123", { sendIn: 1800 });
+    expect(captured[0].url).toBe("/api/channels/edit-scheduled");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: "abc123", send_in: 1800 });
   });
 
   it("votes and closes a DM poll on the DM routes", async () => {

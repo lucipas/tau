@@ -1310,9 +1310,12 @@ export async function editScheduledChannelMessage(
   id: string,
   patch: { text?: string; sendIn?: number },
 ): Promise<ScheduledChannelMessage> {
+  const body: { id: string; text?: string; send_in?: number } = { id };
+  if (patch.text !== undefined) body.text = patch.text;
+  if (patch.sendIn !== undefined) body.send_in = patch.sendIn;
   const data = await post<{ ok: boolean; edited: ScheduledChannelMessage }>(
     "/api/channels/edit-scheduled",
-    { id, ...patch },
+    body,
   );
   return data.edited;
 }
