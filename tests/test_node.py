@@ -1200,7 +1200,36 @@ def test_deliver_entry_drops_queued_group_leg_when_peer_refuses_not_allowed(
     tmp_path, monkeypatch
 ):
     node, group, alice, bob = _group_reaction_node(tmp_path)
-    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    # The drop fires only when this node's own copy agrees the group
+    # is announcements-only: pin it first.  A vote leg is used because
+    # a member post would be caught by this node's own skip before any
+    # send; votes are exempt from the skip, so the refusal is what
+    # reaches the drop branch.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=200.0,
+        announcements_only=True,
+    )
+    node.mailbox.enqueue(
+        to=bob.destination_hash,
+        text="voted: Sunday",
+        message_id="bob-leg-1",
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": list(group["members"]),
+        },
+        sent_at=100.0,
+        poll_vote={
+            "target": {"author": alice.hexhash, "sent_at": 100.0},
+            "option": 1,
+        },
+    )
     snapshot = node.mailbox.get_outbox("bob-leg-1")
 
     def refused(*args, **kwargs):
@@ -1215,6 +1244,31 @@ def test_deliver_entry_drops_queued_group_leg_when_peer_refuses_not_allowed(
     # is dropped instead of held until its TTL.
     assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
     assert node.mailbox.get_outbox("bob-leg-1") is None
+
+
+def test_deliver_entry_keeps_queued_group_leg_when_refusal_is_stale(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+
+    def refused(*args, **kwargs):
+        raise AnnouncementsOnlyError(
+            "peer rejected the request: group is announcements-only: "
+            "only the creator can post"
+        )
+
+    monkeypatch.setattr(node, "_request", refused)
+    # This node's copy says the group is open, so the recipient's
+    # refusal must be a stale "on" — the creator lifted it, but the
+    # recipient has not pinned the "off" yet.  The leg stays queued
+    # for retry instead of being dropped, or the post would be lost
+    # for good once the recipient catches up.
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    kept = node.mailbox.get_outbox("bob-leg-1")
+    assert kept is not None
+    assert kept.attempts == 1
 
 
 def test_deliver_entry_keeps_queued_group_leg_when_peer_refuses_allow_list(
@@ -1274,7 +1328,34 @@ def test_deliver_entry_drop_on_not_allowed_is_bounded_by_deadline(
     tmp_path, monkeypatch
 ):
     node, group, alice, bob = _group_reaction_node(tmp_path)
-    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    # Pin this node's copy announcements-only first (see the drop
+    # test): a vote leg is what reaches the refusal while the copy
+    # agrees.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=200.0,
+        announcements_only=True,
+    )
+    node.mailbox.enqueue(
+        to=bob.destination_hash,
+        text="voted: Sunday",
+        message_id="bob-leg-1",
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": list(group["members"]),
+        },
+        sent_at=100.0,
+        poll_vote={
+            "target": {"author": alice.hexhash, "sent_at": 100.0},
+            "option": 1,
+        },
+    )
     snapshot = node.mailbox.get_outbox("bob-leg-1")
 
     def refused(*args, **kwargs):

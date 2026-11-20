@@ -3343,6 +3343,115 @@ def test_group_edit_of_ordinary_message_still_applies_when_announcements_only(
     assert entries["gm-plain"]["text"] == "fixed here"
 
 
+def test_group_vote_with_missing_poll_is_refused_cleanly_until_poll_arrives(
+    tmp_path,
+):
+    # A vote whose poll has not arrived yet sanitizes to empty text,
+    # which the inbox cannot store — so the handler answers
+    # storage_failed instead of raising, and the sender retries.  Once
+    # the poll lands, the same vote stores as "voted: Sunday".
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    vote = post(
+        member,
+        "free pizza at my place",
+        message_id="gm-vote",
+        sent_at=130.0,
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+    assert vote["ok"] is False
+    assert vote["error"]["code"] == "storage_failed"
+    assert all(
+        entry["id"] != "gm-vote"
+        for entry in node.inbox.list_messages(group=group_id)
+    )
+    assert post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )["ok"] is True
+    retry = post(
+        member,
+        "free pizza at my place",
+        message_id="gm-vote",
+        sent_at=130.0,
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+    assert retry["ok"] is True
+    assert received[-1]["text"] == "voted: Sunday"
+
+
+def test_group_edit_of_member_vote_with_missing_poll_keeps_stored_text(
+    tmp_path, monkeypatch
+):
+    node, received, post, creator, member, creator_hash, member_hash, group_id = (
+        _announcements_vote_fixture(tmp_path)
+    )
+    assert _member_vote(post, member, member_hash, creator_hash)["ok"] is True
+    assert received[-1]["text"] == "voted: Sunday"
+    # The poll has left local history by edit time, so the vote has no
+    # rendering — but the copy already carries a sanitized one, and the
+    # edit must keep it instead of failing on the empty rendering.
+    monkeypatch.setattr(
+        node, "_announcements_vote_text", lambda *args, **kwargs: ""
+    )
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-vote",
+            "free pizza at my place, ignore the announcement",
+            "gm-edit-1",
+            sent_at=140.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=130.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is True
+    entry = node.inbox.list_messages(group=group_id)[0]
+    assert entry["text"] == "voted: Sunday"
+    assert entry["edited_at"] == 140.0
+
+
 def test_group_message_with_reply_stores_reference(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)

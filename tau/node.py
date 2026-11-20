@@ -3300,6 +3300,19 @@ class TauNode:
                         "storage_failed",
                         "could not authorize group reactions",
                     )
+                except ValueError:
+                    # The inbox needs text: a vote whose poll is not
+                    # known yet sanitizes to empty, so it cannot be
+                    # stored.  Answer cleanly instead of raising —
+                    # the sender retries once the poll arrives.
+                    log.info(
+                        "Group message %s has no recordable text",
+                        message_id,
+                    )
+                    return response_error(
+                        "storage_failed",
+                        "group message could not be stored",
+                    )
                 if not duplicate:
                     for tombstone in voided:
                         if not self._publish_reaction(tombstone):
@@ -4755,7 +4768,17 @@ class TauNode:
                     pinned, caller_hash, record
                 )
                 if canonical is not None:
-                    edit_text = canonical
+                    if canonical:
+                        edit_text = canonical
+                    else:
+                        # The poll has left local history, so the vote
+                        # has no rendering — but the copy already
+                        # carries a sanitized one.  Keep it, and let
+                        # the edit advance edited_at.  (A stored vote
+                        # never shows empty text: the inbox rejects
+                        # empty records at append, so a vote whose poll
+                        # is not known yet is never stored.)
+                        edit_text = record["text"]
             # The ownership and ordering checks above read a snapshot;
             # the inbox repeats them atomically so racing edits cannot
             # apply out of order.  A group leg is identified by its own
@@ -4804,7 +4827,7 @@ class TauNode:
                 self.on_edit(
                     {
                         "target": target_id,
-                        "text": edit_text,
+                        "text": edit_text if edit_text is not None else "",
                         "edited_at": effective_at,
                         "from": caller_name,
                         "destination": caller_hash,
@@ -5663,8 +5686,10 @@ class TauNode:
         through.  So the stored copy is rewritten to the vote
         itself — the canonical ``voted: <option>`` rendering when
         the poll is known locally (and ``closed the poll`` for a
-        close), empty when it is not — and the pin and quote are
-        dropped by the caller.  The tally reads ``poll_vote`` /
+        close), empty when it is not.  An empty rendering is never
+        stored: the inbox needs text, so a vote whose poll is not
+        known yet fails the append and the sender retries once the
+        poll arrives.  The tally reads ``poll_vote`` /
         ``poll_close``, never this text, so the vote still counts
         exactly like a direct one.
         """
@@ -5939,34 +5964,54 @@ class TauNode:
                 # A group leg refused as announcements-only is a policy
                 # refusal, like not-a-member: the group will not take
                 # this post, so drop the leg instead of holding it
-                # until its TTL.  Any other refusal — an allow-list
-                # denial, say, which the recipient may lift later —
-                # is not final for the leg: it records an attempt
-                # below and stays queued.  (The refusal code is
+                # until its TTL.  But the recipient may hold a stale
+                # "on": the creator's lift reaches members only via
+                # the creator's next message, so a recipient that has
+                # not pinned the "off" yet refuses a post the group no
+                # longer restricts.  Drop only when this node's own
+                # copy agrees the group is announcements-only (and
+                # this node is not the creator); otherwise keep the
+                # leg queued like an allow-list denial, so it delivers
+                # once the recipient catches up.  (The refusal code is
                 # distinct — see AnnouncementsOnlyError — so the two
                 # cannot be confused.)
                 if isinstance(exc, AnnouncementsOnlyError) and entry.group_id is not None:
-                    log.warning(
-                        "Dropping queued group message %s: %s", entry.id, exc
+                    announcements = self._current_group_announcements(
+                        entry.group_id
                     )
-                    # Bounded by the remaining delivery deadline: an
-                    # unbounded wait for the mailbox lock would stall
-                    # the flush after the budget expired.  On timeout
-                    # the leg stays queued and a later round drops it.
-                    try:
-                        self._remove_queued_version(
-                            entry.id,
-                            text=send_text,
-                            edited_at=send_edited_at,
-                            timeout=_remaining(deadline),
+                    if (
+                        announcements is not None
+                        and announcements[0]
+                        and self.destination_hexhash.lower()
+                        != (fresh.group_creator or "").lower()
+                    ):
+                        log.warning(
+                            "Dropping queued group message %s: %s", entry.id, exc
                         )
-                    except TimeoutError:
-                        log.debug(
-                            "Could not drop refused queued group message %s: "
-                            "mailbox lock busy; leaving it for a later round",
-                            entry.id,
-                        )
-                    return False
+                        # Bounded by the remaining delivery deadline: an
+                        # unbounded wait for the mailbox lock would stall
+                        # the flush after the budget expired.  On timeout
+                        # the leg stays queued and a later round drops it.
+                        try:
+                            self._remove_queued_version(
+                                entry.id,
+                                text=send_text,
+                                edited_at=send_edited_at,
+                                timeout=_remaining(deadline),
+                            )
+                        except TimeoutError:
+                            log.debug(
+                                "Could not drop refused queued group message %s: "
+                                "mailbox lock busy; leaving it for a later round",
+                                entry.id,
+                            )
+                        return False
+                    log.info(
+                        "Keeping queued group message %s: the recipient's "
+                        "announcements-only refusal disagrees with this "
+                        "node's copy of the group; it stays queued for retry",
+                        entry.id,
+                    )
                 # A cancel may have landed while the direct request was in
                 # flight; do not start a fresh send for a cancelled entry.
                 try:
