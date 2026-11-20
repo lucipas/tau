@@ -943,6 +943,18 @@ export default function ChannelsSection() {
                       {m.text}
                     </p>
                   )}
+                  {m.location && (
+                    <p className="mt-1 text-sm">
+                      <a
+                        href={`https://www.openstreetmap.org/?mlat=${m.location.lat}&mlon=${m.location.lon}#map=15/${m.location.lat}/${m.location.lon}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline text-cyan-300"
+                      >
+                        📍 {m.location.name ?? `${m.location.lat.toFixed(5)}, ${m.location.lon.toFixed(5)}`}
+                      </a>
+                    </p>
+                  )}
 {m.poll_options && (
                     <div className="mt-2 flex flex-col gap-1.5" role="group" aria-label="Poll">
                       {m.poll_options.map((option, i) => {

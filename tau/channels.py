@@ -200,6 +200,7 @@ from .protocol import (
     clean_group_poll_target,
     clean_group_poll_vote,
     clean_group_topic,
+    clean_location,
     clean_reaction,
     decode,
     encode,
@@ -264,7 +265,9 @@ _CHANNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # signed body, so a relay cannot move a message into another room
 # without breaking the hash.  ``reply_to`` is covered too, when a
 # message has one — _canonical_body adds it — so a reply cannot be
-# re-pointed at another message either.
+# re-pointed at another message either.  ``location`` is covered the
+# same way when a message pins a place: a relay that strips the pin
+# breaks the hash exactly like one that edits the text.
 HASH_FIELDS = ("v", "channel", "author", "key", "name", "text", "created_at")
 
 # A channel message's expiry is deliberately NOT one of the hash
@@ -342,6 +345,7 @@ _MESSAGE_COLUMNS = (
     "poll_vote",
     "poll_close",
     "reply_to",
+    "location",
 )
 
 # Column order for reaction rows.  A reaction is keyed by
@@ -436,6 +440,12 @@ def _canonical_body(message: Dict[str, Any]) -> bytes:
         # re-pointed; absent for plain messages, whose hashes — and
         # verification — are unchanged.
         body["reply_to"] = reply_to
+    location = message.get("location")
+    if location is not None:
+        # Covered by the hash when present, so a relay cannot strip
+        # a pin; absent for plain messages, whose hashes — and
+        # verification — are unchanged.
+        body["location"] = location
     return json.dumps(
         body,
         ensure_ascii=False,
@@ -574,6 +584,26 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
     else:
         reply_to = _require_hex(raw_reply_to, HASH_HEX_LENGTH, "reply_to")
 
+    # A pin belongs on a plain top-level message: a reply already
+    # points at its parent, and a poll question carries its own
+    # structured payload — the CLI never produces either combination.
+    raw_location = mesg.get("location")
+    cleaned_location = None
+    if raw_location is not None:
+        cleaned_location = clean_location(raw_location)
+        if cleaned_location is None:
+            raise ChannelError(
+                "channel message location must have a latitude -90..90 "
+                "and a longitude -180..180"
+            )
+        if reply_to or any(
+            mesg.get(field) is not None for field in POLL_FIELDS
+        ):
+            raise ChannelError(
+                "a channel location pin can only be attached to a "
+                "top-level message, not a reply or a poll"
+            )
+
     message = {
         "v": CHANNEL_VERSION,
         "channel": channel,
@@ -591,6 +621,8 @@ def _normalize_message(mesg: Dict[str, Any], *, now: Optional[float] = None) -> 
         message["poll_vote"] = cleaned_vote
     if cleaned_close is not None:
         message["poll_close"] = cleaned_close
+    if cleaned_location is not None:
+        message["location"] = cleaned_location
     _check_wire_size(message)
     return message
 
@@ -648,6 +680,10 @@ def _canonical_message(message: Dict[str, Any]) -> Dict[str, Any]:
         # Plain messages keep the old wire shape: the field appears
         # only on replies, matching how the hash treats it.
         canonical["reply_to"] = reply_to
+    if message.get("location") is not None:
+        # Plain messages keep the old wire shape: the pin appears
+        # only on located messages, matching how the hash treats it.
+        canonical["location"] = message["location"]
     return canonical
 
 
@@ -1338,7 +1374,8 @@ CREATE TABLE IF NOT EXISTS messages (
     poll_options TEXT,
     poll_vote TEXT,
     poll_close TEXT,
-    reply_to TEXT NOT NULL DEFAULT ''
+    reply_to TEXT NOT NULL DEFAULT '',
+    location TEXT
 );
 
 CREATE INDEX IF NOT EXISTS messages_channel_created
@@ -1474,6 +1511,11 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''"
         )
+    # Stores written before location pins existed have no location
+    # column: add it in place so an old database keeps its history.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "location" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN location TEXT")
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('version', ?)",
         (str(CHANNEL_VERSION),),
@@ -1499,6 +1541,11 @@ def _row_to_message(row: sqlite3.Row) -> Dict[str, Any]:
             record.pop(field, None)
         else:
             record[field] = json.loads(raw)
+    raw_location = record.get("location")
+    if raw_location is None:
+        record.pop("location", None)
+    else:
+        record["location"] = json.loads(raw_location)
     return _canonical_message(record)
 
 
@@ -1747,14 +1794,18 @@ def store_message(
         return _canonical_message(message), False
     existing = _fetch_message(conn, digest)
     if existing is not None:
-        return _canonical_message(dict(existing)), False
+        # Parse the stored row the same way every other read does:
+        # the raw row carries poll/location fields as JSON strings,
+        # and returning them unparsed would hand callers a string
+        # where a list or dict belongs.
+        return _row_to_message(existing), False
 
     try:
         with conn:
             conn.execute(
                 "INSERT INTO messages(v, hash, channel, author, key, name, text, "
-                "created_at, expires_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, expires_at, received_at, sig, poll_options, poll_vote, poll_close, reply_to, location) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     CHANNEL_VERSION,
                     digest,
@@ -1771,6 +1822,7 @@ def store_message(
                     _dump_poll_field(message.get("poll_vote")),
                     _dump_poll_field(message.get("poll_close")),
                     message.get("reply_to", ""),
+                    _dump_poll_field(message.get("location")),
                 ),
             )
             _prune_store(conn, message["channel"])
@@ -1787,7 +1839,7 @@ def store_message(
         existing = _fetch_message(conn, digest)
         if existing is None:
             raise
-        return _canonical_message(dict(existing)), False
+        return _row_to_message(existing), False
 
     record = get_message(conn, digest)
     if record is None:
@@ -2079,6 +2131,7 @@ def create_message(
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
     reply_to: Optional[str] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a message owned by *identity*.
 
@@ -2089,6 +2142,10 @@ def create_message(
     ``reply_to`` is a parent message's hash or unique hex prefix; it
     must already be stored in this channel, and it is covered by the
     new message's hash.
+
+    ``location`` pins a place on a top-level message (``{"lat": ..,
+    "lon": .., "name": ..}``); it is covered by the hash when
+    present, and refused on a reply or a poll.
 
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
@@ -2117,6 +2174,8 @@ def create_message(
         body["poll_close"] = poll_close
     if reply_to is not None:
         body["reply_to"] = resolve_message_digest(conn, body["channel"], reply_to)
+    if location is not None:
+        body["location"] = location
     normalized = _normalize_message(body, now=timestamp)
     digest = hash_message(normalized)
     mesg = dict(normalized)
@@ -3100,6 +3159,7 @@ class ChannelApp:
         poll_vote: Optional[Dict[str, Any]] = None,
         poll_close: Optional[Dict[str, Any]] = None,
         reply_to: Optional[str] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a message in a joined channel, gossiping it when asked.
 
@@ -3112,7 +3172,8 @@ class ChannelApp:
         ``poll_options``, ``poll_vote`` and ``poll_close`` may be set,
         making the message a poll, a vote on one, or a close of one.
         ``reply_to`` is a parent message's hash or unique hex
-        prefix in the same channel.
+        prefix in the same channel.  ``location`` pins a place on a
+        top-level message; it is refused on a reply or a poll.
         """
         name = clean_channel_name(channel)
         if expires_at is None:
@@ -3138,6 +3199,7 @@ class ChannelApp:
                 poll_vote=poll_vote,
                 poll_close=poll_close,
                 reply_to=reply_to,
+                location=location,
             )
         finally:
             conn.close()

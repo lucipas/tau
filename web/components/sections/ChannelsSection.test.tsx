@@ -155,6 +155,19 @@ beforeEach(() => {
             edited: true,
             edited_at: 1002,
           },
+          {
+            v: 1,
+            hash: "m3".padEnd(64, "0"),
+            channel: "mesh-general",
+            author: "b".repeat(32),
+            key: "b".repeat(32),
+            name: "bob",
+            text: "meet here",
+            created_at: 1002,
+            received_at: 1002,
+            sig: "s",
+            location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+          },
         ],
         count: 2,
       };
@@ -185,6 +198,14 @@ describe("ChannelsSection", () => {
     fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
     // The message shows twice: once in the pinned strip, once in history.
     expect((await screen.findAllByText("hello channel")).length).toBe(2);
+  });
+
+  it("renders a location pin with an open-in-maps link", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    const link = await screen.findByRole("link", { name: /Rock Springs Park/ });
+    expect(link.getAttribute("href")).toContain("openstreetmap.org");
+    expect(link.getAttribute("href")).toContain("mlat=34.05");
   });
 
   it("shows an unread badge on a channel with unread messages", async () => {
