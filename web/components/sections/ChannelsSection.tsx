@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Avatar from "@/components/chrome/Avatar";
 import UnreadChip from "@/components/chrome/UnreadChip";
 import { useHash } from "../chrome/useHash";
@@ -75,12 +75,22 @@ export default function ChannelsSection() {
   const [drafts, setDrafts] = useState<MessageDraft[]>([]);
   const [pendingSeed, setPendingSeed] = useState<{ key: string; text: string } | null>(null);
   const [draftSeedKey, setDraftSeedKey] = useState<string | null>(null);
+  // The draft whose text was actually loaded into the composer for
+  // the selected channel. Only sending that text closes the draft —
+  // an unrelated message sent in the same channel leaves a saved
+  // draft alone.
+  const [loadedDraftKey, setLoadedDraftKey] = useState<string | null>(null);
+  // Unsent composer text parked per channel, so a switch restores
+  // each channel's own text instead of carrying the previous
+  // channel's text into the next one and overwriting its draft.
+  const [textByChannel, setTextByChannel] = useState<Record<string, string>>({});
+  const prevSelectedRef = useRef<string | null>(null);
   const [savingDraft, setSavingDraft] = useState(false);
 
   // The channel named by `#channels?channel=<name>` — set when a
   // channel draft is opened from the chat sidebar. The shell mounts
   // one section at a time, so a fresh mount here reads it.
-  const { channel: hashChannel } = useHash();
+  const { channel: hashChannel, navigate } = useHash();
 
   useEffect(() => {
     if (hashChannel && hashChannel !== channels.selected) {
@@ -109,8 +119,21 @@ export default function ChannelsSection() {
   const selectedChannelName = channels.selected;
   const selectedDraftKey = selectedChannelName ? `channel:${selectedChannelName}` : null;
   useEffect(() => {
+    // Park the outgoing channel's unsent text and restore the
+    // incoming channel's own parked text (or an empty box), so a
+    // switch never carries one channel's text into another.
+    const prev = prevSelectedRef.current;
+    if (prev && prev !== selectedChannelName) {
+      setTextByChannel((m) => ({ ...m, [prev]: text }));
+    }
+    prevSelectedRef.current = selectedChannelName;
+    setText(
+      selectedChannelName ? (textByChannel[selectedChannelName] ?? "") : "",
+    );
     setDraftSeedKey(null);
     setPendingSeed(null);
+    setLoadedDraftKey(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDraftKey]);
   useEffect(() => {
     if (!selectedDraftKey || !selectedChannelName) return;
@@ -122,9 +145,15 @@ export default function ChannelsSection() {
 
   // A saved draft pre-fills the box when its channel opens — but
   // never clobbers text the user already typed into this composer.
+  // The seed is marked consumed only when its text actually loads:
+  // marking it consumed while the box holds other text would lose
+  // the draft without the user ever seeing it.
   if (pendingSeed && draftSeedKey !== pendingSeed.key) {
-    setDraftSeedKey(pendingSeed.key);
-    if (text.trim() === "") setText(pendingSeed.text);
+    if (text.trim() === "") {
+      setDraftSeedKey(pendingSeed.key);
+      setLoadedDraftKey(pendingSeed.key);
+      setText(pendingSeed.text);
+    }
   }
 
   useEffect(() => {
@@ -200,12 +229,16 @@ export default function ChannelsSection() {
       }
       setText("");
       setReplyTo(null);
+      setTextByChannel((m) => ({ ...m, [channel]: "" }));
       // A sent message closes the draft it was loaded from, like
-      // `draft send` — but only when the send actually went through.
-      if (pendingSeed && pendingSeed.key === selectedDraftKey) {
+      // `draft send` — but only when the send actually went through
+      // and the sent text came from that draft. A saved draft
+      // survives an unrelated message sent in the same channel.
+      if (loadedDraftKey && loadedDraftKey === selectedDraftKey) {
         await deleteDraft("channel", channel).catch(() => undefined);
         void refreshDrafts();
       }
+      setLoadedDraftKey(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -214,12 +247,17 @@ export default function ChannelsSection() {
   }
 
   async function handleSaveDraft() {
-    if (!channels.selected || !text.trim() || savingDraft) return;
+    const channel = channels.selected;
+    if (!channel || !text.trim() || savingDraft) return;
     setSavingDraft(true);
     setError(null);
     try {
-      await saveDraft("channel", channels.selected, text.trim());
+      await saveDraft("channel", channel, text.trim());
       setText("");
+      setTextByChannel((m) => ({ ...m, [channel]: "" }));
+      // A freshly saved draft is not loaded text: a later send of
+      // a different message must not delete it.
+      setLoadedDraftKey(null);
       // Mark the just-saved draft consumed, so the seed effect does
       // not pour it straight back into the cleared box once the
       // drafts refresh lands.
@@ -462,7 +500,12 @@ export default function ChannelsSection() {
               key={c.channel}
               type="button"
               aria-pressed={channels.selected === c.channel}
-              onClick={() => channels.select(c.channel)}
+              onClick={() => {
+                // Select now (as before) and keep the URL hash in
+                // sync, so refresh / shared links reopen this channel.
+                channels.select(c.channel);
+                navigate("channels", { channel: c.channel });
+              }}
               className={`rounded-full border px-3 py-1.5 text-sm font-semibold ${
                 channels.selected === c.channel
                   ? "border-cyan-500 bg-cyan-950 text-cyan-200"
@@ -1038,7 +1081,12 @@ export default function ChannelsSection() {
               <div className="flex gap-2">
                 <input
                   value={text}
-                  onChange={(e) => setText(e.target.value)}
+                  onChange={(e) => {
+                    setText(e.target.value);
+                    // Emptying the box discards the loaded draft text,
+                    // so a later send must not close the saved draft.
+                    if (e.target.value.trim() === "") setLoadedDraftKey(null);
+                  }}
                   placeholder={`Message #${channels.selected}`}
                   aria-label={`Message #${channels.selected}`}
                   disabled={sending}
