@@ -1177,6 +1177,41 @@ def test_deliver_entry_drops_queued_group_leg_when_peer_refuses_not_allowed(
     assert node.mailbox.get_outbox("bob-leg-1") is None
 
 
+def test_deliver_entry_drop_on_not_allowed_is_bounded_by_deadline(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+
+    def refused(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", refused)
+    seen = {}
+    real_remove = node._remove_queued_version
+
+    def recording_remove(message_id, *, text, edited_at, timeout=None):
+        seen["timeout"] = timeout
+        return real_remove(
+            message_id, text=text, edited_at=edited_at, timeout=timeout
+        )
+
+    monkeypatch.setattr(node, "_remove_queued_version", recording_remove)
+    assert (
+        node._deliver_entry(
+            bob, snapshot, timeout=1.0, deadline=time.monotonic() + 1.0
+        )
+        is False
+    )
+    assert node.mailbox.get_outbox("bob-leg-1") is None
+    # The removal is bounded by the remaining delivery deadline, so a
+    # mailbox lock held by another process cannot stall the flush
+    # after the budget has expired.
+    assert seen["timeout"] is not None
+    assert seen["timeout"] <= 1.0
+
+
 def test_deliver_entry_carries_announcements_flag_on_retry(
     tmp_path, monkeypatch
 ):

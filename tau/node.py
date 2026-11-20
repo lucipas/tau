@@ -5869,9 +5869,23 @@ class TauNode:
                     log.warning(
                         "Dropping queued group message %s: %s", entry.id, exc
                     )
-                    self._remove_queued_version(
-                        entry.id, text=send_text, edited_at=send_edited_at
-                    )
+                    # Bounded by the remaining delivery deadline: an
+                    # unbounded wait for the mailbox lock would stall
+                    # the flush after the budget expired.  On timeout
+                    # the leg stays queued and a later round drops it.
+                    try:
+                        self._remove_queued_version(
+                            entry.id,
+                            text=send_text,
+                            edited_at=send_edited_at,
+                            timeout=_remaining(deadline),
+                        )
+                    except TimeoutError:
+                        log.debug(
+                            "Could not drop refused queued group message %s: "
+                            "mailbox lock busy; leaving it for a later round",
+                            entry.id,
+                        )
                     return False
                 # A cancel may have landed while the direct request was in
                 # flight; do not start a fresh send for a cancelled entry.
