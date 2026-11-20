@@ -8342,6 +8342,112 @@ def test_parser_forward_arguments():
         )
 
 
+def test_parser_forward_delay():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["forward", "--to", "bob", "--delay", "5m", "abcdef12"]
+    )
+    assert args.delay == "5m"
+
+
+def test_forward_delay_schedules_without_delivery(
+    tmp_path, capsys, monkeypatch
+):
+    _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {"bob": "queued"}
+    _FakeSendNode.deliver_on_flush = False
+    before = time.time()
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--to",
+            "bob",
+            "--delay",
+            "2h",
+            "aaaa",
+        ]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[-1]
+    assert len(node.send_kwargs) == 1
+    send_after = node.send_kwargs[0]["send_after"]
+    assert before + 7200 <= send_after <= time.time() + 7200
+    assert node.sent[0][1] == "Forwarded from alice:\noriginal thought"
+    out = capsys.readouterr().out
+    assert "scheduled for bob" in out
+    assert "sends in 1h" in out
+    assert "it will be delivered at its scheduled time" in out
+
+
+def test_forward_delay_json_reports_send_after(tmp_path, capsys, monkeypatch):
+    _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {"bob": "queued"}
+    _FakeSendNode.deliver_on_flush = False
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+            "--to",
+            "bob",
+            "--delay",
+            "5m",
+            "aaaa",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["queued"] is True
+    assert payload["send_after"] is not None
+    assert payload["send_after"] > time.time()
+
+
+def test_forward_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
+    _seed_reply_conversation(tmp_path)
+    code = _run_forward(
+        tmp_path,
+        monkeypatch,
+        ["--to", "bob", "--delay", "5m", "--no-queue", "aaaa"],
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
+    code = _run_forward(
+        tmp_path, monkeypatch, ["--to", "bob", "--delay", "soon", "aaaa"]
+    )
+    assert code == 1
+    assert "invalid --delay duration" in capsys.readouterr().err
+    code = _run_forward(
+        tmp_path, monkeypatch, ["--to", "bob", "--delay", "30d", "aaaa"]
+    )
+    assert code == 2
+    assert "--delay must be at most 29d23h" in capsys.readouterr().err
+    # 29d fits and queues.
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {"bob": "queued"}
+    _FakeSendNode.deliver_on_flush = False
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--to",
+            "bob",
+            "--delay",
+            "29d",
+            "aaaa",
+        ]
+    )
+    assert code == 0
+
+
 def test_forward_sends_attributed_text(tmp_path, capsys, monkeypatch):
     data_dir, _ = _seed_reply_conversation(tmp_path)
     code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "aaaa"])
@@ -8426,6 +8532,45 @@ def test_forward_to_group_waits_for_queued_legs(
     assert node.wait_calls[0][1] == pytest.approx(5.0, abs=0.05)
     assert 0 < node.wait_calls[1][1] <= node.wait_calls[0][1]
     assert "delivered to alice" in capsys.readouterr().out
+
+
+def test_forward_to_group_delay_schedules_legs(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.groups import GroupStore
+
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    store = GroupStore(config.groups_path)
+    store.create("weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    before = time.time()
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--group",
+            "weekend",
+            "--delay",
+            "2h",
+            "aaaa",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    send_after = node.send_kwargs[0]["send_after"]
+    assert before + 7200 <= send_after <= time.time() + 7200
+    group, text, _ = node.sent[0]
+    assert group["name"] == "weekend"
+    assert text == "Forwarded from alice:\noriginal thought"
+    out = capsys.readouterr().out
+    assert "scheduled for alice" in out
+    assert "scheduled for bob" in out
+    assert "sends in" in out
+    assert "it will be delivered at its scheduled time" in out
 
 
 def test_forward_to_group_wait_conflicts_with_no_queue(
