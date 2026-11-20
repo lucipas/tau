@@ -108,8 +108,8 @@ script) can read what arrives from the mesh and send messages back:
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
     GET  /api/drafts       saved message drafts (``tau draft save``)
-    POST /api/drafts       save a message draft ``{"kind": "peer"|"group",
-                           "target": "<hash>", "text": "..."}``
+    POST /api/drafts       save a message draft ``{"kind": "peer"|"group"|"channel",
+                           "target": "<hash | id | name>", "text": "..."}``
     POST /api/drafts/delete discard a message draft ``{"kind", "target"}``
     GET  /api/messages/muted muted DM conversations, groups and channels
     POST /api/messages/mute mute ``{"peer": "<name or hash>"}``,
@@ -139,6 +139,10 @@ script) can read what arrives from the mesh and send messages back:
                            the block-list
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    POST /api/outbox/edit   edit a scheduled message before it sends
+                           ``{"target": "<message id or prefix>", "text": ...,
+                           "send_in": <seconds from now>}`` — at least one
+                           of "text" / "send_in" is required
     GET  /api/backup       download a backup archive of the data directory
     GET  /api/doctor       health verdicts for the data directory (``tau doctor``)
     POST /api/bundle/export build a signed sneakernet bundle
@@ -179,9 +183,10 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
-    POST /api/tan/schedule schedule a Tan post for later (optional "image" base64 data URL)
-    GET  /api/tan/scheduled queued Tan posts, soonest first
+    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL)
+    GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
+    POST /api/tan/edit-scheduled edit a queued Tan post's text/time
     GET  /api/tan/drafts   saved Tan post drafts, newest first
     POST /api/tan/drafts   save a Tan post draft
     POST /api/tan/drafts/delete discard a saved Tan post draft
@@ -227,6 +232,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later
     GET  /api/channels/scheduled  queued channel messages and polls, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message or poll
+    POST /api/channels/edit-scheduled  edit a queued channel message's text/time
     POST /api/channels/poll  post a poll (``{"channel", "question", "options": [...]}``)
     POST /api/channels/vote  vote on a poll (``{"channel", "poll", "option"}``)
     POST /api/channels/close-poll  close a poll you created (``{"channel", "poll"}``)
@@ -3668,6 +3674,9 @@ class WebBridge:
     def tan_schedule_post(
         self, text: str, *, reply_to: Optional[str] = None, send_in: float,
         expires_in: float = 0.0,
+        kind: Optional[str] = None,
+        target_post: Optional[str] = None,
+        poll_options: Optional[List[str]] = None,
         image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
@@ -3680,14 +3689,31 @@ class WebBridge:
         decodes one — the bytes are stored pinned in the local media
         store at schedule time — and rides the queue entry until the
         publish pass attaches it.
+
+        With *kind* ``"repost"`` / ``"quote"`` the entry amplifies
+        *target_post* instead: a repost carries no text, a quote
+        carries its comment as the text, and the target is resolved
+        the same way as a reply target.
+
+        With *poll_options* the entry is a poll instead: the text is
+        its question, the options ride alongside it, and a reply
+        target is refused — polls are top-level entries.  A poll
+        cannot carry an image.
         """
-        from .scheduled_posts import schedule_post
+        from .scheduled_posts import (
+            schedule_poll,
+            schedule_post,
+            schedule_quote,
+            schedule_repost,
+        )
         from .tangents.tan import MAX_GOSSIP_TTL, resolve_post
 
         if image is not None and reply_to is not None:
             raise ValueError(
                 "an image can only be attached to a top-level post, not a reply"
             )
+        if image is not None and poll_options is not None:
+            raise ValueError("a scheduled poll cannot carry an image")
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
             from .tangents.tan import image_attachment_from_data_url
@@ -3701,7 +3727,45 @@ class WebBridge:
                 reply_to = resolve_post(conn, reply_to)["hash"]
             finally:
                 conn.close()
+        if target_post is not None:
+            conn = self._tan_conn()
+            try:
+                target_post = resolve_post(conn, target_post)["hash"]
+            finally:
+                conn.close()
         config = self.node.config
+        if kind == "repost":
+            post = schedule_repost(
+                config.scheduled_posts_path,
+                target_post=target_post,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                name=getattr(self.node, "name", None),
+            )
+            return post.to_dict()
+        if kind == "quote":
+            post = schedule_quote(
+                config.scheduled_posts_path,
+                target_post=target_post,
+                text=text,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                name=getattr(self.node, "name", None),
+            )
+            return post.to_dict()
+        if poll_options is not None:
+            post = schedule_poll(
+                config.scheduled_posts_path,
+                question=text,
+                options=poll_options,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                # Validate against the name the serving app publishes with
+                # (node.name, refreshed at startup), not the configured name.
+                name=getattr(self.node, "name", None),
+                expires_in=float(expires_in),
+            )
+            return post.to_dict()
         post = schedule_post(
             config.scheduled_posts_path,
             text=text,
@@ -3771,6 +3835,35 @@ class WebBridge:
             on_cancel=_delete_stored,
         )
         return {"cancelled": post.to_dict(), "deleted_local": deleted_local}
+
+    def tan_edit_scheduled_post(
+        self,
+        target: str,
+        *,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or publish time of a queued Tan post.
+
+        Like :meth:`tan_schedule_post`: only the queue entry is
+        touched, so no attached Tan app is needed.  A *send_in* counts
+        from now, the same way the console's Send-later picker does.
+        """
+        from .scheduled_posts import edit_scheduled_post
+
+        publish_at = None
+        if send_in is not None:
+            publish_at = time.time() + float(send_in)
+        post = edit_scheduled_post(
+            self.node.config.scheduled_posts_path,
+            target,
+            text=text,
+            publish_at=publish_at,
+            # Validate against the name the serving app publishes with
+            # (node.name, refreshed at startup), not the configured name.
+            name=getattr(self.node, "name", None),
+        )
+        return post.to_dict()
 
     def tan_drafts(self) -> List[Dict[str, Any]]:
         """Saved Tan post drafts, newest first (the CLI's ``tan drafts``).
@@ -4703,6 +4796,36 @@ class WebBridge:
             on_cancel=_delete_stored,
         )
         return {"cancelled": entry.to_dict(), "deleted_local": deleted_local}
+
+    def channel_edit_scheduled_message(
+        self,
+        target: str,
+        *,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or publish time of a queued channel message.
+
+        Like :meth:`channel_schedule_message`: only the queue entry is
+        touched, so no attached channel app is needed.  A *send_in*
+        counts from now, the same way the console's Send-later picker
+        does.
+        """
+        from .scheduled_channel import edit_scheduled_channel_message
+
+        publish_at = None
+        if send_in is not None:
+            publish_at = time.time() + float(send_in)
+        entry = edit_scheduled_channel_message(
+            self.node.config.scheduled_channel_messages_path,
+            target,
+            text=text,
+            publish_at=publish_at,
+            # Validate against the name the serving app publishes with
+            # (node.name, refreshed at startup), not the configured name.
+            name=getattr(self.node, "name", None),
+        )
+        return entry.to_dict()
 
     def channel_sync(
         self, channel: Optional[str] = None, *, limit: int = 20
@@ -8321,6 +8444,96 @@ class WebBridge:
         self._clear_scheduled_mark(entry.id)
         return described
 
+    def edit_outbox(
+        self,
+        target: str,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or send time of a scheduled outbox entry.
+
+        The console counterpart of ``tau outbox edit``: ``send_in`` is
+        seconds from now, mirroring the send path.  At least one of
+        *text* / *send_in* is required; the mailbox enforces the rest
+        (still scheduled, plain text, new time in the future and within
+        the delay cap).  A group edit rewrites every leg of the message
+        and reports the leg count.  The console's queued record for each
+        edited entry is updated in place, so the bubble shows the new
+        text and countdown without a refresh.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("message id is required")
+        if text is None and send_in is None:
+            raise ValueError(
+                "nothing to change — pass a new text and/or a new send time"
+            )
+        if text is not None and not isinstance(text, str):
+            raise ValueError("text must be a string")
+        send_after = None
+        if send_in is not None:
+            if not _valid_send_in(send_in):
+                raise ValueError(
+                    "send_in must be a number of seconds "
+                    "(0 < send_in <= 29d23h)"
+                )
+            send_after = time.time() + float(send_in)
+        with self.node.mailbox.transaction():
+            # Resolve first so an unknown id or ambiguous prefix stays a
+            # MailboxError (404 at the route); the edit below only raises
+            # MailboxError for state refusals, which become ValueError
+            # (400) here.
+            self.node.mailbox.resolve_outbox(target.strip())
+            try:
+                entries = self.node.mailbox.edit_scheduled_outbox(
+                    target.strip(), text=text, send_after=send_after
+                )
+            except MailboxError as exc:
+                raise ValueError(str(exc)) from exc
+            described = [
+                self._describe_outbox_entry(entry) for entry in entries
+            ]
+        self._update_scheduled_records(
+            [entry.id for entry in entries],
+            text=entries[0].text if text is not None else None,
+            send_after=send_after,
+        )
+        return {"edited": described, "legs": len(described)}
+
+    def _update_scheduled_records(
+        self,
+        mail_ids: List[str],
+        *,
+        text: Optional[str] = None,
+        send_after: Optional[float] = None,
+    ) -> None:
+        """Rewrite a queued console record after an outbox edit.
+
+        Matches on ``mail_id`` — or any of a group record's ``leg_ids``,
+        since a group send keeps one bubble for all its legs — and
+        updates the text and/or the "sends in ..." countdown, then
+        publishes ``message_updated`` so live tabs re-render in place.
+        """
+        wanted = set(mail_ids)
+        updated = []
+        with self._lock:
+            for message in self._messages:
+                if message.get("direction") != "out":
+                    continue
+                ids = {message.get("mail_id")} | set(
+                    message.get("leg_ids") or []
+                )
+                if not (ids & wanted):
+                    continue
+                if text is not None:
+                    message["text"] = text
+                if send_after is not None:
+                    message["send_after"] = send_after
+                updated.append(dict(message))
+            if updated:
+                self._save_messages()
+        for message in updated:
+            self._publish_message_updated(message)
+
     def _clear_scheduled_mark(self, mail_id: str) -> None:
         """Drop the "sends in ..." mark from console entries for a cancelled send.
 
@@ -9445,7 +9658,8 @@ class WebBridge:
         The console resolves a draft's conversation from its own lists,
         but a draft for a peer with no messages yet is in none of them,
         so the name is resolved here too: the peer's registry name, the
-        group name, or ``None`` when neither is known.  A dataless node
+        group name, the channel name itself (a channel draft is keyed
+        by its name), or ``None`` when neither is known.  A dataless node
         has no drafts file and answers empty instead of failing the
         console poll.
         """
@@ -9465,18 +9679,24 @@ class WebBridge:
         drafts = []
         for draft in store.list_drafts():
             entry = dict(draft)
-            entry["name"] = names.get(draft["target"])
+            if draft.get("kind") == "channel":
+                # A channel draft is keyed by the channel name, so the
+                # name is the target itself — no registry lookup applies.
+                entry["name"] = draft["target"]
+            else:
+                entry["name"] = names.get(draft["target"])
             drafts.append(entry)
         return {"drafts": drafts, "count": len(drafts)}
 
     def save_draft(self, *, kind: Any, target: Any, text: Any) -> Dict[str, Any]:
         """Save (or overwrite) the draft for one conversation.
 
-        *kind* is ``"peer"`` or ``"group"`` and *target* is the peer
-        destination hash or group id — the console passes the
-        conversation key straight through, so no name resolution runs
-        here.  A bad kind, target or text is a :class:`ValueError`; a
-        failed write and a dataless node are :class:`WebBridgeError`.
+        *kind* is ``"peer"``, ``"group"`` or ``"channel"`` and *target*
+        is the peer destination hash, group id, or channel name — the
+        console passes the conversation key straight through, so no
+        name resolution runs here.  A bad kind, target or text is a
+        :class:`ValueError`; a failed write and a dataless node are
+        :class:`WebBridgeError`.
         """
         path = self._drafts_path()
         if path is None:
@@ -12128,12 +12348,13 @@ def _valid_send_in(value: Any) -> bool:
 
     The cap mirrors the CLI's ``tau send --delay`` limit: a scheduled
     message must leave at least an hour of delivery window before the
-    30-day mail TTL. Huge JSON integers overflow ``float()``, so the
-    conversion is guarded here instead of raising past the 400 response.
+    30-day mail TTL. Huge JSON integers overflow ``float()`` and
+    non-numeric values raise ``ValueError``, so the conversion is
+    guarded here instead of raising past the 400 response.
     """
     try:
         seconds = float(value)
-    except OverflowError:
+    except (OverflowError, ValueError):
         return False
     return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL - 3600.0
 
@@ -13508,6 +13729,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
                 return
+            if path == "/api/outbox/edit":
+                self._handle_outbox_edit(body, head_only)
+                return
             if path == "/api/settings":
                 self._handle_settings(body, head_only)
                 return
@@ -14399,8 +14623,73 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "post": post}, head_only)
                 return
             if path == "/api/tan/schedule":
+                kind = body.get("kind")
+                if kind is not None and kind not in ("repost", "quote"):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'kind' must be 'repost' or 'quote'"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                target_post = body.get("target_post")
+                if kind is not None:
+                    if not isinstance(target_post, str) or not target_post.strip():
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'target_post' is required to "
+                                    "schedule a repost or quote"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                elif target_post is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'target_post' needs kind "
+                                "'repost' or 'quote'"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 text = body.get("text")
-                if not isinstance(text, str) or not text.strip():
+                if kind == "repost":
+                    # A repost carries no text; an absent text is fine,
+                    # a non-string one is a client bug, and a non-empty
+                    # one would be silently dropped.
+                    if text is not None and not isinstance(text, str):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'text' must be a string"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if isinstance(text, str) and text.strip():
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "a scheduled repost carries no text"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    text = ""
+                elif not isinstance(text, str) or not text.strip():
                     self._send_json(
                         {"error": {"message": "field 'text' is required"}},
                         head_only,
@@ -14413,6 +14702,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                 ):
                     self._send_json(
                         {"error": {"message": "field 'reply_to' must be a post hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if kind is not None and reply_to is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "a scheduled repost or quote cannot "
+                                "be a reply"
+                            }
+                        },
                         head_only,
                         400,
                     )
@@ -14435,6 +14736,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 expires_in = body.get("expires_in")
+                if kind is not None and expires_in is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "a scheduled repost or quote cannot "
+                                "expire"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 if expires_in is not None:
                     # A scheduled post's expiry shares the 7d queue cap
                     # (see schedule_post): it cannot outlive the furthest
@@ -14468,6 +14781,40 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                poll_options = body.get("poll_options")
+                if poll_options is not None:
+                    # A poll is a top-level entry: it cannot be a reply,
+                    # and its options are fixed at schedule time.
+                    if reply_to is not None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "a scheduled poll cannot be a reply"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if (
+                        not isinstance(poll_options, list)
+                        or not 2 <= len(poll_options) <= 8
+                        or any(
+                            not isinstance(option, str) or not option.strip()
+                            for option in poll_options
+                        )
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'poll_options' must be a list "
+                                    "of 2-8 non-empty strings"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 image = body.get("image")
                 if image is not None and not isinstance(image, str):
                     self._send_json(
@@ -14488,6 +14835,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else 0.0
                         ),
+                        kind=kind,
+                        target_post=target_post,
+                        poll_options=poll_options,
                         image=image,
                     )
                 except (ValueError, ProtocolError) as exc:
@@ -14516,6 +14866,69 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/tan/edit-scheduled":
+                target = body.get("id") or body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if text is not None and (
+                    not isinstance(text, str) or not text.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'text' must be non-empty"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                send_in = body.get("send_in")
+                if send_in is not None and (
+                    not isinstance(send_in, (int, float))
+                    or isinstance(send_in, bool)
+                    or not _valid_schedule_in(send_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'send_in' must be a number of "
+                                "seconds (0 < send_in <= 604800)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                if text is None and send_in is None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'text' and/or 'send_in' is required"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    scheduled = self.bridge.tan_edit_scheduled_post(
+                        target.strip(),
+                        text=text,
+                        send_in=(
+                            float(send_in) if send_in is not None else None
+                        ),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "scheduled": scheduled}, head_only)
                 return
             if path == "/api/tan/drafts":
                 text = body.get("text")
@@ -15260,6 +15673,54 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/channels/edit-scheduled":
+                target = body.get("id") or body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if text is not None and not isinstance(text, str):
+                    self._send_json(
+                        {"error": {"message": "field 'text' must be a string"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                send_in = body.get("send_in")
+                if send_in is not None and (
+                    not isinstance(send_in, (int, float))
+                    or isinstance(send_in, bool)
+                    or not _valid_schedule_in(send_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'send_in' must be a number of "
+                                "seconds (0 < send_in <= 604800)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    edited = self.bridge.channel_edit_scheduled_message(
+                        target.strip(),
+                        text=text,
+                        send_in=(float(send_in) if send_in is not None else None),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "edited": edited}, head_only)
                 return
             if path == "/api/channels/poll":
                 channel = body.get("channel")
@@ -16603,6 +17064,64 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 404)
             return
         self._send_json({"ok": True, "cancelled": cancelled}, head_only)
+
+    def _handle_outbox_edit(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target") or body.get("id")
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        text = body.get("text")
+        send_in = body.get("send_in")
+        if text is None and send_in is None:
+            self._send_json(
+                {
+                    "error": {
+                        "message": "nothing to change — pass 'text' and/or "
+                        "'send_in'"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        if text is not None and (
+            not isinstance(text, str) or not text.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'text' must be a non-empty string"}},
+                head_only,
+                400,
+            )
+            return
+        if send_in is not None and not _valid_send_in(send_in):
+            self._send_json(
+                {
+                    "error": {
+                        "message": "field 'send_in' must be a number of "
+                        "seconds (0 < send_in <= 29d23h)"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.edit_outbox(
+                target.strip(),
+                text=text,
+                send_in=send_in,
+            )
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except MailboxError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        self._send_json({"ok": True, **result}, head_only)
 
     def _handle_settings(self, body: Dict[str, Any], head_only: bool) -> None:
         setting = body.get("setting")

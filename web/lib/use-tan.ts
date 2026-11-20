@@ -64,7 +64,10 @@ import {
   repostTanPost,
   saveTanDraft,
   saveTanPost,
+  scheduleTanPoll,
   scheduleTanPost,
+  scheduleTanQuote,
+  scheduleTanRepost,
   searchTan,
   shareTanPost,
   unfollowTanAuthor,
@@ -110,6 +113,12 @@ export interface UseTanFeedResult {
   unlike: (target: string) => Promise<void>;
   repost: (target: string) => Promise<void>;
   quote: (target: string, text: string) => Promise<TanPost>;
+  scheduleRepost: (target: string, sendIn: number) => Promise<void>;
+  scheduleQuote: (
+    target: string,
+    text: string,
+    sendIn: number,
+  ) => Promise<ScheduledTanPost>;
   vote: (target: string, option: number) => Promise<void>;
   share: (target: string, dest: { to: string } | { group: string }) => Promise<void>;
   save: (target: string) => Promise<void>;
@@ -185,6 +194,13 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
       const post = await quoteTanPost(target, text);
       await load();
       return post;
+    },
+    scheduleRepost: (target, sendIn) =>
+      mutate(() => scheduleTanRepost(target, sendIn)),
+    scheduleQuote: async (target, text, sendIn) => {
+      const scheduled = await scheduleTanQuote(target, text, sendIn);
+      await load();
+      return scheduled;
     },
     vote: (target, option) => mutate(() => voteTanPoll(target, option)),
     share: (target, dest) => mutate(() => shareTanPost(target, dest)),
@@ -262,6 +278,7 @@ export interface UseTanComposerResult {
     opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } },
   ) => Promise<TanPost>;
   schedule: (text: string, sendIn: number, opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } }) => Promise<ScheduledTanPost>;
+  schedulePoll: (question: string, options: string[], sendIn: number, opts?: { expiresIn?: number }) => Promise<ScheduledTanPost>;
   poll: (question: string, options: string[], expiresIn?: number) => Promise<TanPost>;
   busy: boolean;
   error: string | null;
@@ -296,6 +313,8 @@ export function useTanComposer(): UseTanComposerResult {
       ),
     schedule: (text, sendIn, opts) =>
       run(() => scheduleTanPost(text, sendIn, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn, image: opts?.image })),
+    schedulePoll: (question, options, sendIn, opts) =>
+      run(() => scheduleTanPoll(question, options, sendIn, { expiresIn: opts?.expiresIn })),
     poll: (question, options, expiresIn) => run(() => createTanPoll(question, options, expiresIn)),
     busy,
     error,

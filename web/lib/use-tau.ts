@@ -35,6 +35,7 @@ import {
   createBroadcast,
   deleteBroadcast,
   dropHeldMail,
+  editOutbox,
   forgetPeer,
   getBeacons,
   getBroadcasts,
@@ -451,6 +452,10 @@ export interface UseOutboxResult {
   error: string | null;
   refresh: () => Promise<void>;
   cancel: (target: string) => Promise<void>;
+  edit: (
+    target: string,
+    patch: { text?: string; send_in?: number },
+  ) => Promise<void>;
   retry: (target?: string) => Promise<unknown>;
   dropHeld: (target: string) => Promise<void>;
 }
@@ -488,6 +493,13 @@ export function useOutbox(pollMs = 15000): UseOutboxResult {
     },
     [refresh],
   );
+  const edit = useCallback(
+    async (target: string, patch: { text?: string; send_in?: number }) => {
+      await editOutbox(target, patch);
+      await refresh();
+    },
+    [refresh],
+  );
   const retry = useCallback(
     async (target?: string) => {
       const result = await retryOutbox(target);
@@ -503,7 +515,7 @@ export function useOutbox(pollMs = 15000): UseOutboxResult {
     },
     [refresh],
   );
-  return { outbox, held, loading, error, refresh, cancel, retry, dropHeld };
+  return { outbox, held, loading, error, refresh, cancel, edit, retry, dropHeld };
 }
 
 // ----------------------------------------------------------------- beacons

@@ -317,6 +317,50 @@ describe("ChannelsSection", () => {
     expect(screen.getByText("2. Tacos")).toBeTruthy();
   });
 
+  it("edits a scheduled message's text and time from the Scheduled rows", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    expect(await screen.findByText("morning hello")).toBeTruthy();
+    // Two scheduled entries render an Edit button (message + poll);
+    // the first is the "morning hello" message this test edits.
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Edit scheduled message" })[0],
+    );
+    fireEvent.change(
+      screen.getByLabelText("Edit scheduled message", {
+        selector: "textarea",
+      }),
+      { target: { value: "morning, mesh!" } },
+    );
+    fireEvent.change(screen.getByLabelText("New send time"), {
+      target: { value: "3600" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/channels/edit-scheduled"),
+    );
+  });
+
+  it("an unchanged scheduled edit makes no request", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    expect(await screen.findByText("morning hello")).toBeTruthy();
+    // Two scheduled entries render an Edit button (message + poll);
+    // the first is the "morning hello" message this test edits.
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Edit scheduled message" })[0],
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    // The form closes (its Edit button is back) without touching the API.
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("button", { name: "Edit scheduled message" })[0],
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByLabelText("New send time")).toBeNull();
+    expect(calls).not.toContain("POST /api/channels/edit-scheduled");
+  });
+
   it("schedules a message when Send later is picked", async () => {
     render(<ChannelsSection />);
     fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
@@ -532,5 +576,735 @@ describe("ChannelsSection", () => {
     fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
     expect(await screen.findByRole("button", { name: "React 👍 (2)" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "React 🎉 (1)" })).toBeTruthy();
+  });
+
+  it("saves the composer text as a channel draft", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    await screen.findAllByText("hello channel");
+    fireEvent.change(screen.getByLabelText("Message #mesh-general"), {
+      target: { value: "park me" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(calls).toContain("POST /api/drafts"));
+    // The box clears once the save lands, and the just-saved draft
+    // does not pour straight back in.
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Message #mesh-general") as HTMLInputElement).value,
+      ).toBe(""),
+    );
+  });
+
+  it("saving a draft does not pour it back into the composer", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [];
+    calls = mockFetch((url, method) => {
+      if (url.includes("/api/drafts/delete")) return { ok: true, deleted: true };
+      if (url.includes("/api/drafts")) {
+        if (method === "POST") {
+          saved.push({
+            kind: "channel",
+            target: "mesh-general",
+            text: "park me",
+            updated_at: 100,
+            name: "mesh-general",
+          });
+          return { ok: true, draft: saved[0] };
+        }
+        return { drafts: saved, count: saved.length };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900, unread: 0 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    const input = await screen.findByLabelText("Message #mesh-general");
+    fireEvent.change(input, { target: { value: "park me" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(calls).toContain("POST /api/drafts"));
+    // The box clears on save; give the drafts refresh time to land
+    // the just-saved draft back in the list, then confirm it did not
+    // re-fill the box.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect((input as HTMLInputElement).value).toBe("");
+  });
+
+  it("opens the channel named by the hash and loads its saved draft", async () => {
+    window.location.hash = "#channels?channel=mesh-general";
+    calls = mockFetch((url, method) => {
+      if (url.includes("/api/drafts/delete")) return { ok: true, deleted: true };
+      if (url.includes("/api/drafts")) {
+        return {
+          drafts: [
+            {
+              kind: "channel",
+              target: "mesh-general",
+              text: "parked hello",
+              updated_at: 100,
+              name: "mesh-general",
+            },
+          ],
+          count: 1,
+        };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900, unread: 0 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    try {
+      render(<ChannelsSection />);
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("deletes the channel draft after the seeded message is sent", async () => {
+    window.location.hash = "#channels?channel=mesh-general";
+    calls = mockFetch((url, method) => {
+      if (url.includes("/api/drafts/delete")) return { ok: true, deleted: true };
+      if (url.includes("/api/drafts")) {
+        return {
+          drafts: [
+            {
+              kind: "channel",
+              target: "mesh-general",
+              text: "parked hello",
+              updated_at: 100,
+              name: "mesh-general",
+            },
+          ],
+          count: 1,
+        };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900, unread: 0 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    try {
+      render(<ChannelsSection />);
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts/delete"));
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("selecting a channel updates the URL hash", async () => {
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      await screen.findAllByText("hello channel");
+      expect(window.location.hash).toBe("#channels?channel=mesh-general");
+      fireEvent.click(screen.getByRole("button", { name: /#quiet-net/ }));
+      await screen.findByLabelText("Message #quiet-net");
+      expect(window.location.hash).toBe("#channels?channel=quiet-net");
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("sending a new message after saving a draft keeps the draft", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [];
+    calls = mockFetch((url, method) => {
+      if (url.includes("/api/drafts/delete")) return { ok: true, deleted: true };
+      if (url.includes("/api/drafts")) {
+        if (method === "POST") {
+          saved.push({
+            kind: "channel",
+            target: "mesh-general",
+            text: "park me",
+            updated_at: 100,
+            name: "mesh-general",
+          });
+          return { ok: true, draft: saved[0] };
+        }
+        return { drafts: saved, count: saved.length };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900, unread: 0 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    const input = await screen.findByLabelText("Message #mesh-general");
+    fireEvent.change(input, { target: { value: "park me" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(calls).toContain("POST /api/drafts"));
+    await waitFor(() =>
+      expect((input as HTMLInputElement).value).toBe(""),
+    );
+    // Let the drafts refresh land the just-saved draft, then send an
+    // unrelated message: the saved draft must survive it.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fireEvent.change(input, { target: { value: "a fresh message" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(calls).not.toContain("POST /api/drafts/delete");
+  });
+
+  it("returning to a channel after switching away still closes its draft on send", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [
+        {
+          kind: "channel",
+          target: "mesh-general",
+          text: "parked hello",
+          updated_at: 100,
+          name: "mesh-general",
+        },
+      ];
+    calls = mockFetch((url) => {
+      if (url.includes("/api/drafts/delete")) {
+        saved.length = 0;
+        return { ok: true, deleted: true };
+      }
+      if (url.includes("/api/drafts")) {
+        return { drafts: saved, count: saved.length };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [
+            { channel: "mesh-general", joined_at: 900, unread: 0 },
+            { channel: "mesh-random", joined_at: 800, unread: 0 },
+          ],
+          count: 2,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+      // Leave and come back: the draft text returns, and it must
+      // still be recognized as the loaded draft when sent.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputAgain = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe("parked hello"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts/delete"));
+      // The draft is deleted exactly once and does not re-seed the
+      // composer, so it cannot be sent a second time.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(
+        calls.filter((c) => c === "POST /api/drafts/delete").length,
+      ).toBe(1);
+      expect((inputAgain as HTMLInputElement).value).toBe("");
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("a saved draft pre-fills the composer again after switching away and back", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [];
+    calls = mockFetch((url, method) => {
+      if (url.includes("/api/drafts/delete")) return { ok: true, deleted: true };
+      if (url.includes("/api/drafts")) {
+        if (method === "POST") {
+          saved.push({
+            kind: "channel",
+            target: "mesh-general",
+            text: "park me",
+            updated_at: 100,
+            name: "mesh-general",
+          });
+          return { ok: true, draft: saved[0] };
+        }
+        return { drafts: saved, count: saved.length };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [
+            { channel: "mesh-general", joined_at: 900, unread: 0 },
+            { channel: "mesh-random", joined_at: 800, unread: 0 },
+          ],
+          count: 2,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      const input = await screen.findByLabelText("Message #mesh-general");
+      fireEvent.change(input, { target: { value: "park me" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts"));
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe(""),
+      );
+      // Leave and come back: the saved draft pre-fills the box
+      // again, and nothing is saved a second time.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputAgain = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe("park me"),
+      );
+      expect(
+        calls.filter((c) => c === "POST /api/drafts").length,
+      ).toBe(1);
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("switching away and back while the draft deletion is pending does not restore the sent text", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [
+        {
+          kind: "channel",
+          target: "mesh-general",
+          text: "parked hello",
+          updated_at: 100,
+          name: "mesh-general",
+        },
+      ];
+    let resolveDelete: ((value: string) => void) | null = null;
+    calls = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        calls.push(`${method} ${url}`);
+        if (url.includes("/api/drafts/delete")) {
+          saved.length = 0;
+          return {
+            ok: true,
+            status: 200,
+            text: () =>
+              new Promise<string>((resolve) => {
+                resolveDelete = resolve;
+              }),
+          } as Response;
+        }
+        if (url.includes("/api/drafts")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ drafts: saved, count: saved.length }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/messages")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", messages: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/pins")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", pins: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/scheduled")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", scheduled: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/topic")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", topic: null }),
+          } as Response;
+        }
+        if (url.includes("/api/channels")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({
+                channels: [
+                  { channel: "mesh-general", joined_at: 900, unread: 0 },
+                  { channel: "mesh-random", joined_at: 800, unread: 0 },
+                ],
+                count: 2,
+              }),
+          } as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ ok: true }),
+        } as Response;
+      }),
+    );
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+      // The deletion is still pending; the box is already clear.
+      await waitFor(() => expect(resolveDelete).not.toBeNull());
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe(""),
+      );
+      // Switch away and back while it hangs: the sent text must not
+      // come back.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputAgain = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe(""),
+      );
+      resolveDelete!(JSON.stringify({ ok: true, deleted: true }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect((inputAgain as HTMLInputElement).value).toBe("");
+      expect(
+        calls.filter((c) => c === "POST /api/drafts/delete").length,
+      ).toBe(1);
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("a stale draft-list response cannot restore a sent draft", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [
+        {
+          kind: "channel",
+          target: "mesh-general",
+          text: "parked hello",
+          updated_at: 100,
+          name: "mesh-general",
+        },
+      ];
+    const staleDraft = { ...saved[0] };
+    // GET /api/drafts calls: the first resolves at once; the second
+    // (the save's refresh) is held until after the send.
+    const heldDrafts: { resolve: (value: string) => void }[] = [];
+    let draftsGets = 0;
+    calls = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        calls.push(`${method} ${url}`);
+        if (url.includes("/api/drafts/delete")) {
+          saved.length = 0;
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ ok: true, deleted: true }),
+          } as Response;
+        }
+        if (url.includes("/api/drafts")) {
+          if (method === "POST") {
+            return {
+              ok: true,
+              status: 200,
+              text: async () =>
+                JSON.stringify({ ok: true, draft: saved[0] }),
+            } as Response;
+          }
+          draftsGets += 1;
+          if (draftsGets === 2) {
+            const entry: { resolve: (value: string) => void } = {
+              resolve: () => undefined,
+            };
+            const promise = new Promise<string>((resolve) => {
+              entry.resolve = resolve;
+            });
+            heldDrafts.push(entry);
+            return { ok: true, status: 200, text: () => promise } as Response;
+          }
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ drafts: saved, count: saved.length }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/messages")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", messages: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/pins")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", pins: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/scheduled")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", scheduled: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/topic")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", topic: null }),
+          } as Response;
+        }
+        if (url.includes("/api/channels")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({
+                channels: [
+                  { channel: "mesh-general", joined_at: 900, unread: 0 },
+                  { channel: "mesh-random", joined_at: 800, unread: 0 },
+                ],
+                count: 2,
+              }),
+          } as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ ok: true }),
+        } as Response;
+      }),
+    );
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+      // Save the loaded draft: its refresh is the stale response.
+      fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts"));
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe(""),
+      );
+      await waitFor(() => expect(heldDrafts.length).toBe(1));
+      // Switch away and back: the saved draft pre-fills again.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputAgain = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe("parked hello"),
+      );
+      // Send it: the post-delete refresh resolves with an empty list.
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts/delete"));
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe(""),
+      );
+      // Now the stale pre-delete response arrives: it must be dropped.
+      heldDrafts[0].resolve(
+        JSON.stringify({ drafts: [staleDraft], count: 1 }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Switch away and back: the deleted draft must not come back.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputFinal = await screen.findByLabelText("Message #mesh-general");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect((inputFinal as HTMLInputElement).value).toBe("");
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("switching channels keeps each channel's unsent text and draft separate", async () => {
+    calls = mockFetch((url) => {
+      if (url.includes("/api/drafts")) {
+        return {
+          drafts: [
+            {
+              kind: "channel",
+              target: "mesh-random",
+              text: "random draft",
+              updated_at: 100,
+              name: "mesh-random",
+            },
+          ],
+          count: 1,
+        };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [
+            { channel: "mesh-general", joined_at: 900, unread: 0 },
+            { channel: "mesh-random", joined_at: 800, unread: 0 },
+          ],
+          count: 2,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      const generalInput = await screen.findByLabelText("Message #mesh-general");
+      fireEvent.change(generalInput, { target: { value: "general text" } });
+      // The other channel's saved draft loads into an empty box.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      const randomInput = await screen.findByLabelText("Message #mesh-random");
+      await waitFor(() =>
+        expect((randomInput as HTMLInputElement).value).toBe("random draft"),
+      );
+      // Back to the first channel: its own unsent text returns, and
+      // nothing was saved over the other channel's draft.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const generalAgain = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((generalAgain as HTMLInputElement).value).toBe("general text"),
+      );
+      expect(calls).not.toContain("POST /api/drafts");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      const randomAgain = await screen.findByLabelText("Message #mesh-random");
+      await waitFor(() =>
+        expect((randomAgain as HTMLInputElement).value).toBe("random draft"),
+      );
+    } finally {
+      window.location.hash = "";
+    }
   });
 });

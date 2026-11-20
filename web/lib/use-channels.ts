@@ -17,6 +17,7 @@ import {
   cancelScheduledChannelMessage,
   closeChannelPoll,
   editChannelMessage,
+  editScheduledChannelMessage,
   getChannelMessages,
   getChannelPins,
   getChannelScheduled,
@@ -80,6 +81,10 @@ export interface UseChannelsResult {
     sendIn: number,
   ) => Promise<ScheduledChannelMessage>;
   cancelScheduled: (id: string) => Promise<void>;
+  editScheduled: (
+    id: string,
+    patch: { text?: string; sendIn?: number },
+  ) => Promise<void>;
   poll: (question: string, options: string[]) => Promise<ChannelMessage>;
   vote: (poll: string, option: number) => Promise<ChannelMessage>;
   closePoll: (poll: string) => Promise<ChannelMessage>;
@@ -273,6 +278,10 @@ export function useChannels(pollMs = 30_000): UseChannelsResult {
     },
     cancelScheduled: async (id) => {
       await cancelScheduledChannelMessage(id);
+      await refreshMessages(selected);
+    },
+    editScheduled: async (id, patch) => {
+      await editScheduledChannelMessage(id, patch);
       await refreshMessages(selected);
     },
     poll: async (question, options) => {

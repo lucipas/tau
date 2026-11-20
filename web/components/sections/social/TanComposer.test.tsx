@@ -11,11 +11,13 @@ import type { TanPost } from "@/lib/types";
 function makeComposer(): UseTanComposerResult & {
   publish: ReturnType<typeof vi.fn>;
   schedule: ReturnType<typeof vi.fn>;
+  schedulePoll: ReturnType<typeof vi.fn>;
   poll: ReturnType<typeof vi.fn>;
 } {
   return {
     publish: vi.fn().mockResolvedValue({} as TanPost),
     schedule: vi.fn().mockResolvedValue({}),
+    schedulePoll: vi.fn().mockResolvedValue({}),
     poll: vi.fn().mockResolvedValue({} as TanPost),
     busy: false,
     error: null,
@@ -132,6 +134,60 @@ describe("TanComposer image attach", () => {
     submit();
     expect((await screen.findByRole("alert")).textContent).toMatch(/2 MB limit/);
     expect(composer.publish).not.toHaveBeenCalled();
+  });
+
+  it("schedules a poll instead of posting it when Send later is set", async () => {
+    const composer = makeComposer();
+    const onPosted = vi.fn();
+    render(<TanComposer composer={composer} onPosted={onPosted} />);
+    fireEvent.click(screen.getByRole("button", { name: "📊 Poll" }));
+    fireEvent.change(screen.getByLabelText("Poll question"), {
+      target: { value: "pizza or tacos?" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 1"), {
+      target: { value: "Pizza" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 2"), {
+      target: { value: "Tacos" },
+    });
+    fireEvent.change(screen.getByLabelText("Send later"), {
+      target: { value: "300" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Schedule" }));
+    await waitFor(() =>
+      expect(composer.schedulePoll).toHaveBeenCalledWith(
+        "pizza or tacos?",
+        ["Pizza", "Tacos"],
+        300,
+        { expiresIn: undefined },
+      ),
+    );
+    expect(composer.poll).not.toHaveBeenCalled();
+    expect(onPosted).toHaveBeenCalled();
+  });
+
+  it("posts a poll immediately when Send later is not set", async () => {
+    const composer = makeComposer();
+    render(<TanComposer composer={composer} />);
+    fireEvent.click(screen.getByRole("button", { name: "📊 Poll" }));
+    fireEvent.change(screen.getByLabelText("Poll question"), {
+      target: { value: "pizza or tacos?" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 1"), {
+      target: { value: "Pizza" },
+    });
+    fireEvent.change(screen.getByLabelText("Poll option 2"), {
+      target: { value: "Tacos" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Post poll" }));
+    await waitFor(() =>
+      expect(composer.poll).toHaveBeenCalledWith(
+        "pizza or tacos?",
+        ["Pizza", "Tacos"],
+        undefined,
+      ),
+    );
+    expect(composer.schedulePoll).not.toHaveBeenCalled();
   });
 });
 

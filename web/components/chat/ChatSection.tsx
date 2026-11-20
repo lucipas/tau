@@ -91,9 +91,9 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
-/** The drafts list key for one conversation: `dm:<hash>` or `group:<id>`. */
-function draftKeyFor(kind: "peer" | "group", target: string): string {
-  return `${kind === "group" ? "group" : "dm"}:${target}`;
+/** The drafts list key for one conversation: `dm:<hash>`, `group:<id>` or `channel:<name>`. */
+function draftKeyFor(kind: "peer" | "group" | "channel", target: string): string {
+  return `${kind === "group" ? "group" : kind === "channel" ? "channel" : "dm"}:${target}`;
 }
 
 export default function ChatSection() {
@@ -117,6 +117,12 @@ export default function ChatSection() {
   const [drafts, setDrafts] = useState<MessageDraft[]>([]);
   const [draftsLoading, setDraftsLoading] = useState(true);
   const [pendingSeed, setPendingSeed] = useState<{ key: string; text: string } | null>(null);
+  // The key of a draft saved from this composer: the seed effect must
+  // not pour it straight back into the box the composer just cleared
+  // once the drafts refresh lands. The mark survives refreshes and is
+  // cleared only on a conversation switch — the channel flow's consumed
+  // mark, #608, in chat shape.
+  const [justSavedDraftKey, setJustSavedDraftKey] = useState<string | null>(null);
   const [showJoin, setShowJoin] = useState(false);
   const [joinLink, setJoinLink] = useState("");
   const [joinBusy, setJoinBusy] = useState(false);
@@ -198,18 +204,38 @@ export default function ChatSection() {
   }, [refreshDrafts]);
 
   // A conversation with a saved draft loads it into the composer when
-  // opened; a conversation without one clears the seed.
+  // opened; a conversation without one clears the seed. A draft saved
+  // from this composer is already parked, so it must not re-seed the
+  // box it was just cleared from — the mark is cleared only on a
+  // conversation switch, below.
   useEffect(() => {
     if (!selectedKey) {
       setPendingSeed(null);
       return;
     }
     const draft = drafts.find((d) => draftKeyFor(d.kind, d.target) === selectedKey);
+    if (draft && justSavedDraftKey === selectedKey) {
+      setPendingSeed(null);
+      return;
+    }
     setPendingSeed(draft ? { key: selectedKey, text: draft.text } : null);
-  }, [selectedKey, drafts]);
+  }, [selectedKey, drafts, justSavedDraftKey]);
+
+  // Reopening a conversation later should load its draft like any
+  // other — the just-saved mark only covers the conversation it was
+  // saved from, until the user leaves it.
+  useEffect(() => {
+    setJustSavedDraftKey(null);
+  }, [selectedKey]);
 
   const handleOpenDraft = useCallback(
     (draft: MessageDraft) => {
+      if (draft.kind === "channel") {
+        // Channel drafts open in the channels section, which seeds its
+        // own composer from the draft — no pending seed crosses sections.
+        navigate("channels", { channel: draft.target });
+        return;
+      }
       if (draft.kind === "group") navigate("chat", { group: draft.target });
       else navigate("chat", { peer: draft.target });
       setPendingSeed({ key: draftKeyFor(draft.kind, draft.target), text: draft.text });
@@ -233,9 +259,13 @@ export default function ChatSection() {
       // Errors propagate to the composer, which shows them and keeps
       // the text — a failed save must never clear the box.
       await saveDraft(selected.kind === "group" ? "group" : "peer", selected.key, text);
+      // Mark the just-saved draft consumed before the drafts refresh
+      // lands, so the seed effect does not pour it straight back into
+      // the cleared box (#609, mirroring the channel fix in #608).
+      if (selectedKey) setJustSavedDraftKey(selectedKey);
       void refreshDrafts();
     },
-    [selected, refreshDrafts],
+    [selected, selectedKey, refreshDrafts],
   );
 
   const handleSelect = useCallback(
@@ -529,6 +559,7 @@ export default function ChatSection() {
             loading={outbox.loading}
             error={outbox.error}
             onCancel={(target) => void outbox.cancel(target)}
+            onEdit={(target, patch) => void outbox.edit(target, patch)}
             onRetry={(target) => void outbox.retry(target)}
             onDropHeld={(target) => void outbox.dropHeld(target)}
           />
