@@ -8111,8 +8111,11 @@ class WebBridge:
             raise ValueError("cannot forward a file: the file has no name")
         if not isinstance(peer_hash, str) or not peer_hash:
             raise ValueError("cannot forward a file: the sender is unknown")
+        wire_id = entry.get("wire_id")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError("cannot forward a file: its record id is missing")
         try:
-            found = self.received_file(peer_hash, name)
+            found = self.received_file(peer_hash, name, wire_id=wire_id)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
         if found is None:
@@ -8121,6 +8124,16 @@ class WebBridge:
                 "moved, deleted, or changed since it arrived"
             )
         data, name = found
+        # The selected entry names the exact record: its size and digest
+        # must match the bytes about to be sent.
+        if len(data) != file_meta.get("size") or (
+            hashlib.sha256(data).hexdigest()
+            != str(file_meta.get("sha256", "")).lower()
+        ):
+            raise ValueError(
+                f"stored file {name} no longer matches this message — "
+                "it cannot be forwarded"
+            )
         forwarded = f"Forwarded from {label}:\n{name}"
         if group is not None:
             messages, response = self.send_group_message(
@@ -11474,7 +11487,11 @@ class WebBridge:
         ]
 
     def received_file(
-        self, sender: str, name: str
+        self,
+        sender: str,
+        name: str,
+        *,
+        wire_id: Optional[str] = None,
     ) -> Optional[Tuple[bytes, str]]:
         """Return the bytes and name of a received file, or ``None``.
 
@@ -11483,7 +11500,9 @@ class WebBridge:
         are re-checked against the bytes on disk, and the recorded
         path must resolve inside this sender's directory under the
         node's files directory — a record pointing anywhere else (a
-        hand-edited inbox, a planted symlink) serves nothing.
+        hand-edited inbox, a planted symlink) serves nothing.  With
+        *wire_id* set, only the record with that id is considered, so
+        an older same-name file is never mistaken for a newer one.
 
         Raises ``ValueError`` when the sender or name is not usable
         at all (a malformed hash, a name that is not already a safe
@@ -17828,3 +17847,5 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
+value, maximum))
+minimum, min(value, maximum))
