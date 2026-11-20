@@ -1247,3 +1247,36 @@ def test_restore_force_removes_stale_scheduled_files(tmp_path, capsys):
     capsys.readouterr()
     assert not stale.exists()
     assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+
+
+def test_backup_skips_orphan_staged_bytes_and_restores(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    source = tmp_path / "notes.txt"
+    source.write_bytes(b"hello mesh")
+    _schedule_file_on_node(node_a, "alice", source)
+    capsys.readouterr()
+    config_a = TauConfig.resolve(data_dir=node_a)
+    # Orphaned staged bytes: a crash between staging and the queue
+    # commit, plus a leftover staging temp file.  Without the
+    # entry-owned filter the archive would hold them and the restore
+    # would refuse the whole backup as unrestorable.
+    orphan_dir = config_a.scheduled_files_dir / ("e" * 16)
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    (orphan_dir / "orphan.bin").write_bytes(b"orphan\n")
+    (orphan_dir / ".notes.txt.tmp-ab12cd34").write_bytes(b"partial")
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    config_b = TauConfig.resolve(data_dir=node_b)
+    from tau.scheduled_files import load_scheduled_files
+
+    queue = load_scheduled_files(config_b.scheduled_files_path)
+    assert len(queue) == 1
+    staged = config_b.scheduled_files_dir / queue.files[0].id / "notes.txt"
+    assert staged.read_bytes() == b"hello mesh"
+    assert not (config_b.scheduled_files_dir / ("e" * 16)).exists()

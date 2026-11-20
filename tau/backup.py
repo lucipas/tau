@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import sqlite3
 import tarfile
@@ -47,6 +48,8 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+log = logging.getLogger(__name__)
 
 from . import __version__
 from .config import (
@@ -253,6 +256,47 @@ def _scheduled_files(config: TauConfig) -> List[str]:
     return members
 
 
+def _owned_scheduled_files(config: TauConfig) -> List[str]:
+    """Staged scheduled-file members owned by a queue entry.
+
+    Like :func:`_scheduled_files`, but only members the queue owns:
+    ``scheduled-files/<id>/<name>`` for entries whose staged file
+    exists as a regular file and is not a symlink.  Orphaned staged
+    bytes — a crash between staging and the queue commit, a failed
+    removal, a leftover ``.tmp-`` file — are skipped and logged, so a
+    backup made while such bytes exist is still restorable: the
+    restore side refuses any staged member without a queue entry, so
+    archiving an orphan would make the whole archive unrestorable.
+    Callers must hold the scheduled-files lock, so the queue and the
+    staged bytes cannot drift between the load and the listing.  A
+    corrupt queue fails the backup loudly instead of silently
+    omitting scheduled files from it.
+    """
+    from .scheduled_files import ScheduledFileError, load_scheduled_files
+
+    try:
+        queue = load_scheduled_files(config.scheduled_files_path)
+    except ScheduledFileError as exc:
+        raise BackupError(
+            f"not a valid tau backup: scheduled-files queue is invalid: {exc}"
+        ) from exc
+    expected = {
+        f"{SCHEDULED_FILES_DIR_NAME}/{entry.id}/{entry.file['name']}"
+        for entry in queue.files
+    }
+    members: List[str] = []
+    for name in _scheduled_files(config):
+        if name in expected:
+            members.append(name)
+        else:
+            log.warning(
+                "Skipping orphaned staged scheduled file %s in backup: "
+                "no queue entry owns it",
+                name,
+            )
+    return members
+
+
 def _destinations(
     config: TauConfig, received: List[str] = (), scheduled: List[str] = ()
 ) -> Dict[str, Path]:
@@ -368,7 +412,12 @@ def create_backup(
             # the backup with "disappeared ... try again", like any
             # other state file that vanishes under the archive.)
             received = _received_files(config)
-            scheduled = _scheduled_files(config)
+            # Only entry-owned staged files: orphaned bytes (a crash
+            # between staging and the queue commit, a failed removal,
+            # a leftover .tmp- file) would make the archive
+            # unrestorable, because the restore refuses any staged
+            # member without a queue entry.
+            scheduled = _owned_scheduled_files(config)
             destinations.update(
                 {name: config.data_dir / name for name in received}
             )

@@ -242,6 +242,44 @@ def test_send_file_delay_schedules_without_a_node(
     assert staged.read_bytes() == source.read_bytes()
 
 
+def test_send_file_delay_holds_lock_across_staging(
+    tmp_path, capsys, monkeypatch
+):
+    import fcntl
+
+    from tau.config import TauConfig
+
+    source = _write_sample_file(tmp_path)
+    real_stage_file = cli.stage_file
+    held = []
+
+    def _stage_and_probe(*args, **kwargs):
+        # Inside staging, a second non-blocking exclusive flock on
+        # the queue lock sidecar must fail: the schedule holds the
+        # lock across staging and the queue commit, so a crash or a
+        # backup cannot slip between them and leave orphaned bytes.
+        config = TauConfig.resolve(data_dir=tmp_path / "node")
+        lock_path = config.scheduled_files_path.with_name(
+            f".{config.scheduled_files_path.name}.lock"
+        )
+        with open(lock_path, "a+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                held.append(True)
+            else:
+                held.append(False)
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        return real_stage_file(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "stage_file", _stage_and_probe)
+    code = _run_send_file(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "2h", str(source)]
+    )
+    assert code == 0
+    assert held == [True]
+
+
 def test_send_file_delay_json_reports_send_after(tmp_path, capsys, monkeypatch):
     source = _write_sample_file(tmp_path)
     code = _run_send_file(

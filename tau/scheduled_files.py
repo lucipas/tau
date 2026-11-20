@@ -21,12 +21,14 @@ removes the entry and deletes its staged bytes.
 A transfer runs off the mail-loop thread (see
 ``TauNode._publish_due_scheduled_files``): a file transfer can take
 minutes, so the publish pass never holds the queue lock across a
-send.  Each entry is claimed under the lock just before sending, so
-a cancel that lands after the claim refuses instead of racing the
-transfer; a cancel before the claim removes the entry and its staged
-bytes.  A claim older than the lease is treated as stale (its worker
-is presumed dead) and the entry becomes claimable — and cancellable
-— again.
+send.  Each entry is claimed under the lock just before sending —
+stamped with the acquisition time, and renewed while the transfer
+runs — so a cancel that lands after the claim refuses instead of
+racing the transfer, and a transfer longer than the claim lease
+cannot let its own claim expire under it; a cancel before the claim
+removes the entry and its staged bytes.  A claim older than the
+lease is treated as stale (its worker is presumed dead) and the
+entry becomes claimable — and cancellable — again.
 
 Entries are validated on load the way the other small JSON stores
 are: a malformed file raises rather than silently dropping queued
@@ -42,6 +44,7 @@ import logging
 import os
 import secrets
 import shutil
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -172,7 +175,13 @@ def _clean_members(value: Any) -> Tuple[str, ...]:
 def _clean_timeout(value: Any, label: str, *, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ScheduledFileError(f"not a timeout: {label}={value!r}")
-    seconds = float(value)
+    try:
+        seconds = float(value)
+    except OverflowError:
+        # A JSON integer beyond the float range is a malformed value,
+        # not a crash: the load must raise ScheduledFileError so the
+        # publish pass can skip the queue instead of aborting.
+        raise ScheduledFileError(f"not a timeout: {label}={value!r}") from None
     if seconds != seconds or seconds == float("inf"):
         raise ScheduledFileError(f"not a timeout: {label}={value!r}")
     if positive and seconds <= 0:
@@ -219,7 +228,12 @@ def _clean_file(value: Any) -> Dict[str, Any]:
 def _clean_timestamp(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ScheduledFileError(f"not a timestamp: {label}={value!r}")
-    stamp = float(value)
+    try:
+        stamp = float(value)
+    except OverflowError:
+        # As in _clean_timeout: a malformed value must raise
+        # ScheduledFileError, not abort the load with OverflowError.
+        raise ScheduledFileError(f"not a timestamp: {label}={value!r}") from None
     if stamp <= 0 or stamp != stamp or stamp in (float("inf"), float("-inf")):
         raise ScheduledFileError(f"not a timestamp: {label}={value!r}")
     return stamp
@@ -235,7 +249,12 @@ def _clean_retry_at(value: Any) -> float:
     # 0.0 means "eligible now"; unlike publish_at it is not a real time.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ScheduledFileError(f"not a retry time: {value!r}")
-    stamp = float(value)
+    try:
+        stamp = float(value)
+    except OverflowError:
+        # As in _clean_timeout: a malformed value must raise
+        # ScheduledFileError, not abort the load with OverflowError.
+        raise ScheduledFileError(f"not a retry time: {value!r}") from None
     if stamp < 0 or stamp != stamp or stamp == float("inf"):
         raise ScheduledFileError(f"not a retry time: {value!r}")
     return stamp
@@ -627,8 +646,22 @@ def schedule_file(
         discover_timeout=_clean_timeout(discover_timeout, "discover_timeout"),
     )
     with scheduled_files_lock(path):
-        queue = load_scheduled_files(path)
-        save_scheduled_files(path, queue.with_added(entry))
+        return _schedule_file_locked(path, entry)
+
+
+def _schedule_file_locked(path: Union[str, Path], entry: ScheduledFile) -> ScheduledFile:
+    """Queue *entry* assuming the scheduled-files lock is already held.
+
+    The lock-holding split of :func:`schedule_file`: callers that
+    stage bytes first (see ``tau.cli._queue_file_for_later``) hold
+    the lock across staging and the queue commit, so a crash or a
+    backup cannot slip between the two and leave orphaned staged
+    bytes.  The lock is an flock sidecar and is not reentrant, so
+    that caller cannot just call :func:`schedule_file` inside its
+    own lock block.
+    """
+    queue = load_scheduled_files(path)
+    save_scheduled_files(path, queue.with_added(entry))
     return entry
 
 
@@ -667,6 +700,62 @@ def cancel_scheduled_file(
     return entry
 
 
+def _claim_renewer(
+    path: Union[str, Path],
+    file_id: str,
+    claim_value: float,
+    clock: Callable[[], float],
+    stop: threading.Event,
+    interval: float,
+) -> threading.Thread:
+    """A daemon thread that keeps one send claim fresh.
+
+    While a transfer runs, re-stamps the entry's ``claimed_at`` to
+    the clock every *interval* seconds, so a transfer longer than
+    ``CLAIM_LEASE_SECONDS`` never lets its own claim expire and a
+    cancel cannot delete the entry under the live transfer.  Only
+    renews while the entry still carries *claim_value* — a cleared
+    or replaced claim means this transfer is over, and the thread
+    exits.  A non-positive *interval* disables renewal (the claim
+    is still stamped at acquisition).  The caller sets *stop* and
+    joins before the post-send queue update.
+    """
+
+    def _run() -> None:
+        if interval <= 0:
+            return
+        # The claim this thread owns: it advances on every renewal,
+        # so the ownership check below must track the latest stamp,
+        # not the original one — otherwise the first renewal would
+        # make the next check think the claim had been replaced.
+        current_claim = claim_value
+        while not stop.wait(interval):
+            try:
+                with scheduled_files_lock(path):
+                    queue = load_scheduled_files(path)
+                    current = queue.resolve(file_id)
+                    if current.claimed_at != current_claim:
+                        return
+                    current_claim = clock()
+                    save_scheduled_files(
+                        path,
+                        queue.with_replaced(
+                            replace(current, claimed_at=current_claim)
+                        ),
+                    )
+            except ScheduledFileError:
+                return
+            except OSError:
+                # A transient queue-write failure must not kill the
+                # transfer; the next renewal retries, and the lease
+                # still expires on its own if renewal keeps failing.
+                continue
+
+    return threading.Thread(
+        target=_run, name=f"scheduled-file-claim-{file_id}", daemon=True
+    )
+
+
 def publish_due_scheduled_files(
     path: Union[str, Path],
     staged_dir: Union[str, Path],
@@ -674,6 +763,7 @@ def publish_due_scheduled_files(
     *,
     now: Optional[float] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    claim_renew_seconds: float = 300.0,
 ) -> Dict[str, int]:
     """Send every due queued file through *send* (a ``(entry, path)``
     callable that raises on failure).
@@ -682,9 +772,12 @@ def publish_due_scheduled_files(
     ``TauNode._publish_due_scheduled_files``): a file transfer can
     take minutes, so unlike the scheduled-channel pass this one never
     holds the queue lock across a send.  Each entry is claimed under
-    the lock just before sending — the claim is what makes a cancel
-    that lands mid-transfer refuse instead of racing it — and the
-    claim is cleared when the attempt finishes.  A cancel that lands
+    the lock just before sending — stamped with the acquisition time,
+    not the pass start, so a long earlier transfer cannot leave a
+    later entry's claim already stale — and the claim is renewed
+    every *claim_renew_seconds* while the transfer runs, so a
+    transfer longer than the lease cannot expire its own claim and
+    let a cancel delete the entry under it.  A cancel that lands
     before the claim is honoured; a cancel during the transfer
     itself cannot recall the bytes.
 
@@ -703,7 +796,8 @@ def publish_due_scheduled_files(
     a warning and sends nothing, so one bad file cannot stall the
     mail loop that calls this.
     """
-    at = now if now is not None else time.time()
+    clock = (lambda: now) if now is not None else time.time
+    at = clock()
     with scheduled_files_lock(path):
         try:
             queue = load_scheduled_files(path)
@@ -724,9 +818,13 @@ def publish_due_scheduled_files(
         if should_stop is not None and should_stop():
             break
         staged = staged_file_path(staged_dir, entry.id, entry.file["name"])
-        # Claim under the lock: a cancel since the snapshot, or a
-        # fresh claim from another pass, means this entry is gone or
-        # already in flight and must not be sent again.
+        # Claim under the lock, stamped at acquisition: a cancel
+        # since the snapshot, or a fresh claim from another pass,
+        # means this entry is gone or already in flight and must not
+        # be sent again.  Stamping the acquisition time (not the pass
+        # start) keeps a long earlier transfer from leaving this
+        # entry's claim already stale when its own transfer begins.
+        claim_at = clock()
         with scheduled_files_lock(path):
             try:
                 queue = load_scheduled_files(path)
@@ -735,19 +833,30 @@ def publish_due_scheduled_files(
                 continue
             if (
                 current.claimed_at
-                and current.claimed_at + CLAIM_LEASE_SECONDS > at
+                and current.claimed_at + CLAIM_LEASE_SECONDS > claim_at
             ):
                 continue
-            entry = replace(current, claimed_at=at)
+            entry = replace(current, claimed_at=claim_at)
             save_scheduled_files(path, queue.with_replaced(entry))
+        # Renew the lease while the transfer runs, so a transfer
+        # longer than the lease cannot expire its own claim and let a
+        # cancel delete the entry under it.  The renewer stops before
+        # the post-send queue update below.
+        stop_renew = threading.Event()
+        renewer = _claim_renewer(
+            path, entry.id, claim_at, clock, stop_renew, claim_renew_seconds
+        )
+        renewer.start()
         try:
             send(entry, staged)
         except Exception as exc:  # noqa: BLE001 - a failed send retries
+            stop_renew.set()
+            renewer.join(timeout=2.0)
             # The retry clock starts when this attempt failed, not
             # when the pass began: an earlier slow transfer must not
             # consume the backoff.  With an injected `now` (tests)
             # the pass time stands in for the failure time.
-            failed_at = now if now is not None else time.time()
+            failed_at = clock()
             delivered = tuple(
                 getattr(exc, "delivered_members", ()) or ()
             )
@@ -791,6 +900,8 @@ def publish_due_scheduled_files(
                     attempts,
                 )
             continue
+        stop_renew.set()
+        renewer.join(timeout=2.0)
         with scheduled_files_lock(path):
             try:
                 queue = load_scheduled_files(path)
@@ -799,17 +910,22 @@ def publish_due_scheduled_files(
                 # Cancelled while the transfer ran: the entry is
                 # already gone, which is the same outcome.
                 pass
-        try:
-            remove_staged_file(staged_dir, entry.id)
-        except OSError as exc:
-            # The file went out and the queue is clean; the orphaned
-            # staged bytes are a leak to report, not a reason to
-            # pretend the send failed.
-            log.warning(
-                "Scheduled file %s sent but its staged bytes could not "
-                "be deleted (%s)",
-                entry.id,
-                exc,
-            )
+            else:
+                # Delete the staged bytes under the same lock hold as
+                # the queue removal: a backup listing members between
+                # the two would archive bytes no queue entry owns,
+                # and the restore would refuse the whole archive.
+                try:
+                    remove_staged_file(staged_dir, entry.id)
+                except OSError as exc:
+                    # The file went out and the queue is clean; the
+                    # orphaned staged bytes are a leak to report, not
+                    # a reason to pretend the send failed.
+                    log.warning(
+                        "Scheduled file %s sent but its staged bytes could not "
+                        "be deleted (%s)",
+                        entry.id,
+                        exc,
+                    )
         published += 1
     return {"published": published, "kept": len(candidates) - published}

@@ -240,12 +240,13 @@ from .scheduled_channel import (
 from .scheduled_files import (
     ScheduledFile,
     ScheduledFileError,
+    _schedule_file_locked,
     cancel_scheduled_file,
     load_scheduled_files,
     new_scheduled_file_id,
     read_file_payload,
     remove_staged_file,
-    schedule_file,
+    scheduled_files_lock,
     stage_file,
 )
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
@@ -13879,53 +13880,61 @@ def _queue_file_for_later(
 
     Reads and validates the file first (same 1..10 MiB limit and safe
     name an immediate send enforces), stages the bytes under a fresh
-    queue id, then records the queue entry.  A queue write that fails
-    after staging removes the staged bytes again, so a failed
-    schedule never leaves an orphaned staged file behind — a removal
-    that itself fails is logged, not hidden behind the original error.
+    queue id, then records the queue entry.  Staging and the queue
+    commit happen under the scheduled-files lock, so a crash or a
+    backup cannot slip between them and leave orphaned staged bytes
+    no queue entry owns.  A queue write that fails after staging
+    removes the staged bytes again under the same lock hold, so a
+    failed schedule never leaves an orphaned staged file behind — a
+    removal that itself fails is logged, not hidden behind the
+    original error.
     """
     try:
         data, name, digest = read_file_payload(path)
     except ScheduledFileError as exc:
         raise NodeError(str(exc)) from exc
     entry_id = new_scheduled_file_id()
-    stage_file(config.scheduled_files_dir, entry_id, name, data)
-    try:
-        return schedule_file(
-            config.scheduled_files_path,
-            target=target,
-            kind=kind,
-            file={"sha256": digest, "size": len(data), "name": name},
-            publish_at=send_after,
-            file_id=entry_id,
-            group_id=group_id,
-            group_members=group_members,
-            timeout=timeout,
-            discover_timeout=discover_timeout,
-        )
-    except ScheduledFileError as exc:
+    with scheduled_files_lock(config.scheduled_files_path):
+        stage_file(config.scheduled_files_dir, entry_id, name, data)
         try:
-            remove_staged_file(config.scheduled_files_dir, entry_id)
-        except OSError as cleanup_exc:
-            log.warning(
-                "Scheduled file %s could not be queued (%s) and its "
-                "staged bytes could not be removed (%s)",
-                entry_id,
-                exc,
-                cleanup_exc,
+            return _schedule_file_locked(
+                config.scheduled_files_path,
+                ScheduledFile(
+                    id=entry_id,
+                    target=target,
+                    kind=kind,
+                    file={"sha256": digest, "size": len(data), "name": name},
+                    publish_at=send_after,
+                    created_at=time.time(),
+                    group_id=group_id,
+                    group_members=group_members,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                ),
             )
-        raise NodeError(str(exc)) from exc
-    except Exception:
-        try:
-            remove_staged_file(config.scheduled_files_dir, entry_id)
-        except OSError as cleanup_exc:  # pragma: no cover - best effort
-            log.warning(
-                "Scheduled file %s could not be queued and its staged "
-                "bytes could not be removed (%s)",
-                entry_id,
-                cleanup_exc,
-            )
-        raise
+        except ScheduledFileError as exc:
+            try:
+                remove_staged_file(config.scheduled_files_dir, entry_id)
+            except OSError as cleanup_exc:
+                log.warning(
+                    "Scheduled file %s could not be queued (%s) and its "
+                    "staged bytes could not be removed (%s)",
+                    entry_id,
+                    exc,
+                    cleanup_exc,
+                )
+            raise NodeError(str(exc)) from exc
+        except Exception:
+            try:
+                remove_staged_file(config.scheduled_files_dir, entry_id)
+            except OSError as cleanup_exc:  # pragma: no cover - best effort
+                log.warning(
+                    "Scheduled file %s could not be queued and its staged "
+                    "bytes could not be removed (%s)",
+                    entry_id,
+                    cleanup_exc,
+                )
+            raise
 
 
 def _print_scheduled_file(entry: ScheduledFile, *, delay: float) -> None:

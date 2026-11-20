@@ -677,3 +677,82 @@ def test_remove_staged_file_raises_when_deletion_fails(tmp_path):
     target.write_bytes(b"not a directory")
     with pytest.raises(OSError):
         remove_staged_file(staged_dir, "e" * 16)
+
+
+def test_oversized_timeout_and_timestamp_raise_not_crash(tmp_path):
+    path = tmp_path / "scheduled-files.json"
+    data = {"files": [_entry().to_dict()]}
+    # A JSON integer beyond the float range: float() would raise
+    # OverflowError; loading must raise ScheduledFileError instead,
+    # so the publish pass can skip the queue rather than aborting.
+    data["files"][0]["timeout"] = 10**400
+    path.write_text(json.dumps(data))
+    with pytest.raises(ScheduledFileError):
+        load_scheduled_files(path)
+    data["files"][0]["timeout"] = 300.0
+    data["files"][0]["publish_at"] = 10**400
+    path.write_text(json.dumps(data))
+    with pytest.raises(ScheduledFileError):
+        load_scheduled_files(path)
+    data["files"][0]["publish_at"] = 1000.0
+    data["files"][0]["claimed_at"] = 10**400
+    path.write_text(json.dumps(data))
+    with pytest.raises(ScheduledFileError):
+        load_scheduled_files(path)
+    # And the publish pass treats such a queue as corrupt: it sends
+    # nothing instead of raising out of the mail loop.
+    sent = []
+    result = publish_due_scheduled_files(
+        path, tmp_path / "scheduled-files", lambda e, p: sent.append(e),
+        now=2000.0,
+    )
+    assert result == {"published": 0, "kept": 0}
+    assert sent == []
+
+
+def test_claim_stamped_at_acquisition_not_pass_start(tmp_path):
+    path, staged_dir, first = _seed(tmp_path)
+    second = schedule_file(
+        path,
+        target="bob",
+        kind="dm",
+        file=dict(FILE),
+        publish_at=1000.0,
+        now=900.0,
+    )
+    stage_file(staged_dir, second.id, "notes.txt", b"hello")
+    seen = []
+
+    def _slow(sent_entry, staged):
+        if not seen:
+            time.sleep(0.3)
+        seen.append(sent_entry)
+
+    result = publish_due_scheduled_files(path, staged_dir, _slow)
+    assert result == {"published": 2, "kept": 0}
+    assert len(seen) == 2
+    # The second entry's claim was stamped when its transfer began,
+    # after the first (slow) transfer — not at the pass start.
+    assert seen[1].claimed_at >= seen[0].claimed_at + 0.2
+
+
+def test_renewal_keeps_long_transfer_claim_fresh(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    observed = []
+
+    def _slow(sent_entry, staged):
+        time.sleep(0.3)
+        observed.append(load_scheduled_files(path).files[0].claimed_at)
+        # A cancel mid-transfer must refuse while the claim is live.
+        with pytest.raises(ScheduledFileError, match="already sending"):
+            cancel_scheduled_file(path, entry.id)
+        time.sleep(0.3)
+        observed.append(load_scheduled_files(path).files[0].claimed_at)
+
+    result = publish_due_scheduled_files(
+        path, staged_dir, _slow, claim_renew_seconds=0.1
+    )
+    assert result == {"published": 1, "kept": 0}
+    assert len(observed) == 2
+    # Renewal re-stamped the claim while the transfer ran.
+    assert observed[1] > observed[0]
