@@ -81,15 +81,16 @@ export default function ChannelsSection() {
   // draft alone.
   const [loadedDraftKey, setLoadedDraftKey] = useState<string | null>(null);
   // Unsent composer state parked per channel: the text plus the
-  // marks saying which saved draft (if any) that text came from.
+  // mark saying which saved draft (if any) that text came from.
   // A switch restores the whole composer, so a draft opened, left,
   // and returned to still closes on send instead of re-seeding
-  // and sending twice.
+  // and sending twice. The seed-consumed mark is deliberately NOT
+  // parked: a return is a fresh open, so a saved draft may pre-fill
+  // the box again — the send path drops a sent draft from the local
+  // list at once, so a deleted draft cannot re-seed while its
+  // refresh is still in flight.
   const [composerByChannel, setComposerByChannel] = useState<
-    Record<
-      string,
-      { text: string; loadedDraftKey: string | null; draftSeedKey: string | null }
-    >
+    Record<string, { text: string; loadedDraftKey: string | null }>
   >({});
   const prevSelectedRef = useRef<string | null>(null);
   const [savingDraft, setSavingDraft] = useState(false);
@@ -129,12 +130,14 @@ export default function ChannelsSection() {
     // Park the outgoing channel's unsent composer state and restore
     // the incoming channel's own parked state (or an empty box), so
     // a switch never carries one channel's text — or its draft
-    // marks — into another.
+    // marks — into another. A return is a fresh open: the
+    // seed-consumed mark is cleared, so a saved draft may pre-fill
+    // the box again.
     const prev = prevSelectedRef.current;
     if (prev && prev !== selectedChannelName) {
       setComposerByChannel((m) => ({
         ...m,
-        [prev]: { text, loadedDraftKey, draftSeedKey },
+        [prev]: { text, loadedDraftKey },
       }));
     }
     prevSelectedRef.current = selectedChannelName;
@@ -142,12 +145,11 @@ export default function ChannelsSection() {
       ? (composerByChannel[selectedChannelName] ?? {
           text: "",
           loadedDraftKey: null,
-          draftSeedKey: null,
         })
-      : { text: "", loadedDraftKey: null, draftSeedKey: null };
+      : { text: "", loadedDraftKey: null };
     setText(parked.text);
     setLoadedDraftKey(parked.loadedDraftKey);
-    setDraftSeedKey(parked.draftSeedKey);
+    setDraftSeedKey(null);
     setPendingSeed(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDraftKey]);
@@ -251,16 +253,24 @@ export default function ChannelsSection() {
       // survives an unrelated message sent in the same channel.
       if (loadedDraftKey && loadedDraftKey === selectedDraftKey) {
         await deleteDraft("channel", channel).catch(() => undefined);
+        // Drop the draft from the local list at once, and clear the
+        // pending seed with it: the seed must not re-pour the
+        // deleted text while the drafts refresh is in flight.
+        // (If the delete itself failed, the refresh puts it back,
+        // and the kept seed mark stops it re-pouring this visit.)
+        setDrafts((prev) =>
+          prev.filter((d) => !(d.kind === "channel" && d.target === channel)),
+        );
+        setPendingSeed(null);
         void refreshDrafts();
       }
       setLoadedDraftKey(null);
-      // Clear the sent channel's parked composer text, but keep its
-      // seed-consumed mark: the deleted draft may still be in
-      // `pendingSeed` until the drafts refresh lands, and clearing
-      // the mark would pour it straight back into the box.
+      // Clear the sent channel's parked composer text. The live
+      // seed-consumed mark is left alone — the optimistic removal
+      // above already stops the deleted draft re-seeding the box.
       setComposerByChannel((m) => ({
         ...m,
-        [channel]: { text: "", loadedDraftKey: null, draftSeedKey },
+        [channel]: { text: "", loadedDraftKey: null },
       }));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -286,11 +296,7 @@ export default function ChannelsSection() {
       if (selectedDraftKey) setDraftSeedKey(selectedDraftKey);
       setComposerByChannel((m) => ({
         ...m,
-        [channel]: {
-          text: "",
-          loadedDraftKey: null,
-          draftSeedKey: selectedDraftKey,
-        },
+        [channel]: { text: "", loadedDraftKey: null },
       }));
       void refreshDrafts();
     } catch (err) {
