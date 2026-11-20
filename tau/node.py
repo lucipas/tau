@@ -5799,10 +5799,10 @@ class TauNode:
             self._request(
                 peer, REQUEST_REACT, payload_bytes, timeout, deadline=deadline
             )
-        except PeerRefusedError as exc:
+        except (PeerRefusedError, NotAMemberError) as exc:
             # A refusal is final: the peer will not take this
-            # reaction, so stop retrying rather than holding the leg
-            # until its TTL.
+            # reaction (or no longer counts this node as a member), so
+            # stop retrying rather than holding the leg until its TTL.
             log.warning("Dropping queued reaction %s: %s", entry.id, exc)
             try:
                 self._remove_queued_version(
@@ -5932,6 +5932,23 @@ class TauNode:
         # which the post-delivery removal would then delete.  The
         # fresh read also carries the edit's timestamp, so the
         # recipient initializes its edit ordering state from it.
+        if getattr(fresh, "reaction", None) is not None or (
+            getattr(fresh, "kind", None) == "reaction"
+        ):
+            # A queued reaction re-sends its pre-signed bytes, not a
+            # text payload — so it is dispatched before the group-message
+            # encoding and the announcements-only post check, which only
+            # apply to posts.  The version check still guards the send.
+            if not self._queued_version_matches(
+                entry.id,
+                text=fresh.text,
+                edited_at=fresh.edited_at,
+                timeout=_remaining(deadline),
+            ):
+                return False
+            return self._deliver_queued_reaction(
+                peer, fresh, timeout, deadline=deadline
+            )
         send_text = fresh.text
         send_edited_at = fresh.edited_at
         if fresh.group_id is not None:
@@ -6065,14 +6082,6 @@ class TauNode:
             timeout=_remaining(deadline),
         ):
             return False
-        if getattr(fresh, "reaction", None) is not None or (
-            getattr(fresh, "kind", None) == "reaction"
-        ):
-            # A queued reaction re-sends its pre-signed bytes, not a
-            # text payload — the text path below must never see it.
-            return self._deliver_queued_reaction(
-                peer, fresh, timeout, deadline=deadline
-            )
         via_lxmf = False
         try:
             response = self._request(
@@ -9314,21 +9323,26 @@ class TauNode:
             )
             if dest_hash is None or self._is_self(dest_hash):
                 raise
-            entry = self.mailbox.enqueue(
-                to=dest_hash,
-                text=token or "reaction cleared",
-                to_name=peer.display_name if peer is not None else "",
-                sent_at=sent_at,
-                reaction={
-                    "target": target_id,
-                    "token": token,
-                    "reaction_id": reaction_id,
-                    "sent_at": sent_at,
-                    "payload_b64": base64.b64encode(payload_bytes).decode(
-                        "ascii"
-                    ),
-                },
-            )
+            try:
+                entry = self.mailbox.enqueue(
+                    to=dest_hash,
+                    text=token or "reaction cleared",
+                    to_name=peer.display_name if peer is not None else "",
+                    sent_at=sent_at,
+                    reaction={
+                        "target": target_id,
+                        "token": token,
+                        "reaction_id": reaction_id,
+                        "sent_at": sent_at,
+                        "payload_b64": base64.b64encode(payload_bytes).decode(
+                            "ascii"
+                        ),
+                    },
+                )
+            except MailboxError as qexc:
+                # Report a full outbox as a delivery error the CLI and
+                # web API already map, not as an unhandled mailbox error.
+                raise NodeError(f"could not queue reaction: {qexc}") from qexc
             return {
                 "ok": False,
                 "queued": True,
@@ -9542,34 +9556,64 @@ class TauNode:
                         "id": reaction_id,
                     }
                 )
+            except PeerRefusedError as exc:
+                # An explicit refusal from an online member (for
+                # example a block-list entry) is final: report the
+                # leg as failed rather than queueing it.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": str(exc),
+                        "id": reaction_id,
+                    }
+                )
             except NodeError as exc:
                 if queue and self.started:
                     # Unreachable, not refused: queue this leg so the
                     # sweep delivers the same signed reaction when
                     # the member is heard from again.
-                    entry = self.mailbox.enqueue(
-                        to=bytes.fromhex(member),
-                        text=token or "reaction cleared",
-                        to_name=peer.display_name if peer is not None else "",
-                        group={
-                            "id": group["id"],
-                            "name": group["name"],
-                            "creator": group["creator"],
-                            "members": group["members"],
-                        },
-                        sent_at=sent_at,
-                        reaction={
-                            "target": target_id,
-                            "token": token,
-                            "reaction_id": reaction_id,
-                            "sent_at": sent_at,
-                            "target_author": target_author,
-                            "target_sent_at": target_sent_at,
-                            "payload_b64": base64.b64encode(
-                                payload_bytes
-                            ).decode("ascii"),
-                        },
-                    )
+                    try:
+                        entry = self.mailbox.enqueue(
+                            to=bytes.fromhex(member),
+                            text=token or "reaction cleared",
+                            to_name=peer.display_name if peer is not None else "",
+                            group={
+                                "id": group["id"],
+                                "name": group["name"],
+                                "creator": group["creator"],
+                                "members": group["members"],
+                            },
+                            sent_at=sent_at,
+                            reaction={
+                                "target": target_id,
+                                "token": token,
+                                "reaction_id": reaction_id,
+                                "sent_at": sent_at,
+                                "target_author": target_author,
+                                "target_sent_at": target_sent_at,
+                                "payload_b64": base64.b64encode(
+                                    payload_bytes
+                                ).decode("ascii"),
+                            },
+                        )
+                    except MailboxError as qexc:
+                        # A full outbox (or a failed write) fails only
+                        # this leg: the remaining members are still
+                        # tried and delivered legs still get recorded.
+                        results.append(
+                            {
+                                "to": member,
+                                "to_name": peer.display_name
+                                if peer is not None
+                                else "",
+                                "ok": False,
+                                "error": f"{exc}; could not queue: {qexc}",
+                                "id": reaction_id,
+                            }
+                        )
+                        continue
                     results.append(
                         {
                             "to": member,
