@@ -403,14 +403,27 @@ def _preflight_envelope(
     ``channels._normalize_message``, which adds ``v``, ``expires_at``
     and ``reply_to`` to the body before ``_check_wire_size`` measures
     it — so the preflight must carry those fields too, at their real
-    encoded sizes (a null expiry, an empty reply), or a replacement
-    near the budget would pass here and then fail the definitive
-    check on every publish attempt, leaving the entry queued for
-    failed retries.
+    encoded sizes (an empty reply), or a replacement near the budget
+    would pass here and then fail the definitive check on every
+    publish attempt, leaving the entry queued for failed retries.
+
+    The expiry is measured at its largest: publishing fills in a
+    numeric expiry from the channel's disappearing-message default
+    (``ChannelApp.send``), and that default can be set or changed
+    after scheduling, so the preflight assumes an expiry is present
+    and uses the longest allowed one (``created_at`` plus the 30-day
+    cap).  A float encodes at a fixed size, so this covers any
+    default the channel may carry by publish time.
     """
     # Lazy import: this module stays importable without Reticulum,
     # which ``tau.backup`` relies on.
-    from .channels import CHANNEL_VERSION, ChannelError, _check_wire_size, sanitize_name
+    from .channels import (
+        CHANNEL_VERSION,
+        MAX_CHANNEL_EXPIRE_SECONDS,
+        ChannelError,
+        _check_wire_size,
+        sanitize_name,
+    )
 
     envelope = {
         # Placeholder author/key at their real lengths (destination
@@ -423,7 +436,7 @@ def _preflight_envelope(
         "name": sanitize_name(name or "anonymous"),
         "text": text,
         "created_at": created_at,
-        "expires_at": None,
+        "expires_at": created_at + MAX_CHANNEL_EXPIRE_SECONDS,
         "reply_to": "",
     }
     try:

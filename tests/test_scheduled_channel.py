@@ -306,6 +306,28 @@ def test_edit_rejects_text_that_creation_would_reject(tmp_path):
     assert load_scheduled_channel_messages(path).messages[0].text == "later"
 
 
+def test_edit_rejects_text_that_only_fits_without_an_expiry(tmp_path):
+    # Disappearing-message boundary: 1,918 four-byte characters fit
+    # the normalized envelope with a null expiry, but overflow once
+    # publishing attaches the numeric expiry from the channel's
+    # disappearing-message default — and that default can be set
+    # after scheduling.  The preflight measures the largest expiry,
+    # so scheduling and editing both refuse the text up front.
+    path = tmp_path / "scheduled-channel-messages.json"
+    entry = schedule_channel_message(
+        path, channel="general", text="later", publish_at=2000.0, now=1000.0
+    )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        schedule_channel_message(
+            path, channel="general", text="😀" * 1918, publish_at=2000.0, now=1000.0
+        )
+    with pytest.raises(ScheduledChannelError, match="too large"):
+        edit_scheduled_channel_message(
+            path, entry.id, text="😀" * 1918, now=1500.0
+        )
+    assert load_scheduled_channel_messages(path).messages[0].text == "later"
+
+
 def test_edit_scheduled_channel_message_rejects_bad_time(tmp_path):
     path = tmp_path / "scheduled-channel-messages.json"
     entry = schedule_channel_message(
