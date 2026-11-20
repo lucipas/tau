@@ -6851,6 +6851,75 @@ class WebBridge:
         self.bus.publish({"type": "message", "message": message})
         return message, response
 
+    def _record_file_legs(
+        self,
+        *,
+        response: Dict[str, Any],
+        clean_name: str,
+        data: bytes,
+        digest: str,
+        sent_at: float,
+        group: Optional[str] = None,
+        group_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Record one outbound feed entry per file fan-out leg.
+
+        The shared recording loop for :meth:`send_group_file` and
+        :meth:`send_broadcast_file`: each leg becomes an outbound file
+        entry to that member, carrying its own delivery status and the
+        file metadata (name, size, SHA-256) — the same shape as a peer
+        file send, so the feed renders both alike.  A failed leg
+        carries no wire id: the recipient never saw that file, so no
+        reply may be quoted against it.  A leg retracted while its
+        console record was still in flight is omitted instead: the leg
+        went out on the wire, so the response still reports it, but
+        there is no record to show.  Group legs additionally carry
+        the group id/name badge; broadcast legs carry none, because
+        no list metadata ever reaches a recipient.
+        """
+        messages: List[Dict[str, Any]] = []
+        for result in response.get("results") or []:
+            member = str(result.get("to") or "")
+            peer_name = result.get("to_name") or (
+                short_hash(member) if member else "unknown"
+            )
+            delivered = bool(result.get("delivered"))
+            status = "delivered" if delivered else "failed"
+            # A failed leg carries no wire id: the recipient never saw
+            # that file, so no reply may be quoted against it.
+            wire_id = (
+                result.get("id")
+                if delivered and isinstance(result.get("id"), str)
+                else None
+            )
+            with self._send_lock:
+                message = self._append_message(
+                    direction="out",
+                    peer=member or None,
+                    peer_name=peer_name,
+                    text=f"Sent file: {clean_name} ({len(data)} bytes)",
+                    sent_at=sent_at,
+                    received_at=time.time(),
+                    status=status,
+                    group=group,
+                    group_name=group_name,
+                    wire_id=wire_id,
+                    file={
+                        "name": clean_name,
+                        "size": len(data),
+                        "sha256": digest,
+                    },
+                )
+                if message is None:
+                    # This leg was retracted while its console record
+                    # was still in flight: the leg went out on the
+                    # wire, so the response still reports it, but
+                    # there is no record to show.
+                    continue
+            self.bus.publish({"type": "message", "message": message})
+            messages.append(message)
+        return messages
+
     def send_group_file(
         self,
         group: str,
@@ -6910,47 +6979,15 @@ class WebBridge:
             response = self.node.send_group_file(
                 group_record, staged, timeout=timeout
             )
-        messages: List[Dict[str, Any]] = []
-        for result in response.get("results") or []:
-            member = str(result.get("to") or "")
-            peer_name = result.get("to_name") or (
-                short_hash(member) if member else "unknown"
-            )
-            delivered = bool(result.get("delivered"))
-            status = "delivered" if delivered else "failed"
-            # A failed leg carries no wire id: the recipient never saw
-            # that file, so no reply may be quoted against it.
-            wire_id = (
-                result.get("id")
-                if delivered and isinstance(result.get("id"), str)
-                else None
-            )
-            with self._send_lock:
-                message = self._append_message(
-                    direction="out",
-                    peer=member or None,
-                    peer_name=peer_name,
-                    text=f"Sent file: {clean_name} ({len(data)} bytes)",
-                    sent_at=sent_at,
-                    received_at=time.time(),
-                    status=status,
-                    group=group_record["id"],
-                    group_name=group_record.get("name") or "",
-                    wire_id=wire_id,
-                    file={
-                        "name": clean_name,
-                        "size": len(data),
-                        "sha256": digest,
-                    },
-                )
-                if message is None:
-                    # This leg was retracted while its console record
-                    # was still in flight: the leg went out on the
-                    # wire, so the response still reports it, but
-                    # there is no record to show.
-                    continue
-            self.bus.publish({"type": "message", "message": message})
-            messages.append(message)
+        messages = self._record_file_legs(
+            response=response,
+            clean_name=clean_name,
+            data=data,
+            digest=digest,
+            sent_at=sent_at,
+            group=group_record["id"],
+            group_name=group_record.get("name") or "",
+        )
         return messages, response
 
     def send_broadcast_file(
@@ -7014,45 +7051,13 @@ class WebBridge:
             response = self.node.send_broadcast_file(
                 broadcast_record, staged, timeout=timeout
             )
-        messages: List[Dict[str, Any]] = []
-        for result in response.get("results") or []:
-            member = str(result.get("to") or "")
-            peer_name = result.get("to_name") or (
-                short_hash(member) if member else "unknown"
-            )
-            delivered = bool(result.get("delivered"))
-            status = "delivered" if delivered else "failed"
-            # A failed leg carries no wire id: the recipient never saw
-            # that file, so no reply may be quoted against it.
-            wire_id = (
-                result.get("id")
-                if delivered and isinstance(result.get("id"), str)
-                else None
-            )
-            with self._send_lock:
-                message = self._append_message(
-                    direction="out",
-                    peer=member or None,
-                    peer_name=peer_name,
-                    text=f"Sent file: {clean_name} ({len(data)} bytes)",
-                    sent_at=sent_at,
-                    received_at=time.time(),
-                    status=status,
-                    wire_id=wire_id,
-                    file={
-                        "name": clean_name,
-                        "size": len(data),
-                        "sha256": digest,
-                    },
-                )
-                if message is None:
-                    # This leg was retracted while its console record
-                    # was still in flight: the leg went out on the
-                    # wire, so the response still reports it, but
-                    # there is no record to show.
-                    continue
-            self.bus.publish({"type": "message", "message": message})
-            messages.append(message)
+        messages = self._record_file_legs(
+            response=response,
+            clean_name=clean_name,
+            data=data,
+            digest=digest,
+            sent_at=sent_at,
+        )
         return messages, response
 
     def react(
