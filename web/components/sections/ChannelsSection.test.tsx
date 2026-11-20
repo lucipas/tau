@@ -208,6 +208,55 @@ describe("ChannelsSection", () => {
     expect(link.getAttribute("href")).toContain("mlat=34.05");
   });
 
+  it("shows a pinned place's map link even when it left history", async () => {
+    mockFetch((url) => {
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return {
+          channel: "mesh-general",
+          pins: [
+            {
+              v: 1,
+              hash: "m3".padEnd(64, "0"),
+              channel: "mesh-general",
+              author: "b".repeat(32),
+              key: "b".repeat(32),
+              name: "bob",
+              text: "meet here",
+              created_at: 1002,
+              received_at: 1002,
+              sig: "s",
+              pinned_at: 1500,
+              location: { lat: 34.05, lon: -83.88, name: "Rock Springs Park" },
+            },
+          ],
+          count: 1,
+        };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [{ channel: "mesh-general", joined_at: 900 }],
+          count: 1,
+        };
+      }
+      return { ok: true };
+    });
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    // The pin is in the strip only: no history row carries it.
+    expect(await screen.findByText("meet here")).toBeTruthy();
+    const link = await screen.findByRole("link", { name: /Rock Springs Park/ });
+    expect(link.getAttribute("href")).toContain("openstreetmap.org");
+  });
+
   it("shows an unread badge on a channel with unread messages", async () => {
     render(<ChannelsSection />);
     expect(await screen.findByLabelText("3 unread")).toBeTruthy();
