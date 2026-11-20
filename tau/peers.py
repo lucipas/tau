@@ -379,6 +379,10 @@ class PeerRegistry:
         self.max_peers = max(1, int(max_peers))
         self._peers: Dict[bytes, Peer] = {}
         self._lock = threading.RLock()
+        # This node's own destination hash, set once the node starts:
+        # the node is never its own peer (see TauNode._drop_self_peer).
+        # None until start, so one-shot registry reads behave as before.
+        self.self_hash: Optional[bytes] = None
         if self.path is not None:
             self.load()
 
@@ -691,6 +695,8 @@ class PeerRegistry:
             raise ValueError("destination hash must be 16 bytes")
         if len(public_key) != PUBLIC_KEY_BYTES:
             raise ValueError("public key must be 64 bytes")
+        if self.self_hash is not None and destination_hash == self.self_hash:
+            raise ValueError("cannot register this node as a peer")
 
         timestamp = now if now is not None else time.time()
         clean_name = sanitize_name(name, fallback="unknown")
@@ -989,6 +995,10 @@ class PeerRegistry:
                 peer = Peer.from_dict(entry)
             except (TypeError, ValueError) as exc:
                 log.debug("Skipping invalid peer entry: %s", exc)
+                continue
+            if self.self_hash is not None and peer.destination_hash == self.self_hash:
+                # A stale registry can list this node as its own peer
+                # (see TauNode._drop_self_peer): never re-admit it.
                 continue
             loaded[peer.destination_hash] = peer
 
