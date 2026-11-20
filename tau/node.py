@@ -5799,10 +5799,13 @@ class TauNode:
             self._request(
                 peer, REQUEST_REACT, payload_bytes, timeout, deadline=deadline
             )
-        except PeerRefusedError as exc:
+        except (PeerRefusedError, NotAMemberError) as exc:
             # A refusal is final: the peer will not take this
             # reaction, so stop retrying rather than holding the leg
-            # until its TTL.
+            # until its TTL.  Not-a-member is final here too — the
+            # receiver checks the roster on /tau/react, so a removed
+            # member's leg can never land, exactly like a refused
+            # queued message.
             log.warning("Dropping queued reaction %s: %s", entry.id, exc)
             try:
                 self._remove_queued_version(
@@ -5925,6 +5928,25 @@ class TauNode:
                     return False
         except TimeoutError:
             return False
+        if getattr(fresh, "reaction", None) is not None or (
+            getattr(fresh, "kind", None) == "reaction"
+        ):
+            # A queued reaction re-sends its pre-signed bytes, not a
+            # text payload — and a reaction is not a post, so the
+            # announcements-only skip below must never catch it: the
+            # live path accepts the same reaction in an
+            # announcements-only group.  Keep the superseded-version
+            # check: a replacement can still land after the fresh read.
+            if not self._queued_version_matches(
+                entry.id,
+                text=fresh.text,
+                edited_at=fresh.edited_at,
+                timeout=_remaining(deadline),
+            ):
+                return False
+            return self._deliver_queued_reaction(
+                peer, fresh, timeout, deadline=deadline
+            )
         # Encode the freshly read entry, not the sweep's snapshot: an
         # edit can cancel and re-queue the leg under the same id with
         # new text after the snapshot was taken, and the snapshot's
@@ -6065,14 +6087,8 @@ class TauNode:
             timeout=_remaining(deadline),
         ):
             return False
-        if getattr(fresh, "reaction", None) is not None or (
-            getattr(fresh, "kind", None) == "reaction"
-        ):
-            # A queued reaction re-sends its pre-signed bytes, not a
-            # text payload — the text path below must never see it.
-            return self._deliver_queued_reaction(
-                peer, fresh, timeout, deadline=deadline
-            )
+        # (Queued reactions are dispatched above, before the group
+        # encoding and the announcements-only skip.)
         via_lxmf = False
         try:
             response = self._request(
@@ -9314,21 +9330,28 @@ class TauNode:
             )
             if dest_hash is None or self._is_self(dest_hash):
                 raise
-            entry = self.mailbox.enqueue(
-                to=dest_hash,
-                text=token or "reaction cleared",
-                to_name=peer.display_name if peer is not None else "",
-                sent_at=sent_at,
-                reaction={
-                    "target": target_id,
-                    "token": token,
-                    "reaction_id": reaction_id,
-                    "sent_at": sent_at,
-                    "payload_b64": base64.b64encode(payload_bytes).decode(
-                        "ascii"
-                    ),
-                },
-            )
+            try:
+                entry = self.mailbox.enqueue(
+                    to=dest_hash,
+                    text=token or "reaction cleared",
+                    to_name=peer.display_name if peer is not None else "",
+                    sent_at=sent_at,
+                    reaction={
+                        "target": target_id,
+                        "token": token,
+                        "reaction_id": reaction_id,
+                        "sent_at": sent_at,
+                        "payload_b64": base64.b64encode(payload_bytes).decode(
+                            "ascii"
+                        ),
+                    },
+                )
+            except MailboxError as qexc:
+                # A full outbox is a delivery failure, not a queueing
+                # success: report it as a NodeError so cmd_react and
+                # the web API surface it cleanly instead of leaking
+                # the mailbox exception.
+                raise NodeError(f"could not queue reaction: {qexc}") from qexc
             return {
                 "ok": False,
                 "queued": True,
@@ -9527,10 +9550,12 @@ class TauNode:
                         "rtt": response.get("_rtt"),
                     }
                 )
-            except (NotAllowedError, NotAMemberError) as exc:
+            except (PeerRefusedError, NotAMemberError) as exc:
                 # The member is online and explicitly refused; a
-                # reaction has no outbox to queue into, so the leg
-                # is simply reported as failed.
+                # refusal is final and is never queued — including a
+                # plain PeerRefusedError, which is how the block-list's
+                # silent "unavailable" arrives (see _request).  Only a
+                # transport failure reaches the queue branch below.
                 results.append(
                     {
                         "to": member,
@@ -9538,7 +9563,9 @@ class TauNode:
                         "ok": False,
                         "error": "not_allowed"
                         if isinstance(exc, NotAllowedError)
-                        else "not_a_member",
+                        else "not_a_member"
+                        if isinstance(exc, NotAMemberError)
+                        else "peer_refused",
                         "id": reaction_id,
                     }
                 )
@@ -9547,7 +9574,8 @@ class TauNode:
                     # Unreachable, not refused: queue this leg so the
                     # sweep delivers the same signed reaction when
                     # the member is heard from again.
-                    entry = self.mailbox.enqueue(
+                    try:
+                        entry = self.mailbox.enqueue(
                         to=bytes.fromhex(member),
                         text=token or "reaction cleared",
                         to_name=peer.display_name if peer is not None else "",
@@ -9570,6 +9598,24 @@ class TauNode:
                             ).decode("ascii"),
                         },
                     )
+                    except MailboxError as qexc:
+                        # A full outbox must not abort the fan-out: the
+                        # legs already delivered still need their local
+                        # record (below), and later members still get
+                        # tried — report this leg as failed and keep
+                        # going, as send_group_message does.
+                        results.append(
+                            {
+                                "to": member,
+                                "to_name": peer.display_name
+                                if peer is not None
+                                else "",
+                                "ok": False,
+                                "error": f"could not queue: {qexc}",
+                                "id": reaction_id,
+                            }
+                        )
+                        continue
                     results.append(
                         {
                             "to": member,
