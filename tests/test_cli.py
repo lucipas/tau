@@ -7675,6 +7675,100 @@ def test_group_poll_rejects_one_option(tmp_path, capsys, monkeypatch):
     assert _FakeGroupSendNode.instances == []
 
 
+def test_parser_group_poll_delay():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["group", "poll", "--delay", "2h", "weekend", "which day?", "Sat", "Sun"]
+    )
+    assert args.func is cli.cmd_group_poll
+    assert args.delay == "2h"
+
+
+def _run_group_poll(tmp_path, monkeypatch, argv):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    return (
+        cli.main(["group", "poll", "--data-dir", str(data_dir), *argv]),
+        group,
+    )
+
+
+def test_group_poll_delay_schedules_without_delivery(
+    tmp_path, capsys, monkeypatch
+):
+    before = time.time()
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "2h", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.send_kwargs) == 1
+    assert node.send_kwargs[0]["poll_options"] == ["Saturday", "Sunday"]
+    send_after = node.send_kwargs[0]["send_after"]
+    assert before + 7200 <= send_after <= time.time() + 7200
+    out = capsys.readouterr().out
+    assert "poll scheduled for weekend" in out
+    assert "scheduled for alice" in out
+    assert "scheduled for bob" in out
+    assert "sends in" in out
+    assert "it will be delivered at its scheduled time" in out
+
+
+def test_group_poll_delay_json_reports_send_after(tmp_path, capsys, monkeypatch):
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--json", "--delay", "5m", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["send_after"] is not None
+    assert payload["send_after"] > time.time()
+    assert all(result.get("send_after") for result in payload["results"])
+
+
+def test_group_poll_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        [
+            "--delay",
+            "5m",
+            "--no-queue",
+            "weekend",
+            "which day?",
+            "Saturday",
+            "Sunday",
+        ],
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "soon", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 1
+    assert "invalid --delay duration" in capsys.readouterr().err
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "30d", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 2
+    assert "--delay must be at most 29d23h" in capsys.readouterr().err
+    # 29d fits and queues.
+    code, _ = _run_group_poll(
+        tmp_path,
+        monkeypatch,
+        ["--delay", "29d", "weekend", "which day?", "Saturday", "Sunday"],
+    )
+    assert code == 0
+
+
 def test_group_vote_sends_target_and_option(tmp_path, capsys, monkeypatch):
     data_dir, group = _seed_group_poll_conversation(tmp_path)
     monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
