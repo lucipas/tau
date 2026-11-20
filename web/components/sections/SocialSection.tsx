@@ -199,9 +199,10 @@ export default function SocialSection() {
     name: p.alias || p.name,
   }));
 
-  // Joined channels for the post share picker. Fetched once on mount
-  // (pollMs 0): the channels section owns the live list.
-  const { channels: joinedChannels } = useChannels(0);
+  // Joined channels for the post share picker. Polled so channels joined
+  // elsewhere (e.g. the CLI) appear while Social stays open. No channel is
+  // selected here, so each poll only refreshes the joined-channel list.
+  const { channels: joinedChannels } = useChannels(30_000);
   const channels = joinedChannels.map((c) => c.channel);
 
   const posts = searchResults ?? feed.posts;
