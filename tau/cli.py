@@ -726,6 +726,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="after queueing, wait up to SECONDS for the message to be delivered",
     )
+    forward.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the forward: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
     forward.set_defaults(func=cmd_forward)
 
     # `send --file` already means "read the message text from a file",
