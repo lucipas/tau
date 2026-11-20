@@ -3,9 +3,11 @@
 //
 // An attached image is read as a base64 data URL and published with the
 // post (the bridge validates and stores it); replies and polls cannot
-// carry an image, and neither can a scheduled post yet, so the picker
-// is hidden for those and the submit guards them. Max length is a
-// client-side guard only.
+// carry an image, so the picker is hidden for those and the submit
+// guards them. A scheduled post can carry one — it rides the queue
+// entry until the publish pass attaches it. Polls can be scheduled
+// like posts, but a scheduled poll cannot carry an image. Max length
+// is a client-side guard only.
 
 "use client";
 
@@ -47,6 +49,16 @@ export interface TanComposerProps {
   replyToName?: string;
   onCancelReply?: () => void;
   placeholder?: string;
+  /** Text to start from — a loaded draft. The parent remounts the
+   *  composer (via `key`) when a different draft is loaded. */
+  initialText?: string;
+  /** Expiry a loaded draft carries, in seconds. */
+  initialExpiresIn?: number;
+  /** Park the current text as a draft instead of posting it. */
+  onSaveDraft?: (
+    text: string,
+    opts: { replyTo?: string; expiresIn?: number },
+  ) => Promise<void>;
 }
 
 export default function TanComposer({
@@ -56,11 +68,14 @@ export default function TanComposer({
   replyToName,
   onCancelReply,
   placeholder = "What's happening on the mesh?",
+  initialText = "",
+  initialExpiresIn,
+  onSaveDraft,
 }: TanComposerProps) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(initialText);
   const [mode, setMode] = useState<"post" | "poll">("post");
   const [pollOptions, setPollOptions] = useState<string[]>(["", ""]);
-  const [expiresIn, setExpiresIn] = useState<number | undefined>(undefined);
+  const [expiresIn, setExpiresIn] = useState<number | undefined>(initialExpiresIn);
   const [sendIn, setSendIn] = useState<number | undefined>(undefined);
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -85,6 +100,22 @@ export default function TanComposer({
     if (fileRef.current) fileRef.current.value = "";
   }
 
+  async function handleSaveDraft() {
+    if (!onSaveDraft) return;
+    const problem = validateTanText(text);
+    if (problem) return setError(problem);
+    setError(null);
+    try {
+      await onSaveDraft(text.trim(), {
+        replyTo: replyTo ?? undefined,
+        expiresIn,
+      });
+      reset();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Saving the draft failed.");
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
@@ -92,11 +123,20 @@ export default function TanComposer({
       const problem = validatePoll(text, pollOptions);
       if (problem) return setError(problem);
       try {
-        await composer.poll(
-          text.trim(),
-          pollOptions.map((o) => o.trim()).filter(Boolean),
-          expiresIn,
-        );
+        if (sendIn !== undefined) {
+          await composer.schedulePoll(
+            text.trim(),
+            pollOptions.map((o) => o.trim()).filter(Boolean),
+            sendIn,
+            { expiresIn },
+          );
+        } else {
+          await composer.poll(
+            text.trim(),
+            pollOptions.map((o) => o.trim()).filter(Boolean),
+            expiresIn,
+          );
+        }
         reset();
         onPosted?.();
       } catch {
@@ -106,9 +146,6 @@ export default function TanComposer({
     }
     const problem = validateTanText(text);
     if (problem) return setError(problem);
-    if (file && sendIn !== undefined) {
-      return setError("Images can't be scheduled yet — post now or remove the image.");
-    }
     if (file && file.size > TAN_MAX_IMAGE_BYTES) {
       return setError("That image is larger than the 2 MB limit.");
     }
@@ -124,7 +161,7 @@ export default function TanComposer({
         }
       }
       if (sendIn !== undefined) {
-        await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn });
+        await composer.schedule(text.trim(), sendIn, { replyTo: replyTo ?? undefined, expiresIn, image });
       } else {
         await composer.publish(text.trim(), {
           replyTo: replyTo ?? undefined,
@@ -305,6 +342,21 @@ export default function TanComposer({
         >
           {text.length}/{TAN_MAX_CHARS}
         </span>
+        {onSaveDraft && (
+          <button
+            type="button"
+            onClick={() => void handleSaveDraft()}
+            disabled={composer.busy || mode === "poll" || !text.trim()}
+            title={
+              mode === "poll"
+                ? "Polls can't be saved as drafts"
+                : "Save this post as a draft to finish later"
+            }
+            className="rounded-full border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+          >
+            Save draft
+          </button>
+        )}
         <button
           type="submit"
           disabled={composer.busy || (mode === "post" && !text.trim())}
