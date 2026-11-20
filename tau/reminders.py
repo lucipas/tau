@@ -25,10 +25,10 @@ import os
 import secrets
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, ContextManager, Dict, Iterator, List, Optional, Union
 
 try:  # POSIX only; Windows locks through msvcrt instead (see below).
     import fcntl
@@ -363,12 +363,14 @@ class ReminderStore:
             return len(self._reminders)
 
 
-def _message_still_stored(inbox: Any, reminder: Dict[str, Any]) -> bool:
-    """Whether the reminded message is still in the inbox.
+def _find_stored(inbox: Any, reminder: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The stored inbox record the reminded message is, or ``None`` if gone.
 
     A group send stores one leg id as the record id and the rest in
     ``leg_ids``, so a reminder naming any leg still matches — the
-    same convention as :meth:`Inbox.resolve`.
+    same convention as :meth:`Inbox.resolve`.  Callers must hold the
+    inbox transaction, so the answer reflects the shared inbox file
+    rather than a stale in-memory copy.
     """
     message_id = reminder["message_id"]
     if reminder["kind"] == "group":
@@ -381,11 +383,19 @@ def _message_still_stored(inbox: Any, reminder: Dict[str, Any]) -> bool:
         )
     for entry in entries:
         if entry.get("id") == message_id:
-            return True
+            return entry
         legs = entry.get("leg_ids")
         if isinstance(legs, list) and message_id in legs:
-            return True
-    return False
+            return entry
+    return None
+
+
+def _inbox_transaction(inbox: Any) -> ContextManager[Any]:
+    """The inbox's cross-process transaction, or a no-op for plain stand-ins."""
+    transaction = getattr(inbox, "transaction", None)
+    if callable(transaction):
+        return transaction()
+    return nullcontext()
 
 
 def fire_due_reminders(
@@ -393,19 +403,27 @@ def fire_due_reminders(
     inbox: Any,
     *,
     now: Optional[float] = None,
+    blocklist_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Fire every due reminder through an inbox.
 
     For each due reminder whose message is still stored, the
     conversation is marked unread again (so it lights the unread
-    badge) and the reminder is printed with the original message
-    text and sender, then consumed.  A reminder whose message was
-    deleted first is dropped silently — there is nothing left to be
-    reminded about.  A failure on one reminder never blocks the
-    others, and this never raises into the mail loop: a bad reminder
-    file is treated as nothing-due, with a warning, so one corrupt
-    file cannot stall mail.
+    badge), the reminder is consumed, and then it is printed with the
+    full original message text and sender.  The consume is an exclusive
+    claim on the reminder store: when two passes or a ``tau remind
+    cancel`` race for the same reminder, only the one whose removal
+    succeeds prints it, and a failed removal means it is not fired.
+    A reminder whose message was deleted first, or whose sender is
+    blocked now, is dropped silently — nothing is shown for it.  When
+    ``blocklist_path`` is given and the block-list cannot be read, the
+    reminder stays due (fail closed).  A failure on one reminder never
+    blocks the others, and this never raises into the mail loop: a bad
+    reminder file is treated as nothing-due, with a warning, so one
+    corrupt file cannot stall mail.
     """
+    from .blocklist import load_blocked_set
+
     moment = time.time() if now is None else now
     try:
         store = ReminderStore(path)
@@ -416,30 +434,50 @@ def fire_due_reminders(
     dropped: List[Dict[str, Any]] = []
     for reminder in store.due(moment):
         try:
-            if not _message_still_stored(inbox, reminder):
-                dropped.append(reminder)
-            else:
-                if reminder["kind"] == "group":
-                    inbox.mark_unread(group=reminder["target"])
+            blocked: Any = frozenset()
+            if blocklist_path is not None:
+                blocked = load_blocked_set(blocklist_path)
+                if blocked is None:
+                    # Unreadable block-list: keep the reminder due and
+                    # show nothing this pass.
+                    continue
+            with _inbox_transaction(inbox):
+                entry = _find_stored(inbox, reminder)
+                if entry is None:
+                    outcome = "dropped"
+                elif entry.get("destination") in blocked:
+                    outcome = "dropped"
                 else:
-                    inbox.mark_unread(reminder["target"])
-                first = reminder["text"].splitlines()[0] if reminder["text"] else ""
-                preview = first if len(first) <= 120 else first[:117] + "…"
-                log.info(
-                    "Reminder from %s: %s",
-                    reminder["sender"],
-                    preview,
-                )
-                fired.append(reminder)
+                    if reminder["kind"] == "group":
+                        counts = inbox.mark_unread(group=reminder["target"])
+                    else:
+                        counts = inbox.mark_unread(reminder["target"])
+                    # No received message to mark unread (for example a
+                    # sent-only conversation): nothing to re-ping about.
+                    outcome = "fire" if counts is not None else "dropped"
         except Exception:  # pragma: no cover - defensive; keep firing
-            log.debug("Reminder %s failed to fire", reminder["id"], exc_info=True)
+            log.warning("Reminder %s failed to fire", reminder["id"], exc_info=True)
             continue
         try:
             store.cancel(reminder["id"])
-        except Exception:  # pragma: no cover - defensive
-            log.debug(
-                "Fired reminder %s could not be removed",
+        except ReminderError:
+            # Already cancelled or claimed by another pass: not ours to show.
+            continue
+        except Exception:
+            log.warning(
+                "Reminder %s could not be consumed; it will be retried",
                 reminder["id"],
                 exc_info=True,
             )
+            continue
+        if outcome == "dropped":
+            dropped.append(reminder)
+            continue
+        fired.append(reminder)
+        first = reminder["text"].splitlines()[0] if reminder["text"] else ""
+        preview = first if len(first) <= 120 else first[:117] + "…"
+        log.info("Reminder from %s: %s", reminder["sender"], preview)
+        print(f"Reminder from {reminder['sender']}:", flush=True)
+        for line in reminder["text"].splitlines() or [""]:
+            print(f"  {line}", flush=True)
     return {"fired": fired, "dropped": dropped}

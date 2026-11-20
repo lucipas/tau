@@ -19597,6 +19597,25 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _reminder_sender_blocked(
+    inbox: Inbox, reminder: Dict[str, Any], blocked: Any
+) -> bool:
+    """Whether the reminded message's sender is blocked now (fail closed).
+
+    A DM reminder's target is the sender.  A group reminder names the
+    group, so the sender is read from the stored message; when that
+    message is gone its sender is unknown, and the reminder is hidden.
+    """
+    if reminder["kind"] != "group":
+        return reminder["target"] in blocked
+    entry = inbox.find(
+        str(reminder["message_id"]), group=str(reminder["target"])
+    )
+    if entry is None:
+        return True
+    return entry.get("destination") in blocked
+
+
 def _describe_reminder(
     reminder: Dict[str, Any], config: TauConfig
 ) -> Dict[str, Any]:
@@ -19639,6 +19658,12 @@ def cmd_remind_add(args: argparse.Namespace) -> int:
         raise NodeError(str(exc)) from exc
     if not record.get("text"):
         raise NodeError("cannot remind on a file message: it has no text")
+    if record.get("kind") == "note":
+        raise NodeError("cannot remind on a private note: remind on a DM or group message")
+    if record.get("direction") == "out":
+        # A reminder re-pings by marking a received message unread; a
+        # conversation with nothing received has nothing to light up.
+        raise NodeError("cannot remind on a message you sent: remind on a received message")
     if record.get("direction") != "out":
         blocked = load_blocked_set(config.blocklist_path)
         if blocked is None:
@@ -19708,9 +19733,15 @@ def cmd_remind_add(args: argparse.Namespace) -> int:
 def cmd_remind_list(args: argparse.Namespace) -> int:
     """List pending message reminders, soonest first."""
     config = _make_config(args)
+    # A reminder whose sender is blocked now stays hidden, like the
+    # message itself; an unreadable block-list hides everything.
+    blocked = load_blocked_set(config.blocklist_path)
+    inbox = Inbox(config.inbox_path)
     reminders = [
         _describe_reminder(reminder, config)
         for reminder in ReminderStore(config.reminders_path).list_reminders()
+        if blocked is not None
+        and not _reminder_sender_blocked(inbox, reminder, blocked)
     ]
     if _json_mode(args):
         _emit({"reminders": reminders, "count": len(reminders)}, True)

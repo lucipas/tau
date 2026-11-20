@@ -4927,7 +4927,9 @@ class TauNode:
 
         try:
             result = fire_due_reminders(
-                self.config.reminders_path, self.inbox
+                self.config.reminders_path,
+                self.inbox,
+                blocklist_path=self.config.blocklist_path,
             )
         except Exception:  # pragma: no cover - defensive; helper logs
             log.debug("Reminder firing failed", exc_info=True)
