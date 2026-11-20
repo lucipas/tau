@@ -22,6 +22,7 @@ from tau.broadcasts import (
 )
 from tau.config import TauConfig
 from tau.identity import destination_hash
+from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.node import NodeError, TauNode
 from tau.peers import PeerRegistry
@@ -325,6 +326,71 @@ def test_broadcast_send_unknown_list(tmp_path, monkeypatch):
     code = _run_broadcast(tmp_path, monkeypatch, ["send", "nope", "hi"])
     assert code != 0
 
+
+# -- forward to a broadcast list ----------------------------------------
+# Issue #630: `tau forward --broadcast LIST` forwards a stored DM to
+# every member of the list, one private DM each.
+
+
+def _seed_forwardable_message(tmp_path):
+    """One received DM from alice, forwardable by its id prefix."""
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "original thought",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "a" * 32,
+            "direction": "in",
+        }
+    )
+    return config
+
+
+def test_forward_to_broadcast_fans_out_attributed_text(
+    tmp_path, capsys, monkeypatch
+):
+    _seed_peers(tmp_path)
+    _seed_forwardable_message(tmp_path)
+    assert (
+        _run_broadcast(
+            tmp_path,
+            monkeypatch,
+            ["create", "team", "--peer", "alice", "--peer", "bob"],
+        )
+        == 0
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeBroadcastNode)
+    _FakeBroadcastNode.instances.clear()
+    code = cli.main(
+        ["forward", "--data-dir", str(tmp_path / "node"), "--broadcast", "team", "aaaa"]
+    )
+    assert code == 0
+    node = _FakeBroadcastNode.instances[-1]
+    # Members are stored sorted by hash, so the fan-out follows that order.
+    assert node.calls == [
+        (hashed, "Forwarded from alice:\noriginal thought")
+        for hashed in sorted([_PEER_MAP["alice"], _PEER_MAP["bob"]])
+    ]
+    out = capsys.readouterr().out
+    assert f"delivered to {_PEER_MAP['alice']}" in out
+    assert f"delivered to {_PEER_MAP['bob']}" in out
+    assert node.started is False
+
+
+def test_forward_to_broadcast_unknown_list(tmp_path, capsys, monkeypatch):
+    _seed_peers(tmp_path)
+    _seed_forwardable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeBroadcastNode)
+    _FakeBroadcastNode.instances.clear()
+    code = cli.main(
+        ["forward", "--data-dir", str(tmp_path / "node"), "--broadcast", "nope", "aaaa"]
+    )
+    assert code == 1
+    assert "unknown broadcast list" in capsys.readouterr().err
 
 # -- broadcast file fan-out (CLI) -------------------------------------------
 
