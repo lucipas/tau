@@ -576,6 +576,142 @@ def test_old_database_gains_a_reply_column(identities, tmp_path):
         conn.close()
 
 
+# -- location pins -----------------------------------------------------------
+
+
+def test_location_pin_is_part_of_the_signed_body(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    message = create_message(
+        conn, alice, "general", "meet here", name="alice", now=1000,
+        location=pin,
+    )
+
+    assert message["location"] == pin
+    assert verify_message(message)["hash"] == message["hash"]
+    assert "location" not in create_message(
+        conn, alice, "general", "plain", name="alice", now=1001
+    )
+
+    # A relay cannot strip the pin: the location is covered by the
+    # hash, so a pin-less copy fails verification.
+    with pytest.raises(ChannelError):
+        verify_message({k: v for k, v in message.items() if k != "location"})
+    # ...and neither can it move the pin onto another message.
+    other = create_message(conn, alice, "general", "other", name="alice", now=1002)
+    with pytest.raises(ChannelError):
+        verify_message(dict(other, location=pin))
+
+
+def test_location_pin_round_trips_through_the_store(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+    message = create_message(
+        conn, alice, "general", "meet here", name="alice", now=1000,
+        location=pin,
+    )
+
+    stored = get_message(conn, message["hash"])
+    assert stored is not None
+    assert stored["location"] == pin
+    assert channel_history(conn, "general")[0]["location"] == pin
+
+    # Re-storing the same message returns the parsed pin, not the
+    # raw JSON string the row stores.
+    again, is_new = store_message(conn, message)
+    assert is_new is False
+    assert again["location"] == pin
+
+
+def test_restoring_an_existing_poll_message_parses_its_fields(
+    identities, tmp_path
+):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(
+        conn, alice, "general", "pick one", name="alice", now=1000,
+        poll_options=["a", "b"],
+    )
+
+    again, is_new = store_message(conn, message)
+    assert is_new is False
+    assert again["poll_options"] == ["a", "b"]
+
+
+def test_location_pin_requires_valid_coordinates(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+
+    for bad in (
+        {"lat": 91, "lon": 0},
+        {"lat": 0, "lon": 181},
+        {"lat": "34.05", "lon": -83.88},
+        "34.05,-83.88",
+        {"lon": -83.88},
+    ):
+        with pytest.raises(ChannelError):
+            create_message(
+                conn, alice, "general", "x", name="alice", now=1000,
+                location=bad,
+            )
+
+
+def test_location_pin_refused_on_reply_and_poll(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    pin = {"lat": 34.05, "lon": -83.88}
+    parent = create_message(conn, alice, "general", "meet here", name="alice", now=1000)
+
+    with pytest.raises(ChannelError, match="top-level"):
+        create_message(
+            conn, alice, "general", "see you", name="alice", now=1001,
+            reply_to=parent["hash"], location=pin,
+        )
+    with pytest.raises(ChannelError, match="top-level"):
+        create_message(
+            conn, alice, "general", "pick one", name="alice", now=1002,
+            poll_options=["a", "b"], location=pin,
+        )
+
+
+def test_old_database_gains_a_location_column(identities, tmp_path):
+    import sqlite3
+
+    alice, _ = identities
+    path = tmp_path / "channels.sqlite3"
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE messages ("
+        "v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "channel TEXT NOT NULL, author TEXT NOT NULL, key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, "
+        "created_at REAL NOT NULL, received_at REAL NOT NULL, sig TEXT NOT NULL)"
+    )
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE memberships (channel TEXT PRIMARY KEY, joined_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = init_db(path)
+    try:
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+        ]
+        assert "location" in columns
+        pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+        message = create_message(
+            conn, alice, "general", "meet here", name="alice", now=1000,
+            location=pin,
+        )
+        assert get_message(conn, message["hash"])["location"] == pin
+    finally:
+        conn.close()
+
+
 def test_feed_serves_replies_with_their_parent_digest(identities, tmp_path):
     alice, bob = identities
     app = _make_app(identities, tmp_path)
@@ -1163,6 +1299,44 @@ def test_publish_fans_out_to_peers(identities, tmp_path):
     assert request["ttl"] == 2
 
 
+class _RejectingNode:
+    """A peer that answers invalid_post: node.request raises for any
+    non-ok response (see TauNode._request_on_link), exactly as a
+    pre-upgrade peer rejecting a message it cannot verify would."""
+
+    def __init__(self, peer):
+        from tau.node import NodeError
+
+        self._error = NodeError("peer rejected the request: bad hash")
+        self.registry = _FakeRegistry(peer)
+
+    def request(self, peer, path, payload, *, timeout=20.0):
+        raise self._error
+
+
+def test_publish_counts_a_rejecting_peer_as_an_error(identities, tmp_path):
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    app.join("general")
+    message = app.send("general", "hello", publish=False)
+
+    peer = Peer(
+        destination_hash=bytes.fromhex(author_of(bob)),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _RejectingNode(peer)
+    app.node = node  # type: ignore[assignment]
+    result = app.publish(message, ttl=2)
+    assert result["delivered"] == 0
+    assert result["peers"] == 1
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["peer"] == author_of(bob)
+
+
 # -- CLI -----------------------------------------------------------------------
 
 
@@ -1288,6 +1462,141 @@ def test_cli_channel_topic_round_trip(tmp_path, capsys):
         == 2
     )
     assert "--clear cannot be combined" in capsys.readouterr().err
+
+
+def test_cli_channel_send_with_location(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    )
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--location",
+                "34.05,-83.88 Rock Springs Park",
+                "general",
+                "meet here",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "sent to #general" in out
+    assert "Rock Springs Park" in out
+    # The map link is printed verbatim on its own line; check the whole
+    # line, not a substring of the URL.
+    assert (
+        "  https://www.openstreetmap.org/?mlat=34.05&mlon=-83.88"
+        "#map=15/34.05/-83.88" in out.splitlines()
+    )
+
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        message = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+    assert message["location"] == {
+        "lat": 34.05,
+        "lon": -83.88,
+        "name": "Rock Springs Park",
+    }
+
+    # A bare pin takes the place name as its text.  stdin is not a
+    # TTY under pytest, so stand in a TTY for the default-text branch.
+    import io
+    import sys
+
+    class _TtyStdin(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--location",
+                "34.05,-83.88",
+                "general",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "channels.sqlite3")
+    try:
+        bare = channel_history(conn, "general")[0]
+    finally:
+        conn.close()
+    assert bare["text"] == "📍 34.05, -83.88"
+    assert bare["location"] == {"lat": 34.05, "lon": -83.88}
+
+    # A pin cannot ride on a reply or a scheduled message.
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--location",
+                "34.05,-83.88",
+                "--reply-to",
+                message["hash"][:12],
+                "general",
+                "see you",
+            ]
+        )
+        == 2
+    )
+    assert "top-level" in capsys.readouterr().err
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--location",
+                "34.05,-83.88",
+                "--delay",
+                "5m",
+                "general",
+                "later",
+            ]
+        )
+        == 2
+    )
+    assert "--delay" in capsys.readouterr().err
+
+    # An unparseable pin fails before anything is stored.
+    assert (
+        main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--location",
+                "not-a-place",
+                "general",
+                "never",
+            ]
+        )
+        == 1
+    )
+    assert "--location" in capsys.readouterr().err
 
 
 def test_cli_search_finds_matches_newest_first(tmp_path, capsys):

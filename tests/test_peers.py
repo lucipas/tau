@@ -368,6 +368,33 @@ def test_merge_exchanged_skips_self_malformed_and_stale(tmp_path):
     assert registry.get(future_destination).last_seen == 1000.0
 
 
+def test_upsert_refuses_self(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    own = bytes([9]) * 16
+    registry.self_hash = own
+    with pytest.raises(ValueError, match="cannot register this node as a peer"):
+        registry.upsert(own, bytes([9]) * PUBLIC_KEY_BYTES, name="self", now=100.0)
+    assert len(registry) == 0
+    # Another peer still registers fine.
+    make_peer(registry, 1, "alice", now=100.0)
+    assert len(registry) == 1
+
+
+def test_load_drops_self_entry(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    own = make_peer(registry, 9, "self", now=100.0)
+    make_peer(registry, 1, "alice", now=100.0)
+    registry.save()
+    assert len(registry) == 2
+
+    reloaded = PeerRegistry(path)
+    reloaded.self_hash = own.destination_hash
+    reloaded.load()
+    assert reloaded.get(own.destination_hash) is None
+    assert reloaded.get("alice") is not None
+
+
 def test_merge_exchanged_never_refreshes_known_peer(tmp_path):
     registry = PeerRegistry()
     entry, _identity, destination = make_exchange_entry("carol", last_seen=900.0)
