@@ -351,6 +351,7 @@ from .beacons import (
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
+    ANNOUNCE_INTERVAL_MAX,
     ARCHIVED_FILE_NAME,
     AWAY_FILE_NAME,
     DISAPPEARING_FILE_NAME,
@@ -361,6 +362,7 @@ from .config import (
     PROFILE_FILE_NAME,
     QUIET_HOURS_FILE_NAME,
     accept_files_enabled,
+    announce_interval,
     send_read_receipts_enabled,
     set_node_setting,
     tan_sync_depth,
@@ -1547,17 +1549,22 @@ class WebBridge:
             "accept_files": accept_files_enabled(data_dir),
             "send_read_receipts": send_read_receipts_enabled(data_dir),
             "tan_sync_depth": tan_sync_depth(data_dir),
+            "announce_interval": announce_interval(data_dir),
         }
 
-    def update_setting(self, setting: str, value: Union[bool, int]) -> Dict[str, Any]:
+    def update_setting(
+        self, setting: str, value: Union[bool, int, float]
+    ) -> Dict[str, Any]:
         """Change one node setting and return the fresh settings.
 
         Only the keys ``tau config`` manages are accepted.  Boolean
         settings take a real boolean — anything else is a client
         error, not a value to coerce — and ``tan_sync_depth`` takes
         the integer 1 or 2 (a boolean is not an integer here, even
-        though Python subclasses it). The write keeps the other
-        settings (and the node's name) in place.
+        though Python subclasses it). ``announce_interval`` takes a
+        number of seconds, 0 or more (0 disables automatic
+        announces). The write keeps the other settings (and the
+        node's name) in place.
         """
         if setting == "tan_sync_depth":
             if (
@@ -1566,6 +1573,23 @@ class WebBridge:
                 or value not in (1, 2)
             ):
                 raise ValueError("setting 'tan_sync_depth' must be 1 or 2")
+        elif setting == "announce_interval":
+            error = ValueError(
+                "setting 'announce_interval' must be 0 or more seconds"
+            )
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise error
+            try:
+                value = float(value)
+            except OverflowError:
+                # An oversized JSON integer cannot be a valid interval.
+                raise error from None
+            if (
+                not math.isfinite(value)
+                or value < 0
+                or value > ANNOUNCE_INTERVAL_MAX
+            ):
+                raise error
         elif setting in ("accept_files", "send_read_receipts"):
             if not isinstance(value, bool):
                 raise ValueError(f"setting {setting!r} must be true or false")

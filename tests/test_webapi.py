@@ -11892,6 +11892,7 @@ def test_settings_defaults(node, tmp_path):
             "accept_files": False,
             "send_read_receipts": True,
             "tan_sync_depth": 2,
+            "announce_interval": 300.0,
         }
         assert not (tmp_path / "node.json").exists()
     finally:
@@ -11914,6 +11915,7 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
                 "accept_files": True,
                 "send_read_receipts": True,
                 "tan_sync_depth": 2,
+                "announce_interval": 300.0,
             },
         }
 
@@ -11929,6 +11931,7 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 2,
+            "announce_interval": 300.0,
         }
 
         # The depth setting takes 1 or 2 and keeps the others too.
@@ -11943,12 +11946,14 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 1,
+            "announce_interval": 300.0,
         }
         status, _, payload = _json(bridge, "/api/settings")
         assert payload == {
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 1,
+            "announce_interval": 300.0,
         }
         stored = json.loads(
             (tmp_path / "node.json").read_text(encoding="utf-8")
@@ -11956,6 +11961,41 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
         assert stored["accept_files"] is True
         assert stored["send_read_receipts"] is False
         assert stored["tan_sync_depth"] == 1
+    finally:
+        bridge.stop()
+
+
+def test_settings_announce_interval_update_and_disable(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A number of seconds persists and keeps the other settings.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "announce_interval", "value": 60},
+        )
+        assert status == 200
+        assert payload["settings"] == {
+            "accept_files": False,
+            "send_read_receipts": True,
+            "tan_sync_depth": 2,
+            "announce_interval": 60.0,
+        }
+
+        # 0 disables automatic announces.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "announce_interval", "value": 0},
+        )
+        assert status == 200
+        assert payload["settings"]["announce_interval"] == 0.0
+        stored = json.loads(
+            (tmp_path / "node.json").read_text(encoding="utf-8")
+        )
+        assert stored["announce_interval"] == 0.0
     finally:
         bridge.stop()
 
@@ -11974,6 +12014,26 @@ def test_settings_update_rejects_bad_input(node, tmp_path):
             ({"setting": "tan_sync_depth", "value": 0}, "must be 1 or 2"),
             ({"setting": "tan_sync_depth", "value": True}, "must be 1 or 2"),
             ({"setting": "tan_sync_depth", "value": "2"}, "must be 1 or 2"),
+            (
+                {"setting": "announce_interval", "value": -1},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": True},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": "60"},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": 10**400},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": 1e308},
+                "must be 0 or more seconds",
+            ),
         ]:
             status, _, payload = _json(
                 bridge, "/api/settings", method="POST", body=body

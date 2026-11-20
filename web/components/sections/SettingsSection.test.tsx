@@ -9,10 +9,20 @@ import SettingsSection from "./SettingsSection";
 import { fakeTau, mockFetch } from "./test-utils";
 
 let calls: string[] = [];
-let settings = { accept_files: true, send_read_receipts: false, tan_sync_depth: 2 };
+let settings = {
+  accept_files: true,
+  send_read_receipts: false,
+  tan_sync_depth: 2,
+  announce_interval: 300,
+};
 
 beforeEach(() => {
-  settings = { accept_files: true, send_read_receipts: false, tan_sync_depth: 2 };
+  settings = {
+    accept_files: true,
+    send_read_receipts: false,
+    tan_sync_depth: 2,
+    announce_interval: 300,
+  };
   const router = mockFetch((url, method) => {
     if (url.includes("/api/settings/away-message"))
       return method === "POST"
@@ -54,7 +64,10 @@ beforeEach(() => {
           };
     if (url.includes("/api/settings")) {
       if (method === "POST") {
-        return { ok: true, settings: { ...settings, tan_sync_depth: 1 } };
+        return {
+          ok: true,
+          settings: { ...settings, tan_sync_depth: 1, announce_interval: 60 },
+        };
       }
       return settings;
     }
@@ -143,6 +156,19 @@ describe("SettingsSection", () => {
       /Tan sync now pulls followed authors only/,
     );
     expect(notice.textContent).toMatch(/followed authors only/);
+  });
+
+  it("shows the announce interval and saving it posts to /api/settings", async () => {
+    renderSettings();
+    const interval = (await screen.findByLabelText(
+      "Announce interval in seconds",
+    )) as HTMLInputElement;
+    expect(interval.value).toBe("300");
+    fireEvent.change(interval, { target: { value: "60" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save interval" }));
+    await waitFor(() => expect(calls).toContain("POST /api/settings"));
+    await waitFor(() => expect(interval.value).toBe("60"));
+    expect(await screen.findByText(/Announcing every 60 seconds/)).toBeTruthy();
   });
 
   it("renaming the node posts to /api/id/rename", async () => {

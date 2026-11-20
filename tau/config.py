@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import socket
 from contextlib import contextmanager
@@ -115,6 +116,12 @@ class TauConfig:
     name: str
     rns_loglevel: int = 2
     announce_interval: float = 300.0
+    # True when `tau serve` was started without --announce-interval:
+    # the announce loop then follows the saved setting live, so a
+    # change made on the CLI or in the console takes effect at the
+    # next cycle without a restart. An explicit flag pins the value
+    # for the run instead.
+    announce_interval_live: bool = False
 
     @classmethod
     def resolve(
@@ -124,6 +131,7 @@ class TauConfig:
         name: Optional[str] = None,
         rns_loglevel: int = 2,
         announce_interval: float = 300.0,
+        announce_interval_live: bool = False,
     ) -> "TauConfig":
         base = (
             Path(data_dir).expanduser() if data_dir is not None else default_data_dir()
@@ -177,6 +185,7 @@ class TauConfig:
             name=node_name,
             rns_loglevel=rns_loglevel,
             announce_interval=announce_interval,
+            announce_interval_live=announce_interval_live,
         )
 
     @property
@@ -256,6 +265,38 @@ def tan_sync_depth(data_dir: Path) -> int:
     return value
 
 
+ANNOUNCE_INTERVAL_DEFAULT = 300.0
+# Largest accepted announce interval (one year). Kept far below
+# threading.TIMEOUT_MAX so a stored value can never overflow a wait.
+ANNOUNCE_INTERVAL_MAX = 365.0 * 24 * 3600
+
+
+def announce_interval(data_dir: Path) -> float:
+    """How often `tau serve` re-announces, in seconds (see #619).
+
+    0 disables automatic announces. Default 300; any other value
+    (including a corrupt, non-finite, oversized, or out-of-range one)
+    falls back to the default, so a hand-edited node.json cannot wedge
+    the announce loop.
+    """
+    value = load_node_settings(data_dir).get(
+        "announce_interval", ANNOUNCE_INTERVAL_DEFAULT
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ANNOUNCE_INTERVAL_DEFAULT
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return ANNOUNCE_INTERVAL_DEFAULT
+    if (
+        not math.isfinite(seconds)
+        or seconds < 0
+        or seconds > ANNOUNCE_INTERVAL_MAX
+    ):
+        return ANNOUNCE_INTERVAL_DEFAULT
+    return seconds
+
+
 def write_node_metadata(data_dir: Path, name: str) -> Path:
     from .util import atomic_write_json
 
@@ -286,7 +327,12 @@ def load_node_settings(data_dir: Path) -> Dict[str, object]:
         return {}
     return {
         key: raw[key]
-        for key in ("accept_files", "send_read_receipts", "tan_sync_depth")
+        for key in (
+            "accept_files",
+            "send_read_receipts",
+            "tan_sync_depth",
+            "announce_interval",
+        )
         if key in raw
     }
 

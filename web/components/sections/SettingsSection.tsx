@@ -1,7 +1,7 @@
 // SettingsSection.tsx — node settings: file acceptance / read receipts /
-// Tan sync depth, rename the node, announce, your public profile,
-// away message, quiet hours, and per-peer / per-group / per-channel
-// disappearing-message defaults. Built on api.ts getSettings /
+// Tan sync depth / announce interval, rename the node, announce, your
+// public profile, away message, quiet hours, and per-peer / per-group /
+// per-channel disappearing-message defaults. Built on api.ts getSettings /
 // updateSetting / renameNode / announce / getOwnProfile / setOwnProfile /
 // getAwayMessage / setAwayMessage / getQuietHours / setQuietHours /
 // getDisappearingDefaults / setDisappearingDefault / getChannels.
@@ -72,6 +72,8 @@ export default function SettingsSection() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [ddTarget, setDdTarget] = useState("");
   const [ddSeconds, setDdSeconds] = useState<string>("");
+  const [announceDraft, setAnnounceDraft] = useState("");
+  const [announceSeeded, setAnnounceSeeded] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -123,6 +125,11 @@ export default function SettingsSection() {
     setQhStart(quietHours.start);
     setQhEnd(quietHours.end);
     setQhEnabled(quietHours.enabled);
+  }
+
+  if (settings && !announceSeeded) {
+    setAnnounceSeeded(true);
+    setAnnounceDraft(String(settings.announce_interval));
   }
 
   async function run(fn: () => Promise<unknown>, okMsg: string) {
@@ -314,6 +321,62 @@ export default function SettingsSection() {
                 <option value="2">2 hops — plus their follows</option>
               </select>
             </label>
+            <div className="flex items-start gap-3 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-3">
+              <span className="flex-1">
+                <label
+                  htmlFor="announce-interval"
+                  className="block text-sm font-semibold text-zinc-100"
+                >
+                  Announce interval
+                </label>
+                <span className="block text-xs text-zinc-500">
+                  How often this node re-announces itself to the mesh, in
+                  seconds. 0 sends no automatic announces. A running node
+                  picks the new interval up at its next cycle.
+                </span>
+              </span>
+              <span className="flex shrink-0 items-center gap-2">
+                <input
+                  id="announce-interval"
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={announceDraft}
+                  disabled={busy}
+                  aria-label="Announce interval in seconds"
+                  onChange={(e) => setAnnounceDraft(e.target.value)}
+                  className="w-24 rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-sm text-zinc-100 outline-none"
+                />
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    if (announceDraft.trim() === "") {
+                      setError("Announce interval needs a number of seconds.");
+                      return;
+                    }
+                    const seconds = Number(announceDraft);
+                    if (!Number.isFinite(seconds) || seconds < 0) {
+                      setError("Announce interval must be 0 or more seconds.");
+                      return;
+                    }
+                    void run(
+                      async () => {
+                        setSettings(
+                          await updateSetting("announce_interval", seconds),
+                        );
+                      },
+                      seconds === 0
+                        ? "Automatic announces turned off."
+                        : `Announcing every ${seconds} seconds.`,
+                    );
+                  }}
+                  className="shrink-0 rounded-full bg-cyan-500 px-3 py-1.5 text-sm font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                >
+                  Save interval
+                </button>
+              </span>
+            </div>
           </div>
         )}
       </section>

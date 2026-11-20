@@ -60,8 +60,11 @@ from .bundle import (
     serialize_bundle,
 )
 from .config import (
+    ANNOUNCE_INTERVAL_DEFAULT,
+    ANNOUNCE_INTERVAL_MAX,
     TauConfig,
     accept_files_enabled,
+    announce_interval,
     load_node_name,
     parse_host_port,
     send_read_receipts_enabled,
@@ -375,7 +378,7 @@ from .channels import (
 
 log = logging.getLogger(__name__)
 
-DEFAULT_ANNOUNCE_INTERVAL = 300.0
+DEFAULT_ANNOUNCE_INTERVAL = ANNOUNCE_INTERVAL_DEFAULT
 
 _EXIT_OK = 0
 _EXIT_ERROR = 1
@@ -500,9 +503,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--announce-interval",
         type=float,
-        default=DEFAULT_ANNOUNCE_INTERVAL,
+        default=None,
         metavar="SECONDS",
-        help="periodic announce interval (default: %(default)s, 0 disables)",
+        help="periodic announce interval in seconds (default: the saved "
+        "setting — see `tau config announce-interval` — 300 when unset; "
+        "0 disables automatic announces)",
     )
     serve.add_argument(
         "--no-announce",
@@ -1787,6 +1792,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="1 = followed authors only, 2 = plus the authors they follow",
     )
     config_depth.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    config_announce = config_sub.add_parser(
+        "announce-interval",
+        parents=[common],
+        help="how often this node re-announces itself (seconds, 0 disables, default 300)",
+    )
+    config_announce.add_argument(
+        "seconds",
+        nargs="?",
+        type=_announce_interval_value,
+        help="re-announce every SECONDS seconds; 0 sends no automatic announces",
+    )
+    config_announce.set_defaults(func=cmd_config)
     config_cmd.set_defaults(func=cmd_config)
 
     block = subparsers.add_parser(
@@ -4996,7 +5015,10 @@ def _lookalike_map(
 
 
 def _make_config(
-    args: argparse.Namespace, *, announce_interval: float = DEFAULT_ANNOUNCE_INTERVAL
+    args: argparse.Namespace,
+    *,
+    announce_interval: float = DEFAULT_ANNOUNCE_INTERVAL,
+    announce_interval_live: bool = False,
 ) -> TauConfig:
     return TauConfig.resolve(
         data_dir=getattr(args, "data_dir", None),
@@ -5004,6 +5026,7 @@ def _make_config(
         name=getattr(args, "name", None),
         rns_loglevel=_rns_log_level(args),
         announce_interval=announce_interval,
+        announce_interval_live=announce_interval_live,
     )
 
 
@@ -10775,15 +10798,30 @@ def cmd_bundle_inspect(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _serve_announce_config(args: argparse.Namespace) -> TauConfig:
+    """Resolve the announce interval for `tau serve` (see #619).
+
+    An explicit --announce-interval pins the value for the run; with
+    no flag the saved setting applies, live — the announce loop
+    re-reads it each cycle.
+    """
+    flag_interval = getattr(args, "announce_interval", None)
+    if flag_interval is None:
+        probe = _make_config(args)
+        return _make_config(
+            args,
+            announce_interval=announce_interval(probe.data_dir),
+            announce_interval_live=True,
+        )
+    return _make_config(args, announce_interval=max(0.0, float(flag_interval)))
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     if getattr(args, "lxmf_propagation", False) and not getattr(
         args, "lxmf", False
     ):
         raise NodeError("--lxmf-propagation requires --lxmf")
-    interval = max(
-        0.0, float(getattr(args, "announce_interval", DEFAULT_ANNOUNCE_INTERVAL))
-    )
-    config = _make_config(args, announce_interval=interval)
+    config = _serve_announce_config(args)
 
     bridge = None
     web_settings = None
@@ -20442,6 +20480,25 @@ def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
         raise AllowListError(f"unknown peer or destination: {value!r}") from None
 
 
+def _announce_interval_value(text: str) -> float:
+    """Parse the `tau config announce-interval` argument (see #619)."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid announce interval: {text!r}"
+        ) from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            "announce interval must be 0 or more seconds"
+        )
+    if value > ANNOUNCE_INTERVAL_MAX:
+        raise argparse.ArgumentTypeError(
+            f"announce interval must be at most {ANNOUNCE_INTERVAL_MAX:g} seconds"
+        )
+    return value
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Show or change this node's own settings (stored in node.json)."""
     config = _make_config(args)
@@ -20497,23 +20554,58 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("  sync also pulls the authors they follow")
         return _EXIT_OK
 
+    if command == "announce-interval":
+        seconds_arg = getattr(args, "seconds", None)
+        if seconds_arg is None:
+            interval = announce_interval(config.data_dir)
+            if json_output:
+                _emit({"announce_interval": interval}, True)
+            else:
+                if interval == 0:
+                    print("Announce interval: off")
+                    print("  automatic announces are disabled")
+                else:
+                    print(f"Announce interval: {interval:g} seconds")
+                    print("  0 disables automatic announces (default 300)")
+            return _EXIT_OK
+        interval = float(seconds_arg)
+        set_node_setting(config.data_dir, "announce_interval", interval)
+        if json_output:
+            _emit({"announce_interval": interval}, True)
+        else:
+            if interval == 0:
+                print("Announce interval: off")
+                print("  this node announces only on startup (or when asked)")
+            else:
+                print(f"Announce interval: {interval:g} seconds")
+                print("  a running `tau serve` picks this up at its next cycle")
+        return _EXIT_OK
+
     settings = {
         "accept_files": accept_files_enabled(config.data_dir),
         "send_read_receipts": send_read_receipts_enabled(config.data_dir),
         "tan_sync_depth": tan_sync_depth(config.data_dir),
+        "announce_interval": announce_interval(config.data_dir),
     }
     if json_output:
         _emit(settings, True)
     else:
         accept_state = "on" if settings["accept_files"] else "off"
         receipts_state = "on" if settings["send_read_receipts"] else "off"
+        interval_state = (
+            "off"
+            if settings["announce_interval"] == 0
+            else f"{settings['announce_interval']:g} seconds"
+        )
         print(f"Settings ({config.data_dir / 'node.json'}):")
         print(f"  accept files: {accept_state}")
         print(f"  send read receipts: {receipts_state}")
         print(f"  tan sync depth: {settings['tan_sync_depth']}")
+        print(f"  announce interval: {interval_state}")
         print("  change with: tau config accept-files on|off")
         print("  change with: tau config read-receipts on|off")
         print("  change with: tau config tan-sync-depth 1|2")
+        print("  change with: tau config announce-interval <seconds>")
     return _EXIT_OK
 
 

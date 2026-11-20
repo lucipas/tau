@@ -2927,6 +2927,89 @@ def test_config_tan_sync_depth_rejects_bad_value(tmp_path, capsys):
         cli.main(["config", "tan-sync-depth", "3", "--data-dir", str(data_dir)])
 
 
+def test_config_announce_interval_show_set_and_list(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    # Default is 300 (per #619) on a fresh node.
+    code = cli.main(["config", "announce-interval", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Announce interval: 300 seconds" in capsys.readouterr().out
+
+    code = cli.main(
+        ["config", "announce-interval", "60", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "Announce interval: 60 seconds" in capsys.readouterr().out
+
+    code = cli.main(
+        ["config", "announce-interval", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == {"announce_interval": 60.0}
+
+    # 0 disables automatic announces.
+    code = cli.main(
+        ["config", "announce-interval", "0", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "Announce interval: off" in capsys.readouterr().out
+
+    # The plain listing shows the interval alongside the other settings.
+    code = cli.main(["config", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "announce interval: off" in out
+    assert "tau config announce-interval <seconds>" in out
+
+
+def test_config_announce_interval_rejects_bad_value(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    with pytest.raises(SystemExit):
+        cli.main(
+            ["config", "announce-interval", "-1", "--data-dir", str(data_dir)]
+        )
+    with pytest.raises(SystemExit):
+        cli.main(
+            ["config", "announce-interval", "soon", "--data-dir", str(data_dir)]
+        )
+    # Non-finite values, including ones that overflow to infinity, and
+    # values above the cap must be rejected rather than saved.
+    for bad in ["nan", "inf", "1e400", "-inf", str(10**9 * 1000)]:
+        with pytest.raises(SystemExit):
+            cli.main(
+                ["config", "announce-interval", bad, "--data-dir", str(data_dir)]
+            )
+    from tau.config import announce_interval
+
+    assert announce_interval(data_dir) == 300.0
+
+
+def test_serve_announce_interval_flag_beats_saved_setting(tmp_path, capsys):
+    data_dir = _init_owner_node(tmp_path, capsys)
+    cli.main(["config", "announce-interval", "600", "--data-dir", str(data_dir)])
+    parser = cli.build_parser()
+
+    # An explicit flag pins the value for the run.
+    args = parser.parse_args(
+        ["serve", "--data-dir", str(data_dir), "--announce-interval", "60"]
+    )
+    config = cli._serve_announce_config(args)
+    assert config.announce_interval == 60.0
+    assert config.announce_interval_live is False
+
+    # With no flag the saved setting applies, live.
+    args = parser.parse_args(["serve", "--data-dir", str(data_dir)])
+    config = cli._serve_announce_config(args)
+    assert config.announce_interval == 600.0
+    assert config.announce_interval_live is True
+
+    # No saved setting: the 300s default applies, still live.
+    fresh = tmp_path / "fresh"
+    args = parser.parse_args(["serve", "--data-dir", str(fresh)])
+    config = cli._serve_announce_config(args)
+    assert config.announce_interval == 300.0
+    assert config.announce_interval_live is True
+
+
 def test_peers_show_includes_profile(tmp_path, capsys):
     data_dir, _, _ = _seed_peer_profile(tmp_path)
     code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])
