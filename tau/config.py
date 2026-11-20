@@ -266,23 +266,35 @@ def tan_sync_depth(data_dir: Path) -> int:
 
 
 ANNOUNCE_INTERVAL_DEFAULT = 300.0
+# Largest accepted announce interval (one year). Kept far below
+# threading.TIMEOUT_MAX so a stored value can never overflow a wait.
+ANNOUNCE_INTERVAL_MAX = 365.0 * 24 * 3600
 
 
 def announce_interval(data_dir: Path) -> float:
     """How often `tau serve` re-announces, in seconds (see #619).
 
     0 disables automatic announces. Default 300; any other value
-    (including a corrupt one) falls back to the default, so a
-    hand-edited node.json cannot wedge the announce loop.
+    (including a corrupt, non-finite, oversized, or out-of-range one)
+    falls back to the default, so a hand-edited node.json cannot wedge
+    the announce loop.
     """
     value = load_node_settings(data_dir).get(
         "announce_interval", ANNOUNCE_INTERVAL_DEFAULT
     )
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return ANNOUNCE_INTERVAL_DEFAULT
-    if not math.isfinite(value) or value < 0:
+    try:
+        seconds = float(value)
+    except OverflowError:
         return ANNOUNCE_INTERVAL_DEFAULT
-    return float(value)
+    if (
+        not math.isfinite(seconds)
+        or seconds < 0
+        or seconds > ANNOUNCE_INTERVAL_MAX
+    ):
+        return ANNOUNCE_INTERVAL_DEFAULT
+    return seconds
 
 
 def write_node_metadata(data_dir: Path, name: str) -> Path:

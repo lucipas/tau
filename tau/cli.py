@@ -20229,9 +20229,13 @@ def _announce_interval_value(text: str) -> float:
         raise argparse.ArgumentTypeError(
             f"invalid announce interval: {text!r}"
         ) from None
-    if value < 0:
+    if not math.isfinite(value) or value < 0:
         raise argparse.ArgumentTypeError(
             "announce interval must be 0 or more seconds"
+        )
+    if value > ANNOUNCE_INTERVAL_MAX:
+        raise argparse.ArgumentTypeError(
+            f"announce interval must be at most {ANNOUNCE_INTERVAL_MAX:g} seconds"
         )
     return value
 

@@ -1459,30 +1459,56 @@ class TauNode:
         )
 
     def _announce_loop(self) -> None:
+        # Waits run in short slices so that a live change to the saved
+        # setting (see below) takes effect promptly rather than after
+        # the whole previous delay has elapsed.
+        slice_seconds = 5.0
+        last_announce = time.monotonic()
         while not self._stop_event.is_set():
             # A serve started without --announce-interval follows the
             # saved setting, so a change made on the CLI or in the
-            # console takes effect at the next cycle without a
-            # restart. A serve started with an explicit flag keeps
-            # that flag for its run. A live interval of 0 idles here
-            # until the setting is switched back on.
-            if getattr(self.config, "announce_interval_live", False):
-                saved = announce_interval(self.config.data_dir)
-                if saved == 0:
-                    if self._stop_event.wait(5.0):
+            # console takes effect without a restart. A serve started
+            # with an explicit flag keeps that flag for its run. A live
+            # interval of 0 idles here until the setting is switched
+            # back on.
+            live = getattr(self.config, "announce_interval_live", False)
+            seen: Optional[float] = None
+            if live:
+                seen = announce_interval(self.config.data_dir)
+                if seen == 0:
+                    last_announce = time.monotonic()
+                    if self._stop_event.wait(slice_seconds):
                         break
                     continue
-                interval = max(1.0, saved)
+                interval = max(1.0, seen)
             else:
                 interval = max(1.0, float(self.config.announce_interval))
             # Jitter keeps a room full of nodes from announcing in lockstep.
             delay = interval * (0.9 + 0.2 * random.random())
-            if self._stop_event.wait(delay):
-                break
+            deadline = last_announce + delay
+            changed = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._stop_event.wait(min(remaining, slice_seconds)):
+                    return
+                if live and announce_interval(self.config.data_dir) != seen:
+                    # Setting changed mid-wait: recompute from the last
+                    # announce time under the new interval.
+                    changed = True
+                    break
+            if changed:
+                continue
+            # Re-check right before announcing so a 0 saved meanwhile
+            # suppresses this announce.
+            if live and announce_interval(self.config.data_dir) != seen:
+                continue
             try:
                 self.announce()
             except Exception:  # pragma: no cover - network dependent
                 log.warning("Periodic announce failed", exc_info=True)
+            last_announce = time.monotonic()
 
     def _on_announce(
         self,

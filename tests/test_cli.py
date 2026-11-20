@@ -2971,6 +2971,16 @@ def test_config_announce_interval_rejects_bad_value(tmp_path, capsys):
         cli.main(
             ["config", "announce-interval", "soon", "--data-dir", str(data_dir)]
         )
+    # Non-finite values, including ones that overflow to infinity, and
+    # values above the cap must be rejected rather than saved.
+    for bad in ["nan", "inf", "1e400", "-inf", str(10**9 * 1000)]:
+        with pytest.raises(SystemExit):
+            cli.main(
+                ["config", "announce-interval", bad, "--data-dir", str(data_dir)]
+            )
+    from tau.config import announce_interval
+
+    assert announce_interval(data_dir) == 300.0
 
 
 def test_serve_announce_interval_flag_beats_saved_setting(tmp_path, capsys):

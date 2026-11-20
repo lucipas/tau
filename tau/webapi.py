@@ -1568,16 +1568,22 @@ class WebBridge:
             ):
                 raise ValueError("setting 'tan_sync_depth' must be 1 or 2")
         elif setting == "announce_interval":
+            error = ValueError(
+                "setting 'announce_interval' must be 0 or more seconds"
+            )
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise error
+            try:
+                value = float(value)
+            except OverflowError:
+                # An oversized JSON integer cannot be a valid interval.
+                raise error from None
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
+                not math.isfinite(value)
                 or value < 0
+                or value > ANNOUNCE_INTERVAL_MAX
             ):
-                raise ValueError(
-                    "setting 'announce_interval' must be 0 or more seconds"
-                )
-            value = float(value)
+                raise error
         elif setting in ("accept_files", "send_read_receipts"):
             if not isinstance(value, bool):
                 raise ValueError(f"setting {setting!r} must be true or false")

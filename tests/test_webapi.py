@@ -11846,6 +11846,14 @@ def test_settings_update_rejects_bad_input(node, tmp_path):
                 {"setting": "announce_interval", "value": "60"},
                 "must be 0 or more seconds",
             ),
+            (
+                {"setting": "announce_interval", "value": 10**400},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": 1e308},
+                "must be 0 or more seconds",
+            ),
         ]:
             status, _, payload = _json(
                 bridge, "/api/settings", method="POST", body=body

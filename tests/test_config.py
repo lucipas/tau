@@ -155,6 +155,16 @@ def test_announce_interval_rejects_bad_values(tmp_path, value):
     assert announce_interval(tmp_path) == 300.0
 
 
+def test_announce_interval_rejects_oversized_values(tmp_path):
+    # A finite value above the cap would overflow the wait; a huge
+    # hand-edited integer cannot be converted to float at all. Both
+    # fall back to the default instead of raising.
+    set_node_setting(tmp_path, "announce_interval", config.ANNOUNCE_INTERVAL_MAX * 2)
+    assert announce_interval(tmp_path) == 300.0
+    (tmp_path / "node.json").write_text('{"announce_interval": ' + "9" * 400 + "}")
+    assert announce_interval(tmp_path) == 300.0
+
+
 def test_announce_interval_keeps_other_settings(tmp_path):
     set_node_setting(tmp_path, "send_read_receipts", False)
     set_node_setting(tmp_path, "announce_interval", 60)
