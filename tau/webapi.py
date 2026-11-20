@@ -6893,17 +6893,25 @@ class WebBridge:
                 peer, staged, timeout=timeout, forwarded_from=forwarded_from
             )
         wire_id = response.get("id") if isinstance(response.get("id"), str) else None
+        shown_from = clean_forwarded_from_or_none(forwarded_from)
+        file_meta: Dict[str, Any] = {
+            "name": clean_name,
+            "size": len(data),
+            "sha256": digest,
+        }
+        if shown_from is not None:
+            file_meta["forwarded_from"] = shown_from
         with self._send_lock:
             message = self._append_message(
                 direction="out",
                 peer=peer.hexhash,
                 peer_name=peer.display_name,
-                text=f"Sent file: {clean_name} ({len(data)} bytes)",
+                text=_sent_file_text(clean_name, len(data), shown_from),
                 sent_at=sent_at,
                 received_at=time.time(),
                 status="delivered",
                 wire_id=wire_id,
-                file={"name": clean_name, "size": len(data), "sha256": digest},
+                file=file_meta,
             )
         if message is None:
             # The file send was retracted while its console record was
@@ -6941,6 +6949,7 @@ class WebBridge:
         no list metadata ever reaches a recipient.
         """
         messages: List[Dict[str, Any]] = []
+        shown_from = clean_forwarded_from_or_none(forwarded_from)
         for result in response.get("results") or []:
             member = str(result.get("to") or "")
             peer_name = result.get("to_name") or (
@@ -6955,23 +6964,26 @@ class WebBridge:
                 if delivered and isinstance(result.get("id"), str)
                 else None
             )
+            file_meta: Dict[str, Any] = {
+                "name": clean_name,
+                "size": len(data),
+                "sha256": digest,
+            }
+            if shown_from is not None:
+                file_meta["forwarded_from"] = shown_from
             with self._send_lock:
                 message = self._append_message(
                     direction="out",
                     peer=member or None,
                     peer_name=peer_name,
-                    text=f"Sent file: {clean_name} ({len(data)} bytes)",
+                    text=_sent_file_text(clean_name, len(data), shown_from),
                     sent_at=sent_at,
                     received_at=time.time(),
                     status=status,
                     group=group,
                     group_name=group_name,
                     wire_id=wire_id,
-                    file={
-                        "name": clean_name,
-                        "size": len(data),
-                        "sha256": digest,
-                    },
+                    file=file_meta,
                 )
                 if message is None:
                     # This leg was retracted while its console record
@@ -7054,6 +7066,7 @@ class WebBridge:
             sent_at=sent_at,
             group=group_record["id"],
             group_name=group_record.get("name") or "",
+            forwarded_from=forwarded_from,
         )
         return messages, response
 
@@ -12693,6 +12706,21 @@ def file_arrival_text(record: Dict[str, Any]) -> str:
         f"({record.get('size')} bytes, "
         f"sha256 {short_hash(str(record.get('sha256') or ''), 12)})"
     )
+
+
+def _sent_file_text(
+    name: str, size: int, forwarded_from: Optional[Dict[str, Any]]
+) -> str:
+    """Feed line for a sent file, naming the original sender when forwarded.
+
+    A forward reads the same way a received forward does
+    (``Forwarded from <name>:``) so the sender's feed keeps the
+    attribution the removed text leg used to carry.
+    """
+    prefix = ""
+    if forwarded_from is not None:
+        prefix = f"Forwarded from {forwarded_from['name']}:\n"
+    return f"{prefix}Sent file: {name} ({size} bytes)"
 
 
 def _valid_expires_in(value: Any) -> bool:
