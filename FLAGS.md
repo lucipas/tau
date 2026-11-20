@@ -41,6 +41,7 @@ Global options may appear before or after the command:
 | `tau draft delete --to PEER` | Discard a saved draft (`--group NAME` for a group draft, `--channel NAME` for a channel draft) |
 | `tau draft send --to PEER` | Send a saved draft through the normal send path and delete it once queued or delivered (a failed send keeps the draft; `--group NAME` sends into a group, `--channel NAME` into a channel) |
 | `tau config accept-files on\|off` | Opt in or out of receiving files (off by default) |
+| `tau config announce-interval SECONDS` | How often this node re-announces itself (default 300; 0 disables automatic announces). A running `tau serve` picks a change up at its next cycle; `tau serve --announce-interval N` overrides it for one run |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |

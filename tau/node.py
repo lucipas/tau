@@ -48,6 +48,7 @@ from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import (
     TauConfig,
     accept_files_enabled,
+    announce_interval,
     send_read_receipts_enabled,
     tcp_listen_endpoints,
     write_rns_config,
@@ -1087,7 +1088,12 @@ class TauNode:
         self._stop_event.clear()
         self._started_at = time.time()
 
-        if self.config.announce_interval > 0:
+        if self.config.announce_interval > 0 or getattr(
+            self.config, "announce_interval_live", False
+        ):
+            # A live loop also starts when the saved interval is 0:
+            # the setting may be switched on later, and the loop
+            # idles until then instead of needing a restart.
             self._announce_thread = threading.Thread(
                 target=self._announce_loop,
                 name="tau-announce",
@@ -1453,8 +1459,22 @@ class TauNode:
         )
 
     def _announce_loop(self) -> None:
-        interval = max(1.0, float(self.config.announce_interval))
         while not self._stop_event.is_set():
+            # A serve started without --announce-interval follows the
+            # saved setting, so a change made on the CLI or in the
+            # console takes effect at the next cycle without a
+            # restart. A serve started with an explicit flag keeps
+            # that flag for its run. A live interval of 0 idles here
+            # until the setting is switched back on.
+            if getattr(self.config, "announce_interval_live", False):
+                saved = announce_interval(self.config.data_dir)
+                if saved == 0:
+                    if self._stop_event.wait(5.0):
+                        break
+                    continue
+                interval = max(1.0, saved)
+            else:
+                interval = max(1.0, float(self.config.announce_interval))
             # Jitter keeps a room full of nodes from announcing in lockstep.
             delay = interval * (0.9 + 0.2 * random.random())
             if self._stop_event.wait(delay):

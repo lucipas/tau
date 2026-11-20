@@ -6,7 +6,9 @@ import pytest
 
 from tau import config
 from tau.config import (
+    ANNOUNCE_INTERVAL_DEFAULT,
     TauConfig,
+    announce_interval,
     parse_host_port,
     render_rns_config,
     set_node_setting,
@@ -127,3 +129,36 @@ def test_tan_sync_depth_keeps_other_settings(tmp_path):
     stored = config.load_node_settings(tmp_path)
     assert stored["send_read_receipts"] is False
     assert stored["tan_sync_depth"] == 1
+
+
+def test_announce_interval_defaults_to_300(tmp_path):
+    # A fresh data directory has no node.json: the #619 default applies.
+    assert announce_interval(tmp_path) == 300.0
+    assert announce_interval(tmp_path) == ANNOUNCE_INTERVAL_DEFAULT
+    assert not (tmp_path / "node.json").exists()
+
+
+@pytest.mark.parametrize("seconds", [0, 60, 300.0, 3600])
+def test_announce_interval_round_trips(tmp_path, seconds):
+    set_node_setting(tmp_path, "announce_interval", seconds)
+    assert announce_interval(tmp_path) == float(seconds)
+
+
+@pytest.mark.parametrize(
+    "value", [-1, -0.5, "300", True, None, float("nan"), float("inf")]
+)
+def test_announce_interval_rejects_bad_values(tmp_path, value):
+    # Any value outside 0.. — including a boolean, a string, or a
+    # non-finite number, which a hand-edited node.json might hold —
+    # falls back to the default.
+    set_node_setting(tmp_path, "announce_interval", value)
+    assert announce_interval(tmp_path) == 300.0
+
+
+def test_announce_interval_keeps_other_settings(tmp_path):
+    set_node_setting(tmp_path, "send_read_receipts", False)
+    set_node_setting(tmp_path, "announce_interval", 60)
+    assert announce_interval(tmp_path) == 60.0
+    stored = config.load_node_settings(tmp_path)
+    assert stored["send_read_receipts"] is False
+    assert stored["announce_interval"] == 60
