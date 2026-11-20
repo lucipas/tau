@@ -1056,6 +1056,8 @@ class TauNode:
         )
         self.destination.set_link_established_callback(self._on_incoming_link)
 
+        self._drop_self_peer()
+
         handlers = {
             REQUEST_PING: self._handle_ping,
             REQUEST_INFO: self._handle_info,
@@ -1747,6 +1749,23 @@ class TauNode:
             if len(raw) == DESTINATION_HASH_BYTES:
                 owed.add(raw)
         return owed
+
+    def _drop_self_peer(self) -> None:
+        """Drop this node's own destination from the peer registry.
+
+        The node's own hash can reach the registry indirectly — a list
+        naming it, a recalled own identity (see :meth:`wait_for_peer`),
+        or a stale ``peers.json`` — so the registry records the node's
+        own hash as its self-filter and any self entry already present
+        is purged on start, before the mail loop or an announce can
+        act on it. A node that has never listed itself is untouched.
+        """
+        if self.destination is None:
+            return
+        self.registry.self_hash = self.destination.hash
+        if self.registry.remove(self.destination.hash) is not None:
+            log.info("Dropped this node from its own peer registry")
+            self._save_peers(force=True)
 
     def _save_peers(self, *, force: bool = False) -> None:
         if self.registry.path is None:
@@ -6251,6 +6270,8 @@ class TauNode:
         is known, a path request is sent and the call waits for the announce.
         """
         if isinstance(target, Peer):
+            if self._is_self(target.destination_hash):
+                raise NodeError("cannot resolve this node as a peer")
             return target
 
         try:
@@ -6258,6 +6279,8 @@ class TauNode:
         except PeerError:
             raise
         if peer is not None:
+            if self._is_self(peer.destination_hash):
+                raise NodeError("cannot resolve this node as a peer")
             return peer
 
         if self.destination is None:
@@ -6275,10 +6298,26 @@ class TauNode:
 
         return self.wait_for_peer(dest_hash, timeout=timeout)
 
+    def _is_self(self, destination_hash: bytes) -> bool:
+        """True when *destination_hash* is this node's own destination.
+
+        The destination may be a bare stand-in with only a hexhash
+        (see the group tests): a missing ``hash`` simply never matches.
+        """
+        if self.destination is None:
+            return False
+        own = getattr(self.destination, "hash", None)
+        return own is not None and destination_hash == own
+
     def wait_for_peer(self, dest_hash: bytes, *, timeout: float = 10.0) -> Peer:
         """Wait for an announce that reveals the identity behind a hash."""
         if len(dest_hash) != 16:
             raise NodeError("destination hash must be 16 bytes")
+        if self._is_self(dest_hash):
+            # Reticulum remembers the node's own announced identity, so
+            # recalling the node's own hash would succeed and register
+            # the node as its own peer — the circular loop behind #618.
+            raise NodeError("cannot resolve this node as a peer")
         deadline = time.time() + max(0.0, timeout)
         try:
             RNS.Transport.request_path(dest_hash)
