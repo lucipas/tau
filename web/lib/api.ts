@@ -629,11 +629,31 @@ export async function retractMessage(id: number): Promise<unknown> {
   return post("/api/messages/retract", { id });
 }
 
+/** Per-leg outcome of a file forward; a failed leg carries `error` or `delivered: false`. */
+export type ForwardFileLeg = {
+  to?: string;
+  to_name?: string;
+  target?: string;
+  delivered?: boolean;
+  ok?: boolean;
+  error?: string;
+};
+
+/**
+ * Forward response. `ok: false` means something failed even though the
+ * request succeeded: the attribution may have gone out while the file did not.
+ */
+export type ForwardResult = {
+  ok?: boolean;
+  file_error?: string;
+  file_response?: { results?: ForwardFileLeg[] };
+};
+
 export async function forwardMessage(
   id: number,
   target: { to: string } | { group: string },
-): Promise<unknown> {
-  return post("/api/messages/forward", { id, ...target });
+): Promise<ForwardResult> {
+  return post("/api/messages/forward", { id, ...target }) as Promise<ForwardResult>;
 }
 
 export async function pinMessage(id: number): Promise<unknown> {
