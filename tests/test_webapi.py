@@ -18832,6 +18832,42 @@ def test_forward_message_endpoint_file_forward_passes_timeout(
     assert seen.get("timeout") == 60
 
 
+def test_forward_message_endpoint_file_forward_defaults_file_timeout_to_300(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+
+    _received_file_entry(bridge, node, tmp_path)
+    node.set_blocklist(BlockList())
+    seen = {}
+    original_send_file = node.send_file
+    original_send_message = node.send_message
+
+    def capturing_send_file(target, path, **kwargs):
+        seen["file_timeout"] = kwargs.get("timeout")
+        return original_send_file(target, path, **kwargs)
+
+    def capturing_send_message(peer, text, **kwargs):
+        seen["text_timeout"] = kwargs.get("timeout")
+        return original_send_message(peer, text, **kwargs)
+
+    node.send_file = capturing_send_file
+    node.send_message = capturing_send_message
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # No timeout in the request: the text leg keeps the 20s default
+    # while the file leg gets the 300s send-file default, so a file
+    # of a few MiB on a slow Reticulum link can still forward.
+    assert seen.get("text_timeout") == 20.0
+    assert seen.get("file_timeout") == 300.0
+
+
 def test_forward_message_endpoint_file_forward_oserror_reports_partial(
     bridge, node, tmp_path
 ):

@@ -9427,6 +9427,23 @@ def test_forward_file_rejects_delay(tmp_path, capsys, monkeypatch):
     assert _FakeSendNode.instances == []
 
 
+def test_forward_file_rejects_broadcast_and_channel(tmp_path, capsys, monkeypatch):
+    _seed_received_file(tmp_path)
+    # Broadcast and channel targets take their text through the
+    # broadcast / channel send paths, which have no file leg: a file
+    # record sent there would go to a ``None`` peer.  Refuse with a
+    # clear error instead of an unrelated send failure.
+    for flag, value in (("--broadcast", "news"), ("--channel", "general")):
+        code = _run_forward(tmp_path, monkeypatch, [flag, value, "ffff"])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert (
+            "a file cannot be forwarded to a broadcast list or a channel yet"
+            in err
+        )
+        assert _FakeSendNode.instances == []
+
+
 def test_forward_file_missing_bytes_is_an_error(tmp_path, capsys, monkeypatch):
     data_dir, stored = _seed_received_file(tmp_path)
     stored.unlink()

@@ -14177,7 +14177,20 @@ def _forward_file(
     a change to the stored file between verification and delivery
     cannot swap in different bytes.  ``--json`` emits ONE combined
     document with the text and file results, not one per leg.
+
+    A file forward only targets a peer or a group: the broadcast and
+    channel targets take their text through the broadcast / channel
+    send paths, which have no file leg — a file record sent there
+    would go to a ``None`` peer.  Refuse those targets with a clear
+    error instead of an unrelated send failure.
     """
+    if getattr(args, "broadcast", None) or getattr(args, "channel", None):
+        print(
+            "error: a file cannot be forwarded to a broadcast list or "
+            "a channel yet — forward it to a peer or a group instead",
+            file=sys.stderr,
+        )
+        return 2
     if getattr(args, "delay", None) is not None:
         print(
             "error: --delay cannot be used when forwarding a file — "

@@ -8052,6 +8052,7 @@ class WebBridge:
         *,
         timeout: float = 20.0,
         group: Optional[str] = None,
+        file_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Forward one stored DM to another peer or into a group, from the
         console.
@@ -8167,6 +8168,7 @@ class WebBridge:
                 to,
                 timeout=timeout,
                 group=group,
+                file_timeout=file_timeout,
             )
         if not isinstance(text, str) or not text:
             raise ValueError("message has no text to forward")
@@ -8203,6 +8205,7 @@ class WebBridge:
         *,
         timeout: float = 20.0,
         group: Optional[str] = None,
+        file_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Forward a stored received file, from the console.
 
@@ -8220,6 +8223,10 @@ class WebBridge:
         leg does not roll back the attribution text already sent: the
         result reports ``ok: False`` with ``file_error`` instead of
         raising, so the console can say what went out and what did not.
+        The file leg runs under ``file_timeout`` (300s when the request
+        gives no timeout), not the text ``timeout``: a file of a few
+        MiB on a slow Reticulum link outlasts the 20s text default,
+        mirroring the CLI, which uses 300s for file legs.
         """
         if entry.get("direction") == "out":
             raise ValueError(
@@ -8240,7 +8247,12 @@ class WebBridge:
             )
             try:
                 file_messages, file_response = self.send_group_file(
-                    group.strip(), name, data, timeout=timeout
+                    group.strip(),
+                    name,
+                    data,
+                    timeout=file_timeout
+                    if file_timeout is not None
+                    else timeout,
                 )
             except (NodeError, ValueError, OSError) as exc:
                 return {
@@ -8262,7 +8274,10 @@ class WebBridge:
         )
         try:
             file_message, file_response = self.send_file(
-                to.strip(), name, data, timeout=timeout
+                to.strip(),
+                name,
+                data,
+                timeout=file_timeout if file_timeout is not None else timeout,
             )
         except (NodeError, ValueError, OSError) as exc:
             return {
@@ -12711,8 +12726,8 @@ def _valid_schedule_in(value: Any) -> bool:
 _TYPING_TIMEOUT_SECONDS = 5.0
 
 
-def _clamped_timeout(value: Any, default: float) -> float:
-    """Clamp a request ``timeout`` to [1.0, 120.0] seconds.
+def _clamped_timeout(value: Any, default: float, maximum: float = 120.0) -> float:
+    """Clamp a request ``timeout`` to [1.0, ``maximum``] seconds.
 
     Non-numeric, boolean, and non-finite values fall back to ``default``.
     Huge JSON integers overflow ``float()``, so the conversion is guarded
@@ -12726,10 +12741,10 @@ def _clamped_timeout(value: Any, default: float) -> float:
         # An integer too large for a float is far above the cap — in
         # either direction, so the overflow path follows the same
         # bounds as the normal clamp.
-        return 120.0 if value > 0 else 1.0
+        return maximum if value > 0 else 1.0
     if not math.isfinite(seconds):
         return default
-    return max(1.0, min(seconds, 120.0))
+    return max(1.0, min(seconds, maximum))
 
 
 class _WebServer(ThreadingHTTPServer):
@@ -17334,12 +17349,19 @@ class _WebHandler(BaseHTTPRequestHandler):
             )
             return
         timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        # The file legs get the send-file timeout (300s when the
+        # request gives none), not the 20s text timeout: a file of a
+        # few MiB on a slow link outlasts the text default.  An
+        # explicit timeout is clamped to 300s for the file legs, as
+        # the send-file handler does.
+        file_timeout = _clamped_timeout(body.get("timeout", 300.0), 300.0, 300.0)
         try:
             result = self.bridge.forward_message(
                 target,
                 to.strip() if isinstance(to, str) else None,
                 timeout=timeout,
                 group=group.strip() if isinstance(group, str) else None,
+                file_timeout=file_timeout,
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
