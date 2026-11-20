@@ -10425,6 +10425,14 @@ def test_parser_channel_scheduled_arguments():
     assert cancelled.func is cli.cmd_channel_cancel_scheduled
     assert cancelled.target == "abcdef"
 
+    edited = parser.parse_args(
+        ["channel", "edit-scheduled", "abcdef", "--text", "fixed", "--delay", "2h"]
+    )
+    assert edited.func is cli.cmd_channel_edit_scheduled
+    assert edited.target == "abcdef"
+    assert edited.text == "fixed"
+    assert edited.delay == "2h"
+
 
 def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
     _init_node(tmp_path, "node", "alice")
@@ -10447,6 +10455,25 @@ def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
     code = _run_channel(tmp_path, "scheduled", "general")
     assert code == 0
     assert "morning hello" in capsys.readouterr().out
+
+    code = _run_channel(
+        tmp_path, "edit-scheduled", entry_id[:8], "--text", "morning, mesh!"
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited" in out
+    assert "morning, mesh!" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "morning, mesh!" in out
+    assert "morning hello" not in out
+
+    # Neither --text nor --delay is a usage error, not a crash.
+    code = _run_channel(tmp_path, "edit-scheduled", entry_id[:8])
+    assert code == 2
+    assert "nothing to change" in capsys.readouterr().err
 
     code = _run_channel(tmp_path, "cancel-scheduled", entry_id[:8])
     assert code == 0

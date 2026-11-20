@@ -228,6 +228,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/schedule  schedule a channel message for later
     GET  /api/channels/scheduled  queued channel messages, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message
+    POST /api/channels/edit-scheduled  edit a queued channel message's text/time
     POST /api/channels/poll  post a poll (``{"channel", "question", "options": [...]}``)
     POST /api/channels/vote  vote on a poll (``{"channel", "poll", "option"}``)
     POST /api/channels/close-poll  close a poll you created (``{"channel", "poll"}``)
@@ -4775,6 +4776,36 @@ class WebBridge:
             on_cancel=_delete_stored,
         )
         return {"cancelled": entry.to_dict(), "deleted_local": deleted_local}
+
+    def channel_edit_scheduled_message(
+        self,
+        target: str,
+        *,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or publish time of a queued channel message.
+
+        Like :meth:`channel_schedule_message`: only the queue entry is
+        touched, so no attached channel app is needed.  A *send_in*
+        counts from now, the same way the console's Send-later picker
+        does.
+        """
+        from .scheduled_channel import edit_scheduled_channel_message
+
+        publish_at = None
+        if send_in is not None:
+            publish_at = time.time() + float(send_in)
+        entry = edit_scheduled_channel_message(
+            self.node.config.scheduled_channel_messages_path,
+            target,
+            text=text,
+            publish_at=publish_at,
+            # Validate against the name the serving app publishes with
+            # (node.name, refreshed at startup), not the configured name.
+            name=getattr(self.node, "name", None),
+        )
+        return entry.to_dict()
 
     def channel_sync(
         self, channel: Optional[str] = None, *, limit: int = 20
@@ -15497,6 +15528,54 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/channels/edit-scheduled":
+                target = body.get("id") or body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if text is not None and not isinstance(text, str):
+                    self._send_json(
+                        {"error": {"message": "field 'text' must be a string"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                send_in = body.get("send_in")
+                if send_in is not None and (
+                    not isinstance(send_in, (int, float))
+                    or isinstance(send_in, bool)
+                    or not _valid_schedule_in(send_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'send_in' must be a number of "
+                                "seconds (0 < send_in <= 604800)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    edited = self.bridge.channel_edit_scheduled_message(
+                        target.strip(),
+                        text=text,
+                        send_in=(float(send_in) if send_in is not None else None),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "edited": edited}, head_only)
                 return
             if path == "/api/channels/poll":
                 channel = body.get("channel")

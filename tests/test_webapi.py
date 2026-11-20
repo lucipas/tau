@@ -21640,6 +21640,40 @@ def test_channel_schedule_via_api(tmp_path):
         )
         assert status == 400
         assert "no scheduled channel message" in payload["error"]["message"]
+
+        # Editing the remaining entry changes its text and time.
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        remaining = payload["scheduled"][0]["id"]
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit-scheduled",
+            method="POST",
+            body={"id": remaining[:8], "text": "sooner, edited", "send_in": 120},
+        )
+        assert status == 200
+        assert payload["edited"]["id"] == remaining
+        assert payload["edited"]["text"] == "sooner, edited"
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert payload["scheduled"][0]["text"] == "sooner, edited"
+
+        # Editing with neither text nor send_in, and an unknown id, are
+        # bad requests, not crashes.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit-scheduled",
+            method="POST",
+            body={"id": remaining[:8]},
+        )
+        assert status == 400
+        assert "nothing to change" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit-scheduled",
+            method="POST",
+            body={"id": "zz" * 8, "text": "nope"},
+        )
+        assert status == 400
+        assert "no scheduled channel message" in payload["error"]["message"]
     finally:
         bridge.stop()
 
@@ -21687,6 +21721,12 @@ def test_channel_schedule_rejects_bad_requests(tmp_path):
 
         status, _, payload = _json(
             bridge, "/api/channels/cancel-scheduled", method="POST", body={}
+        )
+        assert status == 400
+        assert "id" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge, "/api/channels/edit-scheduled", method="POST", body={}
         )
         assert status == 400
         assert "id" in payload["error"]["message"]
