@@ -14850,7 +14850,6 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "draft": draft}, head_only)
                 return
-                return
             if path == "/api/tan/quote":
                 target = body.get("target") or body.get("hash")
                 if not isinstance(target, str) or not target.strip():

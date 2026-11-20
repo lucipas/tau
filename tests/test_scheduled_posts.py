@@ -11,6 +11,7 @@ import pytest
 from tau import cli
 from tau.node import TauNode
 from tau.scheduled_posts import (
+    MAX_PUBLISH_ATTEMPTS,
     ScheduledPost,
     ScheduledPosts,
     ScheduledPostsError,
@@ -569,14 +570,133 @@ def test_edit_scheduled_post_validates_new_time(tmp_path):
     assert load_scheduled_posts(path).posts[0].publish_at == 2000.0
 
 
-def test_edit_scheduled_post_refuses_time_past_expiry(tmp_path):
+def test_edit_scheduled_post_allows_time_beyond_expiry(tmp_path):
+    # Expiry counts from publication, not from scheduling: a post
+    # with a one-hour expiry may be moved to publish two hours out.
     path = tmp_path / "scheduled-posts.json"
     post = schedule_post(
         path, text="later", publish_at=2000.0, now=1000.0, expires_in=3600.0
     )
-    with pytest.raises(ScheduledPostsError, match="expire before it is published"):
-        edit_scheduled_post(path, post.id, publish_at=1000.0 + 3600.0, now=1000.0)
+    edited = edit_scheduled_post(
+        path, post.id, publish_at=1000.0 + 7200.0, now=1000.0
+    )
+    assert edited.publish_at == 1000.0 + 7200.0
+
+
+def test_edit_scheduled_post_refuses_text_on_repost(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_repost(
+        path, target_post="d" * 64, publish_at=2000.0, now=1000.0
+    )
+    with pytest.raises(ScheduledPostsError, match="carries no text"):
+        edit_scheduled_post(path, post.id, text="sneaky", now=1000.0)
+    assert load_scheduled_posts(path).posts[0].text == ""
+    # A time-only edit is still fine: the repost itself is unchanged.
+    edited = edit_scheduled_post(path, post.id, publish_at=3000.0, now=1000.0)
+    assert edited.text == "" and edited.publish_at == 3000.0
+
+
+def test_edit_scheduled_post_counts_poll_options_in_size_check(tmp_path):
+    # 1,860 four-byte characters fit a plain question, but this poll's
+    # eight long options ride in the same entry: refuse the edit
+    # instead of queueing a poll that could never publish.
+    path = tmp_path / "scheduled-posts.json"
+    long_options = [chr(ord("a") + i) + "x" * 99 for i in range(8)]
+    post = schedule_poll(
+        path,
+        question="pizza or tacos?",
+        options=long_options,
+        publish_at=2000.0,
+        now=1000.0,
+    )
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        edit_scheduled_post(path, post.id, text="😀" * 1860, now=1000.0)
+    assert load_scheduled_posts(path).posts[0].text == "pizza or tacos?"
+    # The same question fits a poll with short options.
+    short = schedule_poll(
+        path, question="pick one?", options=["A", "B"],
+        publish_at=2000.0, now=1000.0,
+    )
+    edited = edit_scheduled_post(path, short.id, text="😀" * 1860, now=1000.0)
+    assert edited.text == "😀" * 1860
+
+
+def test_edit_scheduled_post_counts_quote_target_in_size_check(tmp_path):
+    # 1,880 four-byte characters fit a plain post, but a quote carries
+    # its target hash in the envelope too: refuse the edit instead of
+    # queueing a quote that could never publish.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_quote(
+        path, target_post="d" * 64, text="my take",
+        publish_at=2000.0, now=1000.0,
+    )
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        edit_scheduled_post(path, post.id, text="😀" * 1880, now=1000.0)
+    assert load_scheduled_posts(path).posts[0].text == "my take"
+    # The same text fits a plain post: the target hash is what pushes
+    # the quote over.
+    plain = schedule_post(path, text="short", publish_at=2000.0, now=1000.0)
+    edited = edit_scheduled_post(path, plain.id, text="😀" * 1880, now=1000.0)
+    assert edited.text == "😀" * 1880
+
+
+def test_edit_scheduled_post_counts_image_in_size_check(tmp_path):
+    # 1,860 four-byte characters fit a plain post, but the image
+    # descriptor rides in the same entry: refuse the edit instead of
+    # queueing a post that could never publish.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(
+        path, text="morning", publish_at=2000.0, now=1000.0, image=_image()
+    )
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        edit_scheduled_post(path, post.id, text="😀" * 1860, now=1000.0)
+    assert load_scheduled_posts(path).posts[0].text == "morning"
+    plain = schedule_post(path, text="short", publish_at=2000.0, now=1000.0)
+    edited = edit_scheduled_post(path, plain.id, text="😀" * 1860, now=1000.0)
+    assert edited.text == "😀" * 1860
+
+
+def test_edit_scheduled_post_revalidates_time_after_lock(tmp_path, monkeypatch):
+    # The requested time was in the future when the edit started, but
+    # the clock moved past it while the edit waited for the queue
+    # lock: the edit is refused instead of saving a past send time.
+    import itertools
+
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)
+    clock = itertools.chain([1000.0], itertools.repeat(2000.0))
+    monkeypatch.setattr(time, "time", lambda: next(clock))
+    with pytest.raises(ScheduledPostsError, match="in the future"):
+        edit_scheduled_post(path, post.id, publish_at=1500.0)
     assert load_scheduled_posts(path).posts[0].publish_at == 2000.0
+
+
+def test_edit_scheduled_post_clears_retry_state(tmp_path):
+    # An entry that exhausted its retries stays excluded from the
+    # publish pass — until it is edited, which clears the retry state
+    # so it publishes at its new time instead of staying stuck.
+    path = tmp_path / "scheduled-posts.json"
+    save_scheduled_posts(
+        path,
+        ScheduledPosts(
+            posts=(
+                _post(
+                    publish_at=2000.0,
+                    attempts=MAX_PUBLISH_ATTEMPTS,
+                    next_attempt_at=99999.0,
+                    paused_at=5000.0,
+                ),
+            )
+        ),
+    )
+    edited = edit_scheduled_post(
+        path, "a" * 16, text="second chance", publish_at=3000.0, now=1000.0
+    )
+    assert edited.text == "second chance"
+    assert edited.publish_at == 3000.0
+    assert edited.attempts == 0
+    assert edited.next_attempt_at == 0.0
+    assert edited.paused_at == 0.0
 
 
 class _FakeTanApp:

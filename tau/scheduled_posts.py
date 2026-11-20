@@ -827,17 +827,21 @@ def edit_scheduled_post(
 
     At least one of *text* / *publish_at* must be given.  The new text
     gets the same validation as scheduling does (``normalize_message``
-    plus the wire-size preflight against the entry's reply target and
-    expiry), so an edit cannot queue a post that could never be
-    published.  A new publish time must be in the future, within the
-    7-day queue cap, and — when the entry expires — sooner than the
-    expiry, or the post would expire before it goes out.
+    plus the wire-size preflight against the entry's kind and retained
+    fields — a poll's options, a quote's target, an image descriptor —
+    so an edit cannot queue a post that could never be published.
+    A scheduled repost carries no text, so a text edit on one is
+    refused.  A new publish time must be in the future and within the
+    7-day queue cap; expiry counts from publication, so it does not
+    limit how far out the publish time may move.
 
     An entry whose publish already created the signed post (it has a
     stored ``post_hash``) cannot be edited: the text is already signed,
     so changing it would orphan the stored copy.  Cancel it instead.
-    Everything else about the entry — reply target, audience, TTL,
-    expiry, retry state — is left untouched.
+    An edit also clears the entry's retry state (attempts, backoff,
+    pause), so a post that gave up publishes at its new time instead
+    of staying stuck.  Everything else about the entry — reply
+    target, audience, TTL, expiry — is left untouched.
     """
     if text is None and publish_at is None:
         raise ScheduledPostsError(
@@ -866,35 +870,65 @@ def edit_scheduled_post(
             raise ScheduledPostsError(
                 "that post was already created — cancel it instead of editing it"
             )
+        if clean_publish_at is not None:
+            # The time was checked before the lock, but the edit may
+            # have waited behind a publish pass: re-check against a
+            # fresh clock so a stale "future" time is never saved.
+            fresh = now if now is not None else time.time()
+            if clean_publish_at <= fresh:
+                raise ScheduledPostsError("publish time must be in the future")
+            if clean_publish_at - fresh > MAX_SCHEDULED_POST_DELAY:
+                raise ScheduledPostsError(
+                    "publish time must be within 7d (the scheduled-post delay cap)"
+                )
         if clean_text is not None:
+            if post.kind == "repost":
+                raise ScheduledPostsError("a scheduled repost carries no text")
             # Lazy import: this module stays importable without
             # Reticulum, which ``tau.backup`` relies on.
-            from .tangents.tan import PostError, check_post_text_fits
+            from .tangents.tan import (
+                PostError,
+                check_poll_fits,
+                check_post_text_fits,
+            )
 
             try:
-                check_post_text_fits(
-                    clean_text,
-                    name=name,
-                    reply_to=post.reply_to,
-                    expires=post.expires_in > 0,
-                )
+                if post.kind == "poll":
+                    check_poll_fits(
+                        clean_text,
+                        post.options,
+                        name=name,
+                        expires=post.expires_in > 0,
+                    )
+                else:
+                    check_post_text_fits(
+                        clean_text,
+                        name=name,
+                        # A quote's target rides in the envelope like
+                        # a reply target, so it counts toward the
+                        # wire-size budget.
+                        reply_to=(
+                            post.target_post
+                            if post.kind == "quote"
+                            else post.reply_to
+                        ),
+                        expires=post.expires_in > 0,
+                        image=post.image,
+                    )
             except PostError as exc:
                 raise ScheduledPostsError(str(exc)) from exc
-        if (
-            clean_publish_at is not None
-            and post.expires_in > 0
-            and clean_publish_at - at >= post.expires_in
-        ):
-            raise ScheduledPostsError(
-                "publish time must be sooner than the post's expiry — "
-                "the post would expire before it is published"
-            )
         edited = replace(
             post,
             text=clean_text if clean_text is not None else post.text,
             publish_at=(
                 clean_publish_at if clean_publish_at is not None else post.publish_at
             ),
+            # A failed entry that gave up stays excluded from the
+            # publish pass until it is edited; clear the retry state
+            # so the edited entry publishes at its new time.
+            attempts=0,
+            next_attempt_at=0.0,
+            paused_at=0.0,
         )
         save_scheduled_posts(path, queue.with_replaced(edited))
     return edited
