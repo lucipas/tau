@@ -233,7 +233,9 @@ class FakeNode:
             "crew", [PEER_HASH, BOB_HASH], created_by=PEER_HASH
         )
         self.sent_files = []
+        self.sent_file_kwargs = []
         self.group_sent_files = []
+        self.group_sent_file_kwargs = []
         self.broadcast_sent_files = []
         self.media_fetches = []
         self.announced = 0
@@ -803,6 +805,7 @@ class FakeNode:
         timeout=300.0,
         discover_timeout=None,
         progress_callback=None,
+        forwarded_from=None,
     ):
         import hashlib
         from pathlib import Path
@@ -810,6 +813,9 @@ class FakeNode:
         data = Path(path).read_bytes()
         peer = target if isinstance(target, Peer) else self.resolve_peer(target)
         self.sent_files.append((peer.name, Path(path).name, data))
+        self.sent_file_kwargs.append(
+            {"timeout": timeout, "forwarded_from": forwarded_from}
+        )
         return {
             "ok": True,
             "id": f"{len(self.sent_files):032d}",
@@ -819,7 +825,15 @@ class FakeNode:
             "to": peer.hexhash,
         }
 
-    def send_group_file(self, group, path, *, timeout=300.0, discover_timeout=None):
+    def send_group_file(
+        self,
+        group,
+        path,
+        *,
+        timeout=300.0,
+        discover_timeout=None,
+        forwarded_from=None,
+    ):
         import hashlib
         from pathlib import Path
 
@@ -828,6 +842,9 @@ class FakeNode:
         data = Path(path).read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         self.group_sent_files.append((group["name"], Path(path).name, data))
+        self.group_sent_file_kwargs.append(
+            {"timeout": timeout, "forwarded_from": forwarded_from}
+        )
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -18618,15 +18635,21 @@ def test_forward_message_endpoint_forwards_received_file(
     )
     assert status == 200
     assert payload["ok"] is True
-    assert payload["message"]["text"] == "Forwarded from alice:\nphoto.jpg"
+    assert "message" not in payload
     assert payload["file_message"]["text"] == "Sent file: photo.jpg (12 bytes)"
     assert payload["file_response"]["name"] == "photo.jpg"
     assert payload["file_response"]["size"] == 12
-    assert node.sent == [("alice", "Forwarded from alice:\nphoto.jpg", None)]
+    # One leg only: no attribution text goes out, and the offer names
+    # the original sender.
+    assert node.sent == []
     assert node.sent_files == [("alice", "photo.jpg", b"photo-bytes!")]
-    # The original stays in the feed, plus the attribution and the file.
+    assert node.sent_file_kwargs[0]["forwarded_from"] == {
+        "hash": PEER_HASH,
+        "name": "alice",
+    }
+    # The original stays in the feed, plus the file.
     _, _, feed = _json(bridge, "/api/messages")
-    assert [entry["id"] for entry in feed["messages"]] == [1, 2, 3]
+    assert [entry["id"] for entry in feed["messages"]] == [1, 2]
 
 
 def test_forward_message_endpoint_forwards_received_file_to_group(
@@ -18644,17 +18667,78 @@ def test_forward_message_endpoint_forwards_received_file_to_group(
     )
     assert status == 200
     assert payload["ok"] is True
-    assert [entry["text"] for entry in payload["messages"]] == [
-        "Forwarded from alice:\nphoto.jpg",
-        "Forwarded from alice:\nphoto.jpg",
-    ]
+    assert "messages" not in payload
     assert [entry["text"] for entry in payload["file_messages"]] == [
         "Sent file: photo.jpg (12 bytes)",
         "Sent file: photo.jpg (12 bytes)",
     ]
     assert payload["file_response"]["ok"] is True
-    assert node.group_sent == [("crew", "Forwarded from alice:\nphoto.jpg")]
+    assert node.group_sent == []
     assert node.group_sent_files == [("crew", "photo.jpg", b"photo-bytes!")]
+    assert node.group_sent_file_kwargs[0]["forwarded_from"] == {
+        "hash": PEER_HASH,
+        "name": "alice",
+    }
+
+
+def test_forward_message_endpoint_file_forward_keeps_original_sender(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+
+    # A file that arrived already forwarded keeps its original sender
+    # instead of re-attributing to the intermediate forwarder.
+    import hashlib
+    from pathlib import Path
+
+    files_dir = Path(tmp_path) / "files"
+    stored = files_dir / PEER_HASH / "photo.jpg"
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_bytes(b"photo-bytes!")
+    digest = hashlib.sha256(b"photo-bytes!").hexdigest()
+    forwarded_from = {"hash": "cd" * 16, "name": "carol"}
+    node.inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": PEER_HASH,
+            "name": "photo.jpg",
+            "size": 12,
+            "sha256": digest,
+            "path": str(stored),
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-file-1",
+            "direction": "in",
+            "forwarded_from": forwarded_from,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "Forwarded from carol:\nReceived file: photo.jpg (12 bytes, sha256 abababababab)",
+            "file": {
+                "name": "photo.jpg",
+                "size": 12,
+                "sha256": digest,
+                "forwarded_from": forwarded_from,
+            },
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-file-1",
+        }
+    )
+    node.set_blocklist(BlockList())
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert node.sent_file_kwargs[0]["forwarded_from"] == forwarded_from
 
 
 def test_forward_message_endpoint_file_forward_missing_bytes_is_an_error(
@@ -18727,11 +18811,10 @@ def test_forward_message_endpoint_file_forward_failed_leg_reports_partial(
     )
     assert status == 200
     assert payload["ok"] is False
-    # The attribution text went out; only the file leg failed.
-    assert payload["message"]["text"] == "Forwarded from alice:\nphoto.jpg"
+    # Nothing went out: there is no text leg anymore, only the file.
     assert "no path to alice" in payload["file_error"]
     assert "file_message" not in payload
-    assert node.sent == [("alice", "Forwarded from alice:\nphoto.jpg", None)]
+    assert node.sent == []
 
 
 def test_forward_message_endpoint_file_forward_uses_entry_record_not_newest(
@@ -18841,18 +18924,12 @@ def test_forward_message_endpoint_file_forward_defaults_file_timeout_to_300(
     node.set_blocklist(BlockList())
     seen = {}
     original_send_file = node.send_file
-    original_send_message = node.send_message
 
     def capturing_send_file(target, path, **kwargs):
         seen["file_timeout"] = kwargs.get("timeout")
         return original_send_file(target, path, **kwargs)
 
-    def capturing_send_message(peer, text, **kwargs):
-        seen["text_timeout"] = kwargs.get("timeout")
-        return original_send_message(peer, text, **kwargs)
-
     node.send_file = capturing_send_file
-    node.send_message = capturing_send_message
     status, _, payload = _json(
         bridge,
         "/api/messages/forward",
@@ -18861,10 +18938,9 @@ def test_forward_message_endpoint_file_forward_defaults_file_timeout_to_300(
     )
     assert status == 200
     assert payload["ok"] is True
-    # No timeout in the request: the text leg keeps the 20s default
-    # while the file leg gets the 300s send-file default, so a file
-    # of a few MiB on a slow Reticulum link can still forward.
-    assert seen.get("text_timeout") == 20.0
+    # No timeout in the request: the file leg gets the 300s send-file
+    # default, so a file of a few MiB on a slow Reticulum link can
+    # still forward.
     assert seen.get("file_timeout") == 300.0
 
 
@@ -18888,9 +18964,9 @@ def test_forward_message_endpoint_file_forward_oserror_reports_partial(
     )
     assert status == 200
     assert payload["ok"] is False
-    # The attribution text went out; only the file leg failed.
+    # Nothing went out: there is no text leg anymore, only the file.
     assert "disk full" in payload["file_error"]
-    assert node.sent == [("alice", "Forwarded from alice:\nphoto.jpg", None)]
+    assert node.sent == []
 
 
 def test_forward_message_endpoint_rejects_both_or_neither_target(bridge, node):

@@ -634,10 +634,10 @@ export async function forwardMessage(
   target: { to: string } | { group: string },
 ): Promise<unknown> {
   const result = await post("/api/messages/forward", { id, ...target });
-  // A file forward can report HTTP 200 with ok: false: the
-  // attribution text went out but the file leg failed.  Surface that
-  // as an error instead of closing the picker on a success flag —
-  // the caller shows it as a failed forward.
+  // A file forward can report HTTP 200 with ok: false: the file did
+  // not go out (there is no text leg anymore). Surface that as an
+  // error instead of closing the picker on a success flag — the
+  // caller shows it as a failed forward.
   if (result && typeof result === "object") {
     const partial = result as {
       ok?: unknown;
@@ -647,7 +647,7 @@ export async function forwardMessage(
     if (partial.ok === false) {
       if (typeof partial.file_error === "string" && partial.file_error) {
         throw new Error(
-          `the message was forwarded but the file did not send: ${partial.file_error}`,
+          `the file could not be forwarded: ${partial.file_error}`,
         );
       }
       if (
@@ -655,9 +655,7 @@ export async function forwardMessage(
         typeof partial.file_response === "object" &&
         partial.file_response.ok === false
       ) {
-        throw new Error(
-          "the message was forwarded but the file did not reach all members",
-        );
+        throw new Error("the file did not reach all members");
       }
       throw new Error("the message could not be forwarded");
     }

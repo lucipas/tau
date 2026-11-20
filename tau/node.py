@@ -8052,6 +8052,7 @@ class TauNode:
         timeout: float,
         discover_timeout: Optional[float],
         limit_label: str,
+        forwarded_from: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], bool]:
         """Fan already-read file bytes out to *members*, one transfer each.
 
@@ -8102,6 +8103,7 @@ class TauNode:
                     timeout=budget,
                     discover_timeout=leg_discover,
                     deadline=deadline,
+                    forwarded_from=forwarded_from,
                 )
                 results.append(
                     {
@@ -8136,6 +8138,7 @@ class TauNode:
         timeout: float = _FILE_TRANSFER_TIMEOUT,
         discover_timeout: Optional[float] = None,
         only: Optional[Sequence[str]] = None,
+        forwarded_from: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fan a file out to every member of a group except this node.
 
@@ -8175,6 +8178,7 @@ class TauNode:
             timeout=timeout,
             discover_timeout=discover_timeout,
             limit_label="group send",
+            forwarded_from=forwarded_from,
         )
         return {
             "ok": all_ok,
@@ -8244,6 +8248,7 @@ class TauNode:
         discover_timeout: Optional[float] = None,
         progress_callback: Optional[Callable[[float], None]] = None,
         deadline: Optional[float] = None,
+        forwarded_from: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send a small file to a peer over an RNS Resource.
 
@@ -8256,7 +8261,9 @@ class TauNode:
         ``deadline`` is a monotonic cutoff for the whole transfer:
         every stage (discovery, link, offer, resource) is capped by
         the time left before it, instead of each taking the full
-        ``timeout`` in turn.
+        ``timeout`` in turn.  ``forwarded_from`` names the file's
+        original sender when this transfer is a forward; it rides in
+        the signed offer so the attribution travels with the file.
         """
         data, name, digest = _read_file_payload(path)
         return self._send_file_bytes(
@@ -8268,6 +8275,7 @@ class TauNode:
             discover_timeout=discover_timeout,
             progress_callback=progress_callback,
             deadline=deadline,
+            forwarded_from=forwarded_from,
         )
 
     def _send_file_bytes(
@@ -8281,6 +8289,7 @@ class TauNode:
         discover_timeout: Optional[float] = None,
         progress_callback: Optional[Callable[[float], None]] = None,
         deadline: Optional[float] = None,
+        forwarded_from: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send already-read file bytes to a peer over an RNS Resource.
 
@@ -8310,6 +8319,7 @@ class TauNode:
             name=name,
             size=len(data),
             sha256=digest,
+            forwarded_from=forwarded_from,
         )
         link = self._open_link(peer, min(timeout, 30.0), deadline=deadline)
         try:
@@ -10383,7 +10393,7 @@ class TauNode:
             len(data),
             offer["from"][:8],
         )
-        return {
+        record: Dict[str, Any] = {
             "kind": "file",
             "from": offer.get("from_name") or offer["from"][:8],
             "destination": offer["from"],
@@ -10395,6 +10405,12 @@ class TauNode:
             "received_at": time.time(),
             "id": offer["id"],
         }
+        if isinstance(offer.get("forwarded_from"), dict):
+            # The offer carried the file's original sender: keep the
+            # attribution on the record so it renders wherever the
+            # file does — and so a re-forward passes it on unchanged.
+            record["forwarded_from"] = offer["forwarded_from"]
+        return record
 
     def _on_incoming_link(self, link: RNS.Link) -> None:
         self._configure_link(link)

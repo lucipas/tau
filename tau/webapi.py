@@ -107,7 +107,8 @@ script) can read what arrives from the mesh and send messages back:
                            send the message on as a new DM prefixed with
                            ``Forwarded from <name>:`` (``tau forward`` from
                            the console); a file entry forwards its stored
-                           bytes the same way, attribution first
+                           bytes with the original sender named in the
+                           file offer instead
     POST /api/messages/pin pin ``{"id": <console message id>}`` in the node
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
@@ -435,6 +436,7 @@ from .protocol import (
     _clean_group_poll_vote_or_none,
     clean_in_reply_to,
     clean_beacon,
+    clean_forwarded_from_or_none,
     clean_location,
     clean_reaction,
     excerpt_hash,
@@ -914,7 +916,11 @@ def _clean_stored_file(value: Any) -> Optional[Dict[str, Any]]:
         or any(char not in "0123456789abcdef" for char in sha256.lower())
     ):
         return None
-    return {"name": name, "size": size, "sha256": sha256.lower()}
+    cleaned: Dict[str, Any] = {"name": name, "size": size, "sha256": sha256.lower()}
+    forwarded_from = clean_forwarded_from_or_none(value.get("forwarded_from"))
+    if forwarded_from is not None:
+        cleaned["forwarded_from"] = forwarded_from
+    return cleaned
 
 
 def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
@@ -5218,6 +5224,14 @@ class WebBridge:
                     "size": record.get("size"),
                     "sha256": record.get("sha256"),
                 }
+                # The attribution rides on the file entry so a
+                # re-forward passes the original sender on instead of
+                # re-attributing to the intermediate forwarder.
+                forwarded_from = clean_forwarded_from_or_none(
+                    record.get("forwarded_from")
+                )
+                if forwarded_from is not None:
+                    file_meta["forwarded_from"] = forwarded_from
             else:
                 text = str(record.get("text") or "")
             message = self._append_message(
@@ -6823,6 +6837,7 @@ class WebBridge:
         data: bytes,
         *,
         timeout: float = 300.0,
+        forwarded_from: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Send a file to a peer from the console.
 
@@ -6863,7 +6878,9 @@ class WebBridge:
         with tempfile.TemporaryDirectory(prefix="tau-send-file-") as staging:
             staged = Path(staging) / clean_name
             staged.write_bytes(data)
-            response = self.node.send_file(peer, staged, timeout=timeout)
+            response = self.node.send_file(
+                peer, staged, timeout=timeout, forwarded_from=forwarded_from
+            )
         wire_id = response.get("id") if isinstance(response.get("id"), str) else None
         with self._send_lock:
             message = self._append_message(
@@ -6962,6 +6979,7 @@ class WebBridge:
         data: bytes,
         *,
         timeout: float = 300.0,
+        forwarded_from: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a file to every member of a group from the console.
 
@@ -7012,7 +7030,10 @@ class WebBridge:
             staged = Path(staging) / clean_name
             staged.write_bytes(data)
             response = self.node.send_group_file(
-                group_record, staged, timeout=timeout
+                group_record,
+                staged,
+                timeout=timeout,
+                forwarded_from=forwarded_from,
             )
         messages = self._record_file_legs(
             response=response,
@@ -8067,9 +8088,9 @@ class WebBridge:
         the new outbound entry appears in the feed like any other send.
 
         A file entry forwards the stored bytes instead (see
-        :meth:`_forward_file_message`): the recipient first gets the
-        attribution naming the file, then the file itself as a fresh
-        one-to-one transfer.
+        :meth:`_forward_file_message`): the file offer itself names
+        the original sender, so the recipient's file record carries
+        the attribution without a separate text leg.
 
         Exactly one of ``to`` and ``group`` is required.  Same guards
         as the CLI: group messages cannot be forwarded (they would leak
@@ -8159,12 +8180,24 @@ class WebBridge:
                 )
         if file_meta is not None:
             # A file entry carries no forwardable text: the stored
-            # bytes go instead, with the file name as the attributed
-            # line.  The block-list and label checks above already ran.
+            # bytes go instead, with the original sender named in the
+            # file offer itself.  A file that arrived already
+            # forwarded keeps its original sender; otherwise the
+            # sender of this record is the original.  The block-list
+            # and label checks above already ran.
+            forwarded_from = clean_forwarded_from_or_none(
+                file_meta.get("forwarded_from")
+            )
+            if forwarded_from is None:
+                if not isinstance(peer_hash, str) or not peer_hash:
+                    raise ValueError(
+                        "cannot forward a file: the sender is unknown"
+                    )
+                forwarded_from = {"hash": peer_hash, "name": label}
             return self._forward_file_message(
                 entry,
                 file_meta,
-                label,
+                forwarded_from,
                 to,
                 timeout=timeout,
                 group=group,
@@ -8200,7 +8233,7 @@ class WebBridge:
         self,
         entry: Dict[str, Any],
         file_meta: Dict[str, Any],
-        label: str,
+        forwarded_from: Dict[str, Any],
         to: Optional[str] = None,
         *,
         timeout: float = 20.0,
@@ -8209,24 +8242,23 @@ class WebBridge:
     ) -> Dict[str, Any]:
         """Forward a stored received file, from the console.
 
-        The recipient first gets the attribution as a text DM —
-        ``Forwarded from <name>:`` naming the file — then the file
-        itself as a fresh one-to-one transfer, reusing
-        :meth:`send_file` / :meth:`send_group_file`.  The stored bytes
-        come from :meth:`_forward_file_bytes`, which resolves the
-        entry's own inbox record by its wire id (an old entry must
+        The file itself carries the attribution now: the offer names
+        the original sender in ``forwarded_from``, so the recipient's
+        file record shows who sent it first without a separate text
+        leg that could arrive out of order or not at all.  The stored
+        bytes come from :meth:`_forward_file_bytes`, which resolves
+        the entry's own inbox record by its wire id (an old entry must
         not forward a newer file that arrived under the same name)
         and checks the bytes against the entry's recorded size and
-        SHA-256.  A file you
-        sent cannot be forwarded: its bytes were staged in a temporary
-        directory for the transfer and not kept.  A failed peer file
-        leg does not roll back the attribution text already sent: the
-        result reports ``ok: False`` with ``file_error`` instead of
-        raising, so the console can say what went out and what did not.
-        The file leg runs under ``file_timeout`` (300s when the request
-        gives no timeout), not the text ``timeout``: a file of a few
-        MiB on a slow Reticulum link outlasts the 20s text default,
-        mirroring the CLI, which uses 300s for file legs.
+        SHA-256.  A file you sent cannot be forwarded: its bytes were
+        staged in a temporary directory for the transfer and not kept.
+        A failed file leg reports ``ok: False`` with ``file_error``
+        instead of raising, so the console can say the file did not
+        go out — nothing else went out either, there is no text leg
+        anymore.  The file leg runs under ``file_timeout`` (300s when
+        the request gives no timeout), not the text ``timeout``: a
+        file of a few MiB on a slow Reticulum link outlasts the 20s
+        text default, mirroring the CLI, which uses 300s for file legs.
         """
         if entry.get("direction") == "out":
             raise ValueError(
@@ -8240,11 +8272,7 @@ class WebBridge:
         if not isinstance(peer_hash, str) or not peer_hash:
             raise ValueError("cannot forward a file: the sender is unknown")
         data = self._forward_file_bytes(entry, file_meta, peer_hash, name)
-        forwarded = f"Forwarded from {label}:\n{name}"
         if group is not None:
-            messages, response = self.send_group_message(
-                group.strip(), forwarded, timeout=timeout
-            )
             try:
                 file_messages, file_response = self.send_group_file(
                     group.strip(),
@@ -8253,43 +8281,33 @@ class WebBridge:
                     timeout=file_timeout
                     if file_timeout is not None
                     else timeout,
+                    forwarded_from=forwarded_from,
                 )
             except (NodeError, ValueError, OSError) as exc:
                 return {
                     "ok": False,
-                    "messages": messages,
-                    "response": response,
                     "file_error": str(exc),
                 }
             return {
-                "ok": bool(response.get("ok", True))
-                and bool(file_response.get("ok", True)),
-                "messages": messages,
-                "response": response,
+                "ok": bool(file_response.get("ok", True)),
                 "file_messages": file_messages,
                 "file_response": file_response,
             }
-        message, response = self.send_message(
-            to.strip(), forwarded, timeout=timeout
-        )
         try:
             file_message, file_response = self.send_file(
                 to.strip(),
                 name,
                 data,
                 timeout=file_timeout if file_timeout is not None else timeout,
+                forwarded_from=forwarded_from,
             )
         except (NodeError, ValueError, OSError) as exc:
             return {
                 "ok": False,
-                "message": message,
-                "response": response,
                 "file_error": str(exc),
             }
         return {
             "ok": True,
-            "message": message,
-            "response": response,
             "file_message": file_message,
             "file_response": file_response,
         }
@@ -12650,10 +12668,17 @@ def file_arrival_text(record: Dict[str, Any]) -> str:
     """Feed line for a received file: name, size and short SHA-256.
 
     Shared by live file delivery and backup restore so both show the
-    same entry for a file.
+    same entry for a file.  A forwarded file names its original
+    sender first, so the attribution reads the same way a forwarded
+    text does (``Forwarded from <name>:``) instead of arriving as a
+    bare file from the forwarder.
     """
+    forwarded_from = clean_forwarded_from_or_none(record.get("forwarded_from"))
+    prefix = ""
+    if forwarded_from is not None:
+        prefix = f"Forwarded from {forwarded_from['name']}:\n"
     return (
-        f"Received file: {record.get('name')} "
+        f"{prefix}Received file: {record.get('name')} "
         f"({record.get('size')} bytes, "
         f"sha256 {short_hash(str(record.get('sha256') or ''), 12)})"
     )
