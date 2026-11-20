@@ -3729,7 +3729,12 @@ class WebBridge:
         With *kind* ``"repost"`` / ``"quote"`` the entry amplifies
         *target_post* instead: a repost carries no text, a quote
         carries its comment as the text, and the target is resolved
-        the same way as a reply target.
+        the same way as a reply target.  A repost or quote carries
+        neither an image nor poll options — Tan records allow an image
+        only on a top-level post, and a poll is its own kind — so
+        either field with one of those kinds is refused here, before
+        the image bytes are decoded or pinned, rather than scheduled
+        and silently dropped at publish time.
 
         With *poll_options* the entry is a poll instead: the text is
         its question, the options ride alongside it, and a reply
@@ -3750,6 +3755,13 @@ class WebBridge:
             )
         if image is not None and poll_options is not None:
             raise ValueError("a scheduled poll cannot carry an image")
+        if kind in ("repost", "quote"):
+            if image is not None:
+                raise ValueError(f"a scheduled {kind} cannot carry an image")
+            if poll_options is not None:
+                raise ValueError(
+                    f"a scheduled {kind} cannot carry poll options"
+                )
         image_attachment: Optional[Dict[str, Any]] = None
         if image is not None:
             from .tangents.tan import image_attachment_from_data_url

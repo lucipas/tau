@@ -14309,6 +14309,10 @@ def test_tan_schedule_repost_and_quote_via_api(tmp_path):
         ]
 
         # Bad repost/quote requests are 400s and queue nothing.
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
         for body, fragment in [
             ({"kind": "repost", "send_in": 60}, "target_post"),
             ({"kind": "quote", "send_in": 60}, "target_post"),
@@ -14343,12 +14347,59 @@ def test_tan_schedule_repost_and_quote_via_api(tmp_path):
                 {"kind": "repost", "target_post": "cd" * 32, "send_in": 60},
                 "unknown post",
             ),
+            # An image or poll options on a repost/quote is refused up
+            # front, not scheduled and silently dropped at publish
+            # time: Tan records allow an image only on a top-level
+            # post, and a poll is its own kind.
+            (
+                {
+                    "kind": "repost",
+                    "target_post": post["hash"],
+                    "send_in": 60,
+                    "image": data_url,
+                },
+                "cannot carry an image",
+            ),
+            (
+                {
+                    "kind": "repost",
+                    "target_post": post["hash"],
+                    "send_in": 60,
+                    "poll_options": ["A", "B"],
+                },
+                "cannot carry poll options",
+            ),
+            (
+                {
+                    "kind": "quote",
+                    "target_post": post["hash"],
+                    "text": "x",
+                    "send_in": 60,
+                    "image": data_url,
+                },
+                "cannot carry an image",
+            ),
+            (
+                {
+                    "kind": "quote",
+                    "target_post": post["hash"],
+                    "text": "x",
+                    "send_in": 60,
+                    "poll_options": ["A", "B"],
+                },
+                "cannot carry poll options",
+            ),
         ]:
             status, _, payload = _json(
                 bridge, "/api/tan/schedule", method="POST", body=body
             )
             assert status == 400, body
             assert fragment in payload["error"]["message"], body
+        # The refused image was never decoded or pinned: the refusal
+        # happens before the media store sees the bytes.
+        from tau.tangents.tan import media_path
+
+        assert media_path(tmp_path, hashlib.sha256(png).hexdigest()) is None
         status, _, payload = _json(bridge, "/api/tan/scheduled")
         assert payload["count"] == 2
     finally:
