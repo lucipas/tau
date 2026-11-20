@@ -1083,6 +1083,147 @@ def test_group_topic_flag_conflicts_rejected(tmp_path, capsys):
     )
 
 
+def test_parser_group_ban_arguments():
+    parser = cli.build_parser()
+    ban = parser.parse_args(["group", "ban", "weekend", "carol"])
+    assert ban.group_command == "ban"
+    assert ban.func is cli.cmd_group_ban
+    assert ban.group == "weekend"
+    assert ban.peer == "carol"
+
+    unban = parser.parse_args(["group", "unban", "weekend", "carol"])
+    assert unban.func is cli.cmd_group_unban
+
+    banned = parser.parse_args(["group", "banned", "weekend"])
+    assert banned.func is cli.cmd_group_banned
+    assert banned.group == "weekend"
+
+
+class _FakeBanNode:
+    """Stub TauNode for `tau group ban`: real stores, no Reticulum."""
+
+    def __init__(self, config, **kwargs):
+        from tau.groups import GroupStore
+        from tau.identity import destination_hash, load_identity
+        from tau.peers import PeerRegistry
+
+        self.config = config
+        self.groups = GroupStore(config.groups_path)
+        self.registry = PeerRegistry(config.peers_path)
+        identity = load_identity(config.identity_path)
+        self.destination_hexhash = destination_hash(identity).hex()
+        self.started = False
+
+    def start(self, **kwargs):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def resolve_peer(self, target, timeout=10.0):
+        peer = self.registry.resolve(target)
+        if peer is None:
+            from tau.node import NodeError
+
+            raise NodeError(f"unknown peer: {target}")
+        return peer
+
+
+def _seed_group_with_carol(data_dir, own_hash):
+    from tau.groups import GroupStore
+    from tau.peers import PeerRegistry
+
+    registry = PeerRegistry(data_dir / "peers.json")
+    registry.upsert(
+        bytes.fromhex("cd" * 16),
+        b"\x02" * 64,
+        name="carol",
+        now=1000.0,
+    )
+    registry.save()
+    store = GroupStore(data_dir / "groups.json")
+    # Three members, so banning carol does not hit the last-member rule.
+    return store.create(
+        "weekend", [own_hash, "cd" * 16, "ef" * 16], created_by=own_hash
+    )
+
+
+def test_group_ban_unban_banned(tmp_path, capsys, monkeypatch):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    group = _seed_group_with_carol(data_dir, own_hash)
+
+    monkeypatch.setattr(cli, "TauNode", _FakeBanNode)
+    base = ["group", "ban", "--data-dir", str(data_dir), "weekend"]
+    assert cli.main([*base, "carol"]) == 0
+    out = capsys.readouterr().out
+    assert "banned carol from group weekend" in out
+    assert "cannot be re-added" in out
+    banned_group = GroupStore(data_dir / "groups.json").get(group["id"])
+    assert banned_group is None  # the roster change minted a successor
+    stored = GroupStore(data_dir / "groups.json").list_groups()
+    assert len(stored) == 1
+    assert sorted(stored[0]["members"]) == sorted([own_hash, "ef" * 16])
+    assert stored[0]["banned"] == ["cd" * 16]
+
+    assert cli.main(["group", "banned", "--data-dir", str(data_dir), "weekend"]) == 0
+    out = capsys.readouterr().out
+    assert "Banned from weekend" in out
+    assert "carol" in out
+
+    # A banned peer cannot be re-added through the normal path.
+    assert (
+        cli.main(
+            [
+                "group",
+                "add-member",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "--peer",
+                "carol",
+            ]
+        )
+        == 1
+    )
+    assert "is banned" in capsys.readouterr().err
+
+    assert cli.main(["group", "unban", "--data-dir", str(data_dir), "weekend", "carol"]) == 0
+    assert "unbanned carol" in capsys.readouterr().out
+    assert (
+        GroupStore(data_dir / "groups.json").get(stored[0]["id"])["banned"] == []
+    )
+
+    # Unbanning a peer who is not banned says so instead of failing.
+    assert cli.main(["group", "unban", "--data-dir", str(data_dir), "weekend", "carol"]) == 0
+    assert "was not banned" in capsys.readouterr().out
+
+    # JSON mode for the ban list.
+    assert (
+        cli.main(
+            [
+                "group",
+                "banned",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+    assert payload["banned"] == []
+
+    # Banning the creator is refused.
+    assert cli.main([*base, own_hash]) == 1
+    assert "cannot ban the creator" in capsys.readouterr().err
+
+
 def test_status_text_output(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     code = cli.main(["status", "--data-dir", str(data_dir)])
@@ -4980,6 +5121,15 @@ def test_parser_outbox_subcommands():
     assert cancelled.target == "abcdef12"
     assert cancelled.func is cli.cmd_outbox_cancel
 
+    edited = parser.parse_args(
+        ["outbox", "edit", "abcdef12", "--text", "fixed", "--delay", "1h"]
+    )
+    assert edited.outbox_command == "edit"
+    assert edited.target == "abcdef12"
+    assert edited.text == "fixed"
+    assert edited.delay == "1h"
+    assert edited.func is cli.cmd_outbox_edit
+
     retried = parser.parse_args(["outbox", "retry", "abcdef12"])
     assert retried.outbox_command == "retry"
     assert retried.target == "abcdef12"
@@ -5226,6 +5376,127 @@ def test_outbox_cancel_ambiguous_prefix_is_an_error(tmp_path, capsys):
     assert code == 1
     assert "2 queued messages match prefix" in capsys.readouterr().err
     assert len(Mailbox(config.mailbox_path).outbox_list()) == 2
+
+
+def test_outbox_edit_scheduled_entry_round_trip(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="see you soon",
+        message_id="cc" + "11" * 15,
+        send_after=time.time() + 7200.0,
+    )
+
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            entry.id[:8],
+            "--text",
+            "see you at noon",
+            "--delay",
+            "2h",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited cc111111" in out
+    assert "now sends in " in out
+    stored = Mailbox(config.mailbox_path).get_outbox(entry.id)
+    assert stored.text == "see you at noon"
+    assert abs(stored.send_after - (time.time() + 7200.0)) < 5.0
+
+
+def test_outbox_edit_json_reports_legs(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="later",
+        message_id="cc" + "22" * 15,
+        send_after=time.time() + 7200.0,
+    )
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+            entry.id,
+            "--text",
+            "much later, reworded",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["legs"] == 1
+    assert payload["edited"][0]["id"] == entry.id
+    assert payload["edited"][0]["text"] == "much later, reworded"
+
+
+def test_outbox_edit_needs_a_change(tmp_path, capsys):
+    import time
+
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16,
+        text="later",
+        message_id="cc" + "33" * 15,
+        send_after=time.time() + 7200.0,
+    )
+    code = cli.main(
+        ["outbox", "edit", "--data-dir", str(data_dir), entry.id]
+    )
+    assert code == 2
+    assert "nothing to change" in capsys.readouterr().err
+    assert Mailbox(config.mailbox_path).get_outbox(entry.id).text == "later"
+
+
+def test_outbox_edit_refuses_not_scheduled(tmp_path, capsys):
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16, text="now", message_id="cc" + "44" * 15
+    )
+    code = cli.main(
+        [
+            "outbox",
+            "edit",
+            "--data-dir",
+            str(data_dir),
+            entry.id,
+            "--text",
+            "too late",
+        ]
+    )
+    assert code == 1
+    assert "no longer scheduled" in capsys.readouterr().err
+    assert Mailbox(config.mailbox_path).get_outbox(entry.id).text == "now"
 
 
 class _FakeRetryNode:
@@ -9865,6 +10136,9 @@ def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     assert cli.main([*base, "--image", str(big)]) == 1
     png = tmp_path / "photo.png"
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
+    # --image with --delay is allowed now (see
+    # test_tan_post_image_with_delay_schedules); --delay still cannot
+    # combine with --no-publish, which is what this rejects.
     assert cli.main([*base, "--image", str(png), "--delay", "5m"]) == 2
     # A reply cannot carry an image: post first, then reply to it.
     assert cli.main([*base, "--image", str(png)]) == 0
@@ -9879,6 +10153,54 @@ def test_tan_post_image_rejects_bad_input(tmp_path, capsys):
     assert (
         cli.main([*base, "--image", str(png), "--reply-to", post_hash]) == 2
     )
+
+
+def test_tan_post_image_with_delay_schedules(tmp_path, capsys):
+    import hashlib
+    import json
+
+    from tau.config import TauConfig
+
+    data_dir = tmp_path / "node"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
+    capsys.readouterr()
+    png = tmp_path / "photo.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    digest = hashlib.sha256(png.read_bytes()).hexdigest()
+    assert (
+        cli.main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--image",
+                str(png),
+                "--delay",
+                "5m",
+                "morning photo",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "scheduled" in out
+    # The queued entry carries the attachment descriptor, and the
+    # bytes are pinned in the media store for the publish pass.
+    config = TauConfig.resolve(data_dir=data_dir)
+    queue = json.loads(config.scheduled_posts_path.read_text())
+    assert queue["posts"][0]["image"] == {
+        "sha256": digest,
+        "size": len(png.read_bytes()),
+        "mime": "image/png",
+        "name": "photo.png",
+    }
+    from tau.tangents.tan import media_path
+
+    assert media_path(data_dir, digest) is not None
+    assert cli.main(["tan", "scheduled", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "photo.png" in out
 
 
 def test_tan_post_with_location_stores_place(tmp_path, capsys):
@@ -10233,6 +10555,14 @@ def test_parser_channel_scheduled_arguments():
     assert cancelled.func is cli.cmd_channel_cancel_scheduled
     assert cancelled.target == "abcdef"
 
+    edited = parser.parse_args(
+        ["channel", "edit-scheduled", "abcdef", "--text", "fixed", "--delay", "2h"]
+    )
+    assert edited.func is cli.cmd_channel_edit_scheduled
+    assert edited.target == "abcdef"
+    assert edited.text == "fixed"
+    assert edited.delay == "2h"
+
 
 def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
     _init_node(tmp_path, "node", "alice")
@@ -10255,6 +10585,25 @@ def test_channel_send_delay_schedules_lists_and_cancels(tmp_path, capsys):
     code = _run_channel(tmp_path, "scheduled", "general")
     assert code == 0
     assert "morning hello" in capsys.readouterr().out
+
+    code = _run_channel(
+        tmp_path, "edit-scheduled", entry_id[:8], "--text", "morning, mesh!"
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited" in out
+    assert "morning, mesh!" in out
+
+    code = _run_channel(tmp_path, "scheduled")
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "morning, mesh!" in out
+    assert "morning hello" not in out
+
+    # Neither --text nor --delay is a usage error, not a crash.
+    code = _run_channel(tmp_path, "edit-scheduled", entry_id[:8])
+    assert code == 2
+    assert "nothing to change" in capsys.readouterr().err
 
     code = _run_channel(tmp_path, "cancel-scheduled", entry_id[:8])
     assert code == 0

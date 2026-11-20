@@ -39,4 +39,18 @@ describe("DraftsPanel", () => {
     fireEvent.click(screen.getByLabelText("Delete draft for crew"));
     expect(onDelete).toHaveBeenCalledWith(drafts[1]);
   });
+
+  it("shows a channel draft with a # prefix", () => {
+    const channelDraft: MessageDraft = {
+      kind: "channel",
+      target: "general",
+      text: "hello channel",
+      updated_at: 400,
+      name: "general",
+    };
+    render(<DraftsPanel drafts={[channelDraft]} onOpen={() => undefined} onDelete={() => undefined} />);
+    expect(screen.getByText("Drafts (1)")).toBeTruthy();
+    expect(screen.getByText("# general")).toBeTruthy();
+    expect(screen.getByText("hello channel")).toBeTruthy();
+  });
 });

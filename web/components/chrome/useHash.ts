@@ -3,7 +3,8 @@
 // Sections live in the URL hash so refresh / deep-linking works with the
 // static export: `#chat`, `#social`, `#channels`, `#tools`, `#settings`,
 // `#pages`, `#people` (mobile peers view). Chat targets ride along as a
-// query string: `#chat?peer=<destination>` or `#chat?group=<id>`.
+// query string: `#chat?peer=<destination>` or `#chat?group=<id>`; a channel
+// target rides the same way: `#channels?channel=<name>`.
 
 "use client";
 
@@ -28,6 +29,7 @@ export interface ParsedHash {
   section: Section;
   peer?: string;
   group?: string;
+  channel?: string;
 }
 
 export function parseHash(raw: string): ParsedHash {
@@ -37,13 +39,15 @@ export function parseHash(raw: string): ParsedHash {
   const params = new URLSearchParams(query ?? "");
   const peer = params.get("peer") ?? undefined;
   const group = params.get("group") ?? undefined;
-  return { section, peer, group };
+  const channel = params.get("channel") ?? undefined;
+  return { section, peer, group, channel };
 }
 
-export function buildHash(section: Section, opts: { peer?: string; group?: string } = {}): string {
+export function buildHash(section: Section, opts: { peer?: string; group?: string; channel?: string } = {}): string {
   const params = new URLSearchParams();
   if (opts.peer) params.set("peer", opts.peer);
   if (opts.group) params.set("group", opts.group);
+  if (opts.channel) params.set("channel", opts.channel);
   const query = params.toString();
   return `#${section}${query ? `?${query}` : ""}`;
 }
@@ -51,7 +55,7 @@ export function buildHash(section: Section, opts: { peer?: string; group?: strin
 export interface UseHashResult extends ParsedHash {
   /** Raw hash string, e.g. "#chat?peer=ab12". */
   hash: string;
-  navigate: (section: Section, opts?: { peer?: string; group?: string }) => void;
+  navigate: (section: Section, opts?: { peer?: string; group?: string; channel?: string }) => void;
 }
 
 export function useHash(): UseHashResult {
@@ -65,7 +69,7 @@ export function useHash(): UseHashResult {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
 
-  const navigate = useCallback((section: Section, opts: { peer?: string; group?: string } = {}) => {
+  const navigate = useCallback((section: Section, opts: { peer?: string; group?: string; channel?: string } = {}) => {
     const next = buildHash(section, opts);
     if (typeof window !== "undefined") {
       if (window.location.hash === next) {

@@ -7,8 +7,8 @@
 //                        tags.
 //   useTanThread(ref)  — thread view rooted at one post.
 //   useTanComposer()   — publish / schedule / poll composer actions.
-//   useTanLists()      — saved / hidden / pinned / scheduled / following /
-//                        followers / muted lists and tag follows.
+//   useTanLists()      — saved / hidden / pinned / scheduled / drafts /
+//                        following / followers / muted lists and tag follows.
 //
 // Posts arrive from /api/tan/timeline (following by default, `all=1` for
 // everything cached) with bridge annotations: likes/liked/own, quotes,
@@ -26,10 +26,12 @@ import {
   createTanPoll,
   deleteTanList,
   deleteTanPost,
+  deleteTanDraft,
   editTanPost,
   followTanAuthor,
   followTanTag,
   getTanAuthors,
+  getTanDrafts,
   getTanFollowers,
   getTanFollowing,
   getTanHidden,
@@ -60,8 +62,12 @@ import {
   quoteTanPost,
   removeTanListMember,
   repostTanPost,
+  saveTanDraft,
   saveTanPost,
+  scheduleTanPoll,
   scheduleTanPost,
+  scheduleTanQuote,
+  scheduleTanRepost,
   searchTan,
   shareTanPost,
   unfollowTanAuthor,
@@ -78,6 +84,7 @@ import {
 import type {
   ScheduledTanPost,
   TanAuthor,
+  TanDraft,
   TanList,
   TanListMember,
   TanPost,
@@ -106,6 +113,12 @@ export interface UseTanFeedResult {
   unlike: (target: string) => Promise<void>;
   repost: (target: string) => Promise<void>;
   quote: (target: string, text: string) => Promise<TanPost>;
+  scheduleRepost: (target: string, sendIn: number) => Promise<void>;
+  scheduleQuote: (
+    target: string,
+    text: string,
+    sendIn: number,
+  ) => Promise<ScheduledTanPost>;
   vote: (target: string, option: number) => Promise<void>;
   share: (target: string, dest: { to: string } | { group: string }) => Promise<void>;
   save: (target: string) => Promise<void>;
@@ -182,6 +195,13 @@ export function useTanFeed(opts: UseTanFeedOptions = {}): UseTanFeedResult {
       await load();
       return post;
     },
+    scheduleRepost: (target, sendIn) =>
+      mutate(() => scheduleTanRepost(target, sendIn)),
+    scheduleQuote: async (target, text, sendIn) => {
+      const scheduled = await scheduleTanQuote(target, text, sendIn);
+      await load();
+      return scheduled;
+    },
     vote: (target, option) => mutate(() => voteTanPoll(target, option)),
     share: (target, dest) => mutate(() => shareTanPost(target, dest)),
     save: (target) => mutate(() => saveTanPost(target)),
@@ -257,7 +277,8 @@ export interface UseTanComposerResult {
     text: string,
     opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } },
   ) => Promise<TanPost>;
-  schedule: (text: string, sendIn: number, opts?: { replyTo?: string; expiresIn?: number }) => Promise<ScheduledTanPost>;
+  schedule: (text: string, sendIn: number, opts?: { replyTo?: string; expiresIn?: number; image?: { dataUrl: string } }) => Promise<ScheduledTanPost>;
+  schedulePoll: (question: string, options: string[], sendIn: number, opts?: { expiresIn?: number }) => Promise<ScheduledTanPost>;
   poll: (question: string, options: string[], expiresIn?: number) => Promise<TanPost>;
   busy: boolean;
   error: string | null;
@@ -291,7 +312,9 @@ export function useTanComposer(): UseTanComposerResult {
         }),
       ),
     schedule: (text, sendIn, opts) =>
-      run(() => scheduleTanPost(text, sendIn, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn })),
+      run(() => scheduleTanPost(text, sendIn, { replyTo: opts?.replyTo, expiresIn: opts?.expiresIn, image: opts?.image })),
+    schedulePoll: (question, options, sendIn, opts) =>
+      run(() => scheduleTanPoll(question, options, sendIn, { expiresIn: opts?.expiresIn })),
     poll: (question, options, expiresIn) => run(() => createTanPoll(question, options, expiresIn)),
     busy,
     error,
@@ -309,6 +332,7 @@ export interface UseTanListsResult {
   hidden: TanPost[];
   pinned: TanPost[];
   scheduled: ScheduledTanPost[];
+  drafts: TanDraft[];
   mutedAuthors: TanAuthor[];
   mutedKeywords: string[];
   mutedTags: string[];
@@ -323,6 +347,11 @@ export interface UseTanListsResult {
   unmuteTag: (tag: string) => Promise<void>;
   unmuteAuthor: (target: string) => Promise<void>;
   unhide: (target: string) => Promise<void>;
+  saveDraft: (
+    text: string,
+    opts?: { replyTo?: string; expiresIn?: number },
+  ) => Promise<TanDraft>;
+  deleteDraft: (id: number) => Promise<void>;
   createList: (name: string) => Promise<void>;
   deleteList: (name: string) => Promise<void>;
   addToList: (name: string, target: string) => Promise<void>;
@@ -341,6 +370,7 @@ export function useTanLists(): UseTanListsResult {
   const [hidden, setHidden] = useState<TanPost[]>([]);
   const [pinned, setPinned] = useState<TanPost[]>([]);
   const [scheduled, setScheduled] = useState<ScheduledTanPost[]>([]);
+  const [drafts, setDrafts] = useState<TanDraft[]>([]);
   const [mutedAuthors, setMutedAuthors] = useState<TanAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<string[]>([]);
   const [mutedTags, setMutedTags] = useState<string[]>([]);
@@ -349,7 +379,7 @@ export function useTanLists(): UseTanListsResult {
 
   const refresh = useCallback(async () => {
     try {
-      const [t, f, fw, s, sv, h, p, sc, ma, mk, mt, li] = await Promise.all([
+      const [t, f, fw, s, sv, h, p, sc, d, ma, mk, mt, li] = await Promise.all([
         getTanTags(),
         getTanFollowing(),
         getTanFollowers(),
@@ -358,6 +388,7 @@ export function useTanLists(): UseTanListsResult {
         getTanHidden(),
         getTanPinned(),
         getTanScheduled(),
+        getTanDrafts(),
         getTanMuted(),
         getTanMutedKeywords(),
         getTanMutedTags(),
@@ -371,6 +402,7 @@ export function useTanLists(): UseTanListsResult {
       setHidden(h.posts);
       setPinned(p.posts);
       setScheduled(sc);
+      setDrafts(d);
       setMutedAuthors(ma);
       setMutedKeywords(mk);
       setMutedTags(mt);
@@ -401,6 +433,7 @@ export function useTanLists(): UseTanListsResult {
     hidden,
     pinned,
     scheduled,
+    drafts,
     mutedAuthors,
     mutedKeywords,
     mutedTags,
@@ -415,6 +448,12 @@ export function useTanLists(): UseTanListsResult {
     unmuteTag: (tag) => mutate(() => unmuteTanTag(tag)),
     unmuteAuthor: (target) => mutate(() => unmuteTanAuthor(target)),
     unhide: (target) => mutate(() => unhideTanPost(target)),
+    saveDraft: async (text, opts) => {
+      const draft = await saveTanDraft(text, opts);
+      await refresh();
+      return draft;
+    },
+    deleteDraft: (id) => mutate(() => deleteTanDraft(id)),
     createList: (name) => mutate(() => createTanList(name)),
     deleteList: (name) => mutate(() => deleteTanList(name)),
     addToList: (name, target) => mutate(() => addTanListMember(name, target)),

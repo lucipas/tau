@@ -2713,7 +2713,8 @@ class TauNode:
         The successor group (new id, same name) is created and a
         welcome group message pins the roster for the new member.
         Raises :class:`ValueError` when there is no pending request,
-        the group is unknown, or this node did not create it.
+        the group is unknown, this node did not create it, or the
+        peer is banned from the group.
         """
         group = self.groups.find(group_name)
         if group is None:
@@ -2721,12 +2722,27 @@ class TauNode:
         own_hash = self.destination_hexhash
         if not group.get("local") or group.get("creator") != own_hash:
             raise ValueError("only the creator can approve join requests")
+        # The pending check reads without consuming: the ban refusal
+        # below must leave the request pending, so the creator can
+        # deny it, or unban the peer and approve them afterwards.
+        pending = [
+            entry
+            for entry in self.list_join_requests(group["name"])
+            if entry["peer"] == peer_hash
+        ]
+        if not pending:
+            raise ValueError("no pending join request from that peer")
+        if peer_hash in group["members"]:
+            return {"status": "already_member", "group": _invite_group_summary(group)}
+        if peer_hash in (group.get("banned") or []):
+            raise ValueError(
+                f"cannot approve {peer_hash[:8]} into {group['name']!r}:"
+                " that peer is banned from the group"
+            )
         if not resolve_join_request(
             self.config.join_requests_path, group["name"], peer_hash
         ):
             raise ValueError("no pending join request from that peer")
-        if peer_hash in group["members"]:
-            return {"status": "already_member", "group": _invite_group_summary(group)}
         members = list(group["members"]) + [peer_hash]
         new_group = self.groups.update_members(
             group["id"], members, created_by=own_hash

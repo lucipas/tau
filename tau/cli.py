@@ -224,12 +224,16 @@ from .scheduled_posts import (
     ScheduledPostsError,
     cancel_scheduled_post,
     load_scheduled_posts,
+    schedule_poll,
     schedule_post,
+    schedule_quote,
+    schedule_repost,
 )
 from .scheduled_channel import (
     MAX_SCHEDULED_CHANNEL_DELAY,
     ScheduledChannelError,
     cancel_scheduled_channel_message,
+    edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     schedule_channel_message,
 )
@@ -1641,6 +1645,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     outbox_cancel.set_defaults(func=cmd_outbox_cancel)
 
+    outbox_edit = outbox_sub.add_parser(
+        "edit",
+        parents=[common],
+        help="edit a scheduled message before it sends",
+    )
+    outbox_edit.add_argument(
+        "target", metavar="ID", help="message id or unique id prefix"
+    )
+    outbox_edit.add_argument(
+        "--text",
+        metavar="TEXT",
+        default=None,
+        help="replacement text for the scheduled message",
+    )
+    outbox_edit.add_argument(
+        "--delay",
+        metavar="DURATION",
+        default=None,
+        help="move the send time to this long from now (e.g. 30s, 5m, 2h, "
+        "7d; at most 29d23h — the 30d mail TTL less an hour of delivery slack)",
+    )
+    outbox_edit.set_defaults(func=cmd_outbox_edit)
+
     outbox_retry = outbox_sub.add_parser(
         "retry",
         parents=[common],
@@ -2472,6 +2499,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_remove_member.set_defaults(func=cmd_group_remove_member)
 
+    group_ban = group_sub.add_parser(
+        "ban",
+        parents=[common],
+        help="ban a peer from a group you created",
+    )
+    group_ban.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_ban.add_argument(
+        "peer", metavar="PEER", help="peer name or destination hash"
+    )
+    group_ban.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_ban.set_defaults(func=cmd_group_ban)
+
+    group_unban = group_sub.add_parser(
+        "unban",
+        parents=[common],
+        help="lift a ban on a group you created",
+    )
+    group_unban.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_unban.add_argument(
+        "peer", metavar="PEER", help="peer name or destination hash"
+    )
+    group_unban.set_defaults(func=cmd_group_unban)
+
+    group_banned = group_sub.add_parser(
+        "banned",
+        parents=[common],
+        help="list the peers banned from a group you created",
+    )
+    group_banned.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_banned.set_defaults(func=cmd_group_banned)
+
     group_invite = group_sub.add_parser(
         "invite",
         parents=[common],
@@ -3190,6 +3260,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_cancel_scheduled.set_defaults(func=cmd_tan_cancel_scheduled)
 
+    tan_edit_scheduled = tan_sub.add_parser(
+        "edit-scheduled",
+        parents=[common],
+        help="change the text and/or publish time of a queued Tan post",
+    )
+    tan_edit_scheduled.add_argument(
+        "target", metavar="ID", help="scheduled post id or unique id prefix"
+    )
+    tan_edit_scheduled.add_argument(
+        "--text", default=None, help="replacement text for the queued post"
+    )
+    tan_edit_scheduled.add_argument(
+        "--delay",
+        default=None,
+        help="publish this far from now, like 30m or 2h (at most 7d)",
+    )
+    tan_edit_scheduled.set_defaults(func=cmd_tan_edit_scheduled)
+
     tan_quote = tan_sub.add_parser(
         "quote",
         parents=[common],
@@ -3213,6 +3301,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-publish",
         action="store_true",
         help="store locally without contacting peers",
+    )
+    tan_quote.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the quote: queue it now and publish it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d)",
     )
     tan_quote.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_quote.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
@@ -3263,6 +3357,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-publish",
         action="store_true",
         help="store locally without contacting peers",
+    )
+    tan_repost.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the repost: queue it now and publish it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d)",
     )
     tan_repost.add_argument(
         "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
@@ -3404,6 +3504,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="disappearing poll: hide it from timelines and searches "
         "after this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — the "
         "expiry is signed with the poll",
+    )
+    tan_poll.add_argument(
+        "--delay",
+        default=None,
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — needs a node "
+        "serving with --social to publish it",
     )
     tan_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
@@ -4201,6 +4309,25 @@ def build_parser() -> argparse.ArgumentParser:
         "target", metavar="ID", help="scheduled message id or unique id prefix"
     )
     channel_cancel_scheduled.set_defaults(func=cmd_channel_cancel_scheduled)
+
+    channel_edit_scheduled = channel_sub.add_parser(
+        "edit-scheduled",
+        parents=[common],
+        help="change a queued channel message's text and/or publish time",
+    )
+    channel_edit_scheduled.add_argument(
+        "target", metavar="ID", help="scheduled message id or unique id prefix"
+    )
+    channel_edit_scheduled.add_argument(
+        "--text", default=None, help="replacement message text"
+    )
+    channel_edit_scheduled.add_argument(
+        "--delay",
+        default=None,
+        metavar="DURATION",
+        help="publish in DURATION (e.g. 30s, 5m, 2h, 7d); at most 7d",
+    )
+    channel_edit_scheduled.set_defaults(func=cmd_channel_edit_scheduled)
     channel_topic = channel_sub.add_parser(
         "topic",
         parents=[common],
@@ -5964,13 +6091,6 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if getattr(args, "delay", None) is not None:
-            print(
-                "error: --image cannot be combined with --delay — "
-                "scheduled posts cannot carry an attachment yet",
-                file=sys.stderr,
-            )
-            return 2
         image = _read_image(args.image, config.data_dir)
 
     location = None
@@ -6026,6 +6146,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
                 expires_in=expire_seconds,
+                image=image,
             )
         except ScheduledPostsError as exc:
             raise NodeError(str(exc)) from exc
@@ -6621,7 +6742,7 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
         _emit({"scheduled": [post.to_dict() for post in queue.posts]}, True)
         return _EXIT_OK
     if not queue.posts:
-        print("No Tan posts scheduled.")
+        print("No Tan posts, reposts, quotes or polls scheduled.")
         return _EXIT_OK
     now = time.time()
     for post in queue.posts:
@@ -6631,12 +6752,24 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
         else:
             when += f" (in {_ago(post.publish_at - now)})"
         print(f"{post.id}  {when}")
+        if post.kind == "repost":
+            print(f"  repost of {short_hash(post.target_post)}")
+        elif post.kind == "quote":
+            print(f"  quote of {short_hash(post.target_post)}")
+        elif post.kind == "poll":
+            print(f"  poll · {len(post.options)} options")
         if post.reply_to is not None:
             print(f"  in reply to {short_hash(post.reply_to)}")
         if post.to:
             print(f"  to {', '.join(post.to)}")
-        for line in post.text.splitlines() or [""]:
-            print(f"  {line}")
+        if post.image is not None:
+            print(f"  image {post.image['name']} ({post.image['size']} bytes)")
+        if post.text:
+            for line in post.text.splitlines() or [""]:
+                print(f"  {line}")
+        if post.kind == "poll":
+            for index, option in enumerate(post.options, start=1):
+                print(f"    {index}. {option}")
     return _EXIT_OK
 
 
@@ -6686,6 +6819,48 @@ def cmd_tan_cancel_scheduled(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_tan_edit_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    if getattr(args, "text", None) is None and getattr(args, "delay", None) is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    publish_at = None
+    if getattr(args, "delay", None) is not None:
+        try:
+            delay = _parse_duration(
+                args.delay,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_POST_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        publish_at = time.time() + delay
+    from .scheduled_posts import edit_scheduled_post
+
+    try:
+        post = edit_scheduled_post(
+            config.scheduled_posts_path,
+            args.target,
+            text=getattr(args, "text", None),
+            publish_at=publish_at,
+            name=config.name,
+        )
+    except ScheduledPostsError as exc:
+        raise NodeError(str(exc)) from exc
+    if json_output:
+        _emit({"edited": post.to_dict()}, True)
+    else:
+        print(f"edited {post.id} — publishes {_stamp(post.publish_at)}")
+        for line in post.text.splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
 def cmd_tan_quote(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
@@ -6696,6 +6871,47 @@ def cmd_tan_quote(args: argparse.Namespace) -> int:
         target = resolve_post(conn, args.target)["hash"]
     finally:
         conn.close()
+
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled quote is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_POST_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        try:
+            scheduled = schedule_quote(
+                config.scheduled_posts_path,
+                target_post=target,
+                text=text,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+            )
+        except ScheduledPostsError as exc:
+            raise NodeError(str(exc)) from exc
+        if json_output:
+            _emit({"scheduled": scheduled.to_dict()}, True)
+        else:
+            print(
+                f"scheduled {scheduled.id} — quotes {short_hash(target)} "
+                f"in {_ago(delay)}"
+            )
+            print("  list it with `tau tan scheduled`; a node serving")
+            print("  with --social publishes it when the time comes.")
+        return _EXIT_OK
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
@@ -6820,6 +7036,46 @@ def cmd_tan_repost(args: argparse.Namespace) -> int:
         target = resolve_post(conn, args.target)["hash"]
     finally:
         conn.close()
+
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled repost is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_POST_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        try:
+            scheduled = schedule_repost(
+                config.scheduled_posts_path,
+                target_post=target,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+            )
+        except ScheduledPostsError as exc:
+            raise NodeError(str(exc)) from exc
+        if json_output:
+            _emit({"scheduled": scheduled.to_dict()}, True)
+        else:
+            print(
+                f"scheduled {scheduled.id} — reposts {short_hash(target)} "
+                f"in {_ago(delay)}"
+            )
+            print("  list it with `tau tan scheduled`; a node serving")
+            print("  with --social publishes it when the time comes.")
+        return _EXIT_OK
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
@@ -7095,6 +7351,52 @@ def cmd_tan_poll(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     expires_at = time.time() + expire_seconds if expire_text is not None else None
+
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled poll is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_POST_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if expires_at is not None and delay >= expire_seconds:
+            print(
+                "error: --delay must be shorter than --expire — the "
+                "poll would expire before it is published",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            scheduled = schedule_poll(
+                config.scheduled_posts_path,
+                question=question,
+                options=options,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+                expires_in=expire_seconds,
+            )
+        except ScheduledPostsError as exc:
+            raise NodeError(str(exc)) from exc
+        if json_output:
+            _emit({"scheduled": scheduled.to_dict()}, True)
+        else:
+            print(f"scheduled {scheduled.id} — asks in {_ago(delay)}")
+            print("  list it with `tau tan scheduled`; a node serving")
+            print("  with --social publishes it when the time comes.")
+        return _EXIT_OK
 
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
@@ -9451,6 +9753,46 @@ def cmd_channel_cancel_scheduled(args: argparse.Namespace) -> int:
         print(f"cancelled {entry.id} — it will not be published")
         if deleted_local:
             print("  also removed the stored message from the local channel")
+    return _EXIT_OK
+
+
+def cmd_channel_edit_scheduled(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    if getattr(args, "text", None) is None and getattr(args, "delay", None) is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    publish_at = None
+    if getattr(args, "delay", None) is not None:
+        try:
+            delay = _parse_duration(
+                args.delay,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_CHANNEL_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        publish_at = time.time() + delay
+    try:
+        entry = edit_scheduled_channel_message(
+            config.scheduled_channel_messages_path,
+            args.target,
+            text=getattr(args, "text", None),
+            publish_at=publish_at,
+            name=config.name,
+        )
+    except ScheduledChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    if json_output:
+        _emit({"edited": entry.to_dict()}, True)
+    else:
+        print(f"edited {entry.id} — publishes {_stamp(entry.publish_at)}")
+        for line in entry.text.splitlines() or [""]:
+            print(f"  {line}")
     return _EXIT_OK
 
 
@@ -16775,6 +17117,206 @@ def cmd_group_remove_member(args: argparse.Namespace) -> int:
     return _change_group_members(args, adding=False)
 
 
+def _describe_banned(group: Dict[str, Any], registry: PeerRegistry) -> List[Dict[str, str]]:
+    """A group's ban list with display names for output."""
+    entries = []
+    for banned_hash in group.get("banned") or []:
+        peer = registry.get(banned_hash)
+        entries.append(
+            {
+                "hash": banned_hash,
+                "name": peer.display_name if peer is not None else banned_hash[:8],
+            }
+        )
+    return entries
+
+
+def cmd_group_ban(args: argparse.Namespace) -> int:
+    """Ban a peer from a group this node created.
+
+    The peer is removed from the roster when they are a member and
+    recorded on the ban list either way, so they cannot be re-added
+    or approved through a join request afterwards.  Only the creator
+    can ban; the ban itself needs a running node only to resolve an
+    unknown peer — a member (or an already-banned peer) resolves
+    straight from the roster, like a removal.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        group = node.groups.find(args.group)
+        if not group["local"] or group["creator"] != own_hash:
+            raise NodeError("only the creator can ban members of a group")
+        members = list(group["members"])
+        banned = list(group.get("banned") or [])
+        fast = _roster_hash(args.peer, members + banned)
+        if fast is not None:
+            known = node.registry.get(fast)
+            peer = SimpleNamespace(
+                hexhash=fast,
+                display_name=(
+                    known.display_name if known is not None else fast[:8]
+                ),
+            )
+        else:
+            peer = node.resolve_peer(
+                args.peer,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+        previous_id = group["id"]
+        try:
+            new_group = node.groups.ban(
+                group["id"], peer.hexhash, created_by=own_hash
+            )
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+    finally:
+        node.stop()
+
+    described = _describe_group(new_group, node.registry)
+    banned_entries = _describe_banned(new_group, node.registry)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": described,
+                "banned": banned_entries,
+                "previous_id": previous_id,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if previous_id != new_group["id"]:
+        print(
+            f"banned {peer.display_name} from group {new_group['name']}"
+            f" ({previous_id[:8]} -> {new_group['id'][:8]})"
+        )
+    else:
+        print(
+            f"banned {peer.display_name} from group {new_group['name']}"
+            f" ({new_group['id'][:8]})"
+        )
+    print("They cannot be re-added or approved through a join request.")
+    print("Lift it with `tau group unban`.")
+    return _EXIT_OK
+
+
+def _resolve_banned_peer(
+    target: str, banned: List[str], registry: PeerRegistry
+) -> str:
+    """Resolve an unban target to a banned hash.
+
+    A banned hash (full or unique prefix) needs no lookup; anything
+    else resolves through the registry, so a name works too.  A bare
+    hash for a peer the registry never saw is still usable — the ban
+    list is the authority, and unbanning a hash that is not banned
+    changes nothing.
+    """
+    cleaned = target.strip().lower()
+    if not cleaned:
+        raise NodeError("pass a peer name or destination hash")
+    matches = [entry for entry in banned if entry.startswith(cleaned)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise NodeError(
+            f"ambiguous peer: {target!r} matches several banned peers;"
+            " pass a longer hash prefix"
+        )
+    try:
+        peer = registry.resolve(target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is not None:
+        return peer.destination_hash.hex()
+    if len(cleaned) == 32:
+        try:
+            bytes.fromhex(cleaned)
+        except ValueError:
+            raise NodeError(f"unknown peer: {target!r}") from None
+        return cleaned
+    raise NodeError(f"unknown peer: {target!r}")
+
+
+def cmd_group_unban(args: argparse.Namespace) -> int:
+    """Lift a ban on a group this node created.
+
+    Needs no running node: the ban list is local creator state, and
+    the target resolves from the ban list or the registry.  The peer
+    is not re-added to the roster — they can join again afterwards,
+    but only through the normal paths.
+    """
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    own_hash = destination_hash(identity).hex()
+    if not group["local"] or group["creator"] != own_hash:
+        raise NodeError("only the creator can unban members of a group")
+    registry = PeerRegistry(config.peers_path)
+    resolved = _resolve_banned_peer(
+        args.peer, list(group.get("banned") or []), registry
+    )
+    was_banned = resolved in (group.get("banned") or [])
+    try:
+        new_group = store.unban(group["id"], resolved, created_by=own_hash)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_group(new_group, registry)
+    peer = registry.get(resolved)
+    name = peer.display_name if peer is not None else resolved[:8]
+    if _json_mode(args):
+        _emit(
+            {
+                "group": described,
+                "unbanned": {"hash": resolved, "name": name},
+                "was_banned": was_banned,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if was_banned:
+        print(f"unbanned {name} from group {new_group['name']} ({new_group['id'][:8]})")
+    else:
+        print(f"{name} was not banned from group {new_group['name']}.")
+    return _EXIT_OK
+
+
+def cmd_group_banned(args: argparse.Namespace) -> int:
+    """List the peers banned from a group this node created."""
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    registry = PeerRegistry(config.peers_path)
+    entries = _describe_banned(group, registry)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": _describe_group(group, registry),
+                "banned": entries,
+                "count": len(entries),
+            },
+            True,
+        )
+        return _EXIT_OK
+    if not entries:
+        print(f"No banned peers in {group['name']} ({group['id'][:8]}).")
+        return _EXIT_OK
+    print(f"Banned from {group['name']} ({group['id'][:8]}):")
+    for entry in entries:
+        print(f"  {entry['name']} ({entry['hash'][:8]})")
+    return _EXIT_OK
+
+
 def cmd_group_invite(args: argparse.Namespace) -> int:
     """Mint (or revoke) an invite link for a group this node created.
 
@@ -19518,6 +20060,62 @@ def cmd_outbox_cancel(args: argparse.Namespace) -> int:
             "note: sealed copies already held by other peers may still be"
             " delivered; cancelling stops this node's future attempts."
         )
+    return _EXIT_OK
+
+
+def cmd_outbox_edit(args: argparse.Namespace) -> int:
+    text = getattr(args, "text", None)
+    delay_text = getattr(args, "delay", None)
+    if text is None and delay_text is None:
+        print(
+            "error: nothing to change — pass --text and/or --delay",
+            file=sys.stderr,
+        )
+        return 2
+    send_after = None
+    if delay_text is not None:
+        try:
+            delay = _parse_duration(delay_text, flag="--delay")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entries = mailbox.edit_scheduled_outbox(
+            args.target, text=text, send_after=send_after
+        )
+    except MailboxError as exc:
+        raise NodeError(str(exc)) from exc
+    entry = entries[0]
+    peer = registry.get(entry.to)
+    name = peer.display_name if peer is not None else entry.to_name
+    if _json_mode(args):
+        _emit(
+            {
+                "edited": [item.to_dict() for item in entries],
+                "legs": len(entries),
+            },
+            True,
+        )
+    else:
+        print(
+            f"edited {entry.id[:8]} — scheduled for "
+            f"{name or entry.to_hex}"
+        )
+        if len(entries) > 1:
+            print(f"  ({len(entries)} legs of the group message updated)")
+        if send_after is not None:
+            print(f"  now sends in {_ago(send_after - time.time())}")
     return _EXIT_OK
 
 

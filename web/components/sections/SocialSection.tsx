@@ -11,10 +11,11 @@ import Avatar from "@/components/chrome/Avatar";
 import { useTauContext } from "@/components/chrome/TauContext";
 import {
   cancelScheduledTanPost,
+  editScheduledTanPost,
   getTanFollowedTags,
 } from "@/lib/api";
-import { formatDateTime, formatRelative, shortHash } from "@/lib/format";
-import type { TanAuthor, TanListMember, TanPost, TanReactors } from "@/lib/types";
+import { formatDateTime, formatDuration, formatRelative, shortHash } from "@/lib/format";
+import type { TanAuthor, TanDraft, TanListMember, TanPost, TanReactors } from "@/lib/types";
 import {
   useTanComposer,
   useTanFeed,
@@ -23,9 +24,9 @@ import {
   type TanFeedMode,
 } from "@/lib/use-tan";
 import PostCard, { type ReactorKind } from "./social/PostCard";
-import TanComposer from "./social/TanComposer";
+import TanComposer, { SCHEDULE_OPTIONS } from "./social/TanComposer";
 
-type LibraryView = "saved" | "hidden" | "pinned" | "scheduled" | "muted";
+type LibraryView = "saved" | "hidden" | "pinned" | "scheduled" | "drafts" | "muted";
 type View = "feed" | "discover" | "followers" | "lists" | LibraryView;
 
 const FEED_TABS: { id: TanFeedMode; label: string }[] = [
@@ -40,6 +41,7 @@ const LIBRARY_TABS: { id: LibraryView; label: string }[] = [
   { id: "hidden", label: "Hidden" },
   { id: "pinned", label: "Pinned" },
   { id: "scheduled", label: "Scheduled" },
+  { id: "drafts", label: "Drafts" },
   { id: "muted", label: "Muted" },
 ];
 
@@ -72,6 +74,9 @@ export default function SocialSection() {
   const [keywordInput, setKeywordInput] = useState("");
   const [authors, setAuthors] = useState<TanAuthor[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  /** Draft loaded into the composer; the composer remounts (via `key`)
+   *  when a different draft is loaded, so its initial text applies. */
+  const [loadedDraft, setLoadedDraft] = useState<TanDraft | null>(null);
 
   const feed = useTanFeed({ mode: tab, tag: tagFilter ?? undefined, list: listFilter ?? undefined, pollMs: 30_000 });
   const lists = useTanLists();
@@ -98,13 +103,57 @@ export default function SocialSection() {
   }, [view]);
 
   function openThread(post: TanPost) {
+    setLoadedDraft(null);
     setThreadHash(post.hash);
     setReactors(null);
   }
 
   function openReply(post: TanPost) {
+    setLoadedDraft(null);
     setThreadHash(post.hash);
     setReplyTo(post);
+  }
+
+  /** Load a draft into the composer: a reply draft opens its thread,
+   *  a top-level draft goes to the feed composer. The draft stays saved
+   *  until the composer posts it, so leaving the thread loses nothing. */
+  function loadDraft(draft: TanDraft) {
+    setLoadedDraft(draft);
+    setReplyTo(null);
+    if (draft.reply_to) {
+      setThreadHash(draft.reply_to);
+    } else {
+      setThreadHash(null);
+      setView("feed");
+    }
+    setNotice("Draft loaded — post it to publish, or save it again to keep editing.");
+  }
+
+  /** A successful composer submit consumes the loaded draft, mirroring
+   *  `publish-draft`: the posted text is no longer a draft. */
+  async function consumeLoadedDraft() {
+    if (!loadedDraft) return;
+    const id = loadedDraft.id;
+    setLoadedDraft(null);
+    await lists.deleteDraft(id);
+    setNotice("Draft published.");
+  }
+
+  /** Park the composer's text as a draft. Saving an edited loaded draft
+   *  supersedes it: the new row is saved first, then the old one is
+   *  dropped, so the text is never lost and the list never holds two
+   *  copies of the same post. */
+  async function handleSaveDraft(
+    text: string,
+    opts: { replyTo?: string; expiresIn?: number },
+  ) {
+    const saved = await lists.saveDraft(text, opts);
+    if (loadedDraft && loadedDraft.id !== saved.id) {
+      const old = loadedDraft;
+      setLoadedDraft(null);
+      await lists.deleteDraft(old.id);
+    }
+    setNotice("Draft saved — find it under Drafts.");
   }
 
   async function runSearch(q: string) {
@@ -264,6 +313,7 @@ export default function SocialSection() {
               onClick={() => {
                 setThreadHash(null);
                 setReplyTo(null);
+                setLoadedDraft(null);
               }}
               className="rounded-full px-2 py-1 text-sm text-cyan-400 hover:bg-zinc-900"
             >
@@ -272,15 +322,20 @@ export default function SocialSection() {
             <h2 className="text-sm font-bold text-zinc-100">Thread</h2>
           </div>
           <TanComposer
+            key={loadedDraft ? `draft-${loadedDraft.id}` : "fresh"}
             composer={composer}
             replyTo={replyTo?.hash ?? threadHash}
             replyToName={replyTo?.name ?? thread.root?.name}
             onCancelReply={() => setReplyTo(null)}
-            onPosted={() => {
+            onPosted={async () => {
               setReplyTo(null);
-              void thread.refresh();
-              void feed.refresh();
+              await consumeLoadedDraft();
+              await thread.refresh();
+              await feed.refresh();
             }}
+            onSaveDraft={handleSaveDraft}
+            initialText={loadedDraft?.text}
+            initialExpiresIn={loadedDraft?.expires_in ?? undefined}
             placeholder="Reply to this post…"
           />
           {thread.loading && (
@@ -392,8 +447,15 @@ export default function SocialSection() {
 
           {showComposer && (
             <TanComposer
+              key={loadedDraft ? `draft-${loadedDraft.id}` : "fresh"}
               composer={composer}
-              onPosted={() => void feed.refresh()}
+              onPosted={async () => {
+                await consumeLoadedDraft();
+                await feed.refresh();
+              }}
+              onSaveDraft={handleSaveDraft}
+              initialText={loadedDraft?.text}
+              initialExpiresIn={loadedDraft?.expires_in ?? undefined}
             />
           )}
 
@@ -563,6 +625,19 @@ export default function SocialSection() {
               onCancel={async (id) => {
                 await cancelScheduledTanPost(id);
                 await lists.refresh();
+              }}
+              onEdit={async (id, opts) => {
+                await editScheduledTanPost(id, opts);
+                await lists.refresh();
+              }}
+            />
+          )}
+          {view === "drafts" && (
+            <DraftsView
+              drafts={lists.drafts}
+              onEdit={loadDraft}
+              onDelete={async (id) => {
+                await lists.deleteDraft(id);
               }}
             />
           )}
@@ -1139,35 +1214,242 @@ function LibraryList({
 function ScheduledView({
   scheduled,
   onCancel,
+  onEdit,
 }: {
   scheduled: ReturnType<typeof useTanLists>["scheduled"];
   onCancel: (id: string) => Promise<void>;
+  onEdit: (
+    id: string,
+    opts: { text?: string; sendIn?: number },
+  ) => Promise<void>;
 }) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [editSendIn, setEditSendIn] = useState<number | undefined>(undefined);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const startEditing = (s: (typeof scheduled)[number]) => {
+    setEditingId(s.id);
+    setEditText(s.text);
+    setEditSendIn(undefined);
+    setEditError(null);
+  };
+
+  const saveEdit = async (s: (typeof scheduled)[number]) => {
+    const textChanged = editText.trim() !== s.text;
+    const timeChanged = editSendIn !== undefined;
+    if (!textChanged && !timeChanged) {
+      setEditingId(null);
+      return;
+    }
+    if (!editText.trim()) {
+      setEditError("The post text cannot be empty.");
+      return;
+    }
+    setSaving(true);
+    setEditError(null);
+    try {
+      await onEdit(s.id, {
+        ...(textChanged ? { text: editText.trim() } : {}),
+        ...(timeChanged ? { sendIn: editSendIn } : {}),
+      });
+      setEditingId(null);
+    } catch (err) {
+      setEditError(
+        err instanceof Error ? err.message : "Editing the post failed.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div>
       <h2 className="border-b border-zinc-800 px-4 py-3 text-sm font-bold text-zinc-100">
-        Scheduled posts
+        Scheduled posts, reposts, quotes and polls
       </h2>
       {scheduled.length === 0 && (
         <p className="px-4 py-6 text-sm text-zinc-500">
-          Nothing scheduled — pick “Send later” in the composer to queue a post.
+          Nothing scheduled — pick “Send later” in the composer to queue a
+          post, repost, quote or poll, or schedule a repost from a post’s ⋯ menu.
         </p>
       )}
       {scheduled.map((s) => (
         <div key={s.id} className="border-b border-zinc-800 px-4 py-3">
-          <p className="text-sm whitespace-pre-wrap text-zinc-200">{s.text}</p>
+          {editingId === s.id ? (
+            <div>
+              <textarea
+                value={editText}
+                onChange={(e) => setEditText(e.target.value)}
+                aria-label="Edit scheduled post"
+                rows={3}
+                disabled={saving}
+                className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none placeholder:text-zinc-500 focus:border-cyan-500 disabled:opacity-50"
+              />
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-1 text-xs text-zinc-400">
+                  <span aria-hidden="true">🕑</span>
+                  <select
+                    aria-label="Send later"
+                    value={editSendIn === undefined ? "" : String(editSendIn)}
+                    onChange={(e) =>
+                      setEditSendIn(
+                        e.target.value ? Number(e.target.value) : undefined,
+                      )
+                    }
+                    disabled={saving}
+                    className="rounded-md border border-zinc-700 bg-zinc-900 px-1.5 py-1 text-xs text-zinc-200 outline-none"
+                  >
+                    <option value="">Keep current time</option>
+                    {SCHEDULE_OPTIONS.filter((o) => o.seconds !== undefined).map(
+                      (o) => (
+                        <option key={o.label} value={o.seconds}>
+                          {o.label}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void saveEdit(s)}
+                  disabled={saving}
+                  className="rounded-full bg-cyan-500 px-3 py-1 text-xs font-bold text-zinc-950 hover:bg-cyan-400 disabled:opacity-40"
+                >
+                  {saving ? "Saving…" : "Save"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditingId(null)}
+                  disabled={saving}
+                  className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+              {editError && (
+                <p role="alert" className="mt-2 text-xs text-red-400">
+                  {editError}
+                </p>
+              )}
+            </div>
+          ) : (
+            <>
+          {s.kind === "repost" && (
+            <p className="text-xs font-semibold text-emerald-400">
+              Repost · {shortHash(s.target_post ?? "")}
+            </p>
+          )}
+          {s.kind === "quote" && (
+            <p className="text-xs font-semibold text-cyan-400">
+              Quote · {shortHash(s.target_post ?? "")}
+            </p>
+          )}
+          {s.kind === "poll" && (
+            <p className="text-xs font-semibold text-cyan-400">
+              Poll · {(s.options ?? []).length} options
+            </p>
+          )}
+          {s.text ? (
+            <p className="text-sm whitespace-pre-wrap text-zinc-200">{s.text}</p>
+          ) : null}
+          {s.kind === "poll" && (
+            <ul className="mt-1 space-y-0.5">
+              {(s.options ?? []).map((option, i) => (
+                <li key={i} className="text-xs text-zinc-400">
+                  {i + 1}. {option}
+                </li>
+              ))}
+            </ul>
+          )}
+          {/* No thumbnail here: a queued post's image stays private
+              until the post is published (see tan_media), so the
+              media route 404s for it — the name is the attachment. */}
           <p className="mt-1 text-xs text-zinc-500">
             Publishes {formatDateTime(s.publish_at)}
+            {s.image ? ` · image: ${s.image.name}` : ""}
             {s.paused_at ? " · paused" : ""}
             {s.attempts > 0 ? ` · ${s.attempts} attempt${s.attempts === 1 ? "" : "s"}` : ""}
           </p>
-          <button
-            type="button"
-            onClick={() => void onCancel(s.id)}
-            className="mt-2 rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
-          >
-            Cancel scheduled post
-          </button>
+          <div className="mt-2 flex gap-2">
+            {s.kind !== "repost" && (
+              <button
+                type="button"
+                onClick={() => startEditing(s)}
+                className="rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+              >
+                Edit
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void onCancel(s.id)}
+              className="rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
+            >
+              Cancel scheduled{" "}
+              {s.kind === "repost"
+                ? "repost"
+                : s.kind === "quote"
+                  ? "quote"
+                  : s.kind === "poll"
+                    ? "poll"
+                    : "post"}
+            </button>
+          </div>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DraftsView({
+  drafts,
+  onEdit,
+  onDelete,
+}: {
+  drafts: TanDraft[];
+  onEdit: (draft: TanDraft) => void;
+  onDelete: (id: number) => Promise<void>;
+}) {
+  return (
+    <div>
+      <h2 className="border-b border-zinc-800 px-4 py-3 text-sm font-bold text-zinc-100">
+        Drafts
+      </h2>
+      {drafts.length === 0 && (
+        <p className="px-4 py-6 text-sm text-zinc-500">
+          No drafts yet — park a half-written post with “Save draft” in the composer.
+        </p>
+      )}
+      {drafts.map((d) => (
+        <div key={d.id} className="border-b border-zinc-800 px-4 py-3">
+          <p className="text-sm whitespace-pre-wrap text-zinc-200">{d.text}</p>
+          <p className="mt-1 text-xs text-zinc-500">
+            Saved {formatDateTime(d.created_at)}
+            {d.reply_to ? ` · In reply to ${shortHash(d.reply_to)}` : ""}
+            {d.expires_in
+              ? ` · Disappears ${formatDuration(d.expires_in)} after posting`
+              : ""}
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => onEdit(d)}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-900"
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              onClick={() => void onDelete(d.id)}
+              className="rounded-full border border-red-800 px-3 py-1 text-xs text-red-400 hover:bg-red-950"
+            >
+              Delete draft
+            </button>
+          </div>
         </div>
       ))}
     </div>
