@@ -117,6 +117,7 @@ from ..protocol import (
     MAX_NAME_LENGTH,
     MAX_REQUEST_BYTES,
     ProtocolError,
+    clean_location,
     decode,
     encode,
     normalize_message,
@@ -164,6 +165,9 @@ MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_FOLLOWED_TAGS = 256
 MAX_MUTED_TAGS = 256
+MAX_TAN_LISTS = 32
+MAX_LIST_MEMBERS = 256
+MAX_LIST_NAME = 32
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
 MAX_DRAFTS = 100
@@ -278,6 +282,7 @@ _POST_COLUMNS = (
     "target",
     "options",
     "image",
+    "location",
 )
 
 
@@ -335,6 +340,11 @@ def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
         # attachment for another file's hash without breaking the
         # hash, and a post without one hashes exactly as before.
         fields = fields + ("image",)
+    if mesg.get("location") is not None:
+        # A place is signed the same way: a relay cannot move the
+        # post to another place without breaking the hash, and a post
+        # without one hashes exactly as before.
+        fields = fields + ("location",)
     return fields
 
 
@@ -433,6 +443,58 @@ def _decode_image(value: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _clean_location(value: Any) -> Dict[str, Any]:
+    """Validate a Tan post place attachment: ``{lat, lon, name?}``.
+
+    The place rides the signed post, so a malformed one must be
+    rejected here — not dropped — or the hash would no longer cover
+    what the author meant to publish.  Reuses the DM pin validator
+    (:func:`tau.protocol.clean_location`), which also strips a blank
+    name and rejects out-of-range coordinates.
+    """
+    cleaned = clean_location(value)
+    if cleaned is None:
+        raise PostError(
+            "post location must be an object with latitude -90..90 and "
+            "longitude -180..180"
+        )
+    return cleaned
+
+
+def _encode_location(location: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Encode a post's place attachment for the posts table, or None."""
+    if location is None:
+        return None
+    return json.dumps(_clean_location(location), ensure_ascii=False)
+
+
+def _decode_location(value: Any) -> Optional[Dict[str, Any]]:
+    """Decode a stored place attachment: a dict, a JSON string, or None.
+
+    Rows read from the posts table carry the JSON string; normalised
+    entries carry the dict itself.  Anything else decodes to None, so
+    a damaged row never crashes a display surface.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        try:
+            return _clean_location(value)
+        except PostError:
+            return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        if isinstance(parsed, dict):
+            try:
+                return _clean_location(parsed)
+            except PostError:
+                return None
+    return None
+
+
 def _decode_options(value: Any) -> Optional[List[str]]:
     """Decode stored poll options: a list, a JSON string, or None.
 
@@ -511,6 +573,10 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         # The attachment rides with the post entry itself, so an
         # exported or synced post carries its image reference with it.
         canonical["image"] = _decode_image(post.get("image"))
+    if post.get("location") is not None:
+        # The place rides with the post entry itself, so an exported
+        # or synced post carries its place with it.
+        canonical["location"] = _decode_location(post.get("location"))
     return canonical
 
 
@@ -640,10 +706,18 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         image = (
             _clean_image(mesg["image"]) if mesg.get("image") is not None else None
         )
+        location = (
+            _clean_location(mesg["location"])
+            if mesg.get("location") is not None
+            else None
+        )
     else:
         if mesg.get("image") is not None:
             raise PostError("only posts can carry an image")
+        if mesg.get("location") is not None:
+            raise PostError("only posts can carry a location")
         image = None
+        location = None
 
     post = {
         "v": TAN_VERSION,
@@ -658,6 +732,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "expires_at": expires_at,
         "options": options,
         "image": image,
+        "location": location,
     }
     _check_wire_size(post)
     return post
@@ -691,6 +766,7 @@ def check_post_text_fits(
     name: Optional[str] = None,
     reply_to: Optional[str] = None,
     expires: bool = False,
+    image: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Raise PostError if *text* cannot fit a Tan request once encoded.
 
@@ -702,7 +778,9 @@ def check_post_text_fits(
     will carry, so a text that passes here always fits; one that fails
     is rejected before it is stored.  When *expires* is true the post
     will also carry a float ``expires_at`` instead of ``null``, so a
-    widest-possible timestamp stands in for it.
+    widest-possible timestamp stands in for it.  When *image* is given
+    the attachment rides in the estimate too — its descriptor is
+    ~150 bytes of JSON, enough to push a borderline text over budget.
     """
     try:
         clean_text = normalize_message(text)
@@ -724,6 +802,52 @@ def check_post_text_fits(
             "prev": "0" * HASH_HEX_LENGTH,
             "kind": KIND_REPLY if reply_to is not None else KIND_POST,
             "target": reply_to or "",
+            "expires_at": (
+                now + MAX_TAN_POST_EXPIRY + 0.123456789 if expires else None
+            ),
+            **({"image": _clean_image(image)} if image is not None else {}),
+        }
+    )
+
+
+def check_poll_fits(
+    question: str,
+    options: Sequence[str],
+    *,
+    name: Optional[str] = None,
+    expires: bool = False,
+) -> None:
+    """Raise PostError if a poll cannot fit a Tan request once encoded.
+
+    The poll analogue of :func:`check_post_text_fits`: the question and
+    the options ride in one signed entry, so a question that fits alone
+    can still overflow the 8 KiB budget once 8 long options join it.
+    Callers scheduling a poll refuse it up front instead of failing
+    every publish attempt later.  Options are cleaned the same way
+    :func:`create_poll` cleans them, so a poll that passes here is one
+    ``create_poll`` will accept.
+    """
+    try:
+        clean_question = normalize_message(question)
+    except ProtocolError as exc:
+        raise PostError(str(exc)) from exc
+    clean_options = _clean_poll_options(list(options))
+    now = time.time()
+    _check_wire_size(
+        {
+            "v": TAN_VERSION,
+            "author": "0" * AUTHOR_HEX_LENGTH,
+            "key": "0" * KEY_HEX_LENGTH,
+            "name": (
+                sanitize_name(name)
+                if name is not None
+                else "x" * MAX_NAME_LENGTH
+            ),
+            "text": clean_question,
+            "created_at": round(now, 3),
+            "prev": "0" * HASH_HEX_LENGTH,
+            "kind": KIND_POLL,
+            "options": clean_options,
             "expires_at": (
                 now + MAX_TAN_POST_EXPIRY + 0.123456789 if expires else None
             ),
@@ -797,7 +921,8 @@ CREATE TABLE IF NOT EXISTS posts (
     kind TEXT NOT NULL DEFAULT 'post',
     target TEXT NOT NULL DEFAULT '',
     options TEXT,
-    image TEXT
+    image TEXT,
+    location TEXT
 );
 
 CREATE INDEX IF NOT EXISTS posts_author_seq ON posts(author, seq);
@@ -841,6 +966,20 @@ CREATE TABLE IF NOT EXISTS muted_authors (
     muted_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tan_lists (
+    name TEXT PRIMARY KEY,
+    display TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tan_list_members (
+    list_name TEXT NOT NULL,
+    author TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    added_at REAL NOT NULL,
+    PRIMARY KEY (list_name, author)
+);
+
 CREATE TABLE IF NOT EXISTS saved_posts (
     hash TEXT PRIMARY KEY,
     saved_at REAL NOT NULL
@@ -878,6 +1017,23 @@ CREATE TABLE IF NOT EXISTS drafts (
     created_at REAL NOT NULL
 );
 """
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+    """Column names of *table* right now — a fresh read, not a snapshot.
+
+    Migrations run while other threads may be migrating the same file,
+    so a column set read once at the start of :func:`init_db` can go
+    stale mid-migration: a thread that snapshots after ``kind`` lands
+    but before ``target`` would conclude the pair is done and return
+    without it.  Every migration decision below re-reads, so a column
+    is only skipped when it is really there; the check-then-ALTER gap
+    that remains is the one :func:`_add_column` already tolerates.
+    """
+    return {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
 
 
 def _add_column(
@@ -928,58 +1084,59 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
         except OSError:  # pragma: no cover - best effort
             pass
     conn.executescript(_SCHEMA)
-    columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(posts)").fetchall()
-    }
+    columns = _table_columns(conn, "posts")
     if columns and "v" not in columns:  # migrate an early scaffold database
         _add_column(conn, "posts", "v", "INTEGER NOT NULL DEFAULT 1")
-    if columns and "kind" not in columns:  # migrate a pre-reactions database
+    if columns and "kind" not in _table_columns(conn, "posts"):
+        # migrate a pre-reactions database; kind and target are checked
+        # separately — a concurrent migration may have added one but
+        # not the other yet (see _table_columns).
         _add_column(conn, "posts", "kind", "TEXT NOT NULL DEFAULT 'post'")
+    if columns and "target" not in _table_columns(conn, "posts"):
         _add_column(conn, "posts", "target", "TEXT NOT NULL DEFAULT ''")
-    if columns and "expires_at" not in columns:  # migrate a pre-expiry database
+    if columns and "expires_at" not in _table_columns(conn, "posts"):
+        # migrate a pre-expiry database
         _add_column(conn, "posts", "expires_at", "REAL")
-    if columns and "options" not in columns:  # migrate a pre-polls database
-        # A poll's options live in one JSON column on its own entry, so
-        # the migration is a single ALTER, not a new table.
+    if columns and "options" not in _table_columns(conn, "posts"):
+        # migrate a pre-polls database: a poll's options live in one
+        # JSON column on its own entry, so the migration is a single
+        # ALTER, not a new table.
         _add_column(conn, "posts", "options", "TEXT")
-    if columns and "image" not in columns:  # migrate a pre-media database
-        # A post's image attachment lives in one JSON column on its
-        # own entry, like a poll's options.
+    if columns and "image" not in _table_columns(conn, "posts"):
+        # migrate a pre-media database: a post's image attachment lives
+        # in one JSON column on its own entry, like a poll's options.
         _add_column(conn, "posts", "image", "TEXT")
-    draft_columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(drafts)").fetchall()
-    }
+    if columns and "location" not in columns:  # migrate a pre-location database
+        # A post's place lives in one JSON column on its own entry,
+        # like a post's image attachment.
+        _add_column(conn, "posts", "location", "TEXT")
+    draft_columns = _table_columns(conn, "drafts")
     if draft_columns and "post_hash" not in draft_columns:
         # migrate a pre-retry database: drafts could not remember
         # the signed post a partial publish had already created
         _add_draft_column(conn, "post_hash", "TEXT")
-    if draft_columns and "pending_peers" not in draft_columns:
+    if draft_columns and "pending_peers" not in _table_columns(conn, "drafts"):
         _add_draft_column(conn, "pending_peers", "TEXT")
-    if draft_columns and "claimed_at" not in draft_columns:
+    if draft_columns and "claimed_at" not in _table_columns(conn, "drafts"):
         # migrate a pre-claim database: drafts could not be claimed,
         # so two concurrent publish-draft runs could sign two posts
         _add_draft_column(conn, "claimed_at", "REAL")
-    if draft_columns and "claim_token" not in draft_columns:
+    if draft_columns and "claim_token" not in _table_columns(conn, "drafts"):
         # the claim's owner token, so only the publisher that won
         # the claim can refresh or release it
         _add_draft_column(conn, "claim_token", "TEXT")
-    purged_columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(purged_posts)").fetchall()
-    }
+    purged_columns = _table_columns(conn, "purged_posts")
     if purged_columns and "linked" not in purged_columns:
         # migrate a pre-provenance database: purge records made
         # before the linked flag existed cannot prove a chain
         # position, so they bridge nothing — the column defaults to 0.
         _add_column(conn, "purged_posts", "linked", "INTEGER NOT NULL DEFAULT 0")
-    if purged_columns and "target" not in purged_columns:
+    if purged_columns and "target" not in _table_columns(conn, "purged_posts"):
         # migrate a pre-target database: records made before the
         # target was carried cannot name the deleted original, so an
         # edit record stays unbacked until it is re-recorded.
         _add_column(conn, "purged_posts", "target", "TEXT NOT NULL DEFAULT ''")
-    if purged_columns and "restored" not in purged_columns:
+    if purged_columns and "restored" not in _table_columns(conn, "purged_posts"):
         # migrate a pre-provenance database: records made before the
         # restored flag existed were all made locally, so they count
         # as verified — the column defaults to 0.
@@ -1604,8 +1761,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, expires_at, sig, seq, linked, kind, target, options, image) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, expires_at, sig, seq, linked, kind, target, options, image, location) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -1624,6 +1781,7 @@ def store_post(
                     post.get("target") or "",
                     _encode_options(post.get("options")),
                     _encode_image(post.get("image")),
+                    _encode_location(post.get("location")),
                 ),
             )
             if linked:
@@ -1675,6 +1833,7 @@ def create_post(
     previous: Optional[str] = None,
     expires_at: Optional[float] = None,
     image: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create, sign and store a post owned by *identity*.
 
@@ -1684,13 +1843,17 @@ def create_post(
     hash.  It must be after the post's creation time.  When *image*
     is given — ``{sha256, size, mime, name}`` — the attachment is
     signed with the post the same way; the bytes themselves live in
-    the local media store, never in the post.
+    the local media store, never in the post.  When *location* is
+    given — ``{lat, lon, name?}`` — the place is signed with the post
+    the same way, so a relay cannot move the post without breaking
+    the hash.
     """
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
     clean_name = sanitize_name(name)
     clean_text = normalize_message(text)
     clean_image = _clean_image(image) if image is not None else None
+    clean_location = _clean_location(location) if location is not None else None
     if expires_at is not None:
         expires_at = _require_timestamp(expires_at, "expires_at")
         if expires_at <= timestamp:
@@ -1718,6 +1881,8 @@ def create_post(
             body["expires_at"] = expires_at
         if clean_image is not None:
             body["image"] = clean_image
+        if clean_location is not None:
+            body["location"] = clean_location
         digest = hash(body, previous=prev)
         mesg = dict(body)
         mesg["hash"] = digest
@@ -6559,6 +6724,249 @@ def muted(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     ]
 
 
+def clean_list_name(value: Any) -> Tuple[str, str]:
+    """Normalise a user-supplied list name, or raise :class:`TanError`.
+
+    Returns the (key, display) pair: the key is the casefolded name
+    lists are stored and looked up under, the display is the name as
+    typed.  A list name is 1..32 characters of letters, digits, spaces,
+    ``-`` or ``_``, starting with a letter or digit.
+    """
+    if not isinstance(value, str):
+        raise TanError("list name must be text")
+    raw = value.strip()
+    if (
+        not raw
+        or len(raw) > MAX_LIST_NAME
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]*", raw) is None
+    ):
+        raise TanError(
+            f"not a list name: {value!r} "
+            f"(1-{MAX_LIST_NAME} letters, digits, spaces, - or _)"
+        )
+    return raw.casefold(), raw
+
+
+def create_list(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Create an empty named author list.
+
+    Lists are local-only curation: they are never published, signed or
+    synced, so creating one touches no chain and no peer.  Creating a
+    list that already exists (case-insensitively) is an error.
+    """
+    key, display = clean_list_name(name)
+    timestamp = float(now if now is not None else time.time())
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT name, display, created_at FROM tan_lists WHERE name = ?",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            raise TanError(f"list {existing['display']!r} already exists")
+        count = conn.execute("SELECT COUNT(*) AS n FROM tan_lists").fetchone()["n"]
+        if int(count) >= MAX_TAN_LISTS:
+            raise TanError(f"lists are limited to {MAX_TAN_LISTS}")
+        conn.execute(
+            "INSERT INTO tan_lists(name, display, created_at) VALUES(?, ?, ?)",
+            (key, display, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {"name": display, "created_at": timestamp, "members": 0}
+
+
+def delete_list(conn: sqlite3.Connection, name: str) -> bool:
+    """Delete a list and its memberships.  Returns whether one existed.
+
+    Deleting a list never unfollows anyone and never deletes a post —
+    it only drops the local curation.
+    """
+    key, _ = clean_list_name(name)
+    with conn:
+        cursor = conn.execute("DELETE FROM tan_lists WHERE name = ?", (key,))
+        conn.execute(
+            "DELETE FROM tan_list_members WHERE list_name = ?", (key,)
+        )
+    return cursor.rowcount > 0
+
+
+def tan_lists(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Named author lists, oldest first, each with its member count."""
+    rows = conn.execute(
+        "SELECT l.name AS key, l.display AS name, l.created_at AS created_at, "
+        "COUNT(m.author) AS members FROM tan_lists l "
+        "LEFT JOIN tan_list_members m ON m.list_name = l.name "
+        "GROUP BY l.name ORDER BY l.created_at ASC"
+    ).fetchall()
+    return [
+        {
+            "name": str(row["name"]),
+            "created_at": float(row["created_at"]),
+            "members": int(row["members"]),
+        }
+        for row in rows
+    ]
+
+
+def _list_display(conn: sqlite3.Connection, name: str) -> str:
+    """The display name of the list *name* names, or raise :class:`TanError`."""
+    key, _ = clean_list_name(name)
+    row = conn.execute(
+        "SELECT display FROM tan_lists WHERE name = ?", (key,)
+    ).fetchone()
+    if row is None:
+        raise TanError(f"no list named {name!r}")
+    return str(row["display"])
+
+
+def list_members(conn: sqlite3.Connection, name: str) -> List[Dict[str, Any]]:
+    """Members of one list, most recently added first."""
+    display = _list_display(conn, name)
+    key = display.casefold()
+    rows = conn.execute(
+        "SELECT author, name, added_at FROM tan_list_members "
+        "WHERE list_name = ? ORDER BY added_at DESC",
+        (key,),
+    ).fetchall()
+    return [
+        {
+            "author": str(row["author"]),
+            "name": str(row["name"]),
+            "added_at": float(row["added_at"]),
+        }
+        for row in rows
+    ]
+
+
+def list_member_authors(conn: sqlite3.Connection, name: str) -> List[str]:
+    """Author hashes of one list's members, in add order."""
+    display = _list_display(conn, name)
+    rows = conn.execute(
+        "SELECT author FROM tan_list_members WHERE list_name = ? "
+        "ORDER BY added_at ASC",
+        (display.casefold(),),
+    ).fetchall()
+    return [str(row["author"]) for row in rows]
+
+
+def add_to_list(
+    conn: sqlite3.Connection,
+    name: str,
+    author: str,
+    *,
+    author_name: str = "",
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Add *author* to a list.  Re-adding keeps the original ``added_at``.
+
+    The author need not be followed — a list is a curation, not a
+    second follow graph — so callers that care should say so.  Returns
+    the membership record with ``added`` saying whether this call added
+    them (``False`` when they were already a member).
+    """
+    display = _list_display(conn, name)
+    key = display.casefold()
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    clean_name = sanitize_name(author_name, fallback="") if author_name else ""
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking for an existing membership
+    # and the capacity, so a concurrent add cannot slip in between
+    # check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT added_at FROM tan_list_members "
+            "WHERE list_name = ? AND author = ?",
+            (key, author),
+        ).fetchone()
+        if existing is None:
+            count = conn.execute(
+                "SELECT COUNT(*) AS n FROM tan_list_members WHERE list_name = ?",
+                (key,),
+            ).fetchone()["n"]
+            if int(count) >= MAX_LIST_MEMBERS:
+                raise TanError(
+                    f"list {display!r} is limited to {MAX_LIST_MEMBERS} members"
+                )
+        conn.execute(
+            "INSERT INTO tan_list_members(list_name, author, name, added_at) "
+            "VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(list_name, author) DO UPDATE SET "
+            "name = CASE WHEN excluded.name != '' THEN excluded.name "
+            "ELSE tan_list_members.name END, "
+            "added_at = tan_list_members.added_at",
+            (key, author, clean_name, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    if existing is not None:
+        timestamp = float(existing["added_at"])
+    return {
+        "list": display,
+        "author": author,
+        "name": clean_name,
+        "added_at": timestamp,
+        "added": existing is None,
+    }
+
+
+def remove_from_list(conn: sqlite3.Connection, name: str, author: str) -> bool:
+    """Remove *author* from a list.  Returns whether one was removed."""
+    display = _list_display(conn, name)
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM tan_list_members WHERE list_name = ? AND author = ?",
+            (display.casefold(), author),
+        )
+    return cursor.rowcount > 0
+
+
+def list_timeline(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    limit: int = 30,
+    viewer: Optional[str] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+    tag: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """The timeline read through one list: only its members' posts.
+
+    The same silencing as :func:`timeline` applies — muted and blocked
+    authors stay hidden — and a followed tag never pulls a non-member's
+    post into a list view, even though it would into the full timeline.
+    A list with no members, or a list naming no stored posts, reads
+    empty; an unknown list is an error.
+    """
+    members = list_member_authors(conn, name)
+    if not members:
+        return []
+    posts = timeline(
+        conn,
+        members,
+        limit=limit,
+        viewer=viewer,
+        exclude_authors=exclude_authors,
+        exclude_all=exclude_all,
+        tag=tag,
+    )
+    wanted = set(members)
+    return [post for post in posts if post.get("author") in wanted]
+
+
 def _muted_keyword_list(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute("SELECT keyword FROM muted_keywords").fetchall()
     return [str(row["keyword"]) for row in rows]
@@ -8544,12 +8952,14 @@ class TanApp:
         ttl: int = MAX_GOSSIP_TTL,
         expires_at: Optional[float] = None,
         image: Optional[Dict[str, Any]] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a post, or a reply when *reply_to* names a parent post.
 
         When *expires_at* is given the post disappears from display
         surfaces once that time passes; see :func:`create_post`.
         A reply cannot carry an image — only a top-level post can.
+        A reply cannot carry a location either, for the same reason.
         """
         conn = self.connect()
         try:
@@ -8570,6 +8980,7 @@ class TanApp:
                     name=self.name,
                     expires_at=expires_at,
                     image=image,
+                    location=location,
                 )
         finally:
             conn.close()

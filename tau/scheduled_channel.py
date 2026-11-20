@@ -389,6 +389,62 @@ def scheduled_channel_messages_lock(path: Union[str, Path]) -> Iterator[None]:
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _preflight_envelope(
+    *,
+    channel: str,
+    text: str,
+    created_at: float,
+    name: Optional[str] = None,
+) -> None:
+    """Measure *text* against the wire budget with the envelope the
+    publish pass measures.
+
+    The publish pass signs the message through
+    ``channels._normalize_message``, which adds ``v``, ``expires_at``
+    and ``reply_to`` to the body before ``_check_wire_size`` measures
+    it — so the preflight must carry those fields too, at their real
+    encoded sizes (an empty reply), or a replacement near the budget
+    would pass here and then fail the definitive check on every
+    publish attempt, leaving the entry queued for failed retries.
+
+    The expiry is measured at its largest: publishing fills in a
+    numeric expiry from the channel's disappearing-message default
+    (``ChannelApp.send``), and that default can be set or changed
+    after scheduling, so the preflight assumes an expiry is present
+    and uses the longest allowed one (``created_at`` plus the 30-day
+    cap).  A float encodes at a fixed size, so this covers any
+    default the channel may carry by publish time.
+    """
+    # Lazy import: this module stays importable without Reticulum,
+    # which ``tau.backup`` relies on.
+    from .channels import (
+        CHANNEL_VERSION,
+        MAX_CHANNEL_EXPIRE_SECONDS,
+        ChannelError,
+        _check_wire_size,
+        sanitize_name,
+    )
+
+    envelope = {
+        # Placeholder author/key at their real lengths (destination
+        # hash 32 hex, RNS public key 128 hex): a shorter placeholder
+        # would admit a message that only fails once signed.
+        "v": CHANNEL_VERSION,
+        "channel": channel,
+        "author": "0" * 32,
+        "key": "0" * 128,
+        "name": sanitize_name(name or "anonymous"),
+        "text": text,
+        "created_at": created_at,
+        "expires_at": created_at + MAX_CHANNEL_EXPIRE_SECONDS,
+        "reply_to": "",
+    }
+    try:
+        _check_wire_size(envelope)
+    except ChannelError as exc:
+        raise ScheduledChannelError(str(exc)) from exc
+
+
 def schedule_channel_message(
     path: Union[str, Path],
     *,
@@ -415,25 +471,12 @@ def schedule_channel_message(
     """
     clean_channel = _clean_channel(channel)
     clean_text = _clean_text(text)
-    # Lazy import: this module stays importable without Reticulum,
-    # which ``tau.backup`` relies on.
-    from .channels import ChannelError, _check_wire_size, sanitize_name
-
-    envelope = {
-        # Placeholder author/key at their real lengths (destination
-        # hash 32 hex, RNS public key 128 hex): a shorter placeholder
-        # would admit a message that only fails once signed.
-        "channel": clean_channel,
-        "author": "0" * 32,
-        "key": "0" * 128,
-        "name": sanitize_name(name or "anonymous"),
-        "text": clean_text,
-        "created_at": publish_at,
-    }
-    try:
-        _check_wire_size(envelope)
-    except ChannelError as exc:
-        raise ScheduledChannelError(str(exc)) from exc
+    _preflight_envelope(
+        channel=clean_channel,
+        text=clean_text,
+        created_at=publish_at,
+        name=name,
+    )
     message = ScheduledChannelMessage(
         id=new_scheduled_channel_id(),
         channel=clean_channel,
@@ -470,6 +513,87 @@ def cancel_scheduled_channel_message(
             on_cancel(message)
         save_scheduled_channel_messages(path, queue.with_removed(message.id))
     return message
+
+
+def edit_scheduled_channel_message(
+    path: Union[str, Path],
+    prefix: str,
+    *,
+    text: Optional[str] = None,
+    publish_at: Optional[float] = None,
+    name: Optional[str] = None,
+    now: Optional[float] = None,
+) -> ScheduledChannelMessage:
+    """Change the text and/or publish time of one queued channel message.
+
+    At least one of *text* / *publish_at* must be given.  The
+    resulting entry gets the same validation as scheduling does
+    (``normalize_message`` plus the wire-size preflight against the
+    entry's channel, measured with the full normalized envelope the
+    publish pass measures), so an edit cannot queue a message that
+    could never be published — a time-only edit re-checks the stored
+    text too.  A new publish time must be in the future and within
+    the 7-day queue cap.
+
+    An entry whose publish already created the signed message (it has
+    a stored ``message_hash``) cannot be edited: the text is already
+    signed, so changing it would orphan the stored copy.  Cancel it
+    instead.  Everything else about the entry — channel, targets, TTL,
+    retry state — is left untouched.  The queue stays ordered soonest
+    first, so a later publish time moves the entry down the list.
+    """
+    if text is None and publish_at is None:
+        raise ScheduledChannelError(
+            "nothing to change — pass a new text and/or a new publish time"
+        )
+    at = now if now is not None else time.time()
+    clean_text: Optional[str] = None
+    if text is not None:
+        clean_text = _clean_text(text)
+    clean_publish_at: Optional[float] = None
+    if publish_at is not None:
+        clean_publish_at = _clean_timestamp(publish_at, "publish_at")
+        if clean_publish_at <= at:
+            raise ScheduledChannelError("publish time must be in the future")
+        if clean_publish_at - at > MAX_SCHEDULED_CHANNEL_DELAY:
+            raise ScheduledChannelError(
+                "publish time must be within 7d (the scheduled-channel delay cap)"
+            )
+    with scheduled_channel_messages_lock(path):
+        queue = load_scheduled_channel_messages(path)
+        message = queue.resolve(prefix)
+        if message.message_hash is not None:
+            raise ScheduledChannelError(
+                "that message was already created — cancel it instead of editing it"
+            )
+        # The preflight measures the resulting entry — text and
+        # publish time — against the same envelope the publish pass
+        # measures, so an edit cannot queue a message that could never
+        # be published.  A time-only edit re-checks the stored text
+        # against the full normalized shape too.
+        _preflight_envelope(
+            channel=message.channel,
+            text=clean_text if clean_text is not None else message.text,
+            created_at=(
+                clean_publish_at
+                if clean_publish_at is not None
+                else message.publish_at
+            ),
+            name=name,
+        )
+        edited = replace(
+            message,
+            text=clean_text if clean_text is not None else message.text,
+            publish_at=(
+                clean_publish_at if clean_publish_at is not None else message.publish_at
+            ),
+        )
+        replaced = queue.with_replaced(edited)
+        ordered = ScheduledChannelMessages(
+            messages=tuple(sorted(replaced.messages, key=lambda m: m.publish_at))
+        )
+        save_scheduled_channel_messages(path, ordered)
+    return edited
 
 
 class _PassPaused(Exception):

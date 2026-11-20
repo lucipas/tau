@@ -84,6 +84,15 @@ from tau.tangents.tan import (
     likers,
     list_authors,
     list_drafts,
+    list_member_authors,
+    list_members,
+    list_timeline,
+    add_to_list,
+    clean_list_name,
+    create_list,
+    delete_list,
+    remove_from_list,
+    tan_lists,
     mute_keyword,
     mute_tag,
     muted_keywords,
@@ -271,6 +280,75 @@ def test_find_post_by_image(identities, tmp_path):
     assert found is not None and found["hash"] == post["hash"]
     assert find_post_by_image(conn, "f" * 64) is None
     assert find_post_by_image(conn, "not-a-digest") is None
+
+
+def _location_for() -> dict:
+    return {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
+
+
+def test_create_post_with_location_round_trips(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    location = _location_for()
+    post = create_post(
+        conn, alice, "morning run", name="alice", now=1000, location=location
+    )
+
+    assert post["location"] == location
+    assert verify_post(post)["location"] == location
+    stored = get_post(conn, post["hash"])
+    assert stored is not None and stored["location"] == location
+    assert [entry["location"] for entry in feed(conn, author=post["author"])] == [
+        location
+    ]
+
+
+def test_location_is_signed_with_the_post(identities, tmp_path):
+    alice, _ = identities
+    first = init_db(tmp_path / "a.sqlite3")
+    second = init_db(tmp_path / "b.sqlite3")
+    plain = create_post(first, alice, "same text", name="alice", now=1000)
+    with_location = create_post(
+        second, alice, "same text", name="alice", now=1000, location=_location_for()
+    )
+    assert plain["hash"] != with_location["hash"]
+
+    tampered = dict(
+        with_location, location={**with_location["location"], "lat": 0.0}
+    )
+    with pytest.raises(PostError):
+        verify_post(tampered)
+
+
+def test_location_rejected_when_invalid(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    good = _location_for()
+    bad_locations = [
+        {**good, "lat": 91.0},
+        {**good, "lat": -91.0},
+        {**good, "lon": 181.0},
+        {**good, "lon": -181.0},
+        {**good, "lat": "34.05"},
+        {**good, "lon": True},
+        {"lat": 34.05},
+        {"lon": -83.88},
+        "34.05,-83.88",
+        {**good, "name": "x" * 201},
+    ]
+    for bad in bad_locations:
+        with pytest.raises(PostError):
+            create_post(conn, alice, "x", name="alice", now=1000, location=bad)
+
+
+def test_only_posts_carry_locations(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "parent", name="alice", now=1000)
+    reply = create_reply(conn, alice, post["hash"], "a reply", name="alice", now=1001)
+    crafted = dict(reply, location=_location_for())
+    with pytest.raises(PostError):
+        tan_module._normalize_post(crafted)
 
 
 def test_media_store_round_trip_and_prune(tmp_path):
@@ -1002,6 +1080,188 @@ def test_mute_unmute_and_muted_list(identities, tmp_path):
     assert unmute(conn, bob_post["author"]) is False
     assert muted(conn) == []
     assert muted_author_set(conn) == set()
+
+
+def test_list_name_validation():
+    assert clean_list_name("Mesh Core") == ("mesh core", "Mesh Core")
+    assert clean_list_name("  friends-2_x  ") == ("friends-2_x", "friends-2_x")
+    for bad in ("", "   ", "a" * 33, "no!bang", "-lead", "_lead"):
+        with pytest.raises(TanError):
+            clean_list_name(bad)
+
+
+def test_tan_list_create_list_add_remove_delete(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    bob_post = create_post(conn, bob, "from bob", name="bob", now=1000)
+    carol_post = create_post(conn, carol, "from carol", name="carol", now=1001)
+
+    record = create_list(conn, "Mesh Core", now=1002)
+    assert record == {"name": "Mesh Core", "created_at": 1002, "members": 0}
+    # The same name in different case is the same list.
+    with pytest.raises(TanError):
+        create_list(conn, "mesh core")
+    assert [entry["name"] for entry in tan_lists(conn)] == ["Mesh Core"]
+
+    added = add_to_list(conn, "mesh core", bob_post["author"], author_name="bob", now=1003)
+    assert added["added"] is True
+    assert added["list"] == "Mesh Core"
+    assert added["added_at"] == 1003
+    # Re-adding keeps the original add time and refreshes the name.
+    again = add_to_list(conn, "Mesh Core", bob_post["author"], author_name="robert", now=1004)
+    assert again["added"] is False
+    assert again["added_at"] == 1003
+    add_to_list(conn, "Mesh Core", carol_post["author"], author_name="carol", now=1005)
+    assert [entry["name"] for entry in tan_lists(conn)] == ["Mesh Core"]
+    assert tan_lists(conn)[0]["members"] == 2
+    assert list_member_authors(conn, "MESH CORE") == [
+        bob_post["author"],
+        carol_post["author"],
+    ]
+    assert [entry["author"] for entry in list_members(conn, "Mesh Core")] == [
+        carol_post["author"],
+        bob_post["author"],
+    ]
+
+    # Adding to a list that does not exist is an error, not a creation.
+    with pytest.raises(TanError):
+        add_to_list(conn, "nope", bob_post["author"])
+    with pytest.raises(TanError):
+        list_members(conn, "nope")
+    with pytest.raises(TanError):
+        list_member_authors(conn, "nope")
+
+    assert remove_from_list(conn, "Mesh Core", carol_post["author"]) is True
+    assert remove_from_list(conn, "Mesh Core", carol_post["author"]) is False
+    assert [entry["author"] for entry in list_members(conn, "Mesh Core")] == [
+        bob_post["author"]
+    ]
+
+    # Deleting a list drops the curation only: follows and posts stay.
+    follow(conn, bob_post["author"], name="bob")
+    assert delete_list(conn, "Mesh Core") is True
+    assert delete_list(conn, "Mesh Core") is False
+    assert tan_lists(conn) == []
+    assert [post["text"] for post in feed(conn, author=bob_post["author"])] == [
+        "from bob"
+    ]
+    assert [record["author"] for record in following(conn)] == [bob_post["author"]]
+
+
+def test_list_timeline_reads_only_members(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    alice_post = create_post(conn, alice, "from alice", name="alice", now=1000)
+    bob_post = create_post(conn, bob, "from bob", name="bob", now=1001)
+    carol_post = create_post(conn, carol, "from carol", name="carol", now=1002)
+    # A member's repost of a non-member's post is the member's own
+    # action, so it stays; the non-member's own post does not.
+    create_repost(conn, bob, carol_post["hash"], name="bob", now=1003)
+
+    create_list(conn, "friends")
+    add_to_list(conn, "friends", bob_post["author"], author_name="bob")
+    entries = list_timeline(conn, "friends")
+    assert [post["kind"] for post in entries] == ["repost", "post"]
+    assert {post["author"] for post in entries} == {bob_post["author"]}
+    assert entries[0]["repost_of"]["text"] == "from carol"
+    assert entries[1]["text"] == "from bob"
+
+    # Muted members stay hidden from the list view, like everywhere else.
+    mute(conn, bob_post["author"], name="bob")
+    assert list_timeline(conn, "friends") == []
+    unmute(conn, bob_post["author"])
+
+    # An empty list reads empty; an unknown list is an error.
+    create_list(conn, "empty")
+    assert list_timeline(conn, "empty") == []
+    with pytest.raises(TanError):
+        list_timeline(conn, "nope")
+
+
+def test_cli_tan_lists(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        bob = RNS.Identity()
+        carol = RNS.Identity()
+        create_post(conn, bob, "from bob", name="bob", now=1000)
+        create_post(conn, carol, "from carol", name="carol", now=1001)
+        follow(conn, author_of(bob), name="bob")
+    finally:
+        conn.close()
+
+    assert main(["tan", "lists", "--data-dir", str(data_dir)]) == 0
+    assert "No lists yet" in capsys.readouterr().out
+
+    assert (
+        main(["tan", "lists", "create", "Friends", "--data-dir", str(data_dir)]) == 0
+    )
+    assert "created list 'Friends'" in capsys.readouterr().out
+    assert (
+        main(["tan", "lists", "create", "friends", "--data-dir", str(data_dir)])
+        != 0
+    )
+
+    # Add by destination hash; bob is followed, carol is not, and the
+    # CLI says so for the one who is not.
+    assert (
+        main(
+            ["tan", "lists", "add", "Friends", author_of(bob), author_of(carol),
+             "--data-dir", str(data_dir)]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "added bob" in out
+    assert "not followed" in out
+    assert (
+        main(["tan", "lists", "add", "Friends", author_of(bob),
+              "--data-dir", str(data_dir)])
+        == 0
+    )
+    assert "already in 'Friends'" in capsys.readouterr().out
+
+    assert main(["tan", "lists", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["lists"][0]["members"] == 2
+
+    assert main(["tan", "lists", "show", "Friends", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "bob" in out and "carol" in out
+
+    # Removing carol leaves only bob's posts in the list timeline.
+    assert (
+        main(
+            ["tan", "lists", "remove", "Friends", author_of(carol),
+             "--data-dir", str(data_dir)]
+        )
+        == 0
+    )
+    assert "removed carol" in capsys.readouterr().out
+    assert (
+        main(
+            ["tan", "timeline", "--list", "Friends", "--data-dir", str(data_dir)]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "from bob" in out
+    assert "from carol" not in out
+
+    assert (
+        main(["tan", "lists", "delete", "Friends", "--data-dir", str(data_dir)])
+        == 0
+    )
+    assert "deleted list 'Friends'" in capsys.readouterr().out
+    assert (
+        main(["tan", "timeline", "--list", "Friends", "--data-dir", str(data_dir)])
+        != 0
+    )
 
 
 def test_timeline_hides_muted_authors(identities, tmp_path):
@@ -9795,6 +10055,43 @@ def test_init_db_migrates_pre_polls_store(identities, tmp_path):
         )
         create_vote(conn, bob, poll["hash"], 0, name="bob", now=1002)
         assert poll_results(conn, poll["hash"])["counts"] == [1, 0]
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_pre_location_store(identities, tmp_path):
+    alice, _ = identities
+    db_path = tmp_path / "tan.sqlite3"
+    conn = init_db(db_path)
+    post = create_post(conn, alice, "legacy row", name="alice", now=1000)
+    conn.execute("ALTER TABLE posts DROP COLUMN location")
+    conn.commit()
+    conn.close()
+    conn = init_db(db_path)
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        assert "location" in columns
+        stored = get_post(conn, post["hash"])
+        assert stored is not None
+        assert "location" not in stored
+        assert verify_post(stored)["hash"] == post["hash"]
+        # And a located post works on the migrated store.
+        located = create_post(
+            conn,
+            alice,
+            "from here",
+            name="alice",
+            now=1001,
+            location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+        )
+        assert get_post(conn, located["hash"])["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
     finally:
         conn.close()
 

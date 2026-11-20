@@ -498,6 +498,14 @@ export interface OutboxEntry {
   sent_at: number | null;
   edited_at: number | null;
   group?: OutboxGroup;
+  /** Poll this leg carries, if any — the API only includes it when set. */
+  poll_options?: string[];
+  poll_vote?: Record<string, unknown>;
+  poll_close?: Record<string, unknown>;
+  /** Live-beacon marker this leg carries, if any. */
+  beacon?: Record<string, unknown>;
+  /** Static location pin this leg carries, if any. */
+  location?: Record<string, unknown>;
   read_at?: number | null;
 }
 
@@ -589,6 +597,14 @@ export interface TanImage {
   [key: string]: unknown;
 }
 
+/** A place attached to a Tan post: decimal degrees, optional place name. */
+export interface TanLocation {
+  lat: number;
+  lon: number;
+  name?: string;
+  [key: string]: unknown;
+}
+
 export interface TanParentSummary {
   hash: string;
   author: string;
@@ -620,6 +636,7 @@ export interface TanPost {
   expires_at: number | null;
   options?: string[];
   image?: TanImage | null;
+  location?: TanLocation | null;
   // --- annotations added by the bridge (tau/tangents/tan.py) ---
   likes: number;
   liked: boolean;
@@ -643,6 +660,19 @@ export interface TanPost {
 export interface TanTag {
   tag: string;
   count: number;
+}
+
+export interface TanList {
+  name: string;
+  created_at: number;
+  members: number;
+}
+
+export interface TanListMember {
+  author: string;
+  name: string;
+  added_at: number;
+  posts?: number;
 }
 
 export interface TanAuthor {
@@ -698,6 +728,28 @@ export interface ScheduledTanPost {
   next_attempt_at: number | null;
   paused_at: number | null;
   expires_in?: number;
+  /** "post" for a queued post, "repost" for a queued repost, "quote" for a queued quote, "poll" for a queued poll question. */
+  kind?: "post" | "repost" | "quote" | "poll";
+  /** Hash of the post being reposted or quoted; only present for those kinds. */
+  target_post?: string | null;
+  /** Fixed poll choices; only present when kind is "poll". */
+  options?: string[];
+  /** Image attachment descriptor, when the queued post carries one. */
+  image?: { sha256: string; size: number; mime: string; name: string } | null;
+  [key: string]: unknown;
+}
+
+/** A saved Tan post draft: plain text plus the reply target and the
+ *  expiry it will carry once published (mirrors the CLI's tan draft). */
+export interface TanDraft {
+  id: number;
+  text: string;
+  reply_to: string;
+  expires_in: number | null;
+  post_hash: string;
+  pending_peers: string[];
+  claimed_at: number | null;
+  created_at: number;
   [key: string]: unknown;
 }
 

@@ -3103,6 +3103,131 @@ def test_api_groups_change_members_refuses_ambiguous_names(
     ]
 
 
+def test_api_groups_ban_removes_member_and_lists_banned(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH, OTHER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/ban",
+        method="POST",
+        body={"group": "weekend", "peer": OTHER_HASH},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # Banning a member is a roster change, so the successor id applies.
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert OTHER_HASH not in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+    assert payload["banned"] == [{"hash": OTHER_HASH, "name": "carol"}]
+    status, _, listed = _json(
+        bridge, "/api/groups/banned?group=weekend", method="GET"
+    )
+    assert status == 200
+    assert listed["count"] == 1
+    assert listed["banned"] == [{"hash": OTHER_HASH, "name": "carol"}]
+    # A banned peer cannot be re-added or approved.
+    status, _, refused = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "is banned" in refused["error"]["message"]
+
+
+def test_api_groups_unban_lifts_ban_without_readding(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    _json(
+        bridge,
+        "/api/groups/ban",
+        method="POST",
+        body={"group": "weekend", "peer": OTHER_HASH},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/unban",
+        method="POST",
+        body={"group": "weekend", "peer": OTHER_HASH},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["unbanned"] == {"hash": OTHER_HASH, "name": "carol"}
+    assert payload["was_banned"] is True
+    # The peer is not re-added to the roster by the unban.
+    assert OTHER_HASH not in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+    # Unbanning again says so instead of failing.
+    _, _, again = _json(
+        bridge,
+        "/api/groups/unban",
+        method="POST",
+        body={"group": "weekend", "peer": OTHER_HASH},
+    )
+    assert again["was_banned"] is False
+    _, _, listed = _json(bridge, "/api/groups/banned?group=weekend")
+    assert listed["count"] == 0
+
+
+def test_api_groups_ban_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    cases = [
+        (
+            "/api/groups/ban",
+            {"group": "weekend", "peer": "00" * 16},
+            "unknown peer",
+        ),
+        (
+            "/api/groups/ban",
+            {"group": "weekend"},
+            "field 'peer' is required",
+        ),
+        (
+            "/api/groups/ban",
+            {"group": "nope", "peer": OTHER_HASH},
+            "unknown group",
+        ),
+        (
+            "/api/groups/unban",
+            {"group": "weekend", "peer": "mallory"},
+            "unknown peer",
+        ),
+    ]
+    for path, body, message in cases:
+        status, _, payload = _json(bridge, path, method="POST", body=body)
+        assert status == 400, (path, body)
+        assert message in payload["error"]["message"], (path, body)
+
+
 def test_api_groups_learned_group_is_not_created_by_me(bridge, node, tmp_path):
     from tau.groups import GroupStore, derive_group_id
 
@@ -5457,6 +5582,29 @@ def test_tan_timeline_and_follow(tmp_path):
         assert status == 200
         assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
 
+        # A located post carries its place through the API, so the
+        # console post card can render it with an open-in-maps link.
+        conn = init_db(node.config.social_db_path)
+        try:
+            located = create_post(
+                conn,
+                identity,
+                "from the park",
+                name="bob",
+                now=1001,
+                location={"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"},
+            )
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_hash = {item["hash"]: item for item in payload["posts"]}
+        assert by_hash[located["hash"]]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
         status, _, payload = _json(
             bridge,
             "/api/tan/follow",
@@ -5469,7 +5617,8 @@ def test_tan_timeline_and_follow(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/following")
         assert status == 200
         assert payload["count"] == 1
-        assert payload["following"][0]["posts"] == 1
+        # The author now has two posts: the plain one and the located one.
+        assert payload["following"][0]["posts"] == 2
 
         status, _, payload = _json(
             bridge,
@@ -8172,6 +8321,122 @@ def test_tan_mute_via_api(tmp_path):
         )
         assert status == 400
         assert "field 'keyword' is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_lists_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    third = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "hello from tan", name="tester", now=1000)
+        theirs = create_post(conn, other, "bob's update", name="bob", now=1001)
+        hers = create_post(conn, third, "carol's update", name="carol", now=1002)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/lists")
+        assert status == 200
+        assert payload == {"lists": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge, "/api/tan/lists", method="POST", body={"name": "Friends"}
+        )
+        assert status == 200
+        assert payload["list"]["name"] == "Friends"
+        assert payload["list"]["members"] == 0
+
+        # A duplicate name (any case) is a client error.
+        status, _, payload = _json(
+            bridge, "/api/tan/lists", method="POST", body={"name": "friends"}
+        )
+        assert status == 400
+
+        # Members resolve by name, like the CLI; bob is followed here
+        # only after the follow below, so the first add notes that.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/lists/add",
+            method="POST",
+            body={"name": "Friends", "target": "bob"},
+        )
+        assert status == 200
+        assert payload["member"]["author"] == theirs["author"]
+        assert payload["member"]["added"] is True
+        assert payload["member"]["followed"] is False
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/lists/add",
+            method="POST",
+            body={"name": "Friends", "target": hers["author"]},
+        )
+        assert status == 200
+        assert payload["member"]["added"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/lists/members?name=Friends")
+        assert status == 200
+        assert payload["name"] == "Friends"
+        assert payload["count"] == 2
+        assert {item["author"] for item in payload["members"]} == {
+            theirs["author"],
+            hers["author"],
+        }
+
+        # The list timeline reads only its members.
+        status, _, payload = _json(bridge, "/api/tan/timeline?list=Friends")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "carol's update",
+            "bob's update",
+        ]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/lists/remove",
+            method="POST",
+            body={"name": "Friends", "target": "carol"},
+        )
+        assert status == 200
+        assert payload["member"]["removed"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?list=Friends")
+        assert [item["text"] for item in payload["posts"]] == ["bob's update"]
+
+        # Unknown lists and missing fields are client errors.
+        status, _, payload = _json(bridge, "/api/tan/timeline?list=Nope")
+        assert status == 400
+        status, _, payload = _json(bridge, "/api/tan/lists/members?name=Nope")
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/lists", method="POST", body={}
+        )
+        assert status == 400
+        assert "field 'name' is required" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/lists/delete",
+            method="POST",
+            body={"name": "Friends"},
+        )
+        assert status == 200
+        assert payload["list"]["deleted"] is True
+        status, _, payload = _json(bridge, "/api/tan/lists")
+        assert payload == {"lists": [], "count": 0}
     finally:
         bridge.stop()
 
@@ -11476,6 +11741,147 @@ def test_outbox_cancel_errors(bridge, node):
     assert "unknown queued message" in payload["error"]["message"]
 
 
+def _queue_scheduled(node, to_hex, text, message_id=None, delay=7200.0):
+    return node.mailbox.enqueue(
+        to=bytes.fromhex(to_hex),
+        text=text,
+        message_id=message_id,
+        send_after=time.time() + delay,
+    )
+
+
+def test_outbox_edit_by_id_and_prefix(bridge, node):
+    first = _queue_scheduled(node, PEER_HASH, "first", "aa" + "11" * 15)
+    second = _queue_scheduled(node, PEER_HASH, "second", "bb" + "22" * 15)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": first.id, "text": "first, reworded"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["legs"] == 1
+    assert payload["edited"][0]["id"] == first.id
+    assert payload["edited"][0]["text"] == "first, reworded"
+    assert payload["edited"][0]["send_after"] == first.send_after
+
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": second.id[:8], "send_in": 3600},
+    )
+    assert status == 200
+    assert payload["edited"][0]["text"] == "second"
+    assert abs(payload["edited"][0]["send_after"] - (before + 3600)) < 5.0
+
+    _, _, listed = _json(bridge, "/api/outbox")
+    by_id = {entry["id"]: entry for entry in listed["outbox"]}
+    assert by_id[first.id]["text"] == "first, reworded"
+    assert by_id[second.id]["send_after"] > before + 3500
+
+
+def test_outbox_edit_errors(bridge, node):
+    scheduled = _queue_scheduled(node, PEER_HASH, "later", "cc" + "11" * 15)
+    immediate = _queue(node, PEER_HASH, "now")
+
+    # No change requested.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": scheduled.id},
+    )
+    assert status == 400
+    assert "nothing to change" in payload["error"]["message"]
+
+    # Missing target.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"text": "nope"},
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    # Unknown id is a 404; an ambiguous prefix too.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": "ff" * 16, "text": "nope"},
+    )
+    assert status == 404
+    assert "unknown queued message" in payload["error"]["message"]
+
+    # A message that is not scheduled cannot be edited.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": immediate.id, "text": "too late"},
+    )
+    assert status == 400
+    assert "no longer scheduled" in payload["error"]["message"]
+    assert node.mailbox.get_outbox(immediate.id).text == "now"
+
+    # Bad send_in values are 400s, and the entry is untouched.
+    for bad in (0, -30, "soon", 30 * 86400):
+        status, _, payload = _json(
+            bridge,
+            "/api/outbox/edit",
+            method="POST",
+            body={"target": scheduled.id, "send_in": bad},
+        )
+        assert status == 400
+        assert "send_in" in payload["error"]["message"]
+    assert node.mailbox.get_outbox(scheduled.id).text == "later"
+
+
+def test_outbox_edit_group_updates_every_leg(bridge, node):
+    crew = node.groups.list_groups()[0]
+    group = {
+        "id": crew["id"],
+        "name": "crew",
+        "creator": PEER_HASH,
+        "members": [PEER_HASH, BOB_HASH],
+    }
+    first = node.mailbox.enqueue(
+        to=bytes.fromhex(BOB_HASH),
+        text="crew hello",
+        message_id="dd" + "11" * 15,
+        send_after=time.time() + 7200.0,
+        sent_at=1000.0,
+        group=group,
+    )
+    second = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="crew hello",
+        message_id="dd" + "22" * 15,
+        send_after=time.time() + 7200.0,
+        sent_at=1000.0,
+        group=group,
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": first.id[:8], "text": "crew hello, edited"},
+    )
+    assert status == 200
+    assert payload["legs"] == 2
+    assert {entry["id"] for entry in payload["edited"]} == {
+        first.id,
+        second.id,
+    }
+    assert node.mailbox.get_outbox(first.id).text == "crew hello, edited"
+    assert node.mailbox.get_outbox(second.id).text == "crew hello, edited"
+
+
 def test_settings_defaults(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:
@@ -13328,11 +13734,41 @@ def test_tan_schedule_post_via_api(tmp_path):
         assert payload["scheduled"]["expires_in"] == 3600
         assert abs(payload["scheduled"]["publish_at"] - (time.time() + 60)) < 5
 
+        # An image rides the queue entry: the bytes land pinned in the
+        # media store at schedule time, and the descriptor is stored
+        # with the entry until the publish pass attaches it.
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        )
+        digest = hashlib.sha256(png).hexdigest()
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"text": "morning photo", "send_in": 30, "image": data_url},
+        )
+        assert status == 200
+        assert payload["scheduled"]["image"] == {
+            "sha256": digest,
+            "size": len(png),
+            "mime": "image/png",
+            "name": "image.png",
+        }
+        # The bytes are pinned in the media store for the publish pass —
+        # not served yet: a local upload stays private until a post
+        # carrying it is published, so /api/tan/media/<digest> 404s
+        # until the scheduled post goes out.
+        from tau.tangents.tan import media_path
+
+        assert media_path(tmp_path, digest) is not None
+
         status, _, payload = _json(bridge, "/api/tan/scheduled")
         assert status == 200
-        assert payload["count"] == 3
-        # Soonest first: the 60-second reply precedes the hour-out post.
+        assert payload["count"] == 4
+        # Soonest first: the 30-second photo precedes the 60-second posts.
         assert [item["text"] for item in payload["scheduled"]] == [
+            "morning photo",
             "agreed",
             "vanish later",
             "hello later",
@@ -13349,8 +13785,8 @@ def test_tan_schedule_post_via_api(tmp_path):
         assert payload["cancelled"]["id"] == scheduled["id"]
         assert payload["deleted_local"] is False
         status, _, payload = _json(bridge, "/api/tan/scheduled")
-        assert payload["count"] == 2
-        assert payload["scheduled"][0]["text"] == "agreed"
+        assert payload["count"] == 3
+        assert payload["scheduled"][0]["text"] == "morning photo"
 
         # Cancelling an unknown id is a bad request, not a crash.
         status, _, payload = _json(
@@ -13361,6 +13797,249 @@ def test_tan_schedule_post_via_api(tmp_path):
         )
         assert status == 400
         assert "no scheduled post" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_schedule_poll_via_api(tmp_path):
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "pizza or tacos?",
+                "poll_options": ["Pizza", "Tacos"],
+                "send_in": 3600,
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "poll"
+        assert scheduled["text"] == "pizza or tacos?"
+        assert scheduled["options"] == ["Pizza", "Tacos"]
+        assert abs(scheduled["publish_at"] - (time.time() + 3600)) < 5
+
+        # With an expiry the poll disappears that long after it is
+        # published, and the delay must stay shorter than the expiry.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "text": "vanishing poll?",
+                "poll_options": ["Yes", "No"],
+                "send_in": 60,
+                "expires_in": 3600,
+            },
+        )
+        assert status == 200
+        assert payload["scheduled"]["kind"] == "poll"
+        assert payload["scheduled"]["expires_in"] == 3600
+
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload["count"] == 2
+        assert [item["kind"] for item in payload["scheduled"]] == [
+            "poll",
+            "poll",
+        ]
+
+        # Cancelling a queued poll drops only that entry.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/cancel-scheduled",
+            method="POST",
+            body={"id": scheduled["id"][:8]},
+        )
+        assert status == 200
+        assert payload["cancelled"]["id"] == scheduled["id"]
+        assert payload["deleted_local"] is False
+    finally:
+        bridge.stop()
+
+
+def test_tan_schedule_repost_and_quote_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A repost carries no text: the target resolves to its full hash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"kind": "repost", "target_post": post["hash"][:16], "send_in": 3600},
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "repost"
+        assert scheduled["text"] == ""
+        assert scheduled["target_post"] == post["hash"]
+        assert abs(scheduled["publish_at"] - (time.time() + 3600)) < 5
+
+        # A quote carries its comment as the text.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={
+                "kind": "quote",
+                "target_post": post["hash"],
+                "text": "my take",
+                "send_in": 60,
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "quote"
+        assert scheduled["text"] == "my take"
+        assert scheduled["target_post"] == post["hash"]
+
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload["count"] == 2
+        assert [item["kind"] for item in payload["scheduled"]] == [
+            "quote",
+            "repost",
+        ]
+
+        # Bad repost/quote requests are 400s and queue nothing.
+        for body, fragment in [
+            ({"kind": "repost", "send_in": 60}, "target_post"),
+            ({"kind": "quote", "send_in": 60}, "target_post"),
+            (
+                {"kind": "quote", "target_post": post["hash"], "send_in": 60},
+                "text",
+            ),
+            (
+                {"kind": "poll", "target_post": post["hash"], "send_in": 60},
+                "kind",
+            ),
+            (
+                {
+                    "kind": "repost",
+                    "target_post": post["hash"],
+                    "send_in": 60,
+                    "reply_to": post["hash"],
+                },
+                "reply",
+            ),
+            (
+                {
+                    "kind": "quote",
+                    "target_post": post["hash"],
+                    "text": "x",
+                    "send_in": 60,
+                    "expires_in": 3600,
+                },
+                "expire",
+            ),
+            (
+                {"kind": "repost", "target_post": "cd" * 32, "send_in": 60},
+                "unknown post",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/schedule", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert payload["count"] == 2
+    finally:
+        bridge.stop()
+
+
+def test_tan_schedule_poll_rejects_bad_requests(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        for body, fragment in [
+            (
+                {"text": "pick?", "poll_options": ["only one"], "send_in": 60},
+                "poll_options",
+            ),
+            (
+                {
+                    "text": "pick?",
+                    "poll_options": ["a", "b", "c", "d", "e", "f", "g", "h", "i"],
+                    "send_in": 60,
+                },
+                "poll_options",
+            ),
+            (
+                {"text": "pick?", "poll_options": ["Yes", "  "], "send_in": 60},
+                "poll_options",
+            ),
+            (
+                {"text": "pick?", "poll_options": ["Yes", 7], "send_in": 60},
+                "poll_options",
+            ),
+            (
+                {"text": "pick?", "poll_options": "Yes/No", "send_in": 60},
+                "poll_options",
+            ),
+            (
+                {
+                    "text": "pick?",
+                    "poll_options": ["Yes", "No"],
+                    "reply_to": post["hash"][:16],
+                    "send_in": 60,
+                },
+                "cannot be a reply",
+            ),
+            (
+                {
+                    "text": "pick?",
+                    "poll_options": ["Yes", "No"],
+                    "send_in": 3600,
+                    "expires_in": 60,
+                },
+                "shorter than",
+            ),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/schedule", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+        # Nothing queued by the rejected requests.
+        status, _, payload = _json(bridge, "/api/tan/scheduled")
+        assert status == 200
+        assert payload == {"scheduled": [], "count": 0}
     finally:
         bridge.stop()
 
@@ -13376,7 +14055,7 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
     identity = RNS.Identity()
     conn = init_db(node.config.social_db_path)
     try:
-        create_post(conn, identity, "api quotable", name="tester", now=1000)
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
     finally:
         conn.close()
 
@@ -13408,6 +14087,23 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
                 {"text": "hello", "send_in": 3600, "expires_in": 3600},
                 "shorter than",
             ),
+            (
+                {
+                    "text": "reply with pic",
+                    "send_in": 60,
+                    "reply_to": post["hash"][:16],
+                    "image": "data:image/png;base64,iVBORw0KGgo=",
+                },
+                "not a reply",
+            ),
+            (
+                {"text": "hello", "send_in": 60, "image": 42},
+                "data URL",
+            ),
+            (
+                {"text": "hello", "send_in": 60, "image": "not a data url"},
+                "data URL",
+            ),
         ]:
             status, _, payload = _json(
                 bridge, "/api/tan/schedule", method="POST", body=body
@@ -13418,6 +14114,245 @@ def test_tan_schedule_post_rejects_bad_requests(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/scheduled")
         assert status == 200
         assert payload == {"scheduled": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_tan_edit_scheduled_post_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.scheduled_posts import (
+        ScheduledPost,
+        load_scheduled_posts,
+        new_scheduled_post_id,
+        save_scheduled_posts,
+    )
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/schedule",
+            method="POST",
+            body={"text": "hello later", "send_in": 3600},
+        )
+        assert status == 200
+        entry = payload["scheduled"]
+
+        # Text and time change together; the id stays the same.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit-scheduled",
+            method="POST",
+            body={"id": entry["id"][:8], "text": "hello sooner", "send_in": 60},
+        )
+        assert status == 200
+        assert payload["scheduled"]["id"] == entry["id"]
+        assert payload["scheduled"]["text"] == "hello sooner"
+        assert abs(payload["scheduled"]["publish_at"] - (time.time() + 60)) < 5
+
+        # Text-only and time-only edits leave the other half alone.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit-scheduled",
+            method="POST",
+            body={"id": entry["id"], "text": "final wording"},
+        )
+        assert status == 200
+        assert payload["scheduled"]["text"] == "final wording"
+        first_publish_at = payload["scheduled"]["publish_at"]
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit-scheduled",
+            method="POST",
+            body={"id": entry["id"], "send_in": 7200},
+        )
+        assert status == 200
+        assert payload["scheduled"]["text"] == "final wording"
+        assert payload["scheduled"]["publish_at"] > first_publish_at
+
+        # Bad requests: missing id, neither field, bad send_in, unknown id.
+        for body, fragment in [
+            ({"text": "x", "send_in": 60}, "id"),
+            ({"id": entry["id"]}, "text"),
+            ({"id": entry["id"], "text": "  "}, "text"),
+            ({"id": entry["id"], "send_in": 0}, "send_in"),
+            ({"id": entry["id"], "send_in": 604801}, "send_in"),
+            ({"id": "zz" * 8, "text": "x"}, "no scheduled post"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/edit-scheduled", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+
+        # An entry whose publish already stored the signed post cannot
+        # be edited — cancel it instead.
+        queue = load_scheduled_posts(node.config.scheduled_posts_path)
+        created = ScheduledPost(
+            id=new_scheduled_post_id(),
+            text="already stored",
+            publish_at=time.time() + 3600,
+            created_at=time.time(),
+            post_hash="b" * 64,
+        )
+        save_scheduled_posts(
+            node.config.scheduled_posts_path, queue.with_added(created)
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit-scheduled",
+            method="POST",
+            body={"id": created.id, "text": "too late"},
+        )
+        assert status == 400
+        assert "already created" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_drafts_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    # Drafts need no Tan app attached: they live in the social DB, so
+    # a draft saved from the CLI shows up in the console too.
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/drafts")
+        assert status == 200
+        assert payload == {"drafts": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts",
+            method="POST",
+            body={"text": "half-written thought"},
+        )
+        assert status == 200
+        draft = payload["draft"]
+        assert draft["text"] == "half-written thought"
+        assert draft["reply_to"] == ""
+        assert draft["expires_in"] is None
+
+        # A reply resolves its target to the full hash, like tan_post,
+        # and the expiry rides along for the publish.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts",
+            method="POST",
+            body={
+                "text": "agreed",
+                "reply_to": post["hash"][:16],
+                "expires_in": 3600,
+            },
+        )
+        assert status == 200
+        reply_draft = payload["draft"]
+        assert reply_draft["reply_to"] == post["hash"]
+        assert reply_draft["expires_in"] == 3600
+
+        status, _, payload = _json(bridge, "/api/tan/drafts")
+        assert status == 200
+        assert payload["count"] == 2
+        # Newest first: the reply draft precedes the plain one.
+        assert [item["id"] for item in payload["drafts"]] == [
+            reply_draft["id"],
+            draft["id"],
+        ]
+
+        # Discarding by id drops only that draft.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts/delete",
+            method="POST",
+            body={"id": draft["id"]},
+        )
+        assert status == 200
+        assert payload["draft"]["id"] == draft["id"]
+        status, _, payload = _json(bridge, "/api/tan/drafts")
+        assert payload["count"] == 1
+        assert payload["drafts"][0]["id"] == reply_draft["id"]
+
+        # Discarding an unknown draft is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/drafts/delete",
+            method="POST",
+            body={"id": 9999},
+        )
+        assert status == 400
+        assert "unknown draft" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_drafts_rejects_bad_requests(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        for body, fragment in [
+            ({"text": "  "}, "text"),
+            ({"reply_to": "ab" * 16}, "text"),
+            ({"text": "hello", "reply_to": "cd" * 32}, "unknown post"),
+            ({"text": "hello", "reply_to": "zz" * 16}, "unknown post"),
+            ({"text": "hello", "expires_in": 0}, "expires_in"),
+            ({"text": "hello", "expires_in": -10}, "expires_in"),
+            ({"text": "hello", "expires_in": "soon"}, "expires_in"),
+            ({"text": "hello", "expires_in": True}, "expires_in"),
+            ({"text": "hello", "expires_in": 604801}, "expires_in"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/tan/drafts", method="POST", body=body
+            )
+            assert status == 400, body
+            assert fragment in payload["error"]["message"], body
+        for body in [{}]:
+            status, _, payload = _json(
+                bridge, "/api/tan/drafts/delete", method="POST", body=body
+            )
+            assert status == 400, body
+            assert "id" in payload["error"]["message"], body
+        # An id supplied under "draft" is accepted — and an unknown one
+        # is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge, "/api/tan/drafts/delete", method="POST", body={"draft": 1}
+        )
+        assert status == 400
+        assert "unknown draft" in payload["error"]["message"]
+        # Nothing saved by the rejected requests.
+        status, _, payload = _json(bridge, "/api/tan/drafts")
+        assert status == 200
+        assert payload == {"drafts": [], "count": 0}
     finally:
         bridge.stop()
 
@@ -20885,6 +21820,40 @@ def test_channel_schedule_via_api(tmp_path):
         )
         assert status == 400
         assert "no scheduled channel message" in payload["error"]["message"]
+
+        # Editing the remaining entry changes its text and time.
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        remaining = payload["scheduled"][0]["id"]
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit-scheduled",
+            method="POST",
+            body={"id": remaining[:8], "text": "sooner, edited", "send_in": 120},
+        )
+        assert status == 200
+        assert payload["edited"]["id"] == remaining
+        assert payload["edited"]["text"] == "sooner, edited"
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert payload["scheduled"][0]["text"] == "sooner, edited"
+
+        # Editing with neither text nor send_in, and an unknown id, are
+        # bad requests, not crashes.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit-scheduled",
+            method="POST",
+            body={"id": remaining[:8]},
+        )
+        assert status == 400
+        assert "nothing to change" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/edit-scheduled",
+            method="POST",
+            body={"id": "zz" * 8, "text": "nope"},
+        )
+        assert status == 400
+        assert "no scheduled channel message" in payload["error"]["message"]
     finally:
         bridge.stop()
 
@@ -20932,6 +21901,12 @@ def test_channel_schedule_rejects_bad_requests(tmp_path):
 
         status, _, payload = _json(
             bridge, "/api/channels/cancel-scheduled", method="POST", body={}
+        )
+        assert status == 400
+        assert "id" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge, "/api/channels/edit-scheduled", method="POST", body={}
         )
         assert status == 400
         assert "id" in payload["error"]["message"]

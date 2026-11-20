@@ -460,6 +460,236 @@ def test_resolve_outbox_rejects_unknown_and_ambiguous(tmp_path):
         box.resolve_outbox("aa")
     with pytest.raises(MailboxError, match="must not be empty"):
         box.resolve_outbox("  ")
+
+
+def test_edit_scheduled_outbox_text(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(
+        to=BOB,
+        text="see you soon",
+        message_id="cc" + "11" * 15,
+        now=1000.0,
+        send_after=5000.0,
+    )
+    edited = box.edit_scheduled_outbox(
+        entry.id[:8], text="see you at noon", now=2000.0
+    )
+    assert [item.id for item in edited] == [entry.id]
+    stored = box.get_outbox(entry.id)
+    assert stored.text == "see you at noon"
+    assert stored.send_after == 5000.0
+    assert stored.sent_at is None
+    # The edit survives a reload: the new text is what gets delivered.
+    assert Mailbox(path).get_outbox(entry.id).text == "see you at noon"
+
+
+def test_edit_scheduled_outbox_send_time(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        message_id="cc" + "22" * 15,
+        now=1000.0,
+        send_after=5000.0,
+    )
+    edited = box.edit_scheduled_outbox(
+        entry.id, send_after=9000.0, now=2000.0
+    )
+    assert [item.id for item in edited] == [entry.id]
+    stored = box.get_outbox(entry.id)
+    assert stored.text == "later"
+    assert stored.send_after == 9000.0
+
+
+def test_edit_scheduled_outbox_text_and_time(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        message_id="cc" + "33" * 15,
+        now=1000.0,
+        send_after=5000.0,
+    )
+    box.edit_scheduled_outbox(
+        entry.id, text="sooner, and different", send_after=3000.0, now=2000.0
+    )
+    stored = box.get_outbox(entry.id)
+    assert stored.text == "sooner, and different"
+    assert stored.send_after == 3000.0
+
+
+def test_edit_scheduled_outbox_requires_a_change(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        message_id="cc" + "44" * 15,
+        now=1000.0,
+        send_after=5000.0,
+    )
+    with pytest.raises(MailboxError, match="nothing to change"):
+        box.edit_scheduled_outbox(entry.id, now=2000.0)
+    assert box.get_outbox(entry.id).text == "later"
+
+
+def test_edit_scheduled_outbox_rejects_unknown_and_ambiguous(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.enqueue(
+        to=BOB,
+        text="one",
+        message_id="dd" + "11" * 15,
+        now=1000.0,
+        send_after=5000.0,
+    )
+    box.enqueue(
+        to=BOB,
+        text="two",
+        message_id="dd" + "22" * 15,
+        now=1000.0,
+        send_after=5000.0,
+    )
+    with pytest.raises(MailboxError, match="unknown queued message"):
+        box.edit_scheduled_outbox("ff", text="nope", now=2000.0)
+    with pytest.raises(MailboxError, match="2 queued messages match prefix"):
+        box.edit_scheduled_outbox("dd", text="nope", now=2000.0)
+
+
+def test_edit_scheduled_outbox_refuses_not_scheduled(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    immediate = box.enqueue(to=BOB, text="now", now=1000.0)
+    with pytest.raises(MailboxError, match="no longer scheduled"):
+        box.edit_scheduled_outbox(immediate.id, text="too late", now=2000.0)
+    # A send time that already passed is no longer scheduled either.
+    elapsed = box.enqueue(
+        to=BOB,
+        text="was later",
+        message_id="cc" + "55" * 15,
+        now=1000.0,
+        send_after=3000.0,
+    )
+    with pytest.raises(MailboxError, match="no longer scheduled"):
+        box.edit_scheduled_outbox(elapsed.id, text="too late", now=4000.0)
+    assert box.get_outbox(elapsed.id).text == "was later"
+
+
+def test_edit_scheduled_outbox_validates_text(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        message_id="cc" + "66" * 15,
+        now=1000.0,
+        send_after=5000.0,
+    )
+    with pytest.raises(MailboxError, match="must not be empty"):
+        box.edit_scheduled_outbox(entry.id, text="   ", now=2000.0)
+    with pytest.raises(MailboxError, match="longer than 2000 characters"):
+        box.edit_scheduled_outbox(entry.id, text="x" * 2001, now=2000.0)
+    assert box.get_outbox(entry.id).text == "later"
+
+
+def test_edit_scheduled_outbox_validates_send_time(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        message_id="cc" + "77" * 15,
+        now=1000.0,
+        send_after=5000.0,
+    )
+    with pytest.raises(MailboxError, match="must be in the future"):
+        box.edit_scheduled_outbox(entry.id, send_after=2000.0, now=2000.0)
+    with pytest.raises(MailboxError, match="at most 29d23h"):
+        box.edit_scheduled_outbox(
+            entry.id, send_after=2000.0 + 30 * 86400, now=2000.0
+        )
+    assert box.get_outbox(entry.id).send_after == 5000.0
+
+
+def test_edit_scheduled_outbox_refuses_send_after_expiry(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        message_id="cc" + "88" * 15,
+        now=1000.0,
+        send_after=5000.0,
+        expires_at=6000.0,
+    )
+    with pytest.raises(MailboxError, match="before the message expiry"):
+        box.edit_scheduled_outbox(entry.id, send_after=6000.0, now=2000.0)
+    assert box.get_outbox(entry.id).send_after == 5000.0
+
+
+def test_edit_scheduled_outbox_refuses_poll_leg(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="lunch?",
+        message_id="cc" + "99" * 15,
+        now=1000.0,
+        send_after=5000.0,
+        poll_options=["yes", "no"],
+    )
+    with pytest.raises(MailboxError, match="not plain text"):
+        box.edit_scheduled_outbox(entry.id, text="dinner?", now=2000.0)
+    assert box.get_outbox(entry.id).text == "lunch?"
+
+
+def test_edit_scheduled_outbox_updates_every_group_leg(tmp_path):
+    # A scheduled group message fans out to one leg per member, all
+    # sharing the group id and the logical send time: editing one leg
+    # must rewrite them all, so members still receive identical text.
+    # A leg of another group keeps its own text.
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = {
+        "id": "ee" * 16,
+        "name": "crew",
+        "creator": "aa" * 16,
+        "members": ["aa" * 16, "bb" * 16, "cc" * 16],
+    }
+    leg_bob = box.enqueue(
+        to=BOB,
+        text="crew hello",
+        message_id="ee" + "11" * 15,
+        now=1000.0,
+        send_after=5000.0,
+        sent_at=900.0,
+        group=group,
+    )
+    leg_carol = box.enqueue(
+        to=b"\xcc" * 16,
+        text="crew hello",
+        message_id="ee" + "22" * 15,
+        now=1000.0,
+        send_after=5000.0,
+        sent_at=900.0,
+        group=group,
+    )
+    other = box.enqueue(
+        to=BOB,
+        text="other crew",
+        message_id="ee" + "33" * 15,
+        now=1000.0,
+        send_after=5000.0,
+        sent_at=900.0,
+        group={**group, "id": "ff" * 16},
+    )
+    edited = box.edit_scheduled_outbox(
+        leg_bob.id[:8], text="crew hello, edited", send_after=7000.0, now=2000.0
+    )
+    assert {item.id for item in edited} == {leg_bob.id, leg_carol.id}
+    assert box.get_outbox(leg_bob.id).text == "crew hello, edited"
+    assert box.get_outbox(leg_carol.id).text == "crew hello, edited"
+    assert box.get_outbox(leg_carol.id).send_after == 7000.0
+    # The logical send time is untouched, so reactions and retracts
+    # still name the message; the other group is untouched.
+    assert box.get_outbox(leg_bob.id).sent_at == 900.0
+    assert box.get_outbox(other.id).text == "other crew"
+    assert box.get_outbox(other.id).send_after == 5000.0
+
+
 def test_delivery_backoff_schedule(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     entry = box.enqueue(to=BOB, text="back off", now=1000.0)

@@ -28,6 +28,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/delete delete ``{"group": "<id | prefix | name>"}``
     POST /api/groups/add-member add ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
+    POST /api/groups/ban ban ``{"group": "...", "peer": "<hash>"}``
+    POST /api/groups/unban unban ``{"group": "...", "peer": "<hash>"}``
+    GET  /api/groups/banned banned peers for a group (``?group=...``)
     POST /api/groups/rename rename ``{"group": "<id | prefix | name>", "name": "<new name>"}``
     POST /api/groups/topic set or clear the topic ``{"group": "...", "topic": "..."}`` / ``{"group": "...", "clear": true}``
     GET  /api/groups/join-requests pending join requests for groups this node created
@@ -136,6 +139,10 @@ script) can read what arrives from the mesh and send messages back:
                            the block-list
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    POST /api/outbox/edit   edit a scheduled message before it sends
+                           ``{"target": "<message id or prefix>", "text": ...,
+                           "send_in": <seconds from now>}`` — at least one
+                           of "text" / "send_in" is required
     GET  /api/backup       download a backup archive of the data directory
     GET  /api/doctor       health verdicts for the data directory (``tau doctor``)
     POST /api/bundle/export build a signed sneakernet bundle
@@ -163,6 +170,8 @@ script) can read what arrives from the mesh and send messages back:
                            stored value)
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/lists    named author lists with member counts
+    GET  /api/tan/lists/members members of one list (``?name=<list>``)
     GET  /api/tan/tags     tags in stored posts, most-used first
     GET  /api/tan/top      most-liked stored posts (``?limit=10``, ``?author=<name or hash>``)
     GET  /api/tan/search   search stored posts by keyword
@@ -174,9 +183,13 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/reposts  who reposted a Tan post (?target=<post hash>)
     GET  /api/tan/quotes   standing quotes of a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post (optional "image" base64 data URL)
-    POST /api/tan/schedule schedule a Tan post for later
-    GET  /api/tan/scheduled queued Tan posts, soonest first
+    POST /api/tan/schedule schedule a Tan post, repost or quote — or a poll, with ``"poll_options"`` — for later (optional "image" base64 data URL)
+    GET  /api/tan/scheduled queued Tan posts, reposts, quotes and polls, soonest first
     POST /api/tan/cancel-scheduled cancel a queued Tan post
+    POST /api/tan/edit-scheduled edit a queued Tan post's text/time
+    GET  /api/tan/drafts   saved Tan post drafts, newest first
+    POST /api/tan/drafts   save a Tan post draft
+    POST /api/tan/drafts/delete discard a saved Tan post draft
     POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
@@ -188,6 +201,10 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/edit     edit one of your own posts
     POST /api/tan/follow   follow an author
     POST /api/tan/unfollow stop following an author
+    POST /api/tan/lists    create a named author list
+    POST /api/tan/lists/delete delete a named author list
+    POST /api/tan/lists/add add an author to a list
+    POST /api/tan/lists/remove remove an author from a list
     GET  /api/tan/muted    muted authors
     POST /api/tan/mute     mute an author
     POST /api/tan/unmute   unmute an author
@@ -215,6 +232,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/schedule  schedule a channel message for later
     GET  /api/channels/scheduled  queued channel messages, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message
+    POST /api/channels/edit-scheduled  edit a queued channel message's text/time
     POST /api/channels/poll  post a poll (``{"channel", "question", "options": [...]}``)
     POST /api/channels/vote  vote on a poll (``{"channel", "poll", "option"}``)
     POST /api/channels/close-poll  close a poll you created (``{"channel", "poll"}``)
@@ -2449,6 +2467,7 @@ class WebBridge:
         include_all: bool = False,
         author: Optional[str] = None,
         tag: Optional[str] = None,
+        list_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
@@ -2462,6 +2481,7 @@ class WebBridge:
             apply_display_rules,
             author_timeline,
             following,
+            list_timeline,
             resolve_author,
             timeline,
         )
@@ -2483,7 +2503,17 @@ class WebBridge:
                 viewer = (
                     destination_hash(identity).hex() if identity is not None else None
                 )
-            if author:
+            if list_name:
+                posts = list_timeline(
+                    conn,
+                    list_name,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                    tag=tag,
+                )
+            elif author:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
                 posts = author_timeline(
                     conn,
@@ -3398,6 +3428,108 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_lists(self) -> List[Dict[str, Any]]:
+        from .tangents.tan import tan_lists
+
+        conn = self._tan_conn()
+        try:
+            return tan_lists(conn)
+        finally:
+            conn.close()
+
+    def tan_list_members(self, name: str) -> Dict[str, Any]:
+        from .tangents.tan import author_stats_many, list_members, tan_lists
+
+        conn = self._tan_conn()
+        try:
+            records = list_members(conn, name)
+            stats = author_stats_many(conn, [record["author"] for record in records])
+            for record in records:
+                record.update(stats[record["author"]])
+            display = next(
+                (
+                    entry["name"]
+                    for entry in tan_lists(conn)
+                    if entry["name"].casefold() == str(name).strip().casefold()
+                ),
+                str(name).strip(),
+            )
+            return {"name": display, "members": records, "count": len(records)}
+        finally:
+            conn.close()
+
+    def tan_create_list(self, name: str) -> Dict[str, Any]:
+        from .tangents.tan import create_list
+
+        conn = self._tan_conn()
+        try:
+            return create_list(conn, name)
+        finally:
+            conn.close()
+
+    def tan_delete_list(self, name: str) -> Dict[str, Any]:
+        from .tangents.tan import delete_list, tan_lists
+
+        conn = self._tan_conn()
+        try:
+            display = next(
+                (
+                    entry["name"]
+                    for entry in tan_lists(conn)
+                    if entry["name"].casefold() == str(name).strip().casefold()
+                ),
+                str(name).strip(),
+            )
+            return {"name": display, "deleted": delete_list(conn, name)}
+        finally:
+            conn.close()
+
+    def _resolve_list_target(self, conn, target: str):
+        """Resolve a list add/remove target the way the CLI does.
+
+        The registry lookup first, then the name on the author's cached
+        posts — a list member need not be followed or known to the
+        registry.
+        """
+        from .tangents.tan import TanError, resolve_author, resolve_cached_author
+
+        try:
+            return resolve_author(conn, target, registry=self.node.registry)
+        except TanError as exc:
+            try:
+                return resolve_cached_author(conn, target)
+            except TanError:
+                raise exc from None
+
+    def tan_list_add(self, name: str, target: str) -> Dict[str, Any]:
+        from .tangents.tan import add_to_list, following
+
+        conn = self._tan_conn()
+        try:
+            author, author_name = self._resolve_list_target(conn, target)
+            record = add_to_list(conn, name, author, author_name=author_name)
+            record["followed"] = author in {
+                entry["author"] for entry in following(conn)
+            }
+            return record
+        finally:
+            conn.close()
+
+    def tan_list_remove(self, name: str, target: str) -> Dict[str, Any]:
+        from .tangents.tan import remove_from_list
+
+        conn = self._tan_conn()
+        try:
+            author, author_name = self._resolve_list_target(conn, target)
+            return {
+                "list": str(name).strip(),
+                "author": author,
+                "name": author_name,
+                "removed": remove_from_list(conn, name, author),
+            }
+        finally:
+            conn.close()
+
     def tan_mute_keyword(self, keyword: str) -> Dict[str, Any]:
         from .tangents.tan import mute_keyword
 
@@ -3542,24 +3674,98 @@ class WebBridge:
     def tan_schedule_post(
         self, text: str, *, reply_to: Optional[str] = None, send_in: float,
         expires_in: float = 0.0,
+        kind: Optional[str] = None,
+        target_post: Optional[str] = None,
+        poll_options: Optional[List[str]] = None,
+        image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Queue a Tan post for later, like ``tau tan post --delay``.
 
         Scheduling needs no attached Tan app — the queue file is the
         same one the CLI writes, and the serving node publishes due
         entries when it has an app. Only the reply target needs the
-        store, resolved the same way :meth:`tan_post` resolves it.
+        store, resolved the same way :meth:`tan_post` resolves it.  An
+        *image* data URL is decoded the same way :meth:`tan_post`
+        decodes one — the bytes are stored pinned in the local media
+        store at schedule time — and rides the queue entry until the
+        publish pass attaches it.
+
+        With *kind* ``"repost"`` / ``"quote"`` the entry amplifies
+        *target_post* instead: a repost carries no text, a quote
+        carries its comment as the text, and the target is resolved
+        the same way as a reply target.
+
+        With *poll_options* the entry is a poll instead: the text is
+        its question, the options ride alongside it, and a reply
+        target is refused — polls are top-level entries.  A poll
+        cannot carry an image.
         """
-        from .scheduled_posts import schedule_post
+        from .scheduled_posts import (
+            schedule_poll,
+            schedule_post,
+            schedule_quote,
+            schedule_repost,
+        )
         from .tangents.tan import MAX_GOSSIP_TTL, resolve_post
 
+        if image is not None and reply_to is not None:
+            raise ValueError(
+                "an image can only be attached to a top-level post, not a reply"
+            )
+        if image is not None and poll_options is not None:
+            raise ValueError("a scheduled poll cannot carry an image")
+        image_attachment: Optional[Dict[str, Any]] = None
+        if image is not None:
+            from .tangents.tan import image_attachment_from_data_url
+
+            image_attachment = image_attachment_from_data_url(
+                image, Path(self._tan_db_path()).parent
+            )
         if reply_to is not None:
             conn = self._tan_conn()
             try:
                 reply_to = resolve_post(conn, reply_to)["hash"]
             finally:
                 conn.close()
+        if target_post is not None:
+            conn = self._tan_conn()
+            try:
+                target_post = resolve_post(conn, target_post)["hash"]
+            finally:
+                conn.close()
         config = self.node.config
+        if kind == "repost":
+            post = schedule_repost(
+                config.scheduled_posts_path,
+                target_post=target_post,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                name=getattr(self.node, "name", None),
+            )
+            return post.to_dict()
+        if kind == "quote":
+            post = schedule_quote(
+                config.scheduled_posts_path,
+                target_post=target_post,
+                text=text,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                name=getattr(self.node, "name", None),
+            )
+            return post.to_dict()
+        if poll_options is not None:
+            post = schedule_poll(
+                config.scheduled_posts_path,
+                question=text,
+                options=poll_options,
+                publish_at=time.time() + float(send_in),
+                ttl=MAX_GOSSIP_TTL,
+                # Validate against the name the serving app publishes with
+                # (node.name, refreshed at startup), not the configured name.
+                name=getattr(self.node, "name", None),
+                expires_in=float(expires_in),
+            )
+            return post.to_dict()
         post = schedule_post(
             config.scheduled_posts_path,
             text=text,
@@ -3570,6 +3776,7 @@ class WebBridge:
             # (node.name, refreshed at startup), not the configured name.
             name=getattr(self.node, "name", None),
             expires_in=float(expires_in),
+            image=image_attachment,
         )
         return post.to_dict()
 
@@ -3628,6 +3835,87 @@ class WebBridge:
             on_cancel=_delete_stored,
         )
         return {"cancelled": post.to_dict(), "deleted_local": deleted_local}
+
+    def tan_edit_scheduled_post(
+        self,
+        target: str,
+        *,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or publish time of a queued Tan post.
+
+        Like :meth:`tan_schedule_post`: only the queue entry is
+        touched, so no attached Tan app is needed.  A *send_in* counts
+        from now, the same way the console's Send-later picker does.
+        """
+        from .scheduled_posts import edit_scheduled_post
+
+        publish_at = None
+        if send_in is not None:
+            publish_at = time.time() + float(send_in)
+        post = edit_scheduled_post(
+            self.node.config.scheduled_posts_path,
+            target,
+            text=text,
+            publish_at=publish_at,
+            # Validate against the name the serving app publishes with
+            # (node.name, refreshed at startup), not the configured name.
+            name=getattr(self.node, "name", None),
+        )
+        return post.to_dict()
+
+    def tan_drafts(self) -> List[Dict[str, Any]]:
+        """Saved Tan post drafts, newest first (the CLI's ``tan drafts``).
+
+        Drafts need no attached Tan app — they live in the social DB,
+        so a draft saved from the CLI shows up in the console too.
+        """
+        from .tangents.tan import list_drafts
+
+        conn = self._tan_conn()
+        try:
+            return list_drafts(conn)
+        finally:
+            conn.close()
+
+    def tan_save_draft(
+        self,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        expires_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Save a Tan post draft, like ``tau tan draft``.
+
+        The reply target is resolved to its full hash, like
+        :meth:`tan_post` resolves it; the expiry clock starts when
+        the draft is published, not when it is saved.
+        """
+        from .tangents.tan import resolve_post, save_draft
+
+        conn = self._tan_conn()
+        try:
+            if reply_to is not None:
+                reply_to = resolve_post(conn, reply_to)["hash"]
+            return save_draft(
+                conn,
+                text,
+                reply_to=reply_to or "",
+                expires_in=expires_in,
+            )
+        finally:
+            conn.close()
+
+    def tan_delete_draft(self, ref: Any) -> Dict[str, Any]:
+        """Delete a saved Tan post draft, like ``tau tan discard-draft``."""
+        from .tangents.tan import delete_draft
+
+        conn = self._tan_conn()
+        try:
+            return delete_draft(conn, ref)
+        finally:
+            conn.close()
 
     def tan_react(self, target: str, *, liked: bool) -> Dict[str, Any]:
         app = self._tan_app()
@@ -4492,6 +4780,36 @@ class WebBridge:
             on_cancel=_delete_stored,
         )
         return {"cancelled": entry.to_dict(), "deleted_local": deleted_local}
+
+    def channel_edit_scheduled_message(
+        self,
+        target: str,
+        *,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or publish time of a queued channel message.
+
+        Like :meth:`channel_schedule_message`: only the queue entry is
+        touched, so no attached channel app is needed.  A *send_in*
+        counts from now, the same way the console's Send-later picker
+        does.
+        """
+        from .scheduled_channel import edit_scheduled_channel_message
+
+        publish_at = None
+        if send_in is not None:
+            publish_at = time.time() + float(send_in)
+        entry = edit_scheduled_channel_message(
+            self.node.config.scheduled_channel_messages_path,
+            target,
+            text=text,
+            publish_at=publish_at,
+            # Validate against the name the serving app publishes with
+            # (node.name, refreshed at startup), not the configured name.
+            name=getattr(self.node, "name", None),
+        )
+        return entry.to_dict()
 
     def channel_sync(
         self, channel: Optional[str] = None, *, limit: int = 20
@@ -8110,6 +8428,96 @@ class WebBridge:
         self._clear_scheduled_mark(entry.id)
         return described
 
+    def edit_outbox(
+        self,
+        target: str,
+        text: Optional[str] = None,
+        send_in: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the text and/or send time of a scheduled outbox entry.
+
+        The console counterpart of ``tau outbox edit``: ``send_in`` is
+        seconds from now, mirroring the send path.  At least one of
+        *text* / *send_in* is required; the mailbox enforces the rest
+        (still scheduled, plain text, new time in the future and within
+        the delay cap).  A group edit rewrites every leg of the message
+        and reports the leg count.  The console's queued record for each
+        edited entry is updated in place, so the bubble shows the new
+        text and countdown without a refresh.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("message id is required")
+        if text is None and send_in is None:
+            raise ValueError(
+                "nothing to change — pass a new text and/or a new send time"
+            )
+        if text is not None and not isinstance(text, str):
+            raise ValueError("text must be a string")
+        send_after = None
+        if send_in is not None:
+            if not _valid_send_in(send_in):
+                raise ValueError(
+                    "send_in must be a number of seconds "
+                    "(0 < send_in <= 29d23h)"
+                )
+            send_after = time.time() + float(send_in)
+        with self.node.mailbox.transaction():
+            # Resolve first so an unknown id or ambiguous prefix stays a
+            # MailboxError (404 at the route); the edit below only raises
+            # MailboxError for state refusals, which become ValueError
+            # (400) here.
+            self.node.mailbox.resolve_outbox(target.strip())
+            try:
+                entries = self.node.mailbox.edit_scheduled_outbox(
+                    target.strip(), text=text, send_after=send_after
+                )
+            except MailboxError as exc:
+                raise ValueError(str(exc)) from exc
+            described = [
+                self._describe_outbox_entry(entry) for entry in entries
+            ]
+        self._update_scheduled_records(
+            [entry.id for entry in entries],
+            text=entries[0].text if text is not None else None,
+            send_after=send_after,
+        )
+        return {"edited": described, "legs": len(described)}
+
+    def _update_scheduled_records(
+        self,
+        mail_ids: List[str],
+        *,
+        text: Optional[str] = None,
+        send_after: Optional[float] = None,
+    ) -> None:
+        """Rewrite a queued console record after an outbox edit.
+
+        Matches on ``mail_id`` — or any of a group record's ``leg_ids``,
+        since a group send keeps one bubble for all its legs — and
+        updates the text and/or the "sends in ..." countdown, then
+        publishes ``message_updated`` so live tabs re-render in place.
+        """
+        wanted = set(mail_ids)
+        updated = []
+        with self._lock:
+            for message in self._messages:
+                if message.get("direction") != "out":
+                    continue
+                ids = {message.get("mail_id")} | set(
+                    message.get("leg_ids") or []
+                )
+                if not (ids & wanted):
+                    continue
+                if text is not None:
+                    message["text"] = text
+                if send_after is not None:
+                    message["send_after"] = send_after
+                updated.append(dict(message))
+            if updated:
+                self._save_messages()
+        for message in updated:
+            self._publish_message_updated(message)
+
     def _clear_scheduled_mark(self, mail_id: str) -> None:
         """Drop the "sends in ..." mark from console entries for a cancelled send.
 
@@ -10566,6 +10974,139 @@ class WebBridge:
             "previous_id": group["id"],
         }
 
+    def _describe_banned(self, group: Dict[str, Any]) -> List[Dict[str, str]]:
+        """A group's ban list with display names for the console."""
+        entries = []
+        for banned_hash in group.get("banned") or []:
+            peer = self.node.registry.get(banned_hash)
+            entries.append(
+                {
+                    "hash": banned_hash,
+                    "name": (
+                        peer.display_name
+                        if peer is not None
+                        else banned_hash[:8]
+                    ),
+                }
+            )
+        return entries
+
+    def ban_group_member(self, query: str, peer: str) -> Dict[str, Any]:
+        """Ban a peer from a group from the console.
+
+        Mirrors ``tau group ban``: only the group's creator can ban,
+        the peer is removed from the roster when they are a member
+        and recorded on the ban list either way, so they cannot be
+        re-added or approved through a join request afterwards.  The
+        id derives from the roster, so banning a member is a
+        successor group (same name, new id) and the old id is
+        reported as ``previous_id``.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        if not isinstance(peer, str) or not peer.strip():
+            raise ValueError("field 'peer' is required")
+        group = self.node.groups.find(query.strip())
+        own_hash = self.node.destination_hexhash
+        if not group["local"] or group["creator"] != own_hash:
+            raise ValueError("only the creator can ban members of a group")
+        cleaned = peer.strip().lower()
+        # A member (or an already-banned peer) resolves straight from
+        # the roster, like a removal; anything else resolves through
+        # the registry, so the picker can pass a name as well as a hash.
+        known = list(group["members"]) + list(group.get("banned") or [])
+        if len(cleaned) == 32 and cleaned in known:
+            resolved = cleaned
+        else:
+            try:
+                found = self.node.registry.resolve(cleaned)
+            except PeerError as exc:
+                raise ValueError(str(exc)) from exc
+            if found is None:
+                raise ValueError(f"unknown peer: {peer.strip()}")
+            resolved = found.destination_hash.hex()
+        new_group = self.node.groups.ban(
+            group["id"], resolved, created_by=own_hash
+        )
+        return {
+            "group": self._describe_group(new_group),
+            "banned": self._describe_banned(new_group),
+            "previous_id": group["id"],
+        }
+
+    def unban_group_member(self, query: str, peer: str) -> Dict[str, Any]:
+        """Lift a ban on a group from the console.
+
+        Mirrors ``tau group unban``: only the group's creator can
+        unban, and the peer is not re-added to the roster — they can
+        join again afterwards, but only through the normal paths.  A
+        banned hash (full or unique prefix) needs no lookup; anything
+        else resolves through the registry, so the picker can pass a
+        name as well as a hash.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        if not isinstance(peer, str) or not peer.strip():
+            raise ValueError("field 'peer' is required")
+        group = self.node.groups.find(query.strip())
+        own_hash = self.node.destination_hexhash
+        if not group["local"] or group["creator"] != own_hash:
+            raise ValueError("only the creator can unban members of a group")
+        banned = list(group.get("banned") or [])
+        cleaned = peer.strip().lower()
+        matches = [entry for entry in banned if entry.startswith(cleaned)]
+        if len(matches) == 1:
+            resolved = matches[0]
+        elif len(matches) > 1:
+            raise ValueError(
+                f"ambiguous peer: {peer.strip()!r} matches several banned"
+                " peers; pass a longer hash prefix"
+            )
+        else:
+            try:
+                found = self.node.registry.resolve(cleaned)
+            except PeerError as exc:
+                raise ValueError(str(exc)) from exc
+            if found is not None:
+                resolved = found.destination_hash.hex()
+            elif len(cleaned) == 32:
+                try:
+                    bytes.fromhex(cleaned)
+                except ValueError:
+                    raise ValueError(f"unknown peer: {peer.strip()}") from None
+                resolved = cleaned
+            else:
+                raise ValueError(f"unknown peer: {peer.strip()}")
+        was_banned = resolved in banned
+        new_group = self.node.groups.unban(
+            group["id"], resolved, created_by=own_hash
+        )
+        described = self._describe_group(new_group)
+        found_peer = self.node.registry.get(resolved)
+        return {
+            "group": described,
+            "unbanned": {
+                "hash": resolved,
+                "name": (
+                    found_peer.display_name
+                    if found_peer is not None
+                    else resolved[:8]
+                ),
+            },
+            "was_banned": was_banned,
+        }
+
+    def banned_group_members(self, query: str) -> Dict[str, Any]:
+        """List the peers banned from a group, for the console."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        group = self.node.groups.find(query.strip())
+        return {
+            "group": self._describe_group(group),
+            "banned": self._describe_banned(group),
+            "count": len(group.get("banned") or []),
+        }
+
     def rename_group(self, query: str, name: str) -> Dict[str, Any]:
         """Rename a group from the console, mirroring ``tau group rename``.
 
@@ -11791,12 +12332,13 @@ def _valid_send_in(value: Any) -> bool:
 
     The cap mirrors the CLI's ``tau send --delay`` limit: a scheduled
     message must leave at least an hour of delivery window before the
-    30-day mail TTL. Huge JSON integers overflow ``float()``, so the
-    conversion is guarded here instead of raising past the 400 response.
+    30-day mail TTL. Huge JSON integers overflow ``float()`` and
+    non-numeric values raise ``ValueError``, so the conversion is
+    guarded here instead of raising past the 400 response.
     """
     try:
         seconds = float(value)
-    except OverflowError:
+    except (OverflowError, ValueError):
         return False
     return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL - 3600.0
 
@@ -11975,6 +12517,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/groups/left":
                 self._send_json(self.bridge.left_groups(), head_only)
+                return
+            if path == "/api/groups/banned":
+                target = query.get("group")
+                if not target or not target[0].strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    banned = self.bridge.banned_group_members(target[0].strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(banned, head_only)
                 return
             if path == "/api/broadcasts":
                 broadcasts = self.bridge.list_broadcasts()
@@ -12257,14 +12818,43 @@ class _WebHandler(BaseHTTPRequestHandler):
                 include_all = _query_flag(query, "all")
                 author = (query.get("author") or [None])[0]
                 tag = (query.get("tag") or [None])[0]
+                list_name = (query.get("list") or [None])[0]
                 try:
                     posts = self.bridge.tan_timeline(
-                        limit=limit, include_all=include_all, author=author, tag=tag
+                        limit=limit,
+                        include_all=include_all,
+                        author=author,
+                        tag=tag,
+                        list_name=list_name,
                     )
                 except Exception as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/lists":
+                records = self.bridge.tan_lists()
+                self._send_json(
+                    {"lists": records, "count": len(records)}, head_only
+                )
+                return
+            if path == "/api/tan/lists/members":
+                name = (query.get("name") or [None])[0]
+                if not name or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "query 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    payload = self.bridge.tan_list_members(name.strip())
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(payload, head_only)
                 return
             if path == "/api/tan/tags":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=100)
@@ -12557,6 +13147,21 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(
                     {"scheduled": scheduled, "count": len(scheduled)}, head_only
+                )
+                return
+            if path == "/api/tan/drafts":
+                try:
+                    drafts = self.bridge.tan_drafts()
+                except Exception:
+                    log.exception("failed to load saved Tan drafts")
+                    self._send_json(
+                        {"error": {"message": "could not load saved drafts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {"drafts": drafts, "count": len(drafts)}, head_only
                 )
                 return
             if path == "/api/tan/rules":
@@ -13108,6 +13713,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
                 return
+            if path == "/api/outbox/edit":
+                self._handle_outbox_edit(body, head_only)
+                return
             if path == "/api/settings":
                 self._handle_settings(body, head_only)
                 return
@@ -13378,6 +13986,43 @@ class _WebHandler(BaseHTTPRequestHandler):
                         body.get("members"),
                         adding=(path == "/api/groups/add-member"),
                     )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **changed}, head_only)
+                return
+            if path in (
+                "/api/groups/ban",
+                "/api/groups/unban",
+            ):
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                peer = body.get("peer")
+                if not isinstance(peer, str) or not peer.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'peer' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path == "/api/groups/ban":
+                        changed = self.bridge.ban_group_member(
+                            target.strip(), peer.strip()
+                        )
+                    else:
+                        changed = self.bridge.unban_group_member(
+                            target.strip(), peer.strip()
+                        )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
@@ -13962,8 +14607,73 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "post": post}, head_only)
                 return
             if path == "/api/tan/schedule":
+                kind = body.get("kind")
+                if kind is not None and kind not in ("repost", "quote"):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'kind' must be 'repost' or 'quote'"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                target_post = body.get("target_post")
+                if kind is not None:
+                    if not isinstance(target_post, str) or not target_post.strip():
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'target_post' is required to "
+                                    "schedule a repost or quote"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                elif target_post is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'target_post' needs kind "
+                                "'repost' or 'quote'"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 text = body.get("text")
-                if not isinstance(text, str) or not text.strip():
+                if kind == "repost":
+                    # A repost carries no text; an absent text is fine,
+                    # a non-string one is a client bug, and a non-empty
+                    # one would be silently dropped.
+                    if text is not None and not isinstance(text, str):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'text' must be a string"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if isinstance(text, str) and text.strip():
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "a scheduled repost carries no text"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    text = ""
+                elif not isinstance(text, str) or not text.strip():
                     self._send_json(
                         {"error": {"message": "field 'text' is required"}},
                         head_only,
@@ -13976,6 +14686,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                 ):
                     self._send_json(
                         {"error": {"message": "field 'reply_to' must be a post hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if kind is not None and reply_to is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "a scheduled repost or quote cannot "
+                                "be a reply"
+                            }
+                        },
                         head_only,
                         400,
                     )
@@ -13998,6 +14720,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 expires_in = body.get("expires_in")
+                if kind is not None and expires_in is not None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "a scheduled repost or quote cannot "
+                                "expire"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 if expires_in is not None:
                     # A scheduled post's expiry shares the 7d queue cap
                     # (see schedule_post): it cannot outlive the furthest
@@ -14031,6 +14765,52 @@ class _WebHandler(BaseHTTPRequestHandler):
                             400,
                         )
                         return
+                poll_options = body.get("poll_options")
+                if poll_options is not None:
+                    # A poll is a top-level entry: it cannot be a reply,
+                    # and its options are fixed at schedule time.
+                    if reply_to is not None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "a scheduled poll cannot be a reply"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if (
+                        not isinstance(poll_options, list)
+                        or not 2 <= len(poll_options) <= 8
+                        or any(
+                            not isinstance(option, str) or not option.strip()
+                            for option in poll_options
+                        )
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'poll_options' must be a list "
+                                    "of 2-8 non-empty strings"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                image = body.get("image")
+                if image is not None and not isinstance(image, str):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'image' must be a base64 data URL"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
                     scheduled = self.bridge.tan_schedule_post(
                         text,
@@ -14039,6 +14819,10 @@ class _WebHandler(BaseHTTPRequestHandler):
                         expires_in=(
                             float(expires_in) if expires_in is not None else 0.0
                         ),
+                        kind=kind,
+                        target_post=target_post,
+                        poll_options=poll_options,
+                        image=image,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -14066,6 +14850,141 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/tan/edit-scheduled":
+                target = body.get("id") or body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if text is not None and (
+                    not isinstance(text, str) or not text.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'text' must be non-empty"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                send_in = body.get("send_in")
+                if send_in is not None and (
+                    not isinstance(send_in, (int, float))
+                    or isinstance(send_in, bool)
+                    or not _valid_schedule_in(send_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'send_in' must be a number of "
+                                "seconds (0 < send_in <= 604800)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                if text is None and send_in is None:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'text' and/or 'send_in' is required"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    scheduled = self.bridge.tan_edit_scheduled_post(
+                        target.strip(),
+                        text=text,
+                        send_in=(
+                            float(send_in) if send_in is not None else None
+                        ),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "scheduled": scheduled}, head_only)
+                return
+            if path == "/api/tan/drafts":
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                reply_to = body.get("reply_to")
+                if reply_to is not None and (
+                    not isinstance(reply_to, str) or not reply_to.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'reply_to' must be a post hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                expires_in = body.get("expires_in")
+                if expires_in is not None:
+                    if (
+                        not isinstance(expires_in, (int, float))
+                        or isinstance(expires_in, bool)
+                        or not _valid_tan_expires_in(expires_in)
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'expires_in' must be a number of "
+                                    "seconds (0 < expires_in <= 604800)"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                try:
+                    draft = self.bridge.tan_save_draft(
+                        text,
+                        reply_to=reply_to,
+                        expires_in=(
+                            float(expires_in) if expires_in is not None else None
+                        ),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "draft": draft}, head_only)
+                return
+            if path == "/api/tan/drafts/delete":
+                target = body.get("id") or body.get("draft")
+                if target is None or isinstance(target, bool):
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    draft = self.bridge.tan_delete_draft(target)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "draft": draft}, head_only)
                 return
             if path == "/api/tan/quote":
                 target = body.get("target") or body.get("hash")
@@ -14133,6 +15052,75 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "mute": result}, head_only)
+                return
+            if path == "/api/tan/lists":
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    result = self.bridge.tan_create_list(name.strip())
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "list": result}, head_only)
+                return
+            if path == "/api/tan/lists/delete":
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    result = self.bridge.tan_delete_list(name.strip())
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "list": result}, head_only)
+                return
+            if path in ("/api/tan/lists/add", "/api/tan/lists/remove"):
+                name = body.get("name")
+                target = body.get("target") or body.get("author")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    if path.endswith("remove"):
+                        result = self.bridge.tan_list_remove(
+                            name.strip(), target.strip()
+                        )
+                    else:
+                        result = self.bridge.tan_list_add(
+                            name.strip(), target.strip()
+                        )
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "member": result}, head_only)
                 return
             if path in ("/api/tan/mute-keyword", "/api/tan/unmute-keyword"):
                 keyword = body.get("keyword")
@@ -14645,6 +15633,54 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **result}, head_only)
+                return
+            if path == "/api/channels/edit-scheduled":
+                target = body.get("id") or body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'id' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if text is not None and not isinstance(text, str):
+                    self._send_json(
+                        {"error": {"message": "field 'text' must be a string"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                send_in = body.get("send_in")
+                if send_in is not None and (
+                    not isinstance(send_in, (int, float))
+                    or isinstance(send_in, bool)
+                    or not _valid_schedule_in(send_in)
+                ):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "field 'send_in' must be a number of "
+                                "seconds (0 < send_in <= 604800)"
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    edited = self.bridge.channel_edit_scheduled_message(
+                        target.strip(),
+                        text=text,
+                        send_in=(float(send_in) if send_in is not None else None),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "edited": edited}, head_only)
                 return
             if path == "/api/channels/poll":
                 channel = body.get("channel")
@@ -15988,6 +17024,64 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 404)
             return
         self._send_json({"ok": True, "cancelled": cancelled}, head_only)
+
+    def _handle_outbox_edit(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target") or body.get("id")
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        text = body.get("text")
+        send_in = body.get("send_in")
+        if text is None and send_in is None:
+            self._send_json(
+                {
+                    "error": {
+                        "message": "nothing to change — pass 'text' and/or "
+                        "'send_in'"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        if text is not None and (
+            not isinstance(text, str) or not text.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'text' must be a non-empty string"}},
+                head_only,
+                400,
+            )
+            return
+        if send_in is not None and not _valid_send_in(send_in):
+            self._send_json(
+                {
+                    "error": {
+                        "message": "field 'send_in' must be a number of "
+                        "seconds (0 < send_in <= 29d23h)"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.edit_outbox(
+                target.strip(),
+                text=text,
+                send_in=send_in,
+            )
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except MailboxError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        self._send_json({"ok": True, **result}, head_only)
 
     def _handle_settings(self, body: Dict[str, Any], head_only: bool) -> None:
         setting = body.get("setting")

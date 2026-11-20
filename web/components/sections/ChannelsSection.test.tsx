@@ -291,6 +291,43 @@ describe("ChannelsSection", () => {
     );
   });
 
+  it("edits a scheduled message's text and time from the Scheduled rows", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    expect(await screen.findByText("morning hello")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit scheduled message" }),
+    );
+    fireEvent.change(screen.getByLabelText("Edit scheduled message"), {
+      target: { value: "morning, mesh!" },
+    });
+    fireEvent.change(screen.getByLabelText("New send time"), {
+      target: { value: "3600" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls).toContain("POST /api/channels/edit-scheduled"),
+    );
+  });
+
+  it("an unchanged scheduled edit makes no request", async () => {
+    render(<ChannelsSection />);
+    fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+    expect(await screen.findByText("morning hello")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit scheduled message" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    // The form closes (its Edit button is back) without touching the API.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Edit scheduled message" }),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByLabelText("New send time")).toBeNull();
+    expect(calls).not.toContain("POST /api/channels/edit-scheduled");
+  });
+
   it("schedules a message when Send later is picked", async () => {
     render(<ChannelsSection />);
     fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
