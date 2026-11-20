@@ -407,6 +407,10 @@ Global options may appear before or after the command:
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau send-file --to PEER FILE --delay 5m` | Stage a file and send it in 5 minutes (needs a node serving at send time; at most 10 MiB) |
+| `tau group send-file GROUP FILE --delay 5m` | Same, fanned out to a group's members |
+| `tau scheduled-files` | List files scheduled to send later |
+| `tau scheduled-files cancel ID` | Drop a scheduled file before it sends (deletes its staged bytes) |
 | `tau send --to PEER TEXT --poll-options A B` | Ask a question with 2–8 options in a DM (the poll renders with its tally in `tau messages` and the console) |
 | `tau vote --to PEER POLL OPTION` | Vote on a DM poll (option number or exact text; one standing vote per voter, latest wins) |
 | `tau close-poll --to PEER POLL` | Close a DM poll you created (freezes the tally; only the creator can close it) |

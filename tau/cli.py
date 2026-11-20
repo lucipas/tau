@@ -237,6 +237,17 @@ from .scheduled_channel import (
     load_scheduled_channel_messages,
     schedule_channel_message,
 )
+from .scheduled_files import (
+    ScheduledFile,
+    ScheduledFileError,
+    cancel_scheduled_file,
+    load_scheduled_files,
+    new_scheduled_file_id,
+    read_file_payload,
+    remove_staged_file,
+    schedule_file,
+    stage_file,
+)
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
@@ -750,6 +761,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long the whole transfer may take (default 300)",
     )
     send_file.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the file: stage it now and send it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack; needs a node "
+        "serving at send time)",
+    )
+    send_file.add_argument(
         "--discover-timeout",
         type=float,
         default=10.0,
@@ -757,6 +776,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     send_file.set_defaults(func=cmd_send_file)
+
+    # Files queued with `--delay` wait here until a serving node
+    # sends them: list them, or drop one before it goes out.
+    scheduled_files = subparsers.add_parser(
+        "scheduled-files",
+        parents=[common],
+        help="list files scheduled to send later",
+    )
+    scheduled_files_sub = scheduled_files.add_subparsers(
+        dest="scheduled_files_command", metavar="SCHEDULED_FILES_COMMAND"
+    )
+    scheduled_files_cancel = scheduled_files_sub.add_parser(
+        "cancel",
+        parents=[common],
+        help="drop a scheduled file before it sends",
+    )
+    scheduled_files_cancel.add_argument(
+        "target",
+        metavar="ID",
+        help="scheduled file id or unique prefix (see `tau scheduled-files`)",
+    )
+    scheduled_files_cancel.set_defaults(func=cmd_cancel_scheduled_file)
+    scheduled_files.set_defaults(func=cmd_scheduled_files)
 
     # A note is a message to self that never leaves the machine, so it
     # gets its own subcommand instead of overloading `send --to <self>`
@@ -2834,6 +2876,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=300.0,
         metavar="SECONDS",
         help="how long each member's transfer may take (default 300)",
+    )
+    group_send_file.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the file: stage it now and send it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack; needs a node "
+        "serving at send time)",
     )
     group_send_file.add_argument(
         "--discover-timeout",
@@ -13813,8 +13863,98 @@ def cmd_forward(args: argparse.Namespace) -> int:
     return cmd_send(args)
 
 
+def _queue_file_for_later(
+    config: Any,
+    *,
+    target: str,
+    kind: str,
+    path: Path,
+    send_after: float,
+) -> ScheduledFile:
+    """Stage *path* and queue it for *target* at *send_after*.
+
+    Reads and validates the file first (same 1..10 MiB limit and safe
+    name an immediate send enforces), stages the bytes under a fresh
+    queue id, then records the queue entry.  A queue write that fails
+    after staging removes the staged bytes again, so a failed
+    schedule never leaves an orphaned staged file behind.
+    """
+    try:
+        data, name, digest = read_file_payload(path)
+    except ScheduledFileError as exc:
+        raise NodeError(str(exc)) from exc
+    entry_id = new_scheduled_file_id()
+    stage_file(config.scheduled_files_dir, entry_id, name, data)
+    try:
+        return schedule_file(
+            config.scheduled_files_path,
+            target=target,
+            kind=kind,
+            file={"sha256": digest, "size": len(data), "name": name},
+            publish_at=send_after,
+            file_id=entry_id,
+        )
+    except Exception:
+        remove_staged_file(config.scheduled_files_dir, entry_id)
+        raise
+
+
+def _print_scheduled_file(entry: ScheduledFile, *, delay: float) -> None:
+    destination = (
+        f"group {entry.target}" if entry.kind == "group" else entry.target
+    )
+    print(
+        f"scheduled {entry.file['name']} ({entry.file['size']} bytes) "
+        f"for {destination} — sends in {_ago(delay)}"
+    )
+    print(f"  id:      {entry.id}")
+    print("  a node serving will send it at its scheduled time;")
+    print(
+        "  list it with `tau scheduled-files`, cancel it with "
+        "`tau scheduled-files cancel <id>`"
+    )
+
+
+def _emit_scheduled_file(entry: ScheduledFile) -> None:
+    _emit(
+        {
+            "scheduled": True,
+            "id": entry.id,
+            "to": entry.target,
+            "kind": entry.kind,
+            "name": entry.file["name"],
+            "size": entry.file["size"],
+            "sha256": entry.file["sha256"],
+            "send_after": entry.publish_at,
+        },
+        True,
+    )
+
+
 def cmd_send_file(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        entry = _queue_file_for_later(
+            config,
+            target=args.to,
+            kind="dm",
+            path=args.path,
+            send_after=time.time() + delay,
+        )
+        if _json_mode(args):
+            _emit_scheduled_file(entry)
+        else:
+            _print_scheduled_file(entry, delay=delay)
+        return _EXIT_OK
     node = TauNode(config, name=config.name)
     node.start()
     last_percent = -1
@@ -13848,6 +13988,68 @@ def cmd_send_file(args: argparse.Namespace) -> int:
     )
     print(f"  id:     {response['id']}")
     print(f"  sha256: {response['sha256']}")
+    return _EXIT_OK
+
+
+def cmd_scheduled_files(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    try:
+        queue = load_scheduled_files(config.scheduled_files_path)
+    except ScheduledFileError as exc:
+        raise NodeError(str(exc)) from exc
+    entries = queue.files
+    if _json_mode(args):
+        _emit({"scheduled": [entry.to_dict() for entry in entries]}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No files scheduled.")
+        return _EXIT_OK
+    now = time.time()
+    for entry in entries:
+        when = _stamp(entry.publish_at)
+        if entry.publish_at <= now:
+            when += " (due — sends on the next serve pass)"
+        else:
+            when += f" (in {_ago(entry.publish_at - now)})"
+        destination = (
+            f"group {entry.target}" if entry.kind == "group" else entry.target
+        )
+        print(
+            f"{entry.id}  {destination}  {entry.file['name']} "
+            f"({entry.file['size']} bytes)  {when}"
+        )
+        if entry.attempts:
+            if entry.next_attempt_at > now:
+                print(
+                    f"  {entry.attempts} failed attempt(s); "
+                    f"next try in {_ago(entry.next_attempt_at - now)}"
+                )
+            else:
+                print(f"  {entry.attempts} failed attempt(s)")
+    return _EXIT_OK
+
+
+def cmd_cancel_scheduled_file(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+
+    def _delete_staged(entry: ScheduledFile) -> None:
+        # Dropping only the queue entry would leave the staged bytes
+        # behind; a later schedule reuses the id space, never the
+        # bytes, so delete them with the entry.
+        remove_staged_file(config.scheduled_files_dir, entry.id)
+
+    try:
+        entry = cancel_scheduled_file(
+            config.scheduled_files_path,
+            args.target,
+            on_cancel=_delete_staged,
+        )
+    except ScheduledFileError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit({"cancelled": entry.to_dict()}, True)
+    else:
+        print(f"cancelled {entry.id} — {entry.file['name']} will not be sent")
     return _EXIT_OK
 
 
@@ -18479,6 +18681,34 @@ def _report_group_reaction(
 
 def cmd_group_send_file(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        # Resolve the group without starting a node: scheduling only
+        # needs the group to exist.  The name is stored (like a
+        # scheduled channel message stores its channel), so a rename
+        # or roster change orphans the entry — it stays queued for
+        # inspection or cancel rather than sending to the wrong group.
+        group = GroupStore(config.groups_path).find(args.group)
+        entry = _queue_file_for_later(
+            config,
+            target=group["name"],
+            kind="group",
+            path=args.path,
+            send_after=time.time() + delay,
+        )
+        if _json_mode(args):
+            _emit_scheduled_file(entry)
+        else:
+            _print_scheduled_file(entry, delay=delay)
+        return _EXIT_OK
     node = TauNode(config, name=config.name)
     node.start()
     try:

@@ -724,6 +724,7 @@ class TauNode:
         self._foreign_announces: Dict[str, Dict[str, Any]] = {}
         self._foreign_announces_lock = threading.Lock()
         self._mail_thread: Optional[threading.Thread] = None
+        self._scheduled_files_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
         self._mail_round_threads: Set[threading.Thread] = set()
         self._mail_rounds_lock = threading.Lock()
@@ -4725,6 +4726,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled channel-message publish failed", exc_info=True)
             try:
+                self._publish_due_scheduled_files()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Scheduled file send failed", exc_info=True)
+            try:
                 self._send_due_beacon_updates()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Beacon update round failed", exc_info=True)
@@ -4795,6 +4800,98 @@ class TauNode:
                 "Published %d scheduled channel message(s)",
                 result["published"],
             )
+
+    def _publish_due_scheduled_files(self) -> None:
+        """Send files whose scheduled time has come, on a worker thread.
+
+        A file transfer can take minutes, so the pass never runs on
+        the mail-loop thread and never holds the queue lock across a
+        send (see ``tau.scheduled_files``).  At most one pass runs at
+        a time: a pass still working when the next mail loop comes
+        around is left alone, and the next pass picks up whatever is
+        still due.  A failed send keeps the entry queued — see
+        ``tau.scheduled_files`` — so this never raises into the mail
+        loop.
+        """
+        thread = self._scheduled_files_thread
+        if thread is not None and thread.is_alive():
+            return
+        from .scheduled_files import publish_due_scheduled_files
+
+        def _run() -> None:
+            try:
+                result = publish_due_scheduled_files(
+                    self.config.scheduled_files_path,
+                    self.config.scheduled_files_dir,
+                    self._send_scheduled_file,
+                    should_stop=self._stop_event.is_set,
+                )
+            except Exception:  # pragma: no cover - defensive; helper logs
+                log.debug("Scheduled-file send pass failed", exc_info=True)
+                return
+            if result["published"]:
+                log.info("Sent %d scheduled file(s)", result["published"])
+
+        thread = threading.Thread(target=_run, name="scheduled-files", daemon=True)
+        self._scheduled_files_thread = thread
+        thread.start()
+
+    def _send_scheduled_file(self, entry: Any, staged_path: Path) -> None:
+        """One scheduled file transfer: DM via ``send_file``, group
+        via ``send_group_file``.
+
+        The staged bytes are re-read and checked against the queue
+        entry's descriptor first, so a staged copy that was replaced
+        or corrupted after scheduling never goes out under the wrong
+        name or hash.  A group fan-out that fails on any leg raises,
+        so the entry is retried whole rather than half-delivered.
+        """
+        from .scheduled_files import ScheduledFileError
+
+        try:
+            data, name, digest = _read_file_payload(staged_path)
+        except NodeError as exc:
+            raise ScheduledFileError(str(exc)) from exc
+        descriptor = entry.file
+        if (
+            digest != descriptor["sha256"]
+            or name != descriptor["name"]
+            or len(data) != descriptor["size"]
+        ):
+            raise ScheduledFileError(
+                f"scheduled file {entry.id} staged bytes do not match "
+                "their descriptor"
+            )
+        if entry.kind == "group":
+            result = self.send_group_file(
+                entry.target,
+                staged_path,
+                timeout=_FILE_TRANSFER_TIMEOUT,
+                discover_timeout=10.0,
+            )
+            if not result.get("ok"):
+                failed = [
+                    leg
+                    for leg in result.get("results") or []
+                    if not leg.get("delivered")
+                ]
+                detail = "; ".join(
+                    f"{leg.get('to_name') or (leg.get('to') or '')[:8]}: "
+                    f"{leg.get('error') or 'unknown error'}"
+                    for leg in failed
+                )
+                raise NodeError(
+                    f"scheduled file {entry.id} failed for "
+                    f"{len(failed)} member(s)"
+                    + (f": {detail}" if detail else "")
+                )
+            return
+        self.send_file(
+            entry.target,
+            staged_path,
+            timeout=_FILE_TRANSFER_TIMEOUT,
+            discover_timeout=10.0,
+        )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:
         """Ask a few known peers for their peers, outside the mail lock.
