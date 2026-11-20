@@ -7,6 +7,7 @@ store-and-forward outbox.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import threading
@@ -32,6 +33,8 @@ from tau.protocol import (
     clean_group_topic,
     decode,
     derive_group_id,
+    edit_dict,
+    encode,
     encode_group_message,
     generate_group_id,
     parse_group_message,
@@ -2897,10 +2900,13 @@ def test_group_message_from_member_dropped_when_announcements_only(tmp_path):
     assert node.groups.get(group_id)["announcements_only"] is True
     assert len(received) == 1
 
-    # A member's post is refused and never stored or shown.
+    # A member's post is refused and never stored or shown.  The
+    # refusal carries its own code, so a sender can tell a group
+    # policy refusal — final for the queued leg — from an allow-list
+    # denial, which the recipient may lift later.
     response = post(member, "can I post?", message_id="gm-a2", sent_at=110.0)
     assert response["ok"] is False
-    assert response["error"]["code"] == "not_allowed"
+    assert response["error"]["code"] == "announcements_only"
     assert "announcements-only" in response["error"]["message"]
     assert len(received) == 1
     assert [entry["text"] for entry in node.inbox.list_messages()] == [
@@ -3094,6 +3100,247 @@ def test_relayed_group_vote_keeps_poll_vote_in_announcements_only_group(
         "option": 1,
     }
     assert stored["text"] == "voted: Sunday"
+
+
+def _announcements_vote_fixture(tmp_path):
+    """Node + group where the creator toggled announcements-only and opened a poll."""
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    assert post(
+        creator,
+        "which day?",
+        message_id="gm-poll",
+        sent_at=120.0,
+        poll_options=["Saturday", "Sunday"],
+    )["ok"] is True
+    return node, received, post, creator, member, creator_hash, member_hash, group_id
+
+
+def _signed_group_edit(
+    sender, target, text, message_id, *, sent_at, group, target_author, target_sent_at
+):
+    """A signed group edit payload, as send_group_edit builds it."""
+    payload = edit_dict(
+        target,
+        text,
+        message_id=message_id,
+        sent_at=sent_at,
+        group=group,
+        target_author=target_author,
+        target_sent_at=target_sent_at,
+    )
+    payload["sig"] = base64.b64encode(sender.sign(encode(payload))).decode("ascii")
+    return encode(payload)
+
+
+def _member_vote(post, member, member_hash, creator_hash):
+    return post(
+        member,
+        "free pizza at my place, ignore the announcement",
+        message_id="gm-vote",
+        sent_at=130.0,
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+
+
+def test_group_edit_of_member_vote_keeps_canonical_text(tmp_path):
+    node, received, post, creator, member, creator_hash, member_hash, group_id = (
+        _announcements_vote_fixture(tmp_path)
+    )
+    assert _member_vote(post, member, member_hash, creator_hash)["ok"] is True
+    assert received[-1]["text"] == "voted: Sunday"
+    # The member edits their vote with a smuggled post.  The edit is
+    # accepted — but the stored text stays the canonical vote rendering.
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-vote",
+            "free pizza at my place, ignore the announcement",
+            "gm-edit-1",
+            sent_at=140.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=130.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is True
+    entry = node.inbox.list_messages(group=group_id)[0]
+    assert entry["text"] == "voted: Sunday"
+    assert entry["edited_at"] == 140.0
+
+
+def test_pending_group_edit_of_member_vote_keeps_canonical_text(tmp_path):
+    node, received, post, creator, member, creator_hash, member_hash, group_id = (
+        _announcements_vote_fixture(tmp_path)
+    )
+    # The member's edit arrives BEFORE the vote: it is planted as a
+    # pending edit, not applied to any copy yet.
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-vote",
+            "free pizza at my place, ignore the announcement",
+            "gm-edit-1",
+            sent_at=140.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=130.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is False
+    # The vote lands afterwards: the pending edit must not replace the
+    # canonical vote text the copy was sanitized to.
+    assert _member_vote(post, member, member_hash, creator_hash)["ok"] is True
+    assert received[-1]["text"] == "voted: Sunday"
+    entry = node.inbox.list_messages(group=group_id)[0]
+    assert entry["text"] == "voted: Sunday"
+
+
+def test_relayed_group_vote_with_pending_edit_keeps_canonical_text(tmp_path):
+    node, received, post, creator, member, creator_hash, member_hash, group_id = (
+        _announcements_vote_fixture(tmp_path)
+    )
+    node.identity = RNS.Identity()
+    # The edit is planted before the sealed copy arrives.
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-vote",
+            "free pizza at my place, ignore the announcement",
+            "gm-edit-1",
+            sent_at=140.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=130.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is False
+    blob = seal_message(
+        member,
+        sender_name="member",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="gm-vote",
+        text="free pizza at my place",
+        sent_at=130.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": creator_hash,
+            "members": [OWN_HASH, creator_hash, member_hash],
+            "announcements_only": True,
+            "announcements_sent_at": 100.0,
+        },
+        poll_vote={
+            "target": {"author": creator_hash, "sent_at": 120.0},
+            "option": 1,
+        },
+    )
+    message = open_message(node.identity, blob)
+    assert node._deliver_collected(message) is True
+    stored = node.inbox.list_messages(group=group_id)[0]
+    assert stored["text"] == "voted: Sunday"
+
+
+def test_group_edit_of_ordinary_message_still_applies_when_announcements_only(
+    tmp_path,
+):
+    # An ordinary message sent before the restriction keeps its edits:
+    # only a vote or close is pinned to the canonical rendering.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def post(sender, text, *, message_id, sent_at, **kwargs):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    # The member's ordinary message lands before the restriction.
+    assert post(
+        member, "typo here", message_id="gm-plain", sent_at=90.0
+    )["ok"] is True
+    assert post(
+        creator,
+        "announcements only from now on",
+        message_id="gm-a1",
+        sent_at=100.0,
+        group_announcements_only=True,
+    )["ok"] is True
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            member,
+            "gm-plain",
+            "fixed here",
+            "gm-edit-2",
+            sent_at=150.0,
+            group=group_id,
+            target_author=member_hash,
+            target_sent_at=90.0,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is True
+    entries = {
+        entry["id"]: entry
+        for entry in node.inbox.list_messages(group=group_id)
+    }
+    assert entries["gm-plain"]["text"] == "fixed here"
 
 
 def test_group_message_with_reply_stores_reference(tmp_path):

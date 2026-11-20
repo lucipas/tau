@@ -12,7 +12,13 @@ import pytest
 from tau.config import TauConfig
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox, MailboxError
-from tau.node import NodeError, NotAllowedError, TauNode, _AnnounceHandler
+from tau.node import (
+    AnnouncementsOnlyError,
+    NodeError,
+    NotAllowedError,
+    TauNode,
+    _AnnounceHandler,
+)
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import APP_NAME, ASPECT, build_announce, parse_message
 
@@ -1159,6 +1165,37 @@ def test_deliver_entry_skips_queued_post_when_group_goes_announcements_only(
     assert skipped.next_attempt_at > time.time()
 
 
+def test_skip_paces_restricted_leg_once_per_sweep(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+    # The creator restricts the group after the leg was queued.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=200.0,
+        announcements_only=True,
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True},
+    )
+    # The direct skip records the attempt.
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    assert node.mailbox.get_outbox("bob-leg-1").attempts == 1
+    # The deposit loop visits the same leg once per holder peer in the
+    # sweep — those visits must not record again, or one sweep would
+    # compound the backoff without a network attempt and delay the leg
+    # for up to an hour after the creator lifts the restriction.
+    assert node._deposit_entry(alice, snapshot, timeout=1.0) is False
+    assert node._deposit_entry(alice, snapshot, timeout=1.0) is False
+    assert node.mailbox.get_outbox("bob-leg-1").attempts == 1
+
+
 def test_deliver_entry_drops_queued_group_leg_when_peer_refuses_not_allowed(
     tmp_path, monkeypatch
 ):
@@ -1167,14 +1204,70 @@ def test_deliver_entry_drops_queued_group_leg_when_peer_refuses_not_allowed(
     snapshot = node.mailbox.get_outbox("bob-leg-1")
 
     def refused(*args, **kwargs):
-        raise NotAllowedError("peer rejected the request: not allowed")
+        raise AnnouncementsOnlyError(
+            "peer rejected the request: group is announcements-only: "
+            "only the creator can post"
+        )
 
     monkeypatch.setattr(node, "_request", refused)
-    # A group leg refused as not-allowed is a policy refusal, like
-    # not-a-member: the group will not take this post, so the leg is
-    # dropped instead of held until its TTL.
+    # A group leg refused as announcements-only is a policy refusal,
+    # like not-a-member: the group will not take this post, so the leg
+    # is dropped instead of held until its TTL.
     assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
     assert node.mailbox.get_outbox("bob-leg-1") is None
+
+
+def test_deliver_entry_keeps_queued_group_leg_when_peer_refuses_allow_list(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")
+    snapshot = node.mailbox.get_outbox("bob-leg-1")
+
+    def refused(*args, **kwargs):
+        raise NotAllowedError(
+            "peer rejected the request: sender is not on this node's "
+            "allow-list"
+        )
+
+    monkeypatch.setattr(node, "_request", refused)
+    # An allow-list refusal is changeable — the recipient may allow-list
+    # the sender later — so the leg must stay queued for retry instead
+    # of being dropped with the announcements-only refusals.
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is False
+    kept = node.mailbox.get_outbox("bob-leg-1")
+    assert kept is not None
+    assert kept.attempts == 1
+
+
+def test_request_maps_announcements_only_to_its_own_error(tmp_path):
+    from tau.protocol import response_error
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+
+    class _Receipt:
+        def get_response(self):
+            return response_error(
+                "announcements_only",
+                "group is announcements-only: only the creator can post",
+            )
+
+        def get_response_time(self):
+            return 0.004
+
+    class _Link:
+        def request(
+            self, path, payload, *, response_callback, failed_callback, **kwargs
+        ):
+            response_callback(_Receipt())
+            return object()
+
+    # The refusal maps to the distinct error, and that error is still
+    # a NotAllowedError for every existing refusal handler.
+    with pytest.raises(AnnouncementsOnlyError, match="announcements-only"):
+        node._request_on_link(_Link(), "/tau/group", b"{}", 1.0)
+    with pytest.raises(NotAllowedError):
+        node._request_on_link(_Link(), "/tau/group", b"{}", 1.0)
 
 
 def test_deliver_entry_drop_on_not_allowed_is_bounded_by_deadline(
@@ -1185,7 +1278,10 @@ def test_deliver_entry_drop_on_not_allowed_is_bounded_by_deadline(
     snapshot = node.mailbox.get_outbox("bob-leg-1")
 
     def refused(*args, **kwargs):
-        raise NotAllowedError("peer rejected the request: not allowed")
+        raise AnnouncementsOnlyError(
+            "peer rejected the request: group is announcements-only: "
+            "only the creator can post"
+        )
 
     monkeypatch.setattr(node, "_request", refused)
     seen = {}

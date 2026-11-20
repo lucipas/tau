@@ -446,6 +446,18 @@ class NotAllowedError(PeerRefusedError):
     """
 
 
+class AnnouncementsOnlyError(NotAllowedError):
+    """Raised when a peer refuses a group post because the group is announcements-only.
+
+    A subclass of :class:`NotAllowedError`, so every existing refusal
+    handler still treats it as an explicit refusal — but distinguishable
+    from an allow-list denial, which the recipient may lift later: only
+    an announcements-only refusal is final for the queued leg (see
+    :meth:`TauNode._deliver_entry`), while an allow-list refusal stays
+    queued for retry.
+    """
+
+
 class NotAMemberError(NodeError):
     """Raised when a peer rejects a group message as not a group member.
 
@@ -3110,7 +3122,7 @@ class TauNode:
                 message["group"],
             )
             return response_error(
-                "not_allowed",
+                "announcements_only",
                 "group is announcements-only: only the creator can post",
             )
         if (
@@ -3262,6 +3274,15 @@ class TauNode:
                                 # keeps its own text.
                                 record["text"] = pending["text"]
                                 record["edited_at"] = pending["edited_at"]
+                                # An edit of a member's vote cannot
+                                # replace the canonical vote text this
+                                # copy was sanitized to, or the vote
+                                # exemption smuggles a post in.
+                                canonical = self._announcements_edit_text(
+                                    group, caller_hash, record
+                                )
+                                if canonical is not None:
+                                    record["text"] = canonical
                             voided = self.inbox.append_group_message(
                                 record,
                                 group=group["id"],
@@ -3299,6 +3320,13 @@ class TauNode:
                     ):
                         record["text"] = pending["text"]
                         record["edited_at"] = pending["edited_at"]
+                        # As in the id branch: an edit of a member's
+                        # vote cannot replace the canonical vote text.
+                        canonical = self._announcements_edit_text(
+                            group, caller_hash, record
+                        )
+                        if canonical is not None:
+                            record["text"] = canonical
                     self._record_received(record)
             if not duplicate:
                 self._notify_message(record, publish_ok=publish_ok)
@@ -3423,7 +3451,7 @@ class TauNode:
                     named_group["id"][:8],
                 )
                 return response_error(
-                    "not_allowed",
+                    "announcements_only",
                     "group is announcements-only: only the creator can post",
                 )
         self._prune_file_offers()
@@ -4715,6 +4743,19 @@ class TauNode:
                 **group_flag,
             )
         try:
+            # An edit of a member's vote in an announcements-only
+            # group cannot replace the canonical vote text with
+            # arbitrary content: substitute the canonical rendering
+            # for the edit's text (see _announcements_edit_text).
+            # The console callback below sends this text too, so the
+            # served copy never shows the smuggled one either.
+            edit_text = edit["text"]
+            if is_group:
+                canonical = self._announcements_edit_text(
+                    pinned, caller_hash, record
+                )
+                if canonical is not None:
+                    edit_text = canonical
             # The ownership and ordering checks above read a snapshot;
             # the inbox repeats them atomically so racing edits cannot
             # apply out of order.  A group leg is identified by its own
@@ -4724,14 +4765,14 @@ class TauNode:
             if is_group:
                 applied = self.inbox.apply_edit(
                     target_id,
-                    edit["text"],
+                    edit_text,
                     edited_at=effective_at,
                     newer_than_existing=True,
                 )
             else:
                 applied = self.inbox.apply_edit(
                     target_id,
-                    edit["text"],
+                    edit_text,
                     edited_at=effective_at,
                     direction="in",
                     destination=caller_hash,
@@ -4763,7 +4804,7 @@ class TauNode:
                 self.on_edit(
                     {
                         "target": target_id,
-                        "text": edit["text"],
+                        "text": edit_text,
                         "edited_at": effective_at,
                         "from": caller_name,
                         "destination": caller_hash,
@@ -5580,6 +5621,34 @@ class TauNode:
             float(ann_at) if isinstance(ann_at, (int, float)) else None,
         )
 
+    def _announcements_edit_text(
+        self,
+        group: Optional[Dict[str, Any]],
+        author_hash: str,
+        record: Dict[str, Any],
+    ) -> Optional[str]:
+        """Canonical text for an edited vote or close in an announcements-only group.
+
+        A member's vote or close is not a post, but its display text
+        must stay the canonical rendering: an edit of a vote — live,
+        or pending against a copy that had not landed yet — cannot
+        replace that rendering with arbitrary content, or the vote
+        exemption smuggles a post into the group.  Returns the
+        canonical text when the record is a non-creator member's vote
+        or close in an announcements-only group, else None (the edit
+        applies normally).  Ordinary messages keep their edits,
+        including ones sent before the restriction.
+        """
+        if not (group or {}).get("announcements_only"):
+            return None
+        if (author_hash or "").lower() == (group.get("creator") or "").lower():
+            return None
+        if record.get("poll_vote") is None and record.get("poll_close") is None:
+            return None
+        return self._announcements_vote_text(
+            group["id"], record.get("poll_vote"), record.get("poll_close")
+        )
+
     def _announcements_vote_text(
         self,
         group_id: str,
@@ -5725,23 +5794,30 @@ class TauNode:
                 # A skip that records nothing leaves next_attempt_at
                 # untouched, so the sweep re-checks this leg every
                 # round until its TTL.  Record the skip as a failed
-                # attempt, so the backoff moves it out of the way
-                # while the leg stays queued for a later lift.
-                try:
-                    self.mailbox.record_attempt(
-                        entry.id,
-                        error=(
-                            "group is announcements-only: only the creator "
-                            "can post"
-                        ),
-                        timeout=_remaining(deadline),
-                    )
-                except TimeoutError:
-                    log.debug(
-                        "Could not record skipped delivery attempt for %s: "
-                        "mailbox lock busy",
-                        entry.id,
-                    )
+                # attempt — but only while the leg is due: the deposit
+                # loop visits the same leg once per holder peer in a
+                # sweep, and recording every visit would compound the
+                # backoff without a network attempt, delaying delivery
+                # for up to an hour after the creator lifts the
+                # restriction.  The first skip sets next_attempt_at,
+                # so later visits in the same sweep see the leg as not
+                # due and record nothing.
+                if fresh.is_due():
+                    try:
+                        self.mailbox.record_attempt(
+                            entry.id,
+                            error=(
+                                "group is announcements-only: only the creator "
+                                "can post"
+                            ),
+                            timeout=_remaining(deadline),
+                        )
+                    except TimeoutError:
+                        log.debug(
+                            "Could not record skipped delivery attempt for %s: "
+                            "mailbox lock busy",
+                            entry.id,
+                        )
                 return False
             try:
                 payload = encode_group_message(
@@ -5860,12 +5936,16 @@ class TauNode:
             if isinstance(exc, PeerRefusedError) or not self._still_queued(
                 entry.id, timeout=_remaining(deadline)
             ):
-                # A group leg refused as not-allowed is a policy
+                # A group leg refused as announcements-only is a policy
                 # refusal, like not-a-member: the group will not take
                 # this post, so drop the leg instead of holding it
-                # until its TTL.  (A non-group refusal still records
-                # an attempt below and stays queued.)
-                if isinstance(exc, NotAllowedError) and entry.group_id is not None:
+                # until its TTL.  Any other refusal — an allow-list
+                # denial, say, which the recipient may lift later —
+                # is not final for the leg: it records an attempt
+                # below and stays queued.  (The refusal code is
+                # distinct — see AnnouncementsOnlyError — so the two
+                # cannot be confused.)
+                if isinstance(exc, AnnouncementsOnlyError) and entry.group_id is not None:
                     log.warning(
                         "Dropping queued group message %s: %s", entry.id, exc
                     )
@@ -6067,22 +6147,25 @@ class TauNode:
                 # Same as the delivery skip: record the skip as a
                 # failed attempt, so the backoff moves the leg out of
                 # the sweep's way while it stays queued for a later
-                # lift, instead of re-checking it every round.
-                try:
-                    self.mailbox.record_attempt(
-                        entry.id,
-                        error=(
-                            "group is announcements-only: only the creator "
-                            "can post"
-                        ),
-                        timeout=_remaining(deadline),
-                    )
-                except TimeoutError:
-                    log.debug(
-                        "Could not record skipped deposit attempt for %s: "
-                        "mailbox lock busy",
-                        entry.id,
-                    )
+                # lift, instead of re-checking it every round — but
+                # only while the leg is due, or one sweep would record
+                # the same skip once per holder peer (see _deliver_entry).
+                if fresh.is_due():
+                    try:
+                        self.mailbox.record_attempt(
+                            entry.id,
+                            error=(
+                                "group is announcements-only: only the creator "
+                                "can post"
+                            ),
+                            timeout=_remaining(deadline),
+                        )
+                    except TimeoutError:
+                        log.debug(
+                            "Could not record skipped deposit attempt for %s: "
+                            "mailbox lock busy",
+                            entry.id,
+                        )
                 return False
         if self.identity is None:
             return False
@@ -6769,6 +6852,18 @@ class TauNode:
                         # one does (see _handle_group_message).
                         record["text"] = pending["text"]
                         record["edited_at"] = pending["edited_at"]
+                        # As in the direct path: an edit of a
+                        # member's vote cannot replace the canonical
+                        # vote text.
+                        canonical = self._announcements_edit_text(
+                            pinned,
+                            message.get("from")
+                            if isinstance(message.get("from"), str)
+                            else "",
+                            record,
+                        )
+                        if canonical is not None:
+                            record["text"] = canonical
                     voided = self.inbox.append_group_message(
                         record,
                         group=pinned["id"],
@@ -10738,6 +10833,33 @@ class TauNode:
                 # not inbox files, and a failed inbox write must not block them.
                 self._complete_media_fetch(offer, data)
                 return
+            if offer.get("group") is not None:
+                # The offer was accepted while the group was open; the
+                # creator may have switched it to announcements-only
+                # while the bytes were still in flight.  Re-check the
+                # setting now, before the file is recorded — otherwise
+                # a member's file lands after the restriction.  An
+                # unknown group cannot be checked, so it is accepted,
+                # exactly as at offer time.  Media fetches already
+                # returned above: they answer an explicit request, not
+                # a group post.
+                try:
+                    named_group = self.groups.find(offer["group"])
+                except (ValueError, OSError):
+                    named_group = None
+                if (
+                    named_group is not None
+                    and named_group.get("announcements_only")
+                    and offer["from"].lower()
+                    != (named_group.get("creator") or "").lower()
+                ):
+                    log.info(
+                        "File transfer %s refused: group %s is "
+                        "announcements-only and the sender is not its creator",
+                        transfer_id[:8],
+                        named_group["id"][:8],
+                    )
+                    return
             peer = self.registry.get(offer["from"])
             if peer is not None:
                 offer["from_name"] = peer.display_name
@@ -10956,6 +11078,10 @@ class TauNode:
         if decoded.get("ok") is not True:
             error = decoded.get("error") or {}
             message = error.get("message", "unknown error")
+            if error.get("code") == "announcements_only":
+                raise AnnouncementsOnlyError(
+                    f"peer rejected the request: {message}"
+                )
             if error.get("code") == "not_allowed":
                 raise NotAllowedError(f"peer rejected the request: {message}")
             if error.get("code") == "unavailable":
