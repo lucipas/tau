@@ -46,6 +46,7 @@ import {
   revokeGroupInvites,
   saveTanDraft,
   closeDmPoll,
+  editOutbox,
   saveDraft,
   sendBroadcast,
   scheduleChannelMessage,
@@ -326,6 +327,21 @@ describe("POST endpoints", () => {
     nextJson = { ok: true, message: {}, response: {} };
     await sendMessage({ group: "g123" }, "hi");
     expect(bodyOf(0)).toEqual({ group: "g123", text: "hi" });
+  });
+
+  it("edits a scheduled outbox message with text and/or send_in", async () => {
+    nextJson = { ok: true, edited: [], legs: 1 };
+    await editOutbox("aa".repeat(16), { text: "reworded", send_in: 3600 });
+    expect(captured[0].url).toBe("/api/outbox/edit");
+    expect(bodyOf(0)).toEqual({
+      target: "aa".repeat(16),
+      text: "reworded",
+      send_in: 3600,
+    });
+
+    nextJson = { ok: true, edited: [], legs: 1 };
+    await editOutbox("bb".repeat(16), { send_in: 300 });
+    expect(bodyOf(1)).toEqual({ target: "bb".repeat(16), send_in: 300 });
   });
 
   it("saves and deletes a message draft", async () => {

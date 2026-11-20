@@ -39,6 +39,7 @@ import type {
   MessageDraft,
   NodeSettings,
   Outbox,
+  OutboxEntry,
   OutboxRetryResult,
   OwnProfile,
   PageList,
@@ -817,6 +818,13 @@ export async function getOutbox(): Promise<Outbox> {
 
 export async function cancelOutbox(target: string): Promise<unknown> {
   return post("/api/outbox/cancel", { target });
+}
+
+export async function editOutbox(
+  target: string,
+  patch: { text?: string; send_in?: number },
+): Promise<{ ok: boolean; edited: OutboxEntry[]; legs: number }> {
+  return post("/api/outbox/edit", { target, ...patch });
 }
 
 export async function retryOutbox(target?: string): Promise<OutboxRetryResult> {

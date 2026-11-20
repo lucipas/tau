@@ -3,9 +3,17 @@
 
 "use client";
 
+import { useState } from "react";
 import { formatCountdown, formatDateTime } from "@/lib/format";
 import { useNow } from "@/lib/use-now";
-import type { HeldEnvelope, Outbox } from "@/lib/types";
+import type { HeldEnvelope, Outbox, OutboxEntry } from "@/lib/types";
+
+const EDIT_DELAY_OPTIONS: { label: string; seconds: number | undefined }[] = [
+  { label: "Keep time", seconds: undefined },
+  { label: "In 5 minutes", seconds: 5 * 60 },
+  { label: "In 1 hour", seconds: 3600 },
+  { label: "Tomorrow", seconds: 86400 },
+];
 
 export interface OutboxPanelProps {
   outbox: Outbox | null;
@@ -13,6 +21,10 @@ export interface OutboxPanelProps {
   loading?: boolean;
   error?: string | null;
   onCancel: (target: string) => void;
+  onEdit: (
+    target: string,
+    patch: { text?: string; send_in?: number },
+  ) => void;
   onRetry: (target?: string) => void;
   onDropHeld: (target: string) => void;
 }
@@ -23,12 +35,50 @@ export default function OutboxPanel({
   loading = false,
   error,
   onCancel,
+  onEdit,
   onRetry,
   onDropHeld,
 }: OutboxPanelProps) {
   const now = useNow();
   const entries = outbox?.outbox ?? [];
   const count = outbox?.count ?? entries.length;
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [editDelay, setEditDelay] = useState<number | undefined>(undefined);
+
+  function startEditing(entry: OutboxEntry) {
+    setEditingId(entry.id);
+    setEditText(entry.text);
+    setEditDelay(undefined);
+  }
+
+  function saveEdit(entry: OutboxEntry) {
+    const trimmed = editText.trim();
+    if (!trimmed) return;
+    const patch: { text?: string; send_in?: number } = {};
+    if (trimmed !== entry.text) patch.text = trimmed;
+    if (editDelay !== undefined) patch.send_in = editDelay;
+    // Unchanged save makes no request.
+    if (patch.text === undefined && patch.send_in === undefined) {
+      setEditingId(null);
+      return;
+    }
+    onEdit(entry.id, patch);
+    setEditingId(null);
+  }
+
+  // Only a still-scheduled plain message can be edited: poll, vote,
+  // close and beacon legs carry no plain text, and a due or
+  // retry-queued entry is no longer waiting on its send time.
+  function isEditable(entry: OutboxEntry) {
+    return (
+      entry.send_after != null &&
+      entry.poll_options == null &&
+      entry.poll_vote == null &&
+      entry.poll_close == null &&
+      entry.beacon == null
+    );
+  }
 
   return (
     <section aria-label="Outbox" className="border-b border-zinc-800 px-3 py-2">
@@ -76,22 +126,86 @@ export default function OutboxPanel({
                 {entry.send_after ? ` · sends ${formatCountdown(entry.send_after, now)}` : ""}
                 {` · queued ${formatDateTime(entry.created_at)}`}
               </p>
-              <div className="mt-1 flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => onRetry(entry.to)}
-                  className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-xs text-zinc-200 hover:bg-zinc-800"
-                >
-                  Retry
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onCancel(entry.to)}
-                  className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-xs text-zinc-200 hover:bg-zinc-800"
-                >
-                  Cancel
-                </button>
-              </div>
+              {editingId === entry.id ? (
+                <div className="mt-1 flex flex-col gap-1.5">
+                  <input
+                    type="text"
+                    value={editText}
+                    onChange={(event) => setEditText(event.target.value)}
+                    aria-label="Edit scheduled message text"
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-2 py-1 text-sm text-zinc-100"
+                  />
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={editDelay === undefined ? "" : String(editDelay)}
+                      onChange={(event) =>
+                        setEditDelay(
+                          event.target.value === ""
+                            ? undefined
+                            : Number(event.target.value),
+                        )
+                      }
+                      aria-label="New send time"
+                      className="rounded-lg border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-200"
+                    >
+                      {EDIT_DELAY_OPTIONS.map((option) => (
+                        <option
+                          key={option.label}
+                          value={option.seconds === undefined ? "" : String(option.seconds)}
+                        >
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => saveEdit(entry)}
+                      disabled={
+                        !editText.trim() ||
+                        (editText.trim() === entry.text &&
+                          editDelay === undefined)
+                      }
+                      className="rounded-full bg-cyan-500 px-2.5 py-0.5 text-xs font-semibold text-white hover:bg-cyan-400 disabled:opacity-50"
+                    >
+                      Save
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingId(null)}
+                      className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-xs text-zinc-200 hover:bg-zinc-800"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-1 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onRetry(entry.to)}
+                    className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-xs text-zinc-200 hover:bg-zinc-800"
+                  >
+                    Retry
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onCancel(entry.to)}
+                    className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-xs text-zinc-200 hover:bg-zinc-800"
+                  >
+                    Cancel
+                  </button>
+                  {isEditable(entry) && (
+                    <button
+                      type="button"
+                      onClick={() => startEditing(entry)}
+                      aria-label="Edit scheduled message"
+                      className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-xs text-zinc-200 hover:bg-zinc-800"
+                    >
+                      Edit
+                    </button>
+                  )}
+                </div>
+              )}
             </li>
           ))}
         </ul>

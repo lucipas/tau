@@ -11702,6 +11702,147 @@ def test_outbox_cancel_errors(bridge, node):
     assert "unknown queued message" in payload["error"]["message"]
 
 
+def _queue_scheduled(node, to_hex, text, message_id=None, delay=7200.0):
+    return node.mailbox.enqueue(
+        to=bytes.fromhex(to_hex),
+        text=text,
+        message_id=message_id,
+        send_after=time.time() + delay,
+    )
+
+
+def test_outbox_edit_by_id_and_prefix(bridge, node):
+    first = _queue_scheduled(node, PEER_HASH, "first", "aa" + "11" * 15)
+    second = _queue_scheduled(node, PEER_HASH, "second", "bb" + "22" * 15)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": first.id, "text": "first, reworded"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["legs"] == 1
+    assert payload["edited"][0]["id"] == first.id
+    assert payload["edited"][0]["text"] == "first, reworded"
+    assert payload["edited"][0]["send_after"] == first.send_after
+
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": second.id[:8], "send_in": 3600},
+    )
+    assert status == 200
+    assert payload["edited"][0]["text"] == "second"
+    assert abs(payload["edited"][0]["send_after"] - (before + 3600)) < 5.0
+
+    _, _, listed = _json(bridge, "/api/outbox")
+    by_id = {entry["id"]: entry for entry in listed["outbox"]}
+    assert by_id[first.id]["text"] == "first, reworded"
+    assert by_id[second.id]["send_after"] > before + 3500
+
+
+def test_outbox_edit_errors(bridge, node):
+    scheduled = _queue_scheduled(node, PEER_HASH, "later", "cc" + "11" * 15)
+    immediate = _queue(node, PEER_HASH, "now")
+
+    # No change requested.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": scheduled.id},
+    )
+    assert status == 400
+    assert "nothing to change" in payload["error"]["message"]
+
+    # Missing target.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"text": "nope"},
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    # Unknown id is a 404; an ambiguous prefix too.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": "ff" * 16, "text": "nope"},
+    )
+    assert status == 404
+    assert "unknown queued message" in payload["error"]["message"]
+
+    # A message that is not scheduled cannot be edited.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": immediate.id, "text": "too late"},
+    )
+    assert status == 400
+    assert "no longer scheduled" in payload["error"]["message"]
+    assert node.mailbox.get_outbox(immediate.id).text == "now"
+
+    # Bad send_in values are 400s, and the entry is untouched.
+    for bad in (0, -30, "soon", 30 * 86400):
+        status, _, payload = _json(
+            bridge,
+            "/api/outbox/edit",
+            method="POST",
+            body={"target": scheduled.id, "send_in": bad},
+        )
+        assert status == 400
+        assert "send_in" in payload["error"]["message"]
+    assert node.mailbox.get_outbox(scheduled.id).text == "later"
+
+
+def test_outbox_edit_group_updates_every_leg(bridge, node):
+    crew = node.groups.list_groups()[0]
+    group = {
+        "id": crew["id"],
+        "name": "crew",
+        "creator": PEER_HASH,
+        "members": [PEER_HASH, BOB_HASH],
+    }
+    first = node.mailbox.enqueue(
+        to=bytes.fromhex(BOB_HASH),
+        text="crew hello",
+        message_id="dd" + "11" * 15,
+        send_after=time.time() + 7200.0,
+        sent_at=1000.0,
+        group=group,
+    )
+    second = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="crew hello",
+        message_id="dd" + "22" * 15,
+        send_after=time.time() + 7200.0,
+        sent_at=1000.0,
+        group=group,
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/edit",
+        method="POST",
+        body={"target": first.id[:8], "text": "crew hello, edited"},
+    )
+    assert status == 200
+    assert payload["legs"] == 2
+    assert {entry["id"] for entry in payload["edited"]} == {
+        first.id,
+        second.id,
+    }
+    assert node.mailbox.get_outbox(first.id).text == "crew hello, edited"
+    assert node.mailbox.get_outbox(second.id).text == "crew hello, edited"
+
+
 def test_settings_defaults(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:

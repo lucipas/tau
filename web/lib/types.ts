@@ -498,6 +498,14 @@ export interface OutboxEntry {
   sent_at: number | null;
   edited_at: number | null;
   group?: OutboxGroup;
+  /** Poll this leg carries, if any — the API only includes it when set. */
+  poll_options?: string[];
+  poll_vote?: Record<string, unknown>;
+  poll_close?: Record<string, unknown>;
+  /** Live-beacon marker this leg carries, if any. */
+  beacon?: Record<string, unknown>;
+  /** Static location pin this leg carries, if any. */
+  location?: Record<string, unknown>;
   read_at?: number | null;
 }
 
