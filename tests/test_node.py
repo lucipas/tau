@@ -80,6 +80,97 @@ def test_resolve_unknown_peer_without_identity_data(tmp_path):
         node.resolve_peer(b"\x00" * 16)
 
 
+def _make_self_destination():
+    identity = RNS.Identity()
+    destination_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    return identity, destination_hash
+
+
+def test_resolve_peer_refuses_own_hash(tmp_path):
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.resolve_peer(own_hash)
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.resolve_peer(own_hash.hex())
+    self_peer = Peer(
+        destination_hash=own_hash,
+        name="tester",
+        public_key=identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.resolve_peer(self_peer)
+    assert node.registry.get(own_hash) is None
+
+
+def test_wait_for_peer_refuses_own_hash_without_recall(tmp_path, monkeypatch):
+    # The circular loop: Reticulum remembers the node's own announced
+    # identity, so recalling the node's own hash succeeds and the
+    # registry gains the node as its own peer. The guard must fire
+    # before any path request or recall happens.
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    recalled = []
+    monkeypatch.setattr(
+        RNS.Identity,
+        "recall",
+        staticmethod(lambda dest_hash: recalled.append(dest_hash) or identity),
+    )
+    requested = []
+    monkeypatch.setattr(
+        RNS.Transport,
+        "request_path",
+        staticmethod(lambda dest_hash: requested.append(dest_hash)),
+    )
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.wait_for_peer(own_hash, timeout=0.1)
+    assert recalled == []
+    assert requested == []
+    assert node.registry.get(own_hash) is None
+
+
+def test_drop_self_peer_purges_registry_and_persists(tmp_path):
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    node.registry.upsert(
+        own_hash, identity.get_public_key(), name="tester", now=time.time()
+    )
+    other = make_peer()
+    node.registry.upsert(
+        other.destination_hash, other.public_key, name=other.name, now=time.time()
+    )
+    assert len(node.registry) == 2
+
+    node._drop_self_peer()
+
+    assert node.registry.self_hash == own_hash
+    assert node.registry.get(own_hash) is None
+    assert node.registry.get(other.destination_hash) is not None
+    reloaded = PeerRegistry(node.config.peers_path)
+    assert reloaded.get(own_hash) is None
+    assert reloaded.get(other.destination_hash) is not None
+
+
+def test_send_message_to_self_never_enters_outbox(tmp_path):
+    # The resolve guard raises before delivery, but send_message's
+    # NodeError fallback re-derives the target hash and queues the
+    # send — a self-targeted send must be rejected there too, never
+    # queued for store-and-forward to our own hash (Qodo Fixer, #623).
+    node = make_node(tmp_path)
+    identity, own_hash = _make_self_destination()
+    node.destination = SimpleNamespace(hash=own_hash, hexhash=own_hash.hex())
+    node.reticulum = SimpleNamespace()  # started, so the queue fallback is live
+    with pytest.raises(NodeError, match="cannot resolve this node as a peer"):
+        node.send_message(own_hash.hex(), "hello self")
+    assert node.mailbox.outbox_list() == []
+    assert node.registry.get(own_hash) is None
+
+
 def test_info_requires_start(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(NodeError):
@@ -1179,6 +1270,86 @@ def test_send_group_message_with_send_after_queues_without_delivery(
     assert sent[0]["leg_sent_at"] == response["sent_at"]
 
 
+def test_send_group_poll_with_send_after_queues_poll_intact(
+    tmp_path, monkeypatch
+):
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    send_after = time.time() + 3600.0
+    response = node.send_group_message(
+        "crew",
+        "Lunch?",
+        send_after=send_after,
+        poll_options=["Monday", "Tuesday"],
+    )
+
+    # No delivery attempt at all — the poll is scheduled, not sent.
+    assert calls == []
+    assert response["ok"] is True
+    assert len(response["results"]) == 2
+    assert all(result.get("queued") for result in response["results"])
+    assert all(
+        result.get("send_after") == send_after for result in response["results"]
+    )
+    for result in response["results"]:
+        entry = node.mailbox.get_outbox(result["id"])
+        assert entry is not None
+        assert entry.send_after == send_after
+        assert entry.poll_options == ["Monday", "Tuesday"]
+        assert entry.group_id == group["id"]
+    # The sent record carries the poll, so the sender's history
+    # renders it as a poll with its options.
+    sent = node.inbox.list_messages(direction="out")
+    assert len(sent) == 1
+    assert sent[0]["poll_options"] == ["Monday", "Tuesday"]
+    assert sent[0]["leg_sent_at"] == response["sent_at"]
+
+
+def test_scheduled_group_poll_publishes_with_options_when_due(
+    tmp_path, monkeypatch
+):
+    node, group, alice, _ = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message(
+        "crew",
+        "Lunch?",
+        send_after=send_after,
+        poll_options=["Monday", "Tuesday"],
+    )
+    assert all(result.get("queued") for result in response["results"])
+    delivered = []
+    monkeypatch.setattr(
+        node,
+        "_deliver_entry",
+        lambda p, e, timeout, **kwargs: (
+            delivered.append(e),
+            True,
+        )[1],
+    )
+    monkeypatch.setattr(
+        node,
+        "_deposit_entry",
+        lambda p, e, timeout, **kwargs: False,
+    )
+    peer = alice
+    # Not due yet: the flush leaves both legs queued.
+    node._flush_peer(peer, 1.0, respect_backoff=False)
+    assert delivered == []
+    assert len(node.mailbox.outbox_list()) == 2
+    # Once the time passes, the same flush delivers the poll with
+    # its question and options intact.
+    for result in response["results"]:
+        node.mailbox.get_outbox(result["id"]).send_after = time.time() - 1.0
+    node.mailbox.save()
+    node._flush_peer(peer, 1.0, respect_backoff=False)
+    assert len(delivered) == 1
+    assert delivered[0].text == "Lunch?"
+    assert delivered[0].poll_options == ["Monday", "Tuesday"]
+
+
 def test_send_group_message_scheduled_resolves_unregistered_member(
     tmp_path, monkeypatch
 ):
@@ -1765,6 +1936,37 @@ def test_send_group_edit_defers_scheduled_legs(tmp_path, monkeypatch):
     assert all(leg.send_after == send_after for leg in legs)
     # The sender's own copies took the new text too.
     assert node.inbox.list_messages(direction="out")[0]["text"] == "fixed here"
+
+
+def test_send_group_edit_keeps_poll_options_on_scheduled_requeue(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    send_after = time.time() + 3600.0
+    response = node.send_group_message(
+        "crew",
+        "which day?",
+        poll_options=["Saturday", "Sunday"],
+        send_after=send_after,
+    )
+    assert all(result.get("queued") for result in response["results"])
+    sent_at = response["sent_at"]
+    record = node.inbox.list_messages(direction="out")[0]
+
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("no live edit may go out for a scheduled leg")
+        ),
+    )
+    edit = node.send_group_edit(
+        "crew", record["id"], "which weekend?", target_sent_at=sent_at
+    )
+
+    assert edit["ok"] is True
+    legs = node.mailbox.outbox_list()
+    assert len(legs) == 2
+    assert all(leg.text == "which weekend?" for leg in legs)
+    assert all(leg.poll_options == ["Saturday", "Sunday"] for leg in legs)
 
 
 def test_send_group_edit_skips_live_edit_when_scheduled_requeue_fails(

@@ -21,7 +21,11 @@ database before reading the queue could hold neither.  The backup
 therefore holds the scheduled-posts lock from the member-list
 decision through both captures, and the publish pass holds that same
 lock across the create and the removal, so the pair is always one
-consistent state.  Restore treats the archive as untrusted input: the manifest
+consistent state.  The same holds for scheduled files: the backup
+holds the scheduled-files lock from the member-list decision through
+the archive, so the queue file and the staged bytes it names are one
+consistent pair, and restore verifies each staged file against its
+queue entry before installing anything.  Restore treats the archive as untrusted input: the manifest
 must declare format 1, every member must be an allowlisted regular file
 with no ``..`` segments, the archive must contain an identity, and
 expanded sizes are bounded while streaming.
@@ -32,8 +36,10 @@ check during restore imports :mod:`tau.identity`.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import logging
 import os
 import sqlite3
 import tarfile
@@ -42,6 +48,8 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+log = logging.getLogger(__name__)
 
 from . import __version__
 from .config import (
@@ -54,6 +62,8 @@ from .config import (
     FILES_DIR_NAME,
     MUTED_FILE_NAME,
     QUIET_HOURS_FILE_NAME,
+    SCHEDULED_FILES_DIR_NAME,
+    SCHEDULED_FILES_FILE_NAME,
     SCHEDULED_POSTS_FILE_NAME,
     TauConfig,
 )
@@ -92,6 +102,7 @@ BACKUP_FILES = (
     AWAY_FILE_NAME,
     DM_REQUESTS_FILE_NAME,
     SCHEDULED_POSTS_FILE_NAME,
+    SCHEDULED_FILES_FILE_NAME,
     "groups.json",
     "blocklist.json",
     RNS_CONFIG_MEMBER,
@@ -184,12 +195,115 @@ def _received_files(config: TauConfig) -> List[str]:
     return members
 
 
+def _is_scheduled_file_member(name: str) -> bool:
+    """True when *name* is a staged scheduled-file member:
+    ``scheduled-files/<id>/<name>``.
+
+    Staged files are always exactly two levels under
+    ``scheduled-files/`` — the id directory is the queue id (16 hex
+    characters) and the file name is the bare name the queue entry
+    carries — so anything shallower, deeper, or naming ``.`` / ``..``
+    is not a member this module ever writes and is rejected as
+    unexpected on restore.
+    """
+    parts = Path(name).parts
+    if len(parts) != 3 or parts[0] != SCHEDULED_FILES_DIR_NAME:
+        return False
+    queue_id, file_name = parts[1], parts[2]
+    if len(queue_id) != 16 or file_name in ("", ".", ".."):
+        return False
+    try:
+        bytes.fromhex(queue_id)
+    except ValueError:
+        return False
+    return True
+
+
+def _scheduled_files(config: TauConfig) -> List[str]:
+    """Member names of the staged files under the scheduled-files directory.
+
+    Symlinks are never followed: a symlinked ``scheduled-files/``
+    directory, a symlinked id directory, or a symlinked file is
+    skipped, so a backup can never smuggle in a path outside the data
+    directory.  A directory that cannot be listed is an error, never
+    an empty result, so a backup cannot silently omit staged files.
+    """
+    staged_dir = config.scheduled_files_dir
+    if staged_dir.is_symlink() or not staged_dir.is_dir():
+        return []
+    members: List[str] = []
+    try:
+        id_dirs = sorted(staged_dir.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise BackupError(
+            f"could not list staged files in {staged_dir}: {exc}"
+        ) from exc
+    for id_dir in id_dirs:
+        if id_dir.is_symlink() or not id_dir.is_dir():
+            continue
+        try:
+            entries = sorted(id_dir.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise BackupError(
+                f"could not list staged files in {id_dir}: {exc}"
+            ) from exc
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            members.append(
+                f"{SCHEDULED_FILES_DIR_NAME}/{id_dir.name}/{entry.name}"
+            )
+    return members
+
+
+def _owned_scheduled_files(config: TauConfig) -> List[str]:
+    """Staged scheduled-file members owned by a queue entry.
+
+    Like :func:`_scheduled_files`, but only members the queue owns:
+    ``scheduled-files/<id>/<name>`` for entries whose staged file
+    exists as a regular file and is not a symlink.  Orphaned staged
+    bytes — a crash between staging and the queue commit, a failed
+    removal, a leftover ``.tmp-`` file — are skipped and logged, so a
+    backup made while such bytes exist is still restorable: the
+    restore side refuses any staged member without a queue entry, so
+    archiving an orphan would make the whole archive unrestorable.
+    Callers must hold the scheduled-files lock, so the queue and the
+    staged bytes cannot drift between the load and the listing.  A
+    corrupt queue fails the backup loudly instead of silently
+    omitting scheduled files from it.
+    """
+    from .scheduled_files import ScheduledFileError, load_scheduled_files
+
+    try:
+        queue = load_scheduled_files(config.scheduled_files_path)
+    except ScheduledFileError as exc:
+        raise BackupError(
+            f"not a valid tau backup: scheduled-files queue is invalid: {exc}"
+        ) from exc
+    expected = {
+        f"{SCHEDULED_FILES_DIR_NAME}/{entry.id}/{entry.file['name']}"
+        for entry in queue.files
+    }
+    members: List[str] = []
+    for name in _scheduled_files(config):
+        if name in expected:
+            members.append(name)
+        else:
+            log.warning(
+                "Skipping orphaned staged scheduled file %s in backup: "
+                "no queue entry owns it",
+                name,
+            )
+    return members
+
+
 def _destinations(
-    config: TauConfig, received: List[str] = ()
+    config: TauConfig, received: List[str] = (), scheduled: List[str] = ()
 ) -> Dict[str, Path]:
     """Live location of every allowlisted archive member."""
     paths = {name: config.data_dir / name for name in BACKUP_FILES}
     paths.update({name: config.data_dir / name for name in received})
+    paths.update({name: config.data_dir / name for name in scheduled})
     paths[RNS_CONFIG_MEMBER] = config.rns_config_file
     return paths
 
@@ -281,17 +395,38 @@ def create_backup(
         # consistent state — either the post is still queued, or
         # it is in the database snapshot.  (Lazy import: this module
         # stays importable without Reticulum.)
+        from .scheduled_files import scheduled_files_lock
         from .scheduled_posts import scheduled_posts_lock
 
-        with scheduled_posts_lock(config.scheduled_posts_path):
-            # Enumerated under the lock, so the member list cannot drift
-            # from the files actually archived below.
+        with (
+            scheduled_posts_lock(config.scheduled_posts_path),
+            scheduled_files_lock(config.scheduled_files_path),
+        ):
+            # Enumerated under the locks, so the member list cannot
+            # drift from the files actually archived below.  The
+            # scheduled-files lock is held from the member-list
+            # decision through the archive, so no schedule, cancel,
+            # or send claim can interleave: the queue file and the
+            # staged bytes the archive holds are one consistent pair.
+            # (A file that finishes sending mid-backup still fails
+            # the backup with "disappeared ... try again", like any
+            # other state file that vanishes under the archive.)
             received = _received_files(config)
+            # Only entry-owned staged files: orphaned bytes (a crash
+            # between staging and the queue commit, a failed removal,
+            # a leftover .tmp- file) would make the archive
+            # unrestorable, because the restore refuses any staged
+            # member without a queue entry.
+            scheduled = _owned_scheduled_files(config)
             destinations.update(
                 {name: config.data_dir / name for name in received}
             )
+            destinations.update(
+                {name: config.data_dir / name for name in scheduled}
+            )
             files = [name for name in BACKUP_FILES if destinations[name].is_file()]
             files.extend(received)
+            files.extend(scheduled)
             # A symlinked state file would be archived as a symlink member,
             # which restore rejects as not a regular file — so a backup of
             # a node with linked state would succeed and then never
@@ -443,7 +578,10 @@ def _check_members(archive: tarfile.TarFile, manifest: Dict[str, object]) -> Lis
         if name.startswith("/") or ".." in Path(name).parts:
             raise BackupError(f"not a tau backup: unsafe member path {name!r}")
         if name not in allowed and not _is_received_file_member(name):
-            raise BackupError(f"not a tau backup: unexpected member {name!r}")
+            if not _is_scheduled_file_member(name):
+                raise BackupError(
+                    f"not a tau backup: unexpected member {name!r}"
+                )
         if name not in expected:
             raise BackupError(f"not a tau backup: member {name!r} is not in the manifest")
         if not member.isreg():
@@ -533,6 +671,90 @@ def _stage(
             )
             handle.flush()
             os.fsync(handle.fileno())
+
+
+def _check_scheduled_files_dirs(config: TauConfig, scheduled: List[str]) -> None:
+    """Refuse scheduled-file restores whose parent directories are not real.
+
+    Each ``scheduled-files/<id>`` member is written beneath
+    ``scheduled-files/`` and its id directory; a symlink there would
+    redirect the write outside the data directory.  Called under the
+    instance lock, before staging.
+    """
+    staged_dir = config.data_dir / SCHEDULED_FILES_DIR_NAME
+    if not scheduled:
+        return
+    paths = [staged_dir] + [
+        staged_dir / Path(name).parts[1] for name in scheduled
+    ]
+    for path in dict.fromkeys(paths):
+        if os.path.lexists(path) and (path.is_symlink() or not path.is_dir()):
+            raise BackupError(
+                f"refusing to restore scheduled files: {path} is a "
+                "symlink or not a directory"
+            )
+
+
+def _verify_scheduled_files(
+    staged: Dict[Path, Path], destinations: Dict[str, Path], files: List[str]
+) -> None:
+    """Check the staged scheduled-files queue against its staged bytes.
+
+    Every queue entry's bytes must be in the archive and hash to the
+    descriptor the entry carries, and every staged member must belong
+    to a queue entry — otherwise the restore would hand the send pass
+    an entry it can never deliver, or orphaned bytes no entry can
+    manage.  Called after staging, before anything live is replaced.
+    A missing queue file means no scheduled files were backed up, so
+    staged members on their own are refused as orphans.
+    """
+    from .scheduled_files import load_scheduled_files
+
+    members = set(files)
+    staged_members = {
+        name for name in files if _is_scheduled_file_member(name)
+    }
+    if SCHEDULED_FILES_FILE_NAME not in files:
+        if staged_members:
+            raise BackupError(
+                "not a valid tau backup: staged scheduled files without "
+                "their queue"
+            )
+        return
+    queue_path = staged[destinations[SCHEDULED_FILES_FILE_NAME]]
+    try:
+        queue = load_scheduled_files(queue_path)
+    except Exception as exc:
+        raise BackupError(
+            f"not a valid tau backup: scheduled-files queue is invalid: {exc}"
+        ) from exc
+    expected = set()
+    for entry in queue.files:
+        member = (
+            f"{SCHEDULED_FILES_DIR_NAME}/{entry.id}/{entry.file['name']}"
+        )
+        expected.add(member)
+        if member not in members:
+            raise BackupError(
+                "not a valid tau backup: scheduled file "
+                f"{entry.id} has no staged bytes in the archive"
+            )
+        staged_bytes = staged[destinations[member]].read_bytes()
+        if (
+            len(staged_bytes) != entry.file["size"]
+            or hashlib.sha256(staged_bytes).hexdigest()
+            != entry.file["sha256"]
+        ):
+            raise BackupError(
+                "not a valid tau backup: staged bytes for scheduled "
+                f"file {entry.id} do not match its queue entry"
+            )
+    orphans = staged_members - expected
+    if orphans:
+        raise BackupError(
+            "not a valid tau backup: staged scheduled files without a "
+            f"queue entry: {sorted(orphans)}"
+        )
 
 
 def _check_received_dirs(config: TauConfig, received: List[str]) -> None:
@@ -663,7 +885,9 @@ def restore_backup(
         except _READ_ERRORS as exc:
             raise BackupError(f"not a valid tau backup: {exc}") from exc
         destinations = _destinations(
-            config, [name for name in files if _is_received_file_member(name)]
+            config,
+            [name for name in files if _is_received_file_member(name)],
+            [name for name in files if _is_scheduled_file_member(name)],
         )
         state = _state_paths(destinations)
         # Create the data directory before taking the lock: the lock
@@ -682,11 +906,19 @@ def restore_backup(
             _check_received_dirs(
                 config, [name for name in files if _is_received_file_member(name)]
             )
+            _check_scheduled_files_dirs(
+                config,
+                [name for name in files if _is_scheduled_file_member(name)],
+            )
             # Received files on disk that the archive does not hold are
             # stale state too: a --force restore removes them, like any
             # other included file.  Scanned under the lock so a file a
             # serving node saves before the lock is taken cannot survive.
             for name in _received_files(config):
+                state.setdefault(name, config.data_dir / name)
+            # Same for staged scheduled files: a --force restore must
+            # not leave bytes behind that no restored queue entry owns.
+            for name in _scheduled_files(config):
                 state.setdefault(name, config.data_dir / name)
             with _identity_lock(config.identity_path):
                 existing = [
@@ -701,6 +933,7 @@ def restore_backup(
                 staged: Dict[Path, Path] = {}
                 try:
                     _stage(archive, files, destinations, staged)
+                    _verify_scheduled_files(staged, destinations, files)
                     if "inbox.json" in files:
                         _rebase_inbox(
                             staged[destinations["inbox.json"]],

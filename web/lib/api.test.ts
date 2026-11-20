@@ -50,6 +50,7 @@ import {
   saveDraft,
   sendBroadcast,
   scheduleChannelMessage,
+  scheduleChannelPoll,
   scheduleTanPoll,
   scheduleTanPost,
   scheduleTanQuote,
@@ -414,6 +415,19 @@ describe("POST endpoints", () => {
     expect(captured[0].url).toBe("/api/channels/schedule");
     expect(captured[0].init?.method).toBe("POST");
     expect(bodyOf(0)).toEqual({ channel: "general", text: "later", send_in: 300 });
+  });
+
+  it("schedules a channel poll with its options", async () => {
+    nextJson = { ok: true, scheduled: {} };
+    await scheduleChannelPoll("general", "which day?", ["Saturday", "Sunday"], 300);
+    expect(captured[0].url).toBe("/api/channels/schedule");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({
+      channel: "general",
+      text: "which day?",
+      poll_options: ["Saturday", "Sunday"],
+      send_in: 300,
+    });
   });
 
 it("schedules a Tan repost or quote with kind and target_post", async () => {

@@ -407,6 +407,10 @@ Global options may appear before or after the command:
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau send-file --to PEER FILE --delay 5m` | Stage a file and send it in 5 minutes (needs a node serving at send time; at most 10 MiB) |
+| `tau group send-file GROUP FILE --delay 5m` | Same, fanned out to a group's members |
+| `tau scheduled-files` | List files scheduled to send later |
+| `tau scheduled-files cancel ID` | Drop a scheduled file before it sends (deletes its staged bytes) |
 | `tau send --to PEER TEXT --poll-options A B` | Ask a question with 2–8 options in a DM (the poll renders with its tally in `tau messages` and the console) |
 | `tau vote --to PEER POLL OPTION` | Vote on a DM poll (option number or exact text; one standing vote per voter, latest wins) |
 | `tau close-poll --to PEER POLL` | Close a DM poll you created (freezes the tally; only the creator can close it) |
@@ -483,10 +487,11 @@ Global options may appear before or after the command:
 | `tau channel list` | List joined channels with cached message and unread counts |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message; `--expire 30s` makes it a disappearing message, purged from members' stores after the duration; a per-channel default from `tau disappearing --channel` fills the expiry in when no `--expire` is passed) |
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
-| `tau channel scheduled [NAME]` | List queued channel messages, soonest first |
-| `tau channel cancel-scheduled ID` | Drop a queued channel message before it publishes |
+| `tau channel scheduled [NAME]` | List queued channel messages and polls, soonest first |
+| `tau channel cancel-scheduled ID` | Drop a queued channel message or poll before it publishes |
 | `tau channel edit-scheduled ID [--text TEXT] [--delay DURATION]` | Change a queued channel message's text and/or publish time |
 | `tau channel poll NAME "QUESTION" OPT...` | Post a poll in a joined channel (2-8 options) |
+| `tau channel poll NAME "QUESTION" OPT... --delay 5m` | Queue a poll to ask later (a serving node with --channels publishes it). Restart any node serving with `--channels` on this version before queuing polls: an older node reads a queued poll as a plain message and publishes only the question |
 | `tau channel vote NAME POLL OPTION` | Vote on a channel poll (option number or exact text) |
 | `tau channel close-poll NAME POLL` | Close a channel poll you created (freezes the tally) |
 | `tau channel topic NAME [TEXT]` | Show or set a channel's topic (any member may set it; newest wins; `--clear` removes it) |

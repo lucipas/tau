@@ -545,6 +545,7 @@ export interface NodeSettings {
   accept_files: boolean;
   send_read_receipts: boolean;
   tan_sync_depth: number;
+  announce_interval: number;
 }
 
 export interface AllowList {
@@ -850,6 +851,10 @@ export interface ScheduledChannelMessage {
   attempts: number;
   next_attempt_at: number | null;
   paused_at: number | null;
+  /** "message" for a queued message, "poll" for a queued poll question. */
+  kind?: "message" | "poll";
+  /** Fixed poll choices; only present when kind is "poll". */
+  options?: string[];
   [key: string]: unknown;
 }
 

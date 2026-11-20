@@ -251,9 +251,9 @@ export async function getSettings(): Promise<NodeSettings> {
   return get("/api/settings");
 }
 
-/** `setting` is "accept_files" | "send_read_receipts" | "tan_sync_depth"; boolean settings take a boolean, tan_sync_depth takes 1 or 2. */
+/** `setting` is "accept_files" | "send_read_receipts" | "tan_sync_depth" | "announce_interval"; boolean settings take a boolean, tan_sync_depth takes 1 or 2, announce_interval takes seconds (0 disables). */
 export async function updateSetting(
-  setting: "accept_files" | "send_read_receipts" | "tan_sync_depth",
+  setting: "accept_files" | "send_read_receipts" | "tan_sync_depth" | "announce_interval",
   value: boolean | number,
 ): Promise<NodeSettings> {
   const data = await post<{ ok: boolean; settings: NodeSettings }>("/api/settings", {
@@ -1453,6 +1453,25 @@ export async function scheduleChannelMessage(
   sendIn: number,
 ): Promise<ScheduledChannelMessage> {
   return post("/api/channels/schedule", { channel, text, send_in: sendIn });
+}
+
+/** Queue a channel poll for later: the question plus its fixed options. */
+export async function scheduleChannelPoll(
+  channel: string,
+  question: string,
+  options: string[],
+  sendIn: number,
+): Promise<ScheduledChannelMessage> {
+  const data = await post<{ ok: boolean; scheduled: ScheduledChannelMessage }>(
+    "/api/channels/schedule",
+    {
+      channel,
+      text: question,
+      poll_options: options,
+      send_in: sendIn,
+    },
+  );
+  return data.scheduled;
 }
 
 export async function cancelScheduledChannelMessage(id: string): Promise<unknown> {
