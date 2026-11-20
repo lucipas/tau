@@ -903,6 +903,286 @@ describe("ChannelsSection", () => {
     }
   });
 
+  it("switching away and back while the draft deletion is pending does not restore the sent text", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [
+        {
+          kind: "channel",
+          target: "mesh-general",
+          text: "parked hello",
+          updated_at: 100,
+          name: "mesh-general",
+        },
+      ];
+    let resolveDelete: ((value: string) => void) | null = null;
+    calls = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        calls.push(`${method} ${url}`);
+        if (url.includes("/api/drafts/delete")) {
+          saved.length = 0;
+          return {
+            ok: true,
+            status: 200,
+            text: () =>
+              new Promise<string>((resolve) => {
+                resolveDelete = resolve;
+              }),
+          } as Response;
+        }
+        if (url.includes("/api/drafts")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ drafts: saved, count: saved.length }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/messages")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", messages: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/pins")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", pins: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/scheduled")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", scheduled: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/topic")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", topic: null }),
+          } as Response;
+        }
+        if (url.includes("/api/channels")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({
+                channels: [
+                  { channel: "mesh-general", joined_at: 900, unread: 0 },
+                  { channel: "mesh-random", joined_at: 800, unread: 0 },
+                ],
+                count: 2,
+              }),
+          } as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ ok: true }),
+        } as Response;
+      }),
+    );
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+      // The deletion is still pending; the box is already clear.
+      await waitFor(() => expect(resolveDelete).not.toBeNull());
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe(""),
+      );
+      // Switch away and back while it hangs: the sent text must not
+      // come back.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputAgain = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe(""),
+      );
+      resolveDelete!(JSON.stringify({ ok: true, deleted: true }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect((inputAgain as HTMLInputElement).value).toBe("");
+      expect(
+        calls.filter((c) => c === "POST /api/drafts/delete").length,
+      ).toBe(1);
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("a stale draft-list response cannot restore a sent draft", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [
+        {
+          kind: "channel",
+          target: "mesh-general",
+          text: "parked hello",
+          updated_at: 100,
+          name: "mesh-general",
+        },
+      ];
+    const staleDraft = { ...saved[0] };
+    // GET /api/drafts calls: the first resolves at once; the second
+    // (the save's refresh) is held until after the send.
+    const heldDrafts: { resolve: (value: string) => void }[] = [];
+    let draftsGets = 0;
+    calls = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        calls.push(`${method} ${url}`);
+        if (url.includes("/api/drafts/delete")) {
+          saved.length = 0;
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ ok: true, deleted: true }),
+          } as Response;
+        }
+        if (url.includes("/api/drafts")) {
+          if (method === "POST") {
+            return {
+              ok: true,
+              status: 200,
+              text: async () =>
+                JSON.stringify({ ok: true, draft: saved[0] }),
+            } as Response;
+          }
+          draftsGets += 1;
+          if (draftsGets === 2) {
+            const entry: { resolve: (value: string) => void } = {
+              resolve: () => undefined,
+            };
+            const promise = new Promise<string>((resolve) => {
+              entry.resolve = resolve;
+            });
+            heldDrafts.push(entry);
+            return { ok: true, status: 200, text: () => promise } as Response;
+          }
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ drafts: saved, count: saved.length }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/messages")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", messages: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/pins")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", pins: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/scheduled")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", scheduled: [], count: 0 }),
+          } as Response;
+        }
+        if (url.includes("/api/channels/topic")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({ channel: "mesh-general", topic: null }),
+          } as Response;
+        }
+        if (url.includes("/api/channels")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({
+                channels: [
+                  { channel: "mesh-general", joined_at: 900, unread: 0 },
+                  { channel: "mesh-random", joined_at: 800, unread: 0 },
+                ],
+                count: 2,
+              }),
+          } as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ ok: true }),
+        } as Response;
+      }),
+    );
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+      // Save the loaded draft: its refresh is the stale response.
+      fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts"));
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe(""),
+      );
+      await waitFor(() => expect(heldDrafts.length).toBe(1));
+      // Switch away and back: the saved draft pre-fills again.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputAgain = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe("parked hello"),
+      );
+      // Send it: the post-delete refresh resolves with an empty list.
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts/delete"));
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe(""),
+      );
+      // Now the stale pre-delete response arrives: it must be dropped.
+      heldDrafts[0].resolve(
+        JSON.stringify({ drafts: [staleDraft], count: 1 }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Switch away and back: the deleted draft must not come back.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputFinal = await screen.findByLabelText("Message #mesh-general");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect((inputFinal as HTMLInputElement).value).toBe("");
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
   it("switching channels keeps each channel's unsent text and draft separate", async () => {
     calls = mockFetch((url) => {
       if (url.includes("/api/drafts")) {

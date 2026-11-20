@@ -93,6 +93,11 @@ export default function ChannelsSection() {
     Record<string, { text: string; loadedDraftKey: string | null }>
   >({});
   const prevSelectedRef = useRef<string | null>(null);
+  // Generation counter for draft-list requests: only the latest
+  // response may apply, so a stale list cannot overwrite newer
+  // state (e.g. a pre-delete list arriving after the post-delete
+  // refresh and resurrecting a sent draft).
+  const draftsRequestRef = useRef(0);
   const [savingDraft, setSavingDraft] = useState(false);
 
   // The channel named by `#channels?channel=<name>` — set when a
@@ -108,8 +113,10 @@ export default function ChannelsSection() {
   }, [hashChannel]);
 
   const refreshDrafts = useCallback(async () => {
+    const requestId = ++draftsRequestRef.current;
     try {
-      setDrafts(await getDrafts());
+      const next = await getDrafts();
+      if (draftsRequestRef.current === requestId) setDrafts(next);
     } catch {
       // Drafts are advisory; the channel list works without them.
     }
@@ -252,16 +259,16 @@ export default function ChannelsSection() {
       // and the sent text came from that draft. A saved draft
       // survives an unrelated message sent in the same channel.
       if (loadedDraftKey && loadedDraftKey === selectedDraftKey) {
-        await deleteDraft("channel", channel).catch(() => undefined);
-        // Drop the draft from the local list at once, and clear the
-        // pending seed with it: the seed must not re-pour the
-        // deleted text while the drafts refresh is in flight.
-        // (If the delete itself failed, the refresh puts it back,
-        // and the kept seed mark stops it re-pouring this visit.)
+        // Make the draft ineligible for seeding BEFORE awaiting the
+        // deletion: a switch away and back during a slow delete must
+        // not reload the already-sent text. (If the delete itself
+        // fails, the refresh puts the draft back, and the kept seed
+        // mark stops it re-pouring this visit.)
         setDrafts((prev) =>
           prev.filter((d) => !(d.kind === "channel" && d.target === channel)),
         );
         setPendingSeed(null);
+        await deleteDraft("channel", channel).catch(() => undefined);
         void refreshDrafts();
       }
       setLoadedDraftKey(null);
