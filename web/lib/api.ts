@@ -633,7 +633,36 @@ export async function forwardMessage(
   id: number,
   target: { to: string } | { group: string },
 ): Promise<unknown> {
-  return post("/api/messages/forward", { id, ...target });
+  const result = await post("/api/messages/forward", { id, ...target });
+  // A file forward can report HTTP 200 with ok: false: the
+  // attribution text went out but the file leg failed.  Surface that
+  // as an error instead of closing the picker on a success flag —
+  // the caller shows it as a failed forward.
+  if (result && typeof result === "object") {
+    const partial = result as {
+      ok?: unknown;
+      file_error?: unknown;
+      file_response?: { ok?: unknown };
+    };
+    if (partial.ok === false) {
+      if (typeof partial.file_error === "string" && partial.file_error) {
+        throw new Error(
+          `the message was forwarded but the file did not send: ${partial.file_error}`,
+        );
+      }
+      if (
+        partial.file_response &&
+        typeof partial.file_response === "object" &&
+        partial.file_response.ok === false
+      ) {
+        throw new Error(
+          "the message was forwarded but the file did not reach all members",
+        );
+      }
+      throw new Error("the message could not be forwarded");
+    }
+  }
+  return result;
 }
 
 export async function pinMessage(id: number): Promise<unknown> {

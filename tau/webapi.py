@@ -106,7 +106,8 @@ script) can read what arrives from the mesh and send messages back:
                            (or ``"group": "<name>"`` to fan it out to a group):
                            send the message on as a new DM prefixed with
                            ``Forwarded from <name>:`` (``tau forward`` from
-                           the console)
+                           the console); a file entry forwards its stored
+                           bytes the same way, attribution first
     POST /api/messages/pin pin ``{"id": <console message id>}`` in the node
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
@@ -412,7 +413,7 @@ from .ignored_groups import (
 )
 from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
-from .node import NodeError, TauNode
+from .node import NodeError, TauNode, resolve_received_file
 from .peers import Peer, PeerError, safety_number
 from .profile import (
     ProfileError,
@@ -8051,6 +8052,7 @@ class WebBridge:
         *,
         timeout: float = 20.0,
         group: Optional[str] = None,
+        file_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Forward one stored DM to another peer or into a group, from the
         console.
@@ -8064,10 +8066,14 @@ class WebBridge:
         carries no expiry, kind, or reply chain from the original, and
         the new outbound entry appears in the feed like any other send.
 
+        A file entry forwards the stored bytes instead (see
+        :meth:`_forward_file_message`): the recipient first gets the
+        attribution naming the file, then the file itself as a fresh
+        one-to-one transfer.
+
         Exactly one of ``to`` and ``group`` is required.  Same guards
         as the CLI: group messages cannot be forwarded (they would leak
-        the group's text to a nonmember), file transfers cannot be
-        forwarded (they have no text), and a received message from a
+        the group's text to a nonmember), and a received message from a
         blocked peer cannot be forwarded.  An unreadable block-list
         fails closed for received messages, matching the CLI.
         Forwarding your own sent message attributes it as "you"; a
@@ -8108,11 +8114,8 @@ class WebBridge:
                 raise ValueError(f"unknown message: {target!r}")
             if entry.get("group"):
                 raise ValueError("group messages cannot be forwarded")
-            if entry.get("file"):
-                raise ValueError("file transfers cannot be forwarded")
+            file_meta = entry.get("file")
             text = entry.get("text")
-            if not isinstance(text, str) or not text:
-                raise ValueError("message has no text to forward")
             direction = entry.get("direction")
             peer_hash = entry.get("peer")
             peer_name = entry.get("peer_name")
@@ -8154,6 +8157,21 @@ class WebBridge:
                     if isinstance(peer_hash, str) and peer_hash
                     else "unknown"
                 )
+        if file_meta is not None:
+            # A file entry carries no forwardable text: the stored
+            # bytes go instead, with the file name as the attributed
+            # line.  The block-list and label checks above already ran.
+            return self._forward_file_message(
+                entry,
+                file_meta,
+                label,
+                to,
+                timeout=timeout,
+                group=group,
+                file_timeout=file_timeout,
+            )
+        if not isinstance(text, str) or not text:
+            raise ValueError("message has no text to forward")
         forwarded = f"Forwarded from {label}:\n{text}"
         if len(forwarded) > MAX_MESSAGE_CHARS:
             raise ValueError(
@@ -8177,6 +8195,172 @@ class WebBridge:
             to.strip(), forwarded, timeout=timeout
         )
         return {"ok": True, "message": message, "response": response}
+
+    def _forward_file_message(
+        self,
+        entry: Dict[str, Any],
+        file_meta: Dict[str, Any],
+        label: str,
+        to: Optional[str] = None,
+        *,
+        timeout: float = 20.0,
+        group: Optional[str] = None,
+        file_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Forward a stored received file, from the console.
+
+        The recipient first gets the attribution as a text DM —
+        ``Forwarded from <name>:`` naming the file — then the file
+        itself as a fresh one-to-one transfer, reusing
+        :meth:`send_file` / :meth:`send_group_file`.  The stored bytes
+        come from :meth:`_forward_file_bytes`, which resolves the
+        entry's own inbox record by its wire id (an old entry must
+        not forward a newer file that arrived under the same name)
+        and checks the bytes against the entry's recorded size and
+        SHA-256.  A file you
+        sent cannot be forwarded: its bytes were staged in a temporary
+        directory for the transfer and not kept.  A failed peer file
+        leg does not roll back the attribution text already sent: the
+        result reports ``ok: False`` with ``file_error`` instead of
+        raising, so the console can say what went out and what did not.
+        The file leg runs under ``file_timeout`` (300s when the request
+        gives no timeout), not the text ``timeout``: a file of a few
+        MiB on a slow Reticulum link outlasts the 20s text default,
+        mirroring the CLI, which uses 300s for file legs.
+        """
+        if entry.get("direction") == "out":
+            raise ValueError(
+                "cannot forward a file you sent: the original bytes "
+                "were not kept — re-send it with a file send"
+            )
+        name = file_meta.get("name")
+        peer_hash = entry.get("peer")
+        if not isinstance(name, str) or not name:
+            raise ValueError("cannot forward a file: the file has no name")
+        if not isinstance(peer_hash, str) or not peer_hash:
+            raise ValueError("cannot forward a file: the sender is unknown")
+        data = self._forward_file_bytes(entry, file_meta, peer_hash, name)
+        forwarded = f"Forwarded from {label}:\n{name}"
+        if group is not None:
+            messages, response = self.send_group_message(
+                group.strip(), forwarded, timeout=timeout
+            )
+            try:
+                file_messages, file_response = self.send_group_file(
+                    group.strip(),
+                    name,
+                    data,
+                    timeout=file_timeout
+                    if file_timeout is not None
+                    else timeout,
+                )
+            except (NodeError, ValueError, OSError) as exc:
+                return {
+                    "ok": False,
+                    "messages": messages,
+                    "response": response,
+                    "file_error": str(exc),
+                }
+            return {
+                "ok": bool(response.get("ok", True))
+                and bool(file_response.get("ok", True)),
+                "messages": messages,
+                "response": response,
+                "file_messages": file_messages,
+                "file_response": file_response,
+            }
+        message, response = self.send_message(
+            to.strip(), forwarded, timeout=timeout
+        )
+        try:
+            file_message, file_response = self.send_file(
+                to.strip(),
+                name,
+                data,
+                timeout=file_timeout if file_timeout is not None else timeout,
+            )
+        except (NodeError, ValueError, OSError) as exc:
+            return {
+                "ok": False,
+                "message": message,
+                "response": response,
+                "file_error": str(exc),
+            }
+        return {
+            "ok": True,
+            "message": message,
+            "response": response,
+            "file_message": file_message,
+            "file_response": file_response,
+        }
+
+    def _forward_file_bytes(
+        self,
+        entry: Dict[str, Any],
+        file_meta: Dict[str, Any],
+        peer_hash: str,
+        name: str,
+    ) -> bytes:
+        """Return the exact stored bytes for a console file forward.
+
+        Live and restored entries carry the inbox record's wire id, so
+        the exact record is resolved instead of the newest same-name
+        record for the sender: an old entry whose bytes are gone must
+        fail, not forward a newer file that arrived under the same
+        name.  The resolved bytes are checked against the entry's
+        recorded size and SHA-256 as well.  Entries without a wire id
+        fall back to :meth:`received_file` with the same check against
+        the entry's metadata.
+        """
+        wire_id = entry.get("wire_id")
+        inbox = getattr(self.node, "inbox", None)
+        if isinstance(wire_id, str) and wire_id and inbox is not None:
+            try:
+                record = inbox.resolve(wire_id)
+            except ValueError:
+                record = None
+            if record is not None and record.get("kind") == "file":
+                files_dir = getattr(
+                    getattr(self.node, "config", None), "files_dir", None
+                )
+                if files_dir is None:
+                    raise ValueError(
+                        f"stored file {name} is no longer available — it was "
+                        "moved, deleted, or changed since it arrived"
+                    )
+                try:
+                    _path, data = resolve_received_file(record, files_dir)
+                except NodeError as exc:
+                    raise ValueError(str(exc)) from exc
+                if (
+                    record.get("name") != name
+                    or record.get("size") != file_meta.get("size")
+                    or str(record.get("sha256") or "").lower()
+                    != str(file_meta.get("sha256") or "").lower()
+                ):
+                    raise ValueError(
+                        f"stored file {name} does not match the selected "
+                        "message — it was replaced since it arrived"
+                    )
+                return data
+        try:
+            found = self.received_file(peer_hash, name)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if found is None:
+            raise ValueError(
+                f"stored file {name} is no longer available — it was "
+                "moved, deleted, or changed since it arrived"
+            )
+        data, _resolved_name = found
+        if len(data) != file_meta.get("size") or hashlib.sha256(
+            data
+        ).hexdigest() != str(file_meta.get("sha256") or "").lower():
+            raise ValueError(
+                f"stored file {name} does not match the selected "
+                "message — it was replaced since it arrived"
+            )
+        return data
 
     def pin_message(self, target: int) -> Dict[str, Any]:
         """Pin one stored DM from the console history, by console id.
@@ -12542,8 +12726,8 @@ def _valid_schedule_in(value: Any) -> bool:
 _TYPING_TIMEOUT_SECONDS = 5.0
 
 
-def _clamped_timeout(value: Any, default: float) -> float:
-    """Clamp a request ``timeout`` to [1.0, 120.0] seconds.
+def _clamped_timeout(value: Any, default: float, maximum: float = 120.0) -> float:
+    """Clamp a request ``timeout`` to [1.0, ``maximum``] seconds.
 
     Non-numeric, boolean, and non-finite values fall back to ``default``.
     Huge JSON integers overflow ``float()``, so the conversion is guarded
@@ -12557,10 +12741,10 @@ def _clamped_timeout(value: Any, default: float) -> float:
         # An integer too large for a float is far above the cap — in
         # either direction, so the overflow path follows the same
         # bounds as the normal clamp.
-        return 120.0 if value > 0 else 1.0
+        return maximum if value > 0 else 1.0
     if not math.isfinite(seconds):
         return default
-    return max(1.0, min(seconds, 120.0))
+    return max(1.0, min(seconds, maximum))
 
 
 class _WebServer(ThreadingHTTPServer):
@@ -17165,12 +17349,19 @@ class _WebHandler(BaseHTTPRequestHandler):
             )
             return
         timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        # The file legs get the send-file timeout (300s when the
+        # request gives none), not the 20s text timeout: a file of a
+        # few MiB on a slow link outlasts the text default.  An
+        # explicit timeout is clamped to 300s for the file legs, as
+        # the send-file handler does.
+        file_timeout = _clamped_timeout(body.get("timeout", 300.0), 300.0, 300.0)
         try:
             result = self.bridge.forward_message(
                 target,
                 to.strip() if isinstance(to, str) else None,
                 timeout=timeout,
                 group=group.strip() if isinstance(group, str) else None,
+                file_timeout=file_timeout,
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)

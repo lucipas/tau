@@ -14,6 +14,7 @@ import signal
 import socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -188,6 +189,7 @@ from .node import (
     TauNode,
     check_tcp_listen_ports,
     instance_lock_holder,
+    resolve_received_file,
 )
 from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .follows import (
@@ -735,7 +737,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ID|PREFIX",
         help="message id or unique prefix (see tau messages)",
     )
-    forward.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    forward.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="how long to wait for a delivery; file legs default to "
+        "300s (the send-file default) when this is not given",
+    )
     forward.add_argument(
         "--discover-timeout",
         type=float,
@@ -11015,6 +11024,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             # bytes back as a download (GET /api/files/<sender>/<name>).
             bridge.record_inbound(
                 {
+                    "id": record.get("id"),
                     "destination": record.get("destination"),
                     "from": record.get("from"),
                     "text": file_arrival_text(record),
@@ -13213,13 +13223,22 @@ def _send_via_local_node(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    node: Optional[TauNode] = None,
 ) -> List[Dict[str, Any]]:
-    """One-shot send on a node this process starts and stops itself."""
+    """One-shot send on a node this process starts and stops itself.
+
+    Pass an already-started *node* to send on it instead — the caller
+    owns starting and stopping it, so several sends can share one
+    Reticulum instance in a process (a second ``TauNode.start()``
+    fails: Reticulum cannot be reinitialised in the same process).
+    """
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
-    log.info("starting a local one-shot node (data dir %s)", config.data_dir)
-    node = TauNode(config, name=config.name)
-    node.start()
+    owned_node = node is None
+    if owned_node:
+        log.info("starting a local one-shot node (data dir %s)", config.data_dir)
+        node = TauNode(config, name=config.name)
+        node.start()
     results: List[Dict[str, Any]] = []
     try:
         for target in targets:
@@ -13307,7 +13326,8 @@ def _send_via_local_node(
         else:
             _reconcile_queued_sends(node, results, expires_at)
     finally:
-        node.stop()
+        if owned_node:
+            node.stop()
     return results
 
 
@@ -13789,6 +13809,125 @@ def cmd_id_rename(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _send_results_json(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The JSON payload ``cmd_send`` emits for *results*.
+
+    A single successful recipient keeps the historical bare-response
+    shape; anything else reports the per-recipient results with
+    delivered / queued / failed counts.
+    """
+    failed = [result for result in results if not result.get("ok", True)]
+    if len(results) == 1 and not failed:
+        return {k: v for k, v in results[0].items() if k != "target"}
+    return {
+        "results": results,
+        "delivered": sum(
+            1
+            for r in results
+            if r.get("ok", True)
+            and not r.get("queued")
+            and r.get("delivered") is not False
+        ),
+        "queued": sum(1 for r in results if r.get("queued")),
+        "failed": len(failed),
+    }
+
+
+def _report_send_results(
+    args: argparse.Namespace,
+    results: List[Dict[str, Any]],
+    reply_ids: Dict[str, str],
+    expires_at: Optional[float],
+) -> int:
+    """Report *results* the way ``cmd_send`` does and return its exit code.
+
+    JSON mode emits one document; human mode prints one line per
+    recipient plus the queued hint.  A forward reuses this for its
+    attribution text, so the two paths report a send the same way.
+    """
+    failed = [result for result in results if not result.get("ok", True)]
+    # --wait outcomes are recorded on the results by the send path
+    # (see _wait_for_queued_sends): a waited result that is not
+    # delivered failed the wait, whether it is still queued or left the
+    # queue without a delivery confirmation.
+    wait_failed = any(
+        result.get("waited") is not None and result.get("delivered") is False
+        for result in results
+    )
+    if _json_mode(args):
+        _emit(_send_results_json(results), True)
+    else:
+        for result in results:
+            target = result["target"]
+            if not result.get("ok", True):
+                print(f"failed to send to {target}: {result['error']}", file=sys.stderr)
+            elif (
+                result.get("waited") is not None
+                and not result.get("delivered")
+                and not result.get("queued")
+            ):
+                # The entry left the queue while waiting without a delivery
+                # confirmation from this node: cancelled, or delivered by
+                # another process.  Say so instead of claiming delivery.
+                print(f"no longer queued for {target} after {result['waited']:.1f}s")
+                print("  delivery was not confirmed — it may have been cancelled,")
+                print("  or delivered by another process sharing this data directory")
+            elif result.get("queued"):
+                waited = result.get("waited")
+                if waited is not None:
+                    print(f"still queued for {target} after {waited:.1f}s")
+                elif result.get("send_after"):
+                    print(
+                        f"scheduled for {target} — sends in "
+                        f"{_ago(result['send_after'] - time.time())}"
+                    )
+                else:
+                    print(f"queued for {target} — they are unreachable right now")
+                print(f"  id:      {result['id']}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
+            elif result.get("delivered"):
+                waited = result.get("waited")
+                if (
+                    waited is not None
+                    and "_rtt" not in result
+                    and "echo" not in result
+                ):
+                    print(f"delivered to {target} after {waited:.1f}s")
+                else:
+                    print(f"delivered to {target}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
+            else:
+                print(f"delivered to {target}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
+                echo = result.get("echo")
+                if echo is not None:
+                    print(f"echo: {echo}")
+                rtt = result.get("_rtt")
+                if isinstance(rtt, (int, float)):
+                    print(f"round trip: {rtt * 1000:.0f} ms")
+                if result.get("expired"):
+                    print("  the receiver dropped it — past its expiry")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
+        queued = [result for result in results if result.get("queued")]
+        if queued:
+            if all(result.get("send_after") for result in queued):
+                print("  it will be delivered at its scheduled time;")
+            else:
+                print(
+                    "  it will be delivered automatically when they are heard from;"
+                )
+            print("  check `tau outbox` for the queue, or just leave a node serving")
+    return _EXIT_ERROR if (failed or wait_failed) else _EXIT_OK
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     # Validate flags before reading the message, so an invalid command
     # fails at once instead of blocking on stdin.
@@ -13881,105 +14020,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             poll_options=poll_options,
         )
 
-    failed = [result for result in results if not result.get("ok", True)]
-    # --wait outcomes are recorded on the results by the send path
-    # (see _wait_for_queued_sends): a waited result that is not
-    # delivered failed the wait, whether it is still queued or left the
-    # queue without a delivery confirmation.
-    wait_failed = any(
-        result.get("waited") is not None and result.get("delivered") is False
-        for result in results
-    )
-    if _json_mode(args):
-        if len(results) == 1 and not failed:
-            # Single recipient keeps the historical bare-response shape.
-            _emit({k: v for k, v in results[0].items() if k != "target"}, True)
-        else:
-            _emit(
-                {
-                    "results": results,
-                    "delivered": sum(
-                        1
-                        for r in results
-                        if r.get("ok", True)
-                        and not r.get("queued")
-                        and r.get("delivered") is not False
-                    ),
-                    "queued": sum(1 for r in results if r.get("queued")),
-                    "failed": len(failed),
-                },
-                True,
-            )
-    else:
-        for result in results:
-            target = result["target"]
-            if not result.get("ok", True):
-                print(f"failed to send to {target}: {result['error']}", file=sys.stderr)
-            elif (
-                result.get("waited") is not None
-                and not result.get("delivered")
-                and not result.get("queued")
-            ):
-                # The entry left the queue while waiting without a delivery
-                # confirmation from this node: cancelled, or delivered by
-                # another process.  Say so instead of claiming delivery.
-                print(f"no longer queued for {target} after {result['waited']:.1f}s")
-                print("  delivery was not confirmed — it may have been cancelled,")
-                print("  or delivered by another process sharing this data directory")
-            elif result.get("queued"):
-                waited = result.get("waited")
-                if waited is not None:
-                    print(f"still queued for {target} after {waited:.1f}s")
-                elif result.get("send_after"):
-                    print(
-                        f"scheduled for {target} — sends in "
-                        f"{_ago(result['send_after'] - time.time())}"
-                    )
-                else:
-                    print(f"queued for {target} — they are unreachable right now")
-                print(f"  id:      {result['id']}")
-                if reply_ids.get(target):
-                    print(f"  in reply to {short_hash(reply_ids[target])}")
-                if expires_at is not None:
-                    print(f"  disappears in {_ago(expires_at - time.time())}")
-            elif result.get("delivered"):
-                waited = result.get("waited")
-                if (
-                    waited is not None
-                    and "_rtt" not in result
-                    and "echo" not in result
-                ):
-                    print(f"delivered to {target} after {waited:.1f}s")
-                else:
-                    print(f"delivered to {target}")
-                if reply_ids.get(target):
-                    print(f"  in reply to {short_hash(reply_ids[target])}")
-                if expires_at is not None:
-                    print(f"  disappears in {_ago(expires_at - time.time())}")
-            else:
-                print(f"delivered to {target}")
-                if reply_ids.get(target):
-                    print(f"  in reply to {short_hash(reply_ids[target])}")
-                echo = result.get("echo")
-                if echo is not None:
-                    print(f"echo: {echo}")
-                rtt = result.get("_rtt")
-                if isinstance(rtt, (int, float)):
-                    print(f"round trip: {rtt * 1000:.0f} ms")
-                if result.get("expired"):
-                    print("  the receiver dropped it — past its expiry")
-                if expires_at is not None:
-                    print(f"  disappears in {_ago(expires_at - time.time())}")
-        queued = [result for result in results if result.get("queued")]
-        if queued:
-            if all(result.get("send_after") for result in queued):
-                print("  it will be delivered at its scheduled time;")
-            else:
-                print(
-                    "  it will be delivered automatically when they are heard from;"
-                )
-            print("  check `tau outbox` for the queue, or just leave a node serving")
-    return _EXIT_ERROR if (failed or wait_failed) else _EXIT_OK
+    return _report_send_results(args, results, reply_ids, expires_at)
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
@@ -13997,6 +14038,16 @@ def cmd_forward(args: argparse.Namespace) -> int:
     it carries no expiry, kind, or reply chain from the original.
     """
     config = _make_config(args)
+    # `--timeout` defaults to None: the text legs use the send
+    # default (20s) while a file leg uses the send-file default
+    # (300s) — a file transfer outlasts a text send.  An explicit
+    # --timeout applies to both legs.
+    file_timeout = getattr(args, "timeout", None)
+    if file_timeout is None:
+        args.timeout = 20.0
+        file_timeout = 300.0
+    else:
+        file_timeout = float(file_timeout)
     inbox = Inbox(config.inbox_path)
     try:
         record = inbox.resolve(args.message)
@@ -14019,9 +14070,6 @@ def cmd_forward(args: argparse.Namespace) -> int:
         if record.get("destination") in blocked:
             raise NodeError("cannot forward a message from a blocked peer")
     text = record.get("text")
-    if not text:
-        # File records carry no text (see inbox._valid_record).
-        raise NodeError("cannot forward a file message: it has no text to send")
     if record.get("direction") == "out":
         # The message is one this node sent; the recipient already knows
         # the forwarder, so the attribution names the forwarder as "you".
@@ -14048,6 +14096,14 @@ def cmd_forward(args: argparse.Namespace) -> int:
         )
         if peer is not None:
             label = peer.display_name
+    if record.get("kind") == "file":
+        # A file record carries no text: forward the stored bytes
+        # instead, with the file name as the attributed line.
+        return _forward_file(
+            args, config, record, label, file_timeout=file_timeout
+        )
+    if not text:
+        raise NodeError("cannot forward a message with no text to send")
     forwarded = f"Forwarded from {label}:\n{text}"
     if len(forwarded) > MAX_MESSAGE_CHARS:
         raise NodeError(
@@ -14088,6 +14144,318 @@ def cmd_forward(args: argparse.Namespace) -> int:
         return cmd_channel_send(args)
     return cmd_send(args)
 
+
+def _forward_file(
+    args: argparse.Namespace,
+    config: Any,
+    record: Dict[str, Any],
+    label: str,
+    *,
+    file_timeout: float = 300.0,
+) -> int:
+    """Forward a stored received file to a peer or into a group.
+
+    The recipient first gets the usual attribution as a text DM —
+    ``Forwarded from <name>:`` naming the file — then the file itself
+    as a fresh one-to-one transfer, reusing the send-file paths.  The
+    stored bytes are verified against the record before anything is
+    sent, so a missing or altered file fails cleanly up front.  A file
+    leg that fails does not roll back attribution text already sent,
+    and a failed leg is reported per recipient, like
+    ``tau group send-file``.  Scheduling is not supported in v1: a
+    delayed file forward would need the attribution text scheduled
+    alongside the staged bytes.
+
+    Both legs run on ONE node when no node is serving: the text leg
+    and the file leg share the process's single Reticulum instance —
+    starting a second node after the first stopped fails, because
+    Reticulum cannot be reinitialised in the same process.  When a
+    node is serving, the text leg goes through it on its socket and
+    the file leg starts the first local node, like ``tau send-file``.
+    The verified bytes are staged once under their own name and the
+    file legs send from there, never from the mutable stored path, so
+    a change to the stored file between verification and delivery
+    cannot swap in different bytes.  ``--json`` emits ONE combined
+    document with the text and file results, not one per leg.
+
+    A file forward only targets a peer or a group: the broadcast and
+    channel targets take their text through the broadcast / channel
+    send paths, which have no file leg — a file record sent there
+    would go to a ``None`` peer.  Refuse those targets with a clear
+    error instead of an unrelated send failure.
+    """
+    if getattr(args, "broadcast", None) or getattr(args, "channel", None):
+        print(
+            "error: a file cannot be forwarded to a broadcast list or "
+            "a channel yet — forward it to a peer or a group instead",
+            file=sys.stderr,
+        )
+        return 2
+    if getattr(args, "delay", None) is not None:
+        print(
+            "error: --delay cannot be used when forwarding a file — "
+            "schedule the file itself with `tau send-file --delay`",
+            file=sys.stderr,
+        )
+        return 2
+    # Validate --wait the same way `cmd_send` does, before sending.
+    wait = float(getattr(args, "wait", None) or 0.0)
+    if not math.isfinite(wait):
+        print("error: --wait must be a finite number of seconds", file=sys.stderr)
+        return 2
+    if wait < 0:
+        print("error: --wait must not be negative", file=sys.stderr)
+        return 2
+    if getattr(args, "wait", None) is not None and getattr(args, "no_queue", False):
+        print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
+        return 2
+    _path, data = resolve_received_file(record, config.files_dir)
+    name = str(record["name"])
+    size = len(data)
+    digest = hashlib.sha256(data).hexdigest()
+    forwarded = f"Forwarded from {label}:\n{name}"
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    targets = args.to if isinstance(args.to, list) else [args.to]
+    # Stage the verified bytes once: the file legs send from here,
+    # never from the mutable stored path.
+    with tempfile.TemporaryDirectory(prefix="tau-forward-file-") as staging:
+        staged = Path(staging) / name
+        staged.write_bytes(data)
+        if getattr(args, "group", None):
+            return _forward_file_to_group(
+                args,
+                config,
+                staged,
+                name,
+                size,
+                digest,
+                forwarded,
+                file_timeout=file_timeout,
+                discover_timeout=discover_timeout,
+                wait=wait,
+            )
+        return _forward_file_to_peers(
+            args,
+            config,
+            staged,
+            name,
+            size,
+            digest,
+            forwarded,
+            targets,
+            file_timeout=file_timeout,
+            discover_timeout=discover_timeout,
+            wait=wait,
+        )
+
+
+def _forward_file_to_peers(
+    args: argparse.Namespace,
+    config: Any,
+    staged: Path,
+    name: str,
+    size: int,
+    digest: str,
+    forwarded: str,
+    targets: List[str],
+    *,
+    file_timeout: float,
+    discover_timeout: float,
+    wait: float,
+) -> int:
+    """Forward a stored file to peers: attribution text, then the file.
+
+    Both legs share one node when no node is serving (see
+    :func:`_forward_file`); when one is serving, the text leg goes
+    through it and the file leg starts the first local node.
+    """
+    reply_ids: Dict[str, str] = {}
+    if _send_routes_via_running_node(config):
+        log.info("forwarding via the running node")
+        text_results = _send_via_running_node(
+            args, config, forwarded, targets, None, reply_ids, wait=wait
+        )
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            file_results = _forward_file_send_peers(
+                node, targets, staged, file_timeout, discover_timeout
+            )
+        finally:
+            node.stop()
+    else:
+        log.info("forwarding via a local one-shot node")
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            text_results = _send_via_local_node(
+                args,
+                config,
+                forwarded,
+                targets,
+                None,
+                reply_ids,
+                wait=wait,
+                node=node,
+            )
+            file_results = _forward_file_send_peers(
+                node, targets, staged, file_timeout, discover_timeout
+            )
+        finally:
+            node.stop()
+    file_payload = {
+        "name": name,
+        "size": size,
+        "sha256": digest,
+        "results": file_results,
+    }
+    failed_files = [
+        result for result in file_results if not result.get("delivered")
+    ]
+    if _json_mode(args):
+        _emit({"text": _send_results_json(text_results), "file": file_payload}, True)
+        text_failed = any(
+            not r.get("ok", True)
+            or (r.get("waited") is not None and r.get("delivered") is False)
+            for r in text_results
+        )
+        return _EXIT_ERROR if (text_failed or failed_files) else _EXIT_OK
+    text_rc = _report_send_results(args, text_results, reply_ids, None)
+    for result in file_results:
+        if result.get("delivered"):
+            print(
+                f"forwarded {result['name']} ({result['size']} bytes) "
+                f"to {result['target']}"
+            )
+        else:
+            print(
+                f"failed to forward {name} to {result['target']}: "
+                f"{result.get('error') or 'unknown error'}"
+            )
+    return _EXIT_ERROR if (text_rc != _EXIT_OK or failed_files) else _EXIT_OK
+
+
+def _forward_file_send_peers(
+    node: Any,
+    targets: List[str],
+    staged: Path,
+    file_timeout: float,
+    discover_timeout: float,
+) -> List[Dict[str, Any]]:
+    """Send the staged file to each peer, reporting per-recipient results."""
+    results: List[Dict[str, Any]] = []
+    for target in targets:
+        try:
+            sent = node.send_file(
+                target,
+                staged,
+                timeout=file_timeout,
+                discover_timeout=discover_timeout,
+            )
+        except (NodeError, PeerError, ValueError, OSError) as exc:
+            results.append({"target": target, "ok": False, "error": str(exc)})
+            continue
+        results.append({"target": target, "delivered": True, **sent})
+    return results
+
+
+def _forward_file_to_group(
+    args: argparse.Namespace,
+    config: Any,
+    staged: Path,
+    name: str,
+    size: int,
+    digest: str,
+    forwarded: str,
+    *,
+    file_timeout: float,
+    discover_timeout: float,
+    wait: float,
+) -> int:
+    """Forward a stored file into a group: attribution text, then the file.
+
+    Both legs share one node when no node is serving (see
+    :func:`_forward_file`); when one is serving, the text leg goes
+    through it and the file leg starts the first local node.
+    """
+    if _send_routes_via_running_node(config):
+        log.info("forwarding via the running node")
+        text_response = _send_group_via_running_node(
+            args,
+            config,
+            forwarded,
+            expires_at=None,
+            send_after=None,
+            wait=wait,
+        )
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            group = node.groups.find(args.group)
+            file_response = node.send_group_file(
+                group,
+                staged,
+                timeout=file_timeout,
+                discover_timeout=discover_timeout,
+            )
+        finally:
+            node.stop()
+    else:
+        log.info("forwarding via a local one-shot node")
+        delivered_ids: Set[str] = set()
+        node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
+        node.start()
+        try:
+            text_response = _send_group_via_local_node(
+                args,
+                config,
+                forwarded,
+                expires_at=None,
+                send_after=None,
+                wait=wait,
+                node=node,
+                delivered_ids=delivered_ids,
+            )
+            group = node.groups.find(args.group)
+            file_response = node.send_group_file(
+                group,
+                staged,
+                timeout=file_timeout,
+                discover_timeout=discover_timeout,
+            )
+        finally:
+            node.stop()
+    failed_legs = [
+        result for result in file_response["results"] if not result.get("delivered")
+    ]
+    if _json_mode(args):
+        _emit({"text": text_response, "file": file_response}, True)
+        text_failed = any(
+            (not r.get("delivered") and not r.get("queued"))
+            or (r.get("waited") is not None and r.get("delivered") is False)
+            for r in text_response["results"]
+        )
+        return _EXIT_ERROR if (text_failed or failed_legs) else _EXIT_OK
+    text_rc = _report_group_send_results(args, text_response, None, None)
+    if not file_response["results"]:
+        print(
+            f"group {file_response['name']} has no other members"
+            " — nothing to send to."
+        )
+        return text_rc
+    for result in file_response["results"]:
+        member_name = result.get("to_name") or result["to"][:8]
+        if result.get("delivered"):
+            print(
+                f"forwarded {result['name']} "
+                f"({result['size']} bytes) to {member_name}"
+            )
+        else:
+            print(
+                f"failed to forward {name} to {member_name}: "
+                f"{result.get('error') or 'unknown error'}"
+            )
+    return _EXIT_ERROR if (text_rc != _EXIT_OK or failed_legs) else _EXIT_OK
 
 def _queue_file_for_later(
     config: Any,
@@ -18262,11 +18630,27 @@ def _send_group_via_local_node(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    node: Optional[TauNode] = None,
+    delivered_ids: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
-    """One-shot group send on a node this process starts and stops itself."""
-    delivered_ids: Set[str] = set()
-    node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
-    node.start()
+    """One-shot group send on a node this process starts and stops itself.
+
+    Pass an already-started *node* to send on it instead — the caller
+    owns starting and stopping it, so several sends can share one
+    Reticulum instance in a process (a second ``TauNode.start()``
+    fails: Reticulum cannot be reinitialised in the same process).
+    When *node* is given, *delivered_ids* must be the set the node was
+    constructed with as its ``on_delivered`` target, so the one-shot
+    flush can tell a delivered queued leg from one that merely left
+    the outbox.
+    """
+    owned_node = node is None
+    if owned_node:
+        delivered_ids = set()
+        node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
+        node.start()
+    if delivered_ids is None:
+        delivered_ids = set()
     try:
         group = node.groups.find(args.group)
         response = node.send_group_message(
@@ -18311,8 +18695,88 @@ def _send_group_via_local_node(
                     result["ok"] = False
                     result["error"] = "left the outbox without a delivery confirmation"
     finally:
-        node.stop()
+        if owned_node:
+            node.stop()
     return response
+
+
+def _report_group_send_results(
+    args: argparse.Namespace,
+    response: Dict[str, Any],
+    expires_at: Optional[float],
+    send_after: Optional[float],
+) -> int:
+    """Report a group-send *response* the way ``cmd_group_send`` does
+    and return its exit code.
+
+    JSON mode emits the response (with ``expires_at`` / ``send_after``
+    added when set); human mode prints one line per leg.  A forward
+    reuses this for its attribution text, so the two paths report a
+    group send the same way.
+    """
+    failed_legs = [
+        r for r in response["results"] if not r.get("delivered") and not r.get("queued")
+    ]
+    # --wait outcomes are recorded on the results by the wait path
+    # (see _wait_for_queued_sends), mirroring cmd_send: a waited leg
+    # that is not delivered failed the wait, whether it is still
+    # queued or left the queue without a delivery confirmation.
+    wait_failed = any(
+        result.get("waited") is not None and result.get("delivered") is False
+        for result in response["results"]
+    )
+    exit_code = _EXIT_ERROR if (failed_legs or wait_failed) else _EXIT_OK
+    if expires_at is not None:
+        response["expires_at"] = expires_at
+    if send_after is not None:
+        response["send_after"] = send_after
+    if _json_mode(args):
+        _emit(response, True)
+        return exit_code
+    delivered = [r for r in response["results"] if r.get("delivered")]
+    queued = [r for r in response["results"] if r.get("queued")]
+    failed = failed_legs
+    for result in delivered:
+        name = result.get("to_name") or result["to"][:8]
+        waited = result.get("waited")
+        if waited is not None:
+            print(f"delivered to {name} after {waited:.1f}s")
+        else:
+            print(f"delivered to {name}")
+    for result in queued:
+        name = result.get("to_name") or result["to"][:8]
+        if result.get("waited") is not None:
+            print(f"still queued for {name} after {result['waited']:.1f}s")
+        elif result.get("send_after"):
+            print(
+                f"scheduled for {name}"
+                f" — sends in {_ago(result['send_after'] - time.time())}"
+            )
+        else:
+            print(
+                f"queued for {name}"
+                " — they are unreachable right now"
+            )
+    for result in failed:
+        name = result.get("to_name") or result["to"][:8]
+        if result.get("waited") is not None and not result.get("delivered"):
+            # The leg left the queue while waiting without a delivery
+            # confirmation from this node: cancelled, or delivered by
+            # another process.  Say so instead of claiming delivery.
+            print(f"no longer queued for {name} after {result['waited']:.1f}s")
+            print("  delivery was not confirmed — it may have been cancelled,")
+            print("  or delivered by another process sharing this data directory")
+        else:
+            print(
+                f"failed for {name}:"
+                f" {result.get('error') or 'unknown error'}"
+            )
+    if expires_at is not None:
+        print(f"disappears in {_ago(expires_at - time.time())}")
+    if queued and all(result.get("send_after") for result in queued):
+        print("  it will be delivered at its scheduled time;")
+        print("  check `tau outbox` for the queue, or just leave a node serving")
+    return exit_code
 
 
 def cmd_group_send(args: argparse.Namespace) -> int:
@@ -18396,69 +18860,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             in_reply_to=in_reply_to,
             location=location,
         )
-    failed_legs = [
-        r for r in response["results"] if not r.get("delivered") and not r.get("queued")
-    ]
-    # --wait outcomes are recorded on the results by the wait path
-    # (see _wait_for_queued_sends), mirroring cmd_send: a waited leg
-    # that is not delivered failed the wait, whether it is still
-    # queued or left the queue without a delivery confirmation.
-    wait_failed = any(
-        result.get("waited") is not None and result.get("delivered") is False
-        for result in response["results"]
-    )
-    exit_code = _EXIT_ERROR if (failed_legs or wait_failed) else _EXIT_OK
-    if expires_at is not None:
-        response["expires_at"] = expires_at
-    if send_after is not None:
-        response["send_after"] = send_after
-    if _json_mode(args):
-        _emit(response, True)
-        return exit_code
-    delivered = [r for r in response["results"] if r.get("delivered")]
-    queued = [r for r in response["results"] if r.get("queued")]
-    failed = failed_legs
-    for result in delivered:
-        name = result.get("to_name") or result["to"][:8]
-        waited = result.get("waited")
-        if waited is not None:
-            print(f"delivered to {name} after {waited:.1f}s")
-        else:
-            print(f"delivered to {name}")
-    for result in queued:
-        name = result.get("to_name") or result["to"][:8]
-        if result.get("waited") is not None:
-            print(f"still queued for {name} after {result['waited']:.1f}s")
-        elif result.get("send_after"):
-            print(
-                f"scheduled for {name}"
-                f" — sends in {_ago(result['send_after'] - time.time())}"
-            )
-        else:
-            print(
-                f"queued for {name}"
-                " — they are unreachable right now"
-            )
-    for result in failed:
-        name = result.get("to_name") or result["to"][:8]
-        if result.get("waited") is not None and not result.get("delivered"):
-            # The leg left the queue while waiting without a delivery
-            # confirmation from this node: cancelled, or delivered by
-            # another process.  Say so instead of claiming delivery.
-            print(f"no longer queued for {name} after {result['waited']:.1f}s")
-            print("  delivery was not confirmed — it may have been cancelled,")
-            print("  or delivered by another process sharing this data directory")
-        else:
-            print(
-                f"failed for {name}:"
-                f" {result.get('error') or 'unknown error'}"
-            )
-    if expires_at is not None:
-        print(f"disappears in {_ago(expires_at - time.time())}")
-    if queued and all(result.get("send_after") for result in queued):
-        print("  it will be delivered at its scheduled time;")
-        print("  check `tau outbox` for the queue, or just leave a node serving")
-    return exit_code
+    return _report_group_send_results(args, response, expires_at, send_after)
 
 
 def _send_group_poll_message(

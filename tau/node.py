@@ -279,6 +279,66 @@ def _read_file_payload(path: Union[str, Path]) -> Tuple[bytes, str, str]:
     return data, name, hashlib.sha256(data).hexdigest()
 
 
+def resolve_received_file(
+    record: Dict[str, Any], files_dir: Union[str, Path]
+) -> Tuple[Path, bytes]:
+    """Return the verified on-disk path and bytes of a stored
+    received-file record.
+
+    The record carries the path the bytes were saved to when the file
+    arrived (``files/<sender>/<name>``), plus the name, size, and
+    SHA-256 the transfer was verified against.  A record is only
+    forwardable while those bytes are still there, unchanged: the path
+    must resolve inside *files_dir* (a tampered record must not reach
+    outside it), the file must exist, and its size and hash must still
+    match the record — a moved, deleted, or edited file is an error
+    before anything is sent, never a silent forward of the wrong bytes.
+
+    The bytes are read once here and returned alongside the path:
+    callers stage those bytes for the transfer instead of re-reading
+    the mutable path, so a change between verification and send
+    cannot swap in different bytes.
+    """
+    name = record.get("name")
+    if not isinstance(name, str) or sanitize_file_name(name) != name:
+        raise NodeError("stored file record has no usable file name")
+    size = record.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+        raise NodeError("stored file record has no usable file size")
+    digest = record.get("sha256")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise NodeError("stored file record has no usable file hash")
+    raw_path = record.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise NodeError("stored file record has no file path")
+    base = Path(files_dir).expanduser()
+    try:
+        resolved_base = base.resolve()
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = resolved_base / candidate
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise NodeError(f"stored file path is not usable: {exc}") from exc
+    if resolved != resolved_base and resolved_base not in resolved.parents:
+        raise NodeError("stored file path is outside the files directory")
+    if not resolved.is_file():
+        raise NodeError(
+            f"stored file {name} is no longer on disk; it cannot be forwarded"
+        )
+    try:
+        with resolved.open("rb") as handle:
+            data = handle.read(MAX_FILE_BYTES + 1)
+    except OSError as exc:
+        raise NodeError(f"could not read stored file {name}: {exc}") from exc
+    if len(data) != size or hashlib.sha256(data).hexdigest() != digest.lower():
+        raise NodeError(
+            f"stored file {name} changed since it arrived; "
+            "it cannot be forwarded"
+        )
+    return resolved, data
+
+
 # Reticulum adds framing and resource overhead on top of request payloads.
 _REQUEST_WIRE_LIMIT = MAX_REQUEST_BYTES + 2 * 1024
 _MAIL_WIRE_LIMIT = MAX_MAIL_REQUEST_BYTES + 2 * 1024
