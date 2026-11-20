@@ -688,7 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
     forward = subparsers.add_parser(
         "forward",
         parents=[common],
-        help="forward a stored message to a peer or a group",
+        help="forward a stored message to a peer, a group, or a channel",
     )
     forward_target = forward.add_mutually_exclusive_group(required=True)
     forward_target.add_argument(
@@ -701,6 +701,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="NAME|ID",
         help="group name or id: forward into the group instead of to a peer",
+    )
+    forward_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name: forward into the channel instead of to a peer",
     )
     forward.add_argument(
         "message",
@@ -13735,15 +13740,16 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
-    """Forward a stored message to another peer or into a group, attributed
-    to its sender.
+    """Forward a stored message to another peer, into a group, or into
+    a channel, attributed to its sender.
 
     The forwarded text is the original prefixed with one attribution
     line, so the recipient sees who said it on any transport with no
     protocol change.  Delivery reuses :func:`cmd_send` wholesale for a
-    peer target — or :func:`cmd_group_send` for a group target, fanning
-    out one leg per member.  Either way the forward is a new message,
-    so it carries no expiry, kind, or reply chain from the original.
+    peer target — :func:`cmd_group_send` for a group target, fanning
+    out one leg per member, or :func:`cmd_channel_send` for a channel
+    target.  Either way the forward is a new message, so it carries no
+    expiry, kind, or reply chain from the original.
     """
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -13806,10 +13812,18 @@ def cmd_forward(args: argparse.Namespace) -> int:
     # `cmd_send` reads its text from `args.message`; hand it the
     # attributed text and let it own delivery, queueing, and output.
     # A group target takes the group-send path instead: the same
-    # attributed text, fanned out one leg per member.
+    # attributed text, fanned out one leg per member.  A channel
+    # target takes the channel-send path the same way.
     args.message = forwarded
     if getattr(args, "group", None):
         return cmd_group_send(args)
+    if getattr(args, "channel", None):
+        # `cmd_channel_send` reads `args.to` as a publish restriction
+        # ("publish only to these peers"); the forward's own `--to`
+        # is a peer target, unset on this branch by the parser, but
+        # clear it explicitly so the two meanings can never mix.
+        args.to = None
+        return cmd_channel_send(args)
     return cmd_send(args)
 
 
