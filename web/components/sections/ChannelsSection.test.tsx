@@ -762,6 +762,79 @@ describe("ChannelsSection", () => {
     expect(calls).not.toContain("POST /api/drafts/delete");
   });
 
+  it("returning to a channel after switching away still closes its draft on send", async () => {
+    const saved: { kind: string; target: string; text: string; updated_at: number; name: string }[] =
+      [
+        {
+          kind: "channel",
+          target: "mesh-general",
+          text: "parked hello",
+          updated_at: 100,
+          name: "mesh-general",
+        },
+      ];
+    calls = mockFetch((url) => {
+      if (url.includes("/api/drafts/delete")) {
+        saved.length = 0;
+        return { ok: true, deleted: true };
+      }
+      if (url.includes("/api/drafts")) {
+        return { drafts: saved, count: saved.length };
+      }
+      if (url.includes("/api/channels/messages")) {
+        return { channel: "mesh-general", messages: [], count: 0 };
+      }
+      if (url.includes("/api/channels/pins")) {
+        return { channel: "mesh-general", pins: [], count: 0 };
+      }
+      if (url.includes("/api/channels/scheduled")) {
+        return { channel: "mesh-general", scheduled: [], count: 0 };
+      }
+      if (url.includes("/api/channels/topic")) {
+        return { channel: "mesh-general", topic: null };
+      }
+      if (url.includes("/api/channels")) {
+        return {
+          channels: [
+            { channel: "mesh-general", joined_at: 900, unread: 0 },
+            { channel: "mesh-random", joined_at: 800, unread: 0 },
+          ],
+          count: 2,
+        };
+      }
+      return { ok: true };
+    }).calls;
+    try {
+      render(<ChannelsSection />);
+      fireEvent.click(await screen.findByRole("button", { name: /#mesh-general/ }));
+      const input = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((input as HTMLInputElement).value).toBe("parked hello"),
+      );
+      // Leave and come back: the draft text returns, and it must
+      // still be recognized as the loaded draft when sent.
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-random/ }));
+      await screen.findByLabelText("Message #mesh-random");
+      fireEvent.click(screen.getByRole("button", { name: /#mesh-general/ }));
+      const inputAgain = await screen.findByLabelText("Message #mesh-general");
+      await waitFor(() =>
+        expect((inputAgain as HTMLInputElement).value).toBe("parked hello"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      await waitFor(() => expect(calls).toContain("POST /api/channels/send"));
+      await waitFor(() => expect(calls).toContain("POST /api/drafts/delete"));
+      // The draft is deleted exactly once and does not re-seed the
+      // composer, so it cannot be sent a second time.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(
+        calls.filter((c) => c === "POST /api/drafts/delete").length,
+      ).toBe(1);
+      expect((inputAgain as HTMLInputElement).value).toBe("");
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
   it("switching channels keeps each channel's unsent text and draft separate", async () => {
     calls = mockFetch((url) => {
       if (url.includes("/api/drafts")) {
