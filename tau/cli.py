@@ -14360,6 +14360,65 @@ def _forward_file(
         )
 
 
+def _record_forwarded_file(
+    node: Any,
+    *,
+    name: str,
+    size: int,
+    forwarded_from: Dict[str, Any],
+    results: List[Dict[str, Any]],
+    group: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Leave a local trace of a file forward in the forwarder's history.
+
+    A file leg stores nothing locally, so without this a CLI file
+    forward vanishes from ``tau messages``: the old attribution text
+    leg used to leave the trace.  The record is local only — nothing
+    is sent — and mirrors how text sends record: one record per
+    delivered peer leg, one record for a whole group fan-out.
+    """
+    delivered = [r for r in results if r.get("delivered")]
+    if not delivered:
+        return
+    origin = forwarded_from["name"]
+    text = f"Forwarded {name} ({size} bytes) — originally from {origin}"
+    if group is not None:
+        node._record_sent(
+            {
+                "from": node.name,
+                "destination": "",
+                "text": text,
+                "kind": "group",
+                "group": group["id"],
+                "group_name": group["name"],
+                "sent_at": time.time(),
+                "received_at": time.time(),
+                "id": delivered[0].get("id"),
+                "leg_ids": [
+                    r.get("id") for r in delivered if isinstance(r.get("id"), str)
+                ],
+                "direction": "out",
+            }
+        )
+        return
+    for result in delivered:
+        destination = result.get("to")
+        if not isinstance(destination, str) or not destination:
+            continue
+        node._record_sent(
+            {
+                "from": node.name,
+                "destination": destination,
+                "text": text,
+                "kind": "chat",
+                "sent_at": time.time(),
+                "received_at": time.time(),
+                "id": result.get("id"),
+                "direction": "out",
+            }
+        )
+
+
 def _forward_file_to_peers(
     args: argparse.Namespace,
     config: Any,
@@ -14389,6 +14448,13 @@ def _forward_file_to_peers(
             file_timeout,
             discover_timeout,
             forwarded_from=forwarded_from,
+        )
+        _record_forwarded_file(
+            node,
+            name=name,
+            size=size,
+            forwarded_from=forwarded_from,
+            results=file_results,
         )
     finally:
         node.stop()
@@ -14473,6 +14539,14 @@ def _forward_file_to_group(
             timeout=file_timeout,
             discover_timeout=discover_timeout,
             forwarded_from=forwarded_from,
+        )
+        _record_forwarded_file(
+            node,
+            name=name,
+            size=size,
+            forwarded_from=forwarded_from,
+            results=file_response.get("results") or [],
+            group=group,
         )
     finally:
         node.stop()

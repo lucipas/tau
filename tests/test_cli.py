@@ -600,6 +600,8 @@ class _FakeSendNode:
         from tau.mailbox import Mailbox
 
         self.config = config
+        self.name = config.name
+        self.inbox = Inbox(config.inbox_path)
         self.mailbox = Mailbox(config.mailbox_path)
         self.started = False
         self.calls: list = []
@@ -688,7 +690,18 @@ class _FakeSendNode:
             "name": Path(path).name,
             "size": len(data),
             "sha256": digest,
+            # The real send_file names the resolved peer: a forward
+            # trace records it as the destination.
+            "to": self.peer.hexhash,
         }
+
+    def _record_sent(self, record):
+        # Mirror TauNode._record_sent: persist an outgoing record to
+        # the inbox; never break sending.
+        try:
+            self.inbox.append(record)
+        except Exception:
+            pass
 
     def flush_outbox(self, **kwargs):
         self.flush_calls.append(kwargs)
@@ -7427,6 +7440,8 @@ class _FakeGroupSendNode:
         from tau.groups import GroupStore
 
         self.config = config
+        self.name = config.name
+        self.inbox = Inbox(config.inbox_path)
         self.groups = GroupStore(config.groups_path)
         self.mailbox = _FakeGroupMailbox()
         self.sent: list = []
@@ -7535,6 +7550,14 @@ class _FakeGroupSendNode:
             "name": group["name"],
             "results": results,
         }
+
+    def _record_sent(self, record):
+        # Mirror TauNode._record_sent: persist an outgoing record to
+        # the inbox; never break sending.
+        try:
+            self.inbox.append(record)
+        except Exception:
+            pass
 
     def flush_outbox(self, **kwargs):
         pass
@@ -9399,6 +9422,72 @@ def test_forward_file_to_peer_carries_attribution_in_the_offer(
     assert "forwarded photo.jpg (12 bytes) to bob" in out
 
 
+def test_forward_file_to_peer_leaves_a_trace_in_history(
+    tmp_path, monkeypatch
+):
+    # A file leg stores nothing locally, so without a trace the
+    # forward would vanish from `tau messages`: the old attribution
+    # text leg used to leave it.
+    data_dir, _ = _seed_received_file(tmp_path)
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "ffff"])
+    assert code == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    entries = Inbox(config.inbox_path).list_messages(
+        limit=None, direction="out"
+    )
+    assert len(entries) == 1
+    trace = entries[0]
+    assert trace["kind"] == "chat"
+    assert trace["direction"] == "out"
+    assert trace["destination"] == "ab" * 16
+    assert trace["text"] == (
+        "Forwarded photo.jpg (12 bytes) — originally from alice"
+    )
+
+
+def test_forward_file_to_peer_failed_leg_leaves_no_trace(
+    tmp_path, capsys, monkeypatch
+):
+    # Only a delivered leg leaves a trace: a failed forward sent
+    # nothing, so there is nothing to remember.
+    data_dir, _ = _seed_received_file(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    _FakeSendNode.file_behaviour = {"bob": "error"}
+    _FakeSendNode.deliver_on_flush = False
+    code = cli.main(
+        ["forward", "--data-dir", str(tmp_path / "node"), "--to", "bob", "ffff"]
+    )
+    assert code == 1
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    assert (
+        Inbox(config.inbox_path).list_messages(limit=None, direction="out")
+        == []
+    )
+
+
+def test_serve_file_callback_names_the_original_sender(capsys):
+    import argparse
+
+    _, _, on_file = cli._node_callbacks(
+        argparse.Namespace(json_output=False)
+    )
+    on_file(
+        {
+            "from": "bob",
+            "destination": "ab" * 16,
+            "name": "photo.jpg",
+            "size": 12,
+            "path": "/tmp/photo.jpg",
+            "forwarded_from": {"hash": "cd" * 16, "name": "carol"},
+        }
+    )
+    out = capsys.readouterr().out
+    assert "file from bob" in out
+    assert "forwarded from carol" in out
+
+
 def test_forward_file_json_reports_file_results(tmp_path, capsys, monkeypatch):
     _seed_received_file(tmp_path)
     code = _run_forward(
@@ -9537,6 +9626,44 @@ def test_forward_file_to_group_fans_out(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "forwarded photo.jpg (12 bytes) to alice" in out
     assert "forwarded photo.jpg (12 bytes) to bob" in out
+
+
+def test_forward_file_to_group_leaves_a_trace_in_history(
+    tmp_path, monkeypatch
+):
+    # One record for the whole fan-out, mirroring how group text
+    # sends record — not one per leg.
+    from tau.groups import GroupStore
+
+    data_dir, _ = _seed_received_file(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    store = GroupStore(config.groups_path)
+    store.create("weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    _FakeGroupSendNode.group_file_refusals = set()
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(data_dir),
+            "--group",
+            "weekend",
+            "ffff",
+        ]
+    )
+    assert code == 0
+    entries = Inbox(config.inbox_path).list_messages(
+        limit=None, direction="out"
+    )
+    assert len(entries) == 1
+    trace = entries[0]
+    assert trace["kind"] == "group"
+    assert trace["group_name"] == "weekend"
+    assert trace["text"] == (
+        "Forwarded photo.jpg (12 bytes) — originally from alice"
+    )
+    assert trace["leg_ids"] == ["file-abababab", "file-cdcdcdcd"]
 
 
 def test_forward_file_to_group_failed_leg_is_reported(

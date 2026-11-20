@@ -6932,6 +6932,7 @@ class WebBridge:
         sent_at: float,
         group: Optional[str] = None,
         group_name: Optional[str] = None,
+        forwarded_from: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Record one outbound feed entry per file fan-out leg.
 

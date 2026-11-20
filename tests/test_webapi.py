@@ -18723,7 +18723,13 @@ def test_forward_message_endpoint_forwards_received_file(
     assert status == 200
     assert payload["ok"] is True
     assert "message" not in payload
-    assert payload["file_message"]["text"] == "Sent file: photo.jpg (12 bytes)"
+    assert payload["file_message"]["text"] == (
+        "Forwarded from alice:\nSent file: photo.jpg (12 bytes)"
+    )
+    assert payload["file_message"]["file"]["forwarded_from"] == {
+        "hash": PEER_HASH,
+        "name": "alice",
+    }
     assert payload["file_response"]["name"] == "photo.jpg"
     assert payload["file_response"]["size"] == 12
     # One leg only: no attribution text goes out, and the offer names
@@ -18756,9 +18762,13 @@ def test_forward_message_endpoint_forwards_received_file_to_group(
     assert payload["ok"] is True
     assert "messages" not in payload
     assert [entry["text"] for entry in payload["file_messages"]] == [
-        "Sent file: photo.jpg (12 bytes)",
-        "Sent file: photo.jpg (12 bytes)",
+        "Forwarded from alice:\nSent file: photo.jpg (12 bytes)",
+        "Forwarded from alice:\nSent file: photo.jpg (12 bytes)",
     ]
+    assert payload["file_messages"][0]["file"]["forwarded_from"] == {
+        "hash": PEER_HASH,
+        "name": "alice",
+    }
     assert payload["file_response"]["ok"] is True
     assert node.group_sent == []
     assert node.group_sent_files == [("crew", "photo.jpg", b"photo-bytes!")]
@@ -18825,6 +18835,10 @@ def test_forward_message_endpoint_file_forward_keeps_original_sender(
     )
     assert status == 200
     assert payload["ok"] is True
+    assert payload["file_message"]["text"] == (
+        "Forwarded from carol:\nSent file: photo.jpg (12 bytes)"
+    )
+    assert payload["file_message"]["file"]["forwarded_from"] == forwarded_from
     assert node.sent_file_kwargs[0]["forwarded_from"] == forwarded_from
 
 
@@ -22031,6 +22045,25 @@ def test_send_file_is_recorded_with_file_metadata(bridge, node):
     assert feed["messages"][0]["file"]["sha256"] == hashlib.sha256(data).hexdigest()
     published = [e for e in bridge.bus.replay(0) if e.get("type") == "message"]
     assert published[-1]["message"]["id"] == message["id"]
+
+
+def test_send_file_with_forwarded_from_names_the_origin(bridge, node):
+    import hashlib
+
+    data = b"hello mesh"
+    forwarded_from = {"hash": "cd" * 16, "name": "carol"}
+    message, _ = bridge.send_file(
+        "alice", "notes.txt", data, forwarded_from=forwarded_from
+    )
+    assert message["text"] == (
+        "Forwarded from carol:\nSent file: notes.txt (10 bytes)"
+    )
+    assert message["file"] == {
+        "name": "notes.txt",
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "forwarded_from": forwarded_from,
+    }
 
 
 def test_send_file_sanitises_the_name(bridge, node):
