@@ -94,6 +94,12 @@ from .disappearing import (
     save_disappearing_defaults,
 )
 from .drafts import DraftStore
+from .reminders import (
+    MAX_REMINDER_DELAY,
+    ReminderError,
+    ReminderStore,
+    parse_remind_at,
+)
 from .muted import (
     MutedError,
     expand_muted_groups,
@@ -983,6 +989,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="after queueing, wait up to SECONDS for the message to be delivered",
     )
     draft_send.set_defaults(func=cmd_draft_send)
+
+    remind = subparsers.add_parser(
+        "remind",
+        parents=[common],
+        help="snooze a stored DM or group message and be re-pinged later",
+    )
+    remind_sub = remind.add_subparsers(dest="remind_command", metavar="REMIND_COMMAND")
+
+    remind_add = remind_sub.add_parser(
+        "add",
+        parents=[common],
+        help="remind yourself about a stored DM or group message later",
+    )
+    remind_add.add_argument(
+        "message",
+        metavar="MSG",
+        help="message id or unique prefix (as shown by `tau messages`)",
+    )
+    remind_add_time = remind_add.add_mutually_exclusive_group(required=True)
+    remind_add_time.add_argument(
+        "--in",
+        dest="remind_in",
+        metavar="DURATION",
+        help="remind after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
+    remind_add_time.add_argument(
+        "--at",
+        dest="remind_at",
+        metavar="ISO-TIME",
+        help="remind at this time (ISO 8601, e.g. 2026-11-21T09:00; naive times are local)",
+    )
+    remind_add.set_defaults(func=cmd_remind_add)
+
+    remind_list = remind_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list pending message reminders, soonest first",
+    )
+    remind_list.set_defaults(func=cmd_remind_list)
+
+    remind_cancel = remind_sub.add_parser(
+        "cancel",
+        parents=[common],
+        help="drop a pending reminder before it fires",
+    )
+    remind_cancel.add_argument(
+        "reminder",
+        metavar="ID",
+        help="reminder id or unique prefix (as shown by `tau remind list`)",
+    )
+    remind_cancel.set_defaults(func=cmd_remind_cancel)
 
     react = subparsers.add_parser(
         "react",
@@ -19951,6 +20008,192 @@ def cmd_draft_send(args: argparse.Namespace) -> int:
     store.delete(kind, target)
     if not _json_mode(args):
         print(f"sent draft to {name}")
+    return _EXIT_OK
+
+
+def _reminder_sender_blocked(
+    inbox: Inbox, reminder: Dict[str, Any], blocked: Any
+) -> bool:
+    """Whether the reminded message's sender is blocked now (fail closed).
+
+    A DM reminder's target is the sender.  A group reminder names the
+    group, so the sender is read from the stored message; when that
+    message is gone its sender is unknown, and the reminder is hidden.
+    """
+    if reminder["kind"] != "group":
+        return reminder["target"] in blocked
+    entry = inbox.find(
+        str(reminder["message_id"]), group=str(reminder["target"])
+    )
+    if entry is None:
+        return True
+    return entry.get("destination") in blocked
+
+
+def _describe_reminder(
+    reminder: Dict[str, Any], config: TauConfig
+) -> Dict[str, Any]:
+    """A reminder plus its conversation's display name, for output."""
+    if reminder["kind"] == "group":
+        group = GroupStore(config.groups_path).get(str(reminder["target"]))
+        name = str(group["name"]) if group is not None else short_hash(reminder["target"])
+    else:
+        peer = PeerRegistry(config.peers_path).get(str(reminder["target"]))
+        name = peer.display_name if peer is not None else short_hash(reminder["target"])
+    return {
+        "id": reminder["id"],
+        "message_id": reminder["message_id"],
+        "kind": reminder["kind"],
+        "target": reminder["target"],
+        "target_name": name,
+        "text": reminder["text"],
+        "sender": reminder["sender"],
+        "due_at": reminder["due_at"],
+        "created_at": reminder["created_at"],
+    }
+
+
+def cmd_remind_add(args: argparse.Namespace) -> int:
+    """Snooze a stored DM or group message: be re-pinged about it later.
+
+    Local-only: the reminder is a snapshot of the message's text and
+    sender, stored in the data dir and fired by the serving node's
+    mail loop — nothing is sent to the peer.  A reminder on a message
+    from a blocked peer is refused, like a forward is: blocked
+    senders' messages are hidden locally, so they cannot be the
+    subject of a reminder either.
+    """
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        record = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not record.get("text"):
+        raise NodeError("cannot remind on a file message: it has no text")
+    if record.get("kind") == "note":
+        raise NodeError("cannot remind on a private note: remind on a DM or group message")
+    if record.get("direction") == "out":
+        # A reminder re-pings by marking a received message unread; a
+        # conversation with nothing received has nothing to light up.
+        raise NodeError("cannot remind on a message you sent: remind on a received message")
+    if record.get("direction") != "out":
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            raise NodeError("cannot remind: the block-list could not be read")
+        if record.get("destination") in blocked:
+            raise NodeError("cannot remind on a message from a blocked peer")
+    if record.get("kind") == "group":
+        kind, target = "group", str(record.get("group") or "")
+    else:
+        kind, target = "peer", str(record.get("destination") or "")
+    if record.get("direction") == "out":
+        sender_label = "you"
+    else:
+        sender_hash = record.get("destination")
+        stored_name = record.get("from")
+        if not stored_name or stored_name == "unknown":
+            sender_label = (
+                short_hash(sender_hash)
+                if isinstance(sender_hash, str) and sender_hash
+                else "unknown"
+            )
+        else:
+            sender_label = str(stored_name)
+        peer = (
+            registry.get(sender_hash)
+            if isinstance(sender_hash, str) and sender_hash
+            else None
+        )
+        if peer is not None:
+            sender_label = peer.display_name
+    if getattr(args, "remind_in", None) is not None:
+        try:
+            seconds = _parse_duration(
+                args.remind_in, max_seconds=MAX_REMINDER_DELAY, flag="--in"
+            )
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+        due = time.time() + seconds
+        when = f"in {_describe_duration(seconds)}"
+    else:
+        try:
+            due = parse_remind_at(args.remind_at)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+        when = "at " + datetime.fromtimestamp(due).strftime("%Y-%m-%d %H:%M")
+    try:
+        reminder = ReminderStore(config.reminders_path).add(
+            message_id=str(record.get("id") or ""),
+            kind=kind,
+            target=target,
+            text=str(record.get("text") or ""),
+            sender=sender_label,
+            due_at=due,
+        )
+    except (ReminderError, OSError) as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_reminder(reminder, config)
+    if _json_mode(args):
+        _emit({"reminder": described}, True)
+    else:
+        print(f"reminder set for {described['target_name']} {when}")
+        for line in _draft_preview(str(record.get("text") or "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_remind_list(args: argparse.Namespace) -> int:
+    """List pending message reminders, soonest first."""
+    config = _make_config(args)
+    # A reminder whose sender is blocked now stays hidden, like the
+    # message itself; an unreadable block-list hides everything.
+    blocked = load_blocked_set(config.blocklist_path)
+    inbox = Inbox(config.inbox_path)
+    reminders = [
+        _describe_reminder(reminder, config)
+        for reminder in ReminderStore(config.reminders_path).list_reminders()
+        if blocked is not None
+        and not _reminder_sender_blocked(inbox, reminder, blocked)
+    ]
+    if _json_mode(args):
+        _emit({"reminders": reminders, "count": len(reminders)}, True)
+        return _EXIT_OK
+    if not reminders:
+        print("No reminders yet — set one with `tau remind add MSG --in 1h`.")
+        return _EXIT_OK
+    now = time.time()
+    for reminder in reminders:
+        if reminder["kind"] == "group":
+            where = "group "
+        else:
+            where = ""
+        # Round up: a reminder due in 3599s reads as "in 1h", not "in 3599s".
+        due_in = max(0, math.ceil(reminder["due_at"] - now))
+        print(
+            f"[{reminder['id'][:8]}] {where}{reminder['target_name']} — "
+            f"{_draft_preview(str(reminder['text']))} "
+            f"[in {_describe_duration(max(1, due_in))}, from {reminder['sender']}]"
+        )
+    return _EXIT_OK
+
+
+def cmd_remind_cancel(args: argparse.Namespace) -> int:
+    """Drop a pending reminder before it fires."""
+    config = _make_config(args)
+    try:
+        removed = ReminderStore(config.reminders_path).cancel(args.reminder)
+    except (ReminderError, OSError) as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_reminder(removed, config)
+    if _json_mode(args):
+        _emit({"cancelled": described}, True)
+    else:
+        print(
+            f"cancelled reminder for {described['target_name']} "
+            f"({_draft_preview(str(described['text']))})"
+        )
     return _EXIT_OK
 
 
