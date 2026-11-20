@@ -16,7 +16,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import RNS
 
@@ -725,6 +725,7 @@ class TauNode:
         self._foreign_announces: Dict[str, Dict[str, Any]] = {}
         self._foreign_announces_lock = threading.Lock()
         self._mail_thread: Optional[threading.Thread] = None
+        self._scheduled_files_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
         self._mail_round_threads: Set[threading.Thread] = set()
         self._mail_rounds_lock = threading.Lock()
@@ -1437,6 +1438,15 @@ class TauNode:
                 # join() rejects threads whose start() failed or was never called.
                 if worker.ident is not None:
                     worker.join()
+        # The mail loop spawns the scheduled-file worker and returns,
+        # so join it after the mail thread: a transfer in flight must
+        # finish (and update the queue) before links are torn down and
+        # the instance lock is released, or a replacement node could
+        # attempt the same queued file.
+        worker = self._scheduled_files_thread
+        if worker is not None and worker is not threading.current_thread():
+            if worker.ident is not None:
+                worker.join()
 
     def _release_instance_lock(self) -> None:
         lock, self._instance_lock = self._instance_lock, None
@@ -4771,6 +4781,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled channel-message publish failed", exc_info=True)
             try:
+                self._publish_due_scheduled_files()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Scheduled file send failed", exc_info=True)
+            try:
                 self._send_due_beacon_updates()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Beacon update round failed", exc_info=True)
@@ -4841,6 +4855,131 @@ class TauNode:
                 "Published %d scheduled channel message(s)",
                 result["published"],
             )
+
+    def _publish_due_scheduled_files(self) -> None:
+        """Send files whose scheduled time has come, on a worker thread.
+
+        A file transfer can take minutes, so the pass never runs on
+        the mail-loop thread and never holds the queue lock across a
+        send (see ``tau.scheduled_files``).  At most one pass runs at
+        a time: a pass still working when the next mail loop comes
+        around is left alone, and the next pass picks up whatever is
+        still due.  A failed send keeps the entry queued — see
+        ``tau.scheduled_files`` — so this never raises into the mail
+        loop.
+        """
+        thread = self._scheduled_files_thread
+        if thread is not None and thread.is_alive():
+            return
+        from .scheduled_files import publish_due_scheduled_files
+
+        def _run() -> None:
+            try:
+                result = publish_due_scheduled_files(
+                    self.config.scheduled_files_path,
+                    self.config.scheduled_files_dir,
+                    self._send_scheduled_file,
+                    should_stop=self._stop_event.is_set,
+                )
+            except Exception:  # pragma: no cover - defensive; helper logs
+                log.debug("Scheduled-file send pass failed", exc_info=True)
+                return
+            if result["published"]:
+                log.info("Sent %d scheduled file(s)", result["published"])
+
+        thread = threading.Thread(target=_run, name="scheduled-files", daemon=True)
+        self._scheduled_files_thread = thread
+        thread.start()
+
+    def _send_scheduled_file(self, entry: Any, staged_path: Path) -> None:
+        """One scheduled file transfer: DM via ``send_file``, group
+        via ``send_group_file``.
+
+        The staged bytes are re-read and checked against the queue
+        entry's descriptor first, so a staged copy that was replaced
+        or corrupted after scheduling never goes out under the wrong
+        name or hash.  The transfer uses the limits the user set at
+        schedule time (``--timeout`` / ``--discover-timeout``).
+
+        A group file resolves its group by the id pinned at schedule
+        time, and refuses to send when the roster no longer matches
+        the snapshot — a roster change or name reuse must never
+        redirect the file to members who were not in the group when
+        it was queued; the entry stays queued instead.  A fan-out
+        that reaches only some members raises :class:`PartialSend`
+        carrying the delivered ones, so the retry sends only to the
+        members still owed.
+        """
+        from .scheduled_files import PartialSend, ScheduledFileError
+
+        try:
+            data, name, digest = _read_file_payload(staged_path)
+        except NodeError as exc:
+            raise ScheduledFileError(str(exc)) from exc
+        descriptor = entry.file
+        if (
+            digest != descriptor["sha256"]
+            or name != descriptor["name"]
+            or len(data) != descriptor["size"]
+        ):
+            raise ScheduledFileError(
+                f"scheduled file {entry.id} staged bytes do not match "
+                "their descriptor"
+            )
+        if entry.kind == "group":
+            if not entry.group_id or not entry.group_members:
+                raise NodeError(
+                    f"scheduled file {entry.id} has no roster snapshot; "
+                    "cancel it and schedule it again"
+                )
+            try:
+                group = self.groups.find(entry.group_id)
+            except ValueError as exc:
+                raise NodeError(
+                    f"scheduled file {entry.id} group no longer exists; "
+                    "it stays queued until cancelled"
+                ) from exc
+            if sorted(group["members"]) != sorted(entry.group_members):
+                raise NodeError(
+                    f"scheduled file {entry.id} group roster changed "
+                    "since scheduling; it stays queued until cancelled"
+                )
+            result = self.send_group_file(
+                group,
+                staged_path,
+                timeout=entry.timeout,
+                discover_timeout=entry.discover_timeout,
+                only=list(entry.pending_members) or None,
+            )
+            if not result.get("ok"):
+                delivered = tuple(
+                    leg["to"]
+                    for leg in result.get("results") or []
+                    if leg.get("delivered")
+                )
+                failed = [
+                    leg
+                    for leg in result.get("results") or []
+                    if not leg.get("delivered")
+                ]
+                detail = "; ".join(
+                    f"{leg.get('to_name') or (leg.get('to') or '')[:8]}: "
+                    f"{leg.get('error') or 'unknown error'}"
+                    for leg in failed
+                )
+                raise PartialSend(
+                    f"scheduled file {entry.id} failed for "
+                    f"{len(failed)} member(s)"
+                    + (f": {detail}" if detail else ""),
+                    delivered_members=delivered,
+                )
+            return
+        self.send_file(
+            entry.target,
+            staged_path,
+            timeout=entry.timeout,
+            discover_timeout=entry.discover_timeout,
+        )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:
         """Ask a few known peers for their peers, outside the mail lock.
@@ -7809,6 +7948,7 @@ class TauNode:
         *,
         timeout: float = _FILE_TRANSFER_TIMEOUT,
         discover_timeout: Optional[float] = None,
+        only: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Fan a file out to every member of a group except this node.
 
@@ -7822,7 +7962,10 @@ class TauNode:
         ``send_group_message``, so one slow member cannot consume
         another member's window.  The file is read once up front, so
         every leg carries the same bytes even if the file changes
-        mid-fan-out.  Returns a per-member result list:
+        mid-fan-out.  With *only* set, legs go only to those member
+        hashes — a scheduled retry's still-owed members, so a partial
+        fan-out never redelivers to members who already received the
+        file.  Returns a per-member result list:
         ``delivered`` (with the transfer id, name, size and sha256)
         or an ``error`` for that leg.
         """
@@ -7834,6 +7977,9 @@ class TauNode:
         data, name, digest = _read_file_payload(path)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
+        if only is not None:
+            wanted = set(only)
+            members = [m for m in members if m in wanted]
         results: List[Dict[str, Any]] = []
         for member in members:
             deadline = time.monotonic() + timeout

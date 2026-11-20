@@ -174,6 +174,302 @@ def test_send_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
     assert code == 0
 
 
+def _run_send_file(tmp_path, monkeypatch, argv):
+    """Run `tau send-file` with a node that must never start: the
+    --delay path schedules without one."""
+    class _MustNotStartNode:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("send-file --delay started a node")
+
+    monkeypatch.setattr(cli, "TauNode", _MustNotStartNode)
+    return cli.main(["send-file", "--data-dir", str(tmp_path / "node"), *argv])
+
+
+def _write_sample_file(tmp_path, name="notes.txt", data=b"hello mesh"):
+    source = tmp_path / name
+    source.write_bytes(data)
+    return source
+
+
+def test_parser_send_file_delay():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["send-file", "--to", "alice", "--delay", "5m", "notes.txt"]
+    )
+    assert args.delay == "5m"
+    args = parser.parse_args(["scheduled-files"])
+    assert args.scheduled_files_command is None
+    args = parser.parse_args(["scheduled-files", "cancel", "ab12cd34"])
+    assert args.target == "ab12cd34"
+
+
+def test_send_file_delay_schedules_without_a_node(
+    tmp_path, capsys, monkeypatch
+):
+    import hashlib
+
+    from tau.config import TauConfig
+
+    source = _write_sample_file(tmp_path)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    before = time.time()
+    code = _run_send_file(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "2h", str(source)],
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled notes.txt" in out
+    assert "for alice" in out
+    assert "sends in" in out
+    assert "tau scheduled-files" in out
+    config = TauConfig.resolve(data_dir=tmp_path / "node")
+    queue = json.loads(config.scheduled_files_path.read_text())
+    assert len(queue["files"]) == 1
+    entry = queue["files"][0]
+    assert entry["target"] == "alice"
+    assert entry["kind"] == "dm"
+    assert entry["file"] == {
+        "sha256": digest,
+        "size": len(source.read_bytes()),
+        "name": "notes.txt",
+    }
+    assert before + 7200 <= entry["publish_at"] <= time.time() + 7200
+    # The bytes are staged under the queue id, so the original file
+    # can move or be deleted before send time.
+    staged = config.scheduled_files_dir / entry["id"] / "notes.txt"
+    assert staged.read_bytes() == source.read_bytes()
+
+
+def test_send_file_delay_holds_lock_across_staging(
+    tmp_path, capsys, monkeypatch
+):
+    import fcntl
+
+    from tau.config import TauConfig
+
+    source = _write_sample_file(tmp_path)
+    real_stage_file = cli.stage_file
+    held = []
+
+    def _stage_and_probe(*args, **kwargs):
+        # Inside staging, a second non-blocking exclusive flock on
+        # the queue lock sidecar must fail: the schedule holds the
+        # lock across staging and the queue commit, so a crash or a
+        # backup cannot slip between them and leave orphaned bytes.
+        config = TauConfig.resolve(data_dir=tmp_path / "node")
+        lock_path = config.scheduled_files_path.with_name(
+            f".{config.scheduled_files_path.name}.lock"
+        )
+        with open(lock_path, "a+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                held.append(True)
+            else:
+                held.append(False)
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        return real_stage_file(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "stage_file", _stage_and_probe)
+    code = _run_send_file(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "2h", str(source)]
+    )
+    assert code == 0
+    assert held == [True]
+
+
+def test_send_file_delay_json_reports_send_after(tmp_path, capsys, monkeypatch):
+    source = _write_sample_file(tmp_path)
+    code = _run_send_file(
+        tmp_path,
+        monkeypatch,
+        ["--json", "--to", "alice", "--delay", "5m", str(source)],
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scheduled"] is True
+    assert payload["to"] == "alice"
+    assert payload["kind"] == "dm"
+    assert payload["name"] == "notes.txt"
+    assert payload["send_after"] > time.time()
+
+
+def test_send_file_delay_rejects_bad_input(tmp_path, capsys, monkeypatch):
+    source = _write_sample_file(tmp_path)
+    code = _run_send_file(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "soon", str(source)]
+    )
+    assert code == 1
+    assert "invalid --delay duration" in capsys.readouterr().err
+    code = _run_send_file(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "30d", str(source)]
+    )
+    assert code == 2
+    assert "--delay must be at most 29d23h" in capsys.readouterr().err
+    code = _run_send_file(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "5m", str(tmp_path / "missing.txt")],
+    )
+    assert code == 1
+    assert "no such file" in capsys.readouterr().err
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * (10 * 1024 * 1024 + 1))
+    code = _run_send_file(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "5m", str(big)]
+    )
+    assert code == 1
+    assert "outside the" in capsys.readouterr().err
+
+
+def test_send_file_delay_stores_transfer_timeouts(tmp_path, capsys, monkeypatch):
+    from tau.config import TauConfig
+
+    source = _write_sample_file(tmp_path)
+    code = _run_send_file(
+        tmp_path,
+        monkeypatch,
+        [
+            "--to",
+            "alice",
+            "--delay",
+            "5m",
+            "--timeout",
+            "60",
+            "--discover-timeout",
+            "5",
+            str(source),
+        ],
+    )
+    assert code == 0
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=tmp_path / "node")
+    queue = json.loads(config.scheduled_files_path.read_text())
+    entry = queue["files"][0]
+    assert entry["timeout"] == 60.0
+    assert entry["discover_timeout"] == 5.0
+
+
+def test_group_send_file_delay_schedules(tmp_path, capsys, monkeypatch):
+    from tau.config import TauConfig
+
+    source = _write_sample_file(tmp_path)
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+
+    class _MustNotStartNode:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("group send-file --delay started a node")
+
+    monkeypatch.setattr(cli, "TauNode", _MustNotStartNode)
+    code = cli.main(
+        [
+            "group",
+            "send-file",
+            "--data-dir",
+            str(data_dir),
+            "--delay",
+            "5m",
+            "weekend",
+            str(source),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled notes.txt" in out
+    assert "for group weekend" in out
+    config = TauConfig.resolve(data_dir=data_dir)
+    queue = json.loads(config.scheduled_files_path.read_text())
+    assert len(queue["files"]) == 1
+    entry = queue["files"][0]
+    assert entry["target"] == "weekend"
+    assert entry["kind"] == "group"
+    assert entry["file"]["name"] == "notes.txt"
+    assert entry["group_id"] == group["id"]
+    assert sorted(entry["group_members"]) == sorted(group["members"])
+    assert (config.scheduled_files_dir / entry["id"] / "notes.txt").exists()
+
+
+def test_group_send_file_delay_rejects_unknown_group(
+    tmp_path, capsys, monkeypatch
+):
+    source = _write_sample_file(tmp_path)
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    code = cli.main(
+        [
+            "group",
+            "send-file",
+            "--data-dir",
+            str(data_dir),
+            "--delay",
+            "5m",
+            "nope",
+            str(source),
+        ]
+    )
+    assert code == 1
+    assert "unknown group" in capsys.readouterr().err
+
+
+def test_scheduled_files_list_and_cancel(tmp_path, capsys, monkeypatch):
+    from tau.config import TauConfig
+
+    first = _write_sample_file(tmp_path, "one.txt", b"one")
+    second = _write_sample_file(tmp_path, "two.txt", b"two")
+    assert (
+        _run_send_file(
+            tmp_path, monkeypatch, ["--to", "alice", "--delay", "2h", str(first)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        _run_send_file(
+            tmp_path, monkeypatch, ["--to", "bob", "--delay", "3h", str(second)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=tmp_path / "node")
+    queue = json.loads(config.scheduled_files_path.read_text())
+    first_id = queue["files"][0]["id"]
+    second_id = queue["files"][1]["id"]
+    code = cli.main(["scheduled-files", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert first_id in out and "one.txt" in out
+    assert second_id in out and "two.txt" in out
+    # Cancel by unique prefix: the entry and its staged bytes go.
+    code = cli.main(
+        [
+            "scheduled-files",
+            "cancel",
+            "--data-dir",
+            str(tmp_path / "node"),
+            first_id[:8],
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"cancelled {first_id}" in out
+    assert not (config.scheduled_files_dir / first_id).exists()
+    queue = json.loads(config.scheduled_files_path.read_text())
+    assert [entry["id"] for entry in queue["files"]] == [second_id]
+    # Cancelling an unknown id fails plainly.
+    code = cli.main(
+        [
+            "scheduled-files",
+            "cancel",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "ff" * 8,
+        ]
+    )
+    assert code == 1
+    assert "no scheduled file" in capsys.readouterr().err
+
+
 def test_parser_send_location():
     parser = cli.build_parser()
     args = parser.parse_args(
