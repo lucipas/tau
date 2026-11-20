@@ -10538,6 +10538,93 @@ def test_tan_share_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_share_to_channel_via_api(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.channels import ChannelApp
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.set_blocklist(BlockList(blocked=frozenset()))
+    # Attach a real channel app so the share lands in channel history;
+    # its node points at the fake so gossip has nowhere to go.
+    app = ChannelApp(node.config, node.identity, name="tester", gossip=False)
+    app.node = node
+    node.channel_app = app
+    app.join("general")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Sharing a post into a channel sends it as an attributed
+        # channel message; the author is not in the registry, so the
+        # recorded name is used.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"][:16], "channel": "general"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["message"]["text"] == (
+            f"Shared Tan post by other:\nworth sharing\n(tan {foreign['hash']})"
+        )
+
+        # The shared message is in the channel history.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert payload["messages"][0]["text"].startswith(
+            "Shared Tan post by other:"
+        )
+
+        # Exactly one of `to`, `group`, and `channel` is required.
+        for bad in (
+            {"to": "alice", "channel": "general"},
+            {"group": "crew", "channel": "general"},
+            {"channel": ""},
+            {"channel": "  "},
+            {"channel": 123},
+        ):
+            status, _, payload = _json(
+                bridge,
+                "/api/tan/share",
+                method="POST",
+                body={"target": foreign["hash"], **bad},
+            )
+            assert status == 400, bad
+            assert "exactly one of" in payload["error"]["message"] or (
+                "channel" in payload["error"]["message"]
+            ), bad
+
+        # Sharing into a channel this node has not joined is refused.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"], "channel": "nowhere"},
+        )
+        assert status == 400
+        assert "not a member" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_share_uses_cached_app_ruleset(tmp_path):
     # Regression test for Qodo's Critical on PR #450: the share guard
     # must agree with what the console shows. A rules file changed by

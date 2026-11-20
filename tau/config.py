@@ -50,6 +50,7 @@ JOIN_REQUESTS_FILE_NAME = "join-requests.json"
 SCHEDULED_POSTS_FILE_NAME = "scheduled-posts.json"
 SCHEDULED_CHANNEL_MESSAGES_FILE_NAME = "scheduled-channel-messages.json"
 SCHEDULED_FILES_FILE_NAME = "scheduled-files.json"
+REMINDERS_FILE_NAME = "reminders.json"
 SCHEDULED_FILES_DIR_NAME = "scheduled-files"
 PROFILE_FILE_NAME = "profile.json"
 PROFILES_FILE_NAME = "profiles.json"
@@ -108,6 +109,7 @@ class TauConfig:
     scheduled_channel_messages_path: Path
     scheduled_files_path: Path
     scheduled_files_dir: Path
+    reminders_path: Path
     profile_path: Path
     profiles_path: Path
     beacons_path: Path
@@ -179,6 +181,7 @@ class TauConfig:
             / SCHEDULED_CHANNEL_MESSAGES_FILE_NAME,
             scheduled_files_path=base / SCHEDULED_FILES_FILE_NAME,
             scheduled_files_dir=base / SCHEDULED_FILES_DIR_NAME,
+            reminders_path=base / REMINDERS_FILE_NAME,
             profile_path=base / PROFILE_FILE_NAME,
             profiles_path=base / PROFILES_FILE_NAME,
             beacons_path=base / BEACONS_FILE_NAME,

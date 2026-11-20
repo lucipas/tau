@@ -9721,11 +9721,35 @@ def test_parser_tan_share_arguments():
     assert group.group == "weekend"
     assert group.target == "abcdef12"
 
+    channel = parser.parse_args(
+        ["tan", "share", "--channel", "general", "abcdef12"]
+    )
+    assert channel.to is None
+    assert channel.group is None
+    assert channel.channel == "general"
+    assert channel.target == "abcdef12"
+
     with pytest.raises(SystemExit):
         parser.parse_args(["tan", "share", "abcdef12"])
     with pytest.raises(SystemExit):
         parser.parse_args(
             ["tan", "share", "--to", "bob", "--group", "weekend", "abcdef12"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["tan", "share", "--to", "bob", "--channel", "general", "abcdef12"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "tan",
+                "share",
+                "--group",
+                "weekend",
+                "--channel",
+                "general",
+                "abcdef12",
+            ]
         )
 
 
@@ -9774,6 +9798,101 @@ def test_tan_share_to_group_fans_out_attributed_text(
         f"Shared Tan post by alice:\nworth sharing\n(tan {post['hash']})"
     )
     assert "delivered to alice" in capsys.readouterr().out
+
+
+def test_tan_share_to_channel_publishes_attributed_text(
+    tmp_path, capsys, monkeypatch
+):
+    # A channel share takes the channel-send path: the real store
+    # write runs, only the gossip publish is faked (no transport in
+    # the test). The shared text lands in the channel history with
+    # the same attribution a peer share carries.
+    _, post, _ = _seed_tan_post(tmp_path)
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(["channel", "join", "--data-dir", str(data_dir), "general"])
+        == 0
+    )
+
+    class _FakeChannelNode:
+        instances: list = []
+
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.name = kwargs.get("name", config.name)
+            self.identity = load_identity(config.identity_path)
+            # attach() only needs a non-None destination and a handler
+            # registry; nothing here ever touches the transport.
+            self.destination = object()
+            _FakeChannelNode.instances.append(self)
+
+        def start(self, **kwargs):
+            pass
+
+        def stop(self):
+            pass
+
+        def add_request_handler(self, *args, **kwargs):
+            pass
+
+        def resolve_peer(self, target, timeout=10.0):
+            return None
+
+    monkeypatch.setattr(cli, "TauNode", _FakeChannelNode)
+    _FakeChannelNode.instances.clear()
+    monkeypatch.setattr(
+        cli.ChannelApp,
+        "publish",
+        lambda self, message, **kwargs: {
+            "delivered": 0,
+            "peers": 0,
+            "errors": [],
+        },
+    )
+    code = cli.main(
+        [
+            "tan",
+            "share",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            post["hash"][:12],
+        ]
+    )
+    assert code == 0
+    assert "sent to #general" in capsys.readouterr().out
+
+    assert (
+        cli.main(["channel", "read", "--data-dir", str(data_dir), "general"])
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "Shared Tan post by alice:" in out
+    assert "worth sharing" in out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--no-queue"],
+        ["--wait", "30"],
+        ["--discover-timeout", "2"],
+    ],
+)
+def test_tan_share_to_channel_refuses_peer_only_flags(
+    tmp_path, capsys, monkeypatch, argv
+):
+    # Peer/group delivery flags are refused on a channel share
+    # instead of being silently ignored by the channel-send path.
+    _, post, _ = _seed_tan_post(tmp_path)
+    code = _run_share(
+        tmp_path,
+        monkeypatch,
+        ["--channel", "general", *argv, post["hash"][:12]],
+    )
+    assert code == 1
+    assert "does not apply to a channel share" in capsys.readouterr().err
 
 
 def test_tan_share_own_post_labels_you(tmp_path, monkeypatch):

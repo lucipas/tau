@@ -4864,6 +4864,10 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("Scheduled file send failed", exc_info=True)
             try:
+                self._fire_due_reminders()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Reminder firing failed", exc_info=True)
+            try:
                 self._send_due_beacon_updates()
             except Exception:  # pragma: no cover - defensive
                 log.debug("Beacon update round failed", exc_info=True)
@@ -4969,6 +4973,34 @@ class TauNode:
         thread = threading.Thread(target=_run, name="scheduled-files", daemon=True)
         self._scheduled_files_thread = thread
         thread.start()
+
+    def _fire_due_reminders(self) -> None:
+        """Re-ping the owner about snoozed messages whose time has come.
+
+        The reminder itself marks the conversation unread again and
+        prints the original text, so the owner sees it in the unread
+        view and in the serve log.  A reminder whose message was
+        deleted first is dropped — see ``tau.reminders`` — so this
+        never raises into the mail loop.
+        """
+        from .reminders import fire_due_reminders
+
+        try:
+            result = fire_due_reminders(
+                self.config.reminders_path,
+                self.inbox,
+                blocklist_path=self.config.blocklist_path,
+            )
+        except Exception:  # pragma: no cover - defensive; helper logs
+            log.debug("Reminder firing failed", exc_info=True)
+            return
+        if result["fired"]:
+            log.info("Fired %d message reminder(s)", len(result["fired"]))
+        if result["dropped"]:
+            log.debug(
+                "Dropped %d reminder(s) whose message is gone",
+                len(result["dropped"]),
+            )
 
     def _send_scheduled_file(self, entry: Any, staged_path: Path) -> None:
         """One scheduled file transfer: DM via ``send_file``, group

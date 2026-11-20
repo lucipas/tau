@@ -23,6 +23,7 @@ import {
   useTanThread,
   type TanFeedMode,
 } from "@/lib/use-tan";
+import { useChannels } from "@/lib/use-channels";
 import PostCard, { type ReactorKind } from "./social/PostCard";
 import TanComposer, { SCHEDULE_OPTIONS } from "./social/TanComposer";
 
@@ -198,6 +199,12 @@ export default function SocialSection() {
     name: p.alias || p.name,
   }));
 
+  // Joined channels for the post share picker. Polled so channels joined
+  // elsewhere (e.g. the CLI) appear while Social stays open. No channel is
+  // selected here, so each poll only refreshes the joined-channel list.
+  const { channels: joinedChannels } = useChannels(30_000);
+  const channels = joinedChannels.map((c) => c.channel);
+
   const posts = searchResults ?? feed.posts;
   const showComposer = view === "feed" && !threadHash;
 
@@ -355,6 +362,7 @@ export default function SocialSection() {
               post={p}
               actions={feed}
               peers={peers}
+              channels={channels}
               highlighted={p.hash === threadHash}
               onOpenThread={openThread}
               onReply={openReply}
@@ -494,6 +502,7 @@ export default function SocialSection() {
                   post={p}
                   actions={feed}
                   peers={peers}
+                  channels={channels}
                   onOpenThread={openThread}
                   onReply={openReply}
                   onShowReactors={showReactors}
@@ -584,6 +593,7 @@ export default function SocialSection() {
               empty="No saved posts yet — save one from its ⋯ menu."
               actions={feed}
               peers={peers}
+              channels={channels}
               onOpenThread={openThread}
               onReply={openReply}
               onShowReactors={showReactors}
@@ -597,6 +607,7 @@ export default function SocialSection() {
               empty="Nothing hidden."
               actions={feed}
               peers={peers}
+              channels={channels}
               onOpenThread={openThread}
               onReply={openReply}
               onShowReactors={showReactors}
@@ -613,6 +624,7 @@ export default function SocialSection() {
               empty="No pinned posts yet."
               actions={feed}
               peers={peers}
+              channels={channels}
               onOpenThread={openThread}
               onReply={openReply}
               onShowReactors={showReactors}
@@ -1187,6 +1199,7 @@ function LibraryList({
   empty,
   actions,
   peers,
+  channels,
   onOpenThread,
   onReply,
   onShowReactors,
@@ -1198,6 +1211,7 @@ function LibraryList({
   empty: string;
   actions: ReturnType<typeof useTanFeed>;
   peers: { destination: string; name: string }[];
+  channels: string[];
   onOpenThread: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onShowReactors: (kind: ReactorKind, post: TanPost) => void;
@@ -1214,6 +1228,7 @@ function LibraryList({
             post={p}
             actions={actions}
             peers={peers}
+            channels={channels}
             onOpenThread={onOpenThread}
             onReply={onReply}
             onShowReactors={onShowReactors}

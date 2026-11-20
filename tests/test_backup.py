@@ -662,6 +662,45 @@ def test_backup_restore_round_trip_keeps_dm_requests(tmp_path, capsys):
     ).read_bytes()
 
 
+def test_backup_restore_round_trip_keeps_reminders(tmp_path, capsys):
+    from tau.reminders import ReminderStore
+
+    node_a = _init_node(tmp_path, "a", "alice")
+    store = ReminderStore(node_a / "reminders.json")
+    store.add(
+        message_id="msg-1",
+        kind="peer",
+        target="aa" * 16,
+        text="meet at noon?",
+        sender="alice",
+        due_at=time.time() + 3600,
+    )
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "restore",
+                str(archive),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert "reminders.json" in payload["files"]
+    assert (node_b / "reminders.json").read_bytes() == (
+        node_a / "reminders.json"
+    ).read_bytes()
+    assert len(ReminderStore(node_b / "reminders.json")) == 1
+
+
 def test_restore_rejects_misplaced_files_member(tmp_path):
     # Received-file members are exactly files/<sender>/<name>: a file
     # directly under files/, or nested any deeper, is not a member
