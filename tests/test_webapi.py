@@ -6353,6 +6353,93 @@ def test_channel_send_with_expiry_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_send_with_location_via_api(tmp_path):
+    from tau.channels import ChannelApp, join_channel
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    # Attach a real channel app so sends work; its node points at the
+    # fake so gossip has nowhere to go (delivered 0, no raise).
+    app = ChannelApp(node.config, node.identity, name="tester", gossip=False)
+    app.node = node
+    node.channel_app = app
+    app.join("general")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "meet here",
+                "location": {
+                    "lat": 34.05,
+                    "lon": -83.88,
+                    "name": "Rock Springs Park",
+                },
+            },
+        )
+        assert status == 200
+        assert payload["message"]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
+        # The stored message carries the pin into history.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        assert payload["messages"][0]["location"] == {
+            "lat": 34.05,
+            "lon": -83.88,
+            "name": "Rock Springs Park",
+        }
+
+        # A malformed pin is a 400 before the bridge is touched.
+        for bad in (
+            {"lat": 91, "lon": 0},
+            {"lat": 34.05},
+            "34.05,-83.88",
+            42,
+        ):
+            status, _, payload = _json(
+                bridge,
+                "/api/channels/send",
+                method="POST",
+                body={"channel": "general", "text": "nope", "location": bad},
+            )
+            assert status == 400, bad
+            assert "error" in payload
+
+        # A pin cannot ride on a reply.
+        status, _, payload = _json(
+            bridge, "/api/channels/messages?channel=general"
+        )
+        assert status == 200
+        parent = payload["messages"][0]
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/send",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "see you",
+                "reply_to": parent["hash"],
+                "location": {"lat": 34.05, "lon": -83.88},
+            },
+        )
+        assert status == 400
+        assert "top-level" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_pages_via_api(tmp_path):
     from types import SimpleNamespace
 

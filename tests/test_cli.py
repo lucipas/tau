@@ -478,6 +478,10 @@ def test_parser_send_location():
     assert args.location == "34.05,-83.88 Rock Springs Park"
     args = parser.parse_args(["group", "send", "weekend", "--location", "34.05,-83.88"])
     assert args.location == "34.05,-83.88"
+    args = parser.parse_args(
+        ["channel", "send", "--location", "34.05,-83.88 Park", "general", "hi"]
+    )
+    assert args.location == "34.05,-83.88 Park"
 
 
 def test_send_location_reaches_node_and_defaults_text(

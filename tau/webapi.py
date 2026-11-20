@@ -228,7 +228,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/channels/pins  pinned messages for a channel (``?channel=<name>``)
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
-    POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?}``; ``expires_in`` seconds, at most 30d)
+    POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?, "location"?}``; ``expires_in`` seconds, at most 30d; ``location`` is ``{"lat", "lon", "name"?}`` and is refused on a reply)
     POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later
     GET  /api/channels/scheduled  queued channel messages and polls, soonest first
     POST /api/channels/cancel-scheduled  cancel a queued channel message or poll
@@ -4587,6 +4587,7 @@ class WebBridge:
         *,
         reply_to: Optional[str] = None,
         expires_in: Optional[float] = None,
+        location: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send *text* to a joined channel, gossiping it to peers.
 
@@ -4596,6 +4597,10 @@ class WebBridge:
         *expires_in* is an optional disappearing lifetime in seconds;
         without one, a per-channel disappearing default fills the
         expiry in, exactly like the CLI's ``tau channel send``.
+
+        ``location`` pins a place on a top-level message
+        (``{"lat": .., "lon": .., "name": ..}``); it is refused on a
+        reply, exactly like the CLI's ``--location``.
         """
         app = self._channel_app()
         if app is None:
@@ -4606,7 +4611,12 @@ class WebBridge:
         if expires_in is not None:
             expires_at = time.time() + float(expires_in)
         return app.send(
-            channel, text, publish=True, reply_to=reply_to, expires_at=expires_at
+            channel,
+            text,
+            publish=True,
+            reply_to=reply_to,
+            expires_at=expires_at,
+            location=location,
         )
 
     def channel_edit(
@@ -15588,6 +15598,32 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                location = body.get("location")
+                if location is not None:
+                    if not isinstance(location, dict):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'location' must be an object "
+                                    "with lat/lon (and an optional name)"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
+                    if clean_location(location) is None:
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'location' must have a "
+                                    "latitude -90..90 and a longitude -180..180"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     message = self.bridge.channel_send(
                         channel,
@@ -15598,6 +15634,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                             if expires_in is not None
                             else None
                         ),
+                        location=location,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

@@ -4297,6 +4297,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="store locally without contacting peers",
     )
     channel_send.add_argument(
+        "--location",
+        default=None,
+        metavar='"LAT,LON [PLACE]"',
+        help="pin a place on the message (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park"); without message text the '
+        "place name (or the coordinates) becomes the text",
+    )
+    channel_send.add_argument(
         "--delay",
         metavar="DURATION",
         help="schedule the message: queue it now and publish it after "
@@ -5121,6 +5129,7 @@ def _message_text_with_location(
     if (
         location is not None
         and getattr(args, "message", None) is None
+        and getattr(args, "text", None) is None
         and getattr(args, "file", None) is None
         and sys.stdin.isatty()
     ):
@@ -5883,6 +5892,7 @@ def _publish_local_channel_message(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = ChannelApp(
@@ -5904,6 +5914,7 @@ def _publish_local_channel_message(
         poll_vote=poll_vote,
         poll_close=poll_close,
         reply_to=reply_to,
+        location=location,
     )
     published = publisher.publish(
         message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
@@ -6116,6 +6127,7 @@ def _publish_local_post(
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            location=location,
         )
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = TanApp(
@@ -9275,7 +9287,24 @@ def cmd_channel_mark_read(args: argparse.Namespace) -> int:
 
 
 def cmd_channel_send(args: argparse.Namespace) -> int:
-    text = _read_message(args)
+    # Validate the pin before reading the message, so an invalid
+    # --location fails at once instead of blocking on stdin.
+    location = _location_from_args(args)
+    if location is not None and getattr(args, "reply_to", None):
+        print(
+            "error: --location can only be attached to a top-level message, "
+            "not a reply",
+            file=sys.stderr,
+        )
+        return 2
+    if location is not None and getattr(args, "delay", None) is not None:
+        print(
+            "error: --location cannot be combined with --delay — "
+            "scheduled channel messages cannot carry a location pin yet",
+            file=sys.stderr,
+        )
+        return 2
+    text = _message_text_with_location(args, location)
     config = _make_config(args)
     json_output = _json_mode(args)
     try:
@@ -9355,6 +9384,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 text,
                 expires_at=expires_at,
                 reply_to=getattr(args, "reply_to", None),
+                location=location,
             )
         except ChannelError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -9376,6 +9406,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
                 expires_at=expires_at,
+                location=location,
             )
             message, published = result["message"], result["published"]
         else:
@@ -9396,6 +9427,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
                     expires_at=expires_at,
+                    location=location,
                 )
                 message, published = result["message"], result["published"]
             finally:
@@ -9405,6 +9437,11 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         _emit({"message": message, "published": published}, True)
     else:
         print(f"sent to #{name} {short_hash(message['hash'])}")
+        pin = clean_location(message.get("location"))
+        if pin is not None:
+            label = pin.get("name") or "Location"
+            print(f"  📍 {label} — {pin['lat']}, {pin['lon']}")
+            print(f"  {location_maps_url(pin)}")
         if message.get("expires_at") is not None:
             print(
                 "  disappears in "
