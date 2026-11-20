@@ -67,6 +67,8 @@ from .protocol import (
     MAX_MAIL_TTL,
     ProtocolError,
     _clean_group_poll_options_or_none,
+    _clean_group_poll_target_or_none,
+    _clean_group_poll_vote_or_none,
     clean_beacon,
     clean_group_poll_target,
     clean_group_poll_vote,
@@ -2875,6 +2877,8 @@ def seal_message(
     beacon: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
     edited_at: Optional[float] = None,
+    poll_vote: Optional[Dict[str, Any]] = None,
+    poll_close: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
@@ -2996,8 +3000,13 @@ def seal_message(
                     ann_at = None
                 if ann_at is not None and not math.isfinite(ann_at):
                     ann_at = None
-            if ann_at is not None:
-                inner["group"]["announcements_sent_at"] = ann_at
+            # A setting never changed has no stamp of its own: it is
+            # stamped with the message's send time, the baseline
+            # ``record()`` already uses, so every creator envelope
+            # carries both fields.
+            if ann_at is None:
+                ann_at = float(sent_at)
+            inner["group"]["announcements_sent_at"] = ann_at
     if expires_at is not None:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
             raise MailboxError("expires_at must be a finite number")
@@ -3037,6 +3046,18 @@ def seal_message(
         if cleaned_location is None:
             raise MailboxError("a beacon update must carry a location pin")
         inner["beacon"] = cleaned_beacon
+    # A relayed group vote or poll close rides inside the signed
+    # envelope, so a holder cannot forge or strip it.
+    if poll_vote is not None:
+        try:
+            inner["poll_vote"] = clean_group_poll_vote(poll_vote)
+        except ProtocolError as exc:
+            raise MailboxError(f"poll vote is invalid: {exc}") from exc
+    if poll_close is not None:
+        try:
+            inner["poll_close"] = clean_group_poll_target(poll_close)
+        except ProtocolError as exc:
+            raise MailboxError(f"poll close is invalid: {exc}") from exc
     canonical = encode(inner)
     signature = sender_identity.sign(canonical)
     if signature is None:  # pragma: no cover - identity without private keys
@@ -3272,6 +3293,14 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "location": clean_location(payload.get("location")),
         "beacon": clean_beacon(payload.get("beacon")),
     }
+    # A signed vote or poll close; carrying both is contradictory, so
+    # neither is kept (the same rule the plain message parser applies).
+    sealed_vote = _clean_group_poll_vote_or_none(payload.get("poll_vote"))
+    sealed_close = _clean_group_poll_target_or_none(payload.get("poll_close"))
+    if sealed_vote is not None and sealed_close is not None:
+        sealed_vote = sealed_close = None
+    result["poll_vote"] = sealed_vote
+    result["poll_close"] = sealed_close
     group_raw = payload.get("group")
     if group_raw is not None:
         if not isinstance(group_raw, dict):

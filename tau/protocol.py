@@ -565,13 +565,19 @@ def encode_group_message(
             payload["group_topic_sent_at"] = topic_at
     if group_announcements_only is not None:
         payload["group_announcements_only"] = bool(group_announcements_only)
-    if group_announcements_sent_at is not None:
-        try:
-            announcements_at = float(group_announcements_sent_at)
-        except (TypeError, ValueError, OverflowError):
-            announcements_at = None
-        if announcements_at is not None and math.isfinite(announcements_at):
-            payload["group_announcements_sent_at"] = announcements_at
+    if group_announcements_only is not None:
+        # Every creator message carries the setting's own timestamp.  A
+        # setting never changed has none, so it is stamped with the
+        # message's send time — the same baseline ``record()`` uses.
+        announcements_at = None
+        if group_announcements_sent_at is not None:
+            try:
+                announcements_at = float(group_announcements_sent_at)
+            except (TypeError, ValueError, OverflowError):
+                announcements_at = None
+        if announcements_at is None or not math.isfinite(announcements_at):
+            announcements_at = payload["sent_at"]
+        payload["group_announcements_sent_at"] = announcements_at
     if message_id:
         payload["id"] = message_id
     lineage = _clean_renamed_from(renamed_from)
@@ -781,6 +787,52 @@ def clean_group_poll_vote(value: Any) -> Dict[str, Any]:
     if isinstance(option, bool) or not isinstance(option, int) or option < 0:
         raise ProtocolError("poll vote option must be a non-negative integer")
     return {"target": target, "option": option}
+
+
+GROUP_POLL_VOTE_LABEL = "voted"
+GROUP_POLL_CLOSE_LABEL = "closed the poll"
+
+
+def is_group_poll_vote_or_close(
+    text: Any,
+    *,
+    poll_options: Any = None,
+    poll_vote: Any = None,
+    poll_close: Any = None,
+    location: Any = None,
+    beacon: Any = None,
+    in_reply_to: Any = None,
+) -> bool:
+    """True when a group message is a bare poll vote or poll close.
+
+    Only these are exempt from announcements-only groups: votes and
+    closes are not posts.  The message must carry exactly one of
+    ``poll_vote`` / ``poll_close`` and nothing else that makes it
+    content (no poll options, pin, beacon or reply), and its text must
+    be the label clients write: ``"voted"`` or ``"voted: <option>"``
+    for a vote, ``"closed the poll"`` for a close.  The option part is
+    bounded by the poll option length limit.
+    """
+    if (poll_vote is None) == (poll_close is None):
+        return False
+    if (
+        poll_options is not None
+        or location is not None
+        or beacon is not None
+        or in_reply_to is not None
+    ):
+        return False
+    if not isinstance(text, str):
+        return False
+    if poll_close is not None:
+        return text == GROUP_POLL_CLOSE_LABEL
+    if text == GROUP_POLL_VOTE_LABEL:
+        return True
+    prefix = GROUP_POLL_VOTE_LABEL + ": "
+    return (
+        text.startswith(prefix)
+        and len(text) <= len(prefix) + MAX_GROUP_POLL_OPTION_CHARS
+    )
 
 
 def _clean_group_poll_target_or_none(value: Any) -> Optional[Dict[str, Any]]:

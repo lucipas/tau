@@ -182,6 +182,7 @@ from .protocol import (
     clean_in_reply_to,
     clean_location,
     clean_reaction,
+    is_group_poll_vote_or_close,
     decode,
     derive_group_id,
     edit_dict,
@@ -258,22 +259,36 @@ def _group_announcements_blocks_post(
     group: Dict[str, Any],
     own_hash: str,
     *,
+    text: Optional[str] = None,
+    poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
+    beacon: Optional[Dict[str, Any]] = None,
+    in_reply_to: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """True when *own_hash* may not post to *group* right now.
 
     An announcements-only group admits posts only from its creator.
-    Poll votes and poll closes are not posts — members keep voting —
-    and reactions, retracts and edits travel on separate request
-    types, so they are unaffected.  A group with no recorded setting
-    reads as open.
+    A bare poll vote or poll close is not a post — members keep
+    voting — and reactions, retracts and edits travel on separate
+    request types, so they are unaffected.  Anything else a member
+    attaches to a vote (text beyond the vote label, a pin, a reply)
+    still counts as a post.  A group with no recorded setting reads
+    as open.
     """
     return bool(
         group.get("announcements_only")
         and (group.get("creator") or "").lower() != (own_hash or "").lower()
-        and poll_vote is None
-        and poll_close is None
+        and not is_group_poll_vote_or_close(
+            text,
+            poll_options=poll_options,
+            poll_vote=poll_vote,
+            poll_close=poll_close,
+            location=location,
+            beacon=beacon,
+            in_reply_to=in_reply_to,
+        )
     )
 
 
@@ -3088,8 +3103,15 @@ class TauNode:
         if (
             group.get("announcements_only")
             and caller_hash.lower() != (group.get("creator") or "").lower()
-            and message.get("poll_vote") is None
-            and message.get("poll_close") is None
+            and not is_group_poll_vote_or_close(
+                message.get("text"),
+                poll_options=message.get("poll_options"),
+                poll_vote=message.get("poll_vote"),
+                poll_close=message.get("poll_close"),
+                location=message.get("location"),
+                beacon=message.get("beacon"),
+                in_reply_to=message.get("in_reply_to"),
+            )
         ):
             # Announcements-only is enforced on receipt as well as on
             # send: a member's post must not land even from a client
@@ -5609,15 +5631,36 @@ class TauNode:
                 ann_only
                 and self.destination_hexhash.lower()
                 != (fresh.group_creator or "").lower()
-                and fresh.poll_vote is None
-                and fresh.poll_close is None
+                and not is_group_poll_vote_or_close(
+                    send_text,
+                    poll_options=fresh.poll_options,
+                    poll_vote=fresh.poll_vote,
+                    poll_close=fresh.poll_close,
+                    location=fresh.location,
+                    beacon=fresh.beacon,
+                    in_reply_to=fresh.in_reply_to,
+                )
             ):
+                # Not deliverable ever again: the group will not admit
+                # this post.  Leave the outbox now rather than being
+                # re-checked and re-logged on every sweep until TTL.
                 log.info(
-                    "Skipping queued group message %s: group %s is "
+                    "Dropping queued group message %s: group %s is "
                     "announcements-only and this node is not its creator",
                     entry.id,
                     fresh.group_id,
                 )
+                try:
+                    removed = self._remove_queued_version(
+                        entry.id,
+                        text=send_text,
+                        edited_at=send_edited_at,
+                        timeout=_remaining(deadline),
+                    )
+                except TimeoutError:
+                    return False
+                if removed:
+                    self.mailbox.discard_sent(entry.id)
                 return False
             try:
                 payload = encode_group_message(
@@ -5729,6 +5772,16 @@ class TauNode:
             )
             return False
         except NodeError as exc:
+            if entry.group_id is not None and isinstance(exc, NotAllowedError):
+                # A group leg the receiver refuses (announcements-only)
+                # stays refused on every retry: drop it now, as the live
+                # send path does, instead of retrying until TTL.
+                log.warning("Dropping queued group message %s: %s", entry.id, exc)
+                if self._remove_queued_version(
+                    entry.id, text=send_text, edited_at=send_edited_at
+                ):
+                    self.mailbox.discard_sent(entry.id)
+                return False
             # An explicit refusal (allow-list, block-list) is final: falling
             # back to LXMF would deliver to the peer's separate destination
             # and bypass the policy that refused it.  Only transport
@@ -5904,8 +5957,15 @@ class TauNode:
                 and announcements[0]
                 and self.destination_hexhash.lower()
                 != (fresh.group_creator or "").lower()
-                and fresh.poll_vote is None
-                and fresh.poll_close is None
+                and not is_group_poll_vote_or_close(
+                    fresh.text,
+                    poll_options=fresh.poll_options,
+                    poll_vote=fresh.poll_vote,
+                    poll_close=fresh.poll_close,
+                    location=fresh.location,
+                    beacon=fresh.beacon,
+                    in_reply_to=fresh.in_reply_to,
+                )
             ):
                 log.info(
                     "Skipping deposit of queued group message %s: group %s "
@@ -5977,6 +6037,8 @@ class TauNode:
                 beacon=fresh.beacon,
                 kind=getattr(fresh, "kind", None),
                 edited_at=fresh.edited_at,
+                poll_vote=fresh.poll_vote if fresh.group_id is not None else None,
+                poll_close=fresh.poll_close if fresh.group_id is not None else None,
             )
             payload = build_mail_store(
                 to=fresh.to_hex,
@@ -6439,14 +6501,21 @@ class TauNode:
             if (
                 pinned.get("announcements_only")
                 and (sender or "").lower() != (pinned.get("creator") or "").lower()
-                and message.get("poll_vote") is None
-                and message.get("poll_close") is None
+                and not is_group_poll_vote_or_close(
+                    message.get("text"),
+                    poll_options=message.get("poll_options"),
+                    poll_vote=message.get("poll_vote"),
+                    poll_close=message.get("poll_close"),
+                    location=message.get("location"),
+                    beacon=message.get("beacon"),
+                    in_reply_to=message.get("in_reply_to"),
+                )
             ):
                 # Same rule as the live path: a member's post to an
                 # announcements-only group does not land, even from a
-                # holder.  (Sealed envelopes carry no poll fields
-                # today, so the vote exemption is for symmetry with
-                # the live path, not a case that can fire yet.)
+                # holder.  A sealed vote or close carries its poll
+                # field inside the signed envelope, so it is exempt
+                # exactly as on the live path.
                 log.info(
                     "Dropping relayed group message from %s: group %s is "
                     "announcements-only and the sender is not its creator",
@@ -6481,6 +6550,12 @@ class TauNode:
             # time inside its signed envelope: the record starts life
             # with its edit ordering state, exactly like a direct one.
             record["edited_at"] = message["edited_at"]
+        # A relayed vote or poll close keeps its poll field, so the
+        # tally counts it exactly as a direct one.
+        if message.get("poll_vote") is not None:
+            record["poll_vote"] = message["poll_vote"]
+        if message.get("poll_close") is not None:
+            record["poll_close"] = message["poll_close"]
         log.info(
             "Message from %s (%s) via store-and-forward: %s",
             message["from_name"],
@@ -7509,8 +7584,13 @@ class TauNode:
         if _group_announcements_blocks_post(
             group,
             self.destination_hexhash,
+            text=text,
+            poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            location=location,
+            beacon=beacon,
+            in_reply_to=in_reply_to,
         ):
             raise NodeError(
                 "group is announcements-only: only the creator can post"
@@ -10760,6 +10840,11 @@ class TauNode:
                 raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
+            raise NodeError(f"peer rejected the request: {message}")
+        if isinstance(state.get("rtt"), (int, float)):
+            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+se NotAMemberError(f"peer rejected the request: {message}")
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
