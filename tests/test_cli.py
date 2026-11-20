@@ -8717,11 +8717,33 @@ def test_parser_forward_arguments():
     assert group.group == "weekend"
     assert group.message == "abcdef12"
 
+    channel = parser.parse_args(["forward", "--channel", "general", "abcdef12"])
+    assert channel.to is None
+    assert channel.group is None
+    assert channel.channel == "general"
+    assert channel.message == "abcdef12"
+
+    # --discover-timeout is SUPPRESS: absent unless explicitly given,
+    # so the channel branch can tell a passed value from the default.
+    assert not hasattr(channel, "discover_timeout")
+    explicit = parser.parse_args(
+        ["forward", "--to", "bob", "--discover-timeout", "2", "abcdef12"]
+    )
+    assert explicit.discover_timeout == 2.0
+
     with pytest.raises(SystemExit):
         parser.parse_args(["forward", "abcdef12"])
     with pytest.raises(SystemExit):
         parser.parse_args(
             ["forward", "--to", "bob", "--group", "weekend", "abcdef12"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["forward", "--to", "bob", "--channel", "general", "abcdef12"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["forward", "--group", "weekend", "--channel", "general", "abcdef12"]
         )
 
 
@@ -8841,6 +8863,106 @@ def test_forward_sends_attributed_text(tmp_path, capsys, monkeypatch):
     assert target == "bob"
     assert text == "Forwarded from alice:\noriginal thought"
     assert "delivered to bob" in capsys.readouterr().out
+
+
+def test_forward_to_channel_publishes_attributed_text(
+    tmp_path, capsys, monkeypatch
+):
+    # A channel forward takes the channel-send path: the real store
+    # write runs, only the gossip publish is faked (no transport in
+    # the test). The forwarded text lands in the channel history with
+    # the same attribution a peer forward carries.
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    assert cli.main(["init", "--data-dir", str(data_dir), "--name", "bob"]) == 0
+    assert (
+        cli.main(["channel", "join", "--data-dir", str(data_dir), "general"])
+        == 0
+    )
+
+    class _FakeChannelNode:
+        instances: list = []
+
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.name = kwargs.get("name", config.name)
+            self.identity = load_identity(config.identity_path)
+            # attach() only needs a non-None destination and a handler
+            # registry; nothing here ever touches the transport.
+            self.destination = object()
+            _FakeChannelNode.instances.append(self)
+
+        def start(self, **kwargs):
+            pass
+
+        def stop(self):
+            pass
+
+        def add_request_handler(self, *args, **kwargs):
+            pass
+
+        def resolve_peer(self, target, timeout=10.0):
+            return None
+
+    monkeypatch.setattr(cli, "TauNode", _FakeChannelNode)
+    _FakeChannelNode.instances.clear()
+    monkeypatch.setattr(
+        cli.ChannelApp,
+        "publish",
+        lambda self, message, **kwargs: {
+            "delivered": 0,
+            "peers": 0,
+            "errors": [],
+        },
+    )
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "aaaa",
+        ]
+    )
+    assert code == 0
+    assert "sent to #general" in capsys.readouterr().out
+
+    assert (
+        cli.main(["channel", "read", "--data-dir", str(data_dir), "general"])
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "Forwarded from alice:" in out
+    assert "original thought" in out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--no-queue"],
+        ["--wait", "30"],
+        ["--discover-timeout", "2"],
+    ],
+)
+def test_forward_to_channel_refuses_peer_only_flags(
+    tmp_path, capsys, argv
+):
+    # Peer/group delivery flags are refused on a channel forward
+    # instead of being silently ignored by the channel-send path.
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    code = cli.main(
+        [
+            "forward",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            *argv,
+            "aaaa",
+        ]
+    )
+    assert code == 1
+    assert "does not apply to a channel forward" in capsys.readouterr().err
 
 
 def test_forward_to_group_fans_out_attributed_text(

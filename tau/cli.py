@@ -706,7 +706,7 @@ def build_parser() -> argparse.ArgumentParser:
     forward = subparsers.add_parser(
         "forward",
         parents=[common],
-        help="forward a stored message to a peer or a group",
+        help="forward a stored message to a peer, a group, or a channel",
     )
     forward_target = forward.add_mutually_exclusive_group(required=True)
     forward_target.add_argument(
@@ -720,6 +720,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|ID",
         help="group name or id: forward into the group instead of to a peer",
     )
+    forward_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name: forward into the channel instead of to a peer",
+    )
     forward.add_argument(
         "message",
         metavar="ID|PREFIX",
@@ -729,7 +734,11 @@ def build_parser() -> argparse.ArgumentParser:
     forward.add_argument(
         "--discover-timeout",
         type=float,
-        default=10.0,
+        # SUPPRESS, not 10.0: every send path defaults a missing value
+        # to 10s, but `cmd_forward` must be able to tell an explicitly
+        # passed value from the default — a channel forward refuses
+        # the flag instead of silently ignoring it.
+        default=argparse.SUPPRESS,
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
@@ -13942,15 +13951,16 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
-    """Forward a stored message to another peer or into a group, attributed
-    to its sender.
+    """Forward a stored message to another peer, into a group, or into
+    a channel, attributed to its sender.
 
     The forwarded text is the original prefixed with one attribution
     line, so the recipient sees who said it on any transport with no
     protocol change.  Delivery reuses :func:`cmd_send` wholesale for a
-    peer target — or :func:`cmd_group_send` for a group target, fanning
-    out one leg per member.  Either way the forward is a new message,
-    so it carries no expiry, kind, or reply chain from the original.
+    peer target — :func:`cmd_group_send` for a group target, fanning
+    out one leg per member, or :func:`cmd_channel_send` for a channel
+    target.  Either way the forward is a new message, so it carries no
+    expiry, kind, or reply chain from the original.
     """
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -14013,10 +14023,30 @@ def cmd_forward(args: argparse.Namespace) -> int:
     # `cmd_send` reads its text from `args.message`; hand it the
     # attributed text and let it own delivery, queueing, and output.
     # A group target takes the group-send path instead: the same
-    # attributed text, fanned out one leg per member.
+    # attributed text, fanned out one leg per member.  A channel
+    # target takes the channel-send path the same way.
     args.message = forwarded
     if getattr(args, "group", None):
         return cmd_group_send(args)
+    if getattr(args, "channel", None):
+        # `--no-queue`, `--wait`, and `--discover-timeout` only mean
+        # something for peer/group delivery; the channel-send path
+        # never reads them, so refuse them here instead of silently
+        # ignoring them.
+        if getattr(args, "no_queue", False):
+            raise NodeError("--no-queue does not apply to a channel forward")
+        if getattr(args, "wait", None) is not None:
+            raise NodeError("--wait does not apply to a channel forward")
+        if getattr(args, "discover_timeout", None) is not None:
+            raise NodeError(
+                "--discover-timeout does not apply to a channel forward"
+            )
+        # `cmd_channel_send` reads `args.to` as a publish restriction
+        # ("publish only to these peers"); the forward's own `--to`
+        # is a peer target, unset on this branch by the parser, but
+        # clear it explicitly so the two meanings can never mix.
+        args.to = None
+        return cmd_channel_send(args)
     return cmd_send(args)
 
 
