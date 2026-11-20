@@ -44,6 +44,8 @@ export interface PostCardProps {
   actions: FeedActions;
   /** Peer hashes/names for the share picker (from the live snapshot). */
   peers?: { destination: string; name: string }[];
+  /** Joined channel names for the share picker. */
+  channels?: string[];
   /** Open the thread view for this post. */
   onOpenThread?: (post: TanPost) => void;
   /** Start a reply to this post. */
@@ -111,6 +113,7 @@ export default function PostCard({
   post,
   actions,
   peers = [],
+  channels = [],
   onOpenThread,
   onReply,
   onShowReactors,
@@ -126,7 +129,18 @@ export default function PostCard({
   const [quoteSendIn, setQuoteSendIn] = useState<number | undefined>(undefined);
   const [scheduleRepostOpen, setScheduleRepostOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [shareKind, setShareKind] = useState<"peer" | "channel">("peer");
   const [shareTarget, setShareTarget] = useState("");
+
+  // A channel picked earlier can leave the joined list on a poll
+  // (joined elsewhere, then left): the select then has no matching
+  // option, so treat the stored target as empty instead of letting
+  // Share send to a channel the node is no longer in. The server
+  // would refuse it anyway, but the picker should not offer it.
+  const effectiveShareTarget =
+    shareKind === "channel" && !channels.includes(shareTarget)
+      ? ""
+      : shareTarget;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -482,25 +496,62 @@ export default function PostCard({
               <label className="text-xs text-zinc-400" htmlFor={`share-${shown.hash.slice(0, 8)}`}>
                 Share with
               </label>
+              <div className="flex rounded-md border border-zinc-700" role="group" aria-label="Share destination">
+                <button
+                  type="button"
+                  aria-pressed={shareKind === "peer"}
+                  onClick={() => {
+                    setShareKind("peer");
+                    setShareTarget("");
+                  }}
+                  className={`rounded-l-md px-2 py-1 text-xs ${shareKind === "peer" ? "bg-cyan-500 font-bold text-zinc-950" : "text-zinc-300 hover:bg-zinc-800"}`}
+                >
+                  Peer
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={shareKind === "channel"}
+                  onClick={() => {
+                    setShareKind("channel");
+                    setShareTarget("");
+                  }}
+                  className={`rounded-r-md px-2 py-1 text-xs ${shareKind === "channel" ? "bg-cyan-500 font-bold text-zinc-950" : "text-zinc-300 hover:bg-zinc-800"}`}
+                >
+                  Channel
+                </button>
+              </div>
               <select
                 id={`share-${shown.hash.slice(0, 8)}`}
-                value={shareTarget}
+                value={effectiveShareTarget}
                 onChange={(e) => setShareTarget(e.target.value)}
                 className="min-w-0 flex-1 rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 outline-none"
               >
-                <option value="">Choose a peer…</option>
-                {peers.map((p) => (
-                  <option key={p.destination} value={p.destination}>
-                    {p.name || shortHash(p.destination)}
-                  </option>
-                ))}
+                <option value="">
+                  {shareKind === "peer" ? "Choose a peer…" : "Choose a channel…"}
+                </option>
+                {shareKind === "peer"
+                  ? peers.map((p) => (
+                      <option key={p.destination} value={p.destination}>
+                        {p.name || shortHash(p.destination)}
+                      </option>
+                    ))
+                  : channels.map((c) => (
+                      <option key={c} value={c}>
+                        #{c}
+                      </option>
+                    ))}
               </select>
               <button
                 type="button"
-                disabled={busy || !shareTarget}
+                disabled={busy || !effectiveShareTarget}
                 onClick={() =>
                   void run(async () => {
-                    await actions.share(shown.hash, { to: shareTarget });
+                    await actions.share(
+                      shown.hash,
+                      shareKind === "peer"
+                        ? { to: effectiveShareTarget }
+                        : { channel: effectiveShareTarget },
+                    );
                     setShareOpen(false);
                   })
                 }

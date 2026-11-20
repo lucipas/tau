@@ -120,7 +120,10 @@ export interface UseTanFeedResult {
     sendIn: number,
   ) => Promise<ScheduledTanPost>;
   vote: (target: string, option: number) => Promise<void>;
-  share: (target: string, dest: { to: string } | { group: string }) => Promise<void>;
+  share: (
+    target: string,
+    dest: { to: string } | { group: string } | { channel: string },
+  ) => Promise<void>;
   save: (target: string) => Promise<void>;
   unsave: (target: string) => Promise<void>;
   hide: (target: string) => Promise<void>;
