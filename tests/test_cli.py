@@ -8417,11 +8417,27 @@ def test_parser_forward_arguments():
     assert group.group == "weekend"
     assert group.message == "abcdef12"
 
+    broadcast = parser.parse_args(
+        ["forward", "--broadcast", "team", "abcdef12"]
+    )
+    assert broadcast.to is None
+    assert broadcast.group is None
+    assert broadcast.broadcast == "team"
+    assert broadcast.message == "abcdef12"
+
     with pytest.raises(SystemExit):
         parser.parse_args(["forward", "abcdef12"])
     with pytest.raises(SystemExit):
         parser.parse_args(
             ["forward", "--to", "bob", "--group", "weekend", "abcdef12"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["forward", "--to", "bob", "--broadcast", "team", "abcdef12"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["forward", "--group", "weekend", "--broadcast", "team", "abcdef12"]
         )
 
 

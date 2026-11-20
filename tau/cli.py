@@ -694,7 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
     forward = subparsers.add_parser(
         "forward",
         parents=[common],
-        help="forward a stored message to a peer or a group",
+        help="forward a stored message to a peer, a group, or a broadcast list",
     )
     forward_target = forward.add_mutually_exclusive_group(required=True)
     forward_target.add_argument(
@@ -707,6 +707,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="NAME|ID",
         help="group name or id: forward into the group instead of to a peer",
+    )
+    forward_target.add_argument(
+        "--broadcast",
+        metavar="NAME",
+        help="broadcast list name: forward to every member instead of to a peer",
     )
     forward.add_argument(
         "message",
@@ -13854,15 +13859,17 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
-    """Forward a stored message to another peer or into a group, attributed
-    to its sender.
+    """Forward a stored message to another peer, into a group, or to
+    every member of a broadcast list, attributed to its sender.
 
     The forwarded text is the original prefixed with one attribution
     line, so the recipient sees who said it on any transport with no
     protocol change.  Delivery reuses :func:`cmd_send` wholesale for a
-    peer target — or :func:`cmd_group_send` for a group target, fanning
-    out one leg per member.  Either way the forward is a new message,
-    so it carries no expiry, kind, or reply chain from the original.
+    peer target — :func:`cmd_group_send` for a group target, fanning
+    out one leg per member, or :func:`cmd_broadcast_send` for a
+    broadcast target, one DM per member.  Either way the forward is a
+    new message, so it carries no expiry, kind, or reply chain from the
+    original.
     """
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -13925,10 +13932,15 @@ def cmd_forward(args: argparse.Namespace) -> int:
     # `cmd_send` reads its text from `args.message`; hand it the
     # attributed text and let it own delivery, queueing, and output.
     # A group target takes the group-send path instead: the same
-    # attributed text, fanned out one leg per member.
+    # attributed text, fanned out one leg per member.  A broadcast
+    # target takes the broadcast-send path the same way: one DM per
+    # member, each with the same store-and-forward queueing as a
+    # one-to-one DM, so every delivery flag keeps its meaning.
     args.message = forwarded
     if getattr(args, "group", None):
         return cmd_group_send(args)
+    if getattr(args, "broadcast", None):
+        return cmd_broadcast_send(args)
     return cmd_send(args)
 
 
