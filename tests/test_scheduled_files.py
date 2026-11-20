@@ -11,7 +11,9 @@ import pytest
 
 from tau.node import NodeError, TauNode
 from tau.scheduled_files import (
+    CLAIM_LEASE_SECONDS,
     MAX_SEND_ATTEMPTS,
+    PartialSend,
     SEND_RETRY_BASE_SECONDS,
     ScheduledFile,
     ScheduledFileError,
@@ -238,7 +240,10 @@ def test_publish_due_sends_and_cleans_up(tmp_path):
 
     result = publish_due_scheduled_files(path, staged_dir, _send, now=2000.0)
     assert result == {"published": 1, "kept": 0}
-    assert [item[0] for item in sent] == [entry]
+    # The send callable receives the claimed entry.
+    from dataclasses import replace as _replace
+
+    assert [item[0] for item in sent] == [_replace(entry, claimed_at=2000.0)]
     assert len(load_scheduled_files(path)) == 0
     assert not (staged_dir / entry.id).exists()
 
@@ -427,20 +432,248 @@ def test_node_send_rejects_staged_bytes_that_mismatch(tmp_path):
 
 def test_node_send_group_partial_failure_raises(tmp_path):
     path, staged_dir, entry = _seed(tmp_path)
+    members = ("a" * 32, "b" * 32, "c" * 32)
     group_entry = ScheduledFile(
-        **{**entry.to_dict(), "kind": "group", "target": "weekend"}
+        **{
+            **entry.to_dict(),
+            "kind": "group",
+            "target": "weekend",
+            "group_id": "d" * 32,
+            "group_members": members,
+        }
     )
 
     def _fail_group(group, staged, **kwargs):
+        assert group["id"] == "d" * 32
         return {
             "ok": False,
             "results": [
                 {"to": "a" * 32, "to_name": "alice", "delivered": True},
                 {"to": "b" * 32, "to_name": "bob", "error": "no route"},
+                {"to": "c" * 32, "to_name": "carol", "error": "no route"},
             ],
         }
 
     node = _fake_node(tmp_path, path, staged_dir, send_group_file=_fail_group)
+    # The fake node resolves the group by id and reports the roster.
+    record = {"id": "d" * 32, "members": list(members)}
+
+    def _find(query):
+        if query == "d" * 32:
+            return record
+        raise ValueError(f"unknown group: {query!r}")
+
+    node.groups = SimpleNamespace(find=_find)
     staged = staged_dir / entry.id / "notes.txt"
-    with pytest.raises(NodeError, match="1 member"):
+    with pytest.raises(PartialSend, match="2 member") as caught:
         TauNode._send_scheduled_file(node, group_entry, staged)
+    assert caught.value.delivered_members == ("a" * 32,)
+
+def test_node_send_group_uses_entry_timeouts(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    seen = {}
+
+    def _send_file(target, staged, **kwargs):
+        seen.update(kwargs)
+        return {"ok": True}
+
+    node = _fake_node(tmp_path, path, staged_dir, send_file=_send_file)
+    entry = ScheduledFile(
+        **{**entry.to_dict(), "timeout": 60.0, "discover_timeout": 5.0}
+    )
+    TauNode._send_scheduled_file(
+        node, entry, staged_dir / entry.id / "notes.txt"
+    )
+    assert seen == {"timeout": 60.0, "discover_timeout": 5.0}
+
+
+def test_node_send_group_refuses_changed_roster(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    members = ("a" * 32, "b" * 32)
+    group_entry = ScheduledFile(
+        **{
+            **entry.to_dict(),
+            "kind": "group",
+            "target": "weekend",
+            "group_id": "d" * 32,
+            "group_members": members,
+        }
+    )
+    record = {"id": "d" * 32, "members": ["a" * 32, "e" * 32]}
+    node = _fake_node(tmp_path, path, staged_dir)
+    node.groups = SimpleNamespace(find=lambda query: record)
+    with pytest.raises(NodeError, match="roster changed"):
+        TauNode._send_scheduled_file(
+            node, group_entry, staged_dir / entry.id / "notes.txt"
+        )
+
+
+def test_node_send_group_refuses_unknown_group(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    group_entry = ScheduledFile(
+        **{
+            **entry.to_dict(),
+            "kind": "group",
+            "target": "weekend",
+            "group_id": "d" * 32,
+            "group_members": ("a" * 32, "b" * 32),
+        }
+    )
+
+    def _find(query):
+        raise ValueError(f"unknown group: {query!r}")
+
+    node = _fake_node(tmp_path, path, staged_dir)
+    node.groups = SimpleNamespace(find=_find)
+    with pytest.raises(NodeError, match="no longer exists"):
+        TauNode._send_scheduled_file(
+            node, group_entry, staged_dir / entry.id / "notes.txt"
+        )
+
+
+def test_stop_workers_joins_scheduled_files_thread(tmp_path):
+    import time as _time
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _worker():
+        started.set()
+        _time.sleep(0.5)
+        finished.set()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    assert started.wait(timeout=5.0)
+    node = SimpleNamespace(
+        _stop_event=threading.Event(),
+        _announce_thread=None,
+        _mail_thread=None,
+        _scheduled_files_thread=thread,
+    )
+    before = _time.monotonic()
+    TauNode._stop_workers(node)
+    assert _time.monotonic() - before >= 0.4
+    assert not thread.is_alive()
+    assert finished.is_set()
+
+
+def test_schedule_stores_group_snapshot_and_timeouts(tmp_path):
+    path = tmp_path / "scheduled-files.json"
+    members = ("a" * 32, "b" * 32)
+    entry = schedule_file(
+        path,
+        target="weekend",
+        kind="group",
+        file=dict(FILE),
+        publish_at=2000.0,
+        now=1000.0,
+        group_id="d" * 32,
+        group_members=members,
+        timeout=60.0,
+        discover_timeout=5.0,
+    )
+    loaded = load_scheduled_files(path).files[0]
+    assert loaded == entry
+    assert loaded.group_id == "d" * 32
+    assert loaded.group_members == members
+    assert loaded.timeout == 60.0
+    assert loaded.discover_timeout == 5.0
+
+
+def test_cancel_refuses_fresh_claim_but_not_stale_one(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    queue = load_scheduled_files(path)
+    claimed = ScheduledFile(**{**entry.to_dict(), "claimed_at": 2000.0})
+    save_scheduled_files(path, queue.with_replaced(claimed))
+    with pytest.raises(ScheduledFileError, match="already sending"):
+        cancel_scheduled_file(path, entry.id, now=2000.0)
+    # A stale claim (older than the lease) does not block the cancel.
+    cancelled = cancel_scheduled_file(
+        path, entry.id, now=2000.0 + CLAIM_LEASE_SECONDS + 1
+    )
+    assert cancelled.id == entry.id
+    assert len(load_scheduled_files(path)) == 0
+
+
+def test_claim_cleared_on_failure(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+
+    def _fail(sent_entry, staged):
+        raise RuntimeError("peer unreachable")
+
+    result = publish_due_scheduled_files(path, staged_dir, _fail, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+    kept = load_scheduled_files(path).files[0]
+    assert kept.attempts == 1
+    assert kept.claimed_at == 0.0
+
+
+def test_partial_send_remembers_owed_members(tmp_path):
+    path = tmp_path / "scheduled-files.json"
+    staged_dir = tmp_path / "scheduled-files"
+    members = ("a" * 32, "b" * 32, "c" * 32)
+    entry = schedule_file(
+        path,
+        target="weekend",
+        kind="group",
+        file=dict(FILE),
+        publish_at=1000.0,
+        now=900.0,
+        group_id="d" * 32,
+        group_members=members,
+    )
+    stage_file(staged_dir, entry.id, "notes.txt", b"hello")
+
+    def _partial(sent_entry, staged):
+        raise PartialSend("2 members failed", delivered_members=("a" * 32,))
+
+    result = publish_due_scheduled_files(path, staged_dir, _partial, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+    kept = load_scheduled_files(path).files[0]
+    assert kept.pending_members == ("b" * 32, "c" * 32)
+    assert kept.claimed_at == 0.0
+    # The retry is offered only the members still owed.
+    seen = []
+
+    def _succeed(sent_entry, staged):
+        seen.append(sent_entry.pending_members)
+
+    result = publish_due_scheduled_files(
+        path, staged_dir, _succeed, now=3000.0
+    )
+    assert result == {"published": 1, "kept": 0}
+    assert seen == [("b" * 32, "c" * 32)]
+
+
+def test_failure_retry_measured_from_failure_time(tmp_path, monkeypatch):
+    path, staged_dir, entry = _seed(tmp_path)
+
+    def _fail(sent_entry, staged):
+        raise RuntimeError("peer unreachable")
+
+    # Pass time 2000.0, failure time 2100.0: the retry must start
+    # from the failure, not from the pass.  The fake clock returns
+    # 2000.0 once (the pass start) and 2100.0 after that, so stray
+    # time.time() calls elsewhere cannot disturb the assertion.
+    calls = []
+
+    def _fake_time():
+        calls.append(1)
+        return 2000.0 if len(calls) == 1 else 2100.0
+
+    monkeypatch.setattr(time, "time", _fake_time)
+    result = publish_due_scheduled_files(path, staged_dir, _fail, now=None)
+    assert result == {"published": 0, "kept": 1}
+    kept = load_scheduled_files(path).files[0]
+    assert kept.next_attempt_at == 2100.0 + SEND_RETRY_BASE_SECONDS
+
+
+def test_remove_staged_file_raises_when_deletion_fails(tmp_path):
+    staged_dir = tmp_path / "scheduled-files"
+    # A file where the id directory should be: rmtree cannot remove it.
+    target = staged_dir / ("e" * 16)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"not a directory")
+    with pytest.raises(OSError):
+        remove_staged_file(staged_dir, "e" * 16)

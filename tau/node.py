@@ -16,7 +16,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import RNS
 
@@ -1432,6 +1432,15 @@ class TauNode:
                 # join() rejects threads whose start() failed or was never called.
                 if worker.ident is not None:
                     worker.join()
+        # The mail loop spawns the scheduled-file worker and returns,
+        # so join it after the mail thread: a transfer in flight must
+        # finish (and update the queue) before links are torn down and
+        # the instance lock is released, or a replacement node could
+        # attempt the same queued file.
+        worker = self._scheduled_files_thread
+        if worker is not None and worker is not threading.current_thread():
+            if worker.ident is not None:
+                worker.join()
 
     def _release_instance_lock(self) -> None:
         lock, self._instance_lock = self._instance_lock, None
@@ -4843,10 +4852,19 @@ class TauNode:
         The staged bytes are re-read and checked against the queue
         entry's descriptor first, so a staged copy that was replaced
         or corrupted after scheduling never goes out under the wrong
-        name or hash.  A group fan-out that fails on any leg raises,
-        so the entry is retried whole rather than half-delivered.
+        name or hash.  The transfer uses the limits the user set at
+        schedule time (``--timeout`` / ``--discover-timeout``).
+
+        A group file resolves its group by the id pinned at schedule
+        time, and refuses to send when the roster no longer matches
+        the snapshot — a roster change or name reuse must never
+        redirect the file to members who were not in the group when
+        it was queued; the entry stays queued instead.  A fan-out
+        that reaches only some members raises :class:`PartialSend`
+        carrying the delivered ones, so the retry sends only to the
+        members still owed.
         """
-        from .scheduled_files import ScheduledFileError
+        from .scheduled_files import PartialSend, ScheduledFileError
 
         try:
             data, name, digest = _read_file_payload(staged_path)
@@ -4863,13 +4881,36 @@ class TauNode:
                 "their descriptor"
             )
         if entry.kind == "group":
+            if not entry.group_id or not entry.group_members:
+                raise NodeError(
+                    f"scheduled file {entry.id} has no roster snapshot; "
+                    "cancel it and schedule it again"
+                )
+            try:
+                group = self.groups.find(entry.group_id)
+            except ValueError as exc:
+                raise NodeError(
+                    f"scheduled file {entry.id} group no longer exists; "
+                    "it stays queued until cancelled"
+                ) from exc
+            if sorted(group["members"]) != sorted(entry.group_members):
+                raise NodeError(
+                    f"scheduled file {entry.id} group roster changed "
+                    "since scheduling; it stays queued until cancelled"
+                )
             result = self.send_group_file(
-                entry.target,
+                group,
                 staged_path,
-                timeout=_FILE_TRANSFER_TIMEOUT,
-                discover_timeout=10.0,
+                timeout=entry.timeout,
+                discover_timeout=entry.discover_timeout,
+                only=list(entry.pending_members) or None,
             )
             if not result.get("ok"):
+                delivered = tuple(
+                    leg["to"]
+                    for leg in result.get("results") or []
+                    if leg.get("delivered")
+                )
                 failed = [
                     leg
                     for leg in result.get("results") or []
@@ -4880,17 +4921,18 @@ class TauNode:
                     f"{leg.get('error') or 'unknown error'}"
                     for leg in failed
                 )
-                raise NodeError(
+                raise PartialSend(
                     f"scheduled file {entry.id} failed for "
                     f"{len(failed)} member(s)"
-                    + (f": {detail}" if detail else "")
+                    + (f": {detail}" if detail else ""),
+                    delivered_members=delivered,
                 )
             return
         self.send_file(
             entry.target,
             staged_path,
-            timeout=_FILE_TRANSFER_TIMEOUT,
-            discover_timeout=10.0,
+            timeout=entry.timeout,
+            discover_timeout=entry.discover_timeout,
         )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:
@@ -7860,6 +7902,7 @@ class TauNode:
         *,
         timeout: float = _FILE_TRANSFER_TIMEOUT,
         discover_timeout: Optional[float] = None,
+        only: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Fan a file out to every member of a group except this node.
 
@@ -7873,7 +7916,10 @@ class TauNode:
         ``send_group_message``, so one slow member cannot consume
         another member's window.  The file is read once up front, so
         every leg carries the same bytes even if the file changes
-        mid-fan-out.  Returns a per-member result list:
+        mid-fan-out.  With *only* set, legs go only to those member
+        hashes — a scheduled retry's still-owed members, so a partial
+        fan-out never redelivers to members who already received the
+        file.  Returns a per-member result list:
         ``delivered`` (with the transfer id, name, size and sha256)
         or an ``error`` for that leg.
         """
@@ -7885,6 +7931,9 @@ class TauNode:
         data, name, digest = _read_file_payload(path)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
+        if only is not None:
+            wanted = set(only)
+            members = [m for m in members if m in wanted]
         results: List[Dict[str, Any]] = []
         for member in members:
             deadline = time.monotonic() + timeout

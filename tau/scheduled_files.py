@@ -21,12 +21,17 @@ removes the entry and deletes its staged bytes.
 A transfer runs off the mail-loop thread (see
 ``TauNode._publish_due_scheduled_files``): a file transfer can take
 minutes, so the publish pass never holds the queue lock across a
-send.  A cancel that lands while a transfer is already in flight
-cannot recall the bytes — the entry is gone, but the transfer
-finishes.  Entries are validated on load the way the other small
-JSON stores are: a malformed file raises rather than silently
-dropping queued files, and the publish pass treats a corrupt queue
-as nothing-due (with a warning) so one bad file cannot stall mail.
+send.  Each entry is claimed under the lock just before sending, so
+a cancel that lands after the claim refuses instead of racing the
+transfer; a cancel before the claim removes the entry and its staged
+bytes.  A claim older than the lease is treated as stale (its worker
+is presumed dead) and the entry becomes claimable — and cancellable
+— again.
+
+Entries are validated on load the way the other small JSON stores
+are: a malformed file raises rather than silently dropping queued
+files, and the publish pass treats a corrupt queue as nothing-due
+(with a warning) so one bad file cannot stall mail.
 """
 
 from __future__ import annotations
@@ -70,10 +75,31 @@ MAX_SCHEDULED_FILE_DELAY = 30 * 24 * 60 * 60 - 3600
 MAX_SEND_ATTEMPTS = 12
 SEND_RETRY_BASE_SECONDS = 60.0
 SEND_RETRY_CAP_SECONDS = 60.0 * 60.0
+# How long a send claim lasts.  A claim marks an entry as in flight
+# so a cancel cannot start racing a transfer; a claim older than this
+# is treated as stale (the worker that made it is presumed dead) and
+# the entry becomes claimable — and cancellable — again.  The lease
+# is generous because one group fan-out can take a transfer timeout
+# per member; within a live process only one send pass runs at a time,
+# so a live transfer is never double-claimed.
+CLAIM_LEASE_SECONDS = 3600.0
 
 
 class ScheduledFileError(ValueError):
     """Raised when a scheduled-files file or value is malformed."""
+
+
+class PartialSend(Exception):
+    """A group fan-out that delivered to some members but not all.
+
+    Carries the member hashes that received the file, so the retry
+    sends only to the members still owed instead of redelivering to
+    everyone.
+    """
+
+    def __init__(self, message: str, *, delivered_members: Tuple[str, ...] = ()):
+        super().__init__(message)
+        self.delivered_members = tuple(delivered_members)
 
 
 def new_scheduled_file_id() -> str:
@@ -106,6 +132,54 @@ def _clean_kind(value: Any) -> str:
             f"scheduled file kind must be 'dm' or 'group': {value!r}"
         )
     return value
+
+
+def _clean_group_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ScheduledFileError(f"not a group id: {value!r}")
+    lowered = value.lower()
+    if len(lowered) != 32:
+        raise ScheduledFileError(f"not a group id: {value!r}")
+    try:
+        bytes.fromhex(lowered)
+    except ValueError:
+        raise ScheduledFileError(f"not a group id: {value!r}") from None
+    return lowered
+
+
+def _clean_members(value: Any) -> Tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ScheduledFileError("group members must be a list")
+    cleaned = []
+    for member in value:
+        if not isinstance(member, str):
+            raise ScheduledFileError(f"not a member hash: {member!r}")
+        lowered = member.lower()
+        if len(lowered) != 32:
+            raise ScheduledFileError(f"not a member hash: {member!r}")
+        try:
+            bytes.fromhex(lowered)
+        except ValueError:
+            raise ScheduledFileError(f"not a member hash: {member!r}") from None
+        cleaned.append(lowered)
+    return tuple(cleaned)
+
+
+def _clean_timeout(value: Any, label: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ScheduledFileError(f"not a timeout: {label}={value!r}")
+    seconds = float(value)
+    if seconds != seconds or seconds == float("inf"):
+        raise ScheduledFileError(f"not a timeout: {label}={value!r}")
+    if positive and seconds <= 0:
+        raise ScheduledFileError(f"not a timeout: {label}={value!r}")
+    if seconds < 0:
+        raise ScheduledFileError(f"not a timeout: {label}={value!r}")
+    return seconds
 
 
 def _clean_file(value: Any) -> Dict[str, Any]:
@@ -179,6 +253,29 @@ class ScheduledFile:
     created_at: float = 0.0
     attempts: int = 0
     next_attempt_at: float = 0.0
+    # Group deliveries pin the group they were queued for: its id and
+    # the roster snapshot at schedule time.  Delivery resolves by id
+    # and refuses to send when the roster no longer matches, so a
+    # roster change or name reuse can never redirect the file to
+    # members who were not in the group when it was queued.  DM
+    # entries leave both empty.
+    group_id: Optional[str] = None
+    group_members: Tuple[str, ...] = ()
+    # Members still owed after a partial group fan-out; empty means
+    # "every member of the roster snapshot".  Updated on each failed
+    # attempt so retries never redeliver to members who already
+    # received the file.
+    pending_members: Tuple[str, ...] = ()
+    # Transfer limits the user set with --timeout / --discover-timeout
+    # at schedule time, carried through to the eventual send instead
+    # of being silently replaced by defaults.
+    timeout: float = 300.0
+    discover_timeout: float = 10.0
+    # When a send pass claimed this entry (0.0 means unclaimed).  A
+    # fresh claim makes the entry un-cancellable until the transfer
+    # finishes; a stale one (older than CLAIM_LEASE_SECONDS) is
+    # treated as dead and the entry becomes claimable again.
+    claimed_at: float = 0.0
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -192,6 +289,16 @@ class ScheduledFile:
         object.__setattr__(self, "created_at", _clean_timestamp(self.created_at, "created_at"))
         object.__setattr__(self, "attempts", _clean_attempts(self.attempts))
         object.__setattr__(self, "next_attempt_at", _clean_retry_at(self.next_attempt_at))
+        object.__setattr__(self, "group_id", _clean_group_id(self.group_id))
+        object.__setattr__(self, "group_members", _clean_members(self.group_members))
+        object.__setattr__(self, "pending_members", _clean_members(self.pending_members))
+        object.__setattr__(self, "timeout", _clean_timeout(self.timeout, "timeout", positive=True))
+        object.__setattr__(
+            self,
+            "discover_timeout",
+            _clean_timeout(self.discover_timeout, "discover_timeout"),
+        )
+        object.__setattr__(self, "claimed_at", _clean_retry_at(self.claimed_at))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -203,6 +310,12 @@ class ScheduledFile:
             "created_at": self.created_at,
             "attempts": self.attempts,
             "next_attempt_at": self.next_attempt_at,
+            "group_id": self.group_id,
+            "group_members": list(self.group_members),
+            "pending_members": list(self.pending_members),
+            "timeout": self.timeout,
+            "discover_timeout": self.discover_timeout,
+            "claimed_at": self.claimed_at,
         }
 
     @classmethod
@@ -218,6 +331,16 @@ class ScheduledFile:
             created_at=_clean_timestamp(data.get("created_at"), "created_at"),
             attempts=_clean_attempts(data.get("attempts", 0)),
             next_attempt_at=_clean_retry_at(data.get("next_attempt_at", 0.0)),
+            group_id=_clean_group_id(data.get("group_id")),
+            group_members=_clean_members(data.get("group_members")),
+            pending_members=_clean_members(data.get("pending_members")),
+            timeout=_clean_timeout(
+                data.get("timeout", 300.0), "timeout", positive=True
+            ),
+            discover_timeout=_clean_timeout(
+                data.get("discover_timeout", 10.0), "discover_timeout"
+            ),
+            claimed_at=_clean_retry_at(data.get("claimed_at", 0.0)),
         )
 
 
@@ -406,18 +529,27 @@ def stage_file(
     """Write *data* to its staged path (mode 0600) and return the path.
 
     Writes atomically (temp file + rename) so a concurrent send pass
-    never reads a half-written copy.
+    never reads a half-written copy, then fsyncs the file and its
+    directory: the queue entry is committed after this returns, so
+    the staged bytes must be durable before the caller records them
+    — otherwise a crash in between leaves a queued entry pointing at
+    missing or incomplete bytes.  The directory fsync is best-effort
+    on platforms without it (Windows cannot fsync a directory).
     """
     target = staged_file_path(staged_dir, file_id, name)
     ensure_dir(target.parent)
     tmp = target.parent / f".{target.name}.tmp-{secrets.token_hex(4)}"
     try:
-        tmp.write_bytes(data)
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
             os.chmod(tmp, SCHEDULED_FILE_MODE)
         except OSError:  # pragma: no cover - best effort
             pass
         os.replace(tmp, target)
+        _fsync_dir(target.parent)
     finally:
         try:
             tmp.unlink()
@@ -428,10 +560,31 @@ def stage_file(
     return target
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Flush *directory* to disk; best-effort where unsupported."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def remove_staged_file(staged_dir: Union[str, Path], file_id: str) -> None:
-    """Delete a staged file's directory (bytes + temp files, if any)."""
+    """Delete a staged file's directory (bytes + temp files, if any).
+
+    A missing directory is already the goal state and is fine, but a
+    real deletion failure raises: callers must not report a cancel or
+    a delivery as fully done while the bytes are still on disk.
+    """
     target = Path(staged_dir).expanduser() / _clean_id(file_id)
-    shutil.rmtree(target, ignore_errors=True)
+    if not target.exists():
+        return
+    shutil.rmtree(target)
 
 
 def schedule_file(
@@ -443,6 +596,10 @@ def schedule_file(
     publish_at: float,
     now: Optional[float] = None,
     file_id: Optional[str] = None,
+    group_id: Optional[str] = None,
+    group_members: Tuple[str, ...] = (),
+    timeout: float = 300.0,
+    discover_timeout: float = 10.0,
 ) -> ScheduledFile:
     """Queue a file for *publish_at*; returns the stored entry.
 
@@ -452,7 +609,10 @@ def schedule_file(
     send pass.  The caller stages the bytes first (see
     :func:`stage_file`) under *file_id* when given — otherwise a
     fresh id is generated — so the queue entry and the staged bytes
-    agree on the id.
+    agree on the id.  For a group file, *group_id* and the roster
+    snapshot *group_members* pin the delivery target (see
+    :class:`ScheduledFile`); *timeout* / *discover_timeout* are the
+    transfer limits the eventual send uses.
     """
     entry = ScheduledFile(
         id=_clean_id(file_id) if file_id is not None else new_scheduled_file_id(),
@@ -461,6 +621,10 @@ def schedule_file(
         file=_clean_file(file),
         publish_at=_clean_timestamp(publish_at, "publish_at"),
         created_at=now if now is not None else time.time(),
+        group_id=_clean_group_id(group_id),
+        group_members=_clean_members(group_members),
+        timeout=_clean_timeout(timeout, "timeout", positive=True),
+        discover_timeout=_clean_timeout(discover_timeout, "discover_timeout"),
     )
     with scheduled_files_lock(path):
         queue = load_scheduled_files(path)
@@ -473,6 +637,7 @@ def cancel_scheduled_file(
     prefix: str,
     *,
     on_cancel: Optional[Callable[[ScheduledFile], None]] = None,
+    now: Optional[float] = None,
 ) -> ScheduledFile:
     """Drop one queued file by full id or unique prefix; returns it.
 
@@ -480,11 +645,22 @@ def cancel_scheduled_file(
     entry is resolved and before it is removed — so a send pass
     cannot start the transfer between the callback and the removal.
     The callback is how the CLI deletes the staged bytes for the
-    cancelled entry.
+    cancelled entry; if it raises, the entry stays queued and the
+    cancel fails instead of reporting success while bytes remain.
+
+    A freshly claimed entry — a transfer is in flight — cannot be
+    cancelled: the bytes are already going out.  A stale claim (the
+    worker is presumed dead) does not block the cancel.
     """
+    at = now if now is not None else time.time()
     with scheduled_files_lock(path):
         queue = load_scheduled_files(path)
         entry = queue.resolve(prefix)
+        if entry.claimed_at and entry.claimed_at + CLAIM_LEASE_SECONDS > at:
+            raise ScheduledFileError(
+                f"scheduled file {entry.id} is already sending; "
+                "it cannot be cancelled"
+            )
         if on_cancel is not None:
             on_cancel(entry)
         save_scheduled_files(path, queue.with_removed(entry.id))
@@ -505,16 +681,23 @@ def publish_due_scheduled_files(
     The pass runs off the mail-loop thread (see
     ``TauNode._publish_due_scheduled_files``): a file transfer can
     take minutes, so unlike the scheduled-channel pass this one never
-    holds the queue lock across a send.  Each entry is re-checked
-    under the lock just before sending, so a cancel that landed
-    before the transfer started is honoured; a cancel during the
-    transfer itself cannot recall the bytes.
+    holds the queue lock across a send.  Each entry is claimed under
+    the lock just before sending — the claim is what makes a cancel
+    that lands mid-transfer refuse instead of racing it — and the
+    claim is cleared when the attempt finishes.  A cancel that lands
+    before the claim is honoured; a cancel during the transfer
+    itself cannot recall the bytes.
 
     A failed attempt (exception from *send*, or the staged bytes
-    missing) keeps the entry queued with exponential backoff.  After
+    missing) keeps the entry queued with exponential backoff measured
+    from when the attempt actually failed, not from when the pass
+    began — a slow transfer must not eat the retry delay.  After
     ``MAX_SEND_ATTEMPTS`` it is no longer retried automatically but
     stays queued for the user to inspect or cancel.  A pass ends
-    early when *should_stop* says so, between entries.
+    early when *should_stop* says so, between entries.  When *send*
+    raises :class:`PartialSend` (a group fan-out that reached some
+    members), the members still owed are remembered on the entry so
+    the retry sends only to them.
 
     Returns ``{"published": n, "kept": m}``.  A corrupt queue file logs
     a warning and sends nothing, so one bad file cannot stall the
@@ -541,17 +724,33 @@ def publish_due_scheduled_files(
         if should_stop is not None and should_stop():
             break
         staged = staged_file_path(staged_dir, entry.id, entry.file["name"])
-        # Re-check under the lock: a cancel since the snapshot means
-        # this entry is gone and must not be sent.
+        # Claim under the lock: a cancel since the snapshot, or a
+        # fresh claim from another pass, means this entry is gone or
+        # already in flight and must not be sent again.
         with scheduled_files_lock(path):
             try:
                 queue = load_scheduled_files(path)
-                queue.resolve(entry.id)
+                current = queue.resolve(entry.id)
             except ScheduledFileError:
                 continue
+            if (
+                current.claimed_at
+                and current.claimed_at + CLAIM_LEASE_SECONDS > at
+            ):
+                continue
+            entry = replace(current, claimed_at=at)
+            save_scheduled_files(path, queue.with_replaced(entry))
         try:
             send(entry, staged)
         except Exception as exc:  # noqa: BLE001 - a failed send retries
+            # The retry clock starts when this attempt failed, not
+            # when the pass began: an earlier slow transfer must not
+            # consume the backoff.  With an injected `now` (tests)
+            # the pass time stands in for the failure time.
+            failed_at = now if now is not None else time.time()
+            delivered = tuple(
+                getattr(exc, "delivered_members", ()) or ()
+            )
             with scheduled_files_lock(path):
                 try:
                     queue = load_scheduled_files(path)
@@ -565,10 +764,18 @@ def publish_due_scheduled_files(
                     SEND_RETRY_BASE_SECONDS * 2 ** (attempts - 1),
                     SEND_RETRY_CAP_SECONDS,
                 )
+                pending = current.pending_members
+                if delivered:
+                    owed = pending or current.group_members
+                    pending = tuple(
+                        member for member in owed if member not in delivered
+                    )
                 updated = replace(
                     current,
                     attempts=attempts,
-                    next_attempt_at=at + retry_in,
+                    next_attempt_at=failed_at + retry_in,
+                    pending_members=pending,
+                    claimed_at=0.0,
                 )
                 save_scheduled_files(path, queue.with_replaced(updated))
             log.warning(
@@ -592,6 +799,17 @@ def publish_due_scheduled_files(
                 # Cancelled while the transfer ran: the entry is
                 # already gone, which is the same outcome.
                 pass
-        remove_staged_file(staged_dir, entry.id)
+        try:
+            remove_staged_file(staged_dir, entry.id)
+        except OSError as exc:
+            # The file went out and the queue is clean; the orphaned
+            # staged bytes are a leak to report, not a reason to
+            # pretend the send failed.
+            log.warning(
+                "Scheduled file %s sent but its staged bytes could not "
+                "be deleted (%s)",
+                entry.id,
+                exc,
+            )
         published += 1
     return {"published": published, "kept": len(candidates) - published}

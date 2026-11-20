@@ -1061,3 +1061,189 @@ def test_backup_round_trip_without_optional_files(tmp_path, capsys):
     capsys.readouterr()
     assert _id_destination(node_b, capsys) == destination_a
     assert not (node_b / "peers.json").exists()
+
+def _schedule_file_on_node(data_dir, target, source, *, kind="dm", delay="2h"):
+    if kind == "dm":
+        assert (
+            cli.main(
+                [
+                    "send-file",
+                    "--data-dir",
+                    str(data_dir),
+                    "--to",
+                    target,
+                    "--delay",
+                    delay,
+                    str(source),
+                ]
+            )
+            == 0
+        )
+    else:
+        assert (
+            cli.main(
+                [
+                    "group",
+                    "send-file",
+                    "--data-dir",
+                    str(data_dir),
+                    "--delay",
+                    delay,
+                    target,
+                    str(source),
+                ]
+            )
+            == 0
+        )
+
+
+def _rewrite_archive(archive, rewritten, *, drop=(), replace=None):
+    """Rewrite *archive* to *rewritten*, dropping/replacing members.
+
+    The manifest is rewritten to match, so the result still parses as
+    a tau backup — only the member set or bytes differ.
+    """
+    import io as _io
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        members = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+        manifest = json.loads(members["manifest.json"])
+    for name in drop:
+        members.pop(name, None)
+        manifest["files"] = [f for f in manifest["files"] if f != name]
+    for name, data in (replace or {}).items():
+        members[name] = data
+    with tarfile.open(rewritten, mode="w:gz") as tar:
+        for name, data in members.items():
+            if name == "manifest.json":
+                data = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, _io.BytesIO(data))
+
+
+def test_backup_round_trip_keeps_scheduled_files(tmp_path, capsys):
+    import hashlib
+
+    from tau.groups import GroupStore
+    from tau.scheduled_files import load_scheduled_files
+
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    source = tmp_path / "notes.txt"
+    source.write_bytes(b"hello mesh")
+    digest = hashlib.sha256(b"hello mesh").hexdigest()
+    _schedule_file_on_node(node_a, "alice", source)
+    config_a = TauConfig.resolve(data_dir=node_a)
+    store = GroupStore(config_a.groups_path)
+    group = store.create("weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16)
+    _schedule_file_on_node(node_a, "weekend", source, kind="group")
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    config_b = TauConfig.resolve(data_dir=node_b)
+    queue = load_scheduled_files(config_b.scheduled_files_path)
+    assert len(queue) == 2
+    by_kind = {entry.kind: entry for entry in queue.files}
+    assert by_kind["dm"].target == "alice"
+    assert by_kind["dm"].file["sha256"] == digest
+    assert by_kind["group"].target == "weekend"
+    assert by_kind["group"].group_id == group["id"]
+    assert sorted(by_kind["group"].group_members) == sorted(group["members"])
+    for entry in queue.files:
+        staged = config_b.scheduled_files_dir / entry.id / "notes.txt"
+        assert staged.read_bytes() == b"hello mesh"
+    out = capsys.readouterr().out
+    assert cli.main(["scheduled-files", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert "notes.txt" in out and "weekend" in out
+
+
+def test_restore_refuses_scheduled_file_without_staged_bytes(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    source = tmp_path / "notes.txt"
+    source.write_bytes(b"hello mesh")
+    _schedule_file_on_node(node_a, "alice", source)
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    config_a = TauConfig.resolve(data_dir=node_a)
+    from tau.scheduled_files import load_scheduled_files
+
+    entry = load_scheduled_files(config_a.scheduled_files_path).files[0]
+    member = f"scheduled-files/{entry.id}/notes.txt"
+    rewritten = tmp_path / "broken.tar.gz"
+    _rewrite_archive(archive, rewritten, drop=(member,))
+    node_b = tmp_path / "b"
+    code = cli.main(["restore", str(rewritten), "--data-dir", str(node_b)])
+    assert code == 1
+    assert "has no staged bytes" in capsys.readouterr().err
+
+
+def test_restore_refuses_tampered_staged_bytes(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    source = tmp_path / "notes.txt"
+    source.write_bytes(b"hello mesh")
+    _schedule_file_on_node(node_a, "alice", source)
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    config_a = TauConfig.resolve(data_dir=node_a)
+    from tau.scheduled_files import load_scheduled_files
+
+    entry = load_scheduled_files(config_a.scheduled_files_path).files[0]
+    member = f"scheduled-files/{entry.id}/notes.txt"
+    rewritten = tmp_path / "tampered.tar.gz"
+    _rewrite_archive(archive, rewritten, replace={member: b"different bytes"})
+    node_b = tmp_path / "b"
+    code = cli.main(["restore", str(rewritten), "--data-dir", str(node_b)])
+    assert code == 1
+    assert "do not match its queue entry" in capsys.readouterr().err
+
+
+def test_restore_refuses_orphan_staged_bytes(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    source = tmp_path / "notes.txt"
+    source.write_bytes(b"hello mesh")
+    _schedule_file_on_node(node_a, "alice", source)
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+    rewritten = tmp_path / "orphan.tar.gz"
+    _rewrite_archive(archive, rewritten, drop=("scheduled-files.json",))
+    node_b = tmp_path / "b"
+    code = cli.main(["restore", str(rewritten), "--data-dir", str(node_b)])
+    assert code == 1
+    assert "without their queue" in capsys.readouterr().err
+
+
+def test_restore_force_removes_stale_scheduled_files(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = _init_node(tmp_path, "b", "bob")
+    stale = node_b / "scheduled-files" / ("f" * 16) / "stale.bin"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"stale\n")
+    capsys.readouterr()
+    assert (
+        cli.main(["restore", str(archive), "--data-dir", str(node_b), "--force"])
+        == 0
+    )
+    capsys.readouterr()
+    assert not stale.exists()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)

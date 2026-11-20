@@ -13870,6 +13870,10 @@ def _queue_file_for_later(
     kind: str,
     path: Path,
     send_after: float,
+    group_id: Optional[str] = None,
+    group_members: Tuple[str, ...] = (),
+    timeout: float = 300.0,
+    discover_timeout: float = 10.0,
 ) -> ScheduledFile:
     """Stage *path* and queue it for *target* at *send_after*.
 
@@ -13877,7 +13881,8 @@ def _queue_file_for_later(
     name an immediate send enforces), stages the bytes under a fresh
     queue id, then records the queue entry.  A queue write that fails
     after staging removes the staged bytes again, so a failed
-    schedule never leaves an orphaned staged file behind.
+    schedule never leaves an orphaned staged file behind — a removal
+    that itself fails is logged, not hidden behind the original error.
     """
     try:
         data, name, digest = read_file_payload(path)
@@ -13893,9 +13898,33 @@ def _queue_file_for_later(
             file={"sha256": digest, "size": len(data), "name": name},
             publish_at=send_after,
             file_id=entry_id,
+            group_id=group_id,
+            group_members=group_members,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
         )
+    except ScheduledFileError as exc:
+        try:
+            remove_staged_file(config.scheduled_files_dir, entry_id)
+        except OSError as cleanup_exc:
+            log.warning(
+                "Scheduled file %s could not be queued (%s) and its "
+                "staged bytes could not be removed (%s)",
+                entry_id,
+                exc,
+                cleanup_exc,
+            )
+        raise NodeError(str(exc)) from exc
     except Exception:
-        remove_staged_file(config.scheduled_files_dir, entry_id)
+        try:
+            remove_staged_file(config.scheduled_files_dir, entry_id)
+        except OSError as cleanup_exc:  # pragma: no cover - best effort
+            log.warning(
+                "Scheduled file %s could not be queued and its staged "
+                "bytes could not be removed (%s)",
+                entry_id,
+                cleanup_exc,
+            )
         raise
 
 
@@ -13949,6 +13978,8 @@ def cmd_send_file(args: argparse.Namespace) -> int:
             kind="dm",
             path=args.path,
             send_after=time.time() + delay,
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
         )
         if _json_mode(args):
             _emit_scheduled_file(entry)
@@ -18692,10 +18723,9 @@ def cmd_group_send_file(args: argparse.Namespace) -> int:
             )
             return 2
         # Resolve the group without starting a node: scheduling only
-        # needs the group to exist.  The name is stored (like a
-        # scheduled channel message stores its channel), so a rename
-        # or roster change orphans the entry — it stays queued for
-        # inspection or cancel rather than sending to the wrong group.
+        # needs the group to exist.  The name is stored for display
+        # and the id plus roster snapshot pin the delivery target, so
+        # a later roster change or name reuse cannot redirect the file.
         group = GroupStore(config.groups_path).find(args.group)
         entry = _queue_file_for_later(
             config,
@@ -18703,6 +18733,10 @@ def cmd_group_send_file(args: argparse.Namespace) -> int:
             kind="group",
             path=args.path,
             send_after=time.time() + delay,
+            group_id=group["id"],
+            group_members=tuple(sorted(group["members"])),
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
         )
         if _json_mode(args):
             _emit_scheduled_file(entry)

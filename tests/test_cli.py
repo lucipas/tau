@@ -286,11 +286,39 @@ def test_send_file_delay_rejects_bad_input(tmp_path, capsys, monkeypatch):
     assert "outside the" in capsys.readouterr().err
 
 
+def test_send_file_delay_stores_transfer_timeouts(tmp_path, capsys, monkeypatch):
+    from tau.config import TauConfig
+
+    source = _write_sample_file(tmp_path)
+    code = _run_send_file(
+        tmp_path,
+        monkeypatch,
+        [
+            "--to",
+            "alice",
+            "--delay",
+            "5m",
+            "--timeout",
+            "60",
+            "--discover-timeout",
+            "5",
+            str(source),
+        ],
+    )
+    assert code == 0
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=tmp_path / "node")
+    queue = json.loads(config.scheduled_files_path.read_text())
+    entry = queue["files"][0]
+    assert entry["timeout"] == 60.0
+    assert entry["discover_timeout"] == 5.0
+
+
 def test_group_send_file_delay_schedules(tmp_path, capsys, monkeypatch):
     from tau.config import TauConfig
 
     source = _write_sample_file(tmp_path)
-    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
 
     class _MustNotStartNode:
         def __init__(self, *args, **kwargs):
@@ -320,6 +348,8 @@ def test_group_send_file_delay_schedules(tmp_path, capsys, monkeypatch):
     assert entry["target"] == "weekend"
     assert entry["kind"] == "group"
     assert entry["file"]["name"] == "notes.txt"
+    assert entry["group_id"] == group["id"]
+    assert sorted(entry["group_members"]) == sorted(group["members"])
     assert (config.scheduled_files_dir / entry["id"] / "notes.txt").exists()
 
 
