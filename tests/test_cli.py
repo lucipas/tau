@@ -601,6 +601,7 @@ class _FakeSendNode:
         self.calls: list = []
         self.sent: list = []
         self.files_sent: list = []
+        self.file_kwargs: list = []
         self.send_kwargs: list = []
         self.flush_calls: list = []
         self.peer = SimpleNamespace(hexhash="ab" * 16, display_name="alice")
@@ -675,6 +676,7 @@ class _FakeSendNode:
         data = Path(path).read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         self.files_sent.append((target, Path(path).name, data))
+        self.file_kwargs.append(kwargs)
         if _FakeSendNode.file_behaviour.get(target) == "error":
             raise NodeError(f"no path to {target}")
         return {
@@ -7425,6 +7427,7 @@ class _FakeGroupSendNode:
         self.mailbox = _FakeGroupMailbox()
         self.sent: list = []
         self.group_files_sent: list = []
+        self.group_file_kwargs: list = []
         self.send_kwargs: list = []
         self.wait_calls: list = []
         self.destination_hexhash = "ef" * 16
@@ -7494,6 +7497,7 @@ class _FakeGroupSendNode:
         data = Path(path).read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         self.group_files_sent.append((group["name"], Path(path).name, data))
+        self.group_file_kwargs.append(kwargs)
         names = {"ab" * 16: "alice", "cd" * 16: "bob"}
         results = []
         for member in group["members"]:
@@ -8792,9 +8796,17 @@ def test_parser_forward_arguments():
     assert args.command == "forward"
     assert args.to == ["bob"]
     assert args.message == "abcdef12"
+    # --timeout defaults to None: the text legs use the send default
+    # (20s) and a file leg uses the send-file default (300s) unless an
+    # explicit value is given.
     assert args.timeout is None
     assert args.wait is None
     assert args.no_queue is False
+
+    explicit = parser.parse_args(
+        ["forward", "--to", "bob", "--timeout", "45", "abcdef12"]
+    )
+    assert explicit.timeout == 45.0
 
     multi = parser.parse_args(
         ["forward", "--to", "alice", "--to", "bob", "--wait", "5", "abcdef12"]
@@ -9226,12 +9238,16 @@ def test_forward_file_to_peer_sends_attribution_then_file(
     data_dir, stored = _seed_received_file(tmp_path)
     code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "ffff"])
     assert code == 0
+    # Both legs share ONE node: starting a second TauNode after the
+    # first stopped fails — Reticulum cannot be reinitialised in the
+    # same process — so the attribution and the file go out on the
+    # same instance.
+    assert len(_FakeSendNode.instances) == 1
+    node = _FakeSendNode.instances[0]
     # The attribution text goes first, through the usual send path.
-    text_node = _FakeSendNode.instances[0]
-    assert text_node.sent[0][1] == "Forwarded from alice:\nphoto.jpg"
+    assert node.sent[0][1] == "Forwarded from alice:\nphoto.jpg"
     # Then the stored bytes, as a fresh file transfer.
-    file_node = _FakeSendNode.instances[1]
-    assert file_node.files_sent == [("bob", "photo.jpg", b"photo-bytes!")]
+    assert node.files_sent == [("bob", "photo.jpg", b"photo-bytes!")]
     out = capsys.readouterr().out
     assert "delivered to bob" in out
     assert "forwarded photo.jpg (12 bytes) to bob" in out
@@ -9248,8 +9264,11 @@ def test_forward_file_json_reports_file_results(tmp_path, capsys, monkeypatch):
         for line in capsys.readouterr().out.splitlines()
         if line.startswith("{")
     ]
-    assert len(docs) == 2
-    file_doc = docs[1]["file"]
+    # One combined document: the text result and the file result,
+    # not one document per leg.
+    assert len(docs) == 1
+    assert docs[0]["text"]["echo"] == "Forwarded from alice:\nphoto.jpg"
+    file_doc = docs[0]["file"]
     assert file_doc["name"] == "photo.jpg"
     assert file_doc["size"] == 12
     assert file_doc["results"][0]["target"] == "bob"
@@ -9371,12 +9390,138 @@ def test_forward_file_to_group_failed_leg_is_reported(
     finally:
         _FakeGroupSendNode.group_file_refusals = set()
     assert code == 1
-    text_node = _FakeGroupSendNode.instances[0]
+    assert len(_FakeGroupSendNode.instances) == 1
+    node = _FakeGroupSendNode.instances[0]
     # The attribution text still went out; only the file leg failed.
-    assert text_node.sent[0][1] == "Forwarded from alice:\nphoto.jpg"
+    assert node.sent[0][1] == "Forwarded from alice:\nphoto.jpg"
     out = capsys.readouterr().out
     assert "forwarded photo.jpg (12 bytes) to alice" in out
     assert "failed to forward photo.jpg to bob: not_allowed" in out
+
+
+def test_forward_file_timeout_applies_to_both_legs(
+    tmp_path, capsys, monkeypatch
+):
+    # An explicit --timeout bounds the text leg and the file leg.
+    _seed_received_file(tmp_path)
+    code = _run_forward(
+        tmp_path, monkeypatch, ["--to", "bob", "--timeout", "45", "ffff"]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert node.send_kwargs[0]["timeout"] == 45.0
+    assert node.file_kwargs[0]["timeout"] == 45.0
+
+
+def test_forward_file_default_file_timeout_is_300(tmp_path, capsys, monkeypatch):
+    # With no --timeout the text leg uses the send default (20s) and
+    # the file leg the send-file default (300s).
+    _seed_received_file(tmp_path)
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "ffff"])
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert node.send_kwargs[0]["timeout"] == 20.0
+    assert node.file_kwargs[0]["timeout"] == 300.0
+
+
+def test_forward_file_sends_staged_bytes_not_replaced_file(
+    tmp_path, capsys, monkeypatch
+):
+    # The stored file is replaced while the attribution text is being
+    # delivered: the file leg must still send the bytes that were
+    # verified up front, not the replacement.
+    data_dir, stored = _seed_received_file(tmp_path)
+    original_send = _FakeSendNode.send_message
+
+    def swapping_send(self, target, text, **kwargs):
+        stored.write_bytes(b"replacement bytes")
+        return original_send(self, target, text, **kwargs)
+
+    monkeypatch.setattr(_FakeSendNode, "send_message", swapping_send)
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "ffff"])
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert node.files_sent == [("bob", "photo.jpg", b"photo-bytes!")]
+
+
+def test_forward_file_serving_node_shares_one_local_node(
+    tmp_path, capsys, monkeypatch
+):
+    # A serving node takes the text leg on its socket; the file leg
+    # starts the only local node in the process.  The old code started
+    # a second node after the first stopped and crashed the forward
+    # on Reticulum's reinitialisation guard.
+    data_dir, stored = _seed_received_file(tmp_path)
+    calls = []
+
+    def via_running(args, config, text, targets, expires_at, reply_ids, **kwargs):
+        calls.append((targets, text))
+        return [{"target": "bob", "ok": True, "echo": text, "delivered": True}]
+
+    monkeypatch.setattr(cli, "_send_routes_via_running_node", lambda config: True)
+    monkeypatch.setattr(cli, "_send_via_running_node", via_running)
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "ffff"])
+    assert code == 0
+    assert calls == [(["bob"], "Forwarded from alice:\nphoto.jpg")]
+    assert len(_FakeSendNode.instances) == 1
+    node = _FakeSendNode.instances[0]
+    assert node.sent == []
+    assert node.files_sent == [("bob", "photo.jpg", b"photo-bytes!")]
+    out = capsys.readouterr().out
+    assert "delivered to bob" in out
+    assert "forwarded photo.jpg (12 bytes) to bob" in out
+
+
+def test_forward_file_to_group_serving_node_shares_one_local_node(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.groups import GroupStore
+
+    data_dir, _ = _seed_received_file(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    store = GroupStore(config.groups_path)
+    store.create("weekend", ["ab" * 16, "cd" * 16], created_by="ab" * 16)
+    calls = []
+
+    def via_running(args, config, text, **kwargs):
+        calls.append(text)
+        return {
+            "ok": True,
+            "group": "weekend-id",
+            "name": "weekend",
+            "results": [
+                {
+                    "to": "ab" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "id": "f" * 32,
+                },
+                {
+                    "to": "cd" * 16,
+                    "to_name": "bob",
+                    "delivered": True,
+                    "id": "e" * 32,
+                },
+            ],
+        }
+
+    monkeypatch.setattr(cli, "_send_routes_via_running_node", lambda config: True)
+    monkeypatch.setattr(cli, "_send_group_via_running_node", via_running)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    _FakeGroupSendNode.group_file_refusals = set()
+    code = cli.main(
+        ["forward", "--data-dir", str(data_dir), "--group", "weekend", "ffff"]
+    )
+    assert code == 0
+    assert calls == ["Forwarded from alice:\nphoto.jpg"]
+    assert len(_FakeGroupSendNode.instances) == 1
+    node = _FakeGroupSendNode.instances[0]
+    assert node.sent == []
+    assert node.group_files_sent == [("weekend", "photo.jpg", b"photo-bytes!")]
+    out = capsys.readouterr().out
+    assert "delivered to alice" in out
+    assert "forwarded photo.jpg (12 bytes) to alice" in out
 
 
 def _seed_tan_post(tmp_path, *, text="worth sharing", poll=False):
@@ -11691,17 +11836,6 @@ def test_channel_poll_delay_rejects_bad_combinations(tmp_path, capsys):
         "Saturday",
         "Sunday",
         "--delay",
-        "5m",
-    )
-    assert code == 2
-    assert "not a member of channel 'other'" in capsys.readouterr().err
-
-    code = _run_channel(
-        tmp_path, "poll", "general", "which day?", "Saturday", "--delay", "5m"
-    )
-    assert code == 2
-    assert "a poll needs 2-8 options" in capsys.readouterr().err
-"--delay",
         "5m",
     )
     assert code == 2

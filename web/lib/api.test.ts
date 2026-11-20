@@ -17,6 +17,7 @@ import {
   eventsUrl,
   fetchTanMedia,
   fileUrl,
+  forwardMessage,
   getAwayMessage,
   getBeacons,
   getBroadcasts,
@@ -746,6 +747,44 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
     expect(bodyOf(0)).toEqual({ enabled: true, message: "back on Monday" });
     await setAwayMessage({ enabled: false });
     expect(bodyOf(1)).toEqual({ enabled: false });
+  });
+});
+
+describe("forwardMessage", () => {
+  it("returns the forward result on success", async () => {
+    nextJson = { ok: true, message: {}, response: {} };
+    const result = await forwardMessage(1, { to: "alice" });
+    expect(captured[0].url).toBe("/api/messages/forward");
+    expect(bodyOf(0)).toEqual({ id: 1, to: "alice" });
+    expect(result).toEqual({ ok: true, message: {}, response: {} });
+  });
+
+  it("rejects when the attribution went out but the file leg failed", async () => {
+    // The bridge reports a partial file forward as HTTP 200 with
+    // ok: false and file_error: the picker must show the failure
+    // instead of closing on a success flag.
+    nextJson = {
+      ok: false,
+      message: {},
+      response: {},
+      file_error: "no path to alice",
+    };
+    await expect(forwardMessage(1, { to: "alice" })).rejects.toThrow(
+      "the message was forwarded but the file did not send: no path to alice",
+    );
+  });
+
+  it("rejects when a group file forward missed some members", async () => {
+    nextJson = {
+      ok: false,
+      messages: [],
+      response: { ok: true },
+      file_messages: [],
+      file_response: { ok: false, results: [] },
+    };
+    await expect(forwardMessage(1, { group: "crew" })).rejects.toThrow(
+      "the message was forwarded but the file did not reach all members",
+    );
   });
 });
 

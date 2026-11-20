@@ -409,7 +409,7 @@ from .ignored_groups import (
 )
 from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
-from .node import NodeError, TauNode
+from .node import NodeError, TauNode, resolve_received_file
 from .peers import Peer, PeerError, safety_number
 from .profile import (
     ProfileError,
@@ -8089,11 +8089,11 @@ class WebBridge:
         ``Forwarded from <name>:`` naming the file — then the file
         itself as a fresh one-to-one transfer, reusing
         :meth:`send_file` / :meth:`send_group_file`.  The stored bytes
-        come from :meth:`received_file`, which re-checks them against
-        the inbox record's size and SHA-256 and requires the recorded
-        path to sit inside the sender's directory under the files
-        directory — a missing, moved, or altered file fails cleanly
-        up front instead of forwarding the wrong bytes.  A file you
+        come from :meth:`_forward_file_bytes`, which resolves the
+        entry's own inbox record by its wire id (an old entry must
+        not forward a newer file that arrived under the same name)
+        and checks the bytes against the entry's recorded size and
+        SHA-256.  A file you
         sent cannot be forwarded: its bytes were staged in a temporary
         directory for the transfer and not kept.  A failed peer file
         leg does not roll back the attribution text already sent: the
@@ -8111,29 +8111,7 @@ class WebBridge:
             raise ValueError("cannot forward a file: the file has no name")
         if not isinstance(peer_hash, str) or not peer_hash:
             raise ValueError("cannot forward a file: the sender is unknown")
-        wire_id = entry.get("wire_id")
-        if not isinstance(wire_id, str) or not wire_id:
-            raise ValueError("cannot forward a file: its record id is missing")
-        try:
-            found = self.received_file(peer_hash, name, wire_id=wire_id)
-        except ValueError as exc:
-            raise ValueError(str(exc)) from exc
-        if found is None:
-            raise ValueError(
-                f"stored file {name} is no longer available — it was "
-                "moved, deleted, or changed since it arrived"
-            )
-        data, name = found
-        # The selected entry names the exact record: its size and digest
-        # must match the bytes about to be sent.
-        if len(data) != file_meta.get("size") or (
-            hashlib.sha256(data).hexdigest()
-            != str(file_meta.get("sha256", "")).lower()
-        ):
-            raise ValueError(
-                f"stored file {name} no longer matches this message — "
-                "it cannot be forwarded"
-            )
+        data = self._forward_file_bytes(entry, file_meta, peer_hash, name)
         forwarded = f"Forwarded from {label}:\n{name}"
         if group is not None:
             messages, response = self.send_group_message(
@@ -8141,7 +8119,7 @@ class WebBridge:
             )
             try:
                 file_messages, file_response = self.send_group_file(
-                    group.strip(), name, data
+                    group.strip(), name, data, timeout=timeout
                 )
             except (NodeError, ValueError, OSError) as exc:
                 return {
@@ -8162,8 +8140,10 @@ class WebBridge:
             to.strip(), forwarded, timeout=timeout
         )
         try:
-            file_message, file_response = self.send_file(to.strip(), name, data)
-        except (NodeError, ValueError) as exc:
+            file_message, file_response = self.send_file(
+                to.strip(), name, data, timeout=timeout
+            )
+        except (NodeError, ValueError, OSError) as exc:
             return {
                 "ok": False,
                 "message": message,
@@ -8177,6 +8157,74 @@ class WebBridge:
             "file_message": file_message,
             "file_response": file_response,
         }
+
+    def _forward_file_bytes(
+        self,
+        entry: Dict[str, Any],
+        file_meta: Dict[str, Any],
+        peer_hash: str,
+        name: str,
+    ) -> bytes:
+        """Return the exact stored bytes for a console file forward.
+
+        Live and restored entries carry the inbox record's wire id, so
+        the exact record is resolved instead of the newest same-name
+        record for the sender: an old entry whose bytes are gone must
+        fail, not forward a newer file that arrived under the same
+        name.  The resolved bytes are checked against the entry's
+        recorded size and SHA-256 as well.  Entries without a wire id
+        fall back to :meth:`received_file` with the same check against
+        the entry's metadata.
+        """
+        wire_id = entry.get("wire_id")
+        inbox = getattr(self.node, "inbox", None)
+        if isinstance(wire_id, str) and wire_id and inbox is not None:
+            try:
+                record = inbox.resolve(wire_id)
+            except ValueError:
+                record = None
+            if record is not None and record.get("kind") == "file":
+                files_dir = getattr(
+                    getattr(self.node, "config", None), "files_dir", None
+                )
+                if files_dir is None:
+                    raise ValueError(
+                        f"stored file {name} is no longer available — it was "
+                        "moved, deleted, or changed since it arrived"
+                    )
+                try:
+                    _path, data = resolve_received_file(record, files_dir)
+                except NodeError as exc:
+                    raise ValueError(str(exc)) from exc
+                if (
+                    record.get("name") != name
+                    or record.get("size") != file_meta.get("size")
+                    or str(record.get("sha256") or "").lower()
+                    != str(file_meta.get("sha256") or "").lower()
+                ):
+                    raise ValueError(
+                        f"stored file {name} does not match the selected "
+                        "message — it was replaced since it arrived"
+                    )
+                return data
+        try:
+            found = self.received_file(peer_hash, name)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if found is None:
+            raise ValueError(
+                f"stored file {name} is no longer available — it was "
+                "moved, deleted, or changed since it arrived"
+            )
+        data, _resolved_name = found
+        if len(data) != file_meta.get("size") or hashlib.sha256(
+            data
+        ).hexdigest() != str(file_meta.get("sha256") or "").lower():
+            raise ValueError(
+                f"stored file {name} does not match the selected "
+                "message — it was replaced since it arrived"
+            )
+        return data
 
     def pin_message(self, target: int) -> Dict[str, Any]:
         """Pin one stored DM from the console history, by console id.
@@ -11487,11 +11535,7 @@ class WebBridge:
         ]
 
     def received_file(
-        self,
-        sender: str,
-        name: str,
-        *,
-        wire_id: Optional[str] = None,
+        self, sender: str, name: str
     ) -> Optional[Tuple[bytes, str]]:
         """Return the bytes and name of a received file, or ``None``.
 
@@ -11500,9 +11544,7 @@ class WebBridge:
         are re-checked against the bytes on disk, and the recorded
         path must resolve inside this sender's directory under the
         node's files directory — a record pointing anywhere else (a
-        hand-edited inbox, a planted symlink) serves nothing.  With
-        *wire_id* set, only the record with that id is considered, so
-        an older same-name file is never mistaken for a newer one.
+        hand-edited inbox, a planted symlink) serves nothing.
 
         Raises ``ValueError`` when the sender or name is not usable
         at all (a malformed hash, a name that is not already a safe
@@ -17847,5 +17889,3 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
-value, maximum))
-minimum, min(value, maximum))

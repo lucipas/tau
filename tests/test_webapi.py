@@ -18601,6 +18601,129 @@ def test_forward_message_endpoint_file_forward_failed_leg_reports_partial(
     assert node.sent == [("alice", "Forwarded from alice:\nphoto.jpg", None)]
 
 
+def test_forward_message_endpoint_file_forward_uses_entry_record_not_newest(
+    bridge, node, tmp_path
+):
+    # Qodo finding: the forward used to look the bytes up by
+    # (sender, name) — the newest same-name record — so an old entry
+    # forwarded a newer file that arrived under the same name.  The
+    # old entry must fail when its own bytes are gone, and the new
+    # entry must forward the new bytes.
+    import hashlib
+    from pathlib import Path
+
+    from tau.blocklist import BlockList
+
+    old_bytes = b"old-photo-bytes!"
+    new_bytes = b"new-photo!"
+    files_dir = Path(tmp_path) / "files"
+    stored = files_dir / PEER_HASH / "photo.jpg"
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_bytes(new_bytes)
+    for wire_id, data in (("wire-old-1", old_bytes), ("wire-new-1", new_bytes)):
+        digest = hashlib.sha256(data).hexdigest()
+        node.inbox.append(
+            {
+                "kind": "file",
+                "from": "alice",
+                "destination": PEER_HASH,
+                "name": "photo.jpg",
+                "size": len(data),
+                "sha256": digest,
+                "path": str(stored),
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": wire_id,
+                "direction": "in",
+            }
+        )
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": f"Received file: photo.jpg ({len(data)} bytes, sha256 {digest[:12]})",
+                "file": {"name": "photo.jpg", "size": len(data), "sha256": digest},
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": wire_id,
+            }
+        )
+    node.set_blocklist(BlockList())
+    # The old entry's bytes were overwritten by the new arrival: the
+    # forward fails instead of sending the new file as the old one.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 400
+    assert "changed since it arrived" in payload["error"]["message"]
+    assert node.sent == []
+    assert node.sent_files == []
+    # The new entry forwards its own bytes.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 2, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert node.sent_files == [("alice", "photo.jpg", new_bytes)]
+
+
+def test_forward_message_endpoint_file_forward_passes_timeout(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+
+    _received_file_entry(bridge, node, tmp_path)
+    node.set_blocklist(BlockList())
+    seen = {}
+    original_send_file = node.send_file
+
+    def capturing_send_file(target, path, **kwargs):
+        seen.update(kwargs)
+        return original_send_file(target, path, **kwargs)
+
+    node.send_file = capturing_send_file
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice", "timeout": 60},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert seen.get("timeout") == 60
+
+
+def test_forward_message_endpoint_file_forward_oserror_reports_partial(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+
+    _received_file_entry(bridge, node, tmp_path)
+    node.set_blocklist(BlockList())
+
+    def send_file(target, path, **kwargs):
+        raise OSError("disk full")
+
+    node.send_file = send_file
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["ok"] is False
+    # The attribution text went out; only the file leg failed.
+    assert "disk full" in payload["file_error"]
+    assert node.sent == [("alice", "Forwarded from alice:\nphoto.jpg", None)]
+
+
 def test_forward_message_endpoint_rejects_both_or_neither_target(bridge, node):
     from tau.blocklist import BlockList
 

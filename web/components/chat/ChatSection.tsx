@@ -415,31 +415,9 @@ export default function ChatSection() {
     (message: ChatMessage, target: string) => {
       const [kind, key] = target.split(":");
       if (!key) return;
-      void (async () => {
-        setError(null);
-        try {
-          const result = await forwardMessage(
-            message.id,
-            kind === "group" ? { group: key } : { to: key },
-          );
-          await tau.refresh();
-          if (result.ok === false) {
-            // The attribution may have gone out while the file did not:
-            // say what failed instead of refreshing as if it all succeeded.
-            const failed = (result.file_response?.results ?? [])
-              .filter((leg) => leg.delivered === false || leg.ok === false)
-              .map((leg) => leg.to_name || leg.to || leg.target || "a recipient");
-            const detail = result.file_error
-              ? `the text went out but the file did not (${result.file_error})`
-              : failed.length
-                ? `the file did not reach ${failed.join(", ")}`
-                : "some recipients did not receive it";
-            setError(`Forward partly failed: ${detail}`);
-          }
-        } catch (err) {
-          setError(`Forward failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      })();
+      void run("Forward failed", () =>
+        forwardMessage(message.id, kind === "group" ? { group: key } : { to: key }),
+      );
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],

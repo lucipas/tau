@@ -629,31 +629,39 @@ export async function retractMessage(id: number): Promise<unknown> {
   return post("/api/messages/retract", { id });
 }
 
-/** Per-leg outcome of a file forward; a failed leg carries `error` or `delivered: false`. */
-export type ForwardFileLeg = {
-  to?: string;
-  to_name?: string;
-  target?: string;
-  delivered?: boolean;
-  ok?: boolean;
-  error?: string;
-};
-
-/**
- * Forward response. `ok: false` means something failed even though the
- * request succeeded: the attribution may have gone out while the file did not.
- */
-export type ForwardResult = {
-  ok?: boolean;
-  file_error?: string;
-  file_response?: { results?: ForwardFileLeg[] };
-};
-
 export async function forwardMessage(
   id: number,
   target: { to: string } | { group: string },
-): Promise<ForwardResult> {
-  return post("/api/messages/forward", { id, ...target }) as Promise<ForwardResult>;
+): Promise<unknown> {
+  const result = await post("/api/messages/forward", { id, ...target });
+  // A file forward can report HTTP 200 with ok: false: the
+  // attribution text went out but the file leg failed.  Surface that
+  // as an error instead of closing the picker on a success flag —
+  // the caller shows it as a failed forward.
+  if (result && typeof result === "object") {
+    const partial = result as {
+      ok?: unknown;
+      file_error?: unknown;
+      file_response?: { ok?: unknown };
+    };
+    if (partial.ok === false) {
+      if (typeof partial.file_error === "string" && partial.file_error) {
+        throw new Error(
+          `the message was forwarded but the file did not send: ${partial.file_error}`,
+        );
+      }
+      if (
+        partial.file_response &&
+        typeof partial.file_response === "object" &&
+        partial.file_response.ok === false
+      ) {
+        throw new Error(
+          "the message was forwarded but the file did not reach all members",
+        );
+      }
+    }
+  }
+  return result;
 }
 
 export async function pinMessage(id: number): Promise<unknown> {
