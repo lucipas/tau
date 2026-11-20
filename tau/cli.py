@@ -188,6 +188,7 @@ from .node import (
     TauNode,
     check_tcp_listen_ports,
     instance_lock_holder,
+    resolve_received_file,
 )
 from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .follows import (
@@ -13938,9 +13939,6 @@ def cmd_forward(args: argparse.Namespace) -> int:
         if record.get("destination") in blocked:
             raise NodeError("cannot forward a message from a blocked peer")
     text = record.get("text")
-    if not text:
-        # File records carry no text (see inbox._valid_record).
-        raise NodeError("cannot forward a file message: it has no text to send")
     if record.get("direction") == "out":
         # The message is one this node sent; the recipient already knows
         # the forwarder, so the attribution names the forwarder as "you".
@@ -13967,6 +13965,12 @@ def cmd_forward(args: argparse.Namespace) -> int:
         )
         if peer is not None:
             label = peer.display_name
+    if record.get("kind") == "file":
+        # A file record carries no text: forward the stored bytes
+        # instead, with the file name as the attributed line.
+        return _forward_file(args, config, record, label)
+    if not text:
+        raise NodeError("cannot forward a message with no text to send")
     forwarded = f"Forwarded from {label}:\n{text}"
     if len(forwarded) > MAX_MESSAGE_CHARS:
         raise NodeError(
@@ -13981,6 +13985,130 @@ def cmd_forward(args: argparse.Namespace) -> int:
     if getattr(args, "group", None):
         return cmd_group_send(args)
     return cmd_send(args)
+
+
+def _forward_file(
+    args: argparse.Namespace,
+    config: Any,
+    record: Dict[str, Any],
+    label: str,
+) -> int:
+    """Forward a stored received file to a peer or into a group.
+
+    The recipient first gets the usual attribution as a text DM —
+    ``Forwarded from <name>:`` naming the file — then the file itself
+    as a fresh one-to-one transfer, reusing the send-file paths.  The
+    stored bytes are verified against the record before anything is
+    sent, so a missing or altered file fails cleanly up front.  A file
+    leg that fails does not roll back attribution text already sent,
+    and a failed leg is reported per recipient, like
+    ``tau group send-file``.  Scheduling is not supported in v1: a
+    delayed file forward would need the attribution text scheduled
+    alongside the staged bytes.
+    """
+    if getattr(args, "delay", None) is not None:
+        print(
+            "error: --delay cannot be used when forwarding a file — "
+            "schedule the file itself with `tau send-file --delay`",
+            file=sys.stderr,
+        )
+        return 2
+    path = resolve_received_file(record, config.files_dir)
+    name = str(record["name"])
+    forwarded = f"Forwarded from {label}:\n{name}"
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    args.message = forwarded
+    if getattr(args, "group", None):
+        text_rc = cmd_group_send(args)
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            group = node.groups.find(args.group)
+            response = node.send_group_file(
+                group,
+                path,
+                timeout=300.0,
+                discover_timeout=discover_timeout,
+            )
+        finally:
+            node.stop()
+        failed_legs = [
+            result for result in response["results"] if not result.get("delivered")
+        ]
+        exit_code = (
+            _EXIT_ERROR if (text_rc != _EXIT_OK or failed_legs) else _EXIT_OK
+        )
+        if _json_mode(args):
+            _emit({"file": response}, True)
+            return exit_code
+        if not response["results"]:
+            print(
+                f"group {response['name']} has no other members"
+                " — nothing to send to."
+            )
+            return exit_code
+        for result in response["results"]:
+            member_name = result.get("to_name") or result["to"][:8]
+            if result.get("delivered"):
+                print(
+                    f"forwarded {result['name']} "
+                    f"({result['size']} bytes) to {member_name}"
+                )
+            else:
+                print(
+                    f"failed to forward {name} to {member_name}: "
+                    f"{result.get('error') or 'unknown error'}"
+                )
+        return exit_code
+    text_rc = cmd_send(args)
+    targets = args.to if isinstance(args.to, list) else [args.to]
+    node = TauNode(config, name=config.name)
+    node.start()
+    results: List[Dict[str, Any]] = []
+    try:
+        for target in targets:
+            try:
+                sent = node.send_file(
+                    target,
+                    path,
+                    timeout=300.0,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                results.append(
+                    {"target": target, "ok": False, "error": str(exc)}
+                )
+                continue
+            results.append({"target": target, "delivered": True, **sent})
+    finally:
+        node.stop()
+    failed = [result for result in results if not result.get("delivered")]
+    exit_code = _EXIT_ERROR if (text_rc != _EXIT_OK or failed) else _EXIT_OK
+    if _json_mode(args):
+        _emit(
+            {
+                "file": {
+                    "name": name,
+                    "size": record["size"],
+                    "sha256": record["sha256"],
+                    "results": results,
+                }
+            },
+            True,
+        )
+        return exit_code
+    for result in results:
+        if result.get("delivered"):
+            print(
+                f"forwarded {result['name']} ({result['size']} bytes) "
+                f"to {result['target']}"
+            )
+        else:
+            print(
+                f"failed to forward {name} to {result['target']}: "
+                f"{result.get('error') or 'unknown error'}"
+            )
+    return exit_code
 
 
 def _queue_file_for_later(

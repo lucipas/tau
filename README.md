@@ -407,6 +407,7 @@ Global options may appear before or after the command:
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau forward --to PEER ID` | Forward a stored message to a peer, attributed to its sender (`--group NAME` fans it out to a group; a file message forwards its stored bytes, `--delay` not supported for files) |
 | `tau send-file --to PEER FILE --delay 5m` | Stage a file and send it in 5 minutes (needs a node serving at send time; at most 10 MiB) |
 | `tau group send-file GROUP FILE --delay 5m` | Same, fanned out to a group's members |
 | `tau scheduled-files` | List files scheduled to send later |

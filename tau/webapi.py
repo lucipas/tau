@@ -102,7 +102,8 @@ script) can read what arrives from the mesh and send messages back:
                            (or ``"group": "<name>"`` to fan it out to a group):
                            send the message on as a new DM prefixed with
                            ``Forwarded from <name>:`` (``tau forward`` from
-                           the console)
+                           the console); a file entry forwards its stored
+                           bytes the same way, attribution first
     POST /api/messages/pin pin ``{"id": <console message id>}`` in the node
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
@@ -7943,10 +7944,14 @@ class WebBridge:
         carries no expiry, kind, or reply chain from the original, and
         the new outbound entry appears in the feed like any other send.
 
+        A file entry forwards the stored bytes instead (see
+        :meth:`_forward_file_message`): the recipient first gets the
+        attribution naming the file, then the file itself as a fresh
+        one-to-one transfer.
+
         Exactly one of ``to`` and ``group`` is required.  Same guards
         as the CLI: group messages cannot be forwarded (they would leak
-        the group's text to a nonmember), file transfers cannot be
-        forwarded (they have no text), and a received message from a
+        the group's text to a nonmember), and a received message from a
         blocked peer cannot be forwarded.  An unreadable block-list
         fails closed for received messages, matching the CLI.
         Forwarding your own sent message attributes it as "you"; a
@@ -7987,11 +7992,8 @@ class WebBridge:
                 raise ValueError(f"unknown message: {target!r}")
             if entry.get("group"):
                 raise ValueError("group messages cannot be forwarded")
-            if entry.get("file"):
-                raise ValueError("file transfers cannot be forwarded")
+            file_meta = entry.get("file")
             text = entry.get("text")
-            if not isinstance(text, str) or not text:
-                raise ValueError("message has no text to forward")
             direction = entry.get("direction")
             peer_hash = entry.get("peer")
             peer_name = entry.get("peer_name")
@@ -8033,6 +8035,20 @@ class WebBridge:
                     if isinstance(peer_hash, str) and peer_hash
                     else "unknown"
                 )
+        if file_meta is not None:
+            # A file entry carries no forwardable text: the stored
+            # bytes go instead, with the file name as the attributed
+            # line.  The block-list and label checks above already ran.
+            return self._forward_file_message(
+                entry,
+                file_meta,
+                label,
+                to,
+                timeout=timeout,
+                group=group,
+            )
+        if not isinstance(text, str) or not text:
+            raise ValueError("message has no text to forward")
         forwarded = f"Forwarded from {label}:\n{text}"
         if len(forwarded) > MAX_MESSAGE_CHARS:
             raise ValueError(
@@ -8056,6 +8072,98 @@ class WebBridge:
             to.strip(), forwarded, timeout=timeout
         )
         return {"ok": True, "message": message, "response": response}
+
+    def _forward_file_message(
+        self,
+        entry: Dict[str, Any],
+        file_meta: Dict[str, Any],
+        label: str,
+        to: Optional[str] = None,
+        *,
+        timeout: float = 20.0,
+        group: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Forward a stored received file, from the console.
+
+        The recipient first gets the attribution as a text DM —
+        ``Forwarded from <name>:`` naming the file — then the file
+        itself as a fresh one-to-one transfer, reusing
+        :meth:`send_file` / :meth:`send_group_file`.  The stored bytes
+        come from :meth:`received_file`, which re-checks them against
+        the inbox record's size and SHA-256 and requires the recorded
+        path to sit inside the sender's directory under the files
+        directory — a missing, moved, or altered file fails cleanly
+        up front instead of forwarding the wrong bytes.  A file you
+        sent cannot be forwarded: its bytes were staged in a temporary
+        directory for the transfer and not kept.  A failed peer file
+        leg does not roll back the attribution text already sent: the
+        result reports ``ok: False`` with ``file_error`` instead of
+        raising, so the console can say what went out and what did not.
+        """
+        if entry.get("direction") == "out":
+            raise ValueError(
+                "cannot forward a file you sent: the original bytes "
+                "were not kept — re-send it with a file send"
+            )
+        name = file_meta.get("name")
+        peer_hash = entry.get("peer")
+        if not isinstance(name, str) or not name:
+            raise ValueError("cannot forward a file: the file has no name")
+        if not isinstance(peer_hash, str) or not peer_hash:
+            raise ValueError("cannot forward a file: the sender is unknown")
+        try:
+            found = self.received_file(peer_hash, name)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if found is None:
+            raise ValueError(
+                f"stored file {name} is no longer available — it was "
+                "moved, deleted, or changed since it arrived"
+            )
+        data, name = found
+        forwarded = f"Forwarded from {label}:\n{name}"
+        if group is not None:
+            messages, response = self.send_group_message(
+                group.strip(), forwarded, timeout=timeout
+            )
+            try:
+                file_messages, file_response = self.send_group_file(
+                    group.strip(), name, data
+                )
+            except (NodeError, ValueError, OSError) as exc:
+                return {
+                    "ok": False,
+                    "messages": messages,
+                    "response": response,
+                    "file_error": str(exc),
+                }
+            return {
+                "ok": bool(response.get("ok", True))
+                and bool(file_response.get("ok", True)),
+                "messages": messages,
+                "response": response,
+                "file_messages": file_messages,
+                "file_response": file_response,
+            }
+        message, response = self.send_message(
+            to.strip(), forwarded, timeout=timeout
+        )
+        try:
+            file_message, file_response = self.send_file(to.strip(), name, data)
+        except (NodeError, ValueError) as exc:
+            return {
+                "ok": False,
+                "message": message,
+                "response": response,
+                "file_error": str(exc),
+            }
+        return {
+            "ok": True,
+            "message": message,
+            "response": response,
+            "file_message": file_message,
+            "file_response": file_response,
+        }
 
     def pin_message(self, target: int) -> Dict[str, Any]:
         """Pin one stored DM from the console history, by console id.

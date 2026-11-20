@@ -188,6 +188,7 @@ class FakeNode:
             blocklist_path=data_dir / "blocklist.json",
             ignored_groups_path=data_dir / "ignored-groups.json",
             beacons_path=data_dir / "beacons.json",
+            files_dir=data_dir / "files",
         )
         self._allowlist = AllowList()
         self._allowlist_lock = threading.RLock()
@@ -18384,6 +18385,45 @@ def _received_console_entry(bridge, *, text="hello there"):
     )
 
 
+def _received_file_entry(bridge, node, tmp_path, *, data=b"photo-bytes!", name="photo.jpg"):
+    """A received file entry in the feed, with its bytes stored on disk."""
+    import hashlib
+    from pathlib import Path
+
+    files_dir = Path(tmp_path) / "files"
+    stored = files_dir / PEER_HASH / name
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    node.inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": PEER_HASH,
+            "name": name,
+            "size": len(data),
+            "sha256": digest,
+            "path": str(stored),
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-file-1",
+            "direction": "in",
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": f"Received file: {name} ({len(data)} bytes, sha256 {digest[:12]})",
+            "file": {"name": name, "size": len(data), "sha256": digest},
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-file-1",
+        }
+    )
+    return stored
+
+
 def test_forward_message_endpoint_forwards_received_message(bridge, node):
     from tau.blocklist import BlockList
 
@@ -18428,6 +18468,137 @@ def test_forward_message_endpoint_forwards_to_group(bridge, node):
     # The original stays in the feed, plus one entry per member leg.
     _, _, feed = _json(bridge, "/api/messages")
     assert [entry["id"] for entry in feed["messages"]] == [1, 2, 3]
+
+
+def test_forward_message_endpoint_forwards_received_file(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+
+    _received_file_entry(bridge, node, tmp_path)
+    node.set_blocklist(BlockList())
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["message"]["text"] == "Forwarded from alice:\nphoto.jpg"
+    assert payload["file_message"]["text"] == "Sent file: photo.jpg (12 bytes)"
+    assert payload["file_response"]["name"] == "photo.jpg"
+    assert payload["file_response"]["size"] == 12
+    assert node.sent == [("alice", "Forwarded from alice:\nphoto.jpg", None)]
+    assert node.sent_files == [("alice", "photo.jpg", b"photo-bytes!")]
+    # The original stays in the feed, plus the attribution and the file.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [1, 2, 3]
+
+
+def test_forward_message_endpoint_forwards_received_file_to_group(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+
+    _received_file_entry(bridge, node, tmp_path)
+    node.set_blocklist(BlockList())
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "group": "crew"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert [entry["text"] for entry in payload["messages"]] == [
+        "Forwarded from alice:\nphoto.jpg",
+        "Forwarded from alice:\nphoto.jpg",
+    ]
+    assert [entry["text"] for entry in payload["file_messages"]] == [
+        "Sent file: photo.jpg (12 bytes)",
+        "Sent file: photo.jpg (12 bytes)",
+    ]
+    assert payload["file_response"]["ok"] is True
+    assert node.group_sent == [("crew", "Forwarded from alice:\nphoto.jpg")]
+    assert node.group_sent_files == [("crew", "photo.jpg", b"photo-bytes!")]
+
+
+def test_forward_message_endpoint_file_forward_missing_bytes_is_an_error(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+
+    # The entry exists but the bytes were never stored: nothing goes out.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "Received file: photo.jpg (12 bytes, sha256 abababababab)",
+            "file": {"name": "photo.jpg", "size": 12, "sha256": "ab" * 32},
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-file-1",
+        }
+    )
+    node.set_blocklist(BlockList())
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 400
+    assert "no longer available" in payload["error"]["message"]
+    assert node.sent == []
+    assert node.sent_files == []
+
+
+def test_forward_message_endpoint_file_forward_blocked_sender_is_an_error(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+
+    _received_file_entry(bridge, node, tmp_path)
+    node.set_blocklist(BlockList(blocked=frozenset({PEER_HASH})))
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 400
+    assert "blocked peer" in payload["error"]["message"]
+    assert node.sent == []
+    assert node.sent_files == []
+
+
+def test_forward_message_endpoint_file_forward_failed_leg_reports_partial(
+    bridge, node, tmp_path
+):
+    from tau.blocklist import BlockList
+    from tau.node import NodeError
+
+    _received_file_entry(bridge, node, tmp_path)
+    node.set_blocklist(BlockList())
+
+    def send_file(target, path, **kwargs):
+        raise NodeError("no path to alice")
+
+    node.send_file = send_file
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["ok"] is False
+    # The attribution text went out; only the file leg failed.
+    assert payload["message"]["text"] == "Forwarded from alice:\nphoto.jpg"
+    assert "no path to alice" in payload["file_error"]
+    assert "file_message" not in payload
+    assert node.sent == [("alice", "Forwarded from alice:\nphoto.jpg", None)]
 
 
 def test_forward_message_endpoint_rejects_both_or_neither_target(bridge, node):
@@ -18537,7 +18708,8 @@ def test_forward_message_endpoint_rejects_group_file_and_blocked(bridge, node):
     assert status == 400
     assert "group messages cannot be forwarded" in payload["error"]["message"]
 
-    # File transfers have no text to forward.
+    # A file you sent cannot be forwarded: its bytes were staged in a
+    # temporary directory for the transfer and not kept.
     _sent_console_entry(
         bridge,
         node,
@@ -18551,7 +18723,7 @@ def test_forward_message_endpoint_rejects_group_file_and_blocked(bridge, node):
         body={"id": 2, "to": "alice"},
     )
     assert status == 400
-    assert "file transfers cannot be forwarded" in payload["error"]["message"]
+    assert "cannot forward a file you sent" in payload["error"]["message"]
 
     # A received message from a blocked peer stays unforwardable.
     _received_console_entry(bridge)
@@ -18610,7 +18782,12 @@ def test_forward_message_endpoint_rejects_restored_file_entry(bridge, node):
     # Regression test for the Qodo review finding: a file restored
     # from a backup used to arrive in the feed without its file
     # metadata, so the forward guard passed it and the peer got a
-    # fake "Received file: ..." line as a DM.
+    # fake "Received file: ..." line as a DM.  The entry carries its
+    # file metadata now — but its bytes were never stored under
+    # files/, so forwarding fails cleanly instead of sending anything.
+    from tau.blocklist import BlockList
+
+    node.set_blocklist(BlockList())
     bridge._mirror_imported_messages(
         [
             {
@@ -18639,7 +18816,7 @@ def test_forward_message_endpoint_rejects_restored_file_entry(bridge, node):
         body={"id": 1, "to": "alice"},
     )
     assert status == 400
-    assert "file transfers cannot be forwarded" in payload["error"]["message"]
+    assert "no longer available" in payload["error"]["message"]
     assert node.sent == []
 
 
