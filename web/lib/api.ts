@@ -1387,12 +1387,14 @@ export async function sendChannelMessage(
   text: string,
   replyTo?: string,
   expiresIn?: number,
+  location?: { lat: number; lon: number; name?: string },
 ): Promise<ChannelMessage> {
   return post("/api/channels/send", {
     channel,
     text,
     ...(replyTo ? { reply_to: replyTo } : {}),
     ...(expiresIn !== undefined ? { expires_in: expiresIn } : {}),
+    ...(location ? { location } : {}),
   });
 }
 

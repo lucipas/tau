@@ -8042,45 +8042,33 @@ class TauNode:
                     exc,
                 )
 
-    def send_group_file(
+    def _fan_out_file(
         self,
-        group: Union[str, Dict[str, Any]],
-        path: Union[str, Path],
+        members: List[str],
+        data: bytes,
+        name: str,
+        digest: str,
         *,
-        timeout: float = _FILE_TRANSFER_TIMEOUT,
-        discover_timeout: Optional[float] = None,
-        only: Optional[Sequence[str]] = None,
-    ) -> Dict[str, Any]:
-        """Fan a file out to every member of a group except this node.
+        timeout: float,
+        discover_timeout: Optional[float],
+        limit_label: str,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Fan already-read file bytes out to *members*, one transfer each.
 
-        *group* is a group id, id prefix, name, or group record.  Each
-        leg is one ``send_file`` transfer (its own transfer id and
-        ``/tau/file`` offer, hash verified by the receiver, 10 MiB
-        limit).  Files are direct links only in v1, like ``send_file``:
-        a member that cannot be reached or refuses the offer is a
-        failed leg, not a queued one.  Each leg is bounded by
-        ``timeout`` — the per-leg deadline discipline from
-        ``send_group_message``, so one slow member cannot consume
-        another member's window.  The file is read once up front, so
-        every leg carries the same bytes even if the file changes
-        mid-fan-out.  With *only* set, legs go only to those member
-        hashes — a scheduled retry's still-owed members, so a partial
-        fan-out never redelivers to members who already received the
-        file.  Returns a per-member result list:
-        ``delivered`` (with the transfer id, name, size and sha256)
-        or an ``error`` for that leg.
+        The shared per-leg loop for :meth:`send_group_file` and
+        :meth:`send_broadcast_file`: each leg is its own
+        ``_send_file_bytes`` transfer, bounded by its own share of
+        ``timeout`` (the per-leg deadline discipline from
+        ``send_group_message``), so one slow member cannot consume
+        another member's window.  A member that cannot be reached or
+        refuses the offer is a failed leg, not a queued one — files
+        are direct links only in v1.  Returns the per-member results
+        (``delivered`` with transfer id/name/size/sha256, or an
+        ``error``) and whether every leg was delivered.  *members*
+        must already exclude this node; *limit_label* names the
+        fan-out in the not-attempted error (``"group send"``,
+        ``"broadcast send"``).
         """
-        if isinstance(group, str):
-            group = self.groups.find(group)
-        # Read the file once, before any leg is sent, so a missing or
-        # oversized file fails cleanly up front rather than aborting
-        # the fan-out partway through.
-        data, name, digest = _read_file_payload(path)
-        own_hash = self.destination_hexhash
-        members = [m for m in group["members"] if m != own_hash]
-        if only is not None:
-            wanted = set(only)
-            members = [m for m in members if m in wanted]
         results: List[Dict[str, Any]] = []
         for member in members:
             deadline = time.monotonic() + timeout
@@ -8093,7 +8081,10 @@ class TauNode:
                         "to": member,
                         "to_name": peer_name,
                         "ok": False,
-                        "error": "not attempted: group send time limit reached",
+                        "error": (
+                            "not attempted: "
+                            f"{limit_label} time limit reached"
+                        ),
                     }
                 )
                 continue
@@ -8135,11 +8126,112 @@ class TauNode:
         # Aggregate success only when every leg was delivered; a
         # failed leg is a failed fan-out (there is no queue for files).
         all_ok = all(r.get("delivered") for r in results)
+        return results, all_ok
+
+    def send_group_file(
+        self,
+        group: Union[str, Dict[str, Any]],
+        path: Union[str, Path],
+        *,
+        timeout: float = _FILE_TRANSFER_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+        only: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Fan a file out to every member of a group except this node.
+
+        *group* is a group id, id prefix, name, or group record.  Each
+        leg is one ``send_file`` transfer (its own transfer id and
+        ``/tau/file`` offer, hash verified by the receiver, 10 MiB
+        limit).  Files are direct links only in v1, like ``send_file``:
+        a member that cannot be reached or refuses the offer is a
+        failed leg, not a queued one.  Each leg is bounded by
+        ``timeout`` — the per-leg deadline discipline from
+        ``send_group_message``, so one slow member cannot consume
+        another member's window.  The file is read once up front, so
+        every leg carries the same bytes even if the file changes
+        mid-fan-out.  With *only* set, legs go only to those member
+        hashes — a scheduled retry's still-owed members, so a partial
+        fan-out never redelivers to members who already received the
+        file.  Returns a per-member result list:
+        ``delivered`` (with the transfer id, name, size and sha256)
+        or an ``error`` for that leg.
+        """
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        # Read the file once, before any leg is sent, so a missing or
+        # oversized file fails cleanly up front rather than aborting
+        # the fan-out partway through.
+        data, name, digest = _read_file_payload(path)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        if only is not None:
+            wanted = set(only)
+            members = [m for m in members if m in wanted]
+        results, all_ok = self._fan_out_file(
+            members,
+            data,
+            name,
+            digest,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+            limit_label="group send",
+        )
         return {
             "ok": all_ok,
             "v": PROTOCOL_VERSION,
             "group": group["id"],
             "name": group["name"],
+            "results": results,
+        }
+
+    def send_broadcast_file(
+        self,
+        broadcast: Union[str, Dict[str, Any]],
+        path: Union[str, Path],
+        *,
+        timeout: float = _FILE_TRANSFER_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan a file out to every member of a broadcast list.
+
+        *broadcast* is a list name or a broadcast record.  Each leg
+        is one ``send_file`` transfer (its own transfer id and
+        ``/tau/file`` offer, hash verified by the receiver, 10 MiB
+        limit) — the same fan-out as :meth:`send_group_file`, except
+        each member gets an ordinary one-to-one file transfer and no
+        list metadata ever reaches a recipient, exactly as
+        ``tau broadcast send`` sends ordinary DMs.  Files are direct
+        links only in v1, like ``send_file``: a member that cannot be
+        reached or refuses the offer is a failed leg, not a queued
+        one.  Each leg is bounded by ``timeout`` — the per-leg
+        deadline discipline from ``send_group_file``, so one slow
+        member cannot consume another member's window.  The file is
+        read once up front, so every leg carries the same bytes even
+        if the file changes mid-fan-out.  Returns a per-member result
+        list: ``delivered`` (with the transfer id, name, size and
+        sha256) or an ``error`` for that leg.
+        """
+        if isinstance(broadcast, str):
+            broadcast = self.broadcasts.find(broadcast)
+        # Read the file once, before any leg is sent, so a missing or
+        # oversized file fails cleanly up front rather than aborting
+        # the fan-out partway through.
+        data, name, digest = _read_file_payload(path)
+        own_hash = self.destination_hexhash
+        members = [m for m in broadcast["members"] if m != own_hash]
+        results, all_ok = self._fan_out_file(
+            members,
+            data,
+            name,
+            digest,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+            limit_label="broadcast send",
+        )
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "broadcast": broadcast["name"],
             "results": results,
         }
 

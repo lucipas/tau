@@ -6,6 +6,7 @@ send fans out as an ordinary DM per member.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,8 +22,9 @@ from tau.broadcasts import (
 )
 from tau.config import TauConfig
 from tau.identity import destination_hash
+from tau.inbox import Inbox
 from tau.mailbox import Mailbox
-from tau.node import NodeError
+from tau.node import NodeError, TauNode
 from tau.peers import PeerRegistry
 
 OWN_HASH = "ab" * 16
@@ -120,14 +122,17 @@ class _FakeBroadcastNode:
     """A node that resolves a few known peers and records DM sends."""
 
     instances: list = []
+    fail_for: set = set()
 
     def __init__(self, config, name=None):
         self.config = config
         self.mailbox = Mailbox(config.mailbox_path)
         self.registry = PeerRegistry(config.peers_path)
+        self.broadcasts = BroadcastStore(config.broadcasts_path)
         self.destination_hexhash = OWN_HASH
         self.started = False
         self.calls: list = []
+        self.file_calls: list = []
         _FakeBroadcastNode.instances.append(self)
 
     def start(self, **kwargs):
@@ -147,6 +152,43 @@ class _FakeBroadcastNode:
     def send_message(self, target, text, **kwargs):
         self.calls.append((target, text))
         return {"ok": True, "echo": text, "_rtt": 0.05}
+
+    def send_broadcast_file(self, broadcast, path, **kwargs):
+        """Fan a file out like the real node, recording each leg."""
+        if isinstance(broadcast, str):
+            broadcast = self.broadcasts.find(broadcast)
+        data = Path(path).read_bytes()
+        name = Path(path).name
+        digest = hashlib.sha256(data).hexdigest()
+        results = []
+        for member in broadcast["members"]:
+            if member == OWN_HASH:
+                continue
+            peer = self.registry.get(bytes.fromhex(member))
+            peer_name = peer.display_name if peer is not None else ""
+            self.file_calls.append((member, name, data))
+            if member in _FakeBroadcastNode.fail_for:
+                results.append(
+                    {"to": member, "to_name": peer_name, "ok": False,
+                     "error": "unreachable"}
+                )
+                continue
+            results.append(
+                {
+                    "to": member,
+                    "to_name": peer_name,
+                    "delivered": True,
+                    "id": f"{member[:8]}-transfer",
+                    "name": name,
+                    "size": len(data),
+                    "sha256": digest,
+                }
+            )
+        return {
+            "ok": all(r.get("delivered") for r in results),
+            "broadcast": broadcast["name"],
+            "results": results,
+        }
 
 
 def _seed_peers(tmp_path):
@@ -283,3 +325,305 @@ def test_broadcast_send_fans_out_as_individual_dms(tmp_path, capsys, monkeypatch
 def test_broadcast_send_unknown_list(tmp_path, monkeypatch):
     code = _run_broadcast(tmp_path, monkeypatch, ["send", "nope", "hi"])
     assert code != 0
+
+
+# -- forward to a broadcast list ----------------------------------------
+# Issue #630: `tau forward --broadcast LIST` forwards a stored DM to
+# every member of the list, one private DM each.
+
+
+def _seed_forwardable_message(tmp_path):
+    """One received DM from alice, forwardable by its id prefix."""
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="tester")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "original thought",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "a" * 32,
+            "direction": "in",
+        }
+    )
+    return config
+
+
+def test_forward_to_broadcast_fans_out_attributed_text(
+    tmp_path, capsys, monkeypatch
+):
+    _seed_peers(tmp_path)
+    _seed_forwardable_message(tmp_path)
+    assert (
+        _run_broadcast(
+            tmp_path,
+            monkeypatch,
+            ["create", "team", "--peer", "alice", "--peer", "bob"],
+        )
+        == 0
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeBroadcastNode)
+    _FakeBroadcastNode.instances.clear()
+    code = cli.main(
+        ["forward", "--data-dir", str(tmp_path / "node"), "--broadcast", "team", "aaaa"]
+    )
+    assert code == 0
+    node = _FakeBroadcastNode.instances[-1]
+    # Members are stored sorted by hash, so the fan-out follows that order.
+    assert node.calls == [
+        (hashed, "Forwarded from alice:\noriginal thought")
+        for hashed in sorted([_PEER_MAP["alice"], _PEER_MAP["bob"]])
+    ]
+    out = capsys.readouterr().out
+    assert f"delivered to {_PEER_MAP['alice']}" in out
+    assert f"delivered to {_PEER_MAP['bob']}" in out
+    assert node.started is False
+
+
+def test_forward_to_broadcast_unknown_list(tmp_path, capsys, monkeypatch):
+    _seed_peers(tmp_path)
+    _seed_forwardable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeBroadcastNode)
+    _FakeBroadcastNode.instances.clear()
+    code = cli.main(
+        ["forward", "--data-dir", str(tmp_path / "node"), "--broadcast", "nope", "aaaa"]
+    )
+    assert code == 1
+    assert "unknown broadcast list" in capsys.readouterr().err
+
+# -- broadcast file fan-out (CLI) -------------------------------------------
+
+
+def _create_team(tmp_path, monkeypatch):
+    _seed_peers(tmp_path)
+    assert (
+        _run_broadcast(
+            tmp_path,
+            monkeypatch,
+            ["create", "team", "--peer", "alice", "--peer", "bob"],
+        )
+        == 0
+    )
+
+
+def test_broadcast_send_file_fans_out_as_individual_transfers(
+    tmp_path, capsys, monkeypatch
+):
+    _create_team(tmp_path, monkeypatch)
+    shared = tmp_path / "photo.png"
+    shared.write_bytes(b"fake png bytes")
+    code = _run_broadcast(
+        tmp_path, monkeypatch, ["send-file", "team", str(shared)]
+    )
+    assert code == 0
+    node = _FakeBroadcastNode.instances[-1]
+    # Members are stored sorted by hash, so the fan-out follows that order.
+    assert [call[0] for call in node.file_calls] == sorted(
+        [_PEER_MAP["alice"], _PEER_MAP["bob"]]
+    )
+    # Every leg carries the same bytes, read once up front.
+    assert all(call[1] == "photo.png" for call in node.file_calls)
+    assert all(call[2] == b"fake png bytes" for call in node.file_calls)
+    out = capsys.readouterr().out
+    assert "delivered photo.png (14 bytes) to alice" in out
+    assert "delivered photo.png (14 bytes) to bob" in out
+    assert node.started is False
+
+
+def test_broadcast_send_file_unknown_list(tmp_path, monkeypatch):
+    code = _run_broadcast(tmp_path, monkeypatch, ["send-file", "nope", "x.png"])
+    assert code != 0
+
+
+def test_broadcast_send_file_failed_leg_is_reported(
+    tmp_path, capsys, monkeypatch
+):
+    _create_team(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        _FakeBroadcastNode, "fail_for", {_PEER_MAP["alice"]}
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    code = _run_broadcast(
+        tmp_path, monkeypatch, ["send-file", "team", str(shared)]
+    )
+    assert code != 0
+    out = capsys.readouterr().out
+    assert "failed for alice: unreachable" in out
+    assert "delivered notes.txt (5 bytes) to bob" in out
+
+
+# -- broadcast file fan-out (node) ------------------------------------------
+
+
+def _make_node(tmp_path, name="alice"):
+    config = TauConfig.resolve(data_dir=tmp_path, name=name)
+    node = TauNode(
+        config,
+        registry=PeerRegistry(config.peers_path),
+    )
+    node.destination = SimpleNamespace(
+        hexhash=OWN_HASH, hash=bytes.fromhex(OWN_HASH)
+    )
+    return node
+
+
+def _stub_broadcast_send_file(node, *, fail_for=()):
+    """Replace ``_send_file_bytes`` with a recorder; *fail_for* members raise."""
+    calls = []
+
+    def fake_send_file_bytes(
+        target,
+        data,
+        name,
+        digest,
+        *,
+        timeout=300.0,
+        discover_timeout=None,
+        deadline=None,
+    ):
+        calls.append((target, name, timeout, discover_timeout, data, deadline))
+        member = target if isinstance(target, str) else target.hexhash
+        if member in fail_for:
+            raise NodeError("unreachable")
+        return {
+            "ok": True,
+            "id": f"{member[:8]}-transfer",
+            "name": name,
+            "size": len(data),
+            "sha256": digest,
+            "to": member,
+        }
+
+    node._send_file_bytes = fake_send_file_bytes  # type: ignore[method-assign]
+    return calls
+
+
+def test_send_broadcast_file_fans_out_to_every_member(tmp_path):
+    node = _make_node(tmp_path)
+    node.reticulum = object()
+    broadcast = node.broadcasts.create(
+        "team", [OWN_HASH, ALICE_HASH, BOB_HASH]
+    )
+    shared = tmp_path / "photo.png"
+    shared.write_bytes(b"fake png bytes")
+    calls = _stub_broadcast_send_file(node)
+    result = node.send_broadcast_file(broadcast, shared)
+    assert result["ok"] is True
+    assert result["broadcast"] == "team"
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert set(by_to) == {ALICE_HASH, BOB_HASH}
+    # The sender is skipped, and each leg is its own transfer.
+    assert by_to[ALICE_HASH]["delivered"] is True
+    assert by_to[ALICE_HASH]["id"] == f"{ALICE_HASH[:8]}-transfer"
+    assert by_to[ALICE_HASH]["name"] == "photo.png"
+    assert by_to[ALICE_HASH]["size"] == len(b"fake png bytes")
+    assert by_to[BOB_HASH]["delivered"] is True
+    assert by_to[BOB_HASH]["id"] != by_to[ALICE_HASH]["id"]
+    assert len(calls) == 2
+    assert {call[0] for call in calls} == {ALICE_HASH, BOB_HASH}
+    # Every leg carries the same bytes, read once up front.
+    assert all(call[1] == "photo.png" for call in calls)
+    assert all(call[4] == b"fake png bytes" for call in calls)
+    # Each leg carries its own deadline, so one slow member cannot
+    # consume another member's window.
+    assert all(call[5] is not None for call in calls)
+    # Nothing is queued: files are direct links only in v1.
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_broadcast_file_keeps_going_after_a_failed_leg(tmp_path):
+    node = _make_node(tmp_path)
+    node.reticulum = object()
+    broadcast = node.broadcasts.create(
+        "team", [OWN_HASH, ALICE_HASH, BOB_HASH]
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_broadcast_send_file(node, fail_for={ALICE_HASH})
+    result = node.send_broadcast_file(broadcast, shared)
+    assert result["ok"] is False
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[ALICE_HASH].get("delivered") is None
+    assert by_to[ALICE_HASH]["error"] == "unreachable"
+    assert by_to[BOB_HASH]["delivered"] is True
+    assert len(calls) == 2
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_broadcast_file_rejects_a_bad_file_before_any_leg(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("tau.node.MAX_FILE_BYTES", 10)
+    node = _make_node(tmp_path)
+    node.reticulum = object()
+    broadcast = node.broadcasts.create(
+        "team", [OWN_HASH, ALICE_HASH, BOB_HASH]
+    )
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 11)
+    calls = _stub_broadcast_send_file(node)
+    with pytest.raises(NodeError, match="outside the"):
+        node.send_broadcast_file(broadcast, big)
+    assert calls == []
+
+
+def test_send_broadcast_file_accepts_a_list_name_string(tmp_path):
+    node = _make_node(tmp_path)
+    node.reticulum = object()
+    node.broadcasts.create("team", [OWN_HASH, ALICE_HASH])
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_broadcast_send_file(node)
+    result = node.send_broadcast_file("team", shared)
+    assert result["ok"] is True
+    assert [entry["to"] for entry in result["results"]] == [ALICE_HASH]
+    assert len(calls) == 1
+
+
+def test_send_broadcast_file_unknown_list_raises(tmp_path):
+    node = _make_node(tmp_path)
+    node.reticulum = object()
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_broadcast_send_file(node)
+    with pytest.raises(ValueError, match="unknown broadcast list"):
+        node.send_broadcast_file("nope", shared)
+    assert calls == []
+
+
+def test_send_broadcast_file_self_only_list_sends_nowhere(tmp_path):
+    node = _make_node(tmp_path)
+    node.reticulum = object()
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_broadcast_send_file(node)
+    # A list needs at least one member besides the sender to be
+    # created through the store, so a self-only list only reaches the
+    # fan-out as a bare record (a corrupt or hand-edited
+    # broadcasts.json). The fan-out must still be a no-op, not an
+    # error — and must never send to this node itself.
+    broadcast = {"name": "solo", "members": [OWN_HASH]}
+    result = node.send_broadcast_file(broadcast, shared)
+    assert result["ok"] is True
+    assert result["results"] == []
+    assert calls == []
+
+
+def test_send_broadcast_file_timeout_zero_attempts_no_leg(tmp_path):
+    node = _make_node(tmp_path)
+    node.reticulum = object()
+    broadcast = node.broadcasts.create(
+        "team", [OWN_HASH, ALICE_HASH, BOB_HASH]
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_broadcast_send_file(node)
+    result = node.send_broadcast_file(broadcast, shared, timeout=0.0)
+    assert result["ok"] is False
+    assert all(
+        entry["error"] == "not attempted: broadcast send time limit reached"
+        for entry in result["results"]
+    )
+    assert calls == []

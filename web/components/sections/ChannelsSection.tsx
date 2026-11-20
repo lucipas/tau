@@ -10,8 +10,27 @@ import UnreadChip from "@/components/chrome/UnreadChip";
 import { useHash } from "../chrome/useHash";
 import { formatCountdown, formatRelative, shortHash } from "@/lib/format";
 import { deleteDraft, getDrafts, getStatus, saveDraft } from "@/lib/api";
-import type { MessageDraft } from "@/lib/types";
+import type { LocationPin, MessageDraft } from "@/lib/types";
 import { useChannels } from "@/lib/use-channels";
+
+/** A pinned place on a channel message, linked out to a map. Shared by
+ *  the history list and the pinned strip: a pin can outlive its
+ *  presence in the fetched history page, so the strip needs the link
+ *  too. */
+function ChannelLocationLink({ location }: { location: LocationPin }) {
+  return (
+    <p className="mt-1 text-sm">
+      <a
+        href={`https://www.openstreetmap.org/?mlat=${location.lat}&mlon=${location.lon}#map=15/${location.lat}/${location.lon}`}
+        target="_blank"
+        rel="noreferrer"
+        className="underline text-cyan-300"
+      >
+        📍 {location.name ?? `${location.lat.toFixed(5)}, ${location.lon.toFixed(5)}`}
+      </a>
+    </p>
+  );
+}
 
 const SCHEDULE_OPTIONS: { label: string; seconds: number | undefined }[] = [
   { label: "Send now", seconds: undefined },
@@ -866,6 +885,7 @@ export default function ChannelsSection() {
                       <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap text-zinc-200">
                         {m.text}
                       </p>
+                      {m.location && <ChannelLocationLink location={m.location} />}
                     </div>
                     <button
                       type="button"
@@ -959,6 +979,7 @@ export default function ChannelsSection() {
                       {m.text}
                     </p>
                   )}
+                  {m.location && <ChannelLocationLink location={m.location} />}
 {m.poll_options && (
                     <div className="mt-2 flex flex-col gap-1.5" role="group" aria-label="Poll">
                       {m.poll_options.map((option, i) => {

@@ -708,7 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
     forward = subparsers.add_parser(
         "forward",
         parents=[common],
-        help="forward a stored message to a peer or a group",
+        help="forward a stored message to a peer, a group, a broadcast list, or a channel",
     )
     forward_target = forward.add_mutually_exclusive_group(required=True)
     forward_target.add_argument(
@@ -721,6 +721,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="NAME|ID",
         help="group name or id: forward into the group instead of to a peer",
+    )
+    forward_target.add_argument(
+        "--broadcast",
+        metavar="NAME",
+        help="broadcast list name: forward to every member instead of to a peer",
+    )
+    forward_target.add_argument(
+        "--channel",
+        metavar="NAME",
+        help="channel name: forward into the channel instead of to a peer",
     )
     forward.add_argument(
         "message",
@@ -738,7 +748,11 @@ def build_parser() -> argparse.ArgumentParser:
     forward.add_argument(
         "--discover-timeout",
         type=float,
-        default=10.0,
+        # SUPPRESS, not 10.0: every send path defaults a missing value
+        # to 10s, but `cmd_forward` must be able to tell an explicitly
+        # passed value from the default — a channel forward refuses
+        # the flag instead of silently ignoring it.
+        default=argparse.SUPPRESS,
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
@@ -3161,6 +3175,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     broadcast_send.set_defaults(func=cmd_broadcast_send)
 
+    broadcast_send_file = broadcast_sub.add_parser(
+        "send-file",
+        parents=[common],
+        help="send a file to every member of a broadcast list, as a private DM each",
+    )
+    broadcast_send_file.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_send_file.add_argument(
+        "path", type=Path, help="local file to send (at most 10 MiB)"
+    )
+    broadcast_send_file.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="how long each member's transfer may take (default 300)",
+    )
+    broadcast_send_file.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    broadcast_send_file.set_defaults(func=cmd_broadcast_send_file)
+
     tan = subparsers.add_parser(
         "tan",
         parents=[common],
@@ -4306,6 +4347,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="store locally without contacting peers",
     )
     channel_send.add_argument(
+        "--location",
+        default=None,
+        metavar='"LAT,LON [PLACE]"',
+        help="pin a place on the message (e.g. --location "
+        '"34.05,-83.88 Rock Springs Park"); without message text the '
+        "place name (or the coordinates) becomes the text",
+    )
+    channel_send.add_argument(
         "--delay",
         metavar="DURATION",
         help="schedule the message: queue it now and publish it after "
@@ -5130,6 +5179,7 @@ def _message_text_with_location(
     if (
         location is not None
         and getattr(args, "message", None) is None
+        and getattr(args, "text", None) is None
         and getattr(args, "file", None) is None
         and sys.stdin.isatty()
     ):
@@ -5892,6 +5942,7 @@ def _publish_local_channel_message(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    location: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = ChannelApp(
@@ -5913,6 +5964,7 @@ def _publish_local_channel_message(
         poll_vote=poll_vote,
         poll_close=poll_close,
         reply_to=reply_to,
+        location=location,
     )
     published = publisher.publish(
         message, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
@@ -6125,6 +6177,7 @@ def _publish_local_post(
             poll_options=poll_options,
             poll_vote=poll_vote,
             poll_close=poll_close,
+            location=location,
         )
     # Use a separate app so per-command timeouts do not mutate the serving app.
     publisher = TanApp(
@@ -9284,7 +9337,24 @@ def cmd_channel_mark_read(args: argparse.Namespace) -> int:
 
 
 def cmd_channel_send(args: argparse.Namespace) -> int:
-    text = _read_message(args)
+    # Validate the pin before reading the message, so an invalid
+    # --location fails at once instead of blocking on stdin.
+    location = _location_from_args(args)
+    if location is not None and getattr(args, "reply_to", None):
+        print(
+            "error: --location can only be attached to a top-level message, "
+            "not a reply",
+            file=sys.stderr,
+        )
+        return 2
+    if location is not None and getattr(args, "delay", None) is not None:
+        print(
+            "error: --location cannot be combined with --delay — "
+            "scheduled channel messages cannot carry a location pin yet",
+            file=sys.stderr,
+        )
+        return 2
+    text = _message_text_with_location(args, location)
     config = _make_config(args)
     json_output = _json_mode(args)
     try:
@@ -9364,6 +9434,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 text,
                 expires_at=expires_at,
                 reply_to=getattr(args, "reply_to", None),
+                location=location,
             )
         except ChannelError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -9385,6 +9456,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
                 expires_at=expires_at,
+                location=location,
             )
             message, published = result["message"], result["published"]
         else:
@@ -9405,6 +9477,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
                     expires_at=expires_at,
+                    location=location,
                 )
                 message, published = result["message"], result["published"]
             finally:
@@ -9414,6 +9487,11 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
         _emit({"message": message, "published": published}, True)
     else:
         print(f"sent to #{name} {short_hash(message['hash'])}")
+        pin = clean_location(message.get("location"))
+        if pin is not None:
+            label = pin.get("name") or "Location"
+            print(f"  📍 {label} — {pin['lat']}, {pin['lon']}")
+            print(f"  {location_maps_url(pin)}")
         if message.get("expires_at") is not None:
             print(
                 "  disappears in "
@@ -13946,15 +14024,18 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
-    """Forward a stored message to another peer or into a group, attributed
-    to its sender.
+    """Forward a stored message to another peer, into a group, into a
+    channel, or to every member of a broadcast list, attributed to its
+    sender.
 
     The forwarded text is the original prefixed with one attribution
     line, so the recipient sees who said it on any transport with no
-    protocol change.  Delivery reuses the send paths for a peer target
-    — or the group-send path for a group target, fanning out one leg
-    per member.  Either way the forward is a new message, so it
-    carries no expiry, kind, or reply chain from the original.
+    protocol change.  Delivery reuses :func:`cmd_send` wholesale for a
+    peer target — :func:`cmd_group_send` for a group target, fanning
+    out one leg per member, or :func:`cmd_broadcast_send` for a
+    broadcast target, one DM per member, or :func:`cmd_channel_send`
+    for a channel target.  Either way the forward is a new message, so
+    it carries no expiry, kind, or reply chain from the original.
     """
     config = _make_config(args)
     # `--timeout` defaults to None: the text legs use the send
@@ -14032,10 +14113,35 @@ def cmd_forward(args: argparse.Namespace) -> int:
     # `cmd_send` reads its text from `args.message`; hand it the
     # attributed text and let it own delivery, queueing, and output.
     # A group target takes the group-send path instead: the same
-    # attributed text, fanned out one leg per member.
+    # attributed text, fanned out one leg per member.  A broadcast
+    # target takes the broadcast-send path the same way: one DM per
+    # member, each with the same store-and-forward queueing as a
+    # one-to-one DM, so every delivery flag keeps its meaning.  A
+    # channel target takes the channel-send path the same way.
     args.message = forwarded
     if getattr(args, "group", None):
         return cmd_group_send(args)
+    if getattr(args, "broadcast", None):
+        return cmd_broadcast_send(args)
+    if getattr(args, "channel", None):
+        # `--no-queue`, `--wait`, and `--discover-timeout` only mean
+        # something for peer/group delivery; the channel-send path
+        # never reads them, so refuse them here instead of silently
+        # ignoring them.
+        if getattr(args, "no_queue", False):
+            raise NodeError("--no-queue does not apply to a channel forward")
+        if getattr(args, "wait", None) is not None:
+            raise NodeError("--wait does not apply to a channel forward")
+        if getattr(args, "discover_timeout", None) is not None:
+            raise NodeError(
+                "--discover-timeout does not apply to a channel forward"
+            )
+        # `cmd_channel_send` reads `args.to` as a publish restriction
+        # ("publish only to these peers"); the forward's own `--to`
+        # is a peer target, unset on this branch by the parser, but
+        # clear it explicitly so the two meanings can never mix.
+        args.to = None
+        return cmd_channel_send(args)
     return cmd_send(args)
 
 
@@ -19553,6 +19659,52 @@ def cmd_broadcast_send(args: argparse.Namespace) -> int:
     # queueing, and output.
     args.to = list(broadcast["members"])
     return cmd_send(args)
+
+
+def cmd_broadcast_send_file(args: argparse.Namespace) -> int:
+    """Send a file to every member of a broadcast list, as a private DM each.
+
+    Mirrors :func:`cmd_group_send_file`: one ``/tau/file`` offer +
+    RNS Resource transfer per member, each with its own transfer id,
+    and no list metadata ever reaches a recipient.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        response = node.send_broadcast_file(
+            args.broadcast,
+            args.path,
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+    finally:
+        node.stop()
+
+    failed_legs = [
+        r for r in response["results"] if not r.get("delivered")
+    ]
+    exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if _json_mode(args):
+        _emit(response, True)
+        return exit_code
+    if not response["results"]:
+        print(
+            f"broadcast list {response['broadcast']} has no other members"
+            " — nothing to send to."
+        )
+        return _EXIT_OK
+    for result in response["results"]:
+        name = result.get("to_name") or result["to"][:8]
+        if result.get("delivered"):
+            print(
+                f"delivered {result['name']} ({result['size']} bytes) to {name}"
+            )
+        else:
+            print(
+                f"failed for {name}: {result.get('error') or 'unknown error'}"
+            )
+    return exit_code
 
 
 def cmd_note(args: argparse.Namespace) -> int:
