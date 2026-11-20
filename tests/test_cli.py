@@ -10304,6 +10304,10 @@ def test_parser_react_arguments():
     cleared = parser.parse_args(["react", "abcdef12", "--clear"])
     assert cleared.reaction is None
     assert cleared.clear is True
+    assert cleared.no_queue is False
+
+    no_queue = parser.parse_args(["react", "--no-queue", "abcdef12", "👍"])
+    assert no_queue.no_queue is True
 
 
 def test_react_json_and_clear(tmp_path, capsys, monkeypatch):
@@ -10320,7 +10324,7 @@ def test_react_json_and_clear(tmp_path, capsys, monkeypatch):
     assert payload["to"] == sender_hash.hex()
     assert payload["cleared"] is True
     assert _FakeReactNode.instances[0].sent == [
-        (sender_hash.hex(), "m-2", "")
+        (sender_hash.hex(), "m-2", "", True)
     ]
 
 
@@ -10374,7 +10378,7 @@ def test_react_sends_to_the_message_author(tmp_path, capsys, monkeypatch):
     assert "👍" in out
     node = _FakeReactNode.instances[0]
     assert node.started is False
-    assert node.sent == [(sender_hash.hex(), "m-1", "👍")]
+    assert node.sent == [(sender_hash.hex(), "m-1", "👍", True)]
 
 
 def _seed_group_message(tmp_path):
@@ -10480,6 +10484,98 @@ def test_react_group_reports_failed_leg(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "delivered to alice" in out
     assert "failed for bob: no route to peer" in out
+
+
+def test_react_queues_for_offline_peer(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    monkeypatch.setattr(_FakeReactNode, "react_queued", True)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "👍"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "queued" in out
+    assert "reachable" in out
+    node = _FakeReactNode.instances[0]
+    assert node.sent == [(sender_hash.hex(), "m-1", "👍", True)]
+
+
+def test_react_no_queue_flag_passes_through(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["react", "--no-queue", "--data-dir", str(data_dir), "m-1", "👍"]
+    )
+    assert code == 0
+    node = _FakeReactNode.instances[0]
+    assert node.sent == [(sender_hash.hex(), "m-1", "👍", False)]
+
+
+def test_react_group_reports_queued_leg(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    monkeypatch.setattr(
+        _FakeReactNode,
+        "group_results",
+        [
+            {
+                "to": "aa" * 16,
+                "to_name": "alice",
+                "delivered": True,
+                "id": "r-group-1",
+            },
+            {
+                "to": "bb" * 16,
+                "to_name": "bob",
+                "queued": True,
+                "queued_id": "q-1",
+                "id": "r-group-1",
+            },
+        ],
+    )
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "delivered to alice" in out
+    assert "queued for bob" in out
+
+
+def test_react_group_all_queued_reports_queued(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    monkeypatch.setattr(
+        _FakeReactNode,
+        "group_results",
+        [
+            {
+                "to": "aa" * 16,
+                "to_name": "alice",
+                "queued": True,
+                "queued_id": "q-1",
+                "id": "r-group-1",
+            },
+            {
+                "to": "bb" * 16,
+                "to_name": "bob",
+                "queued": True,
+                "queued_id": "q-2",
+                "id": "r-group-1",
+            },
+        ],
+    )
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "queued for the group message" in out
+    assert "queued for alice" in out
+    assert "queued for bob" in out
 
 
 def test_react_group_strips_terminal_escapes_from_leg_errors(
@@ -11450,6 +11546,8 @@ class _FakeReactNode:
     instances = []
     # Tests may override the fan-out results (monkeypatch restores it).
     group_results = None
+    # Tests may force the DM path to report a queued reaction.
+    react_queued = False
     # The local node's identity hash, as TauNode.destination_hexhash.
     destination_hexhash = "ef" * 16
 
@@ -11469,9 +11567,26 @@ class _FakeReactNode:
         self.started = False
 
     def send_reaction(
-        self, target, message_id, reaction, *, timeout=20.0, discover_timeout=None
+        self,
+        target,
+        message_id,
+        reaction,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        queue=True,
     ):
-        self.sent.append((target, message_id, reaction))
+        self.sent.append((target, message_id, reaction, queue))
+        if type(self).react_queued:
+            return {
+                "ok": False,
+                "queued": True,
+                "target": message_id,
+                "reaction": reaction,
+                "cleared": not reaction,
+                "id": "r-1",
+                "queued_id": "q-1",
+            }
         return {"ok": True, "reaction": reaction, "target": message_id, "id": "r-1"}
 
     def send_group_reaction(
@@ -11484,6 +11599,7 @@ class _FakeReactNode:
         discover_timeout=None,
         target_author=None,
         target_sent_at=None,
+        queue=True,
     ):
         # The real node takes a group record and returns its id; mirror
         # that so the fan-out report reads the id, not the record.

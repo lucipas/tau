@@ -123,6 +123,52 @@ def test_bundle_roundtrip_held_and_outbox(tmp_path):
     assert again["skipped"] == 0
 
 
+def test_bundle_export_skips_queued_reaction(tmp_path):
+    # A queued reaction carries pre-signed /tau/react bytes, not a
+    # text message: sealing its display text would land as chat on
+    # the recipient.  It is skipped, and the plain queued message
+    # still exports.
+    import base64 as _base64
+
+    sender, recipient, _ = _identities()
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="queued hello",
+        to_name="bob",
+        message_id="queued-1",
+        now=1000.0,
+    )
+    mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="👍",
+        to_name="bob",
+        message_id="queued-reaction-1",
+        now=1000.0,
+        reaction={
+            "target": "m-1",
+            "token": "👍",
+            "reaction_id": "r-1",
+            "sent_at": 1000.0,
+            "payload_b64": _base64.b64encode(b"signed-reaction-bytes").decode(
+                "ascii"
+            ),
+        },
+    )
+    registry = _registry_with(recipient)
+    _, summary = build_bundle(
+        identity=sender,
+        sender_name="alice",
+        mailbox=mailbox,
+        registry=registry,
+        now=1000.0,
+    )
+    assert summary["mail"] == 1
+    assert len(summary["skipped"]) == 1
+    assert summary["skipped"][0]["id"] == "queued-reaction-1"
+    assert "reaction" in summary["skipped"][0]["reason"]
+
+
 def test_bundle_export_queued_group_leg_keeps_shared_send_time(tmp_path):
     # A queued group leg exported to a bundle must seal with the
     # fan-out's shared send time and its group context, like a relay

@@ -7272,13 +7272,19 @@ class WebBridge:
         if not peer:
             raise ValueError("that message has no known peer to react to")
         response = self.node.send_reaction(peer, target, token, timeout=timeout)
-        return {
+        # An offline peer queues the reaction instead of raising, so
+        # the console reports it as queued rather than a 502.
+        result: Dict[str, Any] = {
             "ok": True,
             "target": target,
             "reaction": token,
             "cleared": clear,
             "id": response.get("id"),
+            "queued": bool(response.get("queued")),
         }
+        if response.get("queued_id"):
+            result["queued_id"] = response["queued_id"]
+        return result
 
     def typing(
         self,
