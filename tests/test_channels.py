@@ -1299,6 +1299,44 @@ def test_publish_fans_out_to_peers(identities, tmp_path):
     assert request["ttl"] == 2
 
 
+class _RejectingNode:
+    """A peer that answers invalid_post: node.request raises for any
+    non-ok response (see TauNode._request_on_link), exactly as a
+    pre-upgrade peer rejecting a message it cannot verify would."""
+
+    def __init__(self, peer):
+        from tau.node import NodeError
+
+        self._error = NodeError("peer rejected the request: bad hash")
+        self.registry = _FakeRegistry(peer)
+
+    def request(self, peer, path, payload, *, timeout=20.0):
+        raise self._error
+
+
+def test_publish_counts_a_rejecting_peer_as_an_error(identities, tmp_path):
+    alice, bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = ChannelApp(config, alice, name="alice", gossip=False)
+    app.join("general")
+    message = app.send("general", "hello", publish=False)
+
+    peer = Peer(
+        destination_hash=bytes.fromhex(author_of(bob)),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _RejectingNode(peer)
+    app.node = node  # type: ignore[assignment]
+    result = app.publish(message, ttl=2)
+    assert result["delivered"] == 0
+    assert result["peers"] == 1
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["peer"] == author_of(bob)
+
+
 # -- CLI -----------------------------------------------------------------------
 
 
