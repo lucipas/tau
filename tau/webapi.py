@@ -108,8 +108,8 @@ script) can read what arrives from the mesh and send messages back:
                            ``tau pinned`` (local only, never sent)
     POST /api/messages/unpin unpin ``{"id": <console message id>}``
     GET  /api/drafts       saved message drafts (``tau draft save``)
-    POST /api/drafts       save a message draft ``{"kind": "peer"|"group",
-                           "target": "<hash>", "text": "..."}``
+    POST /api/drafts       save a message draft ``{"kind": "peer"|"group"|"channel",
+                           "target": "<hash | id | name>", "text": "..."}``
     POST /api/drafts/delete discard a message draft ``{"kind", "target"}``
     GET  /api/messages/muted muted DM conversations, groups and channels
     POST /api/messages/mute mute ``{"peer": "<name or hash>"}``,
@@ -229,9 +229,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/channels/join  join a channel (``{"channel": "<name>"}``)
     POST /api/channels/leave leave a channel (``{"channel": "<name>"}``)
     POST /api/channels/send  send a message to a joined channel (``{"channel", "text", "reply_to"?, "expires_in"?}``; ``expires_in`` seconds, at most 30d)
-    POST /api/channels/schedule  schedule a channel message for later
-    GET  /api/channels/scheduled  queued channel messages, soonest first
-    POST /api/channels/cancel-scheduled  cancel a queued channel message
+    POST /api/channels/schedule  schedule a channel message — or a poll, with ``"poll_options"`` — for later
+    GET  /api/channels/scheduled  queued channel messages and polls, soonest first
+    POST /api/channels/cancel-scheduled  cancel a queued channel message or poll
     POST /api/channels/edit-scheduled  edit a queued channel message's text/time
     POST /api/channels/poll  post a poll (``{"channel", "question", "options": [...]}``)
     POST /api/channels/vote  vote on a poll (``{"channel", "poll", "option"}``)
@@ -351,6 +351,7 @@ from .beacons import (
 from .blocklist import BlockList, BlockListError, load_blocked_set, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import (
+    ANNOUNCE_INTERVAL_MAX,
     ARCHIVED_FILE_NAME,
     AWAY_FILE_NAME,
     DISAPPEARING_FILE_NAME,
@@ -361,6 +362,7 @@ from .config import (
     PROFILE_FILE_NAME,
     QUIET_HOURS_FILE_NAME,
     accept_files_enabled,
+    announce_interval,
     send_read_receipts_enabled,
     set_node_setting,
     tan_sync_depth,
@@ -1547,17 +1549,22 @@ class WebBridge:
             "accept_files": accept_files_enabled(data_dir),
             "send_read_receipts": send_read_receipts_enabled(data_dir),
             "tan_sync_depth": tan_sync_depth(data_dir),
+            "announce_interval": announce_interval(data_dir),
         }
 
-    def update_setting(self, setting: str, value: Union[bool, int]) -> Dict[str, Any]:
+    def update_setting(
+        self, setting: str, value: Union[bool, int, float]
+    ) -> Dict[str, Any]:
         """Change one node setting and return the fresh settings.
 
         Only the keys ``tau config`` manages are accepted.  Boolean
         settings take a real boolean — anything else is a client
         error, not a value to coerce — and ``tan_sync_depth`` takes
         the integer 1 or 2 (a boolean is not an integer here, even
-        though Python subclasses it). The write keeps the other
-        settings (and the node's name) in place.
+        though Python subclasses it). ``announce_interval`` takes a
+        number of seconds, 0 or more (0 disables automatic
+        announces). The write keeps the other settings (and the
+        node's name) in place.
         """
         if setting == "tan_sync_depth":
             if (
@@ -1566,6 +1573,23 @@ class WebBridge:
                 or value not in (1, 2)
             ):
                 raise ValueError("setting 'tan_sync_depth' must be 1 or 2")
+        elif setting == "announce_interval":
+            error = ValueError(
+                "setting 'announce_interval' must be 0 or more seconds"
+            )
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise error
+            try:
+                value = float(value)
+            except OverflowError:
+                # An oversized JSON integer cannot be a valid interval.
+                raise error from None
+            if (
+                not math.isfinite(value)
+                or value < 0
+                or value > ANNOUNCE_INTERVAL_MAX
+            ):
+                raise error
         elif setting in ("accept_files", "send_read_receipts"):
             if not isinstance(value, bool):
                 raise ValueError(f"setting {setting!r} must be true or false")
@@ -4707,7 +4731,8 @@ class WebBridge:
         )
 
     def channel_schedule(
-        self, channel: str, text: str, *, send_in: float
+        self, channel: str, text: str, *, send_in: float,
+        poll_options: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Queue a channel message for later, like ``tau channel send --delay``.
 
@@ -4716,9 +4741,12 @@ class WebBridge:
         entries when it has an app.  Membership is checked up front so
         a message for a channel never joined is refused here, not on
         every publish pass.
+
+        With *poll_options* the entry is a poll instead: the text is
+        its question and the options ride alongside it.
         """
         from .channels import clean_channel_name, is_member
-        from .scheduled_channel import schedule_channel_message
+        from .scheduled_channel import schedule_channel_message, schedule_channel_poll
 
         name = clean_channel_name(channel)
         conn = self._channel_conn()
@@ -4729,12 +4757,24 @@ class WebBridge:
         if not member:
             raise ValueError(f"not a member of channel {name!r}; join it first")
         config = self.node.config
+        if poll_options is not None:
+            entry = schedule_channel_poll(
+                config.scheduled_channel_messages_path,
+                channel=name,
+                question=text,
+                options=poll_options,
+                publish_at=time.time() + float(send_in),
+                name=getattr(self.node, "name", None),
+                disappearing_path=config.disappearing_path,
+            )
+            return entry.to_dict()
         entry = schedule_channel_message(
             config.scheduled_channel_messages_path,
             channel=name,
             text=text,
             publish_at=time.time() + float(send_in),
             name=getattr(self.node, "name", None),
+            disappearing_path=config.disappearing_path,
         )
         return entry.to_dict()
 
@@ -9642,7 +9682,8 @@ class WebBridge:
         The console resolves a draft's conversation from its own lists,
         but a draft for a peer with no messages yet is in none of them,
         so the name is resolved here too: the peer's registry name, the
-        group name, or ``None`` when neither is known.  A dataless node
+        group name, the channel name itself (a channel draft is keyed
+        by its name), or ``None`` when neither is known.  A dataless node
         has no drafts file and answers empty instead of failing the
         console poll.
         """
@@ -9662,18 +9703,24 @@ class WebBridge:
         drafts = []
         for draft in store.list_drafts():
             entry = dict(draft)
-            entry["name"] = names.get(draft["target"])
+            if draft.get("kind") == "channel":
+                # A channel draft is keyed by the channel name, so the
+                # name is the target itself — no registry lookup applies.
+                entry["name"] = draft["target"]
+            else:
+                entry["name"] = names.get(draft["target"])
             drafts.append(entry)
         return {"drafts": drafts, "count": len(drafts)}
 
     def save_draft(self, *, kind: Any, target: Any, text: Any) -> Dict[str, Any]:
         """Save (or overwrite) the draft for one conversation.
 
-        *kind* is ``"peer"`` or ``"group"`` and *target* is the peer
-        destination hash or group id — the console passes the
-        conversation key straight through, so no name resolution runs
-        here.  A bad kind, target or text is a :class:`ValueError`; a
-        failed write and a dataless node are :class:`WebBridgeError`.
+        *kind* is ``"peer"``, ``"group"`` or ``"channel"`` and *target*
+        is the peer destination hash, group id, or channel name — the
+        console passes the conversation key straight through, so no
+        name resolution runs here.  A bad kind, target or text is a
+        :class:`ValueError`; a failed write and a dataless node are
+        :class:`WebBridgeError`.
         """
         path = self._drafts_path()
         if path is None:
@@ -15594,9 +15641,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                poll_options = body.get("poll_options")
+                if poll_options is not None:
+                    # A poll is a top-level entry: its options are fixed
+                    # at schedule time.
+                    if (
+                        not isinstance(poll_options, list)
+                        or not 2 <= len(poll_options) <= 8
+                        or any(
+                            not isinstance(option, str) or not option.strip()
+                            for option in poll_options
+                        )
+                    ):
+                        self._send_json(
+                            {
+                                "error": {
+                                    "message": "field 'poll_options' must be a list "
+                                    "of 2-8 non-empty strings"
+                                }
+                            },
+                            head_only,
+                            400,
+                        )
+                        return
                 try:
                     scheduled = self.bridge.channel_schedule(
-                        channel, text, send_in=float(send_in)
+                        channel, text, send_in=float(send_in),
+                        poll_options=poll_options,
                     )
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

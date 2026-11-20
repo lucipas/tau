@@ -7637,6 +7637,45 @@ def test_drafts_endpoints(node, tmp_path):
         bridge.stop()
 
 
+def test_drafts_channel_endpoint(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A channel draft is keyed by the channel name, and the list
+        # resolves its name to the target itself — no registry lookup.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts",
+            method="POST",
+            body={"kind": "channel", "target": "general", "text": "hello channel"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["draft"]["kind"] == "channel"
+        assert payload["draft"]["target"] == "general"
+        assert payload["draft"]["text"] == "hello channel"
+
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert status == 200
+        assert payload["count"] == 1
+        entry = payload["drafts"][0]
+        assert entry["kind"] == "channel"
+        assert entry["name"] == "general"
+
+        # Deleting a channel draft works the same as the other kinds.
+        status, _, payload = _json(
+            bridge,
+            "/api/drafts/delete",
+            method="POST",
+            body={"kind": "channel", "target": "general"},
+        )
+        assert status == 200
+        assert payload == {"ok": True, "deleted": True}
+        status, _, payload = _json(bridge, "/api/drafts")
+        assert payload == {"drafts": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
 def test_drafts_endpoints_reject_bad_input(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:
@@ -11853,6 +11892,7 @@ def test_settings_defaults(node, tmp_path):
             "accept_files": False,
             "send_read_receipts": True,
             "tan_sync_depth": 2,
+            "announce_interval": 300.0,
         }
         assert not (tmp_path / "node.json").exists()
     finally:
@@ -11875,6 +11915,7 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
                 "accept_files": True,
                 "send_read_receipts": True,
                 "tan_sync_depth": 2,
+                "announce_interval": 300.0,
             },
         }
 
@@ -11890,6 +11931,7 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 2,
+            "announce_interval": 300.0,
         }
 
         # The depth setting takes 1 or 2 and keeps the others too.
@@ -11904,12 +11946,14 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 1,
+            "announce_interval": 300.0,
         }
         status, _, payload = _json(bridge, "/api/settings")
         assert payload == {
             "accept_files": True,
             "send_read_receipts": False,
             "tan_sync_depth": 1,
+            "announce_interval": 300.0,
         }
         stored = json.loads(
             (tmp_path / "node.json").read_text(encoding="utf-8")
@@ -11917,6 +11961,41 @@ def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
         assert stored["accept_files"] is True
         assert stored["send_read_receipts"] is False
         assert stored["tan_sync_depth"] == 1
+    finally:
+        bridge.stop()
+
+
+def test_settings_announce_interval_update_and_disable(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A number of seconds persists and keeps the other settings.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "announce_interval", "value": 60},
+        )
+        assert status == 200
+        assert payload["settings"] == {
+            "accept_files": False,
+            "send_read_receipts": True,
+            "tan_sync_depth": 2,
+            "announce_interval": 60.0,
+        }
+
+        # 0 disables automatic announces.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "announce_interval", "value": 0},
+        )
+        assert status == 200
+        assert payload["settings"]["announce_interval"] == 0.0
+        stored = json.loads(
+            (tmp_path / "node.json").read_text(encoding="utf-8")
+        )
+        assert stored["announce_interval"] == 0.0
     finally:
         bridge.stop()
 
@@ -11935,6 +12014,26 @@ def test_settings_update_rejects_bad_input(node, tmp_path):
             ({"setting": "tan_sync_depth", "value": 0}, "must be 1 or 2"),
             ({"setting": "tan_sync_depth", "value": True}, "must be 1 or 2"),
             ({"setting": "tan_sync_depth", "value": "2"}, "must be 1 or 2"),
+            (
+                {"setting": "announce_interval", "value": -1},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": True},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": "60"},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": 10**400},
+                "must be 0 or more seconds",
+            ),
+            (
+                {"setting": "announce_interval", "value": 1e308},
+                "must be 0 or more seconds",
+            ),
         ]:
             status, _, payload = _json(
                 bridge, "/api/settings", method="POST", body=body
@@ -21819,6 +21918,61 @@ def test_channel_schedule_via_api(tmp_path):
         bridge.stop()
 
 
+def test_channel_schedule_poll_via_api(tmp_path):
+    from tau.channels import init_db as init_channel_db, join_channel
+    from tau.config import TauConfig
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_channel_db(node.config.channels_db_path)
+    try:
+        join_channel(conn, "general")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/schedule",
+            method="POST",
+            body={
+                "channel": "general",
+                "text": "which day?",
+                "send_in": 3600,
+                "poll_options": ["Saturday", "Sunday"],
+            },
+        )
+        assert status == 200
+        scheduled = payload["scheduled"]
+        assert scheduled["kind"] == "poll"
+        assert scheduled["text"] == "which day?"
+        assert scheduled["options"] == ["Saturday", "Sunday"]
+        assert abs(scheduled["publish_at"] - (time.time() + 3600)) < 5
+
+        # The scheduled list carries the poll alongside messages.
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["scheduled"][0]["kind"] == "poll"
+
+        # Cancelling a queued poll works like cancelling a message.
+        status, _, payload = _json(
+            bridge,
+            "/api/channels/cancel-scheduled",
+            method="POST",
+            body={"id": scheduled["id"][:8]},
+        )
+        assert status == 200
+        assert payload["cancelled"]["kind"] == "poll"
+        status, _, payload = _json(bridge, "/api/channels/scheduled")
+        assert payload["count"] == 0
+    finally:
+        bridge.stop()
+
+
 def test_channel_schedule_rejects_bad_requests(tmp_path):
     from tau.channels import init_db as init_channel_db, join_channel
     from tau.config import TauConfig
@@ -21842,6 +21996,42 @@ def test_channel_schedule_rejects_bad_requests(tmp_path):
             ({"channel": "general", "text": "hello", "send_in": 604801}, "send_in"),
             ({"channel": "  ", "text": "hello", "send_in": 60}, "channel"),
             ({"text": "hello", "send_in": 60}, "channel"),
+            (
+                {
+                    "channel": "general",
+                    "text": "which day?",
+                    "send_in": 60,
+                    "poll_options": ["only-one"],
+                },
+                "poll_options",
+            ),
+            (
+                {
+                    "channel": "general",
+                    "text": "which day?",
+                    "send_in": 60,
+                    "poll_options": ["a", "b", "c", "d", "e", "f", "g", "h", "i"],
+                },
+                "poll_options",
+            ),
+            (
+                {
+                    "channel": "general",
+                    "text": "which day?",
+                    "send_in": 60,
+                    "poll_options": ["Saturday", "  "],
+                },
+                "poll_options",
+            ),
+            (
+                {
+                    "channel": "general",
+                    "text": "which day?",
+                    "send_in": 60,
+                    "poll_options": "Saturday",
+                },
+                "poll_options",
+            ),
         ]:
             status, _, payload = _json(
                 bridge, "/api/channels/schedule", method="POST", body=body

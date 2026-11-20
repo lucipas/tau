@@ -41,7 +41,7 @@ export default function DraftsPanel({ drafts, loading = false, onOpen, onDelete 
                     className="min-w-0 flex-1 truncate text-left font-medium text-zinc-200 hover:text-cyan-300"
                     title={`Open draft for ${label}`}
                   >
-                    {draft.kind === "group" ? "# " : ""}
+                    {draft.kind === "group" || draft.kind === "channel" ? "# " : ""}
                     {label}
                   </button>
                   <span className="shrink-0 text-xs text-zinc-500">

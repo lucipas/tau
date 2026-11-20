@@ -60,8 +60,11 @@ from .bundle import (
     serialize_bundle,
 )
 from .config import (
+    ANNOUNCE_INTERVAL_DEFAULT,
+    ANNOUNCE_INTERVAL_MAX,
     TauConfig,
     accept_files_enabled,
+    announce_interval,
     load_node_name,
     parse_host_port,
     send_read_receipts_enabled,
@@ -236,6 +239,7 @@ from .scheduled_channel import (
     edit_scheduled_channel_message,
     load_scheduled_channel_messages,
     schedule_channel_message,
+    schedule_channel_poll,
 )
 from .scheduled_files import (
     ScheduledFile,
@@ -386,7 +390,7 @@ from .channels import (
 
 log = logging.getLogger(__name__)
 
-DEFAULT_ANNOUNCE_INTERVAL = 300.0
+DEFAULT_ANNOUNCE_INTERVAL = ANNOUNCE_INTERVAL_DEFAULT
 
 _EXIT_OK = 0
 _EXIT_ERROR = 1
@@ -511,9 +515,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--announce-interval",
         type=float,
-        default=DEFAULT_ANNOUNCE_INTERVAL,
+        default=None,
         metavar="SECONDS",
-        help="periodic announce interval (default: %(default)s, 0 disables)",
+        help="periodic announce interval in seconds (default: the saved "
+        "setting — see `tau config announce-interval` — 300 when unset; "
+        "0 disables automatic announces)",
     )
     serve.add_argument(
         "--no-announce",
@@ -738,6 +744,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    forward.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the forward: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
     )
     forward.set_defaults(func=cmd_forward)
 
@@ -1824,6 +1837,20 @@ def build_parser() -> argparse.ArgumentParser:
     config_depth.set_defaults(func=cmd_config)
     config_cmd.set_defaults(func=cmd_config)
 
+    config_announce = config_sub.add_parser(
+        "announce-interval",
+        parents=[common],
+        help="how often this node re-announces itself (seconds, 0 disables, default 300)",
+    )
+    config_announce.add_argument(
+        "seconds",
+        nargs="?",
+        type=_announce_interval_value,
+        help="re-announce every SECONDS seconds; 0 sends no automatic announces",
+    )
+    config_announce.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
     block = subparsers.add_parser(
         "block",
         parents=[common],
@@ -2746,6 +2773,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-queue",
         action="store_true",
         help="fail instead of queueing the poll when a member is offline",
+    )
+    group_poll.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
     )
     group_poll.set_defaults(func=cmd_group_poll)
 
@@ -4548,6 +4582,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="store locally without contacting peers",
     )
+    channel_poll.add_argument(
+        "--delay",
+        default=None,
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 7d) — needs a node "
+        "serving with --channels to publish it",
+    )
     channel_poll.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     channel_poll.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     channel_poll.set_defaults(func=cmd_channel_poll)
@@ -5024,7 +5066,10 @@ def _lookalike_map(
 
 
 def _make_config(
-    args: argparse.Namespace, *, announce_interval: float = DEFAULT_ANNOUNCE_INTERVAL
+    args: argparse.Namespace,
+    *,
+    announce_interval: float = DEFAULT_ANNOUNCE_INTERVAL,
+    announce_interval_live: bool = False,
 ) -> TauConfig:
     return TauConfig.resolve(
         data_dir=getattr(args, "data_dir", None),
@@ -5032,6 +5077,7 @@ def _make_config(
         name=getattr(args, "name", None),
         rns_loglevel=_rns_log_level(args),
         announce_interval=announce_interval,
+        announce_interval_live=announce_interval_live,
     )
 
 
@@ -9289,6 +9335,7 @@ def cmd_channel_send(args: argparse.Namespace) -> int:
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
                 name=config.name,
+                disappearing_path=config.disappearing_path,
             )
         except ScheduledChannelError as exc:
             raise NodeError(str(exc)) from exc
@@ -9750,9 +9797,9 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
         return _EXIT_OK
     if not entries:
         if channel_filter is not None:
-            print(f"No channel messages scheduled for #{channel_filter}.")
+            print(f"No channel messages or polls scheduled for #{channel_filter}.")
         else:
-            print("No channel messages scheduled.")
+            print("No channel messages or polls scheduled.")
         return _EXIT_OK
     now = time.time()
     for entry in entries:
@@ -9762,10 +9809,15 @@ def cmd_channel_scheduled(args: argparse.Namespace) -> int:
         else:
             when += f" (in {_ago(entry.publish_at - now)})"
         print(f"{entry.id}  #{entry.channel}  {when}")
+        if entry.kind == "poll":
+            print(f"  poll · {len(entry.options)} options")
         if entry.to:
             print(f"  to {', '.join(entry.to)}")
         for line in entry.text.splitlines() or [""]:
             print(f"  {line}")
+        if entry.kind == "poll":
+            for index, option in enumerate(entry.options, start=1):
+                print(f"    {index}. {option}")
     return _EXIT_OK
 
 
@@ -10024,6 +10076,58 @@ def cmd_channel_poll(args: argparse.Namespace) -> int:
     except ChannelError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_publish", False):
+            print(
+                "error: --delay cannot be combined with --no-publish — "
+                "a scheduled poll is published later, not stored only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            delay = _parse_duration(
+                delay_text,
+                flag="--delay",
+                max_seconds=MAX_SCHEDULED_CHANNEL_DELAY,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        # Refuse to queue for a channel we have not joined: the
+        # publish pass would fail every attempt the same way.
+        conn = init_channel_db(config.channels_db_path)
+        try:
+            member = is_channel_member(conn, name)
+        finally:
+            conn.close()
+        if not member:
+            print(
+                f"error: not a member of channel {name!r}; join it first",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            entry = schedule_channel_poll(
+                config.scheduled_channel_messages_path,
+                channel=name,
+                question=args.question,
+                options=options,
+                publish_at=time.time() + delay,
+                to=getattr(args, "to", None),
+                ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
+                disappearing_path=config.disappearing_path,
+            )
+        except ScheduledChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        if _json_mode(args):
+            _emit({"scheduled": entry.to_dict()}, True)
+        else:
+            print(f"scheduled {entry.id} — asks in {_ago(delay)}")
+            print("  list it with `tau channel scheduled`; a node serving")
+            print("  with --channels publishes it when the time comes.")
+        return _EXIT_OK
     try:
         result = _send_channel_poll_message(
             args, config, name, args.question, poll_options=options
@@ -10745,15 +10849,30 @@ def cmd_bundle_inspect(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _serve_announce_config(args: argparse.Namespace) -> TauConfig:
+    """Resolve the announce interval for `tau serve` (see #619).
+
+    An explicit --announce-interval pins the value for the run; with
+    no flag the saved setting applies, live — the announce loop
+    re-reads it each cycle.
+    """
+    flag_interval = getattr(args, "announce_interval", None)
+    if flag_interval is None:
+        probe = _make_config(args)
+        return _make_config(
+            args,
+            announce_interval=announce_interval(probe.data_dir),
+            announce_interval_live=True,
+        )
+    return _make_config(args, announce_interval=max(0.0, float(flag_interval)))
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     if getattr(args, "lxmf_propagation", False) and not getattr(
         args, "lxmf", False
     ):
         raise NodeError("--lxmf-propagation requires --lxmf")
-    interval = max(
-        0.0, float(getattr(args, "announce_interval", DEFAULT_ANNOUNCE_INTERVAL))
-    )
-    config = _make_config(args, announce_interval=interval)
+    config = _serve_announce_config(args)
 
     bridge = None
     web_settings = None
@@ -18244,12 +18363,16 @@ def _send_group_poll_message(
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
+    send_after: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Fan one group poll, vote, or close out, like ``cmd_group_send``.
 
-    Polls carry no expiry, schedule, quote, or wait — the same two
-    routes as a plain group send (the serving node, else a one-shot
-    local node) with the poll payload attached.
+    Polls carry no expiry, quote, or wait — the same two routes as a
+    plain group send (the serving node, else a one-shot local node)
+    with the poll payload attached.  ``send_after`` schedules a poll
+    the way it schedules a plain group message: the poll is queued
+    with a not-before time and publishes with its options intact once
+    the time arrives.
     """
     if _send_routes_via_running_node(config):
         return _send_group_via_running_node(
@@ -18257,7 +18380,7 @@ def _send_group_poll_message(
             config,
             text,
             expires_at=None,
-            send_after=None,
+            send_after=send_after,
             wait=0.0,
             poll_options=poll_options,
             poll_vote=poll_vote,
@@ -18268,7 +18391,7 @@ def _send_group_poll_message(
         config,
         text,
         expires_at=None,
-        send_after=None,
+        send_after=send_after,
         wait=0.0,
         poll_options=poll_options,
         poll_vote=poll_vote,
@@ -18293,9 +18416,19 @@ def _report_group_poll_send(
         if result.get("delivered"):
             print(f"delivered to {name}")
         elif result.get("queued"):
-            print(f"queued for {name} — they are unreachable right now")
+            if result.get("send_after"):
+                print(
+                    f"scheduled for {name}"
+                    f" — sends in {_ago(result['send_after'] - time.time())}"
+                )
+            else:
+                print(f"queued for {name} — they are unreachable right now")
         else:
             print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+    queued = [result for result in results if result.get("queued")]
+    if queued and all(result.get("send_after") for result in queued):
+        print("  it will be delivered at its scheduled time;")
+        print("  check `tau outbox` for the queue, or just leave a node serving")
     return _EXIT_ERROR if failed else _EXIT_OK
 
 
@@ -18546,6 +18679,15 @@ def cmd_close_poll(args: argparse.Namespace) -> int:
 
 
 def cmd_group_poll(args: argparse.Namespace) -> int:
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None and getattr(args, "no_queue", False):
+        # Reject the conflict before doing anything else, like
+        # ``cmd_group_send``: a scheduled poll is queued by definition.
+        print(
+            "error: --delay cannot be combined with --no-queue",
+            file=sys.stderr,
+        )
+        return 2
     config = _make_config(args)
     try:
         options = clean_poll_options(list(args.options))
@@ -18556,9 +18698,21 @@ def cmd_group_poll(args: argparse.Namespace) -> int:
     if group is None:
         print(f"error: unknown group: {args.group!r}", file=sys.stderr)
         return 2
+    send_after = None
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
     try:
         response = _send_group_poll_message(
-            args, config, args.question, poll_options=options
+            args, config, args.question, poll_options=options,
+            send_after=send_after,
         )
     except (NodeError, MailboxError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -18567,12 +18721,15 @@ def cmd_group_poll(args: argparse.Namespace) -> int:
     results = response.get("results") or []
     if results:
         poll_id = str(results[0].get("id") or "")
+    verb = "scheduled for" if send_after is not None else "posted to"
     summary = (
-        f"poll posted to {group['name']}"
+        f"poll {verb} {group['name']}"
         + (f" #{_safe_id_prefix(poll_id)}" if poll_id else "")
         + ": "
         + args.question
     )
+    if send_after is not None:
+        response["send_after"] = send_after
     return _report_group_poll_send(args, response, summary)
 
 
@@ -20596,6 +20753,25 @@ def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
         raise AllowListError(f"unknown peer or destination: {value!r}") from None
 
 
+def _announce_interval_value(text: str) -> float:
+    """Parse the `tau config announce-interval` argument (see #619)."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid announce interval: {text!r}"
+        ) from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            "announce interval must be 0 or more seconds"
+        )
+    if value > ANNOUNCE_INTERVAL_MAX:
+        raise argparse.ArgumentTypeError(
+            f"announce interval must be at most {ANNOUNCE_INTERVAL_MAX:g} seconds"
+        )
+    return value
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Show or change this node's own settings (stored in node.json)."""
     config = _make_config(args)
@@ -20651,23 +20827,58 @@ def cmd_config(args: argparse.Namespace) -> int:
                 print("  sync also pulls the authors they follow")
         return _EXIT_OK
 
+    if command == "announce-interval":
+        seconds_arg = getattr(args, "seconds", None)
+        if seconds_arg is None:
+            interval = announce_interval(config.data_dir)
+            if json_output:
+                _emit({"announce_interval": interval}, True)
+            else:
+                if interval == 0:
+                    print("Announce interval: off")
+                    print("  automatic announces are disabled")
+                else:
+                    print(f"Announce interval: {interval:g} seconds")
+                    print("  0 disables automatic announces (default 300)")
+            return _EXIT_OK
+        interval = float(seconds_arg)
+        set_node_setting(config.data_dir, "announce_interval", interval)
+        if json_output:
+            _emit({"announce_interval": interval}, True)
+        else:
+            if interval == 0:
+                print("Announce interval: off")
+                print("  this node announces only on startup (or when asked)")
+            else:
+                print(f"Announce interval: {interval:g} seconds")
+                print("  a running `tau serve` picks this up at its next cycle")
+        return _EXIT_OK
+
     settings = {
         "accept_files": accept_files_enabled(config.data_dir),
         "send_read_receipts": send_read_receipts_enabled(config.data_dir),
         "tan_sync_depth": tan_sync_depth(config.data_dir),
+        "announce_interval": announce_interval(config.data_dir),
     }
     if json_output:
         _emit(settings, True)
     else:
         accept_state = "on" if settings["accept_files"] else "off"
         receipts_state = "on" if settings["send_read_receipts"] else "off"
+        interval_state = (
+            "off"
+            if settings["announce_interval"] == 0
+            else f"{settings['announce_interval']:g} seconds"
+        )
         print(f"Settings ({config.data_dir / 'node.json'}):")
         print(f"  accept files: {accept_state}")
         print(f"  send read receipts: {receipts_state}")
         print(f"  tan sync depth: {settings['tan_sync_depth']}")
+        print(f"  announce interval: {interval_state}")
         print("  change with: tau config accept-files on|off")
         print("  change with: tau config read-receipts on|off")
         print("  change with: tau config tan-sync-depth 1|2")
+        print("  change with: tau config announce-interval <seconds>")
     return _EXIT_OK
 
 
