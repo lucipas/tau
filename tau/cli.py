@@ -3286,6 +3286,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     broadcast_send_file.set_defaults(func=cmd_broadcast_send_file)
 
+    broadcast_poll = broadcast_sub.add_parser(
+        "poll",
+        parents=[common],
+        help="post a poll to every member of a broadcast list, as a private DM poll each",
+    )
+    broadcast_poll.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_poll.add_argument(
+        "question", metavar="QUESTION", help="the poll question"
+    )
+    broadcast_poll.add_argument(
+        "options",
+        metavar="OPTION",
+        nargs="+",
+        help="2-8 distinct options",
+    )
+    broadcast_poll.add_argument(
+        "--timeout", type=float, default=20.0, metavar="SECONDS"
+    )
+    broadcast_poll.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the poll when a member is offline",
+    )
+    broadcast_poll.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the poll: queue it now and ask it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
+    broadcast_poll.set_defaults(func=cmd_broadcast_poll)
+
     tan = subparsers.add_parser(
         "tan",
         parents=[common],
@@ -19935,6 +19969,36 @@ def cmd_broadcast_send(args: argparse.Namespace) -> int:
     # `args.to`; hand it the list's members and let it own delivery,
     # queueing, and output.
     args.to = list(broadcast["members"])
+    return cmd_send(args)
+
+
+def cmd_broadcast_poll(args: argparse.Namespace) -> int:
+    """Post a poll to every member of a broadcast list, as a private DM poll each.
+
+    Delivery reuses :func:`cmd_send` wholesale, exactly like
+    :func:`cmd_broadcast_send`: each member gets their own DM poll,
+    with its own poll identity and tally in the sender's thread with
+    that member, so an offline member queues exactly like a one-to-one
+    DM poll and no list metadata ever reaches a recipient.  Votes come
+    back as ordinary DM poll votes; there is no cross-member tally.
+    """
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        broadcast = store.find(args.broadcast)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not broadcast["members"]:
+        # Unreachable through the store (it refuses empty lists), but
+        # a hand-edited broadcasts.json must not poll nobody silently.
+        raise NodeError(f"broadcast list {broadcast['name']!r} has no members")
+    # `cmd_send` reads its text from `args.message`, its targets from
+    # `args.to`, and its options from `args.poll_options`; hand it the
+    # list's members and let it own validation, delivery, queueing,
+    # scheduling, and output.
+    args.to = list(broadcast["members"])
+    args.message = args.question
+    args.poll_options = list(args.options)
     return cmd_send(args)
 
 
