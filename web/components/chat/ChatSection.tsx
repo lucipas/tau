@@ -10,6 +10,7 @@ import {
   clearReaction,
   closeDmPoll,
   closeGroupPoll,
+  createGroup,
   declineDmRequest,
   deleteDraft,
   deleteMessage,
@@ -48,6 +49,7 @@ import BroadcastsPanel from "./BroadcastsPanel";
 import ConversationList from "./ConversationList";
 import DraftsPanel from "./DraftsPanel";
 import MessageSearch from "./MessageSearch";
+import NewGroupPanel from "./NewGroupPanel";
 import OutboxPanel from "./OutboxPanel";
 import ThreadView from "./ThreadView";
 import type { MessageAction } from "./MessageBubble";
@@ -134,6 +136,7 @@ export default function ChatSection() {
   const [joinLink, setJoinLink] = useState("");
   const [joinBusy, setJoinBusy] = useState(false);
   const [joinResult, setJoinResult] = useState<string | null>(null);
+  const [showNewGroup, setShowNewGroup] = useState(false);
 
   const { conversations, archived: archivedConvs, dmRequests, refreshRequests } = useConversations(
     tau,
@@ -320,6 +323,18 @@ export default function ChatSection() {
     }
   }
 
+  async function handleCreateGroup(name: string, members: string[]) {
+    // The panel owns validation and shows API errors inline; this
+    // handler only closes the panel and opens the new thread. A
+    // refresh that fails must not strand the user: the group exists
+    // on the node either way, and the next snapshot picks it up.
+    const group = await createGroup(name, members);
+    setShowNewGroup(false);
+    await tau.refresh().catch(() => undefined);
+    navigate("chat", { group: group.id });
+    return group;
+  }
+
   const handleBack = useCallback(() => navigate("chat"), [navigate]);
 
   const handleOpenSearchResult = useCallback(
@@ -504,6 +519,17 @@ export default function ChatSection() {
           <div className="flex gap-2">
             <button
               type="button"
+              aria-expanded={showNewGroup}
+              onClick={() => {
+                setShowNewGroup((v) => !v);
+                setError(null);
+              }}
+              className="rounded-full border border-zinc-700 px-3 py-1 text-xs font-semibold text-zinc-200 hover:bg-zinc-900"
+            >
+              New group
+            </button>
+            <button
+              type="button"
               aria-expanded={showJoin}
               onClick={() => {
                 setShowJoin((v) => !v);
@@ -534,6 +560,9 @@ export default function ChatSection() {
             </button>
           </div>
         </header>
+        {showNewGroup && (
+          <NewGroupPanel peers={tau.peers} onCreate={handleCreateGroup} />
+        )}
         {showJoin && (
           <div className="border-b border-zinc-800 px-3 py-2">
             <label className="text-xs font-semibold text-zinc-400" htmlFor="join-group-link">

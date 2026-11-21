@@ -307,7 +307,11 @@ export async function getJoinRequests(): Promise<JoinRequest[]> {
 }
 
 export async function createGroup(name: string, members: string[]): Promise<Group> {
-  return post("/api/groups", { name, members });
+  // The bridge wraps the created group: POST /api/groups returns
+  // {ok: true, group: {...}}, so unwrap it — returning the raw
+  // payload would leave callers reading `.id` off the wrapper.
+  const data = await post<{ ok: boolean; group: Group }>("/api/groups", { name, members });
+  return data.group;
 }
 
 export async function deleteGroup(group: string): Promise<{ id: string; name: string }> {

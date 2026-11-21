@@ -8,6 +8,7 @@ import {
   cancelScheduledChannelMessage,
   clearReaction,
   createBroadcast,
+  createGroup,
   deleteBroadcast,
   closeChannelPoll,
   editScheduledChannelMessage,
@@ -820,6 +821,27 @@ describe("URL helpers", () => {
 });
 
 describe("group invite links", () => {
+  it("creates a group and unwraps the created group", async () => {
+    const group = {
+      id: "abc123",
+      name: "crew",
+      members: [],
+      created_at: 1,
+      topic: "",
+      created_by_me: true,
+      can_leave: true,
+      ignored: false,
+    };
+    nextJson = { ok: true, group };
+    const result = await createGroup("crew", ["a".repeat(32)]);
+    expect(captured[0].url).toBe("/api/groups");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ name: "crew", members: ["a".repeat(32)] });
+    // The bridge wraps the group in {ok, group}: the client must hand
+    // back the group itself, or a caller reading `.id` gets undefined.
+    expect(result).toEqual(group);
+  });
+
   it("fetches the invite status by group", async () => {
     nextJson = { group: {}, mode: "open", generation: 0, link: null };
     await getGroupInviteStatus("abc123");
