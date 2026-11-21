@@ -27,7 +27,7 @@ function renderPanel(
     peers: [makePeer({ destination: ALICE, name: "Alice" }), makePeer({ destination: BOB, name: "Bob" })],
     onCreate: vi.fn(async () => undefined),
     onDelete: vi.fn(async () => undefined),
-    onRename: vi.fn(async () => undefined),
+    onRename: vi.fn(async (_name: string, newName: string) => newName),
     onSend: vi.fn(async (): Promise<BroadcastSendResponse> => ({
       ok: true,
       name: "team",
@@ -41,8 +41,8 @@ function renderPanel(
     })),
     ...overrides,
   };
-  render(<BroadcastsPanel {...props} />);
-  return props;
+  const result = render(<BroadcastsPanel {...props} />);
+  return { ...props, ...result };
 }
 
 describe("BroadcastsPanel", () => {
@@ -158,6 +158,98 @@ describe("BroadcastsPanel", () => {
     fireEvent.click(screen.getByText("Save"));
     expect(props.onRename).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("Rename team")).toBeNull();
+  });
+
+  it("moves a half-typed draft to the name the server stored", async () => {
+    const props = renderPanel({
+      // The server normalises the requested name (repeated spaces
+      // collapse), so the draft must follow the stored name, not the
+      // typed one.
+      onRename: vi.fn(async () => "my team"),
+    });
+    fireEvent.change(screen.getByLabelText("Message team"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.change(screen.getByLabelText("Rename team"), {
+      target: { value: "my   team" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+    await vi.waitFor(() => {
+      expect(props.onRename).toHaveBeenCalledWith("team", "my   team");
+    });
+    // The refreshed list carries the stored name; the draft follows it.
+    props.rerender(
+      <BroadcastsPanel
+        broadcasts={[{ ...TEAM, name: "my team" }]}
+        peers={props.peers}
+        onCreate={props.onCreate}
+        onDelete={props.onDelete}
+        onRename={props.onRename}
+        onSend={props.onSend}
+      />,
+    );
+    expect(
+      (screen.getByLabelText("Message my team") as HTMLTextAreaElement).value,
+    ).toBe("hello");
+  });
+
+  it("keeps the draft and send result when the rename normalises back to the same name", async () => {
+    const props = renderPanel({
+      broadcasts: [{ ...TEAM, name: "my team" }],
+      // The requested name collapses back to the stored one, so the
+      // draft and result must stay put instead of being deleted.
+      onRename: vi.fn(async () => "my team"),
+    });
+    fireEvent.change(screen.getByLabelText("Message my team"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByText("Send to 2"));
+    await vi.waitFor(() => {
+      expect(screen.getByText("Alice: delivered")).toBeTruthy();
+    });
+    // A fresh draft after the send, then a no-op rename.
+    fireEvent.change(screen.getByLabelText("Message my team"), {
+      target: { value: "second draft" },
+    });
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.change(screen.getByLabelText("Rename my team"), {
+      target: { value: "my   team" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+    await vi.waitFor(() => {
+      expect(props.onRename).toHaveBeenCalledWith("my team", "my   team");
+    });
+    // The rename form closing means the post-rename render landed, so
+    // the draft and result below are the stable values, not a stale
+    // pre-rename render.
+    await vi.waitFor(() => {
+      expect(screen.queryByLabelText("Rename my team")).toBeNull();
+    });
+    expect(
+      (screen.getByLabelText("Message my team") as HTMLTextAreaElement).value,
+    ).toBe("second draft");
+    expect(screen.getByText("Alice: delivered")).toBeTruthy();
+  });
+
+  it("refuses to rename while a send is in flight", async () => {
+    const props = renderPanel({
+      onSend: vi.fn(() => new Promise<BroadcastSendResponse>(() => {})),
+    });
+    fireEvent.change(screen.getByLabelText("Message team"), {
+      target: { value: "hi" },
+    });
+    fireEvent.click(screen.getByText("Send to 2"));
+    await vi.waitFor(() => {
+      expect(screen.getByText("Sending…")).toBeTruthy();
+    });
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.change(screen.getByLabelText("Rename team"), {
+      target: { value: "squad" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+    expect(props.onRename).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert").textContent).toMatch(/Wait for the send/);
   });
 
   it("says so when there are no lists yet", () => {
