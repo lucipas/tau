@@ -373,6 +373,20 @@ def clean_queued_edit(raw: Any) -> Optional[Dict[str, Any]]:
         cleaned["target_sent_at"] = target_sent_at
     return cleaned
 
+def _raw_edit_id(raw: Any) -> Optional[str]:
+    """The edit id of a stored edit payload that failed validation.
+
+    ``clean_queued_edit`` drops the whole payload; the signed edit id
+    is still needed to tell which group edit the leg belongs to.
+    """
+    if not isinstance(raw, dict):
+        return None
+    edit_id = raw.get("edit_id")
+    if isinstance(edit_id, str) and edit_id:
+        return edit_id
+    return None
+
+
 def clean_queued_reaction(raw: Any) -> Optional[Dict[str, Any]]:
     """Validate one queued reaction, or ``None`` when it is unusable.
 
@@ -530,6 +544,10 @@ class OutboxEntry:
     # fields.  Shape: {"target", "text", "edit_id", "sent_at",
     # "target_author"?, "target_sent_at"?, "payload_b64"}.
     edit: Optional[Dict[str, Any]] = None
+    # Group-edit identity kept when the stored ``edit`` payload fails
+    # validation (``edit`` is then ``None``).  A corrupt leg still
+    # belongs to its edit, so aborting the edit can find its siblings.
+    edit_id_hint: Optional[str] = None
     # Queued-reaction context: when present, this entry is a reaction
     # to a DM or group message, not chat — a retry re-sends the same
     # pre-signed ``/tau/react`` bytes (see ``TauNode.send_reaction``),
@@ -544,6 +562,19 @@ class OutboxEntry:
     @property
     def to_hex(self) -> str:
         return self.to.hex()
+
+    @property
+    def group_edit_id(self) -> Optional[str]:
+        """The edit id this entry is a leg of, or ``None``.
+
+        Read from the validated ``edit`` payload, else from the id kept
+        for a corrupt payload.
+        """
+        if isinstance(self.edit, dict):
+            edit_id = self.edit.get("edit_id")
+            if isinstance(edit_id, str) and edit_id:
+                return edit_id
+        return self.edit_id_hint
 
     @property
     def wire_sent_at(self) -> float:
@@ -632,6 +663,10 @@ class OutboxEntry:
             payload["poll_close"] = dict(self.poll_close)
         if self.edit is not None:
             payload["edit"] = dict(self.edit)
+        elif self.edit_id_hint is not None:
+            # Keep the identity of a corrupt leg across a save, so a
+            # reload still knows which edit it belongs to.
+            payload["edit"] = {"edit_id": self.edit_id_hint}
         if self.reaction is not None:
             payload["reaction"] = dict(self.reaction)
         return payload
@@ -825,6 +860,7 @@ class OutboxEntry:
             poll_vote=poll_vote,
             poll_close=poll_close,
             edit=edit,
+            edit_id_hint=None if edit is not None else _raw_edit_id(raw.get("edit")),
             reaction=reaction,
         )
 
@@ -1903,9 +1939,7 @@ class Mailbox:
         return [
             entry.id
             for entry in self._outbox.values()
-            if entry.id != exclude
-            and isinstance(entry.edit, dict)
-            and entry.edit.get("edit_id") == edit_id
+            if entry.id != exclude and entry.group_edit_id == edit_id
         ]
 
     def remove_outbox(
@@ -1931,21 +1965,20 @@ class Mailbox:
                 return False
             del self._outbox[message_id]
             siblings: List[str] = []
-            if abort_group_edit and isinstance(entry.edit, dict):
-                edit_id = entry.edit.get("edit_id")
-                if isinstance(edit_id, str) and edit_id:
-                    siblings = self._group_edit_sibling_ids(
-                        edit_id, exclude=message_id
-                    )
-                    for sibling_id in siblings:
-                        del self._outbox[sibling_id]
+            edit_id = entry.group_edit_id
+            if abort_group_edit and edit_id is not None:
+                siblings = self._group_edit_sibling_ids(
+                    edit_id, exclude=message_id
+                )
+                for sibling_id in siblings:
+                    del self._outbox[sibling_id]
             self.save()
             if siblings:
                 log.info(
                     "Cancelled %d sibling leg(s) of queued group edit %s "
                     "with %s",
                     len(siblings),
-                    entry.edit.get("edit_id"),
+                    edit_id,
                     message_id,
                 )
             return True
@@ -3032,10 +3065,10 @@ class Mailbox:
             aborted = 0
             for key in list(dead_outbox):
                 entry = self._outbox.get(key)
-                if entry is None or not isinstance(entry.edit, dict):
+                if entry is None:
                     continue
-                edit_id = entry.edit.get("edit_id")
-                if not isinstance(edit_id, str) or not edit_id:
+                edit_id = entry.group_edit_id
+                if edit_id is None:
                     continue
                 for sibling_id in self._group_edit_sibling_ids(
                     edit_id, exclude=key
