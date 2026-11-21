@@ -6468,12 +6468,37 @@ class TauNode:
                         )
                 return True
         if not siblings:
-            self._record_sent_edit_locally(
+            local_errors = self._record_sent_edit_locally(
                 edit["target"],
                 edit["text"],
                 float(edit["sent_at"]),
                 peer_hex=entry.to_hex,
             )
+            if local_errors:
+                # The local apply failed (e.g. the inbox lock or reload
+                # failed), so the pending record must survive for a
+                # later flush to retry. Keep an existing record, or
+                # persist one for this confirmed edit. The insertion
+                # refuses an edit aborted since its legs went.
+                try:
+                    self.mailbox.add_pending_local_edit(
+                        {
+                            "edit_id": edit["edit_id"],
+                            "target": edit["target"],
+                            "text": edit["text"],
+                            "sent_at": float(edit["sent_at"]),
+                            "peer_hex": entry.to_hex,
+                        },
+                        timeout=_remaining(deadline) or 0.5,
+                    )
+                except (TimeoutError, MailboxError, OSError) as exc:
+                    log.warning(
+                        "Could not retain pending local edit %s after a "
+                        "failed local apply: %s",
+                        edit["edit_id"],
+                        exc,
+                    )
+                return True
             # The fan-out completed here, so a pending record left by
             # an earlier leg's timed-out check is satisfied: drop it
             # rather than letting a later round apply the same edit
