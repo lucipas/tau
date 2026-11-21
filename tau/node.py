@@ -6011,7 +6011,12 @@ class TauNode:
                 edited_at=edited_at,
                 newer_than_existing=True,
             )
-        except InboxError as exc:
+        except (InboxError, OSError) as exc:
+            # apply_edit turns a failed persist into InboxError, but
+            # the inbox transaction itself can still raise OSError —
+            # a lock file that cannot be opened, a reload that cannot
+            # read — and that is a local failure too, not a reason
+            # for the caller to lose the edit: report it the same way.
             log.warning("Could not record sent edit: %s", exc)
             local_errors.append(f"inbox copy not updated: {exc}")
         for leg_id in leg_ids:
@@ -6095,6 +6100,20 @@ class TauNode:
             self.mailbox.drop_pending_local_edit(edit_id)
             return dict(record)
 
+    def _is_terminal_local_edit(self, target: str) -> bool:
+        """True when a deferred local apply can never succeed.
+
+        A file record carries no text, so an edit naming one fails
+        on every round.  A target that no longer resolves is not
+        terminal here: its apply reports no error (nothing to
+        update), so the record is dropped by the caller already.
+        """
+        try:
+            record = self.inbox.resolve(target)
+        except ValueError:
+            return False
+        return record.get("kind") == "file"
+
     def _retry_pending_local_edits(
         self, *, deadline: Optional[float] = None
     ) -> None:
@@ -6110,9 +6129,13 @@ class TauNode:
         finds nothing and it never applies here.  A local apply
         that reports errors keeps its record for a later round
         instead of dropping it: the edited-time guards make a
-        re-apply of the copies that did update safe.  A lock that
-        stays busy past the deadline leaves the records for a later
-        round.
+        re-apply of the copies that did update safe.  An OSError
+        escaping the apply is treated the same way — the record is
+        restored, never lost with the claim.  An apply that can
+        never succeed (its target is a file record, which carries
+        no text) is dropped instead of restored, so it cannot
+        retry forever.  A lock that stays busy past the deadline
+        leaves the records for a later round.
         """
         for pending in self.mailbox.pending_local_edits():
             if _past(deadline):
@@ -6134,21 +6157,36 @@ class TauNode:
             peer_hex = claimed.get("peer_hex")
             if (
                 not isinstance(target, str)
+                or not target
                 or not isinstance(text, str)
+                or not text
                 or not isinstance(sent_at, (int, float))
                 or not isinstance(peer_hex, str)
+                or not peer_hex
             ):
                 log.warning(
                     "Dropping malformed deferred local apply for edit %s",
                     edit_id,
                 )
                 continue
-            errors = self._record_sent_edit_locally(
-                target,
-                text,
-                float(sent_at),
-                peer_hex=peer_hex,
-            )
+            try:
+                errors = self._record_sent_edit_locally(
+                    target,
+                    text,
+                    float(sent_at),
+                    peer_hex=peer_hex,
+                )
+            except OSError as exc:
+                # A disk failure escaping the local apply (e.g. the
+                # inbox lock file could not be opened) must not lose
+                # the retry: the claimed record is already dropped,
+                # so report it as a failed apply and restore it below.
+                log.warning(
+                    "Deferred local apply for edit %s failed: %s",
+                    edit_id,
+                    exc,
+                )
+                errors = [f"local apply failed: {exc}"]
             if not errors:
                 continue
             log.warning(
@@ -6156,6 +6194,18 @@ class TauNode:
                 edit_id,
                 "; ".join(errors),
             )
+            if self._is_terminal_local_edit(target):
+                # The target can never take the new text — a file
+                # record has none — so restoring the record would
+                # retry the same failure on every flush.  Drop it
+                # instead: the fan-out completed, and the local
+                # copies simply keep the file as it was.
+                log.warning(
+                    "Dropping deferred local apply for edit %s: its "
+                    "target can no longer take an edit",
+                    edit_id,
+                )
+                continue
             # The apply failed, so the record goes back for a later
             # round — unless the edit was aborted since the claim,
             # in which case the insertion refuses it.
