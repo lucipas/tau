@@ -5758,32 +5758,38 @@ class TauNode:
         """
         cancelled: List[str] = []
         cancelled_edit_ids: Set[str] = set()
-        for entry in self.mailbox.outbox_list():
-            edit = getattr(entry, "edit", None)
-            if not isinstance(edit, dict):
-                continue
-            if edit.get("target") != target_id:
-                continue
-            if (
-                exclude_edit_id is not None
-                and edit.get("edit_id") == exclude_edit_id
-            ):
-                continue
-            if group_id is None:
-                if entry.group_id is not None:
+        # The leg removals and the abort share one transaction: a
+        # flush claiming a deferred apply must never observe the
+        # legs gone while the record is still eligible — that
+        # intermediate state would apply an edit that did not reach
+        # every member.
+        with self.mailbox.transaction():
+            for entry in self.mailbox.outbox_list():
+                edit = getattr(entry, "edit", None)
+                if not isinstance(edit, dict):
                     continue
-            elif entry.group_id != group_id:
-                continue
-            if self.mailbox.remove_outbox(entry.id):
-                cancelled.append(entry.id)
-                if isinstance(edit.get("edit_id"), str):
-                    cancelled_edit_ids.add(edit["edit_id"])
-        # A superseded edit is aborted: a deferred local apply for
-        # it must never land — the newer edit owns the local copy now.
-        # Marking it aborted also refuses a record inserted
-        # afterwards for the same edit.
-        for cancelled_edit_id in cancelled_edit_ids:
-            self.mailbox.abort_pending_local_edit(cancelled_edit_id)
+                if edit.get("target") != target_id:
+                    continue
+                if (
+                    exclude_edit_id is not None
+                    and edit.get("edit_id") == exclude_edit_id
+                ):
+                    continue
+                if group_id is None:
+                    if entry.group_id is not None:
+                        continue
+                elif entry.group_id != group_id:
+                    continue
+                if self.mailbox.remove_outbox(entry.id):
+                    cancelled.append(entry.id)
+                    if isinstance(edit.get("edit_id"), str):
+                        cancelled_edit_ids.add(edit["edit_id"])
+            # A superseded edit is aborted: a deferred local apply for
+            # it must never land — the newer edit owns the local copy
+            # now.  Marking it aborted also refuses a record inserted
+            # afterwards for the same edit.
+            for cancelled_edit_id in cancelled_edit_ids:
+                self.mailbox.abort_pending_local_edit(cancelled_edit_id)
         return cancelled
 
     def _queued_edit_siblings(
@@ -11239,12 +11245,18 @@ class TauNode:
             or result.get("deferred")
         }
         if any(member not in covered for member in members):
-            for sibling in self._queued_edit_siblings(edit_id):
-                self._drop_queued_edit(sibling)
-            # The edit is aborted: a deferred local apply for it
-            # must never land — and a record inserted afterwards for
-            # the same edit is refused.
-            self.mailbox.abort_pending_local_edit(edit_id)
+            # The sibling drops and the abort share one transaction:
+            # a flush claiming a deferred apply must never observe
+            # the legs gone while the record is still eligible —
+            # that intermediate state would apply an edit that did
+            # not reach every member.
+            with self.mailbox.transaction():
+                for sibling in self._queued_edit_siblings(edit_id):
+                    self._drop_queued_edit(sibling)
+                # The edit is aborted: a deferred local apply for it
+                # must never land — and a record inserted afterwards for
+                # the same edit is refused.
+                self.mailbox.abort_pending_local_edit(edit_id)
             for result in results:
                 if result.get("queued"):
                     result["queued"] = False

@@ -4107,6 +4107,147 @@ def test_second_group_leg_clears_deferred_local_apply(
     assert node.mailbox.pending_local_edits() == []
 
 
+def test_supersede_cancellation_and_claim_cannot_interleave(
+    tmp_path, monkeypatch
+):
+    # A deferred apply exists for a queued group edit.  Superseding
+    # it cancels the legs and marks the edit aborted; a flush
+    # claiming the deferred apply at the same time must not observe
+    # the legs gone while the record is still eligible.
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    edit_id = entries[0].edit["edit_id"]
+    node.mailbox.add_pending_local_edit(
+        {
+            "edit_id": edit_id,
+            "target": "leg-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": "ab" * 16,
+        }
+    )
+    real_abort = node.mailbox.abort_pending_local_edit
+    arrived = threading.Event()
+    go = threading.Event()
+
+    def pausing_abort(edit_id_arg, *, now=None, timeout=None):
+        arrived.set()
+        assert go.wait(timeout=5)
+        return real_abort(edit_id_arg, now=now, timeout=timeout)
+
+    monkeypatch.setattr(node.mailbox, "abort_pending_local_edit", pausing_abort)
+    results = {}
+
+    def cancel():
+        results["cancelled"] = node._cancel_queued_edits(
+            "leg-1", group_id=group["id"]
+        )
+
+    cancel_thread = threading.Thread(target=cancel)
+    cancel_thread.start()
+    assert arrived.wait(timeout=5)
+
+    def claim():
+        results["claimed"] = node._claim_pending_local_edit(edit_id)
+
+    claim_thread = threading.Thread(target=claim)
+    claim_thread.start()
+    time.sleep(0.2)
+    go.set()
+    cancel_thread.join(timeout=5)
+    claim_thread.join(timeout=5)
+    assert not cancel_thread.is_alive()
+    assert not claim_thread.is_alive()
+    assert len(results["cancelled"]) == 2
+    # The cancellation removed the legs and marked the edit aborted
+    # in one transaction: the concurrent claim could not observe
+    # legs-gone with the record still eligible.
+    assert results["claimed"] is None
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_live_send_abort_and_claim_cannot_interleave(
+    tmp_path, monkeypatch
+):
+    # A live group edit aborts when a member refuses it: the queued
+    # legs for the other members are dropped and the edit marked
+    # aborted.  A flush claiming a deferred apply at the same time
+    # must not observe the legs gone while the record is still
+    # eligible.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1", "leg-2"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    monkeypatch.setattr(
+        "tau.node.generate_message_id", lambda: "edit-t13"
+    )
+    node.mailbox.add_pending_local_edit(
+        {
+            "edit_id": "edit-t13",
+            "target": "leg-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": "ab" * 16,
+        }
+    )
+
+    def route(peer, path, payload, timeout, deadline=None):
+        if peer.destination_hash == alice.destination_hash:
+            raise NodeError("no route to peer")
+        raise NotAMemberError("peer rejected the request: not a member")
+
+    monkeypatch.setattr(node, "_request", route)
+    real_abort = node.mailbox.abort_pending_local_edit
+    arrived = threading.Event()
+    go = threading.Event()
+
+    def pausing_abort(edit_id_arg, *, now=None, timeout=None):
+        if edit_id_arg == "edit-t13":
+            arrived.set()
+            assert go.wait(timeout=5)
+        return real_abort(edit_id_arg, now=now, timeout=timeout)
+
+    monkeypatch.setattr(node.mailbox, "abort_pending_local_edit", pausing_abort)
+    results = {}
+
+    def send():
+        results["response"] = node.send_group_edit(
+            "crew", "leg-1", "fixed here", target_sent_at=100.0
+        )
+
+    send_thread = threading.Thread(target=send)
+    send_thread.start()
+    assert arrived.wait(timeout=5)
+
+    def claim():
+        results["claimed"] = node._claim_pending_local_edit("edit-t13")
+
+    claim_thread = threading.Thread(target=claim)
+    claim_thread.start()
+    time.sleep(0.2)
+    go.set()
+    send_thread.join(timeout=5)
+    claim_thread.join(timeout=5)
+    assert not send_thread.is_alive()
+    assert not claim_thread.is_alive()
+    assert results["claimed"] is None
+    assert node.mailbox.pending_local_edits() == []
+    assert node.mailbox.outbox_list() == []
+
+
 def test_send_group_edit_aborts_queued_legs_when_a_member_refuses(
     tmp_path, monkeypatch
 ):
