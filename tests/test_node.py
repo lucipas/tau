@@ -3064,6 +3064,364 @@ def test_send_group_edit_needs_the_shared_send_time(tmp_path):
         node.send_group_edit("crew", "leg-1", "fixed here")
 
 
+def _edit_node(tmp_path):
+    """A node with a signing identity, started enough to queue."""
+    import types
+
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    node.identity = identity
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    node.destination = types.SimpleNamespace(hexhash=own_hash)
+    node.reticulum = object()  # started enough to queue
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    return node, peer
+
+
+def _seed_sent_dm(node, peer, message_id="m-1", text="typo here"):
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": text,
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": message_id,
+            "direction": "out",
+        }
+    )
+    node.mailbox.record_sent(message_id, to=peer.destination_hash, text=text)
+
+
+def test_send_edit_queues_for_offline_peer(tmp_path, monkeypatch):
+    from tau.protocol import REQUEST_DM_EDIT, parse_edit
+
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_edit("alice", "m-1", "fixed here")
+
+    assert response["queued"] is True
+    assert response["id"]
+    assert response["target"] == "m-1"
+    # The local copy updates on delivery, not at queue time.
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "edit"
+    assert entry.to == peer.destination_hash
+    assert entry.edit["target"] == "m-1"
+    assert entry.edit["text"] == "fixed here"
+    assert entry.edit["edit_id"] == response["id"]
+    # The retry re-sends the identical signed bytes.
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        sent["payload"] = payload
+        assert path == REQUEST_DM_EDIT
+        return {"ok": True, "edited": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(peer, entry, 1.0) is True
+    import base64
+
+    assert sent["payload"] == base64.b64decode(
+        entry.edit["payload_b64"], validate=True
+    )
+    payload = parse_edit(sent["payload"])
+    assert payload["target"] == "m-1"
+    assert payload["text"] == "fixed here"
+    assert payload["id"] == response["id"]
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "fixed here"
+    assert node.inbox.resolve("m-1")["edited_at"] == payload["sent_at"]
+    assert node.mailbox.sent_record("m-1")["text"] == "fixed here"
+
+
+def test_send_edit_no_queue_raises_for_offline_peer(tmp_path, monkeypatch):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    with pytest.raises(NodeError, match="no route to peer"):
+        node.send_edit("alice", "m-1", "fixed here", queue=False)
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
+def test_send_edit_refusal_is_not_queued(tmp_path, monkeypatch):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def denied(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", denied)
+    with pytest.raises(NotAllowedError):
+        node.send_edit("alice", "m-1", "fixed here")
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
+def test_send_edit_supersedes_older_queued_edit(tmp_path, monkeypatch):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    first = node.send_edit("alice", "m-1", "first fix")
+    second = node.send_edit("alice", "m-1", "second fix")
+
+    # Only the newer edit waits in the outbox.
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 1
+    assert entries[0].edit["edit_id"] == second["id"]
+    assert entries[0].edit["edit_id"] != first["id"]
+    assert entries[0].edit["text"] == "second fix"
+
+
+def test_send_group_edit_queues_unreachable_legs(tmp_path, monkeypatch):
+    from tau.protocol import REQUEST_DM_EDIT, parse_edit
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1", "leg-2"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent("leg-1", to=alice.destination_hash, text="typo here")
+    node.mailbox.record_sent("leg-2", to=bob.destination_hash, text="typo here")
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NodeError("no route to peer")
+        return {"ok": True, "edited": True, "group_edit": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+
+    assert response["ok"] is False
+    assert response["queued"] == 1
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    assert by_to[bob.hexhash].get("queued") is True
+    assert by_to[bob.hexhash].get("queued_id")
+    # The local copy waits for a full fan-out: one leg still queued.
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "edit"
+    assert entry.group_id == group["id"]
+    assert entry.to == bob.destination_hash
+    assert entry.edit["edit_id"] == response["id"]
+    assert entry.edit["target_author"] is not None
+    assert entry.edit["target_sent_at"] == 100.0
+    # The sweep delivers it with the same signed bytes, and the local
+    # copies update now that the fan-out is complete.
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        sent["payload"] = payload
+        assert path == REQUEST_DM_EDIT
+        return {"ok": True, "edited": True, "group_edit": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(bob, entry, 1.0) is True
+    assert parse_edit(sent["payload"])["id"] == response["id"]
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("leg-1")["text"] == "fixed here"
+    assert node.mailbox.sent_record("leg-1")["text"] == "fixed here"
+    assert node.mailbox.sent_record("leg-2")["text"] == "fixed here"
+
+
+def test_send_group_edit_no_queue_reports_failed_leg(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NodeError("no route to peer")
+        return {"ok": True, "edited": True, "group_edit": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0, queue=False
+    )
+
+    assert response["ok"] is False
+    assert response["queued"] == 0
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[bob.hexhash].get("error")
+    assert node.mailbox.outbox_list() == []
+
+
+def test_deliver_queued_edit_drops_refused_leg(tmp_path, monkeypatch):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+
+    def refused(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", refused)
+    assert node._deliver_entry(peer, entry, 1.0) is False
+    # A refusal is final: the leg is dropped, not held until its TTL.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
+def test_deliver_queued_edit_keeps_local_copy_when_peer_has_no_copy(
+    tmp_path, monkeypatch
+):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+
+    def no_copy(peer_arg, path, payload, timeout, deadline=None):
+        return {"ok": True, "edited": False, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", no_copy)
+    assert node._deliver_entry(peer, entry, 1.0) is False
+    # The peer had no copy: the leg is dropped and the local copy
+    # keeps the old text, exactly as on the live path.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
+def test_deliver_queued_edit_drops_unusable_payload(tmp_path, monkeypatch):
+    import json
+
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("an unusable edit must never be sent")
+
+    monkeypatch.setattr(node, "_request", boom)
+    path = node.mailbox.path
+    raw = json.loads(path.read_text())
+    raw["outbox"][0]["edit"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+    # A fresh read drops the corrupt payload but keeps kind "edit".
+    entry = Mailbox(path).outbox_list()[0]
+    assert entry.kind == "edit"
+    assert entry.edit is None
+    # The delivery path re-reads the entry from disk too, so the stale
+    # in-memory copy above never reaches the wire either.
+    stale = node.mailbox.outbox_list()[0]
+
+    assert node._deliver_entry(peer, stale, 1.0) is False
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
+def test_queued_edit_is_never_deposited(tmp_path, monkeypatch):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+    # No sealed copy is ever left with a holder for an edit.
+    assert node._deposit_entry(peer, entry, 1.0) is False
+    assert len(node.mailbox.outbox_list()) == 1
+
+
+def test_deliver_queued_group_edit_cancels_siblings_on_refusal(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1", "leg-2"],
+            "leg_sent_at": 100.0,
+        }
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+    assert response["queued"] == 2
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 2
+    assert entries[0].edit["edit_id"] == entries[1].edit["edit_id"]
+
+    def refused(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", refused)
+    assert node._deliver_entry(alice, entries[0], 1.0) is False
+    # The refusal kills the whole edit: the sibling leg goes with it,
+    # since the fan-out can no longer complete — and the local copy
+    # keeps the old text.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+
+
 def test_send_group_message_records_leg_sent_at(tmp_path, monkeypatch):
     node, _, _, _ = _group_reaction_node(tmp_path)
 

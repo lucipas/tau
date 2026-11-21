@@ -466,6 +466,15 @@ class NotAMemberError(NodeError):
     """
 
 
+class PeerRejectedError(NodeError):
+    """Raised when a peer answers a request with an explicit error code.
+
+    The peer received the request and rejected it (for example an
+    invalid edit or a storage failure), which is not a transport
+    failure: such a rejection must not be queued for retry.
+    """
+
+
 class DeliveryDeferredError(NodeError):
     """A relayed delivery failed transiently and must be retried later.
 
@@ -5723,6 +5732,341 @@ class TauNode:
             return ""
         return ""
 
+    def _cancel_queued_edits(
+        self,
+        target_id: str,
+        *,
+        group_id: Optional[str] = None,
+        exclude_edit_id: Optional[str] = None,
+    ) -> List[str]:
+        """Cancel still-queued edits of *target_id*; returns cancelled ids.
+
+        A newer edit supersedes a still-queued one for the same
+        message: the older edit's legs are dropped so the sweep never
+        spends sends on text the editor has already replaced.  The
+        receiver's newer-than-existing guard would order them anyway;
+        this just avoids the extra legs.  Group-scoped when *group_id*
+        is given, so a DM edit never cancels a group edit of a
+        different copy.  Legs of the edit named by *exclude_edit_id*
+        are never cancelled: a group fan-out queues one leg per
+        member, and a later leg must not drop the legs queued before
+        it for the same edit.
+        """
+        cancelled: List[str] = []
+        for entry in self.mailbox.outbox_list():
+            edit = getattr(entry, "edit", None)
+            if not isinstance(edit, dict):
+                continue
+            if edit.get("target") != target_id:
+                continue
+            if (
+                exclude_edit_id is not None
+                and edit.get("edit_id") == exclude_edit_id
+            ):
+                continue
+            if group_id is None:
+                if entry.group_id is not None:
+                    continue
+            elif entry.group_id != group_id:
+                continue
+            if self.mailbox.remove_outbox(entry.id):
+                cancelled.append(entry.id)
+        return cancelled
+
+    def _queued_edit_siblings(
+        self, edit_id: str, *, exclude: Optional[str] = None
+    ) -> List[Any]:
+        """Still-queued entries carrying the same edit id.
+
+        Group-edit legs share one edit id, so the siblings of a leg
+        are the other members' legs for the same edit.  A DM edit has
+        no siblings: one peer, one leg.
+        """
+        siblings: List[Any] = []
+        for candidate in self.mailbox.outbox_list():
+            if exclude is not None and candidate.id == exclude:
+                continue
+            other = getattr(candidate, "edit", None)
+            if isinstance(other, dict) and other.get("edit_id") == edit_id:
+                siblings.append(candidate)
+        return siblings
+
+    def _drop_queued_edit(
+        self, entry: Any, *, deadline: Optional[float] = None
+    ) -> None:
+        """Drop a queued edit leg that can never deliver.
+
+        A corrupt stored payload, a refusal, or a member running a
+        version without group edits: the leg leaves the outbox now
+        instead of lingering until its TTL.  A mailbox lock that stays
+        busy leaves the leg for a later round.
+        """
+        try:
+            self._remove_queued_version(
+                entry.id,
+                text=entry.text,
+                edited_at=getattr(entry, "edited_at", None),
+                timeout=_remaining(deadline),
+            )
+        except TimeoutError:
+            log.debug(
+                "Could not drop queued edit %s: mailbox lock busy; "
+                "leaving it for a later round",
+                entry.id,
+            )
+
+    def _drop_queued_edit_siblings(
+        self,
+        edit_id: str,
+        *,
+        exclude: Optional[str] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
+        """Drop the still-queued sibling legs of one group edit.
+
+        A refusal of one leg is final for the whole fan-out: the edit
+        can no longer complete, so the other members' legs go with it
+        instead of lingering until their TTL.  Each drop is
+        deadline-bounded and tolerates a busy mailbox lock, like
+        :meth:`_drop_queued_edit`.
+        """
+        for sibling in self._queued_edit_siblings(edit_id, exclude=exclude):
+            self._drop_queued_edit(sibling, deadline=deadline)
+
+    def _record_sent_edit_locally(
+        self,
+        target_id: str,
+        cleaned: str,
+        edited_at: float,
+        *,
+        peer_hex: str,
+    ) -> List[str]:
+        """Apply a sent edit to this node's own copies; returns local errors.
+
+        Mirrors the live paths in :meth:`send_edit` /
+        :meth:`send_group_edit`: the inbox record and every leg's sent
+        record take the new text, guarded so an older edit never
+        rewinds a newer one.  A serving console learns through the
+        same ``on_edit`` callback an inbound edit uses — one record per
+        leg, keyed by that leg's wire id and recipient, exactly as the
+        console's own group-edit path records them.  Nothing is
+        published when the local copies did not update: the console
+        must not show new text the node itself does not hold.
+        """
+        local_errors: List[str] = []
+        try:
+            record = self.inbox.resolve(target_id)
+        except ValueError:
+            record = None
+        leg_ids: List[str] = []
+        if record is not None:
+            leg_ids = list(record.get("leg_ids") or [])
+        if not leg_ids:
+            leg_ids = [target_id]
+        try:
+            self.inbox.apply_edit(
+                target_id,
+                cleaned,
+                edited_at=edited_at,
+                newer_than_existing=True,
+            )
+        except InboxError as exc:
+            log.warning("Could not record sent edit: %s", exc)
+            local_errors.append(f"inbox copy not updated: {exc}")
+        for leg_id in leg_ids:
+            try:
+                self.mailbox.update_sent_text(
+                    str(leg_id), cleaned, edited_at=edited_at
+                )
+            except (MailboxError, OSError) as exc:
+                log.warning("Could not update sent edit: %s", exc)
+                local_errors.append(f"sent copy not updated: {exc}")
+        if local_errors or self.on_edit is None:
+            return local_errors
+        # The recipient of each leg comes from its sent record; a DM
+        # leg names its peer directly, and a group leg whose sent
+        # record is gone (pruned) has no console entry to update.
+        sent_to: Dict[str, str] = {}
+        try:
+            for sent in self.mailbox.sent_list():
+                if sent.get("id") in leg_ids and isinstance(
+                    sent.get("to"), str
+                ):
+                    sent_to[sent["id"]] = sent["to"]
+        except Exception:
+            log.debug(
+                "Could not read sent records for edit publish",
+                exc_info=True,
+            )
+        for leg_id in leg_ids:
+            destination = sent_to.get(leg_id)
+            if destination is None:
+                if len(leg_ids) == 1 and peer_hex:
+                    destination = peer_hex
+                else:
+                    continue
+            try:
+                self.on_edit(
+                    {
+                        "target": leg_id,
+                        "text": cleaned,
+                        "edited_at": edited_at,
+                        "direction": "out",
+                        "destination": destination,
+                    }
+                )
+            except Exception:  # pragma: no cover - console callback
+                log.warning("on_edit callback failed", exc_info=True)
+        return local_errors
+
+    def _deliver_queued_edit(
+        self,
+        peer: Peer,
+        entry: Any,
+        timeout: float,
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
+        """Deliver one queued edit leg; True only on confirmation.
+
+        The retry re-sends the exact bytes signed when the edit was
+        first attempted — the same edit id and signed send time — so a
+        late or repeated delivery is indistinguishable from a live one
+        and the receiver dedupes it by id.  The sender's own copies
+        update here, on delivery, so they only ever show an edit that
+        landed — and for a group edit only when this was the last
+        queued leg for it, so the live path's full-fan-out rule still
+        holds.  A serving console learns through the same ``on_edit``
+        callback an inbound edit uses.
+
+        An explicit refusal is final: the leg is dropped instead of
+        held until its TTL, exactly like a refused queued message —
+        and for a group edit its sibling legs go with it, since the
+        edit can no longer complete the fan-out the live path would
+        have refused.  A member running a version without group edits
+        is the same kind of permanent failure.  A transport failure
+        records an attempt and leaves the leg queued for the next
+        sweep.  Edits ride direct delivery only — there is no LXMF or
+        sealed-relay path for them in v1.
+        """
+        edit = getattr(entry, "edit", None)
+        if not isinstance(edit, dict):
+            # Kind "edit" but the payload did not survive storage: it
+            # can never deliver, and it must never fall through to the
+            # text path and send the replacement as chat.
+            log.error(
+                "Dropping queued edit %s: stored payload is unusable",
+                entry.id,
+            )
+            self._drop_queued_edit(entry, deadline=deadline)
+            return False
+        try:
+            payload_bytes = base64.b64decode(edit["payload_b64"], validate=True)
+        except Exception:
+            log.error(
+                "Dropping queued edit %s: stored payload is not valid base64",
+                entry.id,
+            )
+            self._drop_queued_edit(entry, deadline=deadline)
+            return False
+        try:
+            response = self._request(
+                peer, REQUEST_DM_EDIT, payload_bytes, timeout, deadline=deadline
+            )
+        except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
+            # A refusal or rejection is final: the peer will not take
+            # this edit, so stop retrying rather than holding the leg
+            # until its TTL.
+            log.warning("Dropping queued edit %s: %s", entry.id, exc)
+            self._drop_queued_edit(entry, deadline=deadline)
+            if entry.group_id is not None:
+                self._drop_queued_edit_siblings(
+                    edit["edit_id"], exclude=entry.id, deadline=deadline
+                )
+            return False
+        except NodeError as exc:
+            try:
+                self.mailbox.record_attempt(
+                    entry.id, error=str(exc), timeout=_remaining(deadline)
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not record failed delivery attempt for %s: "
+                    "mailbox lock busy",
+                    entry.id,
+                )
+            return False
+        if entry.group_id is not None and not response.get("group_edit"):
+            # A member running a version without group edits keeps its
+            # copy: the leg can never land, so drop it — and its
+            # siblings, since the fan-out can no longer complete.
+            log.warning(
+                "Dropping queued group edit %s: member runs a version "
+                "without group edit",
+                entry.id,
+            )
+            self._drop_queued_edit(entry, deadline=deadline)
+            for sibling in self._queued_edit_siblings(
+                edit["edit_id"], exclude=entry.id
+            ):
+                self.mailbox.remove_outbox(sibling.id)
+            return False
+        if entry.group_id is None and response.get("edited") is False:
+            # The peer had no copy, or a newer edit already landed:
+            # the local copy must not change either, exactly as on the
+            # live path.
+            self._drop_queued_edit(entry, deadline=deadline)
+            return False
+        # Confirmed: drop the leg, then update the local copies when
+        # no sibling leg for this edit remains — a group edit's local
+        # copies change only on a full fan-out.  The removal runs
+        # first, so two legs delivering concurrently cannot both see
+        # each other as outstanding and leave the local copy stale;
+        # applying twice is harmless (the guards order by signed time).
+        self._delivered_ids.append(entry.id)
+        try:
+            self.mailbox.record_delivered(
+                entry.id,
+                timeout=_remaining(deadline),
+                via="direct",
+            )
+            removed = self._remove_queued_version(
+                entry.id,
+                text=entry.text,
+                edited_at=getattr(entry, "edited_at", None),
+                timeout=_remaining(deadline),
+            )
+            if not removed:
+                # A replacement landed while the send was in flight:
+                # the receiver holds this version, and the edited
+                # replacement stays queued for a later round instead
+                # of being deleted with it.
+                log.info(
+                    "Delivered queued edit %s but a replacement is "
+                    "queued under the same id; leaving it for a later "
+                    "round",
+                    entry.id,
+                )
+                return True
+        except TimeoutError:
+            # The delivery is confirmed, so report success; the entry
+            # stays queued and a later round re-delivers it (the peer
+            # dedupes by message id) and retries the bookkeeping.
+            log.warning(
+                "Delivered queued edit %s but the mailbox lock stayed "
+                "busy; leaving it queued for a later round",
+                entry.id,
+            )
+            return True
+        if not self._queued_edit_siblings(edit["edit_id"], exclude=entry.id):
+            self._record_sent_edit_locally(
+                edit["target"],
+                edit["text"],
+                float(edit["sent_at"]),
+                peer_hex=entry.to_hex,
+            )
+        return True
+
     def _deliver_queued_reaction(
         self,
         peer: Peer,
@@ -5925,6 +6269,17 @@ class TauNode:
                     return False
         except TimeoutError:
             return False
+        if getattr(fresh, "edit", None) is not None or (
+            getattr(fresh, "kind", None) == "edit"
+        ):
+            # A queued edit re-sends its pre-signed bytes, not a text
+            # payload — it routes before the group block below, so the
+            # announcements-only skip never holds it: an edit revises
+            # its author's own post, it is not a new post, and the live
+            # edit path applies no such check either.
+            return self._deliver_queued_edit(
+                peer, fresh, timeout, deadline=deadline
+            )
         # Encode the freshly read entry, not the sweep's snapshot: an
         # edit can cancel and re-queue the leg under the same id with
         # new text after the snapshot was taken, and the snapshot's
@@ -6353,6 +6708,18 @@ class TauNode:
                     )
                     return False
         except TimeoutError:
+            return False
+        if getattr(fresh, "edit", None) is not None or (
+            getattr(fresh, "kind", None) == "edit"
+        ):
+            # Edits ride direct delivery only in v1: the sealed path is
+            # text-shaped, and a holder cannot carry a pre-signed edit
+            # — so no sealed copy is ever left.
+            log.info(
+                "Skipping deposit of queued edit %s: edits are not "
+                "sealed for holders",
+                entry.id,
+            )
             return False
         if getattr(fresh, "reaction", None) is not None or (
             getattr(fresh, "kind", None) == "reaction"
@@ -10105,6 +10472,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         target_sent_at: Optional[float] = None,
+        queue: bool = True,
     ) -> Dict[str, Any]:
         """Fan an edit of a group message out to every member.
 
@@ -10129,8 +10497,14 @@ class TauNode:
         as a re-queue failure.  Returns a per-member result list;
         ``ok`` is true only when every member received the edit and
         the local copies were updated (see ``local_errors``).  A
-        failed leg reports an ``error`` instead of queueing: like DM
-        edits and group retracts, group edits are live-only in v1.
+        failed leg reports an ``error`` instead of queueing when the
+        member explicitly refused (allow-list, block-list, not a
+        member) or when ``queue`` is disabled.  A leg that fails
+        because the member cannot be reached is queued in the outbox
+        instead — one entry per member, carrying the same pre-signed
+        payload — and the mail sweep delivers it when the member is
+        heard from again; the local copies then update when the last
+        queued leg for the edit delivers.
 
         The sender's own copies update only on a full fan-out: the
         inbox record and every leg's sent record take the new text,
@@ -10381,22 +10755,95 @@ class TauNode:
                         "rtt": response.get("_rtt"),
                     }
                 )
-            except (NotAllowedError, NotAMemberError) as exc:
-                # The member is online and explicitly refused; an
-                # edit has no outbox to queue into, so the leg
-                # is simply reported as failed.
+            except (
+                NotAllowedError,
+                NotAMemberError,
+                PeerRefusedError,
+                PeerRejectedError,
+            ) as exc:
+                # The member is online and explicitly refused or
+                # rejected the edit; an edit has no outbox to queue
+                # into for that, so the leg is reported as failed.
+                if isinstance(exc, NotAllowedError):
+                    refusal = "not_allowed"
+                elif isinstance(exc, NotAMemberError):
+                    refusal = "not_a_member"
+                elif isinstance(exc, PeerRefusedError):
+                    refusal = "refused"
+                else:
+                    refusal = "rejected"
                 results.append(
                     {
                         "to": member,
                         "to_name": peer.display_name if peer is not None else "",
                         "ok": False,
-                        "error": "not_allowed"
-                        if isinstance(exc, NotAllowedError)
-                        else "not_a_member",
+                        "error": refusal,
                         "id": edit_id,
                     }
                 )
             except NodeError as exc:
+                if queue and self.started:
+                    # Unreachable, not refused: queue this leg so the
+                    # sweep delivers the same signed edit when the
+                    # member is heard from again.  A newer edit
+                    # supersedes a still-queued one for this message.
+                    # The new leg goes in first, so a full or failed
+                    # outbox leaves the older queued legs in place.
+                    try:
+                        entry = self.mailbox.enqueue(
+                            to=bytes.fromhex(member),
+                            text=cleaned,
+                            to_name=peer.display_name if peer is not None else "",
+                            group={
+                                "id": group["id"],
+                                "name": group["name"],
+                                "creator": group["creator"],
+                                "members": group["members"],
+                            },
+                            sent_at=float(payload["sent_at"]),
+                            edited_at=float(payload["sent_at"]),
+                            edit={
+                                "target": target_id,
+                                "text": cleaned,
+                                "edit_id": edit_id,
+                                "sent_at": float(payload["sent_at"]),
+                                "target_author": own_hash,
+                                "target_sent_at": float(target_sent_at),
+                                "payload_b64": base64.b64encode(
+                                    payload_bytes
+                                ).decode("ascii"),
+                            },
+                        )
+                    except MailboxError as qexc:
+                        results.append(
+                            {
+                                "to": member,
+                                "to_name": peer.display_name
+                                if peer is not None
+                                else "",
+                                "ok": False,
+                                "error": f"{exc}; could not queue: {qexc}",
+                                "id": edit_id,
+                            }
+                        )
+                        continue
+                    self._cancel_queued_edits(
+                        target_id,
+                        group_id=group["id"],
+                        exclude_edit_id=edit_id,
+                    )
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name
+                            if peer is not None
+                            else "",
+                            "queued": True,
+                            "queued_id": entry.id,
+                            "id": edit_id,
+                        }
+                    )
+                    continue
                 results.append(
                     {
                         "to": member,
@@ -10458,6 +10905,7 @@ class TauNode:
             "sent_at": float(payload["sent_at"]),
             "cancelled_queued": cancelled,
             "requeued": requeued,
+            "queued": sum(1 for result in results if result.get("queued")),
             "results": results,
         }
 
@@ -10469,6 +10917,7 @@ class TauNode:
         *,
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
+        queue: bool = True,
     ) -> Dict[str, Any]:
         """Send an edit for a DM this node sent and return the decoded response.
 
@@ -10479,11 +10928,13 @@ class TauNode:
         a reaction — and the receiver applies it only when the editor is
         the message's original sender.
 
-        Edits are delivered live in v1: unlike ``send_message`` there is
-        no outbox queue, because the sealed-mail path is text-shaped
-        throughout.  An unreachable peer raises :class:`NodeError`;
-        queueing edits for offline peers is a follow-up once the
-        mailbox can carry non-text kinds.
+        An unreachable peer queues the edit in the outbox instead of
+        raising, unless ``queue`` is disabled: the sweep re-sends the
+        same pre-signed bytes when the peer is heard from again, and
+        the local copies update on delivery, exactly as the live path
+        updates them on confirmation.  An explicit refusal (allow-list,
+        block-list) is final and never queues.  A newer edit of the
+        same message supersedes a still-queued one for it.
         """
         cleaned = normalize_message(text)
         target_id = message_id.strip() if isinstance(message_id, str) else ""
@@ -10499,13 +10950,62 @@ class TauNode:
             raise NodeError("could not sign edit")
         payload["sig"] = base64.b64encode(signature).decode("ascii")
         payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
-        peer = self.resolve_peer(
-            target,
-            timeout=discover_timeout
-            if discover_timeout is not None
-            else min(timeout, 10.0),
-        )
-        response = self._request(peer, REQUEST_DM_EDIT, payload_bytes, timeout)
+        peer: Optional[Peer] = None
+        try:
+            peer = self.resolve_peer(
+                target,
+                timeout=discover_timeout
+                if discover_timeout is not None
+                else min(timeout, 10.0),
+            )
+            response = self._request(peer, REQUEST_DM_EDIT, payload_bytes, timeout)
+        except (PeerRefusedError, NotAMemberError, PeerRejectedError):
+            # An explicit refusal (allow-list, block-list, not a member)
+            # or a peer rejection is final: queueing it would deliver
+            # to a peer that already said no.
+            raise
+        except NodeError:
+            if not queue or not self.started:
+                raise
+            dest_hash = (
+                peer.destination_hash
+                if peer is not None
+                else self._target_hash(target)
+            )
+            if dest_hash is None or self._is_self(dest_hash):
+                raise
+            # The new leg is queued first, so a full or failed outbox
+            # leaves an older queued edit in place.  Once it is in,
+            # the older leg is dropped so the sweep never spends a
+            # send on text the editor has already replaced.
+            try:
+                entry = self.mailbox.enqueue(
+                    to=dest_hash,
+                    text=cleaned,
+                    to_name=peer.display_name if peer is not None else "",
+                    sent_at=float(payload["sent_at"]),
+                    edited_at=float(payload["sent_at"]),
+                    edit={
+                        "target": target_id,
+                        "text": cleaned,
+                        "edit_id": edit_id,
+                        "sent_at": float(payload["sent_at"]),
+                        "payload_b64": base64.b64encode(payload_bytes).decode(
+                            "ascii"
+                        ),
+                    },
+                )
+            except MailboxError as qexc:
+                raise NodeError(f"could not queue edit: {qexc}") from qexc
+            self._cancel_queued_edits(target_id, exclude_edit_id=edit_id)
+            return {
+                "ok": False,
+                "queued": True,
+                "target": target_id,
+                "id": edit_id,
+                "queued_id": entry.id,
+                "sent_at": float(payload["sent_at"]),
+            }
         if response.get("edited") is False:
             # The receiver answered ok without applying the edit — an
             # unknown id, or a stale edit that lost to a newer one — so
@@ -11462,7 +11962,7 @@ class TauNode:
                 raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
-            raise NodeError(f"peer rejected the request: {message}")
+            raise PeerRejectedError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
         return decoded

@@ -7402,8 +7402,11 @@ class WebBridge:
         has no text to edit, and a message still queued has not
         reached its recipient yet (cancel it from the outbox instead).
         A sent group message fans out instead (see
-        :meth:`_edit_group_message`).  Edits ride the live link only,
-        so an unreachable peer is a failure, not a silent queue.
+        :meth:`_edit_group_message`).  An unreachable peer queues the
+        edit instead of failing, so the console reports it as queued
+        rather than a 502 — the local copies update when the sweep
+        delivers it, through the same ``on_edit`` callback an inbound
+        edit uses.
 
         Ordering keeps every failure retryable from the console: the
         edit goes first, so a failed edit never rewrites the local
@@ -7465,6 +7468,23 @@ class WebBridge:
                     f"message {target!r} is still queued; cancel it from the outbox first"
                 )
         response = self.node.send_edit(peer, wire_id, cleaned, timeout=timeout)
+        if response.get("queued"):
+            # The peer is offline: the edit rides the outbox now, and
+            # the local copies update when the sweep delivers it — so
+            # the console entry keeps the old text until then instead
+            # of showing an edit the peer has not seen.
+            return {
+                "ok": True,
+                "edited": False,
+                "queued": True,
+                "queued_id": response.get("queued_id")
+                if isinstance(response.get("queued_id"), str)
+                else None,
+                "message": None,
+                "id": response.get("id")
+                if isinstance(response.get("id"), str)
+                else None,
+            }
         if response.get("edited") is False:
             # The peer had no copy (or a newer edit already landed):
             # leave the local copy alone and report it, so the console
@@ -7696,7 +7716,12 @@ class WebBridge:
             target_sent_at=sent_at,
         )
         results = response.get("results") or []
-        failed = [result for result in results if not result.get("delivered")]
+        queued = [result for result in results if result.get("queued")]
+        failed = [
+            result
+            for result in results
+            if not result.get("delivered") and not result.get("queued")
+        ]
         if failed:
             # Keep the local copies: the failed members still hold the
             # old text, and the legs carry the send time a retry needs.
@@ -7710,6 +7735,24 @@ class WebBridge:
                 )
                 + "; retry the edit when they are online"
             )
+        if queued:
+            # Some members are offline: their legs ride the outbox
+            # now, and the local copies update when the last queued
+            # leg delivers — so no console entry takes the new text
+            # until then, exactly as the node holds its own copies.
+            return {
+                "ok": True,
+                "edited": False,
+                "queued": True,
+                "message": None,
+                "messages": [],
+                "group": group_id,
+                "results": results,
+                "cancelled_queued": response.get("cancelled_queued") or [],
+                "id": response.get("id")
+                if isinstance(response.get("id"), str)
+                else None,
+            }
         local_errors = response.get("local_errors") or []
         if local_errors:
             # The members already hold the new text, but this node's
