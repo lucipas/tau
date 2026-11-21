@@ -226,8 +226,13 @@ export default function ChatSection() {
   const remindersGeneration = useRef(0);
   const reminderRetryTimer = useRef<number | undefined>(undefined);
   const reminderRetryAttempts = useRef(0);
-  const refreshReminders = useCallback(async () => {
+  const remindersMounted = useRef(true);
+  const refreshReminders = useCallback(async (isRetry = false) => {
     const generation = ++remindersGeneration.current;
+    // Each independent refresh starts a fresh retry budget; a retry in
+    // the chain keeps the count, so failures from separate triggers
+    // cannot consume each other's retries.
+    if (!isRetry) reminderRetryAttempts.current = 0;
     // A newer refresh supersedes any pending retry.
     window.clearTimeout(reminderRetryTimer.current);
     reminderRetryTimer.current = undefined;
@@ -240,10 +245,16 @@ export default function ChatSection() {
       // Reminders are advisory; the chat list works without them.
       // If the latest request failed, retry a bounded number of times so
       // an older successful list that was discarded is not lost for good.
-      if (generation === remindersGeneration.current && reminderRetryAttempts.current < 3) {
+      // A retry is scheduled only while mounted: an in-flight request
+      // can reject after unmount, and must not keep polling then.
+      if (
+        generation === remindersGeneration.current &&
+        remindersMounted.current &&
+        reminderRetryAttempts.current < 3
+      ) {
         const attempt = ++reminderRetryAttempts.current;
         reminderRetryTimer.current = window.setTimeout(
-          () => void refreshReminders(),
+          () => void refreshReminders(true),
           5000 * 2 ** (attempt - 1),
         );
       }
@@ -254,6 +265,10 @@ export default function ChatSection() {
 
   useEffect(
     () => () => {
+      // Invalidate any in-flight list request and stop retries: leaving
+      // the chat must not schedule further requests.
+      remindersMounted.current = false;
+      remindersGeneration.current += 1;
       window.clearTimeout(reminderRetryTimer.current);
     },
     [],
