@@ -8043,6 +8043,43 @@ def test_reminders_endpoints(node, tmp_path):
         assert payload["reminder"]["target"] == group_id
         assert payload["reminder"]["target_name"] == "crew"
 
+        # A reminder whose source message is gone stays hidden: the
+        # sidebar must not keep showing the text of a message the
+        # inbox purged (for example a disappearing DM that expired).
+        node.inbox.delete("wire-1")
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["reminders"][0]["message_id"] == "wire-g1"
+
+        # An expired disappearing message is hidden the same way,
+        # even though its reminder is still pending in the store.
+        from tau.reminders import ReminderStore
+
+        node.inbox.append(
+            {
+                "id": "wire-old",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "text": "gone soon",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "expires_at": time.time() - 60,
+            }
+        )
+        ReminderStore(bridge._reminders_path()).add(
+            message_id="wire-old",
+            kind="peer",
+            target=PEER_HASH,
+            text="gone soon",
+            sender="alice",
+            due_at=time.time() + 3600,
+        )
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["reminders"][0]["message_id"] == "wire-g1"
+
         # Blocking the sender refuses a new reminder and hides the
         # pending ones, like the CLI does.
         save_blocklist(
