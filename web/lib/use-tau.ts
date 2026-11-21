@@ -670,7 +670,13 @@ export function useBroadcasts(): UseBroadcastsResult {
   );
   const rename = useCallback(
     async (name: string, newName: string) => {
-      await renameBroadcast(name, newName);
+      // The rename is committed server-side once this resolves, so apply
+      // the stored list from the response; a failed refresh must not
+      // leave the old name on screen.
+      const { broadcast, previous_name } = await renameBroadcast(name, newName);
+      setBroadcasts((prev) =>
+        prev.map((entry) => (entry.name === previous_name ? broadcast : entry)),
+      );
       await refresh();
     },
     [refresh],
