@@ -323,6 +323,7 @@ from .reminders import (
     MAX_REMINDER_DELAY,
     ReminderError,
     ReminderStore,
+    _inbox_transaction,
     parse_remind_at,
 )
 from .muted import (
@@ -10321,17 +10322,21 @@ class WebBridge:
         """Whether the message a reminder came from is still in the inbox.
 
         A disappearing message that expired or was removed takes its
-        reminder with it, so its text is not shown.  With no inbox the
-        source cannot be confirmed, so the reminder stays hidden.
+        reminder with it, so its text is not shown.  The lookup holds
+        the inbox's cross-process transaction, so a message deleted by
+        another process is seen as gone instead of lingering in the
+        serving node's cached copy.  With no inbox the source cannot
+        be confirmed, so the reminder stays hidden.
         """
         if inbox is None:
             return False
         message_id = str(reminder["message_id"])
         target = str(reminder["target"])
-        if reminder["kind"] == "group":
-            entry = inbox.find(message_id, group=target)
-        else:
-            entry = inbox.find(message_id, peer=target)
+        with _inbox_transaction(inbox):
+            if reminder["kind"] == "group":
+                entry = inbox.find(message_id, group=target)
+            else:
+                entry = inbox.find(message_id, peer=target)
         if entry is None:
             return False
         expires_at = entry.get("expires_at")

@@ -8099,6 +8099,34 @@ def test_reminders_endpoints(node, tmp_path):
         bridge.stop()
 
 
+def test_reminders_hide_message_deleted_by_another_process(node, tmp_path):
+    """The listing reloads the inbox file, so a delete from another
+    process hides the reminder even though the serving bridge's
+    inbox copy is stale."""
+    inbox_path = tmp_path / "inbox.json"
+    node.inbox = Inbox(inbox_path)
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        _seed_pinnable_message(bridge, node)
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders",
+            method="POST",
+            body={"id": 1, "in_seconds": 3600},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert payload["count"] == 1
+
+        # Another process deletes the message from the shared file.
+        Inbox(inbox_path).delete("wire-1")
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 200
+        assert payload == {"reminders": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
 def test_drafts_channel_endpoint(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:
