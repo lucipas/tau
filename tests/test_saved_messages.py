@@ -891,3 +891,128 @@ def test_sender_and_direction_roundtrip(tmp_path):
             },
         ]
     }
+
+
+def test_saved_group_poll_shows_votes(tmp_path, capsys):
+    # A starred poll must carry its tally like the history views show
+    # it: two votes for Saturday, none for Sunday.
+    data_dir, senders = _seed_two_peers(tmp_path)
+    group_id = _seed_group(data_dir, senders)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": senders["carol"],
+            "text": "which day?",
+            "sent_at": 11.0,
+            "received_at": 23.0,
+            "id": "m-poll-1",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "weekend",
+            "poll_options": ["Saturday", "Sunday"],
+        }
+    )
+    for voter, sent_at in ((senders["bob"], 12.0), (senders["alice"], 13.0)):
+        inbox.append(
+            {
+                "from": "bob" if voter == senders["bob"] else "alice",
+                "destination": voter,
+                "text": "voted: Saturday",
+                "sent_at": sent_at,
+                "received_at": sent_at + 10.0,
+                "id": f"m-vote-{sent_at}",
+                "kind": "group",
+                "group": group_id,
+                "group_name": "weekend",
+                "poll_vote": {
+                    "target": {"author": senders["carol"], "sent_at": 11.0},
+                    "option": 0,
+                },
+            }
+        )
+    assert (
+        cli.main(["save", "--data-dir", str(data_dir), "--group", "weekend", "m-poll-1"])
+        == 0
+    )
+    capsys.readouterr()
+
+    code = cli.main(["saved", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    poll = payload["saved"][0]["message"]["poll"]
+    assert poll["options"] == ["Saturday", "Sunday"]
+    assert poll["counts"] == [2, 0]
+    assert poll["total"] == 2
+
+
+def test_save_refuses_expired_channel_message(tmp_path, capsys):
+    # An expired channel row is hidden from history, so it cannot be
+    # starred — the listing would render it as a stub immediately.
+    from tau.channels import create_message
+
+    data_dir = tmp_path / "alice"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        message = create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "old text",
+            name="alice",
+            now=1000,
+            expires_at=1001.0,
+        )
+    finally:
+        conn.close()
+    digest = message["hash"]
+    capsys.readouterr()
+
+    code = cli.main(
+        ["save", "--data-dir", str(data_dir), "--channel", "general", digest[:12]]
+    )
+    assert code != 0
+    assert "expired or retracted" in capsys.readouterr().err
+    assert not load_saved_messages(config.saved_messages_path).is_saved(
+        "channel", "general", digest
+    )
+
+
+def test_unsave_still_clears_expired_channel_star(tmp_path, capsys):
+    # The save-time visibility rule must not break unsave: a star made
+    # while the message was live can still be cleared after it expires.
+    data_dir = tmp_path / "alice"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    digest = _seed_channel_message(data_dir)
+    capsys.readouterr()
+    assert (
+        cli.main(
+            ["save", "--data-dir", str(data_dir), "--channel", "general", digest[:12]]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        conn.execute(
+            "UPDATE messages SET expires_at = ? WHERE hash = ?", (1001.0, digest)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    code = cli.main(
+        ["unsave", "--data-dir", str(data_dir), "--channel", "general", digest[:12]]
+    )
+    assert code == 0
+    assert "unsaved" in capsys.readouterr().out
+    assert not load_saved_messages(config.saved_messages_path).is_saved(
+        "channel", "general", digest
+    )
