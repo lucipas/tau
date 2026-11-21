@@ -253,6 +253,57 @@ def _parse_pending_edit_markers(
     return markers
 
 
+def _parse_pending_local_edits(raw_value: Any) -> List[Dict[str, Any]]:
+    """Parse deferred local-edit applies from a mailbox document.
+
+    A record is ``{"edit_id", "target", "text", "sent_at",
+    "peer_hex"}``: a confirmed edit whose final-sibling check timed
+    out, so the sender's own copies still hold the old text (see
+    ``Mailbox.add_pending_local_edit``).  Malformed entries are
+    dropped rather than letting a bad record rewrite a message.
+    """
+    records: List[Dict[str, Any]] = []
+    if not isinstance(raw_value, list):
+        return records
+    for value in raw_value:
+        if not isinstance(value, dict):
+            continue
+        edit_id = value.get("edit_id")
+        target = value.get("target")
+        text = value.get("text")
+        sent_at = value.get("sent_at")
+        peer_hex = value.get("peer_hex")
+        if (
+            not isinstance(edit_id, str)
+            or not edit_id
+            or not isinstance(target, str)
+            or not target
+            or not isinstance(text, str)
+            or isinstance(sent_at, bool)
+            or not isinstance(sent_at, (int, float))
+            or not isinstance(peer_hex, str)
+            or len(peer_hex) != 32
+        ):
+            continue
+        try:
+            bytes.fromhex(peer_hex)
+            when = float(sent_at)
+        except (ValueError, OverflowError):
+            continue
+        if not math.isfinite(when):
+            continue
+        records.append(
+            {
+                "edit_id": edit_id,
+                "target": target,
+                "text": text,
+                "sent_at": when,
+                "peer_hex": peer_hex.lower(),
+            }
+        )
+    return records
+
+
 def _env_int(name: str, default: int) -> int:
     """Read an integer quota override from the environment, or *default*."""
     raw = os.environ.get(name)
@@ -1120,6 +1171,15 @@ class Mailbox:
         # Only the newest edit per message is kept: an older edit
         # never rewinds a newer marker.
         self._group_pending_edits: Dict[str, Dict[str, Any]] = {}
+        # Confirmed edits whose local apply is deferred: the delivery
+        # was confirmed but the final-sibling check timed out, so the
+        # sender's own copies still hold the old text.  The next
+        # flush retries the check and applies the edit once no
+        # sibling legs remain queued — without resending it.  An edit
+        # aborted since (its legs expired, refused, or cancelled) has
+        # its record dropped by the abort path, so it never applies
+        # here (see add_pending_local_edit).
+        self._pending_local_edits: List[Dict[str, Any]] = {}
         # Sent-retraction markers, keyed by message id (DM) or by
         # (group id, shared send time) for a group message (see
         # _sent_group_retraction_key).  The owner recorded them when
@@ -1250,6 +1310,7 @@ class Mailbox:
             self._sent_retracted = state["sent_retracted"]
             self._sent_group_retracted = state["sent_group_retracted"]
             self._group_pending_edits = state["group_pending_edits"]
+            self._pending_local_edits = state["pending_local_edits"]
             self._sent = state["sent"]
             self._receipts = state["receipts"]
         log.debug(
@@ -1409,6 +1470,9 @@ class Mailbox:
         group_pending_edits = _parse_pending_edit_markers(
             raw.get("group_pending_edits")
         )
+        pending_local_edits = _parse_pending_local_edits(
+            raw.get("pending_local_edits")
+        )
 
         sent: Dict[str, Dict[str, Any]] = {}
         raw_sent = raw.get("sent")
@@ -1508,6 +1572,7 @@ class Mailbox:
             "sent_retracted": sent_retracted,
             "sent_group_retracted": sent_group_retracted,
             "group_pending_edits": group_pending_edits,
+            "pending_local_edits": pending_local_edits,
             "sent": sent,
             "receipts": receipts,
         }
@@ -1543,6 +1608,9 @@ class Mailbox:
                     key: dict(marker)
                     for key, marker in self._group_pending_edits.items()
                 },
+                "pending_local_edits": [
+                    dict(record) for record in self._pending_local_edits
+                ],
                 "pending_acks": {
                     holder: list(ids)
                     for holder, ids in self._pending_acks.items()
@@ -1972,6 +2040,9 @@ class Mailbox:
                 )
                 for sibling_id in siblings:
                     del self._outbox[sibling_id]
+                # The edit can no longer complete its fan-out: a
+                # deferred local apply for it must never land.
+                self.drop_pending_local_edit(edit_id)
             self.save()
             if siblings:
                 log.info(
@@ -2884,6 +2955,86 @@ class Mailbox:
             )
             del pool[oldest]
 
+    # -- deferred local edit applies ---------------------------------
+
+    def add_pending_local_edit(
+        self, record: Dict[str, Any], *, timeout: Optional[float] = None
+    ) -> None:
+        """Remember a confirmed edit whose local apply is deferred.
+
+        The delivery was confirmed but the final-sibling check timed
+        out, so the sender's own copies still hold the old text.  The
+        record (``edit_id``, ``target``, ``text``, ``sent_at``,
+        ``peer_hex``) survives restarts: the next flush retries the
+        check and applies the edit once no sibling legs remain
+        queued, without resending it.  A record for the same edit
+        already deferred keeps standing — the first leg's peer is
+        enough for the console callback.  With a timeout the wait for
+        the mailbox lock is bounded by it.
+        """
+        with self._transaction(timeout=timeout):
+            if any(
+                item.get("edit_id") == record.get("edit_id")
+                for item in self._pending_local_edits
+            ):
+                return
+            self._pending_local_edits.append(
+                {
+                    "edit_id": str(record["edit_id"]),
+                    "target": str(record["target"]),
+                    "text": str(record["text"]),
+                    "sent_at": float(record["sent_at"]),
+                    "peer_hex": str(record["peer_hex"]),
+                }
+            )
+            self.save()
+
+    def pending_local_edits(self) -> List[Dict[str, Any]]:
+        """Copies of the deferred local-edit applies, oldest first."""
+        with self._lock:
+            return [dict(record) for record in self._pending_local_edits]
+
+    def drop_pending_local_edit(self, edit_id: str) -> None:
+        """Drop a deferred local apply, e.g. when its edit is aborted.
+
+        An edit whose legs expired, were refused, or were cancelled
+        can no longer complete its fan-out, so a deferred apply for
+        it must never land: the sender's copies must not show an
+        edit a member never received.
+        """
+        with self._transaction():
+            before = len(self._pending_local_edits)
+            self._pending_local_edits = [
+                record
+                for record in self._pending_local_edits
+                if record.get("edit_id") != edit_id
+            ]
+            if len(self._pending_local_edits) != before:
+                self.save()
+
+    def drop_pending_local_edits_by_text(
+        self, text: str, sent_at: float
+    ) -> None:
+        """Drop deferred local applies matching an edit's text and time.
+
+        For a corrupt leg whose edit id did not survive, the id is
+        unknown — but the replacement text and the edit's signed send
+        time still identify it.  Two different edits sharing both is
+        not a realistic collision (the send time is a float timestamp).
+        """
+        with self._transaction():
+            before = len(self._pending_local_edits)
+            self._pending_local_edits = [
+                record
+                for record in self._pending_local_edits
+                if not (
+                    record.get("text") == text
+                    and record.get("sent_at") == float(sent_at)
+                )
+            ]
+            if len(self._pending_local_edits) != before:
+                self.save()
+
     def pending_group_edit(
         self,
         sender_hash: str,
@@ -3081,8 +3232,18 @@ class Mailbox:
                     "Pruned %d sibling leg(s) of expired queued group edits",
                     aborted,
                 )
+            aborted_edit_ids = {
+                entry.group_edit_id
+                for key in dead_outbox
+                if (entry := self._outbox.get(key)) is not None
+                and entry.group_edit_id is not None
+            }
             for key in dead_outbox:
                 del self._outbox[key]
+            # An expired leg aborts its edit: a deferred local apply
+            # for it must never land.
+            for edit_id in aborted_edit_ids:
+                self.drop_pending_local_edit(edit_id)
             dead_held = [
                 key
                 for key, env in self._held.items()

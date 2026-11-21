@@ -3709,9 +3709,13 @@ def test_deliver_queued_corrupt_edit_drops_leg_and_siblings_together(
         def acquire(self, blocking=True, timeout=-1):
             if self._real._is_owned():
                 return self._real.acquire(blocking, timeout)
-            self.top_level += 1
-            if self.top_level >= 2:
-                return False
+            if timeout is not None and timeout >= 0:
+                # A deadline-bounded wait can fail when the lock is
+                # busy; a blocking wait cannot — the real RLock just
+                # waits — so only bounded acquires refuse here.
+                self.top_level += 1
+                if self.top_level >= 2:
+                    return False
             return self._real.acquire(blocking, timeout)
 
         def release(self):
@@ -3807,6 +3811,127 @@ def test_deliver_queued_edit_skips_local_copy_when_sibling_check_stays_busy(
     # an edit a queued sibling may never have received.
     assert node.mailbox.outbox_list() == []
     assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
+def test_deliver_queued_edit_defers_local_apply_until_a_later_round(
+    tmp_path, monkeypatch
+):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "edited": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(peer, entry, 1.0, deadline=time.monotonic() + 0.2)
+        is True
+    )
+    # The delivery is confirmed, but the local copy must not change
+    # until the fan-out is proven: the apply is deferred, durably.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+    pending = node.mailbox.pending_local_edits()
+    assert [record["edit_id"] for record in pending] == [
+        entry.edit["edit_id"]
+    ]
+    assert pending[0]["target"] == "m-1"
+    assert pending[0]["text"] == "fixed here"
+
+    # A later round retries the check — no resend — and applies.
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("m-1")["text"] == "fixed here"
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_deferred_local_apply_waits_for_a_queued_sibling(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(
+            alice, entries[0], 1.0, deadline=time.monotonic() + 0.2
+        )
+        is True
+    )
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+
+    # The sibling is still queued: a retry must not apply yet.
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+
+    # The sibling delivers and applies the edit itself; the retry
+    # then clears the now-redundant record.
+    assert node._deliver_entry(bob, entries[1], 1.0) is True
+    assert node.inbox.resolve("leg-1")["text"] == "fixed here"
+    node._retry_pending_local_edits()
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_aborted_group_edit_drops_its_deferred_local_apply(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(
+            alice, entries[0], 1.0, deadline=time.monotonic() + 0.2
+        )
+        is True
+    )
+    assert len(node.mailbox.pending_local_edits()) == 1
+
+    # The remaining sibling is refused: the edit is aborted, so the
+    # deferred apply must go with it — the local copy must never
+    # show an edit a member never received.
+    def refused(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", refused)
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+    assert node._deliver_entry(bob, entries[1], 1.0) is False
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.pending_local_edits() == []
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
 
 
 def test_send_group_edit_aborts_queued_legs_when_a_member_refuses(
