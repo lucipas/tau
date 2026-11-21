@@ -1356,6 +1356,34 @@ def test_prune_drops_siblings_of_expired_group_edit_leg(tmp_path):
     assert [e.id for e in box.outbox_list()] == ["plain"]
 
 
+def test_prune_drops_siblings_of_expired_corrupt_group_edit_leg(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=60.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    # Corrupt the first leg's stored payload: validation drops the
+    # edit, but the entry keeps the edit id as a hint, so the prune
+    # still knows which edit the expired leg belongs to.
+    path = tmp_path / "mailbox.json"
+    raw = json.loads(path.read_text())
+    for stored in raw["outbox"]:
+        if stored["id"] == "leg-alice":
+            stored["edit"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert reloaded.get_outbox("leg-alice").edit is None
+    assert reloaded.get_outbox("leg-alice").group_edit_id == "edit-1"
+    removed = reloaded.prune(now=200.0)
+    assert removed["outbox"] == 2
+    assert reloaded.outbox_list() == []
+
+
 def test_remove_outbox_abort_group_edit_drops_siblings(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     group = _edit_group()

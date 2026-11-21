@@ -5960,22 +5960,31 @@ class TauNode:
             )
             self._drop_queued_edit(entry, deadline=deadline)
             if entry.group_id is not None:
-                # The corrupt payload took the edit id with it: the
-                # sibling legs still share the group, the edit's
-                # signed send time and the replacement text, so match
-                # on those instead — a leg that can never deliver
-                # aborts the whole edit, like a refusal does.
-                for sibling in self.mailbox.outbox_list():
-                    other = getattr(sibling, "edit", None)
-                    if (
-                        sibling.id != entry.id
-                        and sibling.group_id == entry.group_id
-                        and isinstance(other, dict)
-                        and entry.sent_at is not None
-                        and other.get("sent_at") == entry.sent_at
-                        and sibling.text == entry.text
-                    ):
-                        self._drop_queued_edit(sibling, deadline=deadline)
+                # The corrupt payload took the edit id with it, but
+                # the entry keeps it as a hint (see
+                # ``OutboxEntry.group_edit_id``): drop the siblings by
+                # id.  When even the hint is gone, the sibling legs
+                # still share the group, the edit's signed send time
+                # and the replacement text, so match on those instead.
+                # Either way a leg that can never deliver aborts the
+                # whole edit, like a refusal does.
+                edit_id = entry.group_edit_id
+                if edit_id is not None:
+                    self._drop_queued_edit_siblings(
+                        edit_id, exclude=entry.id, deadline=deadline
+                    )
+                else:
+                    for sibling in self.mailbox.outbox_list():
+                        other = getattr(sibling, "edit", None)
+                        if (
+                            sibling.id != entry.id
+                            and sibling.group_id == entry.group_id
+                            and isinstance(other, dict)
+                            and entry.sent_at is not None
+                            and other.get("sent_at") == entry.sent_at
+                            and sibling.text == entry.text
+                        ):
+                            self._drop_queued_edit(sibling, deadline=deadline)
             return False
         try:
             payload_bytes = base64.b64decode(edit["payload_b64"], validate=True)
