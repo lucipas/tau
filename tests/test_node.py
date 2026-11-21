@@ -804,6 +804,21 @@ def test_send_reaction_refusal_is_not_queued(tmp_path, monkeypatch):
     assert node.inbox.reactions_for("m-1") == []
 
 
+def test_send_reaction_not_a_member_is_not_queued(tmp_path, monkeypatch):
+    node, _ = _reaction_node(tmp_path)
+
+    def removed(*args, **kwargs):
+        raise NotAMemberError("peer rejected the request: not a member")
+
+    monkeypatch.setattr(node, "_request", removed)
+    with pytest.raises(NotAMemberError):
+        node.send_reaction("alice", "m-1", "👍")
+    # A not-a-member refusal is final, like any other: the reaction
+    # must not be queued for a sweep that would only drop it.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.reactions_for("m-1") == []
+
+
 def test_send_group_reaction_queues_unreachable_legs(tmp_path, monkeypatch):
     from tau.protocol import REQUEST_REACT, parse_reaction
 

@@ -9333,9 +9333,13 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             response = self._request(peer, REQUEST_REACT, payload_bytes, timeout)
-        except PeerRefusedError:
+        except (PeerRefusedError, NotAMemberError):
             # An explicit refusal (allow-list, block-list) is final:
-            # queueing it would deliver to a peer that already said no.
+            # queueing it would deliver to a peer that already said
+            # no.  Not-a-member is final here too: the receiver can
+            # return it for a reaction naming a group message whose
+            # roster excludes this node, and the sweep would only
+            # drop the queued leg as a refusal anyway.
             raise
         except NodeError:
             if not queue or not self.started:
