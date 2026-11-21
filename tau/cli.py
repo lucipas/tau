@@ -10021,11 +10021,14 @@ def cmd_search(args: argparse.Namespace) -> int:
     Block rules match the history views: a blocked sender's received
     messages stay hidden while outbound stays visible, and a
     block-list that cannot be read hides received messages (fail
-    closed) while outbound stays visible.  Expired
-    disappearing messages are never returned — the inbox purges them
-    on load and channel search applies the history lifecycle.  A
-    search is a read-only lookup: it advances no read cursor and
-    sends no receipts, like ``tau messages --search``.
+    closed) while outbound stays visible.  The query is trimmed once,
+    so a padded search matches the same text in every source.
+    Reactions on a group message are filtered against the group's
+    pinned roster, like ``tau messages``.  Expired disappearing
+    messages are never returned — the inbox purges them on load and
+    channel search applies the history lifecycle.  A search is a
+    read-only lookup: it advances no read cursor and sends no
+    receipts, like ``tau messages --search``.
     """
     config = _make_config(args)
     json_output = _json_mode(args)
@@ -10033,6 +10036,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     if not query.strip():
         print("error: search text must not be empty", file=sys.stderr)
         return 2
+    query = query.strip()
     limit = getattr(args, "limit", 20)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
@@ -10122,6 +10126,21 @@ def cmd_search(args: argparse.Namespace) -> int:
         # Poll questions render with their tally, like `tau messages`.
         _attach_group_poll_tallies(inbox, inbox_hits, own_hash)
         _attach_dm_poll_tallies(inbox, inbox_hits, own_hash)
+        # A stored reaction from a non-member must never be displayed
+        # on a group message, like `tau messages`: filter the listed
+        # reactions against each group's pinned roster before anything
+        # prints or is emitted as JSON.  With no pinned roster there
+        # is nothing to check against.
+        rosters = pinned_rosters(
+            GroupStore(config.groups_path),
+            {str(entry.get("group")) for entry in inbox_hits if entry.get("group")},
+        )
+        for entry in inbox_hits:
+            group = entry.get("group")
+            if group and entry.get("reactions"):
+                entry["reactions"] = visible_reactions(
+                    entry["reactions"], rosters.get(str(group))
+                )
     if channel_name is not None or (peer_hash is None and group_ids is None):
         app = ChannelApp(config, _tan_identity(config), name=config.name)
         names = (
@@ -10129,16 +10148,24 @@ def cmd_search(args: argparse.Namespace) -> int:
             if channel_name is not None
             else [item["channel"] for item in app.memberships()]
         )
-        if blocked is not None:
-            for name in names:
-                channel_hits.extend(
-                    app.search(
-                        name,
-                        query,
-                        limit=int(limit) if limit is not None else DEFAULT_CHANNEL_LIMIT,
-                        exclude_authors=blocked,
-                    )
-                )
+        for name in names:
+            hits = app.search(
+                name,
+                query,
+                limit=int(limit) if limit is not None else DEFAULT_CHANNEL_LIMIT,
+                exclude_authors=blocked,
+            )
+            if blocked is None:
+                # The list cannot be read, so received mail stays
+                # hidden (fail closed) — but this node's own posts
+                # are not a blocked sender's, so they stay visible,
+                # the same rule the DM branch applies.
+                hits = [
+                    hit
+                    for hit in hits
+                    if str(hit.get("author", "")) == (own_hash or "")
+                ]
+            channel_hits.extend(hits)
         channel_hits = [
             message
             for message in channel_hits
@@ -10160,7 +10187,14 @@ def cmd_search(args: argparse.Namespace) -> int:
                     parent = channel_reply_parent(conn, message)
                     if parent is None:
                         continue
-                    if str(parent.get("author", "")) in blocked:
+                    if blocked is None:
+                        # The list cannot be read, so a quote must
+                        # come from this node — a received parent
+                        # cannot be vetted, the same fail-closed rule
+                        # the hits themselves follow.
+                        if str(parent.get("author", "")) != (own_hash or ""):
+                            continue
+                    elif str(parent.get("author", "")) in blocked:
                         continue
                     message["reply_parent"] = {
                         "hash": parent["hash"],
@@ -10192,15 +10226,15 @@ def cmd_search(args: argparse.Namespace) -> int:
     shown = hits if limit is None else hits[:limit]
     if json_output:
         _emit(
-            {"query": query.strip(), "messages": shown, "count": len(shown)},
+            {"query": query, "messages": shown, "count": len(shown)},
             True,
         )
         return _EXIT_OK
     if not shown:
         if channel_name is not None:
-            print(f"No messages in #{channel_name} matching {query.strip()!r}.")
+            print(f"No messages in #{channel_name} matching {query!r}.")
         else:
-            print(f"No messages matching {query.strip()!r}.")
+            print(f"No messages matching {query!r}.")
         return _EXIT_OK
     for hit in shown:
         if hit.get("source") == "channel":
@@ -15764,11 +15798,12 @@ def _attach_channel_poll_tallies(
 ) -> None:
     """Attach a ``poll`` tally to each channel-poll record in *entries*.
 
-    The tally derives from the channel's full stored history — votes
-    a displayed page left out still count — so the history is
-    re-read for the channel involved.  Blocked authors are left out
-    of the tally history, so their votes never count.  Entries are
-    the copies :meth:`ChannelApp.history` returns, so attaching here
+    The tally derives from the channel's visible history — votes a
+    displayed page left out still count, but a vote history hides
+    (expired or retracted) never does — so the history is re-read
+    for the channel involved.  Blocked authors are left out of the
+    tally history, so their votes never count.  Entries are the
+    copies :meth:`ChannelApp.history` returns, so attaching here
     never touches the stored records.
     """
     channels = {
@@ -15779,7 +15814,7 @@ def _attach_channel_poll_tallies(
     if not channels:
         return
     for channel in sorted(channels):
-        history = app.all_history(channel)
+        history = app.visible_history(channel)
         if blocked is not None:
             history = [
                 record

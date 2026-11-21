@@ -1605,17 +1605,19 @@ def delete_message(conn: sqlite3.Connection, digest: str) -> bool:
 def reply_parent(
     conn: sqlite3.Connection, message: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """The stored parent of a reply, or ``None``.
+    """The stored parent of a reply, as history shows it, or ``None``.
 
-    ``None`` covers both cases a reader must handle the same way: a
-    plain message (no ``reply_to``) and a reply whose parent has not
-    arrived yet.  The caller shows the digest when the parent is
+    ``None`` covers the cases a reader must handle the same way: a
+    plain message (no ``reply_to``), a parent that has not arrived
+    yet, and a parent history hides — expired or retracted, so its
+    text never resurfaces in a quote, or edited, so the quote shows
+    the latest text.  The caller shows the digest when the parent is
     missing, so a reply never blocks on history it does not have.
     """
     target = message.get("reply_to")
     if not target:
         return None
-    return get_message(conn, target)
+    return get_visible_message(conn, target)
 
 
 # -- retract notices: storage ------------------------------------------------
@@ -2560,6 +2562,33 @@ def channel_messages_all(
     return [_row_to_message(row) for row in rows]
 
 
+def channel_messages_visible(
+    conn: sqlite3.Connection,
+    channel: str,
+) -> List[Dict[str, Any]]:
+    """Every stored message for *channel* that history shows, newest first.
+
+    Like :func:`channel_messages_all` but with the history lifecycle
+    applied — expired and retracted messages are gone, the same
+    clauses :func:`channel_history_page` applies — for callers that
+    derive state from the whole history.  A vote history hides must
+    never count toward a poll tally.  Edits are not applied: tally
+    keys off the poll payloads, not the displayed text.
+    """
+    name = clean_channel_name(channel)
+    rows = conn.execute(
+        f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
+        "WHERE channel = ? "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "AND NOT EXISTS (SELECT 1 FROM retractions r "
+        "WHERE r.hash = messages.hash AND r.author = messages.author) "
+        "ORDER BY created_at DESC, hash DESC "
+        f"LIMIT {MAX_STORED_PER_CHANNEL}",
+        (name, time.time()),
+    ).fetchall()
+    return [_row_to_message(row) for row in rows]
+
+
 def search_channel_messages(
     conn: sqlite3.Connection,
     channel: str,
@@ -2584,12 +2613,17 @@ def search_channel_messages(
     history hides them; an empty query raises :class:`ChannelError`.
     Expired and retracted messages are gone from search, exactly as
     they are from history, and an edited message is matched on its
-    latest text — search shows what history shows.
+    latest text — search shows what history shows.  Poll votes and
+    closes are not chat: they are excluded before the limit, so they
+    never crowd a matching message out of the results.  The limit is
+    capped at the per-channel store bound, not the history page size,
+    so a larger requested limit returns every matching stored
+    message.
     """
     if not isinstance(query, str) or not query.strip():
         raise ChannelError("search text must not be empty")
     name = clean_channel_name(channel)
-    count = max(1, min(int(limit), MAX_CHANNEL_HISTORY))
+    count = max(1, min(int(limit), MAX_STORED_PER_CHANNEL))
     needle = query.strip().casefold()
     clauses = ["channel = ?"]
     params: List[Any] = [name]
@@ -2614,9 +2648,20 @@ def search_channel_messages(
         "ORDER BY created_at DESC, hash DESC",
         params,
     ).fetchall()
-    messages = _apply_edits_to_messages(
-        conn, [_row_to_message(row) for row in rows]
-    )
+    # Poll votes and closes ride as messages so peers can tally them,
+    # but they are not chat: drop them before matching, so a run of
+    # votes can never use up the requested count and hide the chat
+    # message underneath.
+    from .channel_polls import is_channel_poll_close, is_channel_poll_vote
+
+    messages = [
+        message
+        for message in _apply_edits_to_messages(
+            conn, [_row_to_message(row) for row in rows]
+        )
+        if not is_channel_poll_vote(message)
+        and not is_channel_poll_close(message)
+    ]
     matches = [
         message
         for message in messages
@@ -3086,6 +3131,19 @@ class ChannelApp:
         conn = self.connect()
         try:
             return channel_messages_all(conn, channel)
+        finally:
+            conn.close()
+
+    def visible_history(self, channel: str) -> List[Dict[str, Any]]:
+        """Every stored message for *channel* that history shows.
+
+        Like :meth:`all_history` but with the history lifecycle
+        applied — expired and retracted messages are gone — for
+        deriving state (poll tallies) from what a reader can see.
+        """
+        conn = self.connect()
+        try:
+            return channel_messages_visible(conn, channel)
         finally:
             conn.close()
 

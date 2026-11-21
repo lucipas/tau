@@ -422,6 +422,54 @@ def test_search_respects_limit_and_excluded_authors(identities, tmp_path):
     ] == ["mesh three", "mesh one"]
 
 
+def test_search_returns_more_than_history_page(identities, tmp_path):
+    # A search limit above the history page size is honoured up to
+    # the store bound — the page size must never silently truncate a
+    # search.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    for n in range(55):
+        create_message(
+            conn, alice, "general", f"mesh note {n}", name="alice", now=1000 + n
+        )
+    assert len(search_channel_messages(conn, "general", "mesh", limit=100)) == 55
+
+
+def test_search_excludes_poll_votes_before_limit(identities, tmp_path):
+    # Poll votes and closes are not chat: they are dropped before the
+    # limit, so a run of newer votes can never crowd the matching
+    # chat message out of the results.
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    poll = create_message(
+        conn,
+        alice,
+        "general",
+        "which day?",
+        name="alice",
+        now=1000,
+        poll_options=["Saturday", "Sunday"],
+    )
+    target = {"author": poll["author"], "sent_at": poll["created_at"]}
+    for n in range(3):
+        create_message(
+            conn,
+            bob,
+            "general",
+            "voted: Saturday",
+            name="bob",
+            now=1002 + n,
+            poll_vote={"target": target, "option": 0},
+        )
+    create_message(
+        conn, alice, "general", "saturday works for me", name="alice", now=1001
+    )
+    assert [
+        item["text"]
+        for item in search_channel_messages(conn, "general", "saturday", limit=2)
+    ] == ["saturday works for me"]
+
+
 def test_search_rejects_empty_query(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "channels.sqlite3")
