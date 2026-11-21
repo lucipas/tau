@@ -5182,7 +5182,8 @@ class TauNode:
 
     def _send_scheduled_file(self, entry: Any, staged_path: Path) -> None:
         """One scheduled file transfer: DM via ``send_file``, group
-        via ``send_group_file``.
+        via ``send_group_file``, broadcast list via
+        ``send_broadcast_file``.
 
         The staged bytes are re-read and checked against the queue
         entry's descriptor first, so a staged copy that was replaced
@@ -5194,7 +5195,10 @@ class TauNode:
         time, and refuses to send when the roster no longer matches
         the snapshot — a roster change or name reuse must never
         redirect the file to members who were not in the group when
-        it was queued; the entry stays queued instead.  A fan-out
+        it was queued; the entry stays queued instead.  A broadcast
+        file resolves its list by the name pinned at schedule time
+        and refuses on the same terms: the list must still exist and
+        its members must still match the snapshot.  A fan-out
         that reaches only some members raises :class:`PartialSend`
         carrying the delivered ones, so the retry sends only to the
         members still owed.
@@ -5235,6 +5239,55 @@ class TauNode:
                 )
             result = self.send_group_file(
                 group,
+                staged_path,
+                timeout=entry.timeout,
+                discover_timeout=entry.discover_timeout,
+                only=list(entry.pending_members) or None,
+            )
+            if not result.get("ok"):
+                delivered = tuple(
+                    leg["to"]
+                    for leg in result.get("results") or []
+                    if leg.get("delivered")
+                )
+                failed = [
+                    leg
+                    for leg in result.get("results") or []
+                    if not leg.get("delivered")
+                ]
+                detail = "; ".join(
+                    f"{leg.get('to_name') or (leg.get('to') or '')[:8]}: "
+                    f"{leg.get('error') or 'unknown error'}"
+                    for leg in failed
+                )
+                raise PartialSend(
+                    f"scheduled file {entry.id} failed for "
+                    f"{len(failed)} member(s)"
+                    + (f": {detail}" if detail else ""),
+                    delivered_members=delivered,
+                )
+            return
+        if entry.kind == "broadcast":
+            if not entry.group_members:
+                raise NodeError(
+                    f"scheduled file {entry.id} has no member snapshot; "
+                    "cancel it and schedule it again"
+                )
+            try:
+                broadcast = self.broadcasts.find(entry.target)
+            except ValueError as exc:
+                raise NodeError(
+                    f"scheduled file {entry.id} broadcast list no longer "
+                    "exists; it stays queued until cancelled"
+                ) from exc
+            if sorted(broadcast["members"]) != sorted(entry.group_members):
+                raise NodeError(
+                    f"scheduled file {entry.id} broadcast list members "
+                    "changed since scheduling; it stays queued until "
+                    "cancelled"
+                )
+            result = self.send_broadcast_file(
+                broadcast,
                 staged_path,
                 timeout=entry.timeout,
                 discover_timeout=entry.discover_timeout,
@@ -9752,6 +9805,7 @@ class TauNode:
         *,
         timeout: float = _FILE_TRANSFER_TIMEOUT,
         discover_timeout: Optional[float] = None,
+        only: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Fan a file out to every member of a broadcast list.
 
@@ -9768,9 +9822,12 @@ class TauNode:
         deadline discipline from ``send_group_file``, so one slow
         member cannot consume another member's window.  The file is
         read once up front, so every leg carries the same bytes even
-        if the file changes mid-fan-out.  Returns a per-member result
-        list: ``delivered`` (with the transfer id, name, size and
-        sha256) or an ``error`` for that leg.
+        if the file changes mid-fan-out.  With *only* set, legs go
+        only to those member hashes — a scheduled retry's still-owed
+        members, so a partial fan-out never redelivers to members who
+        already received the file.  Returns a per-member result list:
+        ``delivered`` (with the transfer id, name, size and sha256)
+        or an ``error`` for that leg.
         """
         if isinstance(broadcast, str):
             broadcast = self.broadcasts.find(broadcast)
@@ -9780,6 +9837,9 @@ class TauNode:
         data, name, digest = _read_file_payload(path)
         own_hash = self.destination_hexhash
         members = [m for m in broadcast["members"] if m != own_hash]
+        if only is not None:
+            wanted = set(only)
+            members = [m for m in members if m in wanted]
         results, all_ok = self._fan_out_file(
             members,
             data,

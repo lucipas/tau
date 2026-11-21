@@ -102,7 +102,7 @@ def test_schedule_rejects_bad_kind(tmp_path):
         schedule_file(
             tmp_path / "scheduled-files.json",
             target="alice",
-            kind="broadcast",
+            kind="channel",
             file=dict(FILE),
             publish_at=2000.0,
         )
@@ -528,6 +528,124 @@ def test_node_send_group_refuses_unknown_group(tmp_path):
     with pytest.raises(NodeError, match="no longer exists"):
         TauNode._send_scheduled_file(
             node, group_entry, staged_dir / entry.id / "notes.txt"
+        )
+
+
+def test_node_send_broadcast_partial_failure_raises(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    members = ("a" * 32, "b" * 32, "c" * 32)
+    broadcast_entry = ScheduledFile(
+        **{
+            **entry.to_dict(),
+            "kind": "broadcast",
+            "target": "team",
+            "group_members": members,
+        }
+    )
+
+    def _fail_broadcast(broadcast, staged, **kwargs):
+        assert broadcast["name"] == "team"
+        return {
+            "ok": False,
+            "results": [
+                {"to": "a" * 32, "to_name": "alice", "delivered": True},
+                {"to": "b" * 32, "to_name": "bob", "error": "no route"},
+                {"to": "c" * 32, "to_name": "carol", "error": "no route"},
+            ],
+        }
+
+    node = _fake_node(
+        tmp_path, path, staged_dir, send_broadcast_file=_fail_broadcast
+    )
+    # The fake node resolves the list by name and reports its members.
+    record = {"name": "team", "members": list(members)}
+
+    def _find(query):
+        if query == "team":
+            return record
+        raise ValueError(f"unknown broadcast list: {query!r}")
+
+    node.broadcasts = SimpleNamespace(find=_find)
+    staged = staged_dir / entry.id / "notes.txt"
+    with pytest.raises(PartialSend, match="2 member") as caught:
+        TauNode._send_scheduled_file(node, broadcast_entry, staged)
+    assert caught.value.delivered_members == ("a" * 32,)
+
+
+def test_node_send_broadcast_uses_entry_timeouts_and_pending(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    seen = {}
+
+    def _send_broadcast(broadcast, staged, **kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "results": []}
+
+    node = _fake_node(
+        tmp_path, path, staged_dir, send_broadcast_file=_send_broadcast
+    )
+    members = ("a" * 32, "b" * 32)
+    record = {"name": "team", "members": list(members)}
+    node.broadcasts = SimpleNamespace(find=lambda query: record)
+    entry = ScheduledFile(
+        **{
+            **entry.to_dict(),
+            "kind": "broadcast",
+            "target": "team",
+            "group_members": members,
+            "pending_members": ("b" * 32,),
+            "timeout": 60.0,
+            "discover_timeout": 5.0,
+        }
+    )
+    TauNode._send_scheduled_file(
+        node, entry, staged_dir / entry.id / "notes.txt"
+    )
+    assert seen == {
+        "timeout": 60.0,
+        "discover_timeout": 5.0,
+        "only": ["b" * 32],
+    }
+
+
+def test_node_send_broadcast_refuses_changed_members(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    members = ("a" * 32, "b" * 32)
+    broadcast_entry = ScheduledFile(
+        **{
+            **entry.to_dict(),
+            "kind": "broadcast",
+            "target": "team",
+            "group_members": members,
+        }
+    )
+    record = {"name": "team", "members": ["a" * 32, "e" * 32]}
+    node = _fake_node(tmp_path, path, staged_dir)
+    node.broadcasts = SimpleNamespace(find=lambda query: record)
+    with pytest.raises(NodeError, match="members changed"):
+        TauNode._send_scheduled_file(
+            node, broadcast_entry, staged_dir / entry.id / "notes.txt"
+        )
+
+
+def test_node_send_broadcast_refuses_unknown_list(tmp_path):
+    path, staged_dir, entry = _seed(tmp_path)
+    broadcast_entry = ScheduledFile(
+        **{
+            **entry.to_dict(),
+            "kind": "broadcast",
+            "target": "team",
+            "group_members": ("a" * 32, "b" * 32),
+        }
+    )
+
+    def _find(query):
+        raise ValueError(f"unknown broadcast list: {query!r}")
+
+    node = _fake_node(tmp_path, path, staged_dir)
+    node.broadcasts = SimpleNamespace(find=_find)
+    with pytest.raises(NodeError, match="no longer exists"):
+        TauNode._send_scheduled_file(
+            node, broadcast_entry, staged_dir / entry.id / "notes.txt"
         )
 
 
