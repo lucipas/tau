@@ -118,6 +118,14 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/drafts       save a message draft ``{"kind": "peer"|"group"|"channel",
                            "target": "<hash | id | name>", "text": "..."}``
     POST /api/drafts/delete discard a message draft ``{"kind", "target"}``
+    GET  /api/reminders    pending message reminders, soonest first
+                           (``tau remind list``)
+    POST /api/reminders    snooze a stored message ``{"id": <console message id>,
+                           "in_seconds": 3600}`` or ``{"id": ..., "at":
+                           "2026-11-21T09:00"}`` (``tau remind add`` from the
+                           console)
+    POST /api/reminders/cancel drop a pending reminder ``{"id": "<reminder id |
+                           prefix>"}``
     GET  /api/messages/muted muted DM conversations, groups and channels
     POST /api/messages/mute mute ``{"peer": "<name or hash>"}``,
                            ``{"group": "<id | prefix | name>"}`` or
@@ -311,6 +319,12 @@ from .disappearing import (
     save_disappearing_defaults,
 )
 from .drafts import DRAFT_KINDS, DraftStore
+from .reminders import (
+    MAX_REMINDER_DELAY,
+    ReminderError,
+    ReminderStore,
+    parse_remind_at,
+)
 from .muted import (
     MutedError,
     expand_muted_groups,
@@ -368,6 +382,7 @@ from .config import (
     PINNED_FILE_NAME,
     PROFILE_FILE_NAME,
     QUIET_HOURS_FILE_NAME,
+    REMINDERS_FILE_NAME,
     accept_files_enabled,
     announce_interval,
     send_read_receipts_enabled,
@@ -10190,6 +10205,247 @@ class WebBridge:
         store = DraftStore(path)
         return {"deleted": store.delete(kind, target)}
 
+    def _reminders_path(self) -> Optional[Path]:
+        """This node's message-reminders path, or ``None`` for a dataless node."""
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "reminders_path", None)
+        if path is not None:
+            return Path(path)
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / REMINDERS_FILE_NAME
+
+    def _describe_reminder(self, reminder: Dict[str, Any]) -> Dict[str, Any]:
+        """A reminder plus its conversation's display name, for the console.
+
+        Mirrors the CLI's ``_describe_reminder``: the peer's registry
+        name, the group name, or a short hash when neither is known.
+        """
+        names: Dict[str, str] = {}
+        for peer in self.peers():
+            destination = peer.get("destination")
+            if isinstance(destination, str):
+                names[destination] = str(peer.get("name") or destination)
+        for record in self._group_records():
+            group_id = record.get("id")
+            if isinstance(group_id, str):
+                names[group_id] = str(record.get("name") or group_id)
+        return {
+            "id": reminder["id"],
+            "message_id": reminder["message_id"],
+            "kind": reminder["kind"],
+            "target": reminder["target"],
+            "target_name": names.get(reminder["target"])
+            or short_hash(reminder["target"]),
+            "text": reminder["text"],
+            "sender": reminder["sender"],
+            "due_at": reminder["due_at"],
+            "created_at": reminder["created_at"],
+        }
+
+    def _reminder_sender_blocked(
+        self, reminder: Dict[str, Any], blocked: Any
+    ) -> bool:
+        """Whether a reminder's sender is blocked now (fail closed).
+
+        Mirrors the CLI: a DM reminder's target is the sender, while a
+        group reminder names the group, so the sender is read from the
+        stored message — and when that message is gone its sender is
+        unknown, so the reminder stays hidden.
+        """
+        if reminder["kind"] != "group":
+            return reminder["target"] in blocked
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return True
+        entry = inbox.find(
+            str(reminder["message_id"]), group=str(reminder["target"])
+        )
+        if entry is None:
+            return True
+        return entry.get("destination") in blocked
+
+    def list_reminders(self) -> Dict[str, Any]:
+        """Pending message reminders, soonest first, with display names.
+
+        A reminder whose sender is blocked now stays hidden, like the
+        message itself; an unreadable block-list hides everything.  A
+        dataless node has no reminders file and answers empty instead
+        of failing the console poll.
+        """
+        path = self._reminders_path()
+        if path is None:
+            return {"reminders": [], "count": 0}
+        config = getattr(self.node, "config", None)
+        blocklist_path = getattr(config, "blocklist_path", None)
+        blocked = (
+            load_blocked_set(blocklist_path)
+            if blocklist_path is not None
+            else frozenset()
+        )
+        store = ReminderStore(path)
+        reminders = [
+            self._describe_reminder(reminder)
+            for reminder in store.list_reminders()
+            if blocked is not None
+            and not self._reminder_sender_blocked(reminder, blocked)
+        ]
+        return {"reminders": reminders, "count": len(reminders)}
+
+    def add_reminder(
+        self, message: Any, *, in_seconds: Any = None, at: Any = None
+    ) -> Dict[str, Any]:
+        """Snooze one stored DM or group message from the console.
+
+        Mirrors ``tau remind add``: the console message id resolves to
+        its inbox record, and the same refusals apply — a file message
+        has no text to be reminded about, a private note never leaves
+        the node, a message you sent has no received copy to re-ping,
+        and a message from a blocked peer is hidden locally.  Exactly
+        one of ``in_seconds`` (a delay in seconds, at most 30 days) or
+        ``at`` (an ISO 8601 time, like the CLI's ``--at``) sets the due
+        time.  A bad message, due time, or reminder is a
+        :class:`ValueError`; a failed write and a dataless node are
+        :class:`WebBridgeError`.
+        """
+        path = self._reminders_path()
+        if path is None:
+            raise WebBridgeError("this node has no reminders path")
+        if (
+            not isinstance(message, int)
+            or isinstance(message, bool)
+            or message < 1
+        ):
+            raise ValueError("message id is required")
+        with self._lock:
+            entry = next(
+                (
+                    item
+                    for item in self._messages
+                    if item.get("id") == message
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError(f"unknown message: {message!r}")
+            if entry.get("direction") != "in":
+                raise ValueError(
+                    "cannot remind on a message you sent: remind on a received message"
+                )
+            if entry.get("file"):
+                raise ValueError("cannot remind on a file message: it has no text")
+            wire_id = entry.get("wire_id")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError(
+                f"message {message!r} has no stored copy to remind on"
+            )
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise WebBridgeError("this node has no message inbox")
+        try:
+            record = inbox.resolve(wire_id)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if not record.get("text"):
+            raise ValueError("cannot remind on a file message: it has no text")
+        if record.get("kind") == "note":
+            raise ValueError(
+                "cannot remind on a private note: remind on a DM or group message"
+            )
+        if record.get("direction") == "out":
+            raise ValueError(
+                "cannot remind on a message you sent: remind on a received message"
+            )
+        config = getattr(self.node, "config", None)
+        blocklist_path = getattr(config, "blocklist_path", None)
+        blocked = (
+            load_blocked_set(blocklist_path)
+            if blocklist_path is not None
+            else frozenset()
+        )
+        if blocked is None:
+            raise ValueError("cannot remind: the block-list could not be read")
+        if record.get("destination") in blocked:
+            raise ValueError("cannot remind on a message from a blocked peer")
+        if record.get("kind") == "group":
+            kind, target = "group", str(record.get("group") or "")
+        else:
+            kind, target = "peer", str(record.get("destination") or "")
+        sender_hash = record.get("destination")
+        stored_name = record.get("from")
+        if not stored_name or stored_name == "unknown":
+            sender_label = (
+                short_hash(sender_hash)
+                if isinstance(sender_hash, str) and sender_hash
+                else "unknown"
+            )
+        else:
+            sender_label = str(stored_name)
+        peer = (
+            self.node.registry.get(sender_hash)
+            if isinstance(sender_hash, str) and sender_hash
+            else None
+        )
+        if peer is not None:
+            sender_label = peer.display_name
+        if (in_seconds is None) == (at is None):
+            raise ValueError("give exactly one of 'in_seconds' or 'at'")
+        if in_seconds is not None:
+            if (
+                isinstance(in_seconds, bool)
+                or not isinstance(in_seconds, (int, float))
+                or not math.isfinite(in_seconds)
+            ):
+                raise ValueError("'in_seconds' must be a number of seconds")
+            now = time.time()
+            due = now + float(in_seconds)
+            if due <= now or due - now > MAX_REMINDER_DELAY:
+                raise ValueError("reminder must be in the future and within 30d")
+        else:
+            if not isinstance(at, str):
+                raise ValueError("'at' must be an ISO 8601 time")
+            try:
+                due = parse_remind_at(at)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+        store = ReminderStore(path)
+        try:
+            reminder = store.add(
+                message_id=str(record.get("id") or ""),
+                kind=kind,
+                target=target,
+                text=str(record.get("text") or ""),
+                sender=sender_label,
+                due_at=due,
+            )
+        except ReminderError as exc:
+            raise ValueError(str(exc)) from exc
+        except OSError as exc:
+            raise WebBridgeError(f"could not save the reminder ({exc})") from exc
+        return self._describe_reminder(reminder)
+
+    def cancel_reminder(self, ref: Any) -> Dict[str, Any]:
+        """Drop a pending reminder by full id or unique prefix.
+
+        Returns the cancelled reminder with its conversation name.  An
+        unknown id or ambiguous prefix is a :class:`ValueError`; a
+        failed write and a dataless node are :class:`WebBridgeError`.
+        """
+        path = self._reminders_path()
+        if path is None:
+            raise WebBridgeError("this node has no reminders path")
+        if not isinstance(ref, str) or not ref.strip():
+            raise ValueError("reminder id is required")
+        store = ReminderStore(path)
+        try:
+            removed = store.cancel(ref)
+        except ReminderError as exc:
+            raise ValueError(str(exc)) from exc
+        except OSError as exc:
+            raise WebBridgeError(f"could not cancel the reminder ({exc})") from exc
+        return self._describe_reminder(removed)
+
     def _muted_path(self) -> Optional[Path]:
         """This node's muted-conversations path, or ``None`` for a dataless node."""
         config = getattr(self.node, "config", None)
@@ -13206,6 +13462,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(result, head_only)
                 return
+            if path == "/api/reminders":
+                try:
+                    result = self.bridge.list_reminders()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(result, head_only)
+                return
             if path == "/api/messages/export":
                 # The full inbox backup goes only to the local machine,
                 # even when the bridge is bound to a remote interface.
@@ -14189,6 +14453,36 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "draft": draft}, head_only)
+                return
+            if path == "/api/reminders":
+                try:
+                    reminder = self.bridge.add_reminder(
+                        body.get("id"),
+                        in_seconds=body.get("in_seconds"),
+                        at=body.get("at"),
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "reminder": reminder}, head_only)
+                return
+            if path == "/api/reminders/cancel":
+                try:
+                    cancelled = self.bridge.cancel_reminder(body.get("id"))
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "cancelled": cancelled}, head_only)
                 return
             if path == "/api/drafts/delete":
                 try:

@@ -47,6 +47,7 @@ import type {
   PeerInfo,
   PingResult,
   QuietHoursSettings,
+  Reminder,
   SafetyNumberResult,
   ScheduledChannelMessage,
   ScheduledTanPost,
@@ -816,6 +817,29 @@ export async function deleteDraft(kind: "peer" | "group" | "channel", target: st
     target,
   });
   return data.deleted;
+}
+
+/** Pending message reminders, soonest first (``tau remind list``). */
+export async function getReminders(): Promise<Reminder[]> {
+  const data = await get<{ reminders: Reminder[]; count: number }>("/api/reminders");
+  return data.reminders ?? [];
+}
+
+/** Snooze a stored message: be re-pinged about it after this many seconds. */
+export async function addReminder(messageId: number, inSeconds: number): Promise<Reminder> {
+  const data = await post<{ ok: boolean; reminder: Reminder }>("/api/reminders", {
+    id: messageId,
+    in_seconds: inSeconds,
+  });
+  return data.reminder;
+}
+
+/** Drop a pending reminder by full id or unique prefix. */
+export async function cancelReminder(id: string): Promise<Reminder> {
+  const data = await post<{ ok: boolean; cancelled: Reminder }>("/api/reminders/cancel", {
+    id,
+  });
+  return data.cancelled;
 }
 
 export async function setMuted(

@@ -7,6 +7,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   acceptDmRequest,
+  addReminder,
+  cancelReminder,
   clearReaction,
   closeDmPoll,
   closeGroupPoll,
@@ -19,6 +21,7 @@ import {
   getArchivedConversations,
   getDrafts,
   getMutedConversations,
+  getReminders,
   joinGroupViaLink,
   pinMessage,
   reactToMessage,
@@ -32,7 +35,7 @@ import {
   voteGroupPoll,
   type SendMessageOptions,
 } from "@/lib/api";
-import type { ChatMessage, MessageDraft } from "@/lib/types";
+import type { ChatMessage, MessageDraft, Reminder } from "@/lib/types";
 import {
   buildConversations,
   useBeacons,
@@ -51,6 +54,7 @@ import DraftsPanel from "./DraftsPanel";
 import MessageSearch from "./MessageSearch";
 import NewGroupPanel from "./NewGroupPanel";
 import OutboxPanel from "./OutboxPanel";
+import RemindersPanel from "./RemindersPanel";
 import ThreadView from "./ThreadView";
 import type { MessageAction } from "./MessageBubble";
 import type { ComposerSendOptions } from "./Composer";
@@ -125,6 +129,8 @@ export default function ChatSection() {
   const [error, setError] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<MessageDraft[]>([]);
   const [draftsLoading, setDraftsLoading] = useState(true);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [remindersLoading, setRemindersLoading] = useState(true);
   const [pendingSeed, setPendingSeed] = useState<{ key: string; text: string } | null>(null);
   // The key of a draft saved from this composer: the seed effect must
   // not pour it straight back into the box the composer just cleared
@@ -213,6 +219,20 @@ export default function ChatSection() {
     void refreshDrafts();
   }, [refreshDrafts]);
 
+  const refreshReminders = useCallback(async () => {
+    try {
+      setReminders(await getReminders());
+    } catch {
+      // Reminders are advisory; the chat list works without them.
+    } finally {
+      setRemindersLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshReminders();
+  }, [refreshReminders]);
+
   // A conversation with a saved draft loads it into the composer when
   // opened; a conversation without one clears the seed. A draft saved
   // from this composer is already parked, so it must not re-seed the
@@ -261,6 +281,34 @@ export default function ChatSection() {
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [refreshDrafts],
+  );
+
+  const handleOpenReminder = useCallback(
+    (reminder: Reminder) => {
+      if (reminder.kind === "group") navigate("chat", { group: reminder.target });
+      else navigate("chat", { peer: reminder.target });
+    },
+    [navigate],
+  );
+
+  const handleCancelReminder = useCallback(
+    (reminder: Reminder) => {
+      void run("Cancel reminder failed", () => cancelReminder(reminder.id)).then(() =>
+        void refreshReminders(),
+      );
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [refreshReminders],
+  );
+
+  const handleSnooze = useCallback(
+    (message: ChatMessage, inSeconds: number) => {
+      void run("Snooze failed", () => addReminder(message.id, inSeconds)).then(() =>
+        void refreshReminders(),
+      );
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [refreshReminders],
   );
 
   const handleSaveDraft = useCallback(
@@ -630,6 +678,12 @@ export default function ChatSection() {
           onOpen={handleOpenDraft}
           onDelete={handleDeleteDraft}
         />
+        <RemindersPanel
+          reminders={reminders}
+          loading={remindersLoading}
+          onOpen={handleOpenReminder}
+          onCancel={handleCancelReminder}
+        />
         {!searchActive && (
           <div className="min-h-0 flex-1">
             <ConversationList
@@ -688,6 +742,7 @@ export default function ChatSection() {
                 onForward={handleForward}
                 onReact={handleReact}
                 onClearReaction={handleClearReaction}
+                onSnooze={handleSnooze}
                 onVotePoll={handleVotePoll}
                 onClosePoll={handleClosePoll}
                 onSend={handleSend}

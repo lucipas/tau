@@ -33,6 +33,8 @@ export interface ThreadViewProps {
   onForward: (message: ChatMessage, target: string) => void;
   onReact: (message: ChatMessage, reaction: string) => void;
   onClearReaction: (message: ChatMessage) => void;
+  /** Snooze a received message; undefined hides the snooze action. */
+  onSnooze?: (message: ChatMessage, inSeconds: number) => void;
   /** Voting/closing a poll; undefined disables voting in the bubble. */
   onVotePoll?: (message: ChatMessage, option: number) => void;
   onClosePoll?: (message: ChatMessage) => void;
@@ -59,6 +61,7 @@ export default function ThreadView({
   onForward,
   onReact,
   onClearReaction,
+  onSnooze,
   onVotePoll,
   onClosePoll,
   onSend,
@@ -146,6 +149,7 @@ export default function ThreadView({
               onForward={onForward}
               onReact={onReact}
               onClearReaction={onClearReaction}
+              onSnooze={onSnooze}
               onVotePoll={onVotePoll}
               onClosePoll={onClosePoll}
             />

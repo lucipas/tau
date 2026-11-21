@@ -33,11 +33,28 @@ export interface MessageBubbleProps {
   onReact?: (message: ChatMessage, reaction: string) => void;
   onClearReaction?: (message: ChatMessage) => void;
   onForward?: (message: ChatMessage, target: string) => void;
+  /** Snooze a received message: re-ping about it after this many seconds. */
+  onSnooze?: (message: ChatMessage, inSeconds: number) => void;
   onVotePoll?: (message: ChatMessage, option: number) => void;
   onClosePoll?: (message: ChatMessage) => void;
 }
 
 const REACTION_CHOICES = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
+
+/** Seconds until the next 09:00 local time (today, or tomorrow when past it). */
+export function secondsUntilTomorrowNine(from = new Date()): number {
+  const target = new Date(from);
+  target.setHours(9, 0, 0, 0);
+  if (target.getTime() <= from.getTime()) target.setDate(target.getDate() + 1);
+  return Math.max(60, Math.round((target.getTime() - from.getTime()) / 1000));
+}
+
+const SNOOZE_PRESETS: { label: string; seconds: number | "tomorrow" }[] = [
+  { label: "30 min", seconds: 30 * 60 },
+  { label: "1 hour", seconds: 60 * 60 },
+  { label: "3 hours", seconds: 3 * 60 * 60 },
+  { label: "Tomorrow 9am", seconds: "tomorrow" },
+];
 
 function groupReactions(message: ChatMessage): { reaction: string; count: number; names: string[] }[] {
   const map = new Map<string, { count: number; names: string[] }>();
@@ -61,6 +78,7 @@ export default function MessageBubble({
   onReact,
   onClearReaction,
   onForward,
+  onSnooze,
   onVotePoll,
   onClosePoll,
 }: MessageBubbleProps) {
@@ -69,6 +87,7 @@ export default function MessageBubble({
   const [menuOpen, setMenuOpen] = useState(false);
   const [reactOpen, setReactOpen] = useState(false);
   const [forwardOpen, setForwardOpen] = useState(false);
+  const [snoozeOpen, setSnoozeOpen] = useState(false);
   const [forwardTarget, setForwardTarget] = useState("");
 
   const own = message.direction === "out";
@@ -205,7 +224,7 @@ export default function MessageBubble({
             type="button"
             aria-label={`Actions for message ${message.id}`}
             aria-expanded={menuOpen}
-            onClick={() => { setMenuOpen((v) => !v); setReactOpen(false); setForwardOpen(false); }}
+            onClick={() => { setMenuOpen((v) => !v); setReactOpen(false); setForwardOpen(false); setSnoozeOpen(false); }}
             className="rounded px-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
           >
             ⋯
@@ -239,8 +258,30 @@ export default function MessageBubble({
             )}
             <button type="button" onClick={() => { onAction?.("delete", message); setMenuOpen(false); }} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">Delete</button>
             <button type="button" onClick={() => { onAction?.("pin", message); setMenuOpen(false); }} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">{message.pinned ? "Unpin" : "Pin"}</button>
-            <button type="button" onClick={() => { setForwardOpen((v) => !v); setReactOpen(false); }} aria-expanded={forwardOpen} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">Forward</button>
-            <button type="button" onClick={() => { setReactOpen((v) => !v); setForwardOpen(false); }} aria-expanded={reactOpen} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">React</button>
+            {!own && (
+              <button type="button" onClick={() => { setSnoozeOpen((v) => !v); setReactOpen(false); setForwardOpen(false); }} aria-expanded={snoozeOpen} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">Snooze</button>
+            )}
+            <button type="button" onClick={() => { setForwardOpen((v) => !v); setReactOpen(false); setSnoozeOpen(false); }} aria-expanded={forwardOpen} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">Forward</button>
+            <button type="button" onClick={() => { setReactOpen((v) => !v); setForwardOpen(false); setSnoozeOpen(false); }} aria-expanded={reactOpen} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">React</button>
+          </div>
+        )}
+
+        {snoozeOpen && (
+          <div className="mt-1 flex flex-wrap gap-1 rounded-lg border border-zinc-700 bg-zinc-900 p-1" role="group" aria-label="Snooze for">
+            {SNOOZE_PRESETS.map((preset) => (
+              <button
+                key={preset.label}
+                type="button"
+                onClick={() => {
+                  onSnooze?.(message, preset.seconds === "tomorrow" ? secondsUntilTomorrowNine() : preset.seconds);
+                  setSnoozeOpen(false);
+                  setMenuOpen(false);
+                }}
+                className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+              >
+                {preset.label}
+              </button>
+            ))}
           </div>
         )}
 

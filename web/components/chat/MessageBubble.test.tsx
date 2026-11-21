@@ -1,7 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import MessageBubble from "./MessageBubble";
+import MessageBubble, { secondsUntilTomorrowNine } from "./MessageBubble";
 import { makeMessage } from "../test-utils";
+
+describe("secondsUntilTomorrowNine", () => {
+  it("returns the seconds until 09:00, today or tomorrow", () => {
+    expect(secondsUntilTomorrowNine(new Date("2026-11-21T08:00:00"))).toBe(3600);
+    expect(secondsUntilTomorrowNine(new Date("2026-11-21T10:00:00"))).toBe(23 * 3600);
+    expect(secondsUntilTomorrowNine(new Date("2026-11-21T09:00:00"))).toBe(24 * 3600);
+  });
+});
 
 describe("MessageBubble", () => {
   it("renders the text and timestamp, and the action menu for own messages", () => {
@@ -33,6 +41,35 @@ describe("MessageBubble", () => {
     expect(screen.queryByText("Edit")).toBeNull();
     expect(screen.queryByText("Retract")).toBeNull();
     expect(screen.getByText("Reply")).toBeTruthy();
+  });
+
+  it("offers snooze on incoming messages and calls onSnooze with the preset", () => {
+    const onSnooze = vi.fn();
+    render(
+      <MessageBubble
+        message={makeMessage({ id: 8, direction: "in", text: "their message" })}
+        onSnooze={onSnooze}
+        now={1700000060}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("Actions for message 8"));
+    fireEvent.click(screen.getByText("Snooze"));
+    expect(screen.getByText("30 min")).toBeTruthy();
+    expect(screen.getByText("Tomorrow 9am")).toBeTruthy();
+    fireEvent.click(screen.getByText("1 hour"));
+    expect(onSnooze).toHaveBeenCalledWith(expect.objectContaining({ id: 8 }), 3600);
+  });
+
+  it("does not offer snooze on own messages", () => {
+    render(
+      <MessageBubble
+        message={makeMessage({ id: 7, direction: "out", text: "my message", sent_at: 1700000000 })}
+        onSnooze={() => undefined}
+        now={1700000060}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("Actions for message 7"));
+    expect(screen.queryByText("Snooze")).toBeNull();
   });
 
   it("shows grouped reactions and a file download link", () => {
