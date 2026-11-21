@@ -3985,6 +3985,230 @@ def test_deferred_local_apply_kept_when_local_write_fails(
     assert node.mailbox.pending_local_edits() == []
 
 
+def test_deferred_local_apply_restored_when_oserror_escapes(
+    tmp_path, monkeypatch
+):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "edited": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(peer, entry, 1.0, deadline=time.monotonic() + 0.2)
+        is True
+    )
+    assert len(node.mailbox.pending_local_edits()) == 1
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+
+    # An OSError escaping the local apply must not lose the retry:
+    # the claimed record is restored, and a later round applies it
+    # once the disk failure clears.
+    real_apply = node._record_sent_edit_locally
+    calls = []
+
+    def flaky_apply(target, cleaned, edited_at, *, peer_hex):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("simulated disk failure")
+        return real_apply(target, cleaned, edited_at, peer_hex=peer_hex)
+
+    monkeypatch.setattr(node, "_record_sent_edit_locally", flaky_apply)
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("m-1")["text"] == "fixed here"
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_deferred_local_apply_restored_when_inbox_apply_raises_oserror(
+    tmp_path, monkeypatch
+):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "edited": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(peer, entry, 1.0, deadline=time.monotonic() + 0.2)
+        is True
+    )
+    assert len(node.mailbox.pending_local_edits()) == 1
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+
+    # An OSError from the inbox itself (e.g. its lock file cannot
+    # be opened) is a local failure, not a reason to lose the retry.
+    real_apply_edit = node.inbox.apply_edit
+    calls = []
+
+    def flaky_apply_edit(message_id, text, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("simulated disk failure")
+        return real_apply_edit(message_id, text, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "apply_edit", flaky_apply_edit)
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("m-1")["text"] == "fixed here"
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_last_leg_delivery_keeps_pending_record_when_local_apply_fails(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    # The first leg delivers but its sibling check times out: the
+    # local apply is deferred, durably.
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(
+            alice, entries[0], 1.0, deadline=time.monotonic() + 0.2
+        )
+        is True
+    )
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+
+    # The last leg delivers, but the local apply fails once: the
+    # pending record must survive for a later flush instead of
+    # being dropped with the fan-out.
+    real_apply = node._record_sent_edit_locally
+    calls = []
+
+    def flaky_apply(target, cleaned, edited_at, *, peer_hex):
+        calls.append(1)
+        if len(calls) == 1:
+            return ["inbox copy not updated: simulated failure"]
+        return real_apply(target, cleaned, edited_at, peer_hex=peer_hex)
+
+    monkeypatch.setattr(node, "_record_sent_edit_locally", flaky_apply)
+    assert node._deliver_entry(bob, entries[1], 1.0) is True
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+
+    # A later flush retries the apply — no resend — and clears it.
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("leg-1")["text"] == "fixed here"
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_deferred_local_apply_of_file_message_is_dropped(tmp_path):
+    node, peer = _edit_node(tmp_path)
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "kind": "file",
+            "name": "notes.txt",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "files/holder/notes.txt",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+    node.mailbox.record_sent("m-1", to=peer.destination_hash, text="notes.txt")
+    assert node.mailbox.add_pending_local_edit(
+        {
+            "edit_id": "edit-file",
+            "target": "m-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": peer.destination_hash.hex(),
+        }
+    )
+    # A file record has no text to edit, so the apply can never
+    # succeed: the record is dropped instead of restored, and a
+    # later round does not resurrect it.
+    node._retry_pending_local_edits()
+    assert node.mailbox.pending_local_edits() == []
+    assert node.inbox.resolve("m-1").get("text") is None
+    node._retry_pending_local_edits()
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_deferred_local_apply_of_missing_message_is_dropped(tmp_path):
+    node, peer = _edit_node(tmp_path)
+    assert node.mailbox.add_pending_local_edit(
+        {
+            "edit_id": "edit-gone",
+            "target": "gone-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": peer.destination_hash.hex(),
+        }
+    )
+    # The message left local history, so there is nothing to update:
+    # the record is dropped instead of retried forever.
+    node._retry_pending_local_edits()
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_deferred_local_apply_with_empty_text_is_dropped(tmp_path):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+    assert node.mailbox.add_pending_local_edit(
+        {
+            "edit_id": "edit-empty",
+            "target": "m-1",
+            "text": "",
+            "sent_at": 100.0,
+            "peer_hex": peer.destination_hash.hex(),
+        }
+    )
+    # An empty replacement can never apply, so the malformed record
+    # is dropped instead of retried forever; the original stands.
+    node._retry_pending_local_edits()
+    assert node.mailbox.pending_local_edits() == []
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
 def test_cancel_between_sibling_timeout_and_insert_does_not_resurrect_edit(
     tmp_path, monkeypatch
 ):
