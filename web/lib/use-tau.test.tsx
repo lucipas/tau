@@ -448,7 +448,7 @@ describe("useBroadcasts", () => {
       refreshDone = result.current.refresh();
     });
     await waitFor(() => expect(listsCalls).toHaveLength(2));
-    let renameDone: Promise<void>;
+    let renameDone: Promise<string>;
     act(() => {
       renameDone = result.current.rename("team", "squad");
     });

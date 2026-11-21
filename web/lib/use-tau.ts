@@ -629,7 +629,7 @@ export interface UseBroadcastsResult {
   refresh: () => Promise<void>;
   create: (name: string, members: string[]) => Promise<void>;
   remove: (name: string) => Promise<void>;
-  rename: (name: string, newName: string) => Promise<void>;
+  rename: (name: string, newName: string) => Promise<string>;
   send: (name: string, text: string) => Promise<BroadcastSendResponse>;
 }
 
@@ -681,6 +681,9 @@ export function useBroadcasts(): UseBroadcastsResult {
       // Invalidate any refresh already in flight: it may resolve with a
       // pre-rename snapshot after the rename commits.
       generationRef.current += 1;
+      // Return the stored name: the server normalises it (collapsed spaces,
+      // length cap), and the panel keys drafts and send results by that name.
+      let storedName: string;
       try {
         // The rename is committed server-side once this resolves, so apply
         // the stored list from the response; a failed refresh must not
@@ -689,6 +692,7 @@ export function useBroadcasts(): UseBroadcastsResult {
         setBroadcasts((prev) =>
           prev.map((entry) => (entry.name === previous_name ? broadcast : entry)),
         );
+        storedName = broadcast.name;
       } catch (err) {
         // Re-sync on failure: the invalidated refresh above must not
         // leave a stale snapshot (or a stuck loading state) behind.
@@ -696,6 +700,7 @@ export function useBroadcasts(): UseBroadcastsResult {
         throw err;
       }
       await refresh();
+      return storedName;
     },
     [refresh],
   );
