@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,6 +133,7 @@ class _FakeBroadcastNode:
         self.destination_hexhash = OWN_HASH
         self.started = False
         self.calls: list = []
+        self.send_kwargs: list = []
         self.file_calls: list = []
         _FakeBroadcastNode.instances.append(self)
 
@@ -151,6 +153,7 @@ class _FakeBroadcastNode:
 
     def send_message(self, target, text, **kwargs):
         self.calls.append((target, text))
+        self.send_kwargs.append(kwargs)
         return {"ok": True, "echo": text, "_rtt": 0.05}
 
     def send_broadcast_file(self, broadcast, path, **kwargs):
@@ -325,6 +328,99 @@ def test_broadcast_send_fans_out_as_individual_dms(tmp_path, capsys, monkeypatch
 def test_broadcast_send_unknown_list(tmp_path, monkeypatch):
     code = _run_broadcast(tmp_path, monkeypatch, ["send", "nope", "hi"])
     assert code != 0
+
+
+# -- broadcast poll ---------------------------------------------------------
+# Issue #663: `tau broadcast poll` posts a poll to every member of the
+# list, one private DM poll each — the poll surface broadcast lists
+# were missing while DM, group, channel, and Tan all had one.
+
+
+def test_broadcast_poll_fans_out_as_individual_dm_polls(
+    tmp_path, capsys, monkeypatch
+):
+    _create_team(tmp_path, monkeypatch)
+    code = _run_broadcast(
+        tmp_path, monkeypatch, ["poll", "team", "lunch?", "noon", "1pm"]
+    )
+    assert code == 0
+    node = _FakeBroadcastNode.instances[-1]
+    # Members are stored sorted by hash, so the fan-out follows that order.
+    assert node.calls == [
+        (hashed, "lunch?")
+        for hashed in sorted([_PEER_MAP["alice"], _PEER_MAP["bob"]])
+    ]
+    # Every leg carries the same question as a DM poll with the options.
+    assert len(node.send_kwargs) == 2
+    assert all(
+        kwargs.get("poll_options") == ["noon", "1pm"]
+        for kwargs in node.send_kwargs
+    )
+    out = capsys.readouterr().out
+    assert f"delivered to {_PEER_MAP['alice']}" in out
+    assert f"delivered to {_PEER_MAP['bob']}" in out
+    assert node.started is False
+
+
+def test_broadcast_poll_unknown_list(tmp_path, monkeypatch):
+    code = _run_broadcast(
+        tmp_path, monkeypatch, ["poll", "nope", "lunch?", "noon", "1pm"]
+    )
+    assert code != 0
+
+
+def test_broadcast_poll_rejects_bad_options(tmp_path, capsys, monkeypatch):
+    _create_team(tmp_path, monkeypatch)
+    # One option is not a poll.
+    code = _run_broadcast(tmp_path, monkeypatch, ["poll", "team", "lunch?", "noon"])
+    assert code != 0
+    assert "poll" in capsys.readouterr().err.lower()
+    # Duplicate options are not distinct.
+    code = _run_broadcast(
+        tmp_path, monkeypatch, ["poll", "team", "lunch?", "noon", "noon"]
+    )
+    assert code != 0
+    # Nine options exceed the 2-8 rule.
+    code = _run_broadcast(
+        tmp_path,
+        monkeypatch,
+        ["poll", "team", "lunch?", *[f"opt{i}" for i in range(9)]],
+    )
+    assert code != 0
+    # Nothing was sent for any of the rejected polls: validation fails
+    # before a node is even started.
+    assert _FakeBroadcastNode.instances == []
+
+
+def test_broadcast_poll_delay_schedules(tmp_path, monkeypatch):
+    _create_team(tmp_path, monkeypatch)
+    before = time.time()
+    code = _run_broadcast(
+        tmp_path,
+        monkeypatch,
+        ["poll", "team", "lunch?", "noon", "1pm", "--delay", "5m"],
+    )
+    assert code == 0
+    node = _FakeBroadcastNode.instances[-1]
+    assert len(node.send_kwargs) == 2
+    # Both legs carry the same scheduled time, about five minutes out.
+    assert all(
+        kwargs.get("send_after") is not None
+        and before + 290 <= kwargs["send_after"] <= before + 310
+        for kwargs in node.send_kwargs
+    )
+
+
+def test_broadcast_poll_delay_and_no_queue_conflict(tmp_path, monkeypatch):
+    _create_team(tmp_path, monkeypatch)
+    code = _run_broadcast(
+        tmp_path,
+        monkeypatch,
+        ["poll", "team", "lunch?", "noon", "1pm", "--delay", "5m", "--no-queue"],
+    )
+    assert code != 0
+    # The conflict is rejected before a node is started: nothing sent.
+    assert _FakeBroadcastNode.instances == []
 
 
 # -- forward to a broadcast list ----------------------------------------
