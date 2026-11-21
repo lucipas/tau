@@ -66,9 +66,15 @@ def atomic_write_bytes(
 
 
 def atomic_write_text(
-    path: PathLike, text: str, mode: Optional[int] = None, encoding: str = "utf-8"
+    path: PathLike,
+    text: str,
+    mode: Optional[int] = None,
+    encoding: str = "utf-8",
+    restrict_parent: bool = True,
 ) -> Path:
-    return atomic_write_bytes(path, text.encode(encoding), mode=mode)
+    return atomic_write_bytes(
+        path, text.encode(encoding), mode=mode, restrict_parent=restrict_parent
+    )
 
 
 def atomic_write_json(path: PathLike, obj: Any, mode: Optional[int] = None) -> Path:

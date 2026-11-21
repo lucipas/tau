@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -7,8 +9,10 @@ import pytest
 from tau import config
 from tau.config import (
     ANNOUNCE_INTERVAL_DEFAULT,
+    RNS_STAMPS_POLICY,
     TauConfig,
     announce_interval,
+    ensure_rns_stamps_policy,
     parse_host_port,
     render_rns_config,
     set_node_setting,
@@ -63,6 +67,91 @@ def test_render_rns_config_without_interfaces_is_commented():
     assert "[[AutoInterface]]\n    type" not in text
     assert "#   type = AutoInterface" in text
     assert "No interfaces are enabled" in text
+
+
+def test_render_rns_config_includes_zero_cost_stamp_policy():
+    # Reticulum 1.6.1 generates proof-of-work destination stamps by
+    # default; tau opts out (issue #642).
+    text = render_rns_config(auto_interface=False)
+    assert "[stamps]" in text
+    for key, value in RNS_STAMPS_POLICY.items():
+        assert f"{key} = {value}" in text
+
+
+def test_ensure_rns_stamps_policy_appends_missing_section(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.write_text("[reticulum]\n  enable_transport = No\n")
+    assert ensure_rns_stamps_policy(cfg) is True
+    text = cfg.read_text()
+    assert "[reticulum]" in text
+    assert "enable_transport = No" in text
+    assert "[stamps]" in text
+    for key, value in RNS_STAMPS_POLICY.items():
+        assert f"{key} = {value}" in text
+    # Second call is a no-op: the policy is already there.
+    assert ensure_rns_stamps_policy(cfg) is False
+    assert cfg.read_text() == text
+
+
+def test_ensure_rns_stamps_policy_fills_missing_keys_only(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.write_text(
+        "[stamps]\n  destination_value = 25\n\n[interfaces]\n  [[AutoInterface]]\n"
+    )
+    assert ensure_rns_stamps_policy(cfg) is True
+    text = cfg.read_text()
+    # A value the user set by hand is never overridden.
+    assert "destination_value = 25" in text
+    assert "destination_value = 0" not in text
+    for key in ("destination_cost", "pr_value", "pr_cost", "lr_cost"):
+        assert f"{key} = 0" in text
+    assert "[[AutoInterface]]" in text
+
+
+def test_ensure_rns_stamps_policy_recognizes_annotated_header(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.write_text("[ stamps ]  # zero-cost\n  destination_value = 25\n")
+    assert ensure_rns_stamps_policy(cfg) is True
+    text = cfg.read_text()
+    assert text.count("stamps") == 1
+    assert text.count("[") == 1
+    assert "destination_value = 25" in text
+    assert "destination_value = 0" not in text
+    for key in ("destination_cost", "pr_value", "pr_cost", "lr_cost"):
+        assert f"{key} = 0" in text
+
+
+def test_ensure_rns_stamps_policy_preserves_symlink(tmp_path):
+    real = tmp_path / "managed.conf"
+    real.write_text("[reticulum]\n  enable_transport = No\n")
+    link = tmp_path / "config"
+    link.symlink_to(real)
+    assert ensure_rns_stamps_policy(link) is True
+    assert link.is_symlink()
+    assert "[stamps]" in real.read_text()
+
+
+def test_ensure_rns_stamps_policy_keeps_external_modes(tmp_path):
+    # Merging the policy into a symlinked config that lives in a
+    # directory tau does not manage must not tighten that directory or
+    # the file itself (Qodo re-review on #670).
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    os.chmod(managed, 0o755)
+    real = managed / "rns.conf"
+    real.write_text("[reticulum]\n  enable_transport = No\n")
+    os.chmod(real, 0o644)
+    link = tmp_path / "config"
+    link.symlink_to(real)
+    assert ensure_rns_stamps_policy(link) is True
+    assert link.is_symlink()
+    assert "[stamps]" in real.read_text()
+    assert stat.S_IMODE(managed.stat().st_mode) == 0o755
+    assert stat.S_IMODE(real.stat().st_mode) == 0o644
+
+
+def test_ensure_rns_stamps_policy_missing_file_is_noop(tmp_path):
+    assert ensure_rns_stamps_policy(tmp_path / "nope") is False
 
 
 def test_write_rns_config_respects_existing_file(tmp_path):

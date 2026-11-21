@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import socket
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -403,6 +405,25 @@ def parse_host_port(value: str, *, default_host: str = "127.0.0.1") -> Tuple[str
     return host, port
 
 
+# Reticulum 1.6.1 stamp policy (issue #642). RNS 1.6.1 enables
+# proof-of-work stamps for destination announces by default (target value
+# 25.0). Generating one stamp hashes a 768 KiB workblock per attempt, so a
+# single stamp costs minutes of CPU on ordinary hardware — and a fresh
+# node's first announce is withheld until its stamp is ready, which breaks
+# discovery and sends. Tau links are private direct links between tau
+# nodes, not a public mesh, so tau opts out of proof-of-work: stamps are
+# still emitted (the wire format is unchanged), but at zero cost, and tau
+# nodes require zero cost from peers. Revisit if Reticulum ever enforces
+# stamps network-wide.
+RNS_STAMPS_POLICY = {
+    "destination_value": "0",
+    "destination_cost": "0",
+    "pr_value": "0",
+    "pr_cost": "0",
+    "lr_cost": "0",
+}
+
+
 def render_rns_config(
     *,
     tcp_listen: Optional[str] = None,
@@ -427,6 +448,17 @@ def render_rns_config(
         "",
         "[logging]",
         f"  loglevel = {int(loglevel)}",
+        "",
+        "[stamps]",
+        "  # Zero-cost stamps (issue #642): Reticulum 1.6.1 generates",
+        "  # proof-of-work destination stamps by default, which stalls a",
+        "  # fresh node's first announce for minutes. Tau links are",
+        "  # private direct links, so no proof-of-work is required.",
+        "  destination_value = 0",
+        "  destination_cost = 0",
+        "  pr_value = 0",
+        "  pr_cost = 0",
+        "  lr_cost = 0",
         "",
         "[interfaces]",
     ]
@@ -521,6 +553,84 @@ def write_rns_config(
         loglevel=loglevel,
     )
     atomic_write_text(target, text, mode=0o600)
+    return True
+
+
+def ensure_rns_stamps_policy(path: Path) -> bool:
+    """Merge tau's zero-cost stamp policy into an existing RNS config.
+
+    New configs already render the policy (see render_rns_config); configs
+    written before it existed need it added on the next node start, or the
+    node stalls on Reticulum 1.6.1 stamp generation (issue #642). A missing
+    ``[stamps]`` section is appended; an existing one gains only the keys
+    it lacks — a value the user set by hand is never overridden. Returns
+    ``True`` when the file changed. Never raises: a config that cannot be
+    read or written is left untouched (the node still starts, just without
+    the policy).
+    """
+    target = Path(path).expanduser()
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.debug("Could not read Reticulum config at %s: %s", target, exc)
+        return False
+    # Write through symlinks so an externally managed config keeps tracking
+    # its source file instead of being replaced by a regular file.
+    try:
+        write_target = target.resolve()
+    except OSError:
+        write_target = target
+    lines = text.splitlines()
+    section_at: Optional[int] = None
+    present: set = set()
+    for index, raw in enumerate(lines):
+        stripped = raw.strip()
+        if section_at is None:
+            # Accept whitespace inside brackets and trailing inline comments,
+            # e.g. "[ stamps ]  # zero-cost", as Reticulum does.
+            header = re.split(r"\s[#;]", stripped, maxsplit=1)[0].strip()
+            if re.fullmatch(r"\[\s*stamps\s*\]", header):
+                section_at = index
+            continue
+        if stripped.startswith("["):
+            break
+        if "=" in stripped and not stripped.startswith(("#", ";")):
+            present.add(stripped.partition("=")[0].strip().lower())
+    missing = [key for key in RNS_STAMPS_POLICY if key not in present]
+    if section_at is None:
+        block = [
+            "",
+            "[stamps]",
+            "  # Zero-cost stamps (issue #642): see render_rns_config.",
+        ] + [f"  {key} = {RNS_STAMPS_POLICY[key]}" for key in RNS_STAMPS_POLICY]
+        new_lines = lines + block
+    elif not missing:
+        return False
+    else:
+        insert_at = section_at + 1
+        additions = [
+            f"  {key} = {RNS_STAMPS_POLICY[key]}" for key in missing
+        ]
+        new_lines = lines[:insert_at] + additions + lines[insert_at:]
+    # Write through the resolved path, but never tighten permissions the
+    # user (or another tool) chose: the real file may live in a directory
+    # tau does not manage, so its parent keeps its mode and the file keeps
+    # its own. (Qodo re-review on #670: restrict_parent defaults to True
+    # in atomic_write_bytes, which would chmod that directory to 0700.)
+    try:
+        mode = stat.S_IMODE(write_target.stat().st_mode)
+    except OSError:
+        mode = 0o600
+    try:
+        atomic_write_text(
+            write_target,
+            "\n".join(new_lines).rstrip() + "\n",
+            mode=mode,
+            restrict_parent=False,
+        )
+    except OSError as exc:
+        log.warning("Could not update Reticulum config at %s: %s", target, exc)
+        return False
     return True
 
 

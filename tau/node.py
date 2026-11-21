@@ -49,6 +49,7 @@ from .config import (
     TauConfig,
     accept_files_enabled,
     announce_interval,
+    ensure_rns_stamps_policy,
     send_read_receipts_enabled,
     tcp_listen_endpoints,
     write_rns_config,
@@ -1142,6 +1143,11 @@ class TauNode:
                 auto_interface=True,
                 loglevel=self.config.rns_loglevel,
             )
+        else:
+            # Configs written before the zero-cost stamp policy existed
+            # need it merged in, or this node stalls on Reticulum 1.6.1
+            # stamp generation before its first announce (issue #642).
+            ensure_rns_stamps_policy(self.config.rns_config_file)
 
         log.info("Starting Reticulum with config %s", self.config.rns_config_dir)
         self.reticulum = RNS.Reticulum(
