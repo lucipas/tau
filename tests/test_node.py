@@ -11,11 +11,13 @@ import pytest
 
 from tau.config import TauConfig
 from tau.inbox import Inbox
-from tau.mailbox import Mailbox, MailboxError
+from tau.mailbox import Mailbox, MailboxError, MailboxFull
 from tau.node import (
     AnnouncementsOnlyError,
     NodeError,
     NotAllowedError,
+    NotAMemberError,
+    PeerRefusedError,
     TauNode,
     _AnnounceHandler,
 )
@@ -802,6 +804,21 @@ def test_send_reaction_refusal_is_not_queued(tmp_path, monkeypatch):
     assert node.inbox.reactions_for("m-1") == []
 
 
+def test_send_reaction_not_a_member_is_not_queued(tmp_path, monkeypatch):
+    node, _ = _reaction_node(tmp_path)
+
+    def removed(*args, **kwargs):
+        raise NotAMemberError("peer rejected the request: not a member")
+
+    monkeypatch.setattr(node, "_request", removed)
+    with pytest.raises(NotAMemberError):
+        node.send_reaction("alice", "m-1", "👍")
+    # A not-a-member refusal is final, like any other: the reaction
+    # must not be queued for a sweep that would only drop it.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.reactions_for("m-1") == []
+
+
 def test_send_group_reaction_queues_unreachable_legs(tmp_path, monkeypatch):
     from tau.protocol import REQUEST_REACT, parse_reaction
 
@@ -866,6 +883,149 @@ def test_deliver_queued_reaction_drops_refused_leg(tmp_path, monkeypatch):
     # A refusal is final: the leg is dropped, not held until its TTL.
     assert node.mailbox.outbox_list() == []
     assert node.inbox.reactions_for("m-1") == []
+
+
+def test_deliver_queued_reaction_drops_not_a_member_leg(tmp_path, monkeypatch):
+    node, peer = _reaction_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_reaction("alice", "m-1", "👍")
+    entry = node.mailbox.outbox_list()[0]
+
+    def removed(*args, **kwargs):
+        raise NotAMemberError("peer rejected the request: not a member")
+
+    monkeypatch.setattr(node, "_request", removed)
+    assert node._deliver_entry(peer, entry, 1.0) is False
+    # Not-a-member is a permanent refusal, like any other: the leg is
+    # dropped instead of retrying until its TTL.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.reactions_for("m-1") == []
+
+
+def test_send_group_reaction_block_list_refusal_is_not_queued(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            # The block-list drops silently with the generic
+            # "unavailable" code, which _request raises as a plain
+            # PeerRefusedError — not NotAllowedError.
+            raise PeerRefusedError("peer rejected the request: unavailable")
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_reaction("crew", "m-1", "👍")
+
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    assert by_to[bob.hexhash].get("ok") is False
+    # The block-list refusal is reported, not queued: main reports
+    # the refusal text itself for a plain PeerRefusedError.
+    assert "unavailable" in by_to[bob.hexhash].get("error", "")
+    # An explicit refusal is final: no leg is queued for bob, so the
+    # sweep never retries a peer that already said no.
+    assert node.mailbox.outbox_list() == []
+    assert len(node.inbox.reactions_for("m-1")) == 1
+
+
+def test_queued_group_reaction_delivers_in_announcements_only_group(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    # This node's copy says the group is announcements-only, and
+    # this node is not the creator — a member post would be skipped.
+    # A reaction is not a post: the live path accepts it, so the
+    # queued retry must deliver it too.
+    node.groups.record(
+        group["id"],
+        "crew",
+        list(group["members"]),
+        creator=alice.hexhash,
+        sender=alice.hexhash,
+        sent_at=200.0,
+        announcements_only=True,
+    )
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NodeError("no route to peer")
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_group_reaction("crew", "m-1", "👍")
+    assert response["queued"] == 1
+    entry = node.mailbox.outbox_list()[0]
+    assert entry.kind == "reaction"
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(bob, entry, 1.0) is True
+    assert node.mailbox.outbox_list() == []
+    assert len(node.inbox.reactions_for("m-1")) == 1
+
+
+def test_send_group_reaction_full_outbox_keeps_fan_out_going(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import REQUEST_REACT
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NodeError("no route to peer")
+        assert path == REQUEST_REACT
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    def full(*args, **kwargs):
+        raise MailboxFull("outbox is full")
+
+    monkeypatch.setattr(node.mailbox, "enqueue", full)
+    response = node.send_group_reaction("crew", "m-1", "👍")
+
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    # The full outbox fails only bob's leg; it must not abort the
+    # fan-out or lose the local record for the delivered leg.
+    assert by_to[bob.hexhash].get("ok") is False
+    assert "could not queue: outbox is full" in by_to[bob.hexhash].get(
+        "error", ""
+    )
+    assert node.mailbox.outbox_list() == []
+    assert len(node.inbox.reactions_for("m-1")) == 1
+
+
+def test_send_reaction_full_outbox_raises_node_error(tmp_path, monkeypatch):
+    node, peer = _reaction_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+
+    def full(*args, **kwargs):
+        raise MailboxFull("outbox is full")
+
+    monkeypatch.setattr(node.mailbox, "enqueue", full)
+    # A full outbox is a delivery failure: cmd_react and the web API
+    # catch NodeError, so it must arrive as one — not as the raw
+    # MailboxError.
+    with pytest.raises(NodeError, match="could not queue reaction"):
+        node.send_reaction("alice", "m-1", "👍")
+    assert node.mailbox.outbox_list() == []
 
 
 def test_queued_reaction_is_never_deposited(tmp_path, monkeypatch):
