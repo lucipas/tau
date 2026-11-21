@@ -194,6 +194,44 @@ describe("BroadcastsPanel", () => {
     ).toBe("hello");
   });
 
+  it("keeps the draft and send result when the rename normalises back to the same name", async () => {
+    const props = renderPanel({
+      broadcasts: [{ ...TEAM, name: "my team" }],
+      // The requested name collapses back to the stored one, so the
+      // draft and result must stay put instead of being deleted.
+      onRename: vi.fn(async () => "my team"),
+    });
+    fireEvent.change(screen.getByLabelText("Message my team"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByText("Send to 2"));
+    await vi.waitFor(() => {
+      expect(screen.getByText("Alice: delivered")).toBeTruthy();
+    });
+    // A fresh draft after the send, then a no-op rename.
+    fireEvent.change(screen.getByLabelText("Message my team"), {
+      target: { value: "second draft" },
+    });
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.change(screen.getByLabelText("Rename my team"), {
+      target: { value: "my   team" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+    await vi.waitFor(() => {
+      expect(props.onRename).toHaveBeenCalledWith("my team", "my   team");
+    });
+    // The rename form closing means the post-rename render landed, so
+    // the draft and result below are the stable values, not a stale
+    // pre-rename render.
+    await vi.waitFor(() => {
+      expect(screen.queryByLabelText("Rename my team")).toBeNull();
+    });
+    expect(
+      (screen.getByLabelText("Message my team") as HTMLTextAreaElement).value,
+    ).toBe("second draft");
+    expect(screen.getByText("Alice: delivered")).toBeTruthy();
+  });
+
   it("refuses to rename while a send is in flight", async () => {
     const props = renderPanel({
       onSend: vi.fn(() => new Promise<BroadcastSendResponse>(() => {})),

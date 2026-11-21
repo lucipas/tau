@@ -145,19 +145,23 @@ export default function BroadcastsPanel({
       setRenaming(null);
       // Draft text and send results are keyed by list name; carry
       // them over to the stored name so a rename does not swallow a
-      // half-typed message.
-      setTexts((prev) => {
-        if (!(listName in prev)) return prev;
-        const next = { ...prev, [storedName]: prev[listName] };
-        delete next[listName];
-        return next;
-      });
-      setResults((prev) => {
-        if (!(listName in prev)) return prev;
-        const next = { ...prev, [storedName]: prev[listName] };
-        delete next[listName];
-        return next;
-      });
+      // half-typed message. When the server stores the same name (the
+      // requested name normalises back to it), the draft already sits
+      // under that key — re-keying would delete it.
+      if (storedName !== listName) {
+        setTexts((prev) => {
+          if (!(listName in prev)) return prev;
+          const next = { ...prev, [storedName]: prev[listName] };
+          delete next[listName];
+          return next;
+        });
+        setResults((prev) => {
+          if (!(listName in prev)) return prev;
+          const next = { ...prev, [storedName]: prev[listName] };
+          delete next[listName];
+          return next;
+        });
+      }
     } catch (err) {
       setPanelError(err instanceof Error ? err.message : String(err));
     }
