@@ -412,6 +412,69 @@ def test_group_send_file_delay_rejects_unknown_group(
     assert "unknown group" in capsys.readouterr().err
 
 
+def test_broadcast_send_file_delay_schedules(tmp_path, capsys, monkeypatch):
+    from tau.broadcasts import BroadcastStore
+    from tau.config import TauConfig
+
+    source = _write_sample_file(tmp_path)
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    BroadcastStore(config.broadcasts_path).create("team", members)
+
+    class _MustNotStartNode:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("broadcast send-file --delay started a node")
+
+    monkeypatch.setattr(cli, "TauNode", _MustNotStartNode)
+    code = cli.main(
+        [
+            "broadcast",
+            "send-file",
+            "--data-dir",
+            str(data_dir),
+            "--delay",
+            "5m",
+            "team",
+            str(source),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "scheduled notes.txt" in out
+    assert "for broadcast list team" in out
+    config = TauConfig.resolve(data_dir=data_dir)
+    queue = json.loads(config.scheduled_files_path.read_text())
+    assert len(queue["files"]) == 1
+    entry = queue["files"][0]
+    assert entry["target"] == "team"
+    assert entry["kind"] == "broadcast"
+    assert entry["file"]["name"] == "notes.txt"
+    assert sorted(entry["group_members"]) == sorted(members)
+    assert (config.scheduled_files_dir / entry["id"] / "notes.txt").exists()
+
+
+def test_broadcast_send_file_delay_rejects_unknown_list(
+    tmp_path, capsys, monkeypatch
+):
+    source = _write_sample_file(tmp_path)
+    data_dir = tmp_path / "node"
+    code = cli.main(
+        [
+            "broadcast",
+            "send-file",
+            "--data-dir",
+            str(data_dir),
+            "--delay",
+            "5m",
+            "nope",
+            str(source),
+        ]
+    )
+    assert code == 1
+    assert "unknown broadcast list" in capsys.readouterr().err
+
+
 def test_scheduled_files_list_and_cancel(tmp_path, capsys, monkeypatch):
     from tau.config import TauConfig
 
