@@ -4086,6 +4086,56 @@ def test_deferred_local_apply_restored_when_inbox_apply_raises_oserror(
     assert node.mailbox.pending_local_edits() == []
 
 
+def test_last_leg_delivery_keeps_pending_record_when_local_apply_fails(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    # The first leg delivers but its sibling check times out: the
+    # local apply is deferred, durably.
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(
+            alice, entries[0], 1.0, deadline=time.monotonic() + 0.2
+        )
+        is True
+    )
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+
+    # The last leg delivers, but the local apply fails once: the
+    # pending record must survive for a later flush instead of
+    # being dropped with the fan-out.
+    real_apply = node._record_sent_edit_locally
+    calls = []
+
+    def flaky_apply(target, cleaned, edited_at, *, peer_hex):
+        calls.append(1)
+        if len(calls) == 1:
+            return ["inbox copy not updated: simulated failure"]
+        return real_apply(target, cleaned, edited_at, peer_hex=peer_hex)
+
+    monkeypatch.setattr(node, "_record_sent_edit_locally", flaky_apply)
+    assert node._deliver_entry(bob, entries[1], 1.0) is True
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+
+    # A later flush retries the apply — no resend — and clears it.
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("leg-1")["text"] == "fixed here"
+    assert node.mailbox.pending_local_edits() == []
+
+
 def test_deferred_local_apply_of_file_message_is_dropped(tmp_path):
     node, peer = _edit_node(tmp_path)
     node.inbox.append(
