@@ -10216,28 +10216,42 @@ class WebBridge:
             return None
         return data_dir / REMINDERS_FILE_NAME
 
-    def _describe_reminder(self, reminder: Dict[str, Any]) -> Dict[str, Any]:
-        """A reminder plus its conversation's display name, for the console.
-
-        Mirrors the CLI's ``_describe_reminder``: the peer's registry
-        name, the group name, or a short hash when neither is known.
-        """
+    def _group_names(self) -> Dict[str, str]:
+        """Known group names by group id, read once per call site."""
         names: Dict[str, str] = {}
-        for peer in self.peers():
-            destination = peer.get("destination")
-            if isinstance(destination, str):
-                names[destination] = str(peer.get("name") or destination)
         for record in self._group_records():
             group_id = record.get("id")
             if isinstance(group_id, str):
                 names[group_id] = str(record.get("name") or group_id)
+        return names
+
+    def _describe_reminder(
+        self,
+        reminder: Dict[str, Any],
+        *,
+        group_names: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """A reminder plus its conversation's display name, for the console.
+
+        Mirrors the CLI's ``_describe_reminder``: the peer's display name
+        (the user's alias first), the group name, or a short hash when
+        neither is known.  A caller describing many reminders passes a
+        precomputed *group_names* map.
+        """
+        target = reminder["target"]
+        if reminder["kind"] == "group":
+            if group_names is None:
+                group_names = self._group_names()
+            name = group_names.get(target)
+        else:
+            peer = self.node.registry.get(target)
+            name = peer.display_name if peer is not None else None
         return {
             "id": reminder["id"],
             "message_id": reminder["message_id"],
             "kind": reminder["kind"],
             "target": reminder["target"],
-            "target_name": names.get(reminder["target"])
-            or short_hash(reminder["target"]),
+            "target_name": name or short_hash(target),
             "text": reminder["text"],
             "sender": reminder["sender"],
             "due_at": reminder["due_at"],
@@ -10284,14 +10298,50 @@ class WebBridge:
             if blocklist_path is not None
             else frozenset()
         )
-        store = ReminderStore(path)
+        try:
+            store = ReminderStore(path)
+            pending = store.list_reminders()
+        except OSError as exc:
+            raise WebBridgeError(f"could not read the reminders ({exc})") from exc
+        inbox = getattr(self.node, "inbox", None)
+        now = time.time()
+        group_names = self._group_names()
         reminders = [
-            self._describe_reminder(reminder)
-            for reminder in store.list_reminders()
+            self._describe_reminder(reminder, group_names=group_names)
+            for reminder in pending
             if blocked is not None
             and not self._reminder_sender_blocked(reminder, blocked)
+            and self._reminder_source_live(reminder, inbox, now)
         ]
         return {"reminders": reminders, "count": len(reminders)}
+
+    def _reminder_source_live(
+        self, reminder: Dict[str, Any], inbox: Any, now: float
+    ) -> bool:
+        """Whether the message a reminder came from is still in the inbox.
+
+        A disappearing message that expired or was removed takes its
+        reminder with it, so its text is not shown.  With no inbox the
+        source cannot be confirmed, so the reminder stays hidden.
+        """
+        if inbox is None:
+            return False
+        message_id = str(reminder["message_id"])
+        target = str(reminder["target"])
+        if reminder["kind"] == "group":
+            entry = inbox.find(message_id, group=target)
+        else:
+            entry = inbox.find(message_id, peer=target)
+        if entry is None:
+            return False
+        expires_at = entry.get("expires_at")
+        if expires_at is None:
+            return True
+        return (
+            isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and float(expires_at) > now
+        )
 
     def add_reminder(
         self, message: Any, *, in_seconds: Any = None, at: Any = None
