@@ -380,6 +380,10 @@ class ChannelError(ValueError):
     """Base class for channel validation and storage errors."""
 
 
+class AmbiguousDigestError(ChannelError):
+    """A message digest prefix matches more than one stored message."""
+
+
 def clean_channel_name(raw: Any) -> str:
     """Validate a channel name, returning it unchanged or raising."""
     if not isinstance(raw, str):
@@ -979,7 +983,7 @@ def resolve_message_digest(
     if not rows:
         raise ChannelError(f"unknown message: {digest!r}")
     if len(rows) > 1:
-        raise ChannelError(
+        raise AmbiguousDigestError(
             f"ambiguous message digest prefix {digest!r}: "
             f"matches {len(rows)} messages"
         )

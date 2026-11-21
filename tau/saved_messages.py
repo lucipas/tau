@@ -24,9 +24,13 @@ conversation is a different star.  The message itself stays in the
 inbox or the channel store: a star whose message was later deleted
 or expired still holds its place in the list but renders as no
 longer stored, the way a saved Tan post keeps its stub when the
-post is deleted.  A group star keeps the group id the message was
-stored under, so a rename does not move the star — the record keeps
-its original group id, and the star still finds it.
+post is deleted — except the blocklist still applies to the stub:
+a star records its sender and direction when it is created, so a
+blocked sender's star stays hidden after the message is gone, and
+a stub whose sender was never recorded stays hidden too.  A group
+star keeps the group id the message was stored under, so a rename
+does not move the star — the record keeps its original group id,
+and the star still finds it.
 """
 
 from __future__ import annotations
@@ -87,14 +91,42 @@ def clean_saved_message_id(message_id: Any) -> str:
     return message_id.strip()
 
 
+def clean_saved_sender(sender: Any) -> Optional[str]:
+    """Normalise a persisted star sender, or ``None`` when unknown."""
+    if sender is None:
+        return None
+    if not isinstance(sender, str) or not sender.strip():
+        raise SavedMessagesError("star sender must be a non-empty string")
+    return sender.strip()
+
+
+def clean_saved_direction(direction: Any) -> Optional[str]:
+    """Normalise a persisted star direction, or ``None`` when unknown."""
+    if direction is None:
+        return None
+    if direction not in ("in", "out"):
+        raise SavedMessagesError("star direction must be 'in' or 'out'")
+    return direction
+
+
 @dataclass(frozen=True)
 class SavedMessageEntry:
-    """One starred message, newest save first in the list."""
+    """One starred message, newest save first in the list.
+
+    ``sender`` is the hash the blocklist is checked against — the
+    peer for a DM, the message sender for a group, the author for a
+    channel — and ``direction`` is ``"out"`` for a message this node
+    sent.  Both are recorded when the star is created so the
+    blocklist still applies after the message itself is gone; stars
+    written before they existed load with both as ``None``.
+    """
 
     kind: str
     scope: str
     message_id: str
     saved_at: float
+    sender: Optional[str] = None
+    direction: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -123,14 +155,21 @@ class SavedMessages:
         scope: Any,
         message_id: Any,
         now: Optional[float] = None,
+        *,
+        sender: Any = None,
+        direction: Any = None,
     ) -> Tuple["SavedMessages", bool]:
         """Star the message, moving it to the front when already starred.
 
         Returns the new list and whether the star already existed —
         starring an already-starred message is a no-op, not an error.
+        ``sender`` and ``direction`` are recorded with the star so the
+        blocklist still applies once the message itself is gone.
         """
         cleaned_scope = clean_saved_scope(kind, scope)
         cleaned_id = clean_saved_message_id(message_id)
+        cleaned_sender = clean_saved_sender(sender)
+        cleaned_direction = clean_saved_direction(direction)
         stamped = now if now is not None else time.time()
         already = any(
             entry.kind == kind
@@ -153,7 +192,16 @@ class SavedMessages:
                 "unstar one first"
             )
         return SavedMessages(
-            entries=(SavedMessageEntry(kind, cleaned_scope, cleaned_id, stamped),)
+            entries=(
+                SavedMessageEntry(
+                    kind,
+                    cleaned_scope,
+                    cleaned_id,
+                    stamped,
+                    cleaned_sender,
+                    cleaned_direction,
+                ),
+            )
             + rest
         ), already
 
@@ -175,17 +223,22 @@ class SavedMessages:
         return SavedMessages(entries=kept), len(kept) != len(self.entries)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "saved": [
-                {
-                    "kind": entry.kind,
-                    "scope": entry.scope,
-                    "message_id": entry.message_id,
-                    "saved_at": entry.saved_at,
-                }
-                for entry in self.entries
-            ]
-        }
+        entries = []
+        for entry in self.entries:
+            item: Dict[str, Any] = {
+                "kind": entry.kind,
+                "scope": entry.scope,
+                "message_id": entry.message_id,
+                "saved_at": entry.saved_at,
+            }
+            # Sender/direction are omitted when unknown so stars
+            # written before they existed round-trip byte-identically.
+            if entry.sender is not None:
+                item["sender"] = entry.sender
+            if entry.direction is not None:
+                item["direction"] = entry.direction
+            entries.append(item)
+        return {"saved": entries}
 
     @classmethod
     def from_dict(cls, data: Any) -> "SavedMessages":
@@ -219,7 +272,14 @@ class SavedMessages:
             ):
                 raise SavedMessagesError("saved_at must be a number")
             entries.append(
-                SavedMessageEntry(kind, scope, message_id, float(saved_at))
+                SavedMessageEntry(
+                    kind,
+                    scope,
+                    message_id,
+                    float(saved_at),
+                    clean_saved_sender(item.get("sender")),
+                    clean_saved_direction(item.get("direction")),
+                )
             )
         entries.sort(key=lambda entry: entry.saved_at, reverse=True)
         return cls(entries=tuple(entries))

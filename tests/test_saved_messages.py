@@ -88,6 +88,28 @@ def test_malformed_documents_raise(tmp_path):
         {"saved": [{"kind": "peer", "scope": ALICE, "message_id": "m-1", "saved_at": "soon"}]},
         {
             "saved": [
+                {
+                    "kind": "peer",
+                    "scope": ALICE,
+                    "message_id": "m-1",
+                    "saved_at": 1.0,
+                    "direction": "sideways",
+                }
+            ]
+        },
+        {
+            "saved": [
+                {
+                    "kind": "peer",
+                    "scope": ALICE,
+                    "message_id": "m-1",
+                    "saved_at": 1.0,
+                    "sender": 123,
+                }
+            ]
+        },
+        {
+            "saved": [
                 {"kind": "peer", "scope": ALICE, "message_id": "m-1", "saved_at": 1.0},
                 {"kind": "peer", "scope": ALICE, "message_id": "m-1", "saved_at": 2.0},
             ]
@@ -612,3 +634,260 @@ def test_get_visible_channel_message_applies_lifecycle(tmp_path):
         assert visible["edited"] is True
     finally:
         conn.close()
+
+
+# -- Qodo follow-ups on #674 ------------------------------------------------
+
+def test_unsave_refuses_ambiguous_prefix_when_one_star_exists(tmp_path, capsys):
+    # Two live messages share the prefix; only one is starred.  The
+    # live resolver refuses the prefix, so unsave must refuse it too
+    # instead of clearing the one star that happens to match.
+    data_dir, senders = _seed_two_peers(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    Inbox(config.inbox_path).append(
+        {
+            "from": "alice",
+            "destination": senders["alice"],
+            "text": "second hello from alice",
+            "sent_at": 12.0,
+            "received_at": 24.0,
+            "id": "m-alice-2",
+        }
+    )
+    assert (
+        cli.main(["save", "--data-dir", str(data_dir), "--peer", "alice", "m-alice"])
+        == 0
+    )
+    capsys.readouterr()
+
+    code = cli.main(["unsave", "--data-dir", str(data_dir), "--peer", "alice", "m-a"])
+    assert code != 0
+    assert "match" in capsys.readouterr().err
+
+    # The star survives the refused unsave.
+    assert load_saved_messages(config.saved_messages_path).is_saved(
+        "peer", senders["alice"], "m-alice"
+    )
+
+
+def test_unsave_refuses_short_channel_digest_prefix(tmp_path, capsys):
+    # A one-character digest prefix is refused by the live resolver,
+    # so it must not fall through to the starred-entry search and
+    # clear the star it happens to match.
+    data_dir = tmp_path / "alice"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    digest = _seed_channel_message(data_dir)
+    capsys.readouterr()
+    assert (
+        cli.main(
+            ["save", "--data-dir", str(data_dir), "--channel", "general", digest[:12]]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    code = cli.main(
+        ["unsave", "--data-dir", str(data_dir), "--channel", "general", digest[0]]
+    )
+    assert code != 0
+    assert "4 hex" in capsys.readouterr().err
+
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    assert load_saved_messages(config.saved_messages_path).is_saved(
+        "channel", "general", digest
+    )
+
+
+def test_unsave_deleted_peer_resolves_via_saved_scope(tmp_path, capsys):
+    # The peer was never registered and its last inbox record is
+    # deleted, so the hash prefix resolves only from the star itself.
+    data_dir, senders = _seed_two_peers(tmp_path)
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": recipient_hash,
+            "text": "sent to a stranger",
+            "sent_at": 13.0,
+            "received_at": 25.0,
+            "id": "m-sent-1",
+            "direction": "out",
+        }
+    )
+    assert (
+        cli.main(
+            [
+                "save",
+                "--data-dir",
+                str(data_dir),
+                "--peer",
+                recipient_hash[:12],
+                "m-sent-1",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    Inbox(config.inbox_path).delete("m-sent-1")
+
+    code = cli.main(
+        [
+            "unsave",
+            "--data-dir",
+            str(data_dir),
+            "--peer",
+            recipient_hash[:12],
+            "m-sent-1",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "unsaved [m-sent-1]" in out
+    assert "no longer stored" in out
+
+
+def test_unsave_refuses_ambiguous_saved_peer_prefix(tmp_path, capsys):
+    # Two starred peer scopes share the prefix: the saved scopes join
+    # the prefix search, so the ambiguity must be refused, not resolved
+    # to whichever scope happens to come first.
+    data_dir, senders = _seed_two_peers(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    scope_a = "aabbccdd" * 4
+    scope_b = "aabbccdd" + "ee" * 12
+    saved = SavedMessages()
+    saved, _ = saved.with_saved("peer", scope_a, "m-1", now=10.0)
+    saved, _ = saved.with_saved("peer", scope_b, "m-2", now=20.0)
+    save_saved_messages(config.saved_messages_path, saved)
+
+    code = cli.main(
+        ["unsave", "--data-dir", str(data_dir), "--peer", "aabbccdd", "m-1"]
+    )
+    assert code != 0
+    assert "2 senders match" in capsys.readouterr().err
+
+
+def test_saved_list_hides_blocked_sender_stub(tmp_path, capsys):
+    # The star outlives its message, but the blocklist still applies
+    # to the stub: a blocked sender's star must not resurface once
+    # the message is deleted.
+    from tau.blocklist import BlockList, save_blocklist
+
+    data_dir, senders = _seed_two_peers(tmp_path)
+    assert (
+        cli.main(["save", "--data-dir", str(data_dir), "--peer", "alice", "m-alice"])
+        == 0
+    )
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    save_blocklist(config.blocklist_path, BlockList().with_added(senders["alice"]))
+    Inbox(config.inbox_path).delete("m-alice")
+
+    code = cli.main(["saved", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No starred messages" in capsys.readouterr().out
+
+    code = cli.main(["saved", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+def test_saved_list_keeps_outbound_stub(tmp_path, capsys):
+    # A message this node sent stays visible as a stub even when its
+    # recipient is blocked: outbound is never hidden by the blocklist.
+    from tau.blocklist import BlockList, save_blocklist
+
+    data_dir, senders = _seed_two_peers(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    Inbox(config.inbox_path).append(
+        {
+            "from": "alice",
+            "destination": senders["bob"],
+            "text": "sent to bob",
+            "sent_at": 14.0,
+            "received_at": 26.0,
+            "id": "m-sent-bob",
+            "direction": "out",
+        }
+    )
+    assert (
+        cli.main(["save", "--data-dir", str(data_dir), "--peer", "bob", "m-sent-bob"])
+        == 0
+    )
+    capsys.readouterr()
+    save_blocklist(config.blocklist_path, BlockList().with_added(senders["bob"]))
+    Inbox(config.inbox_path).delete("m-sent-bob")
+
+    code = cli.main(["saved", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "DM with bob" in out
+    assert "no longer stored" in out
+
+
+def test_legacy_stub_without_sender_is_hidden(tmp_path, capsys):
+    # A star written before sender/direction were recorded cannot be
+    # checked against the blocklist, so its stub stays hidden once
+    # the message itself is gone.
+    data_dir, senders = _seed_two_peers(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    config.saved_messages_path.write_text(
+        json.dumps(
+            {
+                "saved": [
+                    {
+                        "kind": "peer",
+                        "scope": senders["alice"],
+                        "message_id": "m-alice",
+                        "saved_at": 1.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    Inbox(config.inbox_path).delete("m-alice")
+
+    code = cli.main(["saved", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No starred messages" in capsys.readouterr().out
+
+
+def test_sender_and_direction_roundtrip(tmp_path):
+    path = tmp_path / "saved_messages.json"
+    saved = SavedMessages()
+    saved, _ = saved.with_saved(
+        "peer", ALICE, "m-1", now=10.0, sender=ALICE, direction="in"
+    )
+    saved, _ = saved.with_saved(
+        "peer", BOB, "m-2", now=20.0, sender=BOB, direction="out"
+    )
+    save_saved_messages(path, saved)
+    loaded = load_saved_messages(path)
+    assert [(e.sender, e.direction) for e in loaded.entries] == [
+        (BOB, "out"),
+        (ALICE, "in"),
+    ]
+    assert loaded.to_dict() == {
+        "saved": [
+            {
+                "kind": "peer",
+                "scope": BOB,
+                "message_id": "m-2",
+                "saved_at": 20.0,
+                "sender": BOB,
+                "direction": "out",
+            },
+            {
+                "kind": "peer",
+                "scope": ALICE,
+                "message_id": "m-1",
+                "saved_at": 10.0,
+                "sender": ALICE,
+                "direction": "in",
+            },
+        ]
+    }

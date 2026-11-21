@@ -393,6 +393,7 @@ from .tangents.tan import (
 from .channels import (
     DEFAULT_CHANNEL_LIMIT,
     MAX_FEED_EDITS,
+    AmbiguousDigestError,
     ChannelApp,
     ChannelError,
     clean_channel_name,
@@ -401,6 +402,7 @@ from .channels import (
     create_reaction as create_channel_reaction,
     get_message as get_channel_message,
     get_visible_message as get_visible_channel_message,
+    HASH_HEX_LENGTH,
     init_db as init_channel_db,
     is_member as is_channel_member,
     reply_parent as channel_reply_parent,
@@ -15084,6 +15086,8 @@ def _resolve_inbox_peer(
     registry: PeerRegistry,
     target: str,
     direction: Optional[str] = "in",
+    *,
+    extra_hashes: Optional[Iterable[str]] = None,
 ) -> str:
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
@@ -15098,6 +15102,9 @@ def _resolve_inbox_peer(
     discovered — a direct message needs no prior announce).
     ``direction`` picks which inbox records are searched: ``"in"`` for
     received messages (the default), ``None`` for both directions.
+    ``extra_hashes`` adds further hash candidates to the prefix
+    search — ``unsave`` passes the starred peer scopes, so a star
+    survives its peer disappearing from the registry and the inbox.
     """
     target = target.strip()
     if _is_hex32(target):
@@ -15130,6 +15137,12 @@ def _resolve_inbox_peer(
             for entry in inbox.list_messages(limit=None, direction=direction)
             if str(entry.get("destination") or "").casefold().startswith(prefix)
         }
+        if extra_hashes is not None:
+            senders |= {
+                str(candidate).casefold()
+                for candidate in extra_hashes
+                if str(candidate).casefold().startswith(prefix)
+            }
         if len(senders) == 1:
             return senders.pop()
         if len(senders) > 1:
@@ -15361,6 +15374,16 @@ def _resolve_group_reply_target(
     return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
 
 
+class AmbiguousMessageRefError(NodeError):
+    """A message reference matches more than one stored message.
+
+    Distinct from a plain "not found" :class:`NodeError` so callers
+    that fall back to a starred entry on a missing message — ``unsave``
+    — can refuse an ambiguous reference instead of silently picking
+    the one star that happens to match it.
+    """
+
+
 def _resolve_group_pin_target(
     inbox: Inbox, group_ids: Sequence[str], ref: str
 ) -> Dict[str, Any]:
@@ -15392,7 +15415,7 @@ def _resolve_group_pin_target(
     if exact:
         matches = exact
     if len(matches) > 1:
-        raise NodeError(
+        raise AmbiguousMessageRefError(
             f"{len(matches)} messages in this group match {ref!r};"
             " use a longer prefix"
         )
@@ -16974,7 +16997,7 @@ def _resolve_dm_saved_target(
     if exact:
         matches = exact
     if len(matches) > 1:
-        raise NodeError(
+        raise AmbiguousMessageRefError(
             f"{len(matches)} messages from this peer match {ref!r};"
             " use a longer prefix"
         )
@@ -17019,6 +17042,36 @@ def _saved_entry_for_ref(
     return candidates[0] if candidates else None
 
 
+def _saved_scopes(config: TauConfig, kind: str) -> List[str]:
+    """Starred scopes of *kind*, for resolving a deleted peer.
+
+    A corrupt list yields no scopes here — the starred-entry lookup
+    below raises the corruption error if the flow reaches it — so a
+    bad file cannot turn an ``unsave`` into a misleading
+    "unknown peer".
+    """
+    try:
+        saved = load_saved_messages(config.saved_messages_path)
+    except SavedMessagesError:
+        return []
+    return [entry.scope for entry in saved.entries if entry.kind == kind]
+
+
+def _valid_channel_digest_ref(ref: str) -> bool:
+    """Whether *ref* is a channel digest reference the live resolver accepts.
+
+    A digest prefix must be at least 4 hex characters and no longer
+    than a full digest; anything else is refused by
+    :func:`resolve_message_digest` before any message is looked up, so
+    it must not fall through to the starred-entry search either.
+    """
+    text = ref.strip().lower()
+    return (
+        4 <= len(text) <= HASH_HEX_LENGTH
+        and all(ch in "0123456789abcdef" for ch in text)
+    )
+
+
 def _resolve_saved_message(
     config: TauConfig, args: argparse.Namespace, *, missing_ok: bool = False
 ) -> Tuple[str, str, str, Optional[Dict[str, Any]]]:
@@ -17042,11 +17095,14 @@ def _resolve_saved_message(
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     if getattr(args, "peer", None) is not None:
+        extra_hashes = _saved_scopes(config, "peer") if missing_ok else None
         destination = _resolve_inbox_peer(
-            inbox, registry, args.peer, direction=None
+            inbox, registry, args.peer, direction=None, extra_hashes=extra_hashes
         )
         try:
             entry = _resolve_dm_saved_target(inbox, destination, ref)
+        except AmbiguousMessageRefError:
+            raise
         except NodeError:
             found = (
                 _saved_entry_for_ref(config, "peer", [destination], ref)
@@ -17063,6 +17119,8 @@ def _resolve_saved_message(
         group_ids = _group_ids_spanning_renames(store, group)
         try:
             entry = _resolve_group_pin_target(inbox, group_ids, ref)
+        except AmbiguousMessageRefError:
+            raise
         except NodeError:
             found = (
                 _saved_entry_for_ref(config, "group", group_ids, ref)
@@ -17087,6 +17145,15 @@ def _resolve_saved_message(
         except ChannelError as exc:
             if not missing_ok:
                 raise NodeError(str(exc)) from exc
+            # Only a valid reference for a message that is gone may
+            # fall through to the star: an ambiguous prefix, or a
+            # reference the live resolver refuses (too short, too
+            # long, not hex), stays refused instead of unsaving
+            # whatever star the prefix happens to match.
+            if isinstance(exc, AmbiguousDigestError) or not _valid_channel_digest_ref(
+                ref
+            ):
+                raise NodeError(str(exc)) from exc
             found = _saved_entry_for_ref(config, "channel", [name], ref)
             if found is None:
                 raise NodeError(str(exc)) from exc
@@ -17109,6 +17176,8 @@ def _edit_saved_messages(
     message_id: str,
     *,
     save: bool,
+    sender: Optional[str] = None,
+    direction: Optional[str] = None,
 ) -> Tuple[bool, SavedMessages]:
     """Star or unstar one message, reloading inside the lock.
 
@@ -17116,13 +17185,17 @@ def _edit_saved_messages(
     message — or unstarring an unstarred one — is a no-op, not an
     error, mirroring the pinned-conversation commands.  A corrupt
     list is refused, not overwritten, so a bad file cannot silently
-    drop the owner's other stars.
+    drop the owner's other stars.  ``sender``/``direction`` are
+    recorded with a new star so the blocklist still applies once the
+    message itself is gone.
     """
     with saved_messages_lock(config.saved_messages_path):
         try:
             saved = load_saved_messages(config.saved_messages_path)
             if save:
-                updated, already = saved.with_saved(kind, scope, message_id)
+                updated, already = saved.with_saved(
+                    kind, scope, message_id, sender=sender, direction=direction
+                )
                 changed = not already
             else:
                 updated, changed = saved.without(kind, scope, message_id)
@@ -17131,6 +17204,48 @@ def _edit_saved_messages(
         if changed:
             save_saved_messages(config.saved_messages_path, updated)
     return changed, updated
+
+
+def _saved_star_attribution(
+    kind: str, record: Dict[str, Any], config: TauConfig
+) -> Tuple[Optional[str], Optional[str]]:
+    """A star's sender and direction, from the record being starred.
+
+    The sender is the hash the blocklist is checked against: the
+    peer for a DM, the message sender for a group, the author for a
+    channel.  Direction is the record's own ``"in"``/``"out"`` for
+    inbox records; for a channel message it is ``"out"`` when the
+    author is this node, ``"in"`` otherwise.
+    """
+    if kind == "channel":
+        sender = str(record.get("author") or "").strip() or None
+        if sender is None:
+            return None, None
+        own = _own_destination_hash(config)
+        return sender, "out" if own is not None and sender == own else "in"
+    sender = str(record.get("destination") or "").strip() or None
+    direction = record.get("direction")
+    return sender, direction if direction in ("in", "out") else None
+
+
+def _saved_stub_hidden(entry: Any, blocked: Optional[Any]) -> bool:
+    """Whether a star whose message is gone must stay out of view.
+
+    The same block rules as a stored record, from the sender and
+    direction recorded when the star was created: a message this node
+    sent stays visible, a blocked sender stays hidden, and an
+    unreadable blocklist fails closed.  A stub whose sender was
+    never recorded cannot be checked against the list, so it stays
+    hidden too — showing it would expose a blocked sender's star
+    metadata.
+    """
+    if entry.direction == "out":
+        return False
+    if blocked is None:
+        return True
+    if not entry.sender:
+        return True
+    return entry.sender in blocked
 
 
 def _saved_scope_label(
@@ -17153,7 +17268,10 @@ def _saved_scope_label(
 def cmd_save_message(args: argparse.Namespace) -> int:
     config = _make_config(args)
     kind, scope, message_id, record = _resolve_saved_message(config, args)
-    changed, _ = _edit_saved_messages(config, kind, scope, message_id, save=True)
+    sender, direction = _saved_star_attribution(kind, record, config)
+    changed, _ = _edit_saved_messages(
+        config, kind, scope, message_id, save=True, sender=sender, direction=direction
+    )
     if _json_mode(args):
         _emit(
             {
@@ -17284,7 +17402,14 @@ def cmd_saved_messages(args: argparse.Namespace) -> int:
             if limit is not None and len(rendered) >= limit:
                 break
             record = message_for(entry)
-            if record is not None and hidden(entry, record):
+            if record is None:
+                # A stub has no record to check the sender against:
+                # filter it from the sender/direction recorded with
+                # the star instead, so a blocked sender's star does
+                # not resurface once its message is gone.
+                if _saved_stub_hidden(entry, blocked):
+                    continue
+            elif hidden(entry, record):
                 continue
             rendered.append(
                 {
