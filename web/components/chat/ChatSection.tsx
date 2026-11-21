@@ -229,9 +229,27 @@ export default function ChatSection() {
     }
   }, []);
 
+  // Reminders can fire or change outside this tab, so reload them on
+  // every snapshot change as well as after local snooze/cancel actions.
   useEffect(() => {
     void refreshReminders();
-  }, [refreshReminders]);
+  }, [refreshReminders, tau.messages, tau.unread]);
+
+  // Reload once shortly after the soonest pending reminder comes due,
+  // so a fired reminder leaves the sidebar. An overdue reminder retries
+  // at a fixed interval rather than in a tight loop; the timer is
+  // clamped to the largest delay setTimeout supports, and each reload
+  // re-arms it.
+  useEffect(() => {
+    if (reminders.length === 0) return;
+    const soonest = Math.min(...reminders.map((reminder) => reminder.due_at));
+    const delay = Math.max(soonest * 1000 - Date.now() + 1000, 5000);
+    const timer = window.setTimeout(
+      () => void refreshReminders(),
+      Math.min(delay, 2_147_483_647),
+    );
+    return () => window.clearTimeout(timer);
+  }, [reminders, refreshReminders]);
 
   // A conversation with a saved draft loads it into the composer when
   // opened; a conversation without one clears the seed. A draft saved
