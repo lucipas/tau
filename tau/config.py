@@ -403,6 +403,25 @@ def parse_host_port(value: str, *, default_host: str = "127.0.0.1") -> Tuple[str
     return host, port
 
 
+# Reticulum 1.6.1 stamp policy (issue #642). RNS 1.6.1 enables
+# proof-of-work stamps for destination announces by default (target value
+# 25.0). Generating one stamp hashes a 768 KiB workblock per attempt, so a
+# single stamp costs minutes of CPU on ordinary hardware — and a fresh
+# node's first announce is withheld until its stamp is ready, which breaks
+# discovery and sends. Tau links are private direct links between tau
+# nodes, not a public mesh, so tau opts out of proof-of-work: stamps are
+# still emitted (the wire format is unchanged), but at zero cost, and tau
+# nodes require zero cost from peers. Revisit if Reticulum ever enforces
+# stamps network-wide.
+RNS_STAMPS_POLICY = {
+    "destination_value": "0",
+    "destination_cost": "0",
+    "pr_value": "0",
+    "pr_cost": "0",
+    "lr_cost": "0",
+}
+
+
 def render_rns_config(
     *,
     tcp_listen: Optional[str] = None,
@@ -427,6 +446,17 @@ def render_rns_config(
         "",
         "[logging]",
         f"  loglevel = {int(loglevel)}",
+        "",
+        "[stamps]",
+        "  # Zero-cost stamps (issue #642): Reticulum 1.6.1 generates",
+        "  # proof-of-work destination stamps by default, which stalls a",
+        "  # fresh node's first announce for minutes. Tau links are",
+        "  # private direct links, so no proof-of-work is required.",
+        "  destination_value = 0",
+        "  destination_cost = 0",
+        "  pr_value = 0",
+        "  pr_cost = 0",
+        "  lr_cost = 0",
         "",
         "[interfaces]",
     ]
@@ -521,6 +551,61 @@ def write_rns_config(
         loglevel=loglevel,
     )
     atomic_write_text(target, text, mode=0o600)
+    return True
+
+
+def ensure_rns_stamps_policy(path: Path) -> bool:
+    """Merge tau's zero-cost stamp policy into an existing RNS config.
+
+    New configs already render the policy (see render_rns_config); configs
+    written before it existed need it added on the next node start, or the
+    node stalls on Reticulum 1.6.1 stamp generation (issue #642). A missing
+    ``[stamps]`` section is appended; an existing one gains only the keys
+    it lacks — a value the user set by hand is never overridden. Returns
+    ``True`` when the file changed. Never raises: a config that cannot be
+    read or written is left untouched (the node still starts, just without
+    the policy).
+    """
+    target = Path(path).expanduser()
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.debug("Could not read Reticulum config at %s: %s", target, exc)
+        return False
+    lines = text.splitlines()
+    section_at: Optional[int] = None
+    present: set = set()
+    for index, raw in enumerate(lines):
+        stripped = raw.strip()
+        if section_at is None:
+            if stripped == "[stamps]":
+                section_at = index
+            continue
+        if stripped.startswith("["):
+            break
+        if "=" in stripped and not stripped.startswith(("#", ";")):
+            present.add(stripped.partition("=")[0].strip().lower())
+    missing = [key for key in RNS_STAMPS_POLICY if key not in present]
+    if section_at is None:
+        block = [
+            "",
+            "[stamps]",
+            "  # Zero-cost stamps (issue #642): see render_rns_config.",
+        ] + [f"  {key} = {RNS_STAMPS_POLICY[key]}" for key in RNS_STAMPS_POLICY]
+        new_lines = lines + block
+    elif not missing:
+        return False
+    else:
+        insert_at = section_at + 1
+        additions = [
+            f"  {key} = {RNS_STAMPS_POLICY[key]}" for key in missing
+        ]
+        new_lines = lines[:insert_at] + additions + lines[insert_at:]
+    try:
+        atomic_write_text(target, "\n".join(new_lines).rstrip() + "\n", mode=0o600)
+    except OSError as exc:
+        log.warning("Could not update Reticulum config at %s: %s", target, exc)
+        return False
     return True
 
 
