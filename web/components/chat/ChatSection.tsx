@@ -32,7 +32,7 @@ import {
   voteGroupPoll,
   type SendMessageOptions,
 } from "@/lib/api";
-import type { ChatMessage, Group, MessageDraft } from "@/lib/types";
+import type { ChatMessage, MessageDraft } from "@/lib/types";
 import {
   buildConversations,
   useBeacons,
@@ -137,26 +137,9 @@ export default function ChatSection() {
   const [joinBusy, setJoinBusy] = useState(false);
   const [joinResult, setJoinResult] = useState<string | null>(null);
   const [showNewGroup, setShowNewGroup] = useState(false);
-  // A group just created from this console, kept until a snapshot
-  // includes it, so its thread still opens when a refresh fails.
-  const [createdGroup, setCreatedGroup] = useState<Group | null>(null);
-
-  useEffect(() => {
-    if (createdGroup && tau.groups.some((g) => g.id === createdGroup.id)) {
-      setCreatedGroup(null);
-    }
-  }, [createdGroup, tau.groups]);
-
-  const snapshot = useMemo(
-    () =>
-      createdGroup && !tau.groups.some((g) => g.id === createdGroup.id)
-        ? { ...tau, groups: [...tau.groups, createdGroup] }
-        : tau,
-    [tau, createdGroup],
-  );
 
   const { conversations, archived: archivedConvs, dmRequests, refreshRequests } = useConversations(
-    snapshot,
+    tau,
     { mutedPeers, mutedGroups, archived },
   );
 
@@ -181,7 +164,7 @@ export default function ChatSection() {
   const selected: Conversation | null = useMemo(() => {
     if (selectedPeer) {
       return (
-        buildConversations(snapshot.messages, snapshot.peers, snapshot.groups, snapshot.unread, {
+        buildConversations(tau.messages, tau.peers, tau.groups, tau.unread, {
           mutedPeers,
           mutedGroups,
           archived,
@@ -191,7 +174,7 @@ export default function ChatSection() {
     }
     if (selectedGroup) {
       return (
-        buildConversations(snapshot.messages, snapshot.peers, snapshot.groups, snapshot.unread, {
+        buildConversations(tau.messages, tau.peers, tau.groups, tau.unread, {
           mutedPeers,
           mutedGroups,
           archived,
@@ -200,7 +183,7 @@ export default function ChatSection() {
       );
     }
     return null;
-  }, [selectedPeer, selectedGroup, snapshot, mutedPeers, mutedGroups, archived]);
+  }, [selectedPeer, selectedGroup, tau.messages, tau.peers, tau.groups, tau.unread, mutedPeers, mutedGroups, archived]);
 
   // Opening a thread marks it read (local cursor + snapshot refresh).
   const selectedKey = selected ? `${selected.kind}:${selected.key}` : null;
@@ -342,13 +325,15 @@ export default function ChatSection() {
 
   async function handleCreateGroup(name: string, members: string[]) {
     // The panel owns validation and shows API errors inline; this
-    // handler only closes the panel and opens the new thread. The
-    // group is stashed in `createdGroup` first, so the thread still
-    // resolves when the refresh fails — a failed refresh must not
-    // strand the user on an empty list. The stash clears itself once
-    // a snapshot includes the group.
+    // handler only closes the panel and opens the new thread. It
+    // mirrors the join flow: refresh, then navigate whether or not
+    // the refresh landed — the next snapshot (≤5s poll, or the next
+    // ws frame) picks the group up, so a failed refresh is a brief
+    // empty thread, not a failed creation. A local fallback stash
+    // was tried here and removed: it needed its own retirement rule,
+    // diverged the sidebar's group lookup, and held only one
+    // pending group.
     const group = await createGroup(name, members);
-    setCreatedGroup(group);
     setShowNewGroup(false);
     await tau.refresh().catch(() => undefined);
     navigate("chat", { group: group.id });
