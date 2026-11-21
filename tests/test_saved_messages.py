@@ -441,3 +441,174 @@ def test_corrupt_list_refuses_save_but_lists_empty(tmp_path, capsys):
     code = cli.main(["saved", "--data-dir", str(data_dir)])
     assert code == 0
     assert "No starred messages" in capsys.readouterr().out
+
+
+def test_backup_includes_saved_messages_once():
+    from tau.backup import BACKUP_FILES
+
+    assert BACKUP_FILES.count("saved_messages.json") == 1
+
+
+def test_save_sent_message_by_peer_prefix(tmp_path, capsys):
+    # The recipient lives only in outgoing history: no registry entry,
+    # so the hash prefix must resolve from sent records (direction=None).
+    data_dir, senders = _seed_two_peers(tmp_path)
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": recipient_hash,
+            "text": "sent to a stranger",
+            "sent_at": 13.0,
+            "received_at": 25.0,
+            "id": "m-sent-1",
+            "direction": "out",
+        }
+    )
+    code = cli.main(
+        [
+            "save",
+            "--data-dir",
+            str(data_dir),
+            "--peer",
+            recipient_hash[:12],
+            "m-sent-1",
+        ]
+    )
+    assert code == 0
+    assert "saved [m-sent-1]" in capsys.readouterr().out
+
+
+def test_unsave_after_message_deleted(tmp_path, capsys):
+    # A star outlives its message: the star itself must still be removable.
+    data_dir, senders = _seed_two_peers(tmp_path)
+    assert (
+        cli.main(["save", "--data-dir", str(data_dir), "--peer", "alice", "m-alice"])
+        == 0
+    )
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    Inbox(config.inbox_path).delete("m-alice")
+
+    code = cli.main(
+        ["unsave", "--data-dir", str(data_dir), "--peer", "alice", "m-alice"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "unsaved [m-alice]" in out
+    assert "no longer stored" in out
+
+    code = cli.main(["saved", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No starred messages" in capsys.readouterr().out
+
+
+def test_group_star_survives_rename(tmp_path, capsys):
+    # The star is scoped to the group id the message was stored under,
+    # so renaming the group must not turn the star into a stub.
+    from tau.groups import GroupStore
+
+    data_dir, senders = _seed_two_peers(tmp_path)
+    group_id = _seed_group(data_dir, senders)
+    assert (
+        cli.main(
+            ["save", "--data-dir", str(data_dir), "--group", "weekend", "m-group-1"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    GroupStore(config.groups_path).rename(
+        group_id, "weekend2", created_by=senders["alice"]
+    )
+
+    code = cli.main(["saved", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "weekend plans?" in out
+    assert "no longer stored" not in out
+
+
+def test_saved_list_hides_blocked_sender(tmp_path, capsys):
+    from tau.blocklist import BlockList, save_blocklist
+
+    data_dir, senders = _seed_two_peers(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    # A sent message to bob, starred alongside alice's received one.
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": senders["bob"],
+            "text": "sent to bob",
+            "sent_at": 14.0,
+            "received_at": 26.0,
+            "id": "m-sent-bob",
+            "direction": "out",
+        }
+    )
+    assert (
+        cli.main(["save", "--data-dir", str(data_dir), "--peer", "alice", "m-alice"])
+        == 0
+    )
+    assert (
+        cli.main(["save", "--data-dir", str(data_dir), "--peer", "bob", "m-sent-bob"])
+        == 0
+    )
+    capsys.readouterr()
+    save_blocklist(
+        config.blocklist_path, BlockList().with_added(senders["alice"])
+    )
+
+    code = cli.main(["saved", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "hello from alice" not in out
+    assert "sent to bob" in out
+
+    code = cli.main(["saved", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["saved"][0]["message_id"] == "m-sent-bob"
+
+
+def test_get_visible_channel_message_applies_lifecycle(tmp_path):
+    from tau.channels import (
+        create_edit,
+        create_message,
+        get_message,
+        get_visible_message,
+    )
+
+    config = TauConfig.resolve(data_dir=tmp_path / "alice", name="alice")
+    identity = RNS.Identity()
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        live = create_message(
+            conn, identity, "general", "live text", name="alice", now=1000
+        )
+        expired = create_message(
+            conn,
+            identity,
+            "general",
+            "old text",
+            name="alice",
+            now=1000,
+            expires_at=1001.0,
+        )
+        # The expired row is still stored; history must not show it.
+        assert get_message(conn, expired["hash"]) is not None
+        assert get_visible_message(conn, expired["hash"]) is None
+        assert get_visible_message(conn, live["hash"]) is not None
+        # An edit shows its latest text, like channel history.
+        create_edit(conn, identity, "general", live["hash"], "edited text", now=1002)
+        visible = get_visible_message(conn, live["hash"])
+        assert visible is not None
+        assert visible["text"] == "edited text"
+        assert visible["edited"] is True
+    finally:
+        conn.close()

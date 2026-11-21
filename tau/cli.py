@@ -17042,7 +17042,9 @@ def _resolve_saved_message(
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     if getattr(args, "peer", None) is not None:
-        destination = _resolve_inbox_peer(inbox, registry, args.peer)
+        destination = _resolve_inbox_peer(
+            inbox, registry, args.peer, direction=None
+        )
         try:
             entry = _resolve_dm_saved_target(inbox, destination, ref)
         except NodeError:
