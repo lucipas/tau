@@ -3033,6 +3033,28 @@ def test_send_edit_supersedes_older_queued_edit(tmp_path, monkeypatch):
     assert entries[0].edit["text"] == "second fix"
 
 
+def test_send_edit_queued_original_is_refused(tmp_path, monkeypatch):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+    # The original send is still queued: the peer has never seen it.
+    node.mailbox.enqueue(
+        to=peer.destination_hash, text="typo here", message_id="m-1"
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    with pytest.raises(NodeError, match="has not been sent yet"):
+        node.send_edit("alice", "m-1", "fixed here")
+    # Nothing new was queued: only the original still waits.
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 1
+    assert entries[0].id == "m-1"
+    assert entries[0].edit is None
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
 def test_send_group_edit_queues_unreachable_legs(tmp_path, monkeypatch):
     from tau.protocol import REQUEST_DM_EDIT, parse_edit
 

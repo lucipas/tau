@@ -109,7 +109,13 @@ export default function ChatSection() {
   const [archived, setArchived] = useState<Set<string>>(new Set());
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editing, setEditing] = useState<ChatMessage | null>(null);
-  const [editNotice, setEditNotice] = useState<string | null>(null);
+  // The conversation a queued-edit notice belongs to: a notice set
+  // for one chat must not leak into another when the user switches
+  // chats, or when the edit request finishes after a switch.
+  const [editNotice, setEditNotice] = useState<{
+    text: string;
+    key: string;
+  } | null>(null);
   const [showOutbox, setShowOutbox] = useState(false);
   const [showBroadcasts, setShowBroadcasts] = useState(false);
   const [searchActive, setSearchActive] = useState(false);
@@ -350,11 +356,13 @@ export default function ChatSection() {
           queued = response?.queued === true;
         });
         // A queued edit is accepted but not yet delivered: the message
-        // keeps its old text here until the outbox delivers it.
+        // keeps its old text here until the outbox delivers it.  The
+        // notice belongs to this conversation only.
         if (ok && queued) {
-          setEditNotice(
-            "Edit queued — the peer is offline. It goes out when they are reachable, and the message keeps its old text until then.",
-          );
+          setEditNotice({
+            text: "Edit queued — the peer is offline. It goes out when they are reachable, and the message keeps its old text until then.",
+            key: selected.key,
+          });
         }
         return;
       }
@@ -616,9 +624,9 @@ export default function ChatSection() {
             </button>
           </p>
         )}
-        {editNotice && (
+        {editNotice && selected && editNotice.key === selected.key && (
           <p role="status" className="border-b border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300">
-            {editNotice}
+            {editNotice.text}
             <button type="button" onClick={() => setEditNotice(null)} className="ml-2 underline">
               Dismiss
             </button>
