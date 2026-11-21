@@ -109,6 +109,7 @@ export default function ChatSection() {
   const [archived, setArchived] = useState<Set<string>>(new Set());
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editing, setEditing] = useState<ChatMessage | null>(null);
+  const [editNotice, setEditNotice] = useState<string | null>(null);
   const [showOutbox, setShowOutbox] = useState(false);
   const [showBroadcasts, setShowBroadcasts] = useState(false);
   const [searchActive, setSearchActive] = useState(false);

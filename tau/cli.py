@@ -1070,6 +1070,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
+    react.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing when the peer is offline",
+    )
     react.set_defaults(func=cmd_react)
 
     # `tau typing` sends a live "composing" hint: a start when the
@@ -15109,9 +15114,10 @@ def _resolve_reply_target(
         # to the group send, so it must not resolve as a direct reply.
         if entry.group_id is not None:
             continue
-        # A queued edit is not a message: its id names an edit, so it
-        # must not resolve as a reply target either.
-        if getattr(entry, "kind", None) == "edit":
+        # A queued edit or reaction is not a message: its id names
+        # an edit or a reaction, so it must not resolve as a reply
+        # target either.
+        if getattr(entry, "kind", None) in ("edit", "reaction"):
             continue
         if entry.id.lower().startswith(value):
             candidates.setdefault(
@@ -15178,9 +15184,10 @@ def _resolve_group_reply_target(
             continue
         if entry.id in covered_ids:
             continue
-        # A queued edit is not a message: its id names an edit, so it
-        # must not resolve as a reply target.
-        if getattr(entry, "kind", None) == "edit":
+        # A queued edit or reaction is not a message: its id names
+        # an edit or a reaction, so it must not resolve as a reply
+        # target.
+        if getattr(entry, "kind", None) in ("edit", "reaction"):
             continue
         if entry.id.lower().startswith(value):
             candidates.setdefault(
@@ -19587,11 +19594,24 @@ def _report_group_reaction(
 ) -> int:
     """Report a group-reaction fan-out: per-member results in both modes."""
     results = response.get("results") or []
-    failed_legs = [r for r in results if not r.get("delivered")]
+    failed_legs = [
+        r for r in results if not r.get("delivered") and not r.get("queued")
+    ]
     if _json_mode(args):
         _emit(response, True)
         return _EXIT_ERROR if failed_legs else _EXIT_OK
-    if not token:
+    if results and all(result.get("queued") for result in results):
+        if not token:
+            print(
+                "retraction queued for the group message "
+                f"{_safe_id_prefix(str(target['id']))}"
+            )
+        else:
+            print(
+                f"reaction {token} queued for the group message "
+                f"{_safe_id_prefix(str(target['id']))}"
+            )
+    elif not token:
         print(
             "retracted your reaction to the group message "
             f"{_safe_id_prefix(str(target['id']))}"
@@ -19605,6 +19625,8 @@ def _report_group_reaction(
         name = result.get("to_name") or (result.get("to") or "")[:8]
         if result.get("delivered"):
             print(f"delivered to {name}")
+        elif result.get("queued"):
+            print(f"queued for {name}")
         else:
             print(
                 f"failed for {name}: "
@@ -20432,6 +20454,7 @@ def cmd_react(args: argparse.Namespace) -> int:
                     token,
                     timeout=float(getattr(args, "timeout", 20.0)),
                     discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    queue=not getattr(args, "no_queue", False),
                     target_author=author if isinstance(author, str) else None,
                     target_sent_at=(
                         sent_at
@@ -20441,12 +20464,11 @@ def cmd_react(args: argparse.Namespace) -> int:
                     ),
                 )
             except NodeError as exc:
-                # Reactions ride the live link only in v1 — there is
-                # no outbox queue for them yet — so an unreachable
-                # member is a plain failure, not a silent queue.
+                # With queueing on, a transport failure returns queued
+                # legs instead of raising; only a refusal or a
+                # --no-queue failure reaches here.
                 raise NodeError(
-                    f"could not deliver group reaction: {exc} "
-                    "(reactions need the peer online in v1)"
+                    f"could not deliver group reaction: {exc}"
                 ) from exc
             return _report_group_reaction(args, response, token, target)
         author = target.get("destination") or ""
@@ -20459,20 +20481,31 @@ def cmd_react(args: argparse.Namespace) -> int:
                 token,
                 timeout=float(getattr(args, "timeout", 20.0)),
                 discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                queue=not getattr(args, "no_queue", False),
             )
         except NodeError as exc:
-            # Reactions ride the live link only in v1 — there is no
-            # outbox queue for them yet — so an unreachable peer is a
-            # plain failure, not a silent queue.
+            # With queueing on, an unreachable peer returns a queued
+            # result instead of raising; only a refusal or a
+            # --no-queue failure reaches here.
             raise NodeError(
-                f"could not deliver reaction: {exc} "
-                "(reactions need the peer online in v1)"
+                f"could not deliver reaction: {exc}"
             ) from exc
     finally:
         node.stop()
 
     peer = registry.get(author)
     name = peer.display_name if peer is not None else target.get("from") or author
+    if response.get("queued"):
+        if _json_mode(args):
+            _emit(response, True)
+        elif not token:
+            print(f"retraction queued — will deliver when {name} is reachable")
+        else:
+            print(
+                f"reaction {token} queued — will deliver when {name} "
+                "is reachable"
+            )
+        return _EXIT_OK
     if _json_mode(args):
         _emit(
             {

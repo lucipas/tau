@@ -143,6 +143,17 @@ def build_bundle(
                 {"id": entry.id, "reason": "queued edit — not sealed"}
             )
             continue
+        if getattr(entry, "reaction", None) is not None or (
+            getattr(entry, "kind", None) == "reaction"
+        ):
+            # A queued reaction carries pre-signed /tau/react bytes,
+            # not a text message: it cannot be sealed into a bundle,
+            # and sealing its display text would land as chat.  It
+            # rides direct delivery only.
+            skipped.append(
+                {"id": entry.id, "reason": "queued reaction — not sealed"}
+            )
+            continue
         if entry.is_scheduled(timestamp):
             # Not due yet: a scheduled leg must not leave the node early
             # inside a bundle.  It is exported once its time has arrived.

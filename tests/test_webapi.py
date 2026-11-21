@@ -16009,6 +16009,43 @@ def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     ]
 
 
+def test_react_endpoint_reports_queued_reaction(bridge, node):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+
+    def send_reaction(peer, target, token, *, timeout=20.0, discover_timeout=None):
+        return {
+            "ok": False,
+            "queued": True,
+            "target": target,
+            "reaction": token,
+            "cleared": False,
+            "id": "react-1",
+            "queued_id": "q-1",
+        }
+
+    node.send_reaction = send_reaction
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "👍"},
+    )
+    assert status == 200
+    assert payload["target"] == "wire-1"
+    assert payload["reaction"] == "👍"
+    assert payload["queued"] is True
+    assert payload["queued_id"] == "q-1"
+
+
 def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
     status, _, payload = _json(
         bridge, "/api/react", method="POST", body={"target": "nope", "reaction": "👍"}
