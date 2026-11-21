@@ -342,10 +342,13 @@ export default function ChatSection() {
 
   async function handleCreateGroup(name: string, members: string[]) {
     // The panel owns validation and shows API errors inline; this
-    // handler only closes the panel and opens the new thread. A
-    // refresh that fails must not strand the user: the group exists
-    // on the node either way, and the next snapshot picks it up.
+    // handler only closes the panel and opens the new thread. The
+    // group is stashed in `createdGroup` first, so the thread still
+    // resolves when the refresh fails — a failed refresh must not
+    // strand the user on an empty list. The stash clears itself once
+    // a snapshot includes the group.
     const group = await createGroup(name, members);
+    setCreatedGroup(group);
     setShowNewGroup(false);
     await tau.refresh().catch(() => undefined);
     navigate("chat", { group: group.id });

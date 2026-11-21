@@ -35,8 +35,12 @@ function renderPanel(
     onCreate: vi.fn(async (): Promise<Group> => CREW),
     ...overrides,
   };
-  render(<NewGroupPanel {...props} />);
-  return props;
+  const { rerender } = render(<NewGroupPanel {...props} />);
+  return {
+    ...props,
+    rerender: (next: Partial<Parameters<typeof NewGroupPanel>[0]>) =>
+      rerender(<NewGroupPanel {...props} {...next} />),
+  };
 }
 
 function createNamedGroup(name: string, member: string) {
@@ -90,6 +94,24 @@ describe("NewGroupPanel", () => {
     });
     expect((screen.getByLabelText("Group name") as HTMLInputElement).value).toBe("crew");
     expect(props.onCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a picked peer who disappeared before creating", async () => {
+    const panel = renderPanel();
+    fireEvent.change(screen.getByLabelText("Group name"), {
+      target: { value: "crew" },
+    });
+    fireEvent.click(screen.getByLabelText("Alice"));
+    fireEvent.click(screen.getByLabelText("Bob"));
+    // Bob drops out of the registry while the form is open: his hash
+    // must not be submitted, and there is no checkbox left to uncheck.
+    panel.rerender({
+      peers: [makePeer({ destination: ALICE, name: "Alice" })],
+    });
+    fireEvent.click(screen.getByText("Create group"));
+    await vi.waitFor(() => {
+      expect(panel.onCreate).toHaveBeenCalledWith("crew", [ALICE]);
+    });
   });
 
   it("says so when no peer has announced yet", () => {

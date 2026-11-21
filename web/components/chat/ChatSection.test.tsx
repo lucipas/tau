@@ -287,4 +287,37 @@ describe("ChatSection new group", () => {
       expect(window.location.hash).toBe(`#chat?group=${NEW_GROUP_ID}`),
     );
   });
+
+  it("still opens the new group's thread when the refresh fails", async () => {
+    // The created group is stashed until a snapshot includes it: with
+    // the stash missing, a failed refresh leaves the thread
+    // unresolvable and the console shows "Select a conversation".
+    window.location.hash = "#chat";
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [
+            makePeer({ destination: PEER_HASH, name: "Alice" }),
+            makePeer({ destination: BOB_HASH, name: "Bob" }),
+          ],
+          messages: [],
+          refresh: vi.fn(async () => {
+            throw new Error("bridge down");
+          }),
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "New group" }));
+    fireEvent.change(screen.getByLabelText("Group name"), {
+      target: { value: "crew" },
+    });
+    fireEvent.click(screen.getByLabelText("Bob"));
+    fireEvent.click(screen.getByRole("button", { name: "Create group" }));
+    await waitFor(() =>
+      expect(window.location.hash).toBe(`#chat?group=${NEW_GROUP_ID}`),
+    );
+    expect(await screen.findByLabelText("Message")).toBeTruthy();
+  });
 });
