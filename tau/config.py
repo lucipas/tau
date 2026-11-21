@@ -7,6 +7,7 @@ import math
 import os
 import re
 import socket
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -611,9 +612,21 @@ def ensure_rns_stamps_policy(path: Path) -> bool:
             f"  {key} = {RNS_STAMPS_POLICY[key]}" for key in missing
         ]
         new_lines = lines[:insert_at] + additions + lines[insert_at:]
+    # Write through the resolved path, but never tighten permissions the
+    # user (or another tool) chose: the real file may live in a directory
+    # tau does not manage, so its parent keeps its mode and the file keeps
+    # its own. (Qodo re-review on #670: restrict_parent defaults to True
+    # in atomic_write_bytes, which would chmod that directory to 0700.)
+    try:
+        mode = stat.S_IMODE(write_target.stat().st_mode)
+    except OSError:
+        mode = 0o600
     try:
         atomic_write_text(
-            write_target, "\n".join(new_lines).rstrip() + "\n", mode=0o600
+            write_target,
+            "\n".join(new_lines).rstrip() + "\n",
+            mode=mode,
+            restrict_parent=False,
         )
     except OSError as exc:
         log.warning("Could not update Reticulum config at %s: %s", target, exc)

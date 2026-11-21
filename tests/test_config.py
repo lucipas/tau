@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,25 @@ def test_ensure_rns_stamps_policy_preserves_symlink(tmp_path):
     assert ensure_rns_stamps_policy(link) is True
     assert link.is_symlink()
     assert "[stamps]" in real.read_text()
+
+
+def test_ensure_rns_stamps_policy_keeps_external_modes(tmp_path):
+    # Merging the policy into a symlinked config that lives in a
+    # directory tau does not manage must not tighten that directory or
+    # the file itself (Qodo re-review on #670).
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    os.chmod(managed, 0o755)
+    real = managed / "rns.conf"
+    real.write_text("[reticulum]\n  enable_transport = No\n")
+    os.chmod(real, 0o644)
+    link = tmp_path / "config"
+    link.symlink_to(real)
+    assert ensure_rns_stamps_policy(link) is True
+    assert link.is_symlink()
+    assert "[stamps]" in real.read_text()
+    assert stat.S_IMODE(managed.stat().st_mode) == 0o755
+    assert stat.S_IMODE(real.stat().st_mode) == 0o644
 
 
 def test_ensure_rns_stamps_policy_missing_file_is_noop(tmp_path):
