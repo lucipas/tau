@@ -2453,6 +2453,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages.set_defaults(func=cmd_messages)
 
+    search = subparsers.add_parser(
+        "search",
+        parents=[common],
+        help="search stored chat history by keyword, newest first",
+    )
+    search.add_argument("query", metavar="TEXT", help="text to search for")
+    search_scope = search.add_mutually_exclusive_group()
+    search_scope.add_argument(
+        "--peer",
+        default=None,
+        metavar="NAME|HASH",
+        help="only search one DM peer (name, hash or hash prefix)",
+    )
+    search_scope.add_argument(
+        "--group",
+        default=None,
+        metavar="ID|NAME",
+        help="only search one group (id, id prefix or name)",
+    )
+    search_scope.add_argument(
+        "--channel",
+        default=None,
+        metavar="NAME",
+        help="only search one channel",
+    )
+    search.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="show the newest N matches (default 20)",
+    )
+    search.set_defaults(func=cmd_search)
+
     messages_sub = messages.add_subparsers(metavar="COMMAND")
     messages_delete = messages_sub.add_parser(
         "delete",
@@ -9970,6 +10004,225 @@ def cmd_channel_search(args: argparse.Namespace) -> int:
         print(f"No messages in #{name} matching {query.strip()!r}.")
         return _EXIT_OK
     _print_channel_messages(messages, json_output=False, channel=name)
+    return _EXIT_OK
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """Search stored chat history by keyword, newest first.
+
+    Without a scope flag this searches everywhere: DM and group
+    messages (sent and received) plus every joined channel, merged
+    into one newest-first list.  ``--peer`` narrows to one DM peer,
+    ``--group`` to one group (history spans renames, like
+    ``tau messages``), ``--channel`` to one channel.  The match is a
+    case-insensitive substring over message text, the same promise
+    ``tau tan search`` and ``tau channel search`` make.
+
+    Block rules match the history views: a blocked sender's received
+    messages stay hidden while outbound stays visible, and a
+    block-list that cannot be read hides received messages (fail
+    closed) while outbound stays visible.  Expired
+    disappearing messages are never returned — the inbox purges them
+    on load and channel search applies the history lifecycle.  A
+    search is a read-only lookup: it advances no read cursor and
+    sends no receipts, like ``tau messages --search``.
+    """
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    query = str(getattr(args, "query", "") or "")
+    if not query.strip():
+        print("error: search text must not be empty", file=sys.stderr)
+        return 2
+    limit = getattr(args, "limit", 20)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    # A corrupt mutes file fails open here, like `tau messages`: the
+    # conversations count as unmuted (with a warning), so their unread
+    # markers read the same in search as in the listing.
+    muted_peers = muted_peers_for(config.muted_path)
+    muted_groups = expand_muted_groups(
+        muted_groups_for(config.muted_path),
+        GroupStore(config.groups_path).list_groups(),
+    )
+    quiet = quiet_hours_active(config.quiet_hours_path)
+    peer_hash = None
+    group_ids = None
+    channel_name = None
+    if getattr(args, "peer", None):
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.peer, direction=None
+        )
+    if getattr(args, "group", None):
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
+        # History spans renames: messages stored under a predecessor
+        # id still belong to this group.
+        group_ids = store.lineage(group["id"])
+    if getattr(args, "channel", None):
+        try:
+            channel_name = clean_channel_name(args.channel)
+        except ChannelError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    blocked = load_blocked_set(config.blocklist_path)
+    own_hash = _own_destination_hash(config)
+    inbox_hits: List[Dict[str, Any]] = []
+    channel_hits: List[Dict[str, Any]] = []
+    app: Optional[ChannelApp] = None
+    if channel_name is None:
+        # A search is an explicit lookup, so ignored-group and
+        # archived mail still shows, like `tau messages --search`.
+        entries = inbox.list_messages(
+            limit=None,
+            peer=peer_hash,
+            group=group_ids,
+            query=query,
+            direction=None,
+            exclude_dm_from=muted_peers,
+            exclude_group=muted_groups,
+            quiet=quiet,
+        )
+        if peer_hash is not None:
+            # A --peer filter is a DM filter: group posts from
+            # that sender are the group's mail, not the DM thread.
+            entries = [
+                entry for entry in entries
+                if entry.get("kind") != "group"
+            ]
+        # Blocked senders' history stays stored but is hidden locally,
+        # like `tau messages`; unblocking restores the view.  The filter
+        # applies to received messages only: sent messages are this
+        # node's own, not a blocked sender's, so blocking the recipient
+        # never hides them — and an unreadable list hides received hits
+        # (fail closed) while leaving sent ones visible, the same rule
+        # `tau pinned` applies.
+        if blocked is None:
+            entries = [
+                entry for entry in entries if entry.get("direction") == "out"
+            ]
+        elif blocked:
+            entries = [
+                entry
+                for entry in entries
+                if entry.get("direction") == "out"
+                or entry.get("destination") not in blocked
+            ]
+        # Votes and closes are not chat: they ride as records so
+        # peers can tally them, but they never print as messages.
+        inbox_hits = [
+            entry
+            for entry in entries
+            if not is_group_poll_vote(entry)
+            and not is_group_poll_close(entry)
+            and not is_dm_poll_vote(entry)
+            and not is_dm_poll_close(entry)
+        ]
+        # Poll questions render with their tally, like `tau messages`.
+        _attach_group_poll_tallies(inbox, inbox_hits, own_hash)
+        _attach_dm_poll_tallies(inbox, inbox_hits, own_hash)
+    if channel_name is not None or (peer_hash is None and group_ids is None):
+        app = ChannelApp(config, _tan_identity(config), name=config.name)
+        names = (
+            [channel_name]
+            if channel_name is not None
+            else [item["channel"] for item in app.memberships()]
+        )
+        if blocked is not None:
+            for name in names:
+                channel_hits.extend(
+                    app.search(
+                        name,
+                        query,
+                        limit=int(limit) if limit is not None else DEFAULT_CHANNEL_LIMIT,
+                        exclude_authors=blocked,
+                    )
+                )
+        channel_hits = [
+            message
+            for message in channel_hits
+            if not is_channel_poll_vote(message)
+            and not is_channel_poll_close(message)
+        ]
+        if channel_hits:
+            _attach_channel_poll_tallies(
+                app, channel_hits, own_hash, blocked=blocked
+            )
+            # Resolve each reply's parent from the local store so the
+            # reader sees who and what is being answered, like
+            # `tau channel read` does.
+            conn = init_channel_db(config.channels_db_path)
+            try:
+                for message in channel_hits:
+                    if not message.get("reply_to"):
+                        continue
+                    parent = channel_reply_parent(conn, message)
+                    if parent is None:
+                        continue
+                    if str(parent.get("author", "")) in blocked:
+                        continue
+                    message["reply_parent"] = {
+                        "hash": parent["hash"],
+                        "name": parent.get("name", ""),
+                        "text": parent.get("text", ""),
+                    }
+            finally:
+                conn.close()
+    for entry in inbox_hits:
+        entry["source"] = "group" if entry.get("kind") == "group" else "dm"
+    for message in channel_hits:
+        message["source"] = "channel"
+    # Merge newest first across sources: inbox entries stamp
+    # received_at, channel messages created_at.
+    def _hit_time(hit: Dict[str, Any]) -> float:
+        stamp = (
+            hit.get("created_at")
+            if hit.get("source") == "channel"
+            else hit.get("received_at")
+        )
+        try:
+            return float(stamp or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    hits = sorted(
+        [*inbox_hits, *channel_hits], key=_hit_time, reverse=True
+    )
+    shown = hits if limit is None else hits[:limit]
+    if json_output:
+        _emit(
+            {"query": query.strip(), "messages": shown, "count": len(shown)},
+            True,
+        )
+        return _EXIT_OK
+    if not shown:
+        if channel_name is not None:
+            print(f"No messages in #{channel_name} matching {query.strip()!r}.")
+        else:
+            print(f"No messages matching {query.strip()!r}.")
+        return _EXIT_OK
+    for hit in shown:
+        if hit.get("source") == "channel":
+            print(f"Channel #{hit.get('channel')}")
+            _print_channel_messages(
+                [hit], json_output=False, channel=str(hit.get("channel"))
+            )
+            continue
+        if hit.get("kind") == "group":
+            print(f"Group {hit.get('group_name') or 'group'}")
+        else:
+            destination = str(hit.get("destination") or "")
+            peer = registry.get(destination)
+            name = (
+                peer.display_name
+                if peer is not None
+                else hit.get("from") or "unknown"
+            )
+            print(f"DM with {name} ({short_hash(destination)})")
+        _print_message_entry(
+            inbox, registry, hit, blocked=blocked, own_hash=own_hash
+        )
     return _EXIT_OK
 
 

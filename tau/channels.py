@@ -2582,6 +2582,9 @@ def search_channel_messages(
 
     *exclude_authors* hides messages from those authors, the same way
     history hides them; an empty query raises :class:`ChannelError`.
+    Expired and retracted messages are gone from search, exactly as
+    they are from history, and an edited message is matched on its
+    latest text — search shows what history shows.
     """
     if not isinstance(query, str) or not query.strip():
         raise ChannelError("search text must not be empty")
@@ -2595,16 +2598,29 @@ def search_channel_messages(
         placeholders = ", ".join("?" for _ in excluded)
         clauses.append(f"author NOT IN ({placeholders})")
         params.extend(excluded)
+    # An expired message is gone from search even before the store
+    # purges it, and a retracted one too — the same clauses
+    # channel_history_page applies, so search never resurrects
+    # something history hides.
+    clauses.append("(expires_at IS NULL OR expires_at > ?)")
+    params.append(time.time())
+    clauses.append(
+        "NOT EXISTS (SELECT 1 FROM retractions r "
+        "WHERE r.hash = messages.hash AND r.author = messages.author)"
+    )
     rows = conn.execute(
         f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages "
         f"WHERE {' AND '.join(clauses)} "
         "ORDER BY created_at DESC, hash DESC",
         params,
     ).fetchall()
+    messages = _apply_edits_to_messages(
+        conn, [_row_to_message(row) for row in rows]
+    )
     matches = [
-        _row_to_message(row)
-        for row in rows
-        if needle in str(row["text"]).casefold()
+        message
+        for message in messages
+        if needle in str(message.get("text") or "").casefold()
     ]
     return matches[:count]
 

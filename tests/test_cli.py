@@ -3890,6 +3890,236 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "alice" in out
 
 
+def _seed_search_data(tmp_path, capsys):
+    """A node with DM history, a sent DM, a group post and a channel.
+
+    Timestamps order the hits: the channel message is stamped with the
+    real clock (newest), then the group post (24), the sent DM (23)
+    and the received DM (22).
+    """
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "the bridge is up",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-3",
+        }
+    )
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": sender_hash.hex(),
+            "text": "my bridge note",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "s-1",
+            "direction": "out",
+        }
+    )
+    group = _seed_group_with_carol(data_dir, own_hash)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "cd" * 16,
+            "text": "bridge crew meetup",
+            "sent_at": 14.0,
+            "received_at": 24.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+        }
+    )
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    assert (
+        cli.main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "bridge repairs tonight",
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli.main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "unrelated",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()  # drain the join/send output before the search
+    return data_dir, sender_hash
+
+
+def test_search_merges_sources_newest_first(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(["search", "--data-dir", str(data_dir), "bridge"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "unrelated" not in out
+    assert "first hello" not in out
+    assert "Channel #general" in out
+    assert "Group weekend" in out
+    assert "DM with alice" in out
+    assert out.index("bridge repairs tonight") < out.index("bridge crew meetup")
+    assert out.index("bridge crew meetup") < out.index("my bridge note")
+    assert out.index("my bridge note") < out.index("the bridge is up")
+
+
+def test_search_json_marks_source_per_hit(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--json", "--data-dir", str(data_dir), "bridge"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["query"] == "bridge"
+    assert payload["count"] == 4
+    sources = [item["source"] for item in payload["messages"]]
+    assert sources == ["channel", "group", "dm", "dm"]
+    channel_hit = payload["messages"][0]
+    assert channel_hit["channel"] == "general"
+
+
+def test_search_limit_caps_merged_list(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--json", "--data-dir", str(data_dir), "--limit", "2", "bridge"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert [item["text"] for item in payload["messages"]] == [
+        "bridge repairs tonight",
+        "bridge crew meetup",
+    ]
+
+
+def test_search_peer_scope_only_dm(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--data-dir", str(data_dir), "--peer", "alice", "bridge"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    # Both directions of the DM thread match; channel and group do not.
+    assert "the bridge is up" in out
+    assert "my bridge note" in out
+    assert "bridge repairs tonight" not in out
+    assert "bridge crew meetup" not in out
+
+
+def test_search_group_scope_only_group(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--data-dir", str(data_dir), "--group", "weekend", "bridge"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "bridge crew meetup" in out
+    assert "the bridge is up" not in out
+    assert "bridge repairs tonight" not in out
+
+
+def test_search_channel_scope_only_channel(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--data-dir", str(data_dir), "--channel", "general", "bridge"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "bridge repairs tonight" in out
+    assert "the bridge is up" not in out
+    assert "bridge crew meetup" not in out
+
+    code = cli.main(
+        ["search", "--data-dir", str(data_dir), "--channel", "nope", "bridge"]
+    )
+    assert code == 0
+    assert "No messages in #nope matching 'bridge'." in capsys.readouterr().out
+
+
+def test_search_blocked_sender_hides_received_keeps_outbound(tmp_path, capsys):
+    data_dir, sender_hash = _seed_search_data(tmp_path, capsys)
+
+    def _search_text():
+        code = cli.main(["search", "--data-dir", str(data_dir), "bridge"])
+        assert code == 0
+        return capsys.readouterr().out
+
+    # Blocking the sender hides the received DM, not the sent one.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": [sender_hash.hex()]}), encoding="utf-8"
+    )
+    out = _search_text()
+    assert "the bridge is up" not in out
+    assert "my bridge note" in out
+    assert "bridge repairs tonight" in out
+
+    # An unreadable list hides received hits (fail closed) but keeps
+    # sent ones, the same rule `tau pinned` applies.
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    out = _search_text()
+    assert "the bridge is up" not in out
+    assert "my bridge note" in out
+    assert "bridge repairs tonight" not in out
+
+
+def test_search_empty_query_and_no_match(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(["search", "--data-dir", str(data_dir), "   "])
+    assert code == 2
+    assert "must not be empty" in capsys.readouterr().err
+
+    code = cli.main(["search", "--data-dir", str(data_dir), "nope"])
+    assert code == 0
+    assert "No messages matching 'nope'." in capsys.readouterr().out
+
+
+def test_parser_search_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["search", "hello"])
+    assert args.query == "hello"
+    assert args.limit == 20
+    assert args.peer is None
+    assert args.group is None
+    assert args.channel is None
+    assert args.func == cli.cmd_search
+
+    args = parser.parse_args(["search", "--peer", "alice", "--limit", "5", "hello"])
+    assert args.peer == "alice"
+    assert args.limit == 5
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["search", "--peer", "alice", "--group", "x", "hello"])
+
+
 def test_quote_line_prefers_logical_reference_over_foreign_leg_id(tmp_path):
     """A group reply that carries the logical reference resolves
     against this node's own copy even when the reply names another
