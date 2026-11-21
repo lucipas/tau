@@ -948,8 +948,10 @@ An offline peer queues the edit instead of failing: the signed bytes
 wait in the outbox and the mail sweep delivers them when the peer is
 heard from again, and the sender's own copies update on delivery — for
 a group edit, when the last queued leg for it delivers, so the local
-copies only ever change on a full fan-out. A newer edit of the same
-message supersedes a still-queued one. Refusals never queue (allow-list,
+copies only ever change on a full fan-out. A leg that expires or is
+cancelled aborts the whole edit instead: its sibling legs are cancelled
+with it, so a partial fan-out never rewrites the sender's own copies.
+A newer edit of the same message supersedes a still-queued one. Refusals never queue (allow-list,
 block-list, not a member), and `tau edit --no-queue` keeps the fail-fast
 behaviour. Queued edits ride direct delivery only: no sealed-relay copy,
 no bundle export, no LXMF. A peer running a version that predates edits

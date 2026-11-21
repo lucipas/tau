@@ -5446,6 +5446,10 @@ class TauNode:
         # wait must not stall other mail rounds.
         if to is None and message_id is None:
             summary["receipts"] += self._flush_read_receipts()
+            # Deferred local edits retry here, on the same round that
+            # just moved the mail: a confirmed edit whose final check
+            # timed out applies once its siblings have resolved.
+            self._retry_pending_local_edits(deadline=deadline)
         return summary
 
     def _flush_peer(
@@ -5753,41 +5757,69 @@ class TauNode:
         it for the same edit.
         """
         cancelled: List[str] = []
-        for entry in self.mailbox.outbox_list():
-            edit = getattr(entry, "edit", None)
-            if not isinstance(edit, dict):
-                continue
-            if edit.get("target") != target_id:
-                continue
-            if (
-                exclude_edit_id is not None
-                and edit.get("edit_id") == exclude_edit_id
-            ):
-                continue
-            if group_id is None:
-                if entry.group_id is not None:
+        cancelled_edit_ids: Set[str] = set()
+        # The leg removals and the abort share one transaction: a
+        # flush claiming a deferred apply must never observe the
+        # legs gone while the record is still eligible — that
+        # intermediate state would apply an edit that did not reach
+        # every member.
+        with self.mailbox.transaction():
+            for entry in self.mailbox.outbox_list():
+                edit = getattr(entry, "edit", None)
+                if not isinstance(edit, dict):
                     continue
-            elif entry.group_id != group_id:
-                continue
-            if self.mailbox.remove_outbox(entry.id):
-                cancelled.append(entry.id)
+                if edit.get("target") != target_id:
+                    continue
+                if (
+                    exclude_edit_id is not None
+                    and edit.get("edit_id") == exclude_edit_id
+                ):
+                    continue
+                if group_id is None:
+                    if entry.group_id is not None:
+                        continue
+                elif entry.group_id != group_id:
+                    continue
+                if self.mailbox.remove_outbox(entry.id):
+                    cancelled.append(entry.id)
+                    if isinstance(edit.get("edit_id"), str):
+                        cancelled_edit_ids.add(edit["edit_id"])
+            # A superseded edit is aborted: a deferred local apply for
+            # it must never land — the newer edit owns the local copy
+            # now.  Marking it aborted also refuses a record inserted
+            # afterwards for the same edit.
+            for cancelled_edit_id in cancelled_edit_ids:
+                self.mailbox.abort_pending_local_edit(cancelled_edit_id)
         return cancelled
 
     def _queued_edit_siblings(
-        self, edit_id: str, *, exclude: Optional[str] = None
+        self,
+        edit_id: str,
+        *,
+        exclude: Optional[str] = None,
+        deadline: Optional[float] = None,
     ) -> List[Any]:
         """Still-queued entries carrying the same edit id.
 
         Group-edit legs share one edit id, so the siblings of a leg
         are the other members' legs for the same edit.  A DM edit has
         no siblings: one peer, one leg.
+
+        A leg whose stored payload did not survive still belongs to
+        the edit — its id is kept as a hint (see
+        ``OutboxEntry.group_edit_id``) — so match on that too: a
+        corrupt sibling must still block the local edit until the
+        fan-out resolves, or the sender sees an edit its recipient
+        never received.  With a deadline the mailbox-lock wait is
+        bounded by it (``TimeoutError`` when the budget is spent).
         """
         siblings: List[Any] = []
-        for candidate in self.mailbox.outbox_list():
+        for candidate in self.mailbox.outbox_list(
+            timeout=_remaining(deadline)
+        ):
             if exclude is not None and candidate.id == exclude:
                 continue
-            other = getattr(candidate, "edit", None)
-            if isinstance(other, dict) and other.get("edit_id") == edit_id:
+            if getattr(candidate, "group_edit_id", None) == edit_id:
                 siblings.append(candidate)
         return siblings
 
@@ -5830,8 +5862,117 @@ class TauNode:
         deadline-bounded and tolerates a busy mailbox lock, like
         :meth:`_drop_queued_edit`.
         """
-        for sibling in self._queued_edit_siblings(edit_id, exclude=exclude):
+        try:
+            siblings = self._queued_edit_siblings(
+                edit_id, exclude=exclude, deadline=deadline
+            )
+        except TimeoutError:
+            log.debug(
+                "Could not list queued edit siblings for %s: mailbox "
+                "lock busy; leaving them for a later round",
+                edit_id,
+            )
+            return
+        for sibling in siblings:
             self._drop_queued_edit(sibling, deadline=deadline)
+
+    def _drop_failed_group_edit_leg(
+        self,
+        entry: Any,
+        *,
+        edit_id: Optional[str],
+        deadline: Optional[float] = None,
+    ) -> bool:
+        """Drop a failed group-edit leg and its siblings, atomically.
+
+        One mailbox transaction covers the version check, the sibling
+        lookup and every removal: either the leg and its siblings all
+        go, or — when the lock stays busy past the deadline — nothing
+        does and a later round retries the delivery and the cleanup.
+        A failed leg is never removed while a sibling survives to
+        deliver later and apply the local edit for a partial fan-out.
+
+        ``edit_id`` is the edit the leg belongs to (from the
+        validated payload, or the hint kept for a corrupt one);
+        ``None`` matches siblings by group, signed send time and
+        replacement text instead.  A replacement that landed while
+        the send was in flight keeps its leg.  Returns True when the
+        leg was dropped.  Dropping the leg aborts the whole edit, so
+        a deferred local apply for it goes too: the sender's copies
+        must not show an edit a member never received.
+        """
+        aborted_ids: Set[str] = set()
+        if edit_id is not None:
+            aborted_ids.add(edit_id)
+        dropped = False
+        try:
+            with self.mailbox.transaction(timeout=_remaining(deadline)):
+                current = self.mailbox.get_outbox(entry.id)
+                if current is not None and (
+                    current.text == entry.text
+                    and current.edited_at
+                    == getattr(entry, "edited_at", None)
+                ):
+                    self._drop_queued_edit(entry, deadline=deadline)
+                    if edit_id is not None:
+                        self._drop_queued_edit_siblings(
+                            edit_id, exclude=entry.id, deadline=deadline
+                        )
+                    else:
+                        try:
+                            candidates = self.mailbox.outbox_list(
+                                timeout=_remaining(deadline)
+                            )
+                        except TimeoutError:
+                            log.debug(
+                                "Could not list queued edit siblings for "
+                                "%s: mailbox lock busy; leaving them for a "
+                                "later round",
+                                entry.id,
+                            )
+                            candidates = []
+                        for sibling in candidates:
+                            other = getattr(sibling, "edit", None)
+                            if (
+                                sibling.id != entry.id
+                                and sibling.group_id == entry.group_id
+                                and isinstance(other, dict)
+                                and entry.sent_at is not None
+                                and other.get("sent_at") == entry.sent_at
+                                and sibling.text == entry.text
+                            ):
+                                if sibling.group_edit_id is not None:
+                                    aborted_ids.add(sibling.group_edit_id)
+                                self._drop_queued_edit(
+                                    sibling, deadline=deadline
+                                )
+                    dropped = True
+                # Dropping the leg aborts the whole edit, so a
+                # deferred local apply for it goes too — inside this
+                # same transaction, so a lock that goes busy
+                # afterwards cannot strand the record while the legs
+                # are gone.  (A version mismatch means a replacement
+                # superseded the edit; its apply belongs to the
+                # replacement now.  A leg already gone was cancelled
+                # by a path that drops the record itself.)
+                if aborted_ids:
+                    for aborted_id in aborted_ids:
+                        self.mailbox.abort_pending_local_edit(aborted_id)
+                elif entry.sent_at is not None:
+                    # No id survived anywhere for this edit: match
+                    # its deferred apply by replacement text and
+                    # signed send time.
+                    self.mailbox.drop_pending_local_edits_by_text(
+                        entry.text, entry.sent_at
+                    )
+        except TimeoutError:
+            log.debug(
+                "Could not drop failed group edit leg %s: mailbox "
+                "lock busy; leaving it for a later round",
+                entry.id,
+            )
+            return False
+        return dropped
 
     def _record_sent_edit_locally(
         self,
@@ -5919,6 +6060,135 @@ class TauNode:
                 log.warning("on_edit callback failed", exc_info=True)
         return local_errors
 
+    def _claim_pending_local_edit(
+        self, edit_id: str, *, deadline: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Claim a deferred local edit for this round, atomically.
+
+        One mailbox transaction covers the whole decision: confirm
+        the record still exists, check for queued siblings, and —
+        only when none remain — drop the record, so the caller owns
+        the apply.  A cancellation, prune, or live-send abort that
+        drops the record first wins the race instead: the claim
+        finds no record and the edit never applies.  A sibling still
+        queued leaves the record for a later round.  Returns the
+        claimed record, or None when there is nothing to apply.
+        Raises ``TimeoutError`` when the mailbox lock stays busy
+        past the deadline.
+        """
+        with self.mailbox.transaction(timeout=_remaining(deadline)):
+            record = next(
+                (
+                    item
+                    for item in self.mailbox.pending_local_edits()
+                    if item.get("edit_id") == edit_id
+                ),
+                None,
+            )
+            if record is None:
+                return None
+            siblings = self._queued_edit_siblings(
+                edit_id, deadline=deadline
+            )
+            if siblings:
+                return None
+            self.mailbox.drop_pending_local_edit(edit_id)
+            return dict(record)
+
+    def _retry_pending_local_edits(
+        self, *, deadline: Optional[float] = None
+    ) -> None:
+        """Apply deferred local edits whose fan-out has resolved.
+
+        A confirmed edit whose final-sibling check timed out leaves
+        a pending record instead of updating the local copies: the
+        next round claims it — confirming in one transaction that
+        the record still exists and no sibling leg remains — and
+        applies the edit, without resending it.  A sibling still
+        queued keeps the record for a later round; an edit aborted
+        since has its record dropped by the abort path, so the claim
+        finds nothing and it never applies here.  A local apply
+        that reports errors keeps its record for a later round
+        instead of dropping it: the edited-time guards make a
+        re-apply of the copies that did update safe.  A lock that
+        stays busy past the deadline leaves the records for a later
+        round.
+        """
+        for pending in self.mailbox.pending_local_edits():
+            if _past(deadline):
+                return
+            edit_id = pending.get("edit_id")
+            if not isinstance(edit_id, str):
+                continue
+            try:
+                claimed = self._claim_pending_local_edit(
+                    edit_id, deadline=deadline
+                )
+            except TimeoutError:
+                return
+            if claimed is None:
+                continue
+            target = claimed.get("target")
+            text = claimed.get("text")
+            sent_at = claimed.get("sent_at")
+            peer_hex = claimed.get("peer_hex")
+            if (
+                not isinstance(target, str)
+                or not isinstance(text, str)
+                or not isinstance(sent_at, (int, float))
+                or not isinstance(peer_hex, str)
+            ):
+                log.warning(
+                    "Dropping malformed deferred local apply for edit %s",
+                    edit_id,
+                )
+                continue
+            errors = self._record_sent_edit_locally(
+                target,
+                text,
+                float(sent_at),
+                peer_hex=peer_hex,
+            )
+            if not errors:
+                continue
+            log.warning(
+                "Deferred local apply for edit %s reported: %s",
+                edit_id,
+                "; ".join(errors),
+            )
+            # The apply failed, so the record goes back for a later
+            # round — unless the edit was aborted since the claim,
+            # in which case the insertion refuses it.
+            try:
+                restored = self.mailbox.add_pending_local_edit(
+                    claimed,
+                    timeout=(
+                        _remaining(deadline)
+                        if deadline is not None
+                        else 0.5
+                    ),
+                )
+            except TimeoutError:
+                log.warning(
+                    "Deferred local apply for edit %s failed and its "
+                    "record could not be restored: mailbox lock busy",
+                    edit_id,
+                )
+            except (MailboxError, OSError) as exc:
+                log.warning(
+                    "Deferred local apply for edit %s failed and its "
+                    "record could not be restored: %s",
+                    edit_id,
+                    exc,
+                )
+            else:
+                if not restored:
+                    log.warning(
+                        "Deferred local apply for edit %s failed, but "
+                        "its edit was aborted since; not restoring it",
+                        edit_id,
+                    )
+
     def _deliver_queued_edit(
         self,
         peer: Peer,
@@ -5958,7 +6228,23 @@ class TauNode:
                 "Dropping queued edit %s: stored payload is unusable",
                 entry.id,
             )
-            self._drop_queued_edit(entry, deadline=deadline)
+            if entry.group_id is not None:
+                # The corrupt payload took the edit id with it, but
+                # the entry keeps it as a hint (see
+                # ``OutboxEntry.group_edit_id``).  When even the hint
+                # is gone, the sibling legs still share the group, the
+                # edit's signed send time and the replacement text, so
+                # match on those instead.  Either way a leg that can
+                # never deliver aborts the whole edit, like a refusal
+                # does — and the leg and its siblings go together, or
+                # not at all.
+                self._drop_failed_group_edit_leg(
+                    entry,
+                    edit_id=entry.group_edit_id,
+                    deadline=deadline,
+                )
+            else:
+                self._drop_queued_edit(entry, deadline=deadline)
             return False
         try:
             payload_bytes = base64.b64decode(edit["payload_b64"], validate=True)
@@ -5967,7 +6253,12 @@ class TauNode:
                 "Dropping queued edit %s: stored payload is not valid base64",
                 entry.id,
             )
-            self._drop_queued_edit(entry, deadline=deadline)
+            if entry.group_id is not None:
+                self._drop_failed_group_edit_leg(
+                    entry, edit_id=edit["edit_id"], deadline=deadline
+                )
+            else:
+                self._drop_queued_edit(entry, deadline=deadline)
             return False
         try:
             response = self._request(
@@ -5978,11 +6269,12 @@ class TauNode:
             # this edit, so stop retrying rather than holding the leg
             # until its TTL.
             log.warning("Dropping queued edit %s: %s", entry.id, exc)
-            self._drop_queued_edit(entry, deadline=deadline)
             if entry.group_id is not None:
-                self._drop_queued_edit_siblings(
-                    edit["edit_id"], exclude=entry.id, deadline=deadline
+                self._drop_failed_group_edit_leg(
+                    entry, edit_id=edit["edit_id"], deadline=deadline
                 )
+            else:
+                self._drop_queued_edit(entry, deadline=deadline)
             return False
         except NodeError as exc:
             try:
@@ -6005,11 +6297,9 @@ class TauNode:
                 "without group edit",
                 entry.id,
             )
-            self._drop_queued_edit(entry, deadline=deadline)
-            for sibling in self._queued_edit_siblings(
-                edit["edit_id"], exclude=entry.id
-            ):
-                self.mailbox.remove_outbox(sibling.id)
+            self._drop_failed_group_edit_leg(
+                entry, edit_id=edit["edit_id"], deadline=deadline
+            )
             return False
         if entry.group_id is None and response.get("edited") is False:
             # The peer had no copy, or a newer edit already landed:
@@ -6058,13 +6348,96 @@ class TauNode:
                 entry.id,
             )
             return True
-        if not self._queued_edit_siblings(edit["edit_id"], exclude=entry.id):
+        try:
+            siblings = self._queued_edit_siblings(
+                edit["edit_id"], exclude=entry.id, deadline=deadline
+            )
+        except TimeoutError:
+            # The deadline is spent, but the lock may only be busy
+            # for a moment: one short grace retry before giving up
+            # the local update.  Without it, a confirmed delivery
+            # whose leg is already removed would leave the sender's
+            # copies stale with no later round to repeat the check.
+            try:
+                siblings = self._queued_edit_siblings(
+                    edit["edit_id"],
+                    exclude=entry.id,
+                    deadline=time.monotonic() + 0.5,
+                )
+            except TimeoutError:
+                # The mailbox lock stayed busy, so the fan-out cannot
+                # be proven complete: defer the local update instead
+                # of skipping it.  The record survives restarts; the
+                # next flush retries the check and applies the edit
+                # once no sibling legs remain queued, without
+                # resending it.  An edit aborted since has its record
+                # dropped by the abort path, so it never applies — and
+                # the insertion itself refuses an edit the abort
+                # marked, so a cancellation that landed between the
+                # timed-out check and this insertion cannot resurrect
+                # it.
+                try:
+                    recorded = self.mailbox.add_pending_local_edit(
+                        {
+                            "edit_id": edit["edit_id"],
+                            "target": edit["target"],
+                            "text": edit["text"],
+                            "sent_at": float(edit["sent_at"]),
+                            "peer_hex": entry.to_hex,
+                        },
+                        timeout=0.5,
+                    )
+                except TimeoutError:
+                    log.warning(
+                        "Delivered queued edit %s but the mailbox lock "
+                        "stayed busy; could not defer the local update "
+                        "either, so the sender's copies stay stale",
+                        entry.id,
+                    )
+                except (MailboxError, OSError) as exc:
+                    log.warning(
+                        "Could not defer the local update for delivered "
+                        "queued edit %s: %s",
+                        entry.id,
+                        exc,
+                    )
+                else:
+                    if recorded:
+                        log.warning(
+                            "Delivered queued edit %s but the mailbox "
+                            "lock stayed busy; deferring the local "
+                            "update until a later round",
+                            entry.id,
+                        )
+                    else:
+                        log.warning(
+                            "Delivered queued edit %s but its edit was "
+                            "aborted since; not deferring the local "
+                            "update",
+                            entry.id,
+                        )
+                return True
+        if not siblings:
             self._record_sent_edit_locally(
                 edit["target"],
                 edit["text"],
                 float(edit["sent_at"]),
                 peer_hex=entry.to_hex,
             )
+            # The fan-out completed here, so a pending record left by
+            # an earlier leg's timed-out check is satisfied: drop it
+            # rather than letting a later round apply the same edit
+            # again.
+            try:
+                self.mailbox.drop_pending_local_edit(
+                    edit["edit_id"], timeout=_remaining(deadline)
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not drop pending local edit %s: mailbox "
+                    "lock busy; a later round re-applies it",
+                    edit["edit_id"],
+                )
         return True
 
     def _deliver_queued_reaction(
@@ -10853,6 +11226,44 @@ class TauNode:
                         "id": edit_id,
                     }
                 )
+        # A member the edit can no longer reach — refused, rejected,
+        # running a version without group edits, unqueueable, or never
+        # attempted — dooms the whole edit: legs already queued for
+        # other members must not deliver later and rewrite the local
+        # copies for a partial fan-out.  Drop them and report them as
+        # failed instead of queued, so the user can retry the edit (a
+        # retry is a new edit id; a member who already applied this
+        # one answers ``edited`` False only when a newer edit landed).
+        # A member counts as covered by a delivered, queued or
+        # deferred leg; a re-queue failure alone does not cover them,
+        # since they never receive the edit that way.
+        covered = {
+            result.get("to")
+            for result in results
+            if result.get("delivered")
+            or result.get("queued")
+            or result.get("deferred")
+        }
+        if any(member not in covered for member in members):
+            # The sibling drops and the abort share one transaction:
+            # a flush claiming a deferred apply must never observe
+            # the legs gone while the record is still eligible —
+            # that intermediate state would apply an edit that did
+            # not reach every member.
+            with self.mailbox.transaction():
+                for sibling in self._queued_edit_siblings(edit_id):
+                    self._drop_queued_edit(sibling)
+                # The edit is aborted: a deferred local apply for it
+                # must never land — and a record inserted afterwards for
+                # the same edit is refused.
+                self.mailbox.abort_pending_local_edit(edit_id)
+            for result in results:
+                if result.get("queued"):
+                    result["queued"] = False
+                    result["ok"] = False
+                    result["error"] = (
+                        "edit aborted: another member could not receive it"
+                    )
         all_ok = all(result.get("delivered") for result in results)
         local_errors: List[str] = []
         if all_ok:

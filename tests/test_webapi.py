@@ -12032,6 +12032,51 @@ def test_outbox_cancel_by_id_and_prefix(bridge, node):
     assert payload == {"outbox": [], "count": 0, "held_for_others": 0}
 
 
+def test_outbox_cancel_drops_sibling_group_edit_legs(bridge, node):
+    import base64
+
+    group = {
+        "id": "aa" * 16,
+        "name": "crew",
+        "creator": "bb" * 16,
+        "members": ["cc" * 16, "dd" * 16, "ee" * 16],
+    }
+    edit = {
+        "target": "leg-1",
+        "text": "fixed here",
+        "edit_id": "edit-1",
+        "sent_at": 100.0,
+        "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+    }
+    first = node.mailbox.enqueue(
+        to=bytes.fromhex("cc" * 16),
+        text="fixed here",
+        group=group,
+        edit=dict(edit),
+        message_id="aa" + "11" * 15,
+    )
+    node.mailbox.enqueue(
+        to=bytes.fromhex("dd" * 16),
+        text="fixed here",
+        group=group,
+        edit=dict(edit),
+        message_id="aa" + "22" * 15,
+    )
+    _queue(node, PEER_HASH, "keep me", message_id="bb" + "22" * 15)
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": first.id}
+    )
+    assert status == 200
+    assert payload["cancelled"]["id"] == first.id
+    # Cancelling one leg of a queued group edit cancels the whole edit;
+    # the unrelated entry stays queued.
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert [entry["id"] for entry in payload["outbox"]] == [
+        "bb" + "22" * 15
+    ]
+
+
 def test_outbox_cancel_errors(bridge, node):
     status, _, payload = _json(
         bridge, "/api/outbox/cancel", method="POST", body={}

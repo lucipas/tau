@@ -8860,6 +8860,8 @@ class WebBridge:
 
         Cancelling stops this node's future delivery attempts; sealed
         copies already held by other peers may still be delivered.
+        Cancelling one leg of a queued group edit cancels the whole
+        edit: the remaining legs can no longer complete the fan-out.
         Resolve and remove happen inside one mailbox transaction, so a
         cancel cannot miss an entry another process just queued, and a
         delivery that lands in between is reported instead of silently
@@ -8869,7 +8871,9 @@ class WebBridge:
             raise ValueError("message id is required")
         with self.node.mailbox.transaction():
             entry = self.node.mailbox.resolve_outbox(target.strip())
-            if not self.node.mailbox.remove_outbox(entry.id):
+            if not self.node.mailbox.remove_outbox(
+                entry.id, abort_group_edit=True
+            ):
                 # Delivered or expired between resolve and remove.
                 raise MailboxError(
                     f"queued message {target.strip()!r} is no longer queued"

@@ -1307,6 +1307,292 @@ def test_prune_expires_everything(tmp_path):
     }
 
 
+def _enqueue_group_edit_leg(box, *, leg_id, to_hex, edit_id, group, ttl):
+    """One leg of a queued group edit, for the prune/cancel tests."""
+    return box.enqueue(
+        to=bytes.fromhex(to_hex),
+        text="fixed here",
+        group=group,
+        edit={
+            "target": "leg-1",
+            "text": "fixed here",
+            "edit_id": edit_id,
+            "sent_at": 100.0,
+            "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+        },
+        ttl=ttl,
+        now=100.0,
+        message_id=leg_id,
+    )
+
+
+def _edit_group():
+    return {
+        "id": "aa" * 16,
+        "name": "crew",
+        "creator": "bb" * 16,
+        "members": ["cc" * 16, "dd" * 16, "ee" * 16],
+    }
+
+
+def test_prune_drops_siblings_of_expired_group_edit_leg(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=60.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    box.enqueue(
+        to=BOB, text="keep me", ttl=3600.0, now=100.0, message_id="plain"
+    )
+    # Only the first leg expired, but the edit can no longer complete
+    # its fan-out: the still-live sibling goes with it.
+    removed = box.prune(now=200.0)
+    assert removed["outbox"] == 2
+    assert [e.id for e in box.outbox_list()] == ["plain"]
+
+
+def test_cancel_aborts_deferred_local_apply(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    box.add_pending_local_edit(
+        {
+            "edit_id": "edit-1",
+            "target": "leg-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": "cc" * 16,
+        }
+    )
+    box.add_pending_local_edit(
+        {
+            "edit_id": "edit-2",
+            "target": "leg-2",
+            "text": "other edit",
+            "sent_at": 101.0,
+            "peer_hex": "dd" * 16,
+        }
+    )
+    # The record survives a reload: the deferral is durable.
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    assert [r["edit_id"] for r in reloaded.pending_local_edits()] == [
+        "edit-1",
+        "edit-2",
+    ]
+    assert box.remove_outbox("leg-alice", abort_group_edit=True) is True
+    assert box.outbox_list() == []
+    # The aborted edit's apply goes with it; the other stands.
+    assert [r["edit_id"] for r in box.pending_local_edits()] == ["edit-2"]
+
+
+def test_prune_aborts_deferred_local_apply(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=60.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    box.add_pending_local_edit(
+        {
+            "edit_id": "edit-1",
+            "target": "leg-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": "cc" * 16,
+        }
+    )
+    box.add_pending_local_edit(
+        {
+            "edit_id": "edit-2",
+            "target": "leg-2",
+            "text": "other edit",
+            "sent_at": 101.0,
+            "peer_hex": "dd" * 16,
+        }
+    )
+    removed = box.prune(now=200.0)
+    assert removed["outbox"] == 2
+    assert [r["edit_id"] for r in box.pending_local_edits()] == ["edit-2"]
+
+
+def test_aborted_edit_refuses_later_pending_local_edit(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    record = {
+        "edit_id": "edit-1",
+        "target": "leg-1",
+        "text": "fixed here",
+        "sent_at": 100.0,
+        "peer_hex": "cc" * 16,
+    }
+    # Cancelling the edit aborts it before any record exists: a
+    # record inserted afterwards for the same edit is refused, so a
+    # cancellation that landed between a timed-out sibling check and
+    # the insertion cannot resurrect the edit.
+    assert box.remove_outbox("leg-alice", abort_group_edit=True) is True
+    assert box.is_local_edit_aborted("edit-1") is True
+    assert box.add_pending_local_edit(record) is False
+    assert box.pending_local_edits() == []
+    # Other edits are unaffected, and the mark survives a reload.
+    assert box.add_pending_local_edit(
+        {
+            "edit_id": "edit-2",
+            "target": "leg-2",
+            "text": "other edit",
+            "sent_at": 101.0,
+            "peer_hex": "dd" * 16,
+        }
+    ) is True
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    assert reloaded.is_local_edit_aborted("edit-1") is True
+    assert [r["edit_id"] for r in reloaded.pending_local_edits()] == [
+        "edit-2"
+    ]
+
+
+def test_aborted_local_edit_mark_expires_with_prune(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.abort_pending_local_edit("edit-1", now=1000.0)
+    assert box.is_local_edit_aborted("edit-1", now=1000.0) is True
+    # Still live inside its retention; gone once it expires.
+    box.prune(now=1000.0 + RETRACTED_RETENTION - 1.0)
+    assert box.is_local_edit_aborted("edit-1", now=1000.0) is True
+    box.prune(now=1000.0 + RETRACTED_RETENTION)
+    assert box.is_local_edit_aborted("edit-1", now=1000.0) is False
+    # Malformed marks are dropped on parse, not loaded.
+    path = tmp_path / "mailbox.json"
+    raw = json.loads(path.read_text())
+    raw["aborted_local_edits"] = {
+        "edit-1": 1000.0 + RETRACTED_RETENTION,
+        "bad": "soon",
+    }
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert reloaded.is_local_edit_aborted("edit-1", now=1000.0) is True
+    assert reloaded.is_local_edit_aborted("bad", now=1000.0) is False
+
+
+def test_drop_pending_local_edits_by_text_marks_aborted(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.add_pending_local_edit(
+        {
+            "edit_id": "edit-1",
+            "target": "leg-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": "cc" * 16,
+        }
+    )
+    # A wrong replacement text does not match the record.
+    box.drop_pending_local_edits_by_text("other text", 100.0)
+    assert box.pending_local_edits() != []
+    assert box.is_local_edit_aborted("edit-1") is False
+    # The corrupt-leg fallback identity drops the record and marks
+    # the edit aborted, so a later insertion for it is refused.
+    box.drop_pending_local_edits_by_text("fixed here", 100.0)
+    assert box.pending_local_edits() == []
+    assert box.is_local_edit_aborted("edit-1") is True
+    assert box.add_pending_local_edit(
+        {
+            "edit_id": "edit-1",
+            "target": "leg-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": "cc" * 16,
+        }
+    ) is False
+
+
+def test_prune_drops_siblings_of_expired_corrupt_group_edit_leg(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=60.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    # Corrupt the first leg's stored payload: validation drops the
+    # edit, but the entry keeps the edit id as a hint, so the prune
+    # still knows which edit the expired leg belongs to.
+    path = tmp_path / "mailbox.json"
+    raw = json.loads(path.read_text())
+    for stored in raw["outbox"]:
+        if stored["id"] == "leg-alice":
+            stored["edit"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert reloaded.get_outbox("leg-alice").edit is None
+    assert reloaded.get_outbox("leg-alice").group_edit_id == "edit-1"
+    removed = reloaded.prune(now=200.0)
+    assert removed["outbox"] == 2
+    assert reloaded.outbox_list() == []
+
+
+def test_remove_outbox_abort_group_edit_drops_siblings(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    box.enqueue(
+        to=BOB, text="keep me", ttl=3600.0, now=100.0, message_id="plain"
+    )
+    assert box.remove_outbox("leg-alice", abort_group_edit=True) is True
+    assert [e.id for e in box.outbox_list()] == ["plain"]
+
+
+def test_remove_outbox_leaves_siblings_without_abort_flag(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    box.enqueue(
+        to=BOB, text="keep me", ttl=3600.0, now=100.0, message_id="plain"
+    )
+    # The default is a plain removal: a confirmed delivery removes
+    # only its own leg, so the siblings must stay queued.
+    assert box.remove_outbox("leg-alice") is True
+    assert [e.id for e in box.outbox_list()] == ["leg-bob", "plain"]
+
+
 def test_seen_and_pending_acks(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     assert box.is_seen("nope") is False
