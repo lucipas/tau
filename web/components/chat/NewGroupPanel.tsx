@@ -36,14 +36,18 @@ export default function NewGroupPanel({ peers, onCreate }: NewGroupPanelProps) {
       setFormError("Give the group a name.");
       return;
     }
-    if (selected.size === 0) {
+    // A peer can drop out of the registry while the form is open; its
+    // hash must not be submitted, and it has no checkbox to uncheck.
+    const available = new Set(peers.map((p) => p.destination));
+    const members = [...selected].filter((hash) => available.has(hash));
+    if (members.length === 0) {
       setFormError("Pick at least one peer.");
       return;
     }
     setCreating(true);
     setFormError(null);
     try {
-      await onCreate(trimmed, [...selected]);
+      await onCreate(trimmed, members);
       setName("");
       setSelected(new Set());
     } catch (err) {
