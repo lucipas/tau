@@ -5774,20 +5774,33 @@ class TauNode:
         return cancelled
 
     def _queued_edit_siblings(
-        self, edit_id: str, *, exclude: Optional[str] = None
+        self,
+        edit_id: str,
+        *,
+        exclude: Optional[str] = None,
+        deadline: Optional[float] = None,
     ) -> List[Any]:
         """Still-queued entries carrying the same edit id.
 
         Group-edit legs share one edit id, so the siblings of a leg
         are the other members' legs for the same edit.  A DM edit has
         no siblings: one peer, one leg.
+
+        A leg whose stored payload did not survive still belongs to
+        the edit — its id is kept as a hint (see
+        ``OutboxEntry.group_edit_id``) — so match on that too: a
+        corrupt sibling must still block the local edit until the
+        fan-out resolves, or the sender sees an edit its recipient
+        never received.  With a deadline the mailbox-lock wait is
+        bounded by it (``TimeoutError`` when the budget is spent).
         """
         siblings: List[Any] = []
-        for candidate in self.mailbox.outbox_list():
+        for candidate in self.mailbox.outbox_list(
+            timeout=_remaining(deadline)
+        ):
             if exclude is not None and candidate.id == exclude:
                 continue
-            other = getattr(candidate, "edit", None)
-            if isinstance(other, dict) and other.get("edit_id") == edit_id:
+            if getattr(candidate, "group_edit_id", None) == edit_id:
                 siblings.append(candidate)
         return siblings
 
@@ -5830,7 +5843,18 @@ class TauNode:
         deadline-bounded and tolerates a busy mailbox lock, like
         :meth:`_drop_queued_edit`.
         """
-        for sibling in self._queued_edit_siblings(edit_id, exclude=exclude):
+        try:
+            siblings = self._queued_edit_siblings(
+                edit_id, exclude=exclude, deadline=deadline
+            )
+        except TimeoutError:
+            log.debug(
+                "Could not list queued edit siblings for %s: mailbox "
+                "lock busy; leaving them for a later round",
+                edit_id,
+            )
+            return
+        for sibling in siblings:
             self._drop_queued_edit(sibling, deadline=deadline)
 
     def _record_sent_edit_locally(
@@ -5974,7 +5998,19 @@ class TauNode:
                         edit_id, exclude=entry.id, deadline=deadline
                     )
                 else:
-                    for sibling in self.mailbox.outbox_list():
+                    try:
+                        candidates = self.mailbox.outbox_list(
+                            timeout=_remaining(deadline)
+                        )
+                    except TimeoutError:
+                        log.debug(
+                            "Could not list queued edit siblings for "
+                            "%s: mailbox lock busy; leaving them for a "
+                            "later round",
+                            entry.id,
+                        )
+                        candidates = []
+                    for sibling in candidates:
                         other = getattr(sibling, "edit", None)
                         if (
                             sibling.id != entry.id
@@ -6036,10 +6072,28 @@ class TauNode:
                 entry.id,
             )
             self._drop_queued_edit(entry, deadline=deadline)
-            for sibling in self._queued_edit_siblings(
-                edit["edit_id"], exclude=entry.id
-            ):
-                self.mailbox.remove_outbox(sibling.id)
+            try:
+                siblings = self._queued_edit_siblings(
+                    edit["edit_id"], exclude=entry.id, deadline=deadline
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not list queued edit siblings for %s: "
+                    "mailbox lock busy; leaving them for a later round",
+                    edit["edit_id"],
+                )
+                siblings = []
+            for sibling in siblings:
+                try:
+                    self.mailbox.remove_outbox(
+                        sibling.id, timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not drop queued edit sibling %s: "
+                        "mailbox lock busy; leaving it for a later round",
+                        sibling.id,
+                    )
             return False
         if entry.group_id is None and response.get("edited") is False:
             # The peer had no copy, or a newer edit already landed:
@@ -6088,7 +6142,21 @@ class TauNode:
                 entry.id,
             )
             return True
-        if not self._queued_edit_siblings(edit["edit_id"], exclude=entry.id):
+        try:
+            siblings = self._queued_edit_siblings(
+                edit["edit_id"], exclude=entry.id, deadline=deadline
+            )
+        except TimeoutError:
+            # The mailbox lock stayed busy, so the fan-out cannot be
+            # proven complete: leave the local copies alone rather
+            # than applying an edit a queued sibling never received.
+            log.warning(
+                "Delivered queued edit %s but the mailbox lock stayed "
+                "busy; leaving the local copies for a later round",
+                entry.id,
+            )
+            return True
+        if not siblings:
             self._record_sent_edit_locally(
                 edit["target"],
                 edit["text"],

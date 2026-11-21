@@ -3561,6 +3561,116 @@ def test_deliver_queued_group_edit_drops_siblings_on_corrupt_payload(
     assert node.inbox.resolve("leg-1")["text"] == "typo here"
 
 
+def test_deliver_queued_group_edit_keeps_local_copy_while_a_corrupt_sibling_is_queued(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    # The second leg's stored payload did not survive, but the entry
+    # keeps the edit id as a hint: the first leg may still deliver
+    # to its member, but the local copy must not change — the
+    # corrupt sibling is still queued, so the fan-out is not
+    # complete.
+    path = node.mailbox.path
+    raw = json.loads(path.read_text())
+    for stored in raw["outbox"]:
+        if stored["id"] == entries[1].id:
+            stored["edit"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    assert node._deliver_entry(alice, entries[0], 1.0) is True
+    assert [e.id for e in node.mailbox.outbox_list()] == [entries[1].id]
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+
+
+def test_drop_queued_edit_siblings_defers_when_mailbox_lock_is_busy(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    # Another thread holds the mailbox lock: the deadline-bounded
+    # sibling cleanup must give up promptly instead of waiting
+    # indefinitely, and the siblings stay queued for a later round.
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        node.mailbox._lock.acquire()
+        held.set()
+        release.wait(timeout=30)
+        node.mailbox._lock.release()
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert held.wait(timeout=5)
+    try:
+        start = time.monotonic()
+        node._drop_queued_edit_siblings(
+            entries[0].edit["edit_id"],
+            exclude=entries[0].id,
+            deadline=time.monotonic() + 0.2,
+        )
+        assert time.monotonic() - start < 5.0
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    assert [e.id for e in node.mailbox.outbox_list()] == [
+        entries[0].id,
+        entries[1].id,
+    ]
+
+
+def test_deliver_queued_corrupt_edit_without_hint_defers_when_mailbox_lock_is_busy(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    # The leg's stored payload did not survive and even the edit id
+    # is gone, so the corrupt branch falls back to matching siblings
+    # by group, send time and text — a mailbox lookup that must stay
+    # deadline-bounded when another thread holds the lock.
+    path = node.mailbox.path
+    raw = json.loads(path.read_text())
+    for stored in raw["outbox"]:
+        if stored["id"] == entries[0].id:
+            stored["edit"] = {"payload_b64": "!!!not-base64"}
+    path.write_text(json.dumps(raw))
+    with node.mailbox.transaction():
+        fresh = node.mailbox.get_outbox(entries[0].id)
+    assert fresh.edit is None
+    assert fresh.group_edit_id is None
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        node.mailbox._lock.acquire()
+        held.set()
+        release.wait(timeout=10)
+        node.mailbox._lock.release()
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert held.wait(timeout=5)
+    try:
+        start = time.monotonic()
+        assert (
+            node._deliver_queued_edit(
+                alice, fresh, 1.0, deadline=time.monotonic() + 0.2
+            )
+            is False
+        )
+        assert time.monotonic() - start < 5.0
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    assert [e.id for e in node.mailbox.outbox_list()] == [
+        entries[0].id,
+        entries[1].id,
+    ]
+
+
 def test_send_group_edit_aborts_queued_legs_when_a_member_refuses(
     tmp_path, monkeypatch
 ):
