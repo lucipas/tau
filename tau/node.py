@@ -93,9 +93,11 @@ from .instance_lock import (
     instance_lock_holder,
 )
 from .lxmf import (
+    LXMF_FIELD_TAU_GROUP,
     LXMF_FIELD_TAU_MESSAGE_ID,
     MAX_TAU_MESSAGE_ID_LENGTH,
     LXMFError,
+    build_lxmf_group_message,
     build_lxmf_message,
     lxmf_router_delivery_hash,
     lxmf_router_propagation_hash,
@@ -1349,6 +1351,13 @@ class TauNode:
                 caller_hash,
             )
             return
+        fields = getattr(message, "fields", None)
+        if isinstance(fields, dict) and fields.get(LXMF_FIELD_TAU_GROUP):
+            # A group message rides as the content (see
+            # build_lxmf_group_message): it goes through the group
+            # handler, not the DM inbox below.
+            self._deliver_lxmf_group_message(message, sender)
+            return
         content_as_string = getattr(message, "content_as_string", None)
         text = content_as_string() if callable(content_as_string) else None
         if not text:
@@ -1469,6 +1478,66 @@ class TauNode:
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_message callback failed", exc_info=True)
         self._maybe_send_away_reply(caller_hash)
+
+    def _deliver_lxmf_group_message(self, message: Any, sender: Any) -> None:
+        """Deliver one LXMF message carrying an encoded group message.
+
+        The content is the ``/tau/group`` payload (see
+        :func:`tau.lxmf.build_lxmf_group_message`), so it goes through
+        the same handler as a direct group request: roster acceptance,
+        announcements-only enforcement, dedupe by tau id, retraction
+        markers and pending edits all apply exactly as they do on the
+        direct path — and the copy lands in the group inbox, never the
+        DM inbox.  The sender was already attributed (by LXMF delivery
+        hash) and admitted (block-list, allow-list) by
+        :meth:`_deliver_lxmf_message` before this runs.  A payload that
+        does not parse is dropped with a log line.
+
+        The handler takes the sender's identity, not a hash: it is
+        rebuilt from the sender's registered public key, exactly as
+        :meth:`_destination_for` does, so the handler attributes the
+        message the same way it does a direct request.  The handler's
+        signature must keep exactly five parameters — Reticulum counts
+        them to decide whether to pass a link id, so adding one (even
+        keyword-only) changes the call shape and breaks direct group
+        delivery.
+        """
+        caller_hash = sender.hexhash
+        content_as_string = getattr(message, "content_as_string", None)
+        text = content_as_string() if callable(content_as_string) else None
+        if not text:
+            log.info(
+                "Dropping LXMF group message from %s with no readable content",
+                caller_hash,
+            )
+            return
+        raw = text.encode("utf-8")
+        try:
+            parse_group_message(raw)
+        except ProtocolError as exc:
+            log.info(
+                "Dropping LXMF group message from %s: %s",
+                caller_hash,
+                exc,
+            )
+            return
+        identity = RNS.Identity(create_keys=False)
+        if not load_public_key(identity, sender.public_key):
+            log.info(
+                "Dropping LXMF group message from %s: public key unusable",
+                caller_hash,
+            )
+            return
+        # The response bytes are the direct path's delivery receipt;
+        # LXMF delivery is confirmed by the router's callback instead,
+        # so they are discarded here.
+        self._handle_group_message(
+            REQUEST_GROUP_MESSAGE,
+            raw,
+            b"",
+            identity,
+            time.time(),
+        )
 
     def _wait_for_lxmf_deliveries(self) -> None:
         """Wait for in-flight LXMF deliveries, bounded so stop never hangs.
@@ -7073,7 +7142,11 @@ class TauNode:
                         entry.id,
                     )
                 return False
-            if not self._deliver_via_lxmf(entry, timeout):
+            if not self._deliver_via_lxmf(
+                entry,
+                timeout,
+                group_payload=payload if entry.group_id is not None else None,
+            ):
                 try:
                     self.mailbox.record_attempt(
                         entry.id, error=str(exc), timeout=_remaining(deadline)
@@ -7086,6 +7159,39 @@ class TauNode:
                     )
                 return False
             via_lxmf = True
+        if via_lxmf and entry.group_id is not None:
+            # LXMF confirms transport, not group acceptance: the
+            # receiver's group handler can still refuse the copy — a
+            # roster this node has not learned yet, or a stale
+            # announcements-only setting — and no receipt comes back
+            # to say so.  Marking the leg delivered here would lose
+            # the message exactly when the direct path would have
+            # kept it queued for retry, so a group leg sent over
+            # LXMF stays queued: the next sweep retries direct
+            # first, and the receiver dedupes the repeat LXMF copies
+            # by tau id.  The attempt is recorded, so the retry
+            # follows the usual backoff instead of every sweep.  (A
+            # DM has no handler refusal to lose it to, so its LXMF
+            # confirmation still counts as delivered.)
+            log.info(
+                "Group message %s sent over LXMF to %s; keeping it "
+                "queued until direct delivery confirms it",
+                entry.id,
+                peer.hexhash,
+            )
+            try:
+                self.mailbox.record_attempt(
+                    entry.id,
+                    error="sent over LXMF; awaiting direct confirmation",
+                    timeout=_remaining(deadline),
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not record LXMF attempt for %s: "
+                    "mailbox lock busy",
+                    entry.id,
+                )
+            return False
         # Record the confirmed delivery before the entry leaves the outbox,
         # so a waiter that sees the entry gone can tell it was delivered.
         self._delivered_ids.append(entry.id)
@@ -7135,7 +7241,13 @@ class TauNode:
                 log.warning("on_delivered callback failed", exc_info=True)
         return True
 
-    def _deliver_via_lxmf(self, entry: Any, timeout: float) -> bool:
+    def _deliver_via_lxmf(
+        self,
+        entry: Any,
+        timeout: float,
+        *,
+        group_payload: Optional[bytes] = None,
+    ) -> bool:
         """Try one queued entry over LXMF; True only on confirmation.
 
         The LXMF router must be running and the recipient must have a
@@ -7143,13 +7255,19 @@ class TauNode:
         derived.  Delivery is confirmed by the router's callback (the
         peer received it, or a propagation node accepted it); anything
         else leaves the entry queued for the next sweep.
+
+        A group entry carries its encoded ``/tau/group`` payload
+        (``group_payload``, built by :meth:`_deliver_entry`): the
+        payload rides as the LXMF content, marked so the receiver
+        routes it to the group handler instead of the DM inbox (see
+        :func:`tau.lxmf.build_lxmf_group_message`).  Without a
+        payload a group leg stays queued — LXMF carries only plain
+        text, and a bare group text would land as a DM.
         """
         if self.lxmf_router is None or self.identity is None:
             return False
-        if getattr(entry, "group_id", None) is not None:
-            # LXMF carries only plain text: a group message sent this
-            # way would land in the recipient's DM inbox, not the
-            # group.  Leave it queued for a direct retry instead.
+        is_group = getattr(entry, "group_id", None) is not None
+        if is_group and group_payload is None:
             return False
         if entry.expires_at <= time.time() or (
             entry.message_expires_at is not None
@@ -7171,12 +7289,20 @@ class TauNode:
             )
             return False
         try:
-            message = build_lxmf_message(
-                self.identity,
-                recipient.public_key,
-                entry.text,
-                tau_message_id=entry.id,
-            )
+            if is_group:
+                message = build_lxmf_group_message(
+                    self.identity,
+                    recipient.public_key,
+                    group_payload,
+                    tau_message_id=entry.id,
+                )
+            else:
+                message = build_lxmf_message(
+                    self.identity,
+                    recipient.public_key,
+                    entry.text,
+                    tau_message_id=entry.id,
+                )
             return send_lxmf_message(self.lxmf_router, message, timeout=timeout)
         except (LXMFError, ValueError) as exc:
             log.debug(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import sys
 import threading
 import time
@@ -18,7 +19,13 @@ from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.node import NodeError, NotAllowedError, PeerRefusedError, TauNode
 from tau.peers import Peer, PeerRegistry
-from tau.protocol import decode, encode, retract_dict
+from tau.protocol import (
+    decode,
+    derive_group_id,
+    encode,
+    encode_group_message,
+    retract_dict,
+)
 
 
 def test_delivery_hash_matches_rns_destination_hash() -> None:
@@ -549,6 +556,71 @@ def test_build_lxmf_message_rejects_bad_tau_message_id(fake_lxmf):
         )
 
 
+def _lxmf_group_payload(own_hash, peer_hash, *, text="hello group"):
+    """An encoded group message from *own_hash* to a two-member group."""
+    members = sorted([own_hash, peer_hash])
+    group_id = derive_group_id(own_hash, "testers", members)
+    payload = encode_group_message(
+        text,
+        message_id="tau-group-1",
+        group_id=group_id,
+        group_name="testers",
+        creator=own_hash,
+        members=members,
+    )
+    return group_id, payload
+
+
+def test_build_lxmf_group_message_marks_group_payload(fake_lxmf):
+    own = RNS.Identity()
+    peer = RNS.Identity()
+    _group_id, payload = _lxmf_group_payload(
+        destination_hash(own).hex(), destination_hash(peer).hex()
+    )
+    message = lxmf.build_lxmf_group_message(
+        own, peer.get_public_key(), payload, tau_message_id="tau-group-1"
+    )
+    assert message.content == payload.decode("utf-8")
+    assert message.fields == {
+        lxmf.LXMF_FIELD_TAU_GROUP: "1",
+        lxmf.LXMF_FIELD_TAU_MESSAGE_ID: "tau-group-1",
+    }
+    assert message.destination.hash == lxmf.lxmf_delivery_hash_for_key(
+        peer.get_public_key()
+    )
+    assert message.source.hash == lxmf.lxmf_delivery_hash(own)
+
+
+def test_build_lxmf_group_message_without_tau_id(fake_lxmf):
+    own = RNS.Identity()
+    peer = RNS.Identity()
+    _group_id, payload = _lxmf_group_payload(
+        destination_hash(own).hex(), destination_hash(peer).hex()
+    )
+    message = lxmf.build_lxmf_group_message(own, peer.get_public_key(), payload)
+    assert message.fields == {lxmf.LXMF_FIELD_TAU_GROUP: "1"}
+
+
+def test_build_lxmf_group_message_rejects_bad_payload(fake_lxmf):
+    own = RNS.Identity()
+    peer = RNS.Identity()
+    _group_id, payload = _lxmf_group_payload(
+        destination_hash(own).hex(), destination_hash(peer).hex()
+    )
+    with pytest.raises(ValueError):
+        lxmf.build_lxmf_group_message(own, peer.get_public_key(), "not bytes")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        lxmf.build_lxmf_group_message(own, peer.get_public_key(), b"")
+    with pytest.raises(ValueError):
+        lxmf.build_lxmf_group_message(own, peer.get_public_key(), b"\xff\xfe")
+    with pytest.raises(ValueError):
+        lxmf.build_lxmf_group_message(
+            own, peer.get_public_key(), payload, tau_message_id=""
+        )
+    with pytest.raises(ValueError):
+        lxmf.build_lxmf_group_message(own, b"not a key", payload)
+
+
 def test_send_lxmf_message_returns_true_on_delivery(fake_lxmf, tmp_path):
     router = _FakeLXMRouter(identity=RNS.Identity(), storagepath=str(tmp_path))
     router.outcome = "deliver"
@@ -698,6 +770,93 @@ def test_deliver_entry_falls_back_to_lxmf_when_direct_fails(
     assert sent.source.hash == lxmf.lxmf_delivery_hash(node.identity)
 
 
+def _lxmf_group_for(node, peer, name="testers"):
+    """A group dict this node created with *peer* as the other member."""
+    creator = destination_hash(node.identity).hex()
+    members = sorted([creator, peer.hexhash])
+    return {
+        "id": derive_group_id(creator, name, members),
+        "name": name,
+        "creator": creator,
+        "members": members,
+    }
+
+
+def test_deliver_entry_keeps_group_leg_queued_after_lxmf_send(
+    tmp_path, monkeypatch, fake_lxmf
+):
+    # LXMF confirms transport, not group acceptance: the receiver's
+    # group handler can still refuse the copy, so the leg stays queued
+    # for a direct retry instead of being recorded delivered — unlike
+    # a DM, whose LXMF confirmation does count as delivered.
+    node, peer, router = _lxmf_send_node(tmp_path)
+    router.outcome = "deliver"
+    group = _lxmf_group_for(node, peer)
+    entry = node.mailbox.enqueue(
+        to=peer.destination_hash,
+        text="hello group",
+        message_id="cc" + "60" * 15,
+        group=group,
+    )
+    _failing_request(node, monkeypatch)
+    assert node._deliver_entry(peer, entry, timeout=1.0) is False
+    assert node.mailbox.get_outbox(entry.id) is not None
+    assert len(router.outbound) == 1
+    sent = router.outbound[0]
+    carried = decode(sent.content)
+    assert carried["type"] == "group_message"
+    assert carried["text"] == "hello group"
+    assert carried["group"] == group["id"]
+    assert carried["id"] == entry.id
+    assert sent.fields == {
+        lxmf.LXMF_FIELD_TAU_GROUP: "1",
+        lxmf.LXMF_FIELD_TAU_MESSAGE_ID: entry.id,
+    }
+    assert sent.destination.hash == lxmf.lxmf_delivery_hash_for_key(
+        peer.public_key
+    )
+    assert sent.source.hash == lxmf.lxmf_delivery_hash(node.identity)
+
+
+def test_deliver_via_lxmf_group_without_payload_stays_queued(
+    tmp_path, fake_lxmf
+):
+    # A group leg with no encoded payload to carry cannot go over
+    # LXMF: the plain text would land in the recipient's DM inbox.
+    node, peer, router = _lxmf_send_node(tmp_path)
+    router.outcome = "deliver"
+    entry = node.mailbox.enqueue(
+        to=peer.destination_hash,
+        text="hello group",
+        message_id="cc" + "61" * 15,
+        group=_lxmf_group_for(node, peer),
+    )
+    assert node._deliver_via_lxmf(entry, timeout=1.0) is False
+    assert router.outbound == []
+    assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def test_deliver_via_lxmf_group_skips_expired(tmp_path, fake_lxmf):
+    node, peer, router = _lxmf_send_node(tmp_path)
+    router.outcome = "deliver"
+    group = _lxmf_group_for(node, peer)
+    entry = node.mailbox.enqueue(
+        to=peer.destination_hash,
+        text="too late",
+        message_id="cc" + "62" * 15,
+        group=group,
+        expires_at=time.time() - 1.0,
+    )
+    _group_id, payload = _lxmf_group_payload(
+        group["creator"], peer.hexhash, text="too late"
+    )
+    assert (
+        node._deliver_via_lxmf(entry, timeout=1.0, group_payload=payload)
+        is False
+    )
+    assert router.outbound == []
+
+
 def test_deliver_entry_keeps_entry_when_lxmf_fails(
     tmp_path, monkeypatch, fake_lxmf
 ):
@@ -747,6 +906,12 @@ def _lxmf_node(tmp_path, *, on_message=None):
         on_message=on_message,
     )
     node.identity = RNS.Identity()
+    # A started node has a destination; the group handler reads it
+    # (see _accept_group_message), so give the fixture one.
+    node.destination = types.SimpleNamespace(
+        hexhash=destination_hash(node.identity).hex(),
+        hash=destination_hash(node.identity),
+    )
     node._start_lxmf_router()
     return node
 
@@ -1006,6 +1171,186 @@ def test_node_lxmf_delivery_ignores_malformed_tau_id_field(fake_lxmf, tmp_path):
         assert len(stored) == 4
         # Every copy fell back to its LXMF hash id.
         assert all(record["id"].startswith("lxmf:") for record in stored)
+    finally:
+        node.stop()
+
+
+# -- incoming LXMF group delivery ------------------------------------------
+
+def _lxmf_group_delivery(sender, node, *, text="hello group", message_id="tau-group-1", creator=None, members=None):
+    """A delivered LXMessage carrying an encoded group message.
+
+    Returns ``(group_id, message)``.  By default the sender created
+    the group with the receiving node as the other member.
+    """
+    receiver_hash = destination_hash(node.identity).hex()
+    sender_hash = destination_hash(sender).hex()
+    creator = creator if creator is not None else sender_hash
+    members = (
+        members if members is not None else sorted([creator, receiver_hash])
+    )
+    group_id = derive_group_id(creator, "testers", members)
+    payload = encode_group_message(
+        text,
+        message_id=message_id,
+        group_id=group_id,
+        group_name="testers",
+        creator=creator,
+        members=members,
+    )
+    return (
+        group_id,
+        types.SimpleNamespace(
+            source_hash=lxmf.lxmf_delivery_hash(sender),
+            signature_validated=True,
+            content_as_string=lambda: payload.decode("utf-8"),
+            hash=b"\x33" * 16,
+            timestamp=1_700_000_000.0,
+            fields={
+                lxmf.LXMF_FIELD_TAU_GROUP: "1",
+                lxmf.LXMF_FIELD_TAU_MESSAGE_ID: message_id,
+            },
+        ),
+    )
+
+
+def test_node_lxmf_group_delivery_lands_in_group_inbox(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    peer, sender = _lxmf_peer(node)
+    try:
+        group_id, message = _lxmf_group_delivery(sender, node)
+        node.lxmf_router.delivery_callback(message)
+        stored = node.inbox.list_messages()
+        assert len(stored) == 1
+        record = stored[0]
+        assert record["kind"] == "group"
+        assert record["group"] == group_id
+        assert record["group_name"] == "testers"
+        assert record["text"] == "hello group"
+        assert record["id"] == "tau-group-1"
+        assert record["destination"] == peer.hexhash
+        assert record["direction"] == "in"
+        # The roster pins from the message, exactly like a direct leg.
+        assert node.groups.get(group_id) is not None
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_group_delivery_dedupes_by_tau_id(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        _group_id, first = _lxmf_group_delivery(sender, node)
+        _group_id, second = _lxmf_group_delivery(sender, node)
+        second.hash = b"\x44" * 16  # a different LXMF transport copy
+        node.lxmf_router.delivery_callback(first)
+        node.lxmf_router.delivery_callback(second)
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_group_delivery_drops_malformed_payload(
+    fake_lxmf, tmp_path
+):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        node.lxmf_router.delivery_callback(
+            _lxmf_message(
+                sender,
+                text="not json {",
+                fields={lxmf.LXMF_FIELD_TAU_GROUP: "1"},
+            )
+        )
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_group_delivery_drops_non_member_sender(
+    fake_lxmf, tmp_path
+):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    mallory = RNS.Identity()
+    node.registry.upsert(
+        destination_hash(mallory), mallory.get_public_key(), name="mallory"
+    )
+    try:
+        # Mallory sends a message for alice's group, but she is not
+        # on the roster: the group is not pinned and nothing is stored.
+        group_id, message = _lxmf_group_delivery(
+            mallory, node, creator=destination_hash(sender).hex()
+        )
+        node.lxmf_router.delivery_callback(message)
+        assert node.inbox.list_messages() == []
+        assert node.groups.get(group_id) is None
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_group_delivery_refuses_stale_announcements_only_then_recovers(
+    fake_lxmf, tmp_path
+):
+    # A member posts while the receiver still enforces a stale
+    # announcements-only setting: the LXMF copy is refused, not
+    # stored — and because the refusal is not marked seen, the same
+    # copy (same tau id) lands once the receiver learns the lift.
+    # This is the copy the sender retries because it keeps the leg
+    # queued after an LXMF send instead of recording it delivered.
+    node = _lxmf_node(tmp_path)
+    peer, sender = _lxmf_peer(node)
+    carol = RNS.Identity()
+    node.registry.upsert(
+        destination_hash(carol), carol.get_public_key(), name="carol"
+    )
+    try:
+        receiver_hash = destination_hash(node.identity).hex()
+        creator_hash = destination_hash(carol).hex()
+        members = sorted(
+            [creator_hash, destination_hash(sender).hex(), receiver_hash]
+        )
+        group_id = derive_group_id(creator_hash, "testers", members)
+        node.groups.create("testers", members, created_by=creator_hash)
+        node.groups.set_announcements_only(
+            group_id, True, created_by=creator_hash
+        )
+        _gid, message = _lxmf_group_delivery(
+            sender, node, creator=creator_hash, members=members
+        )
+        node.lxmf_router.delivery_callback(message)
+        assert node.inbox.list_messages() == []
+        node.groups.set_announcements_only(
+            group_id, False, created_by=creator_hash
+        )
+        _gid, retry = _lxmf_group_delivery(
+            sender, node, creator=creator_hash, members=members
+        )
+        node.lxmf_router.delivery_callback(retry)
+        stored = node.inbox.list_messages()
+        assert len(stored) == 1
+        assert stored[0]["kind"] == "group"
+        assert stored[0]["text"] == "hello group"
+    finally:
+        node.stop()
+
+
+def test_group_message_handler_keeps_five_parameter_signature(
+    fake_lxmf, tmp_path
+):
+    # Reticulum counts a request handler's parameters to decide
+    # whether to pass a link id: five means (path, data, request_id,
+    # remote_identity, requested_at), six means the link id rides too.
+    # A sixth parameter — even keyword-only — flips the call shape and
+    # breaks direct group delivery with a TypeError on the receiver,
+    # which the unit tests cannot see (they call the handler directly).
+    node = _lxmf_node(tmp_path)
+    try:
+        assert (
+            len(inspect.signature(node._handle_group_message).parameters)
+            == 5
+        )
     finally:
         node.stop()
 
