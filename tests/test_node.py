@@ -3934,6 +3934,179 @@ def test_aborted_group_edit_drops_its_deferred_local_apply(
     assert node.inbox.resolve("leg-1")["text"] == "typo here"
 
 
+def test_deferred_local_apply_kept_when_local_write_fails(
+    tmp_path, monkeypatch
+):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "edited": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(peer, entry, 1.0, deadline=time.monotonic() + 0.2)
+        is True
+    )
+    assert len(node.mailbox.pending_local_edits()) == 1
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+
+    # A transient local-write failure must not lose the retry: the
+    # record stays, and a later round applies it once the write
+    # succeeds.
+    real_apply = node._record_sent_edit_locally
+    calls = []
+
+    def flaky_apply(target, cleaned, edited_at, *, peer_hex):
+        calls.append(1)
+        if len(calls) == 1:
+            return ["inbox copy not updated: simulated failure"]
+        return real_apply(target, cleaned, edited_at, peer_hex=peer_hex)
+
+    monkeypatch.setattr(node, "_record_sent_edit_locally", flaky_apply)
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+    assert len(node.mailbox.pending_local_edits()) == 1
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("m-1")["text"] == "fixed here"
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_cancel_between_sibling_timeout_and_insert_does_not_resurrect_edit(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    alice_leg = next(e for e in entries if e.to == alice.destination_hash)
+    bob_leg = next(e for e in entries if e.to == bob.destination_hash)
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    real_add = node.mailbox.add_pending_local_edit
+
+    def cancelling_add(record, *, timeout=None):
+        # Cancellation lands between the timed-out sibling check and
+        # the insertion: the remaining leg goes, and the edit is
+        # marked aborted before the record is inserted.
+        node.mailbox.remove_outbox(bob_leg.id, abort_group_edit=True)
+        return real_add(record, timeout=timeout)
+
+    monkeypatch.setattr(node.mailbox, "add_pending_local_edit", cancelling_add)
+    assert (
+        node._deliver_entry(
+            alice, alice_leg, 1.0, deadline=time.monotonic() + 5.0
+        )
+        is True
+    )
+    # The insertion was refused for the aborted edit: no record, no
+    # later apply for the partial fan-out.
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.pending_local_edits() == []
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+
+
+def test_retry_skips_deferred_apply_cancelled_before_claim(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    alice_leg = next(e for e in entries if e.to == alice.destination_hash)
+    bob_leg = next(e for e in entries if e.to == bob.destination_hash)
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(
+            alice, alice_leg, 1.0, deadline=time.monotonic() + 5.0
+        )
+        is True
+    )
+    assert len(node.mailbox.pending_local_edits()) == 1
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+
+    # Cancellation lands after the retry snapshots the record but
+    # before its claim: the claim must find nothing and skip the
+    # apply, not work from the stale snapshot.
+    real_pending = node.mailbox.pending_local_edits
+    calls = []
+
+    def cancelling_pending(*args, **kwargs):
+        result = real_pending(*args, **kwargs)
+        if not calls:
+            calls.append(1)
+            node.mailbox.remove_outbox(bob_leg.id, abort_group_edit=True)
+        return result
+
+    monkeypatch.setattr(node.mailbox, "pending_local_edits", cancelling_pending)
+    node._retry_pending_local_edits()
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    assert node.mailbox.pending_local_edits() == []
+
+
+def test_second_group_leg_clears_deferred_local_apply(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    alice_leg = next(e for e in entries if e.to == alice.destination_hash)
+    bob_leg = next(e for e in entries if e.to == bob.destination_hash)
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(
+            alice, alice_leg, 1.0, deadline=time.monotonic() + 5.0
+        )
+        is True
+    )
+    assert len(node.mailbox.pending_local_edits()) == 1
+    # The second leg delivers with a working sibling check: no legs
+    # remain, so the local edit applies here — and the pending record
+    # from the first leg is already cleared, not applied again later.
+    monkeypatch.setattr(node, "_queued_edit_siblings", real_siblings)
+    assert (
+        node._deliver_entry(bob, bob_leg, 1.0, deadline=time.monotonic() + 5.0)
+        is True
+    )
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("leg-1")["text"] == "fixed here"
+    assert node.mailbox.pending_local_edits() == []
+
+
 def test_send_group_edit_aborts_queued_legs_when_a_member_refuses(
     tmp_path, monkeypatch
 ):

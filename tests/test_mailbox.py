@@ -1431,6 +1431,102 @@ def test_prune_aborts_deferred_local_apply(tmp_path):
     assert [r["edit_id"] for r in box.pending_local_edits()] == ["edit-2"]
 
 
+def test_aborted_edit_refuses_later_pending_local_edit(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    record = {
+        "edit_id": "edit-1",
+        "target": "leg-1",
+        "text": "fixed here",
+        "sent_at": 100.0,
+        "peer_hex": "cc" * 16,
+    }
+    # Cancelling the edit aborts it before any record exists: a
+    # record inserted afterwards for the same edit is refused, so a
+    # cancellation that landed between a timed-out sibling check and
+    # the insertion cannot resurrect the edit.
+    assert box.remove_outbox("leg-alice", abort_group_edit=True) is True
+    assert box.is_local_edit_aborted("edit-1") is True
+    assert box.add_pending_local_edit(record) is False
+    assert box.pending_local_edits() == []
+    # Other edits are unaffected, and the mark survives a reload.
+    assert box.add_pending_local_edit(
+        {
+            "edit_id": "edit-2",
+            "target": "leg-2",
+            "text": "other edit",
+            "sent_at": 101.0,
+            "peer_hex": "dd" * 16,
+        }
+    ) is True
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    assert reloaded.is_local_edit_aborted("edit-1") is True
+    assert [r["edit_id"] for r in reloaded.pending_local_edits()] == [
+        "edit-2"
+    ]
+
+
+def test_aborted_local_edit_mark_expires_with_prune(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.abort_pending_local_edit("edit-1", now=1000.0)
+    assert box.is_local_edit_aborted("edit-1", now=1000.0) is True
+    # Still live inside its retention; gone once it expires.
+    box.prune(now=1000.0 + RETRACTED_RETENTION - 1.0)
+    assert box.is_local_edit_aborted("edit-1", now=1000.0) is True
+    box.prune(now=1000.0 + RETRACTED_RETENTION)
+    assert box.is_local_edit_aborted("edit-1", now=1000.0) is False
+    # Malformed marks are dropped on parse, not loaded.
+    path = tmp_path / "mailbox.json"
+    raw = json.loads(path.read_text())
+    raw["aborted_local_edits"] = {
+        "edit-1": 1000.0 + RETRACTED_RETENTION,
+        "bad": "soon",
+    }
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert reloaded.is_local_edit_aborted("edit-1", now=1000.0) is True
+    assert reloaded.is_local_edit_aborted("bad", now=1000.0) is False
+
+
+def test_drop_pending_local_edits_by_text_marks_aborted(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.add_pending_local_edit(
+        {
+            "edit_id": "edit-1",
+            "target": "leg-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": "cc" * 16,
+        }
+    )
+    # A wrong replacement text does not match the record.
+    box.drop_pending_local_edits_by_text("other text", 100.0)
+    assert box.pending_local_edits() != []
+    assert box.is_local_edit_aborted("edit-1") is False
+    # The corrupt-leg fallback identity drops the record and marks
+    # the edit aborted, so a later insertion for it is refused.
+    box.drop_pending_local_edits_by_text("fixed here", 100.0)
+    assert box.pending_local_edits() == []
+    assert box.is_local_edit_aborted("edit-1") is True
+    assert box.add_pending_local_edit(
+        {
+            "edit_id": "edit-1",
+            "target": "leg-1",
+            "text": "fixed here",
+            "sent_at": 100.0,
+            "peer_hex": "cc" * 16,
+        }
+    ) is False
+
+
 def test_prune_drops_siblings_of_expired_corrupt_group_edit_leg(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     group = _edit_group()
