@@ -612,7 +612,9 @@ def ensure_rns_stamps_policy(path: Path) -> bool:
         ]
         new_lines = lines[:insert_at] + additions + lines[insert_at:]
     try:
-        atomic_write_text(target, "\n".join(new_lines).rstrip() + "\n", mode=0o600)
+        atomic_write_text(
+            write_target, "\n".join(new_lines).rstrip() + "\n", mode=0o600
+        )
     except OSError as exc:
         log.warning("Could not update Reticulum config at %s: %s", target, exc)
         return False
@@ -724,4 +726,3 @@ def tcp_listen_endpoints(config_path: Path) -> List[TcpListenEndpoint]:
             )
         )
     return endpoints
- return endpoints
