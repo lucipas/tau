@@ -3596,7 +3596,7 @@ def build_parser() -> argparse.ArgumentParser:
     tan_share = tan_sub.add_parser(
         "share",
         parents=[common],
-        help="share a Tan post with a peer, a group, or a channel (sends it as a message)",
+        help="share a Tan post with a peer, a group, a broadcast list, or a channel (sends it as a message)",
     )
     share_target = tan_share.add_mutually_exclusive_group(required=True)
     share_target.add_argument(
@@ -3609,6 +3609,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group",
         metavar="NAME|ID",
         help="group name or id: share into the group instead of with a peer",
+    )
+    share_target.add_argument(
+        "--broadcast",
+        metavar="NAME",
+        help="broadcast list name: share with every member instead of with a peer or a group",
     )
     share_target.add_argument(
         "--channel",
@@ -7380,17 +7385,20 @@ def cmd_tan_repost(args: argparse.Namespace) -> int:
 
 
 def cmd_tan_share(args: argparse.Namespace) -> int:
-    """Share a Tan post with a peer, a group, or a channel, as an attributed message.
+    """Share a Tan post with a peer, a group, a broadcast list, or a
+    channel, as an attributed message.
 
     Mirrors :func:`cmd_forward`: the share is a new DM or group message
     carrying the post's text plus an attribution line, so the recipient
     reads it on any transport with no protocol change.  Delivery reuses
     :func:`cmd_send` wholesale for a peer target — or
     :func:`cmd_group_send` for a group target, fanning out one leg per
-    member, or :func:`cmd_channel_send` for a channel target.  Either
-    way the share is a new message, so it carries no expiry, kind, or
-    reply chain from the post.  A repost shares its original (see
-    :func:`resolve_share_post`); a poll shares its question and options.
+    member, or :func:`cmd_broadcast_send` for a broadcast target, one
+    DM per member, or :func:`cmd_channel_send` for a channel target.
+    Either way the share is a new message, so it carries no expiry,
+    kind, or reply chain from the post.  A repost shares its original
+    (see :func:`resolve_share_post`); a poll shares its question and
+    options.
     """
     config = _make_config(args)
     conn = init_db(config.social_db_path)
@@ -7444,11 +7452,16 @@ def cmd_tan_share(args: argparse.Namespace) -> int:
     # `cmd_send` reads its text from `args.message`; hand it the
     # attributed text and let it own delivery, queueing, and output.
     # A group target takes the group-send path instead: the same
-    # attributed text, fanned out one leg per member.  A channel
-    # target takes the channel-send path the same way.
+    # attributed text, fanned out one leg per member.  A broadcast
+    # target takes the broadcast-send path the same way: one DM per
+    # member, each with the same store-and-forward queueing as a
+    # one-to-one DM, so every delivery flag keeps its meaning.  A
+    # channel target takes the channel-send path the same way.
     args.message = share_text(post, label)
     if getattr(args, "group", None):
         return cmd_group_send(args)
+    if getattr(args, "broadcast", None):
+        return cmd_broadcast_send(args)
     if getattr(args, "channel", None):
         # `--no-queue`, `--wait`, and `--discover-timeout` only mean
         # something for peer/group delivery; the channel-send path
