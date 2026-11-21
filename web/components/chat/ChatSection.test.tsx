@@ -5,20 +5,39 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatSection from "./ChatSection";
 import { TauContext } from "../chrome/TauContext";
-import { fakeTau, makeMessage, makePeer } from "../test-utils";
-import type { MessageDraft } from "@/lib/types";
+import { fakeTau, makeMessage, makePeer, makeUnread } from "../test-utils";
+import type { MessageDraft, Reminder } from "@/lib/types";
 
 const PEER_HASH = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
 const NEW_GROUP_ID = "d".repeat(32);
 
 let saved: MessageDraft[] = [];
 let calls: string[] = [];
+let reminders: Reminder[] = [];
+let reminderSeq = 0;
+
+/** A deferred the next GET /api/reminders waits on: the test resolves it
+ *  with a stale payload to prove an older response cannot overwrite
+ *  newer state. */
+function defer<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+let heldGet: ReturnType<typeof defer<unknown>> | null = null;
 
 /** Bridge stub with a stateful drafts list: a POSTed draft shows up in
- *  later GETs, like the real bridge once the save lands. */
+ *  later GETs, like the real bridge once the save lands. Reminders behave
+ *  the same way, except a GET past a reminder's due time no longer
+ *  returns it — the serving node consumes it when it fires. */
 function stubFetch() {
   calls = [];
   saved = [];
+  reminders = [];
+  reminderSeq = 0;
+  heldGet = null;
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -26,7 +45,43 @@ function stubFetch() {
       const method = init?.method ?? "GET";
       calls.push(`${method} ${url}`);
       let payload: unknown = { ok: true };
-      if (url.includes("/api/drafts/delete")) {
+      if (url.includes("/api/reminders/cancel")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        const at = reminders.findIndex((r) => r.id.startsWith(body.id));
+        const cancelled = at >= 0 ? reminders.splice(at, 1)[0] : null;
+        payload = { ok: true, cancelled };
+      } else if (url.includes("/api/reminders")) {
+        if (method === "POST") {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          reminderSeq += 1;
+          const now = Date.now() / 1000;
+          const reminder: Reminder = {
+            id: `r${reminderSeq}`.padEnd(16, "0"),
+            message_id: "wire-1",
+            kind: "peer",
+            target: PEER_HASH,
+            target_name: "Alice",
+            text: "hello",
+            sender: "Alice",
+            due_at: now + (body.in_seconds ?? 3600),
+            created_at: now,
+          };
+          reminders.push(reminder);
+          payload = { ok: true, reminder };
+        } else if (heldGet) {
+          const held = heldGet;
+          heldGet = null;
+          const stale = await held.promise;
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify(stale),
+          } as Response;
+        } else {
+          const pending = reminders.filter((r) => r.due_at > Date.now() / 1000);
+          payload = { reminders: pending, count: pending.length };
+        }
+      } else if (url.includes("/api/drafts/delete")) {
         payload = { ok: true, deleted: true };
       } else if (url.includes("/api/drafts")) {
         if (method === "POST") {
@@ -141,6 +196,138 @@ describe("ChatSection drafts", () => {
     renderChat();
     const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
     await waitFor(() => expect(box.value).toBe("resume me"));
+  });
+});
+
+describe("ChatSection reminders", () => {
+  it("snoozing a message adds a Reminders row, and cancelling removes it", async () => {
+    renderChat();
+    await waitFor(() => expect(screen.queryByLabelText("Reminders")).toBeNull());
+    fireEvent.click(screen.getByLabelText("Actions for message 1"));
+    fireEvent.click(screen.getByText("Snooze"));
+    fireEvent.click(screen.getByText("30 min"));
+    await waitFor(() => expect(calls).toContain("POST /api/reminders"));
+    await waitFor(() => expect(screen.getByText("Reminders (1)")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("Cancel reminder for Alice"));
+    await waitFor(() => expect(calls).toContain("POST /api/reminders/cancel"));
+    await waitFor(() => expect(screen.queryByLabelText("Reminders")).toBeNull());
+  });
+
+  it("a fired reminder clears shortly after its due time", async () => {
+    const now = Date.now() / 1000;
+    reminders = [
+      {
+        id: "r1".padEnd(16, "0"),
+        message_id: "wire-1",
+        kind: "peer",
+        target: PEER_HASH,
+        target_name: "Alice",
+        text: "hello",
+        sender: "Alice",
+        due_at: now + 2,
+        created_at: now,
+      },
+    ];
+    renderChat();
+    await waitFor(() => expect(screen.getByText("Reminders (1)")).toBeTruthy());
+    // The node consumes the reminder at its due time; the sidebar
+    // refreshes just after and the row goes away on its own. The
+    // refresh timer floors at 5s, so this test needs a longer timeout.
+    await waitFor(() => expect(screen.queryByLabelText("Reminders")).toBeNull(), {
+      timeout: 10000,
+    });
+  }, 15000);
+
+  it("reloads reminders when the unread total moves", async () => {
+    const tau = fakeTau({
+      peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
+      messages: [makeMessage({ id: 1, peer: PEER_HASH, text: "hello" })],
+      unread: makeUnread({ total: 0, revision: 1 }),
+    });
+    window.location.hash = `#chat?peer=${PEER_HASH}`;
+    const { rerender } = render(
+      <TauContext.Provider value={tau}>
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    await waitFor(() => expect(calls.filter((c) => c === "GET /api/reminders").length).toBeGreaterThanOrEqual(1));
+    const before = calls.filter((c) => c === "GET /api/reminders").length;
+    rerender(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
+          messages: [makeMessage({ id: 1, peer: PEER_HASH, text: "hello" })],
+          unread: makeUnread({ total: 1, revision: 2 }),
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    await waitFor(() =>
+      expect(calls.filter((c) => c === "GET /api/reminders").length).toBeGreaterThan(before),
+    );
+  });
+
+  it("a slow list response cannot restore a row a newer refresh removed", async () => {
+    const now = Date.now() / 1000;
+    const stale: Reminder = {
+      id: "r1".padEnd(16, "0"),
+      message_id: "wire-1",
+      kind: "peer",
+      target: PEER_HASH,
+      target_name: "Alice",
+      text: "hello",
+      sender: "Alice",
+      due_at: now + 3600,
+      created_at: now,
+    };
+    reminders = [stale];
+    window.location.hash = `#chat?peer=${PEER_HASH}`;
+    const { rerender } = render(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
+          messages: [makeMessage({ id: 1, peer: PEER_HASH, text: "hello" })],
+          unread: makeUnread({ total: 0, revision: 1 }),
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    await waitFor(() => expect(screen.getByText("Reminders (1)")).toBeTruthy());
+    const getsBefore = calls.filter((c) => c === "GET /api/reminders").length;
+    // The cancel-triggered refresh stalls on a held GET; a snapshot
+    // refresh overtakes it and clears the row first. Keep the deferred
+    // in a local: the stub nulls the shared handle when it takes it.
+    const held = defer<unknown>();
+    heldGet = held;
+    fireEvent.click(screen.getByLabelText("Cancel reminder for Alice"));
+    await waitFor(() => expect(calls).toContain("POST /api/reminders/cancel"));
+    // The stalled refresh must have started before the snapshot one
+    // overtakes it, or the generations would order the other way.
+    await waitFor(() =>
+      expect(calls.filter((c) => c === "GET /api/reminders").length).toBeGreaterThan(getsBefore),
+    );
+    // The row is still there while the stalled refresh is pending —
+    // nothing has answered the cancel yet.
+    expect(screen.getByText("Reminders (1)")).toBeTruthy();
+    rerender(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [makePeer({ destination: PEER_HASH, name: "Alice" })],
+          messages: [makeMessage({ id: 1, peer: PEER_HASH, text: "hello" })],
+          unread: makeUnread({ total: 1, revision: 2 }),
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    await waitFor(() => expect(screen.queryByLabelText("Reminders")).toBeNull());
+    // The stalled response finally lands with the canceled row in it —
+    // the generation guard drops it instead of restoring the row.
+    held.resolve({ reminders: [stale], count: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(screen.queryByLabelText("Reminders")).toBeNull();
   });
 });
 

@@ -7903,6 +7903,12 @@ def test_reminders_endpoints(node, tmp_path):
         assert reminder["message_id"] == "wire-1"
         assert before + 3500 < reminder["due_at"] <= time.time() + 3600
 
+        # The list prefers the owner's alias over the peer's own name.
+        node.registry._peers[0].alias = "ally"
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert payload["reminders"][0]["target_name"] == "ally"
+        node.registry._peers[0].alias = None
+
         # An ISO time works too, and the list is soonest first.
         from datetime import datetime
 
@@ -8095,6 +8101,20 @@ def test_reminders_endpoints(node, tmp_path):
         assert status == 400
         status, _, payload = _json(bridge, "/api/reminders")
         assert payload == {"reminders": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_reminders_endpoint_returns_503_when_store_locked(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # A directory where the lock file goes makes every store
+        # listing fail: the endpoint must answer storage-unavailable,
+        # not a generic internal error.
+        (tmp_path / "reminders.json.lock").mkdir()
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 503
+        assert "could not read the reminders" in payload["error"]["message"]
     finally:
         bridge.stop()
 

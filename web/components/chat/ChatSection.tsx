@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   acceptDmRequest,
   addReminder,
@@ -219,13 +219,21 @@ export default function ChatSection() {
     void refreshDrafts();
   }, [refreshDrafts]);
 
+  // Snapshot, timer and local-action refreshes can overlap, and a slow
+  // list response must never overwrite a newer one — a canceled row
+  // would reappear. Each refresh takes the next generation and only
+  // the latest generation may apply its response.
+  const remindersGeneration = useRef(0);
   const refreshReminders = useCallback(async () => {
+    const generation = ++remindersGeneration.current;
     try {
-      setReminders(await getReminders());
+      const next = await getReminders();
+      if (generation !== remindersGeneration.current) return;
+      setReminders(next);
     } catch {
       // Reminders are advisory; the chat list works without them.
     } finally {
-      setRemindersLoading(false);
+      if (generation === remindersGeneration.current) setRemindersLoading(false);
     }
   }, []);
 
