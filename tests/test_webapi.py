@@ -7876,6 +7876,257 @@ def test_drafts_endpoints(node, tmp_path):
         bridge.stop()
 
 
+def test_reminders_endpoints(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 200
+        assert payload == {"reminders": [], "count": 0}
+
+        # A received DM can be snoozed; the list resolves the peer name.
+        _seed_pinnable_message(bridge, node)
+        before = time.time()
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders",
+            method="POST",
+            body={"id": 1, "in_seconds": 3600},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        reminder = payload["reminder"]
+        assert reminder["kind"] == "peer"
+        assert reminder["target"] == PEER_HASH
+        assert reminder["target_name"] == "alice"
+        assert reminder["sender"] == "alice"
+        assert reminder["text"] == "hello"
+        assert reminder["message_id"] == "wire-1"
+        assert before + 3500 < reminder["due_at"] <= time.time() + 3600
+
+        # An ISO time works too, and the list is soonest first.
+        from datetime import datetime
+
+        at_time = datetime.fromtimestamp(time.time() + 2 * 86400).strftime(
+            "%Y-%m-%dT%H:%M"
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders",
+            method="POST",
+            body={"id": 1, "at": at_time},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert payload["count"] == 2
+        assert payload["reminders"][0]["id"] == reminder["id"]
+        assert payload["reminders"][1]["due_at"] > payload["reminders"][0]["due_at"]
+
+        # Cancelling by unique prefix drops just that reminder.
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders/cancel",
+            method="POST",
+            body={"id": reminder["id"][:8]},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["cancelled"]["id"] == reminder["id"]
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert payload["count"] == 1
+
+        # Bad inputs are 400s, not 500s.
+        for body in (
+            {"id": 999, "in_seconds": 60},
+            {"id": 1},
+            {"id": 1, "in_seconds": 0},
+            {"id": 1, "in_seconds": -5},
+            {"id": 1, "in_seconds": "1h"},
+            {"id": 1, "in_seconds": 60, "at": at_time},
+            {"id": 1, "at": "2020-01-01T09:00"},
+            {"id": 1, "at": "not a time"},
+        ):
+            status, _, payload = _json(
+                bridge, "/api/reminders", method="POST", body=body
+            )
+            assert status == 400, body
+        status, _, payload = _json(
+            bridge, "/api/reminders/cancel", method="POST", body={"id": "nope"}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/reminders/cancel", method="POST", body={"id": ""}
+        )
+        assert status == 400
+
+        # A message you sent has no received copy to re-ping.
+        bridge.send_message("alice", "hi out")
+        sent_id = bridge._messages[-1]["id"]
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders",
+            method="POST",
+            body={"id": sent_id, "in_seconds": 60},
+        )
+        assert status == 400
+
+        # A file message has no text to be reminded about.
+        node.inbox.append(
+            {
+                "id": "wire-file",
+                "kind": "file",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "name": "photo.jpg",
+                "size": 123,
+                "sha256": "ab" * 32,
+                "path": "files/photo.jpg",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+            }
+        )
+        file_entry = bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-file",
+                "file": {"name": "photo.jpg", "size": 123, "sha256": "ab" * 32},
+            }
+        )
+        assert file_entry is not None and file_entry.get("file") is not None
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders",
+            method="POST",
+            body={"id": file_entry["id"], "in_seconds": 60},
+        )
+        assert status == 400
+
+        # A group message snoozes against the group, with its name.
+        group_id = node.groups.list_groups()[0]["id"]
+        node.inbox.append(
+            {
+                "id": "wire-g1",
+                "kind": "group",
+                "group": group_id,
+                "destination": PEER_HASH,
+                "from": "alice",
+                "text": "crew hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+            }
+        )
+        group_entry = bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "crew hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-g1",
+                "kind": "group",
+                "group": group_id,
+                "group_name": "crew",
+            }
+        )
+        assert group_entry is not None
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders",
+            method="POST",
+            body={"id": group_entry["id"], "in_seconds": 60},
+        )
+        assert status == 200
+        assert payload["reminder"]["kind"] == "group"
+        assert payload["reminder"]["target"] == group_id
+        assert payload["reminder"]["target_name"] == "crew"
+
+        # A reminder whose source message is gone stays hidden: the
+        # sidebar must not keep showing the text of a message the
+        # inbox purged (for example a disappearing DM that expired).
+        node.inbox.delete("wire-1")
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["reminders"][0]["message_id"] == "wire-g1"
+
+        # An expired disappearing message is hidden the same way,
+        # even though its reminder is still pending in the store.
+        from tau.reminders import ReminderStore
+
+        node.inbox.append(
+            {
+                "id": "wire-old",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "text": "gone soon",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "expires_at": time.time() - 60,
+            }
+        )
+        ReminderStore(bridge._reminders_path()).add(
+            message_id="wire-old",
+            kind="peer",
+            target=PEER_HASH,
+            text="gone soon",
+            sender="alice",
+            due_at=time.time() + 3600,
+        )
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["reminders"][0]["message_id"] == "wire-g1"
+
+        # Blocking the sender refuses a new reminder and hides the
+        # pending ones, like the CLI does.
+        save_blocklist(
+            tmp_path / "blocklist.json",
+            BlockList(blocked=frozenset({PEER_HASH})),
+        )
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders",
+            method="POST",
+            body={"id": 1, "in_seconds": 60},
+        )
+        assert status == 400
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert payload == {"reminders": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
+def test_reminders_hide_message_deleted_by_another_process(node, tmp_path):
+    """The listing reloads the inbox file, so a delete from another
+    process hides the reminder even though the serving bridge's
+    inbox copy is stale."""
+    inbox_path = tmp_path / "inbox.json"
+    node.inbox = Inbox(inbox_path)
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        _seed_pinnable_message(bridge, node)
+        status, _, payload = _json(
+            bridge,
+            "/api/reminders",
+            method="POST",
+            body={"id": 1, "in_seconds": 3600},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert payload["count"] == 1
+
+        # Another process deletes the message from the shared file.
+        Inbox(inbox_path).delete("wire-1")
+        status, _, payload = _json(bridge, "/api/reminders")
+        assert status == 200
+        assert payload == {"reminders": [], "count": 0}
+    finally:
+        bridge.stop()
+
+
 def test_drafts_channel_endpoint(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:

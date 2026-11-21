@@ -5,6 +5,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  addReminder,
+  cancelReminder,
   cancelScheduledChannelMessage,
   clearReaction,
   createBroadcast,
@@ -31,6 +33,7 @@ import {
   getMessages,
   getOwnProfile,
   getQuietHours,
+  getReminders,
   getTanDrafts,
   getTanLists,
   getTanThread,
@@ -190,6 +193,29 @@ describe("GET endpoints", () => {
     expect(drafts[0].name).toBe("alice");
   });
 
+  it("lists message reminders", async () => {
+    nextJson = {
+      reminders: [
+        {
+          id: "aa".repeat(8),
+          message_id: "wire-1",
+          kind: "peer",
+          target: "ab".repeat(16),
+          target_name: "alice",
+          text: "hello",
+          sender: "alice",
+          due_at: 1700003600,
+          created_at: 1700000000,
+        },
+      ],
+      count: 1,
+    };
+    const reminders = await getReminders();
+    expect(captured[0].url).toBe("/api/reminders");
+    expect(reminders).toHaveLength(1);
+    expect(reminders[0].target_name).toBe("alice");
+  });
+
   it("posts a channel poll with question and options", async () => {
     nextJson = { ok: true, message: { hash: "p".repeat(64) } };
     const message = await postChannelPoll("general", "which day?", ["Saturday", "Sunday"]);
@@ -346,6 +372,34 @@ describe("POST endpoints", () => {
     nextJson = { ok: true, edited: [], legs: 1 };
     await editOutbox("bb".repeat(16), { send_in: 300 });
     expect(bodyOf(1)).toEqual({ target: "bb".repeat(16), send_in: 300 });
+  });
+
+  it("snoozes and cancels a message reminder", async () => {
+    nextJson = {
+      ok: true,
+      reminder: {
+        id: "aa".repeat(8),
+        message_id: "wire-1",
+        kind: "peer",
+        target: "ab".repeat(16),
+        target_name: "alice",
+        text: "hello",
+        sender: "alice",
+        due_at: 1700003600,
+        created_at: 1700000000,
+      },
+    };
+    const reminder = await addReminder(7, 3600);
+    expect(captured[0].url).toBe("/api/reminders");
+    expect(captured[0].init?.method).toBe("POST");
+    expect(bodyOf(0)).toEqual({ id: 7, in_seconds: 3600 });
+    expect(reminder.due_at).toBe(1700003600);
+
+    nextJson = { ok: true, cancelled: { id: "aa".repeat(8) } };
+    const cancelled = await cancelReminder("aa".repeat(8));
+    expect(captured[1].url).toBe("/api/reminders/cancel");
+    expect(bodyOf(1)).toEqual({ id: "aa".repeat(8) });
+    expect(cancelled.id).toBe("aa".repeat(8));
   });
 
   it("saves and deletes a message draft", async () => {

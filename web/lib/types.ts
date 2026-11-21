@@ -460,6 +460,27 @@ export interface MessageDraft {
   name: string | null;
 }
 
+/** A pending message reminder (``tau remind add``): snooze one stored
+ * DM or group message and be re-pinged when it is due. */
+export interface Reminder {
+  /** Reminder id (16 hex chars); a unique prefix cancels it. */
+  id: string;
+  /** Inbox record id of the snoozed message. */
+  message_id: string;
+  kind: "peer" | "group";
+  /** Peer destination hash or group id. */
+  target: string;
+  /** Best-effort conversation name from the bridge. */
+  target_name: string;
+  /** Text snapshot taken when the reminder was set. */
+  text: string;
+  /** Who sent the message, as labelled when the reminder was set. */
+  sender: string;
+  /** Unix time the reminder fires. */
+  due_at: number;
+  created_at: number;
+}
+
 export interface OwnProfile {
   author: string | null;
   name: string;
