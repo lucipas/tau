@@ -339,6 +339,13 @@ export async function deleteBroadcast(broadcast: string): Promise<{ ok: boolean;
   return post("/api/broadcasts/delete", { broadcast });
 }
 
+export async function renameBroadcast(
+  broadcast: string,
+  new_name: string,
+): Promise<{ ok: boolean; broadcast: BroadcastList; previous_name: string }> {
+  return post("/api/broadcasts/rename", { broadcast, new_name });
+}
+
 export async function sendBroadcast(
   broadcast: string,
   text: string,

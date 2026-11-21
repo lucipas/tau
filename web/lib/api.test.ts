@@ -53,6 +53,7 @@ import {
   closeDmPoll,
   editOutbox,
   saveDraft,
+  renameBroadcast,
   sendBroadcast,
   scheduleChannelMessage,
   scheduleChannelPoll,
@@ -768,6 +769,17 @@ it("schedules a Tan repost or quote with kind and target_post", async () => {
     await deleteBroadcast("team");
     expect(captured[0].url).toBe("/api/broadcasts/delete");
     expect(bodyOf(0)).toEqual({ broadcast: "team" });
+  });
+
+  it("renames a broadcast list by name", async () => {
+    nextJson = {
+      ok: true,
+      broadcast: { name: "squad", members: [], created_at: 1 },
+      previous_name: "team",
+    };
+    await renameBroadcast("team", "squad");
+    expect(captured[0].url).toBe("/api/broadcasts/rename");
+    expect(bodyOf(0)).toEqual({ broadcast: "team", new_name: "squad" });
   });
 
   it("sends a broadcast with list name and text", async () => {

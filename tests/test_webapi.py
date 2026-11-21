@@ -2630,6 +2630,50 @@ def test_api_broadcasts_delete_removes_list(bridge, node, tmp_path):
     assert "unknown broadcast list" in payload["error"]["message"]
 
 
+def test_api_broadcasts_rename_renames_list(bridge, node, tmp_path):
+    from tau.broadcasts import BroadcastStore
+
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "team", "members": [PEER_HASH]},
+    )
+    _json(
+        bridge,
+        "/api/broadcasts",
+        method="POST",
+        body={"name": "other", "members": [PEER_HASH]},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/broadcasts/rename",
+        method="POST",
+        body={"broadcast": "team", "new_name": "squad"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["broadcast"]["name"] == "squad"
+    assert payload["broadcast"]["members"] == [{"hash": PEER_HASH, "name": "alice"}]
+    assert payload["previous_name"] == "team"
+    _, _, listed = _json(bridge, "/api/broadcasts")
+    assert [item["name"] for item in listed["broadcasts"]] == ["squad", "other"]
+    # Renaming onto another list, an unknown list, or a blank name fails.
+    for body, message in [
+        ({"broadcast": "squad", "new_name": "other"}, "already exists"),
+        ({"broadcast": "nope", "new_name": "squad"}, "unknown broadcast list"),
+        ({"broadcast": "squad", "new_name": "  "}, "field 'new_name' is required"),
+        ({"broadcast": "squad"}, "field 'new_name' is required"),
+        ({"new_name": "squad"}, "field 'broadcast' is required"),
+    ]:
+        status, _, payload = _json(
+            bridge, "/api/broadcasts/rename", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+
+
 def test_api_broadcasts_send_fans_out_to_members(bridge, node, tmp_path):
     from tau.broadcasts import BroadcastStore
 

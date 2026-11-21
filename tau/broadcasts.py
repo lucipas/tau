@@ -303,6 +303,44 @@ class BroadcastStore:
                 raise
         return True
 
+    def rename(self, name: str, new_name: str) -> Dict[str, Any]:
+        """Rename a list in place, keeping its members and creation time.
+
+        Raises :class:`ValueError` when the list is unknown, the new
+        name is blank/invalid, or another list already has the new
+        name (names are unique case-insensitively), and
+        :class:`OSError` when the write fails (the in-memory store is
+        left as it was on disk).  A case-only rename (``team`` ->
+        ``Team``) is allowed: the key is unchanged, only the stored
+        name changes.
+        """
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError("a broadcast list needs a name")
+        cleaned = sanitize_group_name(new_name.strip())
+        if not cleaned:
+            raise ValueError("a broadcast list needs a name")
+        with self._transaction():
+            broadcast = self._lists.get(name.strip().casefold())
+            if broadcast is None:
+                raise ValueError(f"unknown broadcast list: {name!r}")
+            key = broadcast["name"].casefold()
+            new_key = cleaned.casefold()
+            if new_key != key and new_key in self._lists:
+                raise ValueError(
+                    f"a broadcast list named {cleaned!r} already exists"
+                )
+            snapshot = self._snapshot()
+            renamed = dict(broadcast, name=cleaned)
+            if new_key != key:
+                del self._lists[key]
+            self._lists[new_key] = renamed
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+        return dict(renamed)
+
     def find(self, query: str) -> Optional[Dict[str, Any]]:
         """Resolve a list by exact name (case-insensitive).
 

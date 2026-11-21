@@ -1,4 +1,4 @@
-// BroadcastsPanel.tsx — saved broadcast lists: create, send, delete.
+// BroadcastsPanel.tsx — saved broadcast lists: create, send, rename, delete.
 // A broadcast is a named set of peers; a send fans out as one private
 // DM per member, so recipients never see each other or the list.
 
@@ -18,6 +18,7 @@ export interface BroadcastsPanelProps {
   error?: string | null;
   onCreate: (name: string, members: string[]) => Promise<void>;
   onDelete: (name: string) => Promise<void>;
+  onRename: (name: string, newName: string) => Promise<void>;
   onSend: (name: string, text: string) => Promise<BroadcastSendResponse>;
 }
 
@@ -28,6 +29,7 @@ export default function BroadcastsPanel({
   error,
   onCreate,
   onDelete,
+  onRename,
   onSend,
 }: BroadcastsPanelProps) {
   const [showCreate, setShowCreate] = useState(false);
@@ -41,6 +43,8 @@ export default function BroadcastsPanel({
   >({});
   const [sending, setSending] = useState<Set<string>>(new Set());
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameName, setRenameName] = useState("");
   const [panelError, setPanelError] = useState<string | null>(null);
 
   const count = broadcasts.length;
@@ -112,6 +116,35 @@ export default function BroadcastsPanel({
       setConfirmDelete(null);
       setResults((prev) => {
         const next = { ...prev };
+        delete next[listName];
+        return next;
+      });
+    } catch (err) {
+      setPanelError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleRename(listName: string) {
+    const trimmed = renameName.trim();
+    if (!trimmed || trimmed === listName) {
+      setRenaming(null);
+      return;
+    }
+    setPanelError(null);
+    try {
+      await onRename(listName, trimmed);
+      setRenaming(null);
+      // Draft text and send results are keyed by list name; carry
+      // them over so a rename does not swallow a half-typed message.
+      setTexts((prev) => {
+        if (!(listName in prev)) return prev;
+        const next = { ...prev, [trimmed]: prev[listName] };
+        delete next[listName];
+        return next;
+      });
+      setResults((prev) => {
+        if (!(listName in prev)) return prev;
+        const next = { ...prev, [trimmed]: prev[listName] };
         delete next[listName];
         return next;
       });
@@ -211,34 +244,85 @@ export default function BroadcastsPanel({
                 className="rounded-lg bg-zinc-900 px-2 py-1.5 text-sm"
               >
                 <div className="flex items-center justify-between gap-2">
-                  <span className="min-w-0 flex-1 truncate font-medium text-zinc-200">
-                    {list.name} ({list.members.length})
-                  </span>
-                  {confirmDelete === list.name ? (
-                    <span className="flex shrink-0 gap-2">
+                  {renaming === list.name ? (
+                    <span className="flex min-w-0 flex-1 items-center gap-2">
+                      <input
+                        type="text"
+                        value={renameName}
+                        onChange={(e) => setRenameName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            void handleRename(list.name);
+                          }
+                          if (e.key === "Escape") {
+                            setRenaming(null);
+                          }
+                        }}
+                        placeholder="New list name"
+                        aria-label={`Rename ${list.name}`}
+                        className="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-sm text-zinc-100 placeholder:text-zinc-500"
+                      />
                       <button
                         type="button"
-                        onClick={() => void handleDelete(list.name)}
-                        className="text-xs font-semibold text-red-400 hover:text-red-300"
+                        onClick={() => void handleRename(list.name)}
+                        className="shrink-0 text-xs font-semibold text-cyan-400 hover:text-cyan-300"
                       >
-                        Confirm delete
+                        Save
                       </button>
                       <button
                         type="button"
-                        onClick={() => setConfirmDelete(null)}
-                        className="text-xs text-zinc-400 hover:text-zinc-200"
+                        onClick={() => setRenaming(null)}
+                        className="shrink-0 text-xs text-zinc-400 hover:text-zinc-200"
                       >
-                        Keep
+                        Cancel
                       </button>
                     </span>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDelete(list.name)}
-                      className="shrink-0 text-xs text-zinc-500 hover:text-red-400"
-                    >
-                      Delete
-                    </button>
+                    <>
+                      <span className="min-w-0 flex-1 truncate font-medium text-zinc-200">
+                        {list.name} ({list.members.length})
+                      </span>
+                      {confirmDelete === list.name ? (
+                        <span className="flex shrink-0 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void handleDelete(list.name)}
+                            className="text-xs font-semibold text-red-400 hover:text-red-300"
+                          >
+                            Confirm delete
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDelete(null)}
+                            className="text-xs text-zinc-400 hover:text-zinc-200"
+                          >
+                            Keep
+                          </button>
+                        </span>
+                      ) : (
+                        <span className="flex shrink-0 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRenaming(list.name);
+                              setRenameName(list.name);
+                              setConfirmDelete(null);
+                            }}
+                            className="text-xs text-zinc-500 hover:text-zinc-200"
+                          >
+                            Rename
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDelete(list.name)}
+                            className="text-xs text-zinc-500 hover:text-red-400"
+                          >
+                            Delete
+                          </button>
+                        </span>
+                      )}
+                    </>
                   )}
                 </div>
                 <p className="truncate text-xs text-zinc-400">

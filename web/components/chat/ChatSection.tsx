@@ -715,6 +715,7 @@ export default function ChatSection() {
             error={broadcasts.error}
             onCreate={(name, members) => broadcasts.create(name, members)}
             onDelete={(name) => broadcasts.remove(name)}
+            onRename={(name, newName) => broadcasts.rename(name, newName)}
             onSend={(name, text) => broadcasts.send(name, text)}
           />
         )}

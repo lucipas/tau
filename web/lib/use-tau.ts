@@ -48,6 +48,7 @@ import {
   markRead,
   markUnread,
   pingPeer,
+  renameBroadcast,
   retryOutbox,
   sendBroadcast,
   setMuted,
@@ -628,6 +629,7 @@ export interface UseBroadcastsResult {
   refresh: () => Promise<void>;
   create: (name: string, members: string[]) => Promise<void>;
   remove: (name: string) => Promise<void>;
+  rename: (name: string, newName: string) => Promise<void>;
   send: (name: string, text: string) => Promise<BroadcastSendResponse>;
 }
 
@@ -666,12 +668,19 @@ export function useBroadcasts(): UseBroadcastsResult {
     },
     [refresh],
   );
+  const rename = useCallback(
+    async (name: string, newName: string) => {
+      await renameBroadcast(name, newName);
+      await refresh();
+    },
+    [refresh],
+  );
   const send = useCallback(async (name: string, text: string) => {
     const result = await sendBroadcast(name, text);
     await refresh();
     return result;
   }, [refresh]);
-  return { broadcasts, loading, error, refresh, create, remove, send };
+  return { broadcasts, loading, error, refresh, create, remove, rename, send };
 }
 
 // ----------------------------------------------------------------- traffic
