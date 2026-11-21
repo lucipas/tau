@@ -118,6 +118,13 @@ from .pinned import (
     pinned_lock,
     save_pinned,
 )
+from .saved_messages import (
+    SavedMessages,
+    SavedMessagesError,
+    load_saved_messages,
+    save_saved_messages,
+    saved_messages_lock,
+)
 from .quiet_hours import (
     QuietHours,
     QuietHoursError,
@@ -392,9 +399,11 @@ from .channels import (
     create_edit as create_channel_edit,
     create_message as create_channel_message,
     create_reaction as create_channel_reaction,
+    get_message as get_channel_message,
     init_db as init_channel_db,
     is_member as is_channel_member,
     reply_parent as channel_reply_parent,
+    resolve_message_digest,
 )
 
 log = logging.getLogger(__name__)
@@ -2036,6 +2045,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="list pinned conversations, newest pin first",
     )
     pinned_conversations.set_defaults(func=cmd_pinned_conversations)
+
+    save_message = subparsers.add_parser(
+        "save",
+        parents=[common],
+        help="star a stored message so it stays in `tau saved`",
+    )
+    save_target = save_message.add_mutually_exclusive_group(required=True)
+    save_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    save_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    save_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name",
+    )
+    save_message.add_argument(
+        "message",
+        metavar="MESSAGE",
+        help="message id or unique prefix",
+    )
+    save_message.set_defaults(func=cmd_save_message)
+
+    unsave_message = subparsers.add_parser(
+        "unsave",
+        parents=[common],
+        help="remove the star from a stored message",
+    )
+    unsave_target = unsave_message.add_mutually_exclusive_group(required=True)
+    unsave_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    unsave_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    unsave_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name",
+    )
+    unsave_message.add_argument(
+        "message",
+        metavar="MESSAGE",
+        help="message id or unique prefix",
+    )
+    unsave_message.set_defaults(func=cmd_unsave_message)
+
+    saved_messages = subparsers.add_parser(
+        "saved",
+        parents=[common],
+        help="list starred messages, newest save first",
+    )
+    saved_messages.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="maximum starred messages to show (default 30)",
+    )
+    saved_messages.set_defaults(func=cmd_saved_messages)
 
     disappearing = subparsers.add_parser(
         "disappearing",
@@ -16869,6 +16948,293 @@ def cmd_pinned_conversations(args: argparse.Namespace) -> int:
     for entry in entries:
         age = _ago(time.time() - float(entry["pinned_at"]))
         print(f"{entry['label']} — pinned {age} ago")
+    return _EXIT_OK
+
+
+def _resolve_dm_saved_target(
+    inbox: Inbox, peer_hash: str, ref: str
+) -> Dict[str, Any]:
+    """Resolve ``tau save`` / ``unsave --peer`` to one stored DM.
+
+    Same rules as :func:`_resolve_group_pin_target` but peer-scoped:
+    a star attaches to a stored record, so a still-queued message has
+    nothing to star and is never a candidate.  An exact id wins over a
+    longer id that merely starts with it; a prefix matching more than
+    one record, or nothing at all, is refused.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("message must not be empty")
+    matches = inbox.find_prefix(ref, peer=peer_hash)
+    exact = [m for m in matches if str(m["id"]) == ref]
+    if not exact:
+        folded = ref.lower()
+        exact = [m for m in matches if str(m["id"]).lower() == folded]
+    if exact:
+        matches = exact
+    if len(matches) > 1:
+        raise NodeError(
+            f"{len(matches)} messages from this peer match {ref!r};"
+            " use a longer prefix"
+        )
+    if not matches:
+        raise NodeError(
+            f"no message {ref!r} from this peer to save;"
+            " stars attach to a stored message from this peer's history"
+        )
+    return matches[0]
+
+
+def _resolve_saved_message(
+    config: TauConfig, args: argparse.Namespace
+) -> Tuple[str, str, str, Dict[str, Any]]:
+    """Resolve ``tau save`` / ``unsave`` scope + ref to a stored message.
+
+    Returns ``(kind, scope, message_id, record)``: the record is the
+    stored inbox record for a DM or group message, or the stored
+    channel message for a channel.  A star attaches to a stored
+    record, like a group pin, so a still-queued leg has nothing to
+    star.  For a group the scope is the group's id at save time; a
+    rename does not move the star, because the record keeps its
+    original group id.
+    """
+    ref = str(getattr(args, "message", "") or "").strip()
+    if not ref:
+        raise NodeError("message must not be empty")
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    if getattr(args, "peer", None) is not None:
+        destination = _resolve_inbox_peer(inbox, registry, args.peer)
+        entry = _resolve_dm_saved_target(inbox, destination, ref)
+        return "peer", destination, str(entry["id"]), entry
+    if getattr(args, "group", None) is not None:
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
+        group_ids = _group_ids_spanning_renames(store, group)
+        entry = _resolve_group_pin_target(inbox, group_ids, ref)
+        return "group", group["id"], str(entry["id"]), entry
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    conn = app.connect()
+    try:
+        try:
+            digest = resolve_message_digest(conn, name, ref)
+        except ChannelError as exc:
+            raise NodeError(str(exc)) from exc
+        record = get_channel_message(conn, digest)
+    finally:
+        conn.close()
+    if record is None:
+        raise NodeError(f"no stored message {ref!r} in #{name}")
+    return "channel", name, digest, record
+
+
+def _edit_saved_messages(
+    config: TauConfig,
+    kind: str,
+    scope: str,
+    message_id: str,
+    *,
+    save: bool,
+) -> Tuple[bool, SavedMessages]:
+    """Star or unstar one message, reloading inside the lock.
+
+    Returns ``(changed, new list)``: starring an already-starred
+    message — or unstarring an unstarred one — is a no-op, not an
+    error, mirroring the pinned-conversation commands.  A corrupt
+    list is refused, not overwritten, so a bad file cannot silently
+    drop the owner's other stars.
+    """
+    with saved_messages_lock(config.saved_messages_path):
+        try:
+            saved = load_saved_messages(config.saved_messages_path)
+            if save:
+                updated, already = saved.with_saved(kind, scope, message_id)
+                changed = not already
+            else:
+                updated, changed = saved.without(kind, scope, message_id)
+        except SavedMessagesError as exc:
+            raise NodeError(str(exc)) from exc
+        if changed:
+            save_saved_messages(config.saved_messages_path, updated)
+    return changed, updated
+
+
+def _saved_scope_label(
+    registry: PeerRegistry, store: GroupStore, kind: str, scope: str
+) -> str:
+    """One saved message's conversation, as a reader-facing label."""
+    if kind == "peer":
+        peer = registry.get(scope)
+        name = peer.display_name if peer is not None else "unknown"
+        return f"DM with {name} ({short_hash(scope)})"
+    if kind == "group":
+        try:
+            group = store.find(scope)
+            return f"group \"{group['name']}\""
+        except ValueError:
+            return f"group {short_hash(scope)}"
+    return f"#{scope}"
+
+
+def cmd_save_message(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    kind, scope, message_id, record = _resolve_saved_message(config, args)
+    changed, _ = _edit_saved_messages(config, kind, scope, message_id, save=True)
+    if _json_mode(args):
+        _emit(
+            {
+                "kind": kind,
+                "scope": scope,
+                "message_id": message_id,
+                "saved": True,
+                "changed": changed,
+            },
+            True,
+        )
+        return _EXIT_OK
+    registry = PeerRegistry(config.peers_path)
+    store = GroupStore(config.groups_path)
+    label = _saved_scope_label(registry, store, kind, scope)
+    if kind == "channel":
+        who = str(record.get("name") or "anonymous")
+        when = _format_message_time(float(record.get("created_at", 0)))
+    else:
+        who = _message_peer_label(registry, record)
+        when = _format_message_time(float(record.get("received_at", 0)))
+    short = _safe_id_prefix(message_id)
+    state = "saved" if changed else "already saved"
+    print(f"{state} [{short}] {who} ({when}) — {label}")
+    if changed:
+        print(
+            "note: stars are local-only; the message stays where it is"
+            " and the star is never sent."
+        )
+    return _EXIT_OK
+
+
+def cmd_unsave_message(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    kind, scope, message_id, record = _resolve_saved_message(config, args)
+    changed, _ = _edit_saved_messages(config, kind, scope, message_id, save=False)
+    if _json_mode(args):
+        _emit(
+            {
+                "kind": kind,
+                "scope": scope,
+                "message_id": message_id,
+                "saved": False,
+                "changed": changed,
+            },
+            True,
+        )
+        return _EXIT_OK
+    registry = PeerRegistry(config.peers_path)
+    store = GroupStore(config.groups_path)
+    label = _saved_scope_label(registry, store, kind, scope)
+    if kind == "channel":
+        who = str(record.get("name") or "anonymous")
+        when = _format_message_time(float(record.get("created_at", 0)))
+    else:
+        who = _message_peer_label(registry, record)
+        when = _format_message_time(float(record.get("received_at", 0)))
+    short = _safe_id_prefix(message_id)
+    state = "unsaved" if changed else "was not saved"
+    print(f"{state} [{short}] {who} ({when}) — {label}")
+    return _EXIT_OK
+
+
+def cmd_saved_messages(args: argparse.Namespace) -> int:
+    """List starred messages, newest save first, with their text."""
+    config = _make_config(args)
+    try:
+        saved = load_saved_messages(config.saved_messages_path)
+    except SavedMessagesError as exc:
+        # A listing is display-only: a corrupt list fails open with
+        # a warning, like the pinned-conversation listing, instead
+        # of hiding stars the owner marked.
+        log.warning(
+            "Starred-message list at %s is unusable (%s); showing none",
+            config.saved_messages_path,
+            exc,
+        )
+        saved = SavedMessages()
+    limit = getattr(args, "limit", 30)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    shown = saved.entries if limit is None else saved.entries[:limit]
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    store = GroupStore(config.groups_path)
+    channel_conn = None
+    channel_app = None
+    try:
+
+        def message_for(entry: Any) -> Optional[Dict[str, Any]]:
+            """The stored message a star names, or ``None`` when it is gone."""
+            nonlocal channel_conn, channel_app
+            if entry.kind == "channel":
+                if channel_app is None:
+                    channel_app = ChannelApp(
+                        config, _tan_identity(config), name=config.name
+                    )
+                    channel_conn = channel_app.connect()
+                assert channel_conn is not None
+                return get_channel_message(channel_conn, entry.message_id)
+            if entry.kind == "peer":
+                matches = inbox.find_prefix(entry.message_id, peer=entry.scope)
+            else:
+                matches = inbox.find_prefix(entry.message_id, group=entry.scope)
+            exact = [
+                m for m in matches if str(m.get("id")) == entry.message_id
+            ]
+            return exact[0] if exact else None
+
+        rendered: List[Dict[str, Any]] = []
+        for entry in shown:
+            rendered.append(
+                {
+                    "kind": entry.kind,
+                    "scope": entry.scope,
+                    "scope_label": _saved_scope_label(
+                        registry, store, entry.kind, entry.scope
+                    ),
+                    "message_id": entry.message_id,
+                    "saved_at": entry.saved_at,
+                    "message": message_for(entry),
+                }
+            )
+    finally:
+        if channel_conn is not None:
+            channel_conn.close()
+    if _json_mode(args):
+        _emit({"saved": rendered, "count": len(rendered)}, True)
+        return _EXIT_OK
+    if not rendered:
+        print("No starred messages — star one with `tau save`.")
+        return _EXIT_OK
+    own_hash = _own_destination_hash(config)
+    for item in rendered:
+        entry_label = item["scope_label"]
+        when = _format_message_time(float(item["saved_at"]))
+        print(f"★ saved {when} · {entry_label}")
+        record = item["message"]
+        if record is None:
+            print(f"  (message {item['message_id'][:8]} no longer stored)")
+            continue
+        if item["kind"] == "channel":
+            _print_channel_messages(
+                [record],
+                json_output=False,
+                channel=item["scope"],
+            )
+        else:
+            _print_message_entry(
+                inbox, registry, record, blocked=None, own_hash=own_hash
+            )
     return _EXIT_OK
 
 

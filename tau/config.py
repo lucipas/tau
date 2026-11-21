@@ -44,6 +44,7 @@ DISAPPEARING_FILE_NAME = "disappearing.json"
 DRAFTS_FILE_NAME = "drafts.json"
 MUTED_FILE_NAME = "muted.json"
 PINNED_FILE_NAME = "pinned.json"
+SAVED_MESSAGES_FILE_NAME = "saved_messages.json"
 QUIET_HOURS_FILE_NAME = "quiet_hours.json"
 AWAY_FILE_NAME = "away.json"
 DM_REQUESTS_FILE_NAME = "dm-requests.json"
@@ -102,6 +103,7 @@ class TauConfig:
     drafts_path: Path
     muted_path: Path
     pinned_path: Path
+    saved_messages_path: Path
     quiet_hours_path: Path
     away_path: Path
     dm_requests_path: Path
@@ -173,6 +175,7 @@ class TauConfig:
             drafts_path=base / DRAFTS_FILE_NAME,
             muted_path=base / MUTED_FILE_NAME,
             pinned_path=base / PINNED_FILE_NAME,
+            saved_messages_path=base / SAVED_MESSAGES_FILE_NAME,
             quiet_hours_path=base / QUIET_HOURS_FILE_NAME,
             away_path=base / AWAY_FILE_NAME,
             dm_requests_path=base / DM_REQUESTS_FILE_NAME,

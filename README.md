@@ -433,6 +433,9 @@ Global options may appear before or after the command:
 | `tau pin-conversation --peer PEER` | Pin a conversation so it stays at the top of the conversation list (`--group NAME` pins a group, `--channel NAME` a joined channel; local-only, idempotent) |
 | `tau unpin-conversation --peer PEER` | Remove the pin from a conversation (`--group NAME` / `--channel NAME` for a group or channel pin) |
 | `tau pinned-conversations` | List pinned conversations, newest pin first |
+| `tau save --peer PEER MESSAGE` | Star a stored message so it stays in `tau saved` (`--group NAME` stars a group message, `--channel NAME` a channel message; message by id or unique prefix; local-only, idempotent) |
+| `tau unsave --peer PEER MESSAGE` | Remove the star from a stored message (`--group NAME` / `--channel NAME` for a group or channel message) |
+| `tau saved` | List starred messages, newest save first, with their text (`--json`, `--limit`) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
