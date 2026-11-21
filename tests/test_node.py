@@ -3671,6 +3671,144 @@ def test_deliver_queued_corrupt_edit_without_hint_defers_when_mailbox_lock_is_bu
     ]
 
 
+def test_deliver_queued_corrupt_edit_drops_leg_and_siblings_together(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    # The first leg's stored payload did not survive: dropping it
+    # must drop its sibling under the same mailbox transaction. A
+    # lock that goes busy after the leg's own removal would leave
+    # the sibling queued to deliver later and apply the local edit
+    # for a partial fan-out — so simulate exactly that: the second
+    # top-level lock acquisition fails.
+    path = node.mailbox.path
+    raw = json.loads(path.read_text())
+    for stored in raw["outbox"]:
+        if stored["id"] == entries[0].id:
+            stored["edit"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+    with node.mailbox.transaction():
+        fresh = node.mailbox.get_outbox(entries[0].id)
+    assert fresh.edit is None
+
+    real_lock = node.mailbox._lock
+
+    class _FailSecondAcquireLock:
+        """An RLock that refuses the second fresh acquisition.
+
+        Nested acquires by the thread that already holds the lock
+        still succeed, exactly like the real RLock — only a new
+        top-level acquisition can fail, which is what a lock going
+        busy between two separate operations looks like.
+        """
+
+        def __init__(self, real):
+            self._real = real
+            self.top_level = 0
+
+        def acquire(self, blocking=True, timeout=-1):
+            if self._real._is_owned():
+                return self._real.acquire(blocking, timeout)
+            self.top_level += 1
+            if self.top_level >= 2:
+                return False
+            return self._real.acquire(blocking, timeout)
+
+        def release(self):
+            return self._real.release()
+
+        def __enter__(self):
+            if not self.acquire():
+                raise TimeoutError("mailbox lock is held by another thread")
+            return self
+
+        def __exit__(self, *exc):
+            self.release()
+            return False
+
+    node.mailbox._lock = _FailSecondAcquireLock(real_lock)
+    try:
+        assert (
+            node._deliver_queued_edit(
+                alice, fresh, 1.0, deadline=time.monotonic() + 5.0
+            )
+            is False
+        )
+    finally:
+        node.mailbox._lock = real_lock
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+
+
+def test_deliver_queued_edit_retries_sibling_check_after_timeout(
+    tmp_path, monkeypatch
+):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "edited": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    real_siblings = node._queued_edit_siblings
+    calls = []
+
+    def flaky(edit_id, *, exclude=None, deadline=None):
+        calls.append(edit_id)
+        if len(calls) == 1:
+            raise TimeoutError("simulated busy mailbox")
+        return real_siblings(edit_id, exclude=exclude, deadline=deadline)
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", flaky)
+    assert (
+        node._deliver_entry(peer, entry, 1.0, deadline=time.monotonic() + 0.2)
+        is True
+    )
+    assert len(calls) == 2
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "fixed here"
+
+
+def test_deliver_queued_edit_skips_local_copy_when_sibling_check_stays_busy(
+    tmp_path, monkeypatch
+):
+    node, peer = _edit_node(tmp_path)
+    _seed_sent_dm(node, peer)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_edit("alice", "m-1", "fixed here")
+    entry = node.mailbox.outbox_list()[0]
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "edited": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+
+    def always_busy(edit_id, *, exclude=None, deadline=None):
+        raise TimeoutError("simulated busy mailbox")
+
+    monkeypatch.setattr(node, "_queued_edit_siblings", always_busy)
+    assert (
+        node._deliver_entry(peer, entry, 1.0, deadline=time.monotonic() + 0.2)
+        is True
+    )
+    # The delivery itself is confirmed, but the fan-out cannot be
+    # proven complete: the local copy stays old rather than showing
+    # an edit a queued sibling may never have received.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "typo here"
+
+
 def test_send_group_edit_aborts_queued_legs_when_a_member_refuses(
     tmp_path, monkeypatch
 ):

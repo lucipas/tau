@@ -5857,6 +5857,82 @@ class TauNode:
         for sibling in siblings:
             self._drop_queued_edit(sibling, deadline=deadline)
 
+    def _drop_failed_group_edit_leg(
+        self,
+        entry: Any,
+        *,
+        edit_id: Optional[str],
+        deadline: Optional[float] = None,
+    ) -> bool:
+        """Drop a failed group-edit leg and its siblings, atomically.
+
+        One mailbox transaction covers the version check, the sibling
+        lookup and every removal: either the leg and its siblings all
+        go, or — when the lock stays busy past the deadline — nothing
+        does and a later round retries the delivery and the cleanup.
+        A failed leg is never removed while a sibling survives to
+        deliver later and apply the local edit for a partial fan-out.
+
+        ``edit_id`` is the edit the leg belongs to (from the
+        validated payload, or the hint kept for a corrupt one);
+        ``None`` matches siblings by group, signed send time and
+        replacement text instead.  A replacement that landed while
+        the send was in flight keeps its leg.  Returns True when the
+        leg was dropped.
+        """
+        try:
+            with self.mailbox.transaction(timeout=_remaining(deadline)):
+                current = self.mailbox.get_outbox(entry.id)
+                if current is None:
+                    return False
+                if (
+                    current.text != entry.text
+                    or current.edited_at
+                    != getattr(entry, "edited_at", None)
+                ):
+                    # A replacement landed while the send was in
+                    # flight: keep it, and leave its siblings alone.
+                    return False
+                self._drop_queued_edit(entry, deadline=deadline)
+                if edit_id is not None:
+                    self._drop_queued_edit_siblings(
+                        edit_id, exclude=entry.id, deadline=deadline
+                    )
+                else:
+                    try:
+                        candidates = self.mailbox.outbox_list(
+                            timeout=_remaining(deadline)
+                        )
+                    except TimeoutError:
+                        log.debug(
+                            "Could not list queued edit siblings for "
+                            "%s: mailbox lock busy; leaving them for a "
+                            "later round",
+                            entry.id,
+                        )
+                        candidates = []
+                    for sibling in candidates:
+                        other = getattr(sibling, "edit", None)
+                        if (
+                            sibling.id != entry.id
+                            and sibling.group_id == entry.group_id
+                            and isinstance(other, dict)
+                            and entry.sent_at is not None
+                            and other.get("sent_at") == entry.sent_at
+                            and sibling.text == entry.text
+                        ):
+                            self._drop_queued_edit(
+                                sibling, deadline=deadline
+                            )
+                return True
+        except TimeoutError:
+            log.debug(
+                "Could not drop failed group edit leg %s: mailbox "
+                "lock busy; leaving it for a later round",
+                entry.id,
+            )
+            return False
+
     def _record_sent_edit_locally(
         self,
         target_id: str,
@@ -5982,45 +6058,23 @@ class TauNode:
                 "Dropping queued edit %s: stored payload is unusable",
                 entry.id,
             )
-            self._drop_queued_edit(entry, deadline=deadline)
             if entry.group_id is not None:
                 # The corrupt payload took the edit id with it, but
                 # the entry keeps it as a hint (see
-                # ``OutboxEntry.group_edit_id``): drop the siblings by
-                # id.  When even the hint is gone, the sibling legs
-                # still share the group, the edit's signed send time
-                # and the replacement text, so match on those instead.
-                # Either way a leg that can never deliver aborts the
-                # whole edit, like a refusal does.
-                edit_id = entry.group_edit_id
-                if edit_id is not None:
-                    self._drop_queued_edit_siblings(
-                        edit_id, exclude=entry.id, deadline=deadline
-                    )
-                else:
-                    try:
-                        candidates = self.mailbox.outbox_list(
-                            timeout=_remaining(deadline)
-                        )
-                    except TimeoutError:
-                        log.debug(
-                            "Could not list queued edit siblings for "
-                            "%s: mailbox lock busy; leaving them for a "
-                            "later round",
-                            entry.id,
-                        )
-                        candidates = []
-                    for sibling in candidates:
-                        other = getattr(sibling, "edit", None)
-                        if (
-                            sibling.id != entry.id
-                            and sibling.group_id == entry.group_id
-                            and isinstance(other, dict)
-                            and entry.sent_at is not None
-                            and other.get("sent_at") == entry.sent_at
-                            and sibling.text == entry.text
-                        ):
-                            self._drop_queued_edit(sibling, deadline=deadline)
+                # ``OutboxEntry.group_edit_id``).  When even the hint
+                # is gone, the sibling legs still share the group, the
+                # edit's signed send time and the replacement text, so
+                # match on those instead.  Either way a leg that can
+                # never deliver aborts the whole edit, like a refusal
+                # does — and the leg and its siblings go together, or
+                # not at all.
+                self._drop_failed_group_edit_leg(
+                    entry,
+                    edit_id=entry.group_edit_id,
+                    deadline=deadline,
+                )
+            else:
+                self._drop_queued_edit(entry, deadline=deadline)
             return False
         try:
             payload_bytes = base64.b64decode(edit["payload_b64"], validate=True)
@@ -6029,11 +6083,12 @@ class TauNode:
                 "Dropping queued edit %s: stored payload is not valid base64",
                 entry.id,
             )
-            self._drop_queued_edit(entry, deadline=deadline)
             if entry.group_id is not None:
-                self._drop_queued_edit_siblings(
-                    edit["edit_id"], exclude=entry.id, deadline=deadline
+                self._drop_failed_group_edit_leg(
+                    entry, edit_id=edit["edit_id"], deadline=deadline
                 )
+            else:
+                self._drop_queued_edit(entry, deadline=deadline)
             return False
         try:
             response = self._request(
@@ -6044,11 +6099,12 @@ class TauNode:
             # this edit, so stop retrying rather than holding the leg
             # until its TTL.
             log.warning("Dropping queued edit %s: %s", entry.id, exc)
-            self._drop_queued_edit(entry, deadline=deadline)
             if entry.group_id is not None:
-                self._drop_queued_edit_siblings(
-                    edit["edit_id"], exclude=entry.id, deadline=deadline
+                self._drop_failed_group_edit_leg(
+                    entry, edit_id=edit["edit_id"], deadline=deadline
                 )
+            else:
+                self._drop_queued_edit(entry, deadline=deadline)
             return False
         except NodeError as exc:
             try:
@@ -6071,29 +6127,9 @@ class TauNode:
                 "without group edit",
                 entry.id,
             )
-            self._drop_queued_edit(entry, deadline=deadline)
-            try:
-                siblings = self._queued_edit_siblings(
-                    edit["edit_id"], exclude=entry.id, deadline=deadline
-                )
-            except TimeoutError:
-                log.debug(
-                    "Could not list queued edit siblings for %s: "
-                    "mailbox lock busy; leaving them for a later round",
-                    edit["edit_id"],
-                )
-                siblings = []
-            for sibling in siblings:
-                try:
-                    self.mailbox.remove_outbox(
-                        sibling.id, timeout=_remaining(deadline)
-                    )
-                except TimeoutError:
-                    log.debug(
-                        "Could not drop queued edit sibling %s: "
-                        "mailbox lock busy; leaving it for a later round",
-                        sibling.id,
-                    )
+            self._drop_failed_group_edit_leg(
+                entry, edit_id=edit["edit_id"], deadline=deadline
+            )
             return False
         if entry.group_id is None and response.get("edited") is False:
             # The peer had no copy, or a newer edit already landed:
@@ -6147,15 +6183,29 @@ class TauNode:
                 edit["edit_id"], exclude=entry.id, deadline=deadline
             )
         except TimeoutError:
-            # The mailbox lock stayed busy, so the fan-out cannot be
-            # proven complete: leave the local copies alone rather
-            # than applying an edit a queued sibling never received.
-            log.warning(
-                "Delivered queued edit %s but the mailbox lock stayed "
-                "busy; leaving the local copies for a later round",
-                entry.id,
-            )
-            return True
+            # The deadline is spent, but the lock may only be busy
+            # for a moment: one short grace retry before giving up
+            # the local update.  Without it, a confirmed delivery
+            # whose leg is already removed would leave the sender's
+            # copies stale with no later round to repeat the check.
+            try:
+                siblings = self._queued_edit_siblings(
+                    edit["edit_id"],
+                    exclude=entry.id,
+                    deadline=time.monotonic() + 0.5,
+                )
+            except TimeoutError:
+                # The mailbox lock stayed busy, so the fan-out cannot
+                # be proven complete: leave the local copies alone
+                # rather than applying an edit a queued sibling never
+                # received.
+                log.warning(
+                    "Delivered queued edit %s but the mailbox lock "
+                    "stayed busy; leaving the local copies for a "
+                    "later round",
+                    entry.id,
+                )
+                return True
         if not siblings:
             self._record_sent_edit_locally(
                 edit["target"],
