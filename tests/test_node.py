@@ -3444,6 +3444,170 @@ def test_deliver_queued_group_edit_cancels_siblings_on_refusal(
     assert node.inbox.resolve("leg-1")["text"] == "typo here"
 
 
+def _queue_group_edit(tmp_path, monkeypatch):
+    """Queue a two-leg group edit; returns its outbox entries."""
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1", "leg-2"],
+            "leg_sent_at": 100.0,
+        }
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+    assert response["queued"] == 2
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 2
+    assert entries[0].edit["edit_id"] == entries[1].edit["edit_id"]
+    return node, group, alice, bob, entries
+
+
+def test_deliver_queued_group_edit_drops_siblings_when_a_leg_expires(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    # One leg's TTL ran out while the other was still queued: the
+    # prune aborts the whole edit instead of leaving the sibling to
+    # deliver later and rewrite the local copy on its own.
+    path = node.mailbox.path
+    raw = json.loads(path.read_text())
+    for stored in raw["outbox"]:
+        if stored["id"] == entries[0].id:
+            stored["expires_at"] = 100.0
+    path.write_text(json.dumps(raw))
+    node.mailbox.prune()
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+
+
+def test_deliver_queued_group_edit_keeps_local_copy_while_a_leg_is_outstanding(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    # The first leg expired but has not been pruned yet: the second
+    # leg may still deliver to its member, but the local copy must
+    # not change — the fan-out is no longer complete.
+    path = node.mailbox.path
+    raw = json.loads(path.read_text())
+    for stored in raw["outbox"]:
+        if stored["id"] == entries[0].id:
+            stored["expires_at"] = 100.0
+    path.write_text(json.dumps(raw))
+
+    def delivered(peer_arg, path_arg, payload, timeout, deadline=None):
+        return {"ok": True, "group_edit": True, "received_at": 120.0}
+
+    monkeypatch.setattr(node, "_request", delivered)
+    assert node._deliver_entry(bob, entries[1], 1.0) is True
+    assert [e.id for e in node.mailbox.outbox_list()] == [entries[0].id]
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    # The next prune takes the expired leg too: nothing of the edit
+    # is left queued.
+    node.mailbox.prune()
+    assert node.mailbox.outbox_list() == []
+
+
+def test_cancel_queued_group_edit_leg_aborts_the_edit(tmp_path, monkeypatch):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    # Cancelling one leg (``tau outbox cancel`` / the console) aborts
+    # the whole edit: the sibling goes with it, so a later delivery
+    # can never apply the local edit for a partial fan-out.
+    assert (
+        node.mailbox.remove_outbox(entries[0].id, abort_group_edit=True)
+        is True
+    )
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+
+
+def test_deliver_queued_group_edit_drops_siblings_on_corrupt_payload(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    # A leg whose stored payload did not survive can never deliver:
+    # its siblings go with it, since the fan-out can no longer
+    # complete.
+    path = node.mailbox.path
+    raw = json.loads(path.read_text())
+    for stored in raw["outbox"]:
+        if stored["id"] == entries[0].id:
+            stored["edit"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+
+    def boom(*args, **kwargs):
+        raise AssertionError("an unusable edit must never be sent")
+
+    monkeypatch.setattr(node, "_request", boom)
+    stale = node.mailbox.outbox_list()[0]
+    assert node._deliver_entry(alice, stale, 1.0) is False
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+
+
+def test_send_group_edit_aborts_queued_legs_when_a_member_refuses(
+    tmp_path, monkeypatch
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1", "leg-2"],
+            "leg_sent_at": 100.0,
+        }
+    )
+
+    def mixed(peer_arg, path_arg, payload, timeout, deadline=None):
+        if peer_arg.hexhash == alice.hexhash:
+            raise NodeError("no route to peer")
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", mixed)
+    response = node.send_group_edit(
+        "crew", "leg-1", "fixed here", target_sent_at=100.0
+    )
+    # Bob's refusal dooms the edit, so Alice's queued leg is dropped
+    # instead of delivering later and rewriting the local copy alone —
+    # and the report says so instead of claiming it is queued.
+    assert response["ok"] is False
+    assert response["queued"] == 0
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("leg-1")["text"] == "typo here"
+    alice_result = [
+        r for r in response["results"] if r["to"] == alice.hexhash
+    ][0]
+    assert alice_result.get("queued") is False
+    assert "aborted" in alice_result.get("error", "")
+    bob_result = [r for r in response["results"] if r["to"] == bob.hexhash][0]
+    assert bob_result.get("error") == "not_allowed"
+
+
 def test_send_group_message_records_leg_sent_at(tmp_path, monkeypatch):
     node, _, _, _ = _group_reaction_node(tmp_path)
 

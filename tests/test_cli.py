@@ -5823,6 +5823,54 @@ def test_outbox_cancel_by_prefix_removes_only_that_entry(tmp_path, capsys):
     ]
 
 
+def test_outbox_cancel_drops_sibling_group_edit_legs(tmp_path, capsys):
+    import base64
+
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    group = {
+        "id": "aa" * 16,
+        "name": "crew",
+        "creator": "bb" * 16,
+        "members": ["cc" * 16, "dd" * 16, "ee" * 16],
+    }
+    edit = {
+        "target": "leg-1",
+        "text": "fixed here",
+        "edit_id": "edit-1",
+        "sent_at": 100.0,
+        "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+    }
+    first = box.enqueue(
+        to=b"\xcc" * 16,
+        text="fixed here",
+        group=group,
+        edit=dict(edit),
+        message_id="aa" + "11" * 15,
+    )
+    box.enqueue(
+        to=b"\xdd" * 16,
+        text="fixed here",
+        group=group,
+        edit=dict(edit),
+        message_id="aa" + "22" * 15,
+    )
+    box.enqueue(to=b"\xbb" * 16, text="keep me", message_id="bb" + "22" * 15)
+
+    code = cli.main(
+        ["outbox", "cancel", "--data-dir", str(data_dir), first.id[:8]]
+    )
+    assert code == 0
+    # Cancelling one leg of a queued group edit cancels the whole edit;
+    # the unrelated entry stays queued.
+    assert [e.id for e in Mailbox(config.mailbox_path).outbox_list()] == [
+        "bb" + "22" * 15
+    ]
+
+
 def test_outbox_cancel_json_and_unknown(tmp_path, capsys):
     from tau.mailbox import Mailbox
 

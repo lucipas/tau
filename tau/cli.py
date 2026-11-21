@@ -21503,7 +21503,10 @@ def cmd_outbox_cancel(args: argparse.Namespace) -> int:
         entry = mailbox.resolve_outbox(args.target)
     except MailboxError as exc:
         raise NodeError(str(exc)) from exc
-    mailbox.remove_outbox(entry.id)
+    # Cancelling one leg of a queued group edit aborts the whole edit:
+    # the remaining legs can no longer complete the fan-out, so they go
+    # with it instead of lingering until their TTL.
+    mailbox.remove_outbox(entry.id, abort_group_edit=True)
     peer = registry.get(entry.to)
     name = peer.display_name if peer is not None else entry.to_name
     if _json_mode(args):

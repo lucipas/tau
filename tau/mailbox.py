@@ -1890,12 +1890,64 @@ class Mailbox:
             if entry.is_due(timestamp)
         ]
 
-    def remove_outbox(self, message_id: str, *, timeout: Optional[float] = None) -> bool:
+    def _group_edit_sibling_ids(
+        self, edit_id: str, *, exclude: Optional[str] = None
+    ) -> List[str]:
+        """Ids of still-queued entries carrying the same edit id.
+
+        Group-edit legs share one edit id, so the siblings of a leg
+        are the other members' legs for the same edit.  A DM edit has
+        no siblings: one peer, one leg.  Callers hold the mailbox
+        transaction; this only reads the in-memory outbox.
+        """
+        return [
+            entry.id
+            for entry in self._outbox.values()
+            if entry.id != exclude
+            and isinstance(entry.edit, dict)
+            and entry.edit.get("edit_id") == edit_id
+        ]
+
+    def remove_outbox(
+        self,
+        message_id: str,
+        *,
+        timeout: Optional[float] = None,
+        abort_group_edit: bool = False,
+    ) -> bool:
+        """Remove one queued entry; True when it was present.
+
+        With *abort_group_edit*, removing one leg of a queued group
+        edit also removes its sibling legs: the edit can no longer
+        complete its fan-out, so the remaining legs must not linger
+        until their TTL — and a later delivery must not apply the
+        local edit for a partial fan-out.  A delivered leg never
+        takes this path (see ``TauNode._remove_queued_version``), so
+        a confirmed delivery still leaves the other legs queued.
+        """
         with self._transaction(timeout=timeout):
-            if message_id not in self._outbox:
+            entry = self._outbox.get(message_id)
+            if entry is None:
                 return False
             del self._outbox[message_id]
+            siblings: List[str] = []
+            if abort_group_edit and isinstance(entry.edit, dict):
+                edit_id = entry.edit.get("edit_id")
+                if isinstance(edit_id, str) and edit_id:
+                    siblings = self._group_edit_sibling_ids(
+                        edit_id, exclude=message_id
+                    )
+                    for sibling_id in siblings:
+                        del self._outbox[sibling_id]
             self.save()
+            if siblings:
+                log.info(
+                    "Cancelled %d sibling leg(s) of queued group edit %s "
+                    "with %s",
+                    len(siblings),
+                    entry.edit.get("edit_id"),
+                    message_id,
+                )
             return True
 
     def edit_scheduled_outbox(
@@ -2972,6 +3024,30 @@ class Mailbox:
                 for key, entry in self._outbox.items()
                 if entry.expires_at <= timestamp
             ]
+            # An expired leg of a queued group edit aborts the whole
+            # edit: the remaining legs can no longer complete the
+            # fan-out, so they go with it instead of lingering until
+            # their TTL — and a later delivery must not apply the
+            # local edit for a partial fan-out.
+            aborted = 0
+            for key in list(dead_outbox):
+                entry = self._outbox.get(key)
+                if entry is None or not isinstance(entry.edit, dict):
+                    continue
+                edit_id = entry.edit.get("edit_id")
+                if not isinstance(edit_id, str) or not edit_id:
+                    continue
+                for sibling_id in self._group_edit_sibling_ids(
+                    edit_id, exclude=key
+                ):
+                    if sibling_id not in dead_outbox:
+                        dead_outbox.append(sibling_id)
+                        aborted += 1
+            if aborted:
+                log.info(
+                    "Pruned %d sibling leg(s) of expired queued group edits",
+                    aborted,
+                )
             for key in dead_outbox:
                 del self._outbox[key]
             dead_held = [

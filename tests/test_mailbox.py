@@ -1307,6 +1307,93 @@ def test_prune_expires_everything(tmp_path):
     }
 
 
+def _enqueue_group_edit_leg(box, *, leg_id, to_hex, edit_id, group, ttl):
+    """One leg of a queued group edit, for the prune/cancel tests."""
+    return box.enqueue(
+        to=bytes.fromhex(to_hex),
+        text="fixed here",
+        group=group,
+        edit={
+            "target": "leg-1",
+            "text": "fixed here",
+            "edit_id": edit_id,
+            "sent_at": 100.0,
+            "payload_b64": base64.b64encode(b"payload").decode("ascii"),
+        },
+        ttl=ttl,
+        now=100.0,
+        message_id=leg_id,
+    )
+
+
+def _edit_group():
+    return {
+        "id": "aa" * 16,
+        "name": "crew",
+        "creator": "bb" * 16,
+        "members": ["cc" * 16, "dd" * 16, "ee" * 16],
+    }
+
+
+def test_prune_drops_siblings_of_expired_group_edit_leg(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=60.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    box.enqueue(
+        to=BOB, text="keep me", ttl=3600.0, now=100.0, message_id="plain"
+    )
+    # Only the first leg expired, but the edit can no longer complete
+    # its fan-out: the still-live sibling goes with it.
+    removed = box.prune(now=200.0)
+    assert removed["outbox"] == 2
+    assert [e.id for e in box.outbox_list()] == ["plain"]
+
+
+def test_remove_outbox_abort_group_edit_drops_siblings(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    box.enqueue(
+        to=BOB, text="keep me", ttl=3600.0, now=100.0, message_id="plain"
+    )
+    assert box.remove_outbox("leg-alice", abort_group_edit=True) is True
+    assert [e.id for e in box.outbox_list()] == ["plain"]
+
+
+def test_remove_outbox_leaves_siblings_without_abort_flag(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    group = _edit_group()
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-alice", to_hex="cc" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    _enqueue_group_edit_leg(
+        box, leg_id="leg-bob", to_hex="dd" * 16, edit_id="edit-1",
+        group=group, ttl=3600.0,
+    )
+    box.enqueue(
+        to=BOB, text="keep me", ttl=3600.0, now=100.0, message_id="plain"
+    )
+    # The default is a plain removal: a confirmed delivery removes
+    # only its own leg, so the siblings must stay queued.
+    assert box.remove_outbox("leg-alice") is True
+    assert [e.id for e in box.outbox_list()] == ["leg-bob", "plain"]
+
+
 def test_seen_and_pending_acks(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     assert box.is_seen("nope") is False

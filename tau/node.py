@@ -5959,6 +5959,23 @@ class TauNode:
                 entry.id,
             )
             self._drop_queued_edit(entry, deadline=deadline)
+            if entry.group_id is not None:
+                # The corrupt payload took the edit id with it: the
+                # sibling legs still share the group, the edit's
+                # signed send time and the replacement text, so match
+                # on those instead — a leg that can never deliver
+                # aborts the whole edit, like a refusal does.
+                for sibling in self.mailbox.outbox_list():
+                    other = getattr(sibling, "edit", None)
+                    if (
+                        sibling.id != entry.id
+                        and sibling.group_id == entry.group_id
+                        and isinstance(other, dict)
+                        and entry.sent_at is not None
+                        and other.get("sent_at") == entry.sent_at
+                        and sibling.text == entry.text
+                    ):
+                        self._drop_queued_edit(sibling, deadline=deadline)
             return False
         try:
             payload_bytes = base64.b64decode(edit["payload_b64"], validate=True)
@@ -5968,6 +5985,10 @@ class TauNode:
                 entry.id,
             )
             self._drop_queued_edit(entry, deadline=deadline)
+            if entry.group_id is not None:
+                self._drop_queued_edit_siblings(
+                    edit["edit_id"], exclude=entry.id, deadline=deadline
+                )
             return False
         try:
             response = self._request(
@@ -10853,6 +10874,34 @@ class TauNode:
                         "id": edit_id,
                     }
                 )
+        # A member the edit can no longer reach — refused, rejected,
+        # running a version without group edits, unqueueable, or never
+        # attempted — dooms the whole edit: legs already queued for
+        # other members must not deliver later and rewrite the local
+        # copies for a partial fan-out.  Drop them and report them as
+        # failed instead of queued, so the user can retry the edit (a
+        # retry is a new edit id; a member who already applied this
+        # one answers ``edited`` False only when a newer edit landed).
+        # A member counts as covered by a delivered, queued or
+        # deferred leg; a re-queue failure alone does not cover them,
+        # since they never receive the edit that way.
+        covered = {
+            result.get("to")
+            for result in results
+            if result.get("delivered")
+            or result.get("queued")
+            or result.get("deferred")
+        }
+        if any(member not in covered for member in members):
+            for sibling in self._queued_edit_siblings(edit_id):
+                self._drop_queued_edit(sibling)
+            for result in results:
+                if result.get("queued"):
+                    result["queued"] = False
+                    result["ok"] = False
+                    result["error"] = (
+                        "edit aborted: another member could not receive it"
+                    )
         all_ok = all(result.get("delivered") for result in results)
         local_errors: List[str] = []
         if all_ok:
