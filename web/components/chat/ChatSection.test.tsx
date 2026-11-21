@@ -9,6 +9,7 @@ import { fakeTau, makeMessage, makePeer } from "../test-utils";
 import type { MessageDraft } from "@/lib/types";
 
 const PEER_HASH = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+const NEW_GROUP_ID = "d".repeat(32);
 
 let saved: MessageDraft[] = [];
 let calls: string[] = [];
@@ -58,6 +59,20 @@ function stubFetch() {
         payload = { archived: [] };
       } else if (url.includes("/api/beacons")) {
         payload = { beacons: [], count: 0 };
+      } else if (url.includes("/api/groups") && method === "POST") {
+        payload = {
+          ok: true,
+          group: {
+            id: NEW_GROUP_ID,
+            name: "crew",
+            members: [],
+            created_at: 1700000000,
+            topic: "",
+            created_by_me: true,
+            can_leave: true,
+            ignored: false,
+          },
+        };
       } else if (url.includes("/api/messages/read")) {
         payload = {
           ok: true,
@@ -240,5 +255,68 @@ describe("ChatSection announcements-only", () => {
     const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
     expect(box.disabled).toBe(false);
     expect(screen.queryByText(/Only the creator can post here/)).toBeNull();
+  });
+});
+
+describe("ChatSection new group", () => {
+  const BOB_HASH = "b".repeat(32);
+
+  it("creates a group and opens its thread", async () => {
+    window.location.hash = "#chat";
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [
+            makePeer({ destination: PEER_HASH, name: "Alice" }),
+            makePeer({ destination: BOB_HASH, name: "Bob" }),
+          ],
+          messages: [],
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "New group" }));
+    fireEvent.change(screen.getByLabelText("Group name"), {
+      target: { value: "crew" },
+    });
+    fireEvent.click(screen.getByLabelText("Bob"));
+    fireEvent.click(screen.getByRole("button", { name: "Create group" }));
+    await waitFor(() => expect(calls).toContain("POST /api/groups"));
+    await waitFor(() =>
+      expect(window.location.hash).toBe(`#chat?group=${NEW_GROUP_ID}`),
+    );
+  });
+
+  it("navigates to the new group even when the refresh fails", async () => {
+    // Parity with the join flow: refresh, then navigate whether or
+    // not the refresh landed — the next snapshot picks the group up,
+    // so a failed refresh must not look like a failed creation.
+    window.location.hash = "#chat";
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [
+            makePeer({ destination: PEER_HASH, name: "Alice" }),
+            makePeer({ destination: BOB_HASH, name: "Bob" }),
+          ],
+          messages: [],
+          refresh: vi.fn(async () => {
+            throw new Error("bridge down");
+          }),
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "New group" }));
+    fireEvent.change(screen.getByLabelText("Group name"), {
+      target: { value: "crew" },
+    });
+    fireEvent.click(screen.getByLabelText("Bob"));
+    fireEvent.click(screen.getByRole("button", { name: "Create group" }));
+    await waitFor(() =>
+      expect(window.location.hash).toBe(`#chat?group=${NEW_GROUP_ID}`),
+    );
   });
 });
