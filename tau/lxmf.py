@@ -278,8 +278,28 @@ def _lxmf_destination(identity: RNS.Identity) -> Any:
 #: the direct-path copy (see :func:`build_lxmf_message`).
 LXMF_FIELD_TAU_MESSAGE_ID = "tau_message_id"
 
+#: LXMF message field marking the content as an encoded tau group
+#: message (see :func:`build_lxmf_group_message`): the receiver
+#: routes it to the group handler instead of the DM inbox.
+LXMF_FIELD_TAU_GROUP = "tau_group"
+
 #: Tau message ids are capped at 64 characters on the wire.
 MAX_TAU_MESSAGE_ID_LENGTH = 64
+
+
+def _clean_tau_message_id(tau_message_id: Optional[str]) -> Optional[str]:
+    """Validate a carried tau message id, or ``None`` when absent."""
+    if tau_message_id is None:
+        return None
+    if (
+        not isinstance(tau_message_id, str)
+        or not tau_message_id
+        or len(tau_message_id) > MAX_TAU_MESSAGE_ID_LENGTH
+    ):
+        raise ValueError(
+            "tau_message_id must be a non-empty string of at most 64 characters"
+        )
+    return tau_message_id
 
 
 def build_lxmf_message(
@@ -308,12 +328,7 @@ def build_lxmf_message(
     sender — the receiver falls back to the LXMF hash id.  The id
     must be a non-empty string within the 64-character wire cap.
     """
-    if tau_message_id is not None and (
-        not isinstance(tau_message_id, str)
-        or not tau_message_id
-        or len(tau_message_id) > MAX_TAU_MESSAGE_ID_LENGTH
-    ):
-        raise ValueError("tau_message_id must be a non-empty string of at most 64 characters")
+    tau_message_id = _clean_tau_message_id(tau_message_id)
     lxmf_module = _import_lxmf()
     destination = _lxmf_destination(_identity_for_key(destination_public_key))
     source = _lxmf_destination(source_identity)
@@ -323,6 +338,50 @@ def build_lxmf_message(
         else None
     )
     return lxmf_module.LXMessage(destination, source, content=text, fields=fields)
+
+
+def build_lxmf_group_message(
+    source_identity: RNS.Identity,
+    destination_public_key: bytes,
+    group_payload: bytes,
+    *,
+    tau_message_id: Optional[str] = None,
+) -> Any:
+    """Build an ``LXMessage`` carrying an encoded tau group message.
+
+    The payload is the bytes :func:`tau.protocol.encode_group_message`
+    returns for the leg — the full ``/tau/group`` request body, roster
+    and topic included — so the receiver can hand it to the same
+    handler as a direct group request.  It rides as the message
+    content (LXMF's ``content_as_string`` channel), marked by the
+    ``tau_group`` field so the receiver routes it to the group inbox
+    instead of the DM inbox; the tau message id rides alongside in
+    the fields, exactly as it does for a DM, so the copy dedupes
+    against the direct-path leg and retraction markers cover it.
+
+    Raises :class:`LXMFError` when the ``lxmf`` package is not
+    installed and :class:`ValueError` for a key that cannot be
+    loaded, a payload that is not non-empty UTF-8 bytes, or a bad
+    tau message id.  The payload is already capped at 8 KiB by the
+    protocol (``MAX_REQUEST_BYTES``), so no separate size check is
+    needed here.
+    """
+    tau_message_id = _clean_tau_message_id(tau_message_id)
+    if not isinstance(group_payload, (bytes, bytearray)):
+        raise ValueError("group_payload must be bytes")
+    if not group_payload:
+        raise ValueError("group_payload must not be empty")
+    try:
+        content = bytes(group_payload).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("group_payload must be UTF-8 text") from exc
+    lxmf_module = _import_lxmf()
+    destination = _lxmf_destination(_identity_for_key(destination_public_key))
+    source = _lxmf_destination(source_identity)
+    fields = {LXMF_FIELD_TAU_GROUP: "1"}
+    if tau_message_id is not None:
+        fields[LXMF_FIELD_TAU_MESSAGE_ID] = tau_message_id
+    return lxmf_module.LXMessage(destination, source, content=content, fields=fields)
 
 
 def send_lxmf_message(router: Any, message: Any, *, timeout: float) -> bool:
