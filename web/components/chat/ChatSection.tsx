@@ -4,7 +4,7 @@
 
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   acceptDmRequest,
   addReminder,
@@ -219,15 +219,60 @@ export default function ChatSection() {
     void refreshDrafts();
   }, [refreshDrafts]);
 
-  const refreshReminders = useCallback(async () => {
+  // Snapshot, timer and local-action refreshes can overlap, and a slow
+  // list response must never overwrite a newer one — a canceled row
+  // would reappear. Each refresh takes the next generation and only
+  // the latest generation may apply its response.
+  const remindersGeneration = useRef(0);
+  const reminderRetryTimer = useRef<number | undefined>(undefined);
+  const reminderRetryAttempts = useRef(0);
+  const remindersMounted = useRef(true);
+  const refreshReminders = useCallback(async (isRetry = false) => {
+    const generation = ++remindersGeneration.current;
+    // Each independent refresh starts a fresh retry budget; a retry in
+    // the chain keeps the count, so failures from separate triggers
+    // cannot consume each other's retries.
+    if (!isRetry) reminderRetryAttempts.current = 0;
+    // A newer refresh supersedes any pending retry.
+    window.clearTimeout(reminderRetryTimer.current);
+    reminderRetryTimer.current = undefined;
     try {
-      setReminders(await getReminders());
+      const next = await getReminders();
+      if (generation !== remindersGeneration.current) return;
+      reminderRetryAttempts.current = 0;
+      setReminders(next);
     } catch {
       // Reminders are advisory; the chat list works without them.
+      // If the latest request failed, retry a bounded number of times so
+      // an older successful list that was discarded is not lost for good.
+      // A retry is scheduled only while mounted: an in-flight request
+      // can reject after unmount, and must not keep polling then.
+      if (
+        generation === remindersGeneration.current &&
+        remindersMounted.current &&
+        reminderRetryAttempts.current < 3
+      ) {
+        const attempt = ++reminderRetryAttempts.current;
+        reminderRetryTimer.current = window.setTimeout(
+          () => void refreshReminders(true),
+          5000 * 2 ** (attempt - 1),
+        );
+      }
     } finally {
-      setRemindersLoading(false);
+      if (generation === remindersGeneration.current) setRemindersLoading(false);
     }
   }, []);
+
+  useEffect(
+    () => () => {
+      // Invalidate any in-flight list request and stop retries: leaving
+      // the chat must not schedule further requests.
+      remindersMounted.current = false;
+      remindersGeneration.current += 1;
+      window.clearTimeout(reminderRetryTimer.current);
+    },
+    [],
+  );
 
   // Reminders can fire or change outside this tab, so reload them on
   // every snapshot change as well as after local snooze/cancel actions.
