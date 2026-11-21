@@ -7159,6 +7159,39 @@ class TauNode:
                     )
                 return False
             via_lxmf = True
+        if via_lxmf and entry.group_id is not None:
+            # LXMF confirms transport, not group acceptance: the
+            # receiver's group handler can still refuse the copy — a
+            # roster this node has not learned yet, or a stale
+            # announcements-only setting — and no receipt comes back
+            # to say so.  Marking the leg delivered here would lose
+            # the message exactly when the direct path would have
+            # kept it queued for retry, so a group leg sent over
+            # LXMF stays queued: the next sweep retries direct
+            # first, and the receiver dedupes the repeat LXMF copies
+            # by tau id.  The attempt is recorded, so the retry
+            # follows the usual backoff instead of every sweep.  (A
+            # DM has no handler refusal to lose it to, so its LXMF
+            # confirmation still counts as delivered.)
+            log.info(
+                "Group message %s sent over LXMF to %s; keeping it "
+                "queued until direct delivery confirms it",
+                entry.id,
+                peer.hexhash,
+            )
+            try:
+                self.mailbox.record_attempt(
+                    entry.id,
+                    error="sent over LXMF; awaiting direct confirmation",
+                    timeout=_remaining(deadline),
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not record LXMF attempt for %s: "
+                    "mailbox lock busy",
+                    entry.id,
+                )
+            return False
         # Record the confirmed delivery before the entry leaves the outbox,
         # so a waiter that sees the entry gone can tell it was delivered.
         self._delivered_ids.append(entry.id)

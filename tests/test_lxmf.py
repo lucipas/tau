@@ -782,9 +782,13 @@ def _lxmf_group_for(node, peer, name="testers"):
     }
 
 
-def test_deliver_entry_falls_back_to_lxmf_for_group_leg(
+def test_deliver_entry_keeps_group_leg_queued_after_lxmf_send(
     tmp_path, monkeypatch, fake_lxmf
 ):
+    # LXMF confirms transport, not group acceptance: the receiver's
+    # group handler can still refuse the copy, so the leg stays queued
+    # for a direct retry instead of being recorded delivered — unlike
+    # a DM, whose LXMF confirmation does count as delivered.
     node, peer, router = _lxmf_send_node(tmp_path)
     router.outcome = "deliver"
     group = _lxmf_group_for(node, peer)
@@ -795,8 +799,8 @@ def test_deliver_entry_falls_back_to_lxmf_for_group_leg(
         group=group,
     )
     _failing_request(node, monkeypatch)
-    assert node._deliver_entry(peer, entry, timeout=1.0) is True
-    assert node.mailbox.get_outbox(entry.id) is None
+    assert node._deliver_entry(peer, entry, timeout=1.0) is False
+    assert node.mailbox.get_outbox(entry.id) is not None
     assert len(router.outbound) == 1
     sent = router.outbound[0]
     carried = decode(sent.content)
@@ -1282,6 +1286,52 @@ def test_node_lxmf_group_delivery_drops_non_member_sender(
         node.lxmf_router.delivery_callback(message)
         assert node.inbox.list_messages() == []
         assert node.groups.get(group_id) is None
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_group_delivery_refuses_stale_announcements_only_then_recovers(
+    fake_lxmf, tmp_path
+):
+    # A member posts while the receiver still enforces a stale
+    # announcements-only setting: the LXMF copy is refused, not
+    # stored — and because the refusal is not marked seen, the same
+    # copy (same tau id) lands once the receiver learns the lift.
+    # This is the copy the sender retries because it keeps the leg
+    # queued after an LXMF send instead of recording it delivered.
+    node = _lxmf_node(tmp_path)
+    peer, sender = _lxmf_peer(node)
+    carol = RNS.Identity()
+    node.registry.upsert(
+        destination_hash(carol), carol.get_public_key(), name="carol"
+    )
+    try:
+        receiver_hash = destination_hash(node.identity).hex()
+        creator_hash = destination_hash(carol).hex()
+        members = sorted(
+            [creator_hash, destination_hash(sender).hex(), receiver_hash]
+        )
+        group_id = derive_group_id(creator_hash, "testers", members)
+        node.groups.create("testers", members, created_by=creator_hash)
+        node.groups.set_announcements_only(
+            group_id, True, created_by=creator_hash
+        )
+        _gid, message = _lxmf_group_delivery(
+            sender, node, creator=creator_hash, members=members
+        )
+        node.lxmf_router.delivery_callback(message)
+        assert node.inbox.list_messages() == []
+        node.groups.set_announcements_only(
+            group_id, False, created_by=creator_hash
+        )
+        _gid, retry = _lxmf_group_delivery(
+            sender, node, creator=creator_hash, members=members
+        )
+        node.lxmf_router.delivery_callback(retry)
+        stored = node.inbox.list_messages()
+        assert len(stored) == 1
+        assert stored[0]["kind"] == "group"
+        assert stored[0]["text"] == "hello group"
     finally:
         node.stop()
 
