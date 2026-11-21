@@ -316,7 +316,7 @@ class BroadcastStore:
         """
         if not isinstance(new_name, str) or not new_name.strip():
             raise ValueError("a broadcast list needs a name")
-        cleaned = sanitize_group_name(new_name.strip())
+        cleaned = sanitize_group_name(new_name.strip(), fallback="")
         if not cleaned:
             raise ValueError("a broadcast list needs a name")
         with self._transaction():
@@ -331,9 +331,12 @@ class BroadcastStore:
                 )
             snapshot = self._snapshot()
             renamed = dict(broadcast, name=cleaned)
-            if new_key != key:
-                del self._lists[key]
-            self._lists[new_key] = renamed
+            # Rebuild in place so the list keeps its position: equal
+            # created_at values keep dict order when listing.
+            self._lists = {
+                (new_key if k == key else k): (renamed if k == key else v)
+                for k, v in self._lists.items()
+            }
             try:
                 self._save()
             except OSError:
