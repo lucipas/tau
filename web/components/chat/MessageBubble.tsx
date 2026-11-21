@@ -41,11 +41,11 @@ export interface MessageBubbleProps {
 
 const REACTION_CHOICES = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
 
-/** Seconds until the next 09:00 local time (today, or tomorrow when past it). */
+/** Seconds until 09:00 local time on the next calendar day. */
 export function secondsUntilTomorrowNine(from = new Date()): number {
   const target = new Date(from);
+  target.setDate(target.getDate() + 1);
   target.setHours(9, 0, 0, 0);
-  if (target.getTime() <= from.getTime()) target.setDate(target.getDate() + 1);
   return Math.max(60, Math.round((target.getTime() - from.getTime()) / 1000));
 }
 
@@ -258,7 +258,7 @@ export default function MessageBubble({
             )}
             <button type="button" onClick={() => { onAction?.("delete", message); setMenuOpen(false); }} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">Delete</button>
             <button type="button" onClick={() => { onAction?.("pin", message); setMenuOpen(false); }} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">{message.pinned ? "Unpin" : "Pin"}</button>
-            {!own && (
+            {!own && !message.file && onSnooze && (
               <button type="button" onClick={() => { setSnoozeOpen((v) => !v); setReactOpen(false); setForwardOpen(false); }} aria-expanded={snoozeOpen} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">Snooze</button>
             )}
             <button type="button" onClick={() => { setForwardOpen((v) => !v); setReactOpen(false); setSnoozeOpen(false); }} aria-expanded={forwardOpen} className="rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-800">Forward</button>

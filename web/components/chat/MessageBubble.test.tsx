@@ -5,7 +5,7 @@ import { makeMessage } from "../test-utils";
 
 describe("secondsUntilTomorrowNine", () => {
   it("returns the seconds until 09:00, today or tomorrow", () => {
-    expect(secondsUntilTomorrowNine(new Date("2026-11-21T08:00:00"))).toBe(3600);
+    expect(secondsUntilTomorrowNine(new Date("2026-11-21T08:00:00"))).toBe(25 * 3600);
     expect(secondsUntilTomorrowNine(new Date("2026-11-21T10:00:00"))).toBe(23 * 3600);
     expect(secondsUntilTomorrowNine(new Date("2026-11-21T09:00:00"))).toBe(24 * 3600);
   });
@@ -69,6 +69,33 @@ describe("MessageBubble", () => {
       />,
     );
     fireEvent.click(screen.getByLabelText("Actions for message 7"));
+    expect(screen.queryByText("Snooze")).toBeNull();
+  });
+
+  it("does not offer snooze on incoming file messages or without onSnooze", () => {
+    const { unmount } = render(
+      <MessageBubble
+        message={makeMessage({
+          id: 10,
+          direction: "in",
+          text: "",
+          file: { name: "notes.txt", size: 2048, sha256: "ab".repeat(32) },
+        })}
+        onSnooze={() => undefined}
+        now={1700000060}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("Actions for message 10"));
+    expect(screen.queryByText("Snooze")).toBeNull();
+    unmount();
+
+    render(
+      <MessageBubble
+        message={makeMessage({ id: 11, direction: "in", text: "their message" })}
+        now={1700000060}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("Actions for message 11"));
     expect(screen.queryByText("Snooze")).toBeNull();
   });
 
