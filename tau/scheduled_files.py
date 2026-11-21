@@ -130,9 +130,9 @@ def _clean_target(value: Any) -> str:
 
 
 def _clean_kind(value: Any) -> str:
-    if value not in ("dm", "group"):
+    if value not in ("dm", "group", "broadcast"):
         raise ScheduledFileError(
-            f"scheduled file kind must be 'dm' or 'group': {value!r}"
+            f"scheduled file kind must be 'dm', 'group' or 'broadcast': {value!r}"
         )
     return value
 
@@ -272,12 +272,14 @@ class ScheduledFile:
     created_at: float = 0.0
     attempts: int = 0
     next_attempt_at: float = 0.0
-    # Group deliveries pin the group they were queued for: its id and
-    # the roster snapshot at schedule time.  Delivery resolves by id
-    # and refuses to send when the roster no longer matches, so a
-    # roster change or name reuse can never redirect the file to
-    # members who were not in the group when it was queued.  DM
-    # entries leave both empty.
+    # Group and broadcast deliveries pin the target they were queued
+    # for: a group pins its id and the roster snapshot at schedule
+    # time, a broadcast list pins the member snapshot at schedule
+    # time (its name is the target).  Delivery resolves by id (group)
+    # or name (broadcast) and refuses to send when the roster no
+    # longer matches, so a roster change or name reuse can never
+    # redirect the file to members who were not in the group or list
+    # when it was queued.  DM entries leave both empty.
     group_id: Optional[str] = None
     group_members: Tuple[str, ...] = ()
     # Members still owed after a partial group fan-out; empty means

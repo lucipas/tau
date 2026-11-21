@@ -3291,6 +3291,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long each member's transfer may take (default 300)",
     )
     broadcast_send_file.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the file: stage it now and send it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack; needs a node "
+        "serving at send time)",
+    )
+    broadcast_send_file.add_argument(
         "--discover-timeout",
         type=float,
         default=10.0,
@@ -14745,9 +14753,12 @@ def _queue_file_for_later(
 
 
 def _print_scheduled_file(entry: ScheduledFile, *, delay: float) -> None:
-    destination = (
-        f"group {entry.target}" if entry.kind == "group" else entry.target
-    )
+    if entry.kind == "group":
+        destination = f"group {entry.target}"
+    elif entry.kind == "broadcast":
+        destination = f"broadcast list {entry.target}"
+    else:
+        destination = entry.target
     print(
         f"scheduled {entry.file['name']} ({entry.file['size']} bytes) "
         f"for {destination} — sends in {_ago(delay)}"
@@ -14858,9 +14869,12 @@ def cmd_scheduled_files(args: argparse.Namespace) -> int:
             when += " (due — sends on the next serve pass)"
         else:
             when += f" (in {_ago(entry.publish_at - now)})"
-        destination = (
-            f"group {entry.target}" if entry.kind == "group" else entry.target
-        )
+        if entry.kind == "group":
+            destination = f"group {entry.target}"
+        elif entry.kind == "broadcast":
+            destination = f"broadcast list {entry.target}"
+        else:
+            destination = entry.target
         print(
             f"{entry.id}  {destination}  {entry.file['name']} "
             f"({entry.file['size']} bytes)  {when}"
@@ -20048,6 +20062,40 @@ def cmd_broadcast_send_file(args: argparse.Namespace) -> int:
     and no list metadata ever reaches a recipient.
     """
     config = _make_config(args)
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        # Resolve the list without starting a node: scheduling only
+        # needs the list to exist.  The name is stored for display
+        # and the member snapshot pins the delivery target, so a
+        # later member change or name reuse cannot redirect the file.
+        store = BroadcastStore(config.broadcasts_path)
+        try:
+            broadcast = store.find(args.broadcast)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+        entry = _queue_file_for_later(
+            config,
+            target=broadcast["name"],
+            kind="broadcast",
+            path=args.path,
+            send_after=time.time() + delay,
+            group_members=tuple(sorted(broadcast["members"])),
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+        if _json_mode(args):
+            _emit_scheduled_file(entry)
+        else:
+            _print_scheduled_file(entry, delay=delay)
+        return _EXIT_OK
     node = TauNode(config, name=config.name)
     node.start()
     try:
