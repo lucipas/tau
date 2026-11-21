@@ -130,6 +130,12 @@ export default function BroadcastsPanel({
       setRenaming(null);
       return;
     }
+    if (sending.has(listName)) {
+      // The in-flight send reports its result under the old name; renaming
+      // now would let the draft be sent again under the new name.
+      setPanelError("Wait for the send to finish before renaming this list.");
+      return;
+    }
     setPanelError(null);
     try {
       await onRename(listName, trimmed);
