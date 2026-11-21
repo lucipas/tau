@@ -63,6 +63,8 @@ function stubFetch() {
           ok: true,
           unread: { per_peer: {}, per_group: {}, per_channel: {}, total: 0, revision: 1 },
         };
+      } else if (url.includes("/api/messages/edit")) {
+        payload = { ok: true, queued: true };
       }
       return {
         ok: true,
@@ -124,6 +126,54 @@ describe("ChatSection drafts", () => {
     renderChat();
     const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
     await waitFor(() => expect(box.value).toBe("resume me"));
+  });
+});
+
+describe("ChatSection queued edit notice", () => {
+  const BOB_HASH = "b".repeat(32);
+
+  function renderTwoPeers() {
+    window.location.hash = `#chat?peer=${PEER_HASH}`;
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [
+            makePeer({ destination: PEER_HASH, name: "Alice" }),
+            makePeer({ destination: BOB_HASH, name: "Bob" }),
+          ],
+          messages: [
+            makeMessage({ id: 1, peer: PEER_HASH, direction: "out", text: "hello" }),
+            makeMessage({ id: 2, peer: BOB_HASH, direction: "in", text: "hi" }),
+          ],
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+  }
+
+  function switchTo(peerHash: string) {
+    window.location.hash = `#chat?peer=${peerHash}`;
+    fireEvent(window, new Event("hashchange"));
+  }
+
+  it("shows the notice only in the conversation it was queued from", async () => {
+    renderTwoPeers();
+    // Open the message menu and start editing our own sent message.
+    fireEvent.click(screen.getByLabelText("Actions for message 1"));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    await waitFor(() => expect(box.value).toBe("hello"));
+    fireEvent.change(box, { target: { value: "hello edited" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save edit" }));
+    // The edit queues (peer offline): the notice shows in Alice's chat.
+    await waitFor(() => expect(screen.getByText(/Edit queued/)).toBeTruthy());
+    // Switching to Bob's chat hides it…
+    switchTo(BOB_HASH);
+    await waitFor(() => expect(screen.queryByText(/Edit queued/)).toBeNull());
+    // …and switching back shows it again — it belongs to Alice's chat.
+    switchTo(PEER_HASH);
+    await waitFor(() => expect(screen.getByText(/Edit queued/)).toBeTruthy());
   });
 });
 

@@ -10934,7 +10934,9 @@ class TauNode:
         the local copies update on delivery, exactly as the live path
         updates them on confirmation.  An explicit refusal (allow-list,
         block-list) is final and never queues.  A newer edit of the
-        same message supersedes a still-queued one for it.
+        same message supersedes a still-queued one for it.  An edit
+        of a message whose original send is still queued is refused:
+        cancel the queued send first.
         """
         cleaned = normalize_message(text)
         target_id = message_id.strip() if isinstance(message_id, str) else ""
@@ -10967,6 +10969,19 @@ class TauNode:
         except NodeError:
             if not queue or not self.started:
                 raise
+            if any(
+                entry.id == target_id
+                for entry in self.mailbox.outbox_list()
+            ):
+                # The original send is still queued: the peer has
+                # never seen the message, so queueing the edit behind
+                # it would deliver a rewrite of a message that does
+                # not exist for them yet.  Refuse instead — cancel
+                # the queued send first, then edit the sent copy.
+                raise NodeError(
+                    "cannot edit a message that has not been sent yet: "
+                    "cancel the queued send first"
+                )
             dest_hash = (
                 peer.destination_hash
                 if peer is not None
