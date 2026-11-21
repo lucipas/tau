@@ -17087,7 +17087,9 @@ def _resolve_saved_message(
 
     With *missing_ok* (``unsave``), a message that is no longer stored
     resolves to the matching star instead, with a ``None`` record, so
-    the star can still be cleared.
+    the star can still be cleared.  A channel star attaches to a
+    message channel history shows: an expired or retracted row cannot
+    be starred, though it can still be unstarred through the fallback.
     """
     ref = str(getattr(args, "message", "") or "").strip()
     if not ref:
@@ -17141,7 +17143,17 @@ def _resolve_saved_message(
     try:
         try:
             digest = resolve_message_digest(conn, name, ref)
-            record = get_channel_message(conn, digest)
+            # A star attaches to a message channel history shows:
+            # an expired or retracted row is hidden there, so it
+            # cannot be starred — the listing would render it as a
+            # missing-message stub the moment it was saved.
+            record = get_visible_channel_message(conn, digest)
+            if record is None and not missing_ok:
+                if get_channel_message(conn, digest) is not None:
+                    raise NodeError(
+                        f"message {ref!r} in #{name} is expired or retracted;"
+                        " stars attach to visible messages"
+                    )
         except ChannelError as exc:
             if not missing_ok:
                 raise NodeError(str(exc)) from exc
@@ -17397,9 +17409,10 @@ def cmd_saved_messages(args: argparse.Namespace) -> int:
                 return False
             return blocked is None or record.get("destination") in blocked
 
-        rendered: List[Dict[str, Any]] = []
+        own_hash = _own_destination_hash(config)
+        pairs: List[Tuple[Any, Optional[Dict[str, Any]]]] = []
         for entry in saved.entries:
-            if limit is not None and len(rendered) >= limit:
+            if limit is not None and len(pairs) >= limit:
                 break
             record = message_for(entry)
             if record is None:
@@ -17411,6 +17424,19 @@ def cmd_saved_messages(args: argparse.Namespace) -> int:
                     continue
             elif hidden(entry, record):
                 continue
+            pairs.append((entry, record))
+        # Polls carry their tally on the record itself, derived from
+        # the conversation's full history like the normal views do —
+        # without this, a starred poll renders zero votes.
+        records = [record for _, record in pairs if record is not None]
+        _attach_dm_poll_tallies(inbox, records, own_hash)
+        _attach_group_poll_tallies(inbox, records, own_hash)
+        if channel_app is not None:
+            _attach_channel_poll_tallies(
+                channel_app, records, own_hash, blocked=blocked
+            )
+        rendered: List[Dict[str, Any]] = []
+        for entry, record in pairs:
             rendered.append(
                 {
                     "kind": entry.kind,
@@ -17432,7 +17458,6 @@ def cmd_saved_messages(args: argparse.Namespace) -> int:
     if not rendered:
         print("No starred messages — star one with `tau save`.")
         return _EXIT_OK
-    own_hash = _own_destination_hash(config)
     for item in rendered:
         entry_label = item["scope_label"]
         when = _format_message_time(float(item["saved_at"]))
