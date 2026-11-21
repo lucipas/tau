@@ -555,6 +555,7 @@ tau broadcast send team "meet at noon"
 tau broadcast send-file team photo.png
 tau broadcast send-file team photo.png --delay 30m
 tau broadcast poll team "lunch?" noon 1pm
+tau broadcast rename team squad
 # The web console has the same lists: Chat → Broadcasts, for
 # creating a list, sending to it, and deleting it.
 

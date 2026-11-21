@@ -27,6 +27,7 @@ function renderPanel(
     peers: [makePeer({ destination: ALICE, name: "Alice" }), makePeer({ destination: BOB, name: "Bob" })],
     onCreate: vi.fn(async () => undefined),
     onDelete: vi.fn(async () => undefined),
+    onRename: vi.fn(async () => undefined),
     onSend: vi.fn(async (): Promise<BroadcastSendResponse> => ({
       ok: true,
       name: "team",
@@ -137,6 +138,26 @@ describe("BroadcastsPanel", () => {
     await vi.waitFor(() => {
       expect(props.onDelete).toHaveBeenCalledWith("team");
     });
+  });
+
+  it("renames a list from the inline editor", async () => {
+    const props = renderPanel();
+    fireEvent.click(screen.getByText("Rename"));
+    const input = screen.getByLabelText("Rename team") as HTMLInputElement;
+    expect(input.value).toBe("team");
+    fireEvent.change(input, { target: { value: "squad" } });
+    fireEvent.click(screen.getByText("Save"));
+    await vi.waitFor(() => {
+      expect(props.onRename).toHaveBeenCalledWith("team", "squad");
+    });
+  });
+
+  it("does not rename when the name is unchanged", async () => {
+    const props = renderPanel();
+    fireEvent.click(screen.getByText("Rename"));
+    fireEvent.click(screen.getByText("Save"));
+    expect(props.onRename).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Rename team")).toBeNull();
   });
 
   it("says so when there are no lists yet", () => {

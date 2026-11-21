@@ -10,9 +10,10 @@ import {
   buildTraffic,
   useBeaconFeed,
   useBeacons,
+  useBroadcasts,
   useTau,
 } from "./use-tau";
-import type { Beacon, ChatMessage, Group, Peer, Snapshot } from "./types";
+import type { Beacon, BroadcastList, ChatMessage, Group, Peer, Snapshot } from "./types";
 
 // ------------------------------------------------------------ fake socket --
 
@@ -393,4 +394,89 @@ describe("useBeacons / useBeaconFeed", () => {
     });
     expect(posted).toHaveLength(0);
   });
+});
+
+describe("useBroadcasts", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  function jsonResponse(data: unknown): Response {
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify(data),
+    } as Response;
+  }
+
+  const member = { hash: "a".repeat(32), name: "alice" };
+  const oldList: BroadcastList = { name: "team", members: [member], created_at: 1000 };
+  const newList: BroadcastList = { name: "squad", members: [member], created_at: 1000 };
+
+  it("a stale pre-rename refresh never restores the old name", async () => {
+    // One deferred response per GET /api/broadcasts, in call order.
+    const listsCalls: Array<ReturnType<typeof deferred<Response>>> = [];
+    const renameCall = deferred<Response>();
+    fetchImpl = async (url: string) => {
+      if (url === "/api/broadcasts") {
+        const call = deferred<Response>();
+        listsCalls.push(call);
+        return call.promise;
+      }
+      if (url === "/api/broadcasts/rename") {
+        return renameCall.promise;
+      }
+      return jsonResponse(makeSnapshot());
+    };
+
+    const { result } = renderHook(() => useBroadcasts());
+    // The mount refresh lands first, so the list is on screen.
+    await waitFor(() => expect(listsCalls).toHaveLength(1));
+    await act(async () => {
+      listsCalls[0].resolve(jsonResponse({ broadcasts: [oldList], count: 1 }));
+      await listsCalls[0].promise;
+    });
+    expect(result.current.broadcasts[0]?.name).toBe("team");
+
+    // A second refresh starts, then a rename begins while it is in flight.
+    let refreshDone: Promise<void>;
+    act(() => {
+      refreshDone = result.current.refresh();
+    });
+    await waitFor(() => expect(listsCalls).toHaveLength(2));
+    let renameDone: Promise<void>;
+    act(() => {
+      renameDone = result.current.rename("team", "squad");
+    });
+    await act(async () => {
+      renameCall.resolve(
+        jsonResponse({ ok: true, broadcast: newList, previous_name: "team" }),
+      );
+      await renameCall.promise;
+    });
+    // The rename applied the response and started its own refresh.
+    await waitFor(() => expect(listsCalls).toHaveLength(3));
+    expect(result.current.broadcasts[0]?.name).toBe("squad");
+
+    // The stale pre-rename refresh now resolves with the old snapshot.
+    await act(async () => {
+      listsCalls[1].resolve(jsonResponse({ broadcasts: [oldList], count: 1 }));
+      await listsCalls[1].promise;
+      await refreshDone;
+    });
+    expect(result.current.broadcasts[0]?.name).toBe("squad");
+
+    // The rename's own refresh resolves with the post-rename snapshot.
+    await act(async () => {
+      listsCalls[2].resolve(jsonResponse({ broadcasts: [newList], count: 1 }));
+      await listsCalls[2].promise;
+      await renameDone;
+    });
+    expect(result.current.broadcasts[0]?.name).toBe("squad");
+    expect(result.current.loading).toBe(false);
+});
 });

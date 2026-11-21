@@ -3192,6 +3192,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     broadcast_delete.set_defaults(func=cmd_broadcast_delete)
 
+    broadcast_rename = broadcast_sub.add_parser(
+        "rename",
+        parents=[common],
+        help="rename a broadcast list, keeping its members and creation time",
+    )
+    broadcast_rename.add_argument(
+        "broadcast", metavar="NAME", help="broadcast list name"
+    )
+    broadcast_rename.add_argument(
+        "new_name", metavar="NEW_NAME", help="the list's new name"
+    )
+    broadcast_rename.set_defaults(func=cmd_broadcast_rename)
+
     # `tau broadcast send` shares `tau send`'s delivery flags: a
     # broadcast is a fan-out of ordinary DMs, so every flag means what
     # it means for a one-to-one send.  There is no --reply-to: a
@@ -19958,6 +19971,31 @@ def cmd_broadcast_delete(args: argparse.Namespace) -> int:
         _emit({"deleted": broadcast["name"]}, True)
         return _EXIT_OK
     print(f"deleted broadcast list {broadcast['name']}")
+    return _EXIT_OK
+
+
+def cmd_broadcast_rename(args: argparse.Namespace) -> int:
+    """Rename a broadcast list in place, keeping its members.
+
+    Local-only, like ``delete``: the list name never travels on the
+    wire, so no node is needed and members never learn the new name —
+    they only ever see their own private DM.
+    """
+    config = _make_config(args)
+    store = BroadcastStore(config.broadcasts_path)
+    try:
+        old = store.find(args.broadcast)
+        renamed = store.rename(args.broadcast, args.new_name)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_broadcast(renamed, PeerRegistry(config.peers_path))
+    if _json_mode(args):
+        _emit({"broadcast": described, "previous_name": old["name"]}, True)
+        return _EXIT_OK
+    if renamed["name"] == old["name"]:
+        print(f"broadcast list {renamed['name']!r} already has that name")
+    else:
+        print(f"renamed broadcast list {old['name']!r} to {renamed['name']!r}")
     return _EXIT_OK
 
 

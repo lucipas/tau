@@ -54,6 +54,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/broadcasts   saved broadcast lists with their member lists
     POST /api/broadcasts   create ``{"name": "...", "members": ["<hash>", ...]}``
     POST /api/broadcasts/delete delete ``{"broadcast": "<name>"}``
+    POST /api/broadcasts/rename rename ``{"broadcast": "<name>", "new_name": "<name>"}``
     POST /api/broadcasts/send send ``{"broadcast": "<name>", "text": "..."}`` —
                            one DM per member, per-member results in reply
     POST /api/broadcasts/send-file send a file to a broadcast list
@@ -11428,6 +11429,21 @@ class WebBridge:
             raise ValueError(f"unknown broadcast list: {name.strip()!r}")
         return {"name": broadcast["name"]}
 
+    def rename_broadcast(self, name: str, new_name: Any) -> Dict[str, Any]:
+        """Rename a broadcast list from the console, mirroring ``tau broadcast rename``."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'broadcast' is required")
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError("field 'new_name' is required")
+        broadcast = self.node.broadcasts.find(name.strip())
+        renamed = self.node.broadcasts.rename(
+            broadcast["name"], new_name.strip()
+        )
+        return {
+            "broadcast": self._describe_broadcast(renamed),
+            "previous_name": broadcast["name"],
+        }
+
     def send_broadcast(
         self,
         name: str,
@@ -14727,6 +14743,27 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, **deleted}, head_only)
+                return
+            if path == "/api/broadcasts/rename":
+                target = body.get("broadcast")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'broadcast' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    renamed = self.bridge.rename_broadcast(
+                        target.strip(), body.get("new_name")
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **renamed}, head_only)
                 return
             if path == "/api/broadcasts/send":
                 target = body.get("broadcast")

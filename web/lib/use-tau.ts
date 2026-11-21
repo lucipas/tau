@@ -48,6 +48,7 @@ import {
   markRead,
   markUnread,
   pingPeer,
+  renameBroadcast,
   retryOutbox,
   sendBroadcast,
   setMuted,
@@ -628,6 +629,7 @@ export interface UseBroadcastsResult {
   refresh: () => Promise<void>;
   create: (name: string, members: string[]) => Promise<void>;
   remove: (name: string) => Promise<void>;
+  rename: (name: string, newName: string) => Promise<void>;
   send: (name: string, text: string) => Promise<BroadcastSendResponse>;
 }
 
@@ -636,15 +638,23 @@ export function useBroadcasts(): UseBroadcastsResult {
   const [broadcasts, setBroadcasts] = useState<BroadcastList[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Monotonic generation: a refresh only applies its snapshot while no
+  // newer refresh or rename has started, so a stale pre-rename snapshot
+  // can never overwrite a rename that already committed.
+  const generationRef = useRef(0);
 
   const refresh = useCallback(async () => {
+    const generation = ++generationRef.current;
     try {
-      setBroadcasts(await getBroadcasts());
+      const lists = await getBroadcasts();
+      if (generationRef.current !== generation) return;
+      setBroadcasts(lists);
       setError(null);
     } catch (err) {
+      if (generationRef.current !== generation) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (generationRef.current === generation) setLoading(false);
     }
   }, []);
 
@@ -666,12 +676,35 @@ export function useBroadcasts(): UseBroadcastsResult {
     },
     [refresh],
   );
+  const rename = useCallback(
+    async (name: string, newName: string) => {
+      // Invalidate any refresh already in flight: it may resolve with a
+      // pre-rename snapshot after the rename commits.
+      generationRef.current += 1;
+      try {
+        // The rename is committed server-side once this resolves, so apply
+        // the stored list from the response; a failed refresh must not
+        // leave the old name on screen.
+        const { broadcast, previous_name } = await renameBroadcast(name, newName);
+        setBroadcasts((prev) =>
+          prev.map((entry) => (entry.name === previous_name ? broadcast : entry)),
+        );
+      } catch (err) {
+        // Re-sync on failure: the invalidated refresh above must not
+        // leave a stale snapshot (or a stuck loading state) behind.
+        await refresh();
+        throw err;
+      }
+      await refresh();
+    },
+    [refresh],
+  );
   const send = useCallback(async (name: string, text: string) => {
     const result = await sendBroadcast(name, text);
     await refresh();
     return result;
   }, [refresh]);
-  return { broadcasts, loading, error, refresh, create, remove, send };
+  return { broadcasts, loading, error, refresh, create, remove, rename, send };
 }
 
 // ----------------------------------------------------------------- traffic

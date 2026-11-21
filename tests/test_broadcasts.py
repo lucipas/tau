@@ -96,6 +96,41 @@ def test_broadcast_store_delete(tmp_path):
     assert len(store) == 0
 
 
+def test_broadcast_store_rename(tmp_path):
+    store = BroadcastStore(tmp_path / "broadcasts.json")
+    created = store.create("team", [ALICE_HASH, BOB_HASH])
+    store.create("other", [CAROL_HASH])
+    renamed = store.rename("TEAM", "squad")
+    assert renamed["name"] == "squad"
+    assert renamed["members"] == created["members"]
+    # The rename is in place: creation time (and list order) survive.
+    assert renamed["created_at"] == created["created_at"]
+    assert [item["name"] for item in store.list_broadcasts()] == [
+        "squad",
+        "other",
+    ]
+    assert store.find("squad") == renamed
+    with pytest.raises(ValueError, match="unknown broadcast list"):
+        store.find("team")
+    # Renaming onto another list's name is refused, case-insensitively.
+    with pytest.raises(ValueError, match="already exists"):
+        store.rename("squad", "OTHER")
+    with pytest.raises(ValueError, match="unknown broadcast list"):
+        store.rename("nope", "squad")
+    with pytest.raises(ValueError, match="needs a name"):
+        store.rename("squad", "   ")
+    # A case-only rename is allowed: same list, new casing.
+    assert store.rename("squad", "Squad")["name"] == "Squad"
+    assert [item["name"] for item in store.list_broadcasts()] == [
+        "Squad",
+        "other",
+    ]
+    # The rename persists across a reload.
+    assert BroadcastStore(tmp_path / "broadcasts.json").find("Squad") == (
+        store.find("Squad")
+    )
+
+
 def test_broadcast_store_persists_and_drops_corrupt_entries(tmp_path):
     path = tmp_path / "broadcasts.json"
     store = BroadcastStore(path)
@@ -299,6 +334,47 @@ def test_broadcast_delete(tmp_path, capsys, monkeypatch):
     code = _run_broadcast(tmp_path, monkeypatch, ["list"])
     assert code == 0
     assert "No broadcast lists yet" in capsys.readouterr().out
+
+
+def test_broadcast_rename(tmp_path, capsys, monkeypatch):
+    _seed_peers(tmp_path)
+    assert (
+        _run_broadcast(tmp_path, monkeypatch, ["create", "team", "--peer", "alice"])
+        == 0
+    )
+    assert (
+        _run_broadcast(tmp_path, monkeypatch, ["create", "other", "--peer", "bob"])
+        == 0
+    )
+    code = _run_broadcast(tmp_path, monkeypatch, ["rename", "team", "squad"])
+    assert code == 0
+    assert "renamed broadcast list 'team' to 'squad'" in capsys.readouterr().out
+    # The old name is gone; the new name resolves with the same member.
+    code = _run_broadcast(tmp_path, monkeypatch, ["show", "squad"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "squad (1 members)" in out
+    assert "alice" in out
+    code = _run_broadcast(tmp_path, monkeypatch, ["show", "team"])
+    assert code != 0
+    # Renaming onto another list's name, or an unknown list, fails.
+    code = _run_broadcast(tmp_path, monkeypatch, ["rename", "squad", "other"])
+    assert code != 0
+    code = _run_broadcast(tmp_path, monkeypatch, ["rename", "nope", "squad"])
+    assert code != 0
+    # A case-only rename is a rename, not an error.
+    code = _run_broadcast(tmp_path, monkeypatch, ["rename", "squad", "Squad"])
+    assert code == 0
+    assert "renamed broadcast list 'squad' to 'Squad'" in capsys.readouterr().out
+    # JSON mode reports the renamed list and the previous name.
+    code = _run_broadcast(
+        tmp_path, monkeypatch, ["rename", "Squad", "crew", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["broadcast"]["name"] == "crew"
+    assert payload["previous_name"] == "Squad"
+    assert payload["broadcast"]["members"][0]["name"] == "alice"
 
 
 def test_broadcast_send_fans_out_as_individual_dms(tmp_path, capsys, monkeypatch):
