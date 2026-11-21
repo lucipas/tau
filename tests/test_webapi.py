@@ -18466,6 +18466,63 @@ def test_edit_message_endpoint_keeps_group_bubbles_on_partial_fanout(
     ]
 
 
+def test_edit_message_endpoint_reports_queued_group_legs(bridge, node):
+    crew = node.groups.list_groups()[0]
+    entries = _sent_group_console_entries(bridge, node, crew["id"])
+
+    def send_group_edit(group, message_id, text, **kwargs):
+        return {
+            "ok": False,
+            "group": group["id"] if isinstance(group, dict) else group,
+            "target": message_id,
+            "id": "edit-1",
+            "sent_at": 2000.0,
+            "cancelled_queued": [],
+            "queued": 1,
+            "results": [
+                {
+                    "to": PEER_HASH,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "edited": True,
+                    "id": "edit-1",
+                },
+                {
+                    "to": BOB_HASH,
+                    "to_name": "bob",
+                    "queued": True,
+                    "queued_id": "q-1",
+                    "id": "edit-1",
+                },
+            ],
+        }
+
+    node.send_group_edit = send_group_edit
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["queued"] is True
+    assert payload["edited"] is False
+    assert payload["group"] == crew["id"]
+    # No bubble takes the new text until the last queued leg delivers.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello",
+        "hello",
+    ]
+    assert all("edited_at" not in entry for entry in feed["messages"])
+    assert not [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+
+
 def test_edit_message_endpoint_refuses_group_message_with_queued_leg(
     bridge, node
 ):
@@ -20712,6 +20769,45 @@ def test_edit_message_endpoint_keeps_the_bubble_when_the_peer_is_unreachable(
     assert "unreachable" in payload["error"]["message"]
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"][0]["text"] == "typo here"
+
+
+def test_edit_message_endpoint_reports_queued_edit(bridge, node):
+    message = _send_for_edit(bridge, node)
+
+    def send_edit(peer, message_id, text, **kwargs):
+        return {
+            "ok": False,
+            "queued": True,
+            "target": message_id,
+            "id": "edit-1",
+            "queued_id": "q-1",
+            "sent_at": 200.0,
+        }
+
+    node.send_edit = send_edit
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["edited"] is False
+    assert payload["queued"] is True
+    assert payload["queued_id"] == "q-1"
+    assert payload["id"] == "edit-1"
+    assert payload["message"] is None
+    # The bubble keeps the old text until the sweep delivers the edit.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "typo here"
+    assert "edited_at" not in feed["messages"][0]
+    assert not [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
 
 
 def test_record_edit_applies_an_inbound_edit(bridge):

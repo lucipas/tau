@@ -132,6 +132,17 @@ def build_bundle(
         if entry.expires_at <= timestamp:
             skipped.append({"id": entry.id, "reason": "expired"})
             continue
+        if getattr(entry, "edit", None) is not None or (
+            getattr(entry, "kind", None) == "edit"
+        ):
+            # A queued edit carries pre-signed /tau/dm/edit bytes,
+            # not a text message: it cannot be sealed into a bundle,
+            # and sealing its display text would land as chat.  It
+            # rides direct delivery only.
+            skipped.append(
+                {"id": entry.id, "reason": "queued edit — not sealed"}
+            )
+            continue
         if getattr(entry, "reaction", None) is not None or (
             getattr(entry, "kind", None) == "reaction"
         ):
