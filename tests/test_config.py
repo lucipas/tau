@@ -106,6 +106,29 @@ def test_ensure_rns_stamps_policy_fills_missing_keys_only(tmp_path):
     assert "[[AutoInterface]]" in text
 
 
+def test_ensure_rns_stamps_policy_recognizes_annotated_header(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.write_text("[ stamps ]  # zero-cost\n  destination_value = 25\n")
+    assert ensure_rns_stamps_policy(cfg) is True
+    text = cfg.read_text()
+    assert text.count("stamps") == 1
+    assert text.count("[") == 1
+    assert "destination_value = 25" in text
+    assert "destination_value = 0" not in text
+    for key in ("destination_cost", "pr_value", "pr_cost", "lr_cost"):
+        assert f"{key} = 0" in text
+
+
+def test_ensure_rns_stamps_policy_preserves_symlink(tmp_path):
+    real = tmp_path / "managed.conf"
+    real.write_text("[reticulum]\n  enable_transport = No\n")
+    link = tmp_path / "config"
+    link.symlink_to(real)
+    assert ensure_rns_stamps_policy(link) is True
+    assert link.is_symlink()
+    assert "[stamps]" in real.read_text()
+
+
 def test_ensure_rns_stamps_policy_missing_file_is_noop(tmp_path):
     assert ensure_rns_stamps_policy(tmp_path / "nope") is False
 

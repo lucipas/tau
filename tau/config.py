@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import socket
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -572,13 +573,22 @@ def ensure_rns_stamps_policy(path: Path) -> bool:
     except OSError as exc:
         log.debug("Could not read Reticulum config at %s: %s", target, exc)
         return False
+    # Write through symlinks so an externally managed config keeps tracking
+    # its source file instead of being replaced by a regular file.
+    try:
+        write_target = target.resolve()
+    except OSError:
+        write_target = target
     lines = text.splitlines()
     section_at: Optional[int] = None
     present: set = set()
     for index, raw in enumerate(lines):
         stripped = raw.strip()
         if section_at is None:
-            if stripped == "[stamps]":
+            # Accept whitespace inside brackets and trailing inline comments,
+            # e.g. "[ stamps ]  # zero-cost", as Reticulum does.
+            header = re.split(r"\s[#;]", stripped, maxsplit=1)[0].strip()
+            if re.fullmatch(r"\[\s*stamps\s*\]", header):
                 section_at = index
             continue
         if stripped.startswith("["):
@@ -714,3 +724,4 @@ def tcp_listen_endpoints(config_path: Path) -> List[TcpListenEndpoint]:
             )
         )
     return endpoints
+ return endpoints
