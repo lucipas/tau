@@ -118,6 +118,13 @@ from .pinned import (
     pinned_lock,
     save_pinned,
 )
+from .saved_messages import (
+    SavedMessages,
+    SavedMessagesError,
+    load_saved_messages,
+    save_saved_messages,
+    saved_messages_lock,
+)
 from .quiet_hours import (
     QuietHours,
     QuietHoursError,
@@ -386,15 +393,20 @@ from .tangents.tan import (
 from .channels import (
     DEFAULT_CHANNEL_LIMIT,
     MAX_FEED_EDITS,
+    AmbiguousDigestError,
     ChannelApp,
     ChannelError,
     clean_channel_name,
     create_edit as create_channel_edit,
     create_message as create_channel_message,
     create_reaction as create_channel_reaction,
+    get_message as get_channel_message,
+    get_visible_message as get_visible_channel_message,
+    HASH_HEX_LENGTH,
     init_db as init_channel_db,
     is_member as is_channel_member,
     reply_parent as channel_reply_parent,
+    resolve_message_digest,
 )
 
 log = logging.getLogger(__name__)
@@ -2036,6 +2048,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="list pinned conversations, newest pin first",
     )
     pinned_conversations.set_defaults(func=cmd_pinned_conversations)
+
+    save_message = subparsers.add_parser(
+        "save",
+        parents=[common],
+        help="star a stored message so it stays in `tau saved`",
+    )
+    save_target = save_message.add_mutually_exclusive_group(required=True)
+    save_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    save_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    save_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name",
+    )
+    save_message.add_argument(
+        "message",
+        metavar="MESSAGE",
+        help="message id or unique prefix",
+    )
+    save_message.set_defaults(func=cmd_save_message)
+
+    unsave_message = subparsers.add_parser(
+        "unsave",
+        parents=[common],
+        help="remove the star from a stored message",
+    )
+    unsave_target = unsave_message.add_mutually_exclusive_group(required=True)
+    unsave_target.add_argument(
+        "--peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    unsave_target.add_argument(
+        "--group",
+        metavar="GROUP",
+        help="group id, id prefix or name",
+    )
+    unsave_target.add_argument(
+        "--channel",
+        metavar="CHANNEL",
+        help="channel name",
+    )
+    unsave_message.add_argument(
+        "message",
+        metavar="MESSAGE",
+        help="message id or unique prefix",
+    )
+    unsave_message.set_defaults(func=cmd_unsave_message)
+
+    saved_messages = subparsers.add_parser(
+        "saved",
+        parents=[common],
+        help="list starred messages, newest save first",
+    )
+    saved_messages.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="maximum starred messages to show (default 30)",
+    )
+    saved_messages.set_defaults(func=cmd_saved_messages)
 
     disappearing = subparsers.add_parser(
         "disappearing",
@@ -15004,6 +15086,8 @@ def _resolve_inbox_peer(
     registry: PeerRegistry,
     target: str,
     direction: Optional[str] = "in",
+    *,
+    extra_hashes: Optional[Iterable[str]] = None,
 ) -> str:
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
@@ -15018,6 +15102,9 @@ def _resolve_inbox_peer(
     discovered — a direct message needs no prior announce).
     ``direction`` picks which inbox records are searched: ``"in"`` for
     received messages (the default), ``None`` for both directions.
+    ``extra_hashes`` adds further hash candidates to the prefix
+    search — ``unsave`` passes the starred peer scopes, so a star
+    survives its peer disappearing from the registry and the inbox.
     """
     target = target.strip()
     if _is_hex32(target):
@@ -15050,6 +15137,12 @@ def _resolve_inbox_peer(
             for entry in inbox.list_messages(limit=None, direction=direction)
             if str(entry.get("destination") or "").casefold().startswith(prefix)
         }
+        if extra_hashes is not None:
+            senders |= {
+                str(candidate).casefold()
+                for candidate in extra_hashes
+                if str(candidate).casefold().startswith(prefix)
+            }
         if len(senders) == 1:
             return senders.pop()
         if len(senders) > 1:
@@ -15281,6 +15374,16 @@ def _resolve_group_reply_target(
     return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
 
 
+class AmbiguousMessageRefError(NodeError):
+    """A message reference matches more than one stored message.
+
+    Distinct from a plain "not found" :class:`NodeError` so callers
+    that fall back to a starred entry on a missing message — ``unsave``
+    — can refuse an ambiguous reference instead of silently picking
+    the one star that happens to match it.
+    """
+
+
 def _resolve_group_pin_target(
     inbox: Inbox, group_ids: Sequence[str], ref: str
 ) -> Dict[str, Any]:
@@ -15312,7 +15415,7 @@ def _resolve_group_pin_target(
     if exact:
         matches = exact
     if len(matches) > 1:
-        raise NodeError(
+        raise AmbiguousMessageRefError(
             f"{len(matches)} messages in this group match {ref!r};"
             " use a longer prefix"
         )
@@ -16869,6 +16972,485 @@ def cmd_pinned_conversations(args: argparse.Namespace) -> int:
     for entry in entries:
         age = _ago(time.time() - float(entry["pinned_at"]))
         print(f"{entry['label']} — pinned {age} ago")
+    return _EXIT_OK
+
+
+def _resolve_dm_saved_target(
+    inbox: Inbox, peer_hash: str, ref: str
+) -> Dict[str, Any]:
+    """Resolve ``tau save`` / ``unsave --peer`` to one stored DM.
+
+    Same rules as :func:`_resolve_group_pin_target` but peer-scoped:
+    a star attaches to a stored record, so a still-queued message has
+    nothing to star and is never a candidate.  An exact id wins over a
+    longer id that merely starts with it; a prefix matching more than
+    one record, or nothing at all, is refused.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("message must not be empty")
+    matches = inbox.find_prefix(ref, peer=peer_hash)
+    exact = [m for m in matches if str(m["id"]) == ref]
+    if not exact:
+        folded = ref.lower()
+        exact = [m for m in matches if str(m["id"]).lower() == folded]
+    if exact:
+        matches = exact
+    if len(matches) > 1:
+        raise AmbiguousMessageRefError(
+            f"{len(matches)} messages from this peer match {ref!r};"
+            " use a longer prefix"
+        )
+    if not matches:
+        raise NodeError(
+            f"no message {ref!r} from this peer to save;"
+            " stars attach to a stored message from this peer's history"
+        )
+    return matches[0]
+
+
+def _saved_entry_for_ref(
+    config: TauConfig, kind: str, scopes: Sequence[str], ref: str
+) -> Any:
+    """The one starred entry of *kind* in *scopes* that *ref* names, or ``None``.
+
+    Used by ``unsave`` when the stored message is gone: a star outlives
+    its message, so the star itself is what gets removed.  An exact id
+    wins over a longer id that merely starts with it; a prefix matching
+    more than one star is refused.
+    """
+    try:
+        saved = load_saved_messages(config.saved_messages_path)
+    except SavedMessagesError as exc:
+        raise NodeError(str(exc)) from exc
+    folded = ref.lower()
+    candidates = [
+        entry
+        for entry in saved.entries
+        if entry.kind == kind
+        and entry.scope in scopes
+        and entry.message_id.lower().startswith(folded)
+    ]
+    exact = [entry for entry in candidates if entry.message_id.lower() == folded]
+    if exact:
+        candidates = exact
+    if len(candidates) > 1:
+        raise NodeError(
+            f"{len(candidates)} starred messages match {ref!r};"
+            " use a longer prefix"
+        )
+    return candidates[0] if candidates else None
+
+
+def _saved_scopes(config: TauConfig, kind: str) -> List[str]:
+    """Starred scopes of *kind*, for resolving a deleted peer.
+
+    A corrupt list yields no scopes here — the starred-entry lookup
+    below raises the corruption error if the flow reaches it — so a
+    bad file cannot turn an ``unsave`` into a misleading
+    "unknown peer".
+    """
+    try:
+        saved = load_saved_messages(config.saved_messages_path)
+    except SavedMessagesError:
+        return []
+    return [entry.scope for entry in saved.entries if entry.kind == kind]
+
+
+def _valid_channel_digest_ref(ref: str) -> bool:
+    """Whether *ref* is a channel digest reference the live resolver accepts.
+
+    A digest prefix must be at least 4 hex characters and no longer
+    than a full digest; anything else is refused by
+    :func:`resolve_message_digest` before any message is looked up, so
+    it must not fall through to the starred-entry search either.
+    """
+    text = ref.strip().lower()
+    return (
+        4 <= len(text) <= HASH_HEX_LENGTH
+        and all(ch in "0123456789abcdef" for ch in text)
+    )
+
+
+def _resolve_saved_message(
+    config: TauConfig, args: argparse.Namespace, *, missing_ok: bool = False
+) -> Tuple[str, str, str, Optional[Dict[str, Any]]]:
+    """Resolve ``tau save`` / ``unsave`` scope + ref to a stored message.
+
+    Returns ``(kind, scope, message_id, record)``: the record is the
+    stored inbox record for a DM or group message, or the stored
+    channel message for a channel.  A star attaches to a stored
+    record, like a group pin, so a still-queued leg has nothing to
+    star.  For a group the scope is the stored record's group id, so a
+    message stored before a rename keeps its star under the id it was
+    stored under.
+
+    With *missing_ok* (``unsave``), a message that is no longer stored
+    resolves to the matching star instead, with a ``None`` record, so
+    the star can still be cleared.
+    """
+    ref = str(getattr(args, "message", "") or "").strip()
+    if not ref:
+        raise NodeError("message must not be empty")
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    if getattr(args, "peer", None) is not None:
+        extra_hashes = _saved_scopes(config, "peer") if missing_ok else None
+        destination = _resolve_inbox_peer(
+            inbox, registry, args.peer, direction=None, extra_hashes=extra_hashes
+        )
+        try:
+            entry = _resolve_dm_saved_target(inbox, destination, ref)
+        except AmbiguousMessageRefError:
+            raise
+        except NodeError:
+            found = (
+                _saved_entry_for_ref(config, "peer", [destination], ref)
+                if missing_ok
+                else None
+            )
+            if found is None:
+                raise
+            return "peer", found.scope, found.message_id, None
+        return "peer", destination, str(entry["id"]), entry
+    if getattr(args, "group", None) is not None:
+        store = GroupStore(config.groups_path)
+        group = store.find(args.group)
+        group_ids = _group_ids_spanning_renames(store, group)
+        try:
+            entry = _resolve_group_pin_target(inbox, group_ids, ref)
+        except AmbiguousMessageRefError:
+            raise
+        except NodeError:
+            found = (
+                _saved_entry_for_ref(config, "group", group_ids, ref)
+                if missing_ok
+                else None
+            )
+            if found is None:
+                raise
+            return "group", found.scope, found.message_id, None
+        scope = str(entry.get("group") or group["id"])
+        return "group", scope, str(entry["id"]), entry
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        raise NodeError(str(exc)) from exc
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    conn = app.connect()
+    try:
+        try:
+            digest = resolve_message_digest(conn, name, ref)
+            record = get_channel_message(conn, digest)
+        except ChannelError as exc:
+            if not missing_ok:
+                raise NodeError(str(exc)) from exc
+            # Only a valid reference for a message that is gone may
+            # fall through to the star: an ambiguous prefix, or a
+            # reference the live resolver refuses (too short, too
+            # long, not hex), stays refused instead of unsaving
+            # whatever star the prefix happens to match.
+            if isinstance(exc, AmbiguousDigestError) or not _valid_channel_digest_ref(
+                ref
+            ):
+                raise NodeError(str(exc)) from exc
+            found = _saved_entry_for_ref(config, "channel", [name], ref)
+            if found is None:
+                raise NodeError(str(exc)) from exc
+            return "channel", name, found.message_id, None
+    finally:
+        conn.close()
+    if record is None:
+        if missing_ok:
+            found = _saved_entry_for_ref(config, "channel", [name], ref)
+            if found is not None:
+                return "channel", name, found.message_id, None
+        raise NodeError(f"no stored message {ref!r} in #{name}")
+    return "channel", name, digest, record
+
+
+def _edit_saved_messages(
+    config: TauConfig,
+    kind: str,
+    scope: str,
+    message_id: str,
+    *,
+    save: bool,
+    sender: Optional[str] = None,
+    direction: Optional[str] = None,
+) -> Tuple[bool, SavedMessages]:
+    """Star or unstar one message, reloading inside the lock.
+
+    Returns ``(changed, new list)``: starring an already-starred
+    message — or unstarring an unstarred one — is a no-op, not an
+    error, mirroring the pinned-conversation commands.  A corrupt
+    list is refused, not overwritten, so a bad file cannot silently
+    drop the owner's other stars.  ``sender``/``direction`` are
+    recorded with a new star so the blocklist still applies once the
+    message itself is gone.
+    """
+    with saved_messages_lock(config.saved_messages_path):
+        try:
+            saved = load_saved_messages(config.saved_messages_path)
+            if save:
+                updated, already = saved.with_saved(
+                    kind, scope, message_id, sender=sender, direction=direction
+                )
+                changed = not already
+            else:
+                updated, changed = saved.without(kind, scope, message_id)
+        except SavedMessagesError as exc:
+            raise NodeError(str(exc)) from exc
+        if changed:
+            save_saved_messages(config.saved_messages_path, updated)
+    return changed, updated
+
+
+def _saved_star_attribution(
+    kind: str, record: Dict[str, Any], config: TauConfig
+) -> Tuple[Optional[str], Optional[str]]:
+    """A star's sender and direction, from the record being starred.
+
+    The sender is the hash the blocklist is checked against: the
+    peer for a DM, the message sender for a group, the author for a
+    channel.  Direction is the record's own ``"in"``/``"out"`` for
+    inbox records; for a channel message it is ``"out"`` when the
+    author is this node, ``"in"`` otherwise.
+    """
+    if kind == "channel":
+        sender = str(record.get("author") or "").strip() or None
+        if sender is None:
+            return None, None
+        own = _own_destination_hash(config)
+        return sender, "out" if own is not None and sender == own else "in"
+    sender = str(record.get("destination") or "").strip() or None
+    direction = record.get("direction")
+    return sender, direction if direction in ("in", "out") else None
+
+
+def _saved_stub_hidden(entry: Any, blocked: Optional[Any]) -> bool:
+    """Whether a star whose message is gone must stay out of view.
+
+    The same block rules as a stored record, from the sender and
+    direction recorded when the star was created: a message this node
+    sent stays visible, a blocked sender stays hidden, and an
+    unreadable blocklist fails closed.  A stub whose sender was
+    never recorded cannot be checked against the list, so it stays
+    hidden too — showing it would expose a blocked sender's star
+    metadata.
+    """
+    if entry.direction == "out":
+        return False
+    if blocked is None:
+        return True
+    if not entry.sender:
+        return True
+    return entry.sender in blocked
+
+
+def _saved_scope_label(
+    registry: PeerRegistry, store: GroupStore, kind: str, scope: str
+) -> str:
+    """One saved message's conversation, as a reader-facing label."""
+    if kind == "peer":
+        peer = registry.get(scope)
+        name = peer.display_name if peer is not None else "unknown"
+        return f"DM with {name} ({short_hash(scope)})"
+    if kind == "group":
+        try:
+            group = store.find(scope)
+            return f"group \"{group['name']}\""
+        except ValueError:
+            return f"group {short_hash(scope)}"
+    return f"#{scope}"
+
+
+def cmd_save_message(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    kind, scope, message_id, record = _resolve_saved_message(config, args)
+    sender, direction = _saved_star_attribution(kind, record, config)
+    changed, _ = _edit_saved_messages(
+        config, kind, scope, message_id, save=True, sender=sender, direction=direction
+    )
+    if _json_mode(args):
+        _emit(
+            {
+                "kind": kind,
+                "scope": scope,
+                "message_id": message_id,
+                "saved": True,
+                "changed": changed,
+            },
+            True,
+        )
+        return _EXIT_OK
+    registry = PeerRegistry(config.peers_path)
+    store = GroupStore(config.groups_path)
+    label = _saved_scope_label(registry, store, kind, scope)
+    if kind == "channel":
+        who = str(record.get("name") or "anonymous")
+        when = _format_message_time(float(record.get("created_at", 0)))
+    else:
+        who = _message_peer_label(registry, record)
+        when = _format_message_time(float(record.get("received_at", 0)))
+    short = _safe_id_prefix(message_id)
+    state = "saved" if changed else "already saved"
+    print(f"{state} [{short}] {who} ({when}) — {label}")
+    if changed:
+        print(
+            "note: stars are local-only; the message stays where it is"
+            " and the star is never sent."
+        )
+    return _EXIT_OK
+
+
+def cmd_unsave_message(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    kind, scope, message_id, record = _resolve_saved_message(
+        config, args, missing_ok=True
+    )
+    changed, _ = _edit_saved_messages(config, kind, scope, message_id, save=False)
+    if _json_mode(args):
+        _emit(
+            {
+                "kind": kind,
+                "scope": scope,
+                "message_id": message_id,
+                "saved": False,
+                "changed": changed,
+            },
+            True,
+        )
+        return _EXIT_OK
+    registry = PeerRegistry(config.peers_path)
+    store = GroupStore(config.groups_path)
+    label = _saved_scope_label(registry, store, kind, scope)
+    short = _safe_id_prefix(message_id)
+    state = "unsaved" if changed else "was not saved"
+    if record is None:
+        print(f"{state} [{short}] (message no longer stored) — {label}")
+        return _EXIT_OK
+    if kind == "channel":
+        who = str(record.get("name") or "anonymous")
+        when = _format_message_time(float(record.get("created_at", 0)))
+    else:
+        who = _message_peer_label(registry, record)
+        when = _format_message_time(float(record.get("received_at", 0)))
+    print(f"{state} [{short}] {who} ({when}) — {label}")
+    return _EXIT_OK
+
+
+def cmd_saved_messages(args: argparse.Namespace) -> int:
+    """List starred messages, newest save first, with their text."""
+    config = _make_config(args)
+    try:
+        saved = load_saved_messages(config.saved_messages_path)
+    except SavedMessagesError as exc:
+        # A listing is display-only: a corrupt list fails open with
+        # a warning, like the pinned-conversation listing, instead
+        # of hiding stars the owner marked.
+        log.warning(
+            "Starred-message list at %s is unusable (%s); showing none",
+            config.saved_messages_path,
+            exc,
+        )
+        saved = SavedMessages()
+    limit = getattr(args, "limit", 30)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    store = GroupStore(config.groups_path)
+    # Same block rules as the history views: a blocked sender's received
+    # message stays hidden, outbound stays visible, and an unreadable
+    # list fails closed (channel messages hidden, received hidden).
+    blocked = load_blocked_set(config.blocklist_path)
+    channel_conn = None
+    channel_app = None
+    try:
+
+        def message_for(entry: Any) -> Optional[Dict[str, Any]]:
+            """The stored message a star names, or ``None`` when it is gone."""
+            nonlocal channel_conn, channel_app
+            if entry.kind == "channel":
+                if channel_app is None:
+                    channel_app = ChannelApp(
+                        config, _tan_identity(config), name=config.name
+                    )
+                    channel_conn = channel_app.connect()
+                assert channel_conn is not None
+                return get_visible_channel_message(channel_conn, entry.message_id)
+            if entry.kind == "peer":
+                matches = inbox.find_prefix(entry.message_id, peer=entry.scope)
+            else:
+                matches = inbox.find_prefix(entry.message_id, group=entry.scope)
+            exact = [
+                m for m in matches if str(m.get("id")) == entry.message_id
+            ]
+            return exact[0] if exact else None
+
+        def hidden(entry: Any, record: Dict[str, Any]) -> bool:
+            """Whether a blocked or unreadable-list record must stay out of view."""
+            if entry.kind == "channel":
+                return blocked is None or str(record.get("author", "")) in blocked
+            if record.get("direction") == "out":
+                return False
+            return blocked is None or record.get("destination") in blocked
+
+        rendered: List[Dict[str, Any]] = []
+        for entry in saved.entries:
+            if limit is not None and len(rendered) >= limit:
+                break
+            record = message_for(entry)
+            if record is None:
+                # A stub has no record to check the sender against:
+                # filter it from the sender/direction recorded with
+                # the star instead, so a blocked sender's star does
+                # not resurface once its message is gone.
+                if _saved_stub_hidden(entry, blocked):
+                    continue
+            elif hidden(entry, record):
+                continue
+            rendered.append(
+                {
+                    "kind": entry.kind,
+                    "scope": entry.scope,
+                    "scope_label": _saved_scope_label(
+                        registry, store, entry.kind, entry.scope
+                    ),
+                    "message_id": entry.message_id,
+                    "saved_at": entry.saved_at,
+                    "message": record,
+                }
+            )
+    finally:
+        if channel_conn is not None:
+            channel_conn.close()
+    if _json_mode(args):
+        _emit({"saved": rendered, "count": len(rendered)}, True)
+        return _EXIT_OK
+    if not rendered:
+        print("No starred messages — star one with `tau save`.")
+        return _EXIT_OK
+    own_hash = _own_destination_hash(config)
+    for item in rendered:
+        entry_label = item["scope_label"]
+        when = _format_message_time(float(item["saved_at"]))
+        print(f"★ saved {when} · {entry_label}")
+        record = item["message"]
+        if record is None:
+            print(f"  (message {item['message_id'][:8]} no longer stored)")
+            continue
+        if item["kind"] == "channel":
+            _print_channel_messages(
+                [record],
+                json_output=False,
+                channel=item["scope"],
+            )
+        else:
+            _print_message_entry(
+                inbox, registry, record, blocked=blocked, own_hash=own_hash
+            )
     return _EXIT_OK
 
 

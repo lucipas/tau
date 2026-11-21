@@ -380,6 +380,10 @@ class ChannelError(ValueError):
     """Base class for channel validation and storage errors."""
 
 
+class AmbiguousDigestError(ChannelError):
+    """A message digest prefix matches more than one stored message."""
+
+
 def clean_channel_name(raw: Any) -> str:
     """Validate a channel name, returning it unchanged or raising."""
     if not isinstance(raw, str):
@@ -979,7 +983,7 @@ def resolve_message_digest(
     if not rows:
         raise ChannelError(f"unknown message: {digest!r}")
     if len(rows) > 1:
-        raise ChannelError(
+        raise AmbiguousDigestError(
             f"ambiguous message digest prefix {digest!r}: "
             f"matches {len(rows)} messages"
         )
@@ -1560,6 +1564,27 @@ def get_message(conn: sqlite3.Connection, digest: str) -> Optional[Dict[str, Any
     """Return a stored message by hash, or ``None``."""
     row = _fetch_message(conn, digest)
     return _row_to_message(row) if row is not None else None
+
+
+def get_visible_message(
+    conn: sqlite3.Connection, digest: str
+) -> Optional[Dict[str, Any]]:
+    """Return a stored message as channel history shows it, or ``None``.
+
+    Applies the same lifecycle as :func:`channel_history_page`: an
+    expired or retracted message is gone (``None``), and a live one
+    carries its latest author-matching edit.
+    """
+    row = conn.execute(
+        f"SELECT {', '.join(_MESSAGE_COLUMNS)} FROM messages WHERE hash = ? "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "AND NOT EXISTS (SELECT 1 FROM retractions r "
+        "WHERE r.hash = messages.hash AND r.author = messages.author)",
+        (digest, time.time()),
+    ).fetchone()
+    if row is None:
+        return None
+    return _apply_edits_to_messages(conn, [_row_to_message(row)])[0]
 
 
 def delete_message(conn: sqlite3.Connection, digest: str) -> bool:
