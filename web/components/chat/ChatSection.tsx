@@ -32,7 +32,7 @@ import {
   voteGroupPoll,
   type SendMessageOptions,
 } from "@/lib/api";
-import type { ChatMessage, MessageDraft } from "@/lib/types";
+import type { ChatMessage, Group, MessageDraft } from "@/lib/types";
 import {
   buildConversations,
   useBeacons,
@@ -137,9 +137,26 @@ export default function ChatSection() {
   const [joinBusy, setJoinBusy] = useState(false);
   const [joinResult, setJoinResult] = useState<string | null>(null);
   const [showNewGroup, setShowNewGroup] = useState(false);
+  // A group just created from this console, kept until a snapshot
+  // includes it, so its thread still opens when a refresh fails.
+  const [createdGroup, setCreatedGroup] = useState<Group | null>(null);
+
+  useEffect(() => {
+    if (createdGroup && tau.groups.some((g) => g.id === createdGroup.id)) {
+      setCreatedGroup(null);
+    }
+  }, [createdGroup, tau.groups]);
+
+  const snapshot = useMemo(
+    () =>
+      createdGroup && !tau.groups.some((g) => g.id === createdGroup.id)
+        ? { ...tau, groups: [...tau.groups, createdGroup] }
+        : tau,
+    [tau, createdGroup],
+  );
 
   const { conversations, archived: archivedConvs, dmRequests, refreshRequests } = useConversations(
-    tau,
+    snapshot,
     { mutedPeers, mutedGroups, archived },
   );
 
@@ -164,7 +181,7 @@ export default function ChatSection() {
   const selected: Conversation | null = useMemo(() => {
     if (selectedPeer) {
       return (
-        buildConversations(tau.messages, tau.peers, tau.groups, tau.unread, {
+        buildConversations(snapshot.messages, snapshot.peers, snapshot.groups, snapshot.unread, {
           mutedPeers,
           mutedGroups,
           archived,
@@ -174,7 +191,7 @@ export default function ChatSection() {
     }
     if (selectedGroup) {
       return (
-        buildConversations(tau.messages, tau.peers, tau.groups, tau.unread, {
+        buildConversations(snapshot.messages, snapshot.peers, snapshot.groups, snapshot.unread, {
           mutedPeers,
           mutedGroups,
           archived,
@@ -183,7 +200,7 @@ export default function ChatSection() {
       );
     }
     return null;
-  }, [selectedPeer, selectedGroup, tau.messages, tau.peers, tau.groups, tau.unread, mutedPeers, mutedGroups, archived]);
+  }, [selectedPeer, selectedGroup, snapshot, mutedPeers, mutedGroups, archived]);
 
   // Opening a thread marks it read (local cursor + snapshot refresh).
   const selectedKey = selected ? `${selected.kind}:${selected.key}` : null;
