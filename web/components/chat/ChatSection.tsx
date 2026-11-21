@@ -224,18 +224,40 @@ export default function ChatSection() {
   // would reappear. Each refresh takes the next generation and only
   // the latest generation may apply its response.
   const remindersGeneration = useRef(0);
+  const reminderRetryTimer = useRef<number | undefined>(undefined);
+  const reminderRetryAttempts = useRef(0);
   const refreshReminders = useCallback(async () => {
     const generation = ++remindersGeneration.current;
+    // A newer refresh supersedes any pending retry.
+    window.clearTimeout(reminderRetryTimer.current);
+    reminderRetryTimer.current = undefined;
     try {
       const next = await getReminders();
       if (generation !== remindersGeneration.current) return;
+      reminderRetryAttempts.current = 0;
       setReminders(next);
     } catch {
       // Reminders are advisory; the chat list works without them.
+      // If the latest request failed, retry a bounded number of times so
+      // an older successful list that was discarded is not lost for good.
+      if (generation === remindersGeneration.current && reminderRetryAttempts.current < 3) {
+        const attempt = ++reminderRetryAttempts.current;
+        reminderRetryTimer.current = window.setTimeout(
+          () => void refreshReminders(),
+          5000 * 2 ** (attempt - 1),
+        );
+      }
     } finally {
       if (generation === remindersGeneration.current) setRemindersLoading(false);
     }
   }, []);
+
+  useEffect(
+    () => () => {
+      window.clearTimeout(reminderRetryTimer.current);
+    },
+    [],
+  );
 
   // Reminders can fire or change outside this tab, so reload them on
   // every snapshot change as well as after local snooze/cancel actions.
