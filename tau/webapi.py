@@ -203,7 +203,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/vote     vote on a Tan poll (signed vote entry on your chain)
     POST /api/tan/poll     ask a Tan poll question (signed poll entry on your chain)
     POST /api/tan/repost   repost a post (signed repost entry on your chain)
-    POST /api/tan/share    share a post with a peer, a group, or a channel (sends it as a message)
+    POST /api/tan/share    share a post with a peer, a group, a broadcast list, or a channel (sends it as a message)
     POST /api/tan/delete   delete one of your own posts
     POST /api/tan/edit     edit one of your own posts
     POST /api/tan/follow   follow an author
@@ -4040,10 +4040,12 @@ class WebBridge:
         *,
         to: Optional[str] = None,
         group: Optional[str] = None,
+        broadcast: Optional[str] = None,
         channel: Optional[str] = None,
         timeout: float = 20.0,
     ) -> Dict[str, Any]:
-        """Share a Tan post with a peer, into a group, or into a channel, from the console.
+        """Share a Tan post with a peer, into a group, with a broadcast
+        list, or into a channel, from the console.
 
         Mirrors :meth:`forward_message`: the shared text is the post
         rendered by :func:`tau.tangents.tan.share_text` — author, text,
@@ -4051,13 +4053,15 @@ class WebBridge:
         inline on any transport with no protocol change.  Delivery
         reuses :meth:`send_message` wholesale for a peer target — or
         :meth:`send_group_message` for a group target, fanning out one
-        leg per member, or :meth:`channel_send` for a channel target.
+        leg per member, or :meth:`send_broadcast` for a broadcast
+        target, one DM per member, or :meth:`channel_send` for a
+        channel target.
         Either way the share is a new message, so it carries no expiry,
         kind, or reply chain from the post, and the new outbound entry
         appears in the feed like any other send.  A repost shares its
         original; a post by a blocked author is refused, matching the
-        CLI.  Exactly one of ``to``, ``group``, and ``channel`` is
-        required.
+        CLI.  Exactly one of ``to``, ``group``, ``broadcast``, and
+        ``channel`` is required.
         """
         if to is not None and (not isinstance(to, str) or not to.strip()):
             raise ValueError("target peer is required")
@@ -4065,13 +4069,24 @@ class WebBridge:
             not isinstance(group, str) or not group.strip()
         ):
             raise ValueError("target group is required")
+        if broadcast is not None and (
+            not isinstance(broadcast, str) or not broadcast.strip()
+        ):
+            raise ValueError("target broadcast list is required")
         if channel is not None and (
             not isinstance(channel, str) or not channel.strip()
         ):
             raise ValueError("target channel is required")
-        if sum(target is not None for target in (to, group, channel)) != 1:
+        if (
+            sum(
+                target is not None
+                for target in (to, group, broadcast, channel)
+            )
+            != 1
+        ):
             raise ValueError(
-                "exactly one of 'to', 'group', and 'channel' is required"
+                "exactly one of 'to', 'group', 'broadcast', and "
+                "'channel' is required"
             )
         app = self._tan_app()
         if app is None:
@@ -4151,6 +4166,18 @@ class WebBridge:
                 "ok": bool(response.get("ok", True)),
                 "messages": messages,
                 "response": response,
+            }
+        if broadcast is not None:
+            result = self.send_broadcast(
+                broadcast.strip(), shared, timeout=timeout
+            )
+            # The aggregate ok mirrors the group-send branch: a failed
+            # leg reports False so the console can name the members
+            # who missed the message instead of closing the picker on
+            # a success flag.
+            return {
+                "ok": result.get("failed", 0) == 0,
+                "response": result,
             }
         message, response = self.send_message(
             to.strip(), shared, timeout=timeout
@@ -17588,6 +17615,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         to = body.get("to")
         group = body.get("group")
+        broadcast = body.get("broadcast")
         channel = body.get("channel")
         if to is not None and (not isinstance(to, str) or not to.strip()):
             self._send_json(
@@ -17605,6 +17633,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
+        if broadcast is not None and (
+            not isinstance(broadcast, str) or not broadcast.strip()
+        ):
+            self._send_json(
+                {
+                    "error": {
+                        "message": "field 'broadcast' must be a broadcast list name"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
         if channel is not None and (
             not isinstance(channel, str) or not channel.strip()
         ):
@@ -17614,11 +17655,17 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
-        if sum(value is not None for value in (to, group, channel)) != 1:
+        if (
+            sum(
+                value is not None
+                for value in (to, group, broadcast, channel)
+            )
+            != 1
+        ):
             self._send_json(
                 {
                     "error": {
-                        "message": "exactly one of 'to', 'group', and 'channel' is required"
+                        "message": "exactly one of 'to', 'group', 'broadcast', and 'channel' is required"
                     }
                 },
                 head_only,
@@ -17632,6 +17679,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 to=to.strip() if isinstance(to, str) else None,
                 timeout=timeout,
                 group=group.strip() if isinstance(group, str) else None,
+                broadcast=(
+                    broadcast.strip() if isinstance(broadcast, str) else None
+                ),
                 channel=channel.strip() if isinstance(channel, str) else None,
             )
         except WebBridgeError as exc:

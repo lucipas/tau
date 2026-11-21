@@ -9968,6 +9968,15 @@ def test_parser_tan_share_arguments():
     assert channel.channel == "general"
     assert channel.target == "abcdef12"
 
+    broadcast = parser.parse_args(
+        ["tan", "share", "--broadcast", "team", "abcdef12"]
+    )
+    assert broadcast.to is None
+    assert broadcast.group is None
+    assert broadcast.channel is None
+    assert broadcast.broadcast == "team"
+    assert broadcast.target == "abcdef12"
+
     with pytest.raises(SystemExit):
         parser.parse_args(["tan", "share", "abcdef12"])
     with pytest.raises(SystemExit):
@@ -9985,6 +9994,34 @@ def test_parser_tan_share_arguments():
                 "share",
                 "--group",
                 "weekend",
+                "--channel",
+                "general",
+                "abcdef12",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["tan", "share", "--to", "bob", "--broadcast", "team", "abcdef12"]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "tan",
+                "share",
+                "--group",
+                "weekend",
+                "--broadcast",
+                "team",
+                "abcdef12",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "tan",
+                "share",
+                "--broadcast",
+                "team",
                 "--channel",
                 "general",
                 "abcdef12",
@@ -10037,6 +10074,42 @@ def test_tan_share_to_group_fans_out_attributed_text(
         f"Shared Tan post by alice:\nworth sharing\n(tan {post['hash']})"
     )
     assert "delivered to alice" in capsys.readouterr().out
+
+
+def test_tan_share_to_broadcast_fans_out_attributed_text(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.broadcasts import BroadcastStore
+
+    _, post, _ = _seed_tan_post(tmp_path)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    store = BroadcastStore(config.broadcasts_path)
+    store.create("team", ["ab" * 16, "cd" * 16])
+    code = _run_share(
+        tmp_path, monkeypatch, ["--broadcast", "team", post["hash"][:12]]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.sent) == 2
+    # The store sorts members, so the legs go out in sorted order.
+    assert [target for target, _, _ in node.sent] == ["ab" * 16, "cd" * 16]
+    for _, text, _ in node.sent:
+        assert text == (
+            f"Shared Tan post by alice:\nworth sharing\n(tan {post['hash']})"
+        )
+    assert "delivered to" in capsys.readouterr().out
+
+
+def test_tan_share_to_broadcast_unknown_list_is_an_error(
+    tmp_path, capsys, monkeypatch
+):
+    _, post, _ = _seed_tan_post(tmp_path)
+    code = _run_share(
+        tmp_path, monkeypatch, ["--broadcast", "nope", post["hash"][:12]]
+    )
+    assert code == 1
+    assert "unknown broadcast list" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
 
 
 def test_tan_share_to_channel_publishes_attributed_text(

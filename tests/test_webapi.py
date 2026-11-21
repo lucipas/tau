@@ -10713,6 +10713,159 @@ def test_tan_share_to_channel_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_share_to_broadcast_via_api(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.broadcasts import BroadcastStore
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.set_blocklist(BlockList(blocked=frozenset()))
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    node.broadcasts.create("team", [PEER_HASH])
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Sharing a post with a broadcast list sends it as an
+        # attributed DM to every member; the author is not in the
+        # registry, so the recorded name is used.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"][:16], "broadcast": "team"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["response"]["name"] == "team"
+        assert payload["response"]["delivered"] == 1
+        assert payload["response"]["failed"] == 0
+        assert node.sent == [
+            (
+                "alice",
+                f"Shared Tan post by other:\nworth sharing\n(tan {foreign['hash']})",
+                None,
+            )
+        ]
+
+        # Exactly one of `to`, `group`, `broadcast`, and `channel` is
+        # required.
+        for bad in (
+            {"to": "alice", "broadcast": "team"},
+            {"group": "crew", "broadcast": "team"},
+            {"broadcast": "team", "channel": "general"},
+            {"broadcast": ""},
+            {"broadcast": "  "},
+            {"broadcast": 123},
+        ):
+            status, _, payload = _json(
+                bridge,
+                "/api/tan/share",
+                method="POST",
+                body={"target": foreign["hash"], **bad},
+            )
+            assert status == 400, bad
+            assert "exactly one of" in payload["error"]["message"] or (
+                "broadcast" in payload["error"]["message"]
+            ), bad
+
+        # Sharing with an unknown list is refused.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"], "broadcast": "nope"},
+        )
+        assert status == 400
+        assert "unknown broadcast list" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_share_to_broadcast_reports_partial_failure_via_api(tmp_path):
+    import time
+
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.broadcasts import BroadcastStore
+    from tau.config import TauConfig
+    from tau.peers import Peer
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    assert cli.main(["init", "--data-dir", str(tmp_path), "--name", "tester"]) == 0
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.set_blocklist(BlockList(blocked=frozenset()))
+    # A second registry peer the fake node cannot resolve: its send
+    # fails, but the first member still gets the message.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex(OTHER_HASH),
+            name="bob",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    node.broadcasts = BroadcastStore(tmp_path / "broadcasts.json")
+    node.broadcasts.create("team", [PEER_HASH, OTHER_HASH])
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/share",
+            method="POST",
+            body={"target": foreign["hash"][:16], "broadcast": "team"},
+        )
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["response"]["delivered"] == 1
+        assert payload["response"]["failed"] == 1
+        assert payload["response"]["results"][0]["status"] == "delivered"
+        assert payload["response"]["results"][1] == {
+            "hash": OTHER_HASH,
+            "name": "bob",
+            "status": "failed",
+            "error": f"unknown peer: {OTHER_HASH}",
+        }
+        assert node.sent == [
+            (
+                "alice",
+                f"Shared Tan post by other:\nworth sharing\n(tan {foreign['hash']})",
+                None,
+            )
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_tan_share_uses_cached_app_ruleset(tmp_path):
     # Regression test for Qodo's Critical on PR #450: the share guard
     # must agree with what the console shows. A rules file changed by
