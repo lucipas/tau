@@ -313,6 +313,7 @@ from .tangents.tan import (
     _muted_tag_list,
     add_to_list,
     ancestry_hidden,
+    annotate_edits,
     annotate_pinned,
     annotate_quote_counts,
     annotate_quotes,
@@ -8375,20 +8376,28 @@ def cmd_tan_thread(args: argparse.Namespace) -> int:
 def cmd_tan_show(args: argparse.Namespace) -> int:
     """Show one Tan post's full details: verification, counts, viewer state.
 
-    Read-only: the Tan store is read from disk, no node is started and
-    nothing is sent.  Visibility mirrors :func:`tan.thread` and
-    :func:`tan.likers`: an unlinked post is refused, a post from a
-    blocked author is refused, and a reply beneath a deleted or blocked
-    ancestor is refused (via :func:`tan.ancestry_hidden`); a muted
-    author or a hidden post still shows, flagged, because the caller
-    named it explicitly — the same way a muted author anchors a thread.
+    Read-only: the Tan store is opened read-only and the identity is
+    loaded without hardening, so invoking show never creates, migrates
+    or chmods a file; no node is started and nothing is sent.
+    Visibility mirrors :func:`tan.thread` and :func:`tan.likers`: an
+    unlinked post is refused, a post from a blocked author is refused,
+    and a reply beneath a deleted, expired or blocked ancestor is
+    refused (via :func:`tan.ancestry_hidden`); a muted author or a
+    hidden post still shows, flagged, because the caller named it
+    explicitly — the same way a muted author anchors a thread.
     """
     config = _make_config(args)
     json_output = _json_mode(args)
     blocked = load_blocked_set(config.blocklist_path)
-    conn = init_db(config.social_db_path)
+    path = Path(config.social_db_path).expanduser()
+    if not path.is_file():
+        raise NodeError(f"no Tan store at {path}; nothing to show yet")
     try:
-        identity = load_identity(config.identity_path)
+        conn = open_db_readonly(path)
+    except (OSError, sqlite3.Error) as exc:
+        raise NodeError(f"could not read Tan store at {path}: {exc}") from exc
+    try:
+        identity = load_identity(config.identity_path, harden=False)
         viewer = destination_hash(identity).hex() if identity is not None else None
         post = resolve_post(conn, args.ref)
         if not post.get("linked"):
@@ -8401,7 +8410,9 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
         if post.get("author") in blocked_set:
             raise TanError(f"post is from a blocked author: {args.ref!r}")
         if ancestry_hidden(conn, post, blocked_set):
-            raise TanError("post is hidden by a deleted or blocked ancestor")
+            raise TanError(
+                "post hangs beneath a deleted, expired, or blocked ancestor"
+            )
         silenced = muted_author_set(conn)
         hidden_hashes = hidden_post_set(conn)
         # The same display context the timeline passes, so a parent
@@ -8426,7 +8437,7 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
             hidden_posts=hidden_hashes,
         )
         annotate_repost_counts(conn, [post], viewer=viewer)
-        annotate_reposts(
+        kept = annotate_reposts(
             conn,
             [post],
             muted_keywords=_muted_keyword_list(conn),
@@ -8434,14 +8445,25 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
             blocked_authors=blocked_set,
             hidden_posts=hidden_hashes,
         )
+        if not kept:
+            # A repost whose original is blocked, muted, keyword-muted
+            # or hidden is dropped by the annotator instead of being
+            # kept with a redacted preview — refuse it rather than
+            # rendering the repost with a misleading "not cached" label.
+            raise TanError(
+                "repost's original is blocked, muted, or hidden: "
+                f"{args.ref!r}"
+            )
         annotate_saved(conn, [post])
         annotate_pinned(conn, [post])
-        # Standing replies only: linked, not deleted — the same
-        # definition the timeline uses for a post's audience.
+        # Standing, unexpired replies only: linked, not deleted, not
+        # past their expiry — the same definition the thread view uses
+        # for a post's visible conversation.
         row = conn.execute(
             "SELECT COUNT(*) FROM posts WHERE kind = 'reply' AND linked = 1 "
-            f"AND target = ? AND {_NOT_DELETED}",
-            (str(post["hash"]),),
+            f"AND target = ? AND {_NOT_DELETED} "
+            "AND (expires_at IS NULL OR expires_at > ?)",
+            (str(post["hash"]), time.time()),
         ).fetchone()
         replies = int(row[0]) if row is not None else 0
         try:
@@ -8449,12 +8471,17 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
             verification = "verified"
         except TanError as exc:
             verification = f"invalid: {exc}"
+        # Verify the original signed post first: the edit replacement
+        # below must not be verified as the signed payload.
+        annotate_edits(conn, [post])
         author = str(post.get("author") or "")
         author_muted = author in silenced
         author_followed = author in {
             record["author"] for record in following(conn)
         }
         hidden = str(post["hash"]) in hidden_hashes
+    except sqlite3.Error as exc:
+        raise NodeError(f"could not read Tan store at {path}: {exc}") from exc
     finally:
         conn.close()
     try:
@@ -8464,6 +8491,17 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
     if not apply_display_rules([post], display_ruleset):
         # Like likers(): a post the owner's display rules hide is not shown.
         raise TanError(f"post is hidden by your Tan display rules: {args.ref!r}")
+    # Previews inherit the same display rules: a referenced post whose
+    # kind the owner does not display is redacted before either output
+    # path runs, so its text cannot leak through a visible reply,
+    # repost or quote.
+    for preview_key in ("reply_to", "repost_of", "quoted"):
+        preview = post.get(preview_key)
+        if isinstance(preview, dict) and not display_ruleset.displays(
+            str(preview.get("kind") or "post")
+        ):
+            preview["text"] = ""
+            preview["hidden"] = True
     post["verification"] = verification
     post["replies"] = replies
     post["author_muted"] = author_muted
@@ -8489,6 +8527,7 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
         f"{short_hash(str(post.get('hash', '')))}"
         f"{' (edited)' if post.get('edited') else ''}"
     )
+    print(f"  hash: {post.get('hash', '')}")
     print(f"  created: {_format_message_time(created_at)} ({age} ago)")
     print(f"  kind: {post.get('kind')}")
     print(f"  chain: {verification}")
@@ -8501,6 +8540,10 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
                 print("  in reply to a deleted post")
             elif parent.get("muted"):
                 print("  in reply to a muted post")
+            elif parent.get("expired"):
+                print("  in reply to an expired post")
+            elif parent.get("hidden"):
+                print("  in reply to a hidden post")
             else:
                 parent_text = str(parent.get("text") or "")
                 if len(parent_text) > 80:
@@ -8516,6 +8559,10 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
         if isinstance(original, dict):
             if original.get("deleted"):
                 print("  reposted a deleted post")
+            elif original.get("expired"):
+                print("  reposted an expired post")
+            elif original.get("hidden"):
+                print("  reposted a hidden post")
             else:
                 print(
                     f"  reposted {original.get('name') or 'anonymous'} "
@@ -8538,6 +8585,12 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
                 print("  quoting a blocked author's post")
             elif quoted.get("deleted"):
                 print("  quoting a deleted post")
+            elif quoted.get("muted"):
+                print("  quoting a muted author's post")
+            elif quoted.get("expired"):
+                print("  quoting an expired post")
+            elif quoted.get("hidden"):
+                print("  quoting a hidden post")
             else:
                 print(f"  quoting {quoted.get('name') or 'anonymous'}:")
                 for line in str(quoted.get("text") or "").splitlines() or [""]:
@@ -8548,13 +8601,19 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
         _print_poll_options(post)
     _print_tan_image(post)
     _print_tan_location(post)
-    likes = int(post.get("likes") or 0)
-    liked = " (you liked this)" if post.get("liked") else ""
-    print(f"  likes: {likes}{liked}")
-    reposts = int(post.get("reposts") or 0)
-    reposted = " (you reposted this)" if post.get("reposted") else ""
-    print(f"  reposts: {reposts}{reposted}")
-    print(f"  quotes: {int(post.get('quotes') or 0)}")
+    # Engagement lines print only when their annotation survived the
+    # display rules: a ruleset hiding a kind strips its count, and a
+    # missing count must not read as zero activity.
+    if "likes" in post:
+        likes = int(post.get("likes") or 0)
+        liked = " (you liked this)" if post.get("liked") else ""
+        print(f"  likes: {likes}{liked}")
+    if "reposts" in post:
+        reposts = int(post.get("reposts") or 0)
+        reposted = " (you reposted this)" if post.get("reposted") else ""
+        print(f"  reposts: {reposts}{reposted}")
+    if "quotes" in post:
+        print(f"  quotes: {int(post.get('quotes') or 0)}")
     print(f"  replies: {replies}")
     expires_at = post.get("expires_at")
     if isinstance(expires_at, (int, float)):
