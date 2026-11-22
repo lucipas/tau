@@ -7526,6 +7526,19 @@ class TauNode:
             sealed_kind = None
         if is_reaction:
             sealed_id = reaction["target"]
+            # A short prefix names the message only to this node; seal
+            # the canonical id so the recipient, who matches reactions
+            # by exact id, lands it under the message it names.
+            try:
+                known_target = self.inbox.resolve(sealed_id)
+            except ValueError:
+                known_target = None
+            if (
+                known_target is not None
+                and known_target.get("kind") != "group"
+                and isinstance(known_target.get("id"), str)
+            ):
+                sealed_id = known_target["id"]
             sealed_kind = "reaction"
             sealed_reaction = {
                 "token": reaction["token"],
@@ -7977,50 +7990,74 @@ class TauNode:
         target_id = message.get("id")
         if not isinstance(target_id, str) or not target_id:
             return False
-        try:
-            resolved = self.inbox.resolve(target_id)
-        except ValueError:
-            resolved = None
-        if resolved is not None and resolved.get("kind") == "group":
-            # A DM reaction leg naming a group message is foreign: a
-            # group reaction needs the signed group context and the
-            # roster check the direct path runs, and the leg carries
-            # neither — so it is refused, never stored.
-            return False
-        record = {
-            "target": target_id,
-            "reaction": token,
-            "from": message.get("from_name", ""),
-            "destination": sender,
-            "sent_at": float(sent_at),
-            "received_at": time.time(),
-            "id": reaction_id,
-        }
-        try:
-            stored = self.inbox.record_reaction(record)
-        except OSError as exc:
-            # The reaction never landed: defer instead of resolving
-            # the leg, so the holder keeps its copy and a later sweep
-            # retries it — resolving here would drop the only copy of
-            # a reaction the recipient never got.
-            raise DeliveryDeferredError(
-                f"could not persist relayed reaction for {target_id}: {exc}"
-            ) from exc
-        if stored is None and token:
-            # Stale: a newer reaction from this reactor already
-            # stands, and the merge dropped this one — the copy is
-            # resolved either way.  (A retraction returns None too,
-            # but it applied; only a non-empty token losing means
-            # stale.  A stale retraction is indistinguishable from an
-            # applied one, so it counts as received — the inbox merge
-            # is authoritative and the console merges the same way,
-            # so nothing visible changes either way.)
-            return False
+        # Reload, resolve, authorize and persist under one mailbox and
+        # inbox transaction: the group check must see the inbox as it
+        # is at the store (another process may have imported the group
+        # message since any cached read), and the held-ownership recheck
+        # must see a drop made by another process before anything lands.
+        with self.mailbox.transaction(), self.inbox.transaction():
+            if held_id is not None and not self.mailbox.is_held(
+                held_id, to=held_to
+            ):
+                # Dropped by the owner after this sweep listed it: defer
+                # before anything is stored or published.
+                raise DeliveryDeferredError(
+                    f"held envelope {held_id} no longer held"
+                )
+            if self.mailbox.is_seen(seen_key):
+                return False
+            try:
+                resolved = self.inbox.resolve(target_id)
+            except ValueError:
+                resolved = None
+            if resolved is not None and resolved.get("kind") == "group":
+                # A DM reaction leg naming a group message is foreign: a
+                # group reaction needs the signed group context and the
+                # roster check the direct path runs, and the leg carries
+                # neither — so it is refused, never stored.
+                return False
+            # Store under the canonical id of the message it names, so
+            # the reaction shows under exact-id lookups even when the
+            # sender used a unique prefix.
+            canonical_target = (
+                resolved["id"]
+                if resolved is not None and isinstance(resolved.get("id"), str)
+                else target_id
+            )
+            record = {
+                "target": canonical_target,
+                "reaction": token,
+                "from": message.get("from_name", ""),
+                "destination": sender,
+                "sent_at": float(sent_at),
+                "received_at": time.time(),
+                "id": reaction_id,
+            }
+            try:
+                stored = self.inbox.record_reaction(record)
+            except OSError as exc:
+                # The reaction never landed: defer instead of resolving
+                # the leg, so the holder keeps its copy and a later sweep
+                # retries it — resolving here would drop the only copy of
+                # a reaction the recipient never got.
+                raise DeliveryDeferredError(
+                    f"could not persist relayed reaction for {target_id}: {exc}"
+                ) from exc
+            if stored is None and token:
+                # Stale: a newer reaction from this reactor already
+                # stands, and the merge dropped this one — the copy is
+                # resolved either way.  (A retraction returns None too,
+                # but it applied; only a non-empty token losing means
+                # stale.  A stale retraction is indistinguishable from an
+                # applied one, so it counts as received — the inbox merge
+                # is authoritative and the console merges the same way,
+                # so nothing visible changes either way.)
+                return False
+            self.mailbox.mark_seen(seen_key)
         # The reaction is recorded; a failed fan-out only means the
         # live console missed this update, exactly as on the direct
         # path — the console reseeds from the inbox.
         self._publish_reaction(record)
-        self.mailbox.mark_seen(seen_key)
         return True
 
     def _apply_relayed_dm_edit(
@@ -8269,7 +8306,9 @@ class TauNode:
             # it is applied, never stored as chat — the target is a
             # message this node sent, so it is not in the seen set
             # the branch below checks.
-            return self._apply_relayed_dm_reaction(message)
+            return self._apply_relayed_dm_reaction(
+                message, held_id=held_id, held_to=held_to
+            )
         if self.mailbox.is_seen(message["id"]) or self._stored_dm_edit_target(
             message
         ):
