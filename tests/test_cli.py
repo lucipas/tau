@@ -11035,6 +11035,533 @@ def test_parser_tan_share_arguments():
         )
 
 
+def test_parser_tan_show_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["tan", "show", "abcdef12"])
+    assert args.func is cli.cmd_tan_show
+    assert args.ref == "abcdef12"
+    assert getattr(args, "json_output", False) is False
+    args = parser.parse_args(["tan", "show", "abcdef12", "--json"])
+    assert args.func is cli.cmd_tan_show
+    assert args.json_output is True
+
+
+def _run_tan_show(tmp_path, *argv):
+    return cli.main(["tan", "show", "--data-dir", str(tmp_path / "node"), *argv])
+
+
+def test_tan_show_text_json_and_errors(tmp_path, capsys):
+    from tau.tangents.tan import (
+        create_reaction,
+        create_reply,
+        follow,
+        init_db,
+        save_post,
+    )
+
+    _, post, peer_hash = _seed_tan_post(tmp_path)
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    bob = load_identity(config.identity_path)
+    carol = RNS.Identity()
+    conn = init_db(config.social_db_path)
+    try:
+        create_reply(conn, carol, post["hash"], "agreed", name="carol", now=1002)
+        create_reaction(conn, carol, post["hash"], liked=True, name="carol", now=1003)
+        create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1004)
+        save_post(conn, post["hash"])
+        follow(conn, peer_hash, name="alice")
+    finally:
+        conn.close()
+
+    assert _run_tan_show(tmp_path, post["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert post["hash"][:8] in out
+    assert post["hash"] in out
+    assert "kind: post" in out
+    assert "chain: verified" in out
+    assert "worth sharing" in out
+    assert "likes: 2 (you liked this)" in out
+    assert "reposts: 0" in out
+    assert "quotes: 0" in out
+    assert "replies: 1" in out
+    assert "saved: yes, pinned: no, hidden: no" in out
+    assert "author: followed yes, muted no" in out
+
+    assert _run_tan_show(tmp_path, post["hash"][:12], "--json") == 0
+    payload = json.loads(capsys.readouterr().out)["post"]
+    assert payload["hash"] == post["hash"]
+    assert payload["author"] == peer_hash
+    assert payload["verification"] == "verified"
+    assert payload["likes"] == 2
+    assert payload["liked"] is True
+    assert payload["reposts"] == 0
+    assert payload["quotes"] == 0
+    assert payload["replies"] == 1
+    assert payload["saved"] is True
+    assert payload["pinned"] is False
+    assert payload["hidden"] is False
+    assert payload["author_followed"] is True
+    assert payload["author_muted"] is False
+
+    code = _run_tan_show(tmp_path, "deadbeef")
+    assert code == 1
+    assert "unknown post" in capsys.readouterr().err
+
+    save_blocklist(
+        config.blocklist_path, BlockList(blocked=frozenset({peer_hash}))
+    )
+    code = _run_tan_show(tmp_path, post["hash"][:12])
+    assert code == 1
+    assert "blocked author" in capsys.readouterr().err
+
+
+def test_tan_show_poll_tally_and_own_pinned_post(tmp_path, capsys):
+    from tau.tangents.tan import (
+        create_post,
+        create_vote,
+        init_db,
+        pin_post,
+    )
+
+    _, poll, _ = _seed_tan_post(tmp_path, text="best colour?", poll=True)
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    bob = load_identity(config.identity_path)
+    bob_hash = destination_hash(bob).hex()
+    carol = RNS.Identity()
+    conn = init_db(config.social_db_path)
+    try:
+        create_vote(conn, carol, poll["hash"], 0, name="carol", now=1002)
+        create_vote(conn, bob, poll["hash"], 1, name="bob", now=1003)
+        own = create_post(conn, bob, "my own thought", name="bob", now=1004)
+        pin_post(conn, own["hash"], owner=bob_hash)
+    finally:
+        conn.close()
+
+    assert _run_tan_show(tmp_path, poll["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "kind: poll" in out
+    assert "1. red — 1 vote" in out
+    assert "2. blue — 1 vote (your vote)" in out
+    assert "2 votes total" in out
+
+    assert _run_tan_show(tmp_path, own["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "kind: post" in out
+    assert "my own thought" in out
+    assert "saved: no, pinned: yes, hidden: no" in out
+
+
+def test_tan_show_muted_author_still_shows_flagged(tmp_path, capsys):
+    from tau.tangents.tan import init_db, mute
+
+    _, post, peer_hash = _seed_tan_post(tmp_path)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    conn = init_db(config.social_db_path)
+    try:
+        mute(conn, peer_hash, name="alice")
+    finally:
+        conn.close()
+
+    assert _run_tan_show(tmp_path, post["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "worth sharing" in out
+    assert "author: followed no, muted yes" in out
+
+
+def test_tan_show_unlinked_is_an_error(tmp_path, capsys):
+    from tau.tangents.tan import create_post, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = load_identity(config.identity_path)
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(
+            conn,
+            identity,
+            "waiting on its parent",
+            name="bob",
+            now=1000,
+            previous="ab" * 32,
+        )
+    finally:
+        conn.close()
+
+    code = _run_tan_show(tmp_path, post["hash"][:12])
+    assert code == 1
+    assert "has not linked yet" in capsys.readouterr().err
+
+
+def test_tan_show_edited_post_shows_new_text(tmp_path, capsys):
+    from tau.tangents.tan import create_edit, create_post, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(conn, alice, "first draft", name="alice", now=1000)
+        create_edit(conn, alice, post["hash"], "second draft", name="alice", now=1001)
+    finally:
+        conn.close()
+
+    assert _run_tan_show(tmp_path, post["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "second draft" in out
+    assert "first draft" not in out
+    assert "(edited)" in out
+    assert "chain: verified" in out
+
+    assert _run_tan_show(tmp_path, post["hash"][:12], "--json") == 0
+    payload = json.loads(capsys.readouterr().out)["post"]
+    assert payload["text"] == "second draft"
+    assert payload["edited"] is True
+
+
+def test_tan_show_reply_beneath_deleted_parent_is_an_error(tmp_path, capsys):
+    from tau.tangents.tan import (
+        create_delete,
+        create_post,
+        create_reply,
+        init_db,
+    )
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    bob_peer = RNS.Identity()
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+        reply = create_reply(conn, bob_peer, post["hash"], "a reply", name="bob", now=1001)
+        create_delete(conn, alice, post["hash"], name="alice", now=1002)
+    finally:
+        conn.close()
+
+    code = _run_tan_show(tmp_path, reply["hash"][:12])
+    assert code == 1
+    assert "deleted, expired, or blocked ancestor" in capsys.readouterr().err
+
+
+def test_tan_show_reply_beneath_expired_parent_is_an_error(tmp_path, capsys):
+    from tau.tangents.tan import create_post, create_reply, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    bob_peer = RNS.Identity()
+    now = time.time()
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(
+            conn, alice, "about to go", name="alice", now=now, expires_at=now + 3600
+        )
+        reply = create_reply(conn, bob_peer, post["hash"], "too late?", name="bob", now=now)
+        conn.execute(
+            "UPDATE posts SET expires_at = ? WHERE hash = ?", (now - 10, post["hash"])
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    code = _run_tan_show(tmp_path, reply["hash"][:12])
+    assert code == 1
+    assert "deleted, expired, or blocked ancestor" in capsys.readouterr().err
+
+
+def test_tan_show_filtered_repost_is_an_error(tmp_path, capsys):
+    from tau.tangents.tan import (
+        create_post,
+        create_repost,
+        hide_post,
+        init_db,
+        mute,
+    )
+
+    def _seed_repost(dirname):
+        data_dir = _init_node(tmp_path, dirname, "bob")
+        config = TauConfig.resolve(data_dir=data_dir, name="bob")
+        alice = RNS.Identity()
+        carol = RNS.Identity()
+        conn = init_db(config.social_db_path)
+        try:
+            post = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+            repost = create_repost(conn, carol, post["hash"], name="carol", now=1001)
+        finally:
+            conn.close()
+        return data_dir, config, post, repost, alice
+
+    def _show(data_dir, ref):
+        return cli.main(["tan", "show", "--data-dir", str(data_dir), ref])
+
+    # Blocked original.
+    data_dir, config, post, repost, alice = _seed_repost("node-blocked")
+    save_blocklist(
+        config.blocklist_path,
+        BlockList(blocked=frozenset({destination_hash(alice).hex()})),
+    )
+    code = _show(data_dir, repost["hash"][:12])
+    assert code == 1
+    assert "repost's original is blocked, muted, or hidden" in capsys.readouterr().err
+
+    # Muted original.
+    data_dir, config, post, repost, alice = _seed_repost("node-muted")
+    conn = init_db(config.social_db_path)
+    try:
+        mute(conn, destination_hash(alice).hex(), name="alice")
+    finally:
+        conn.close()
+    code = _show(data_dir, repost["hash"][:12])
+    assert code == 1
+    assert "repost's original is blocked, muted, or hidden" in capsys.readouterr().err
+
+    # Hidden original.
+    data_dir, config, post, repost, alice = _seed_repost("node-hidden")
+    conn = init_db(config.social_db_path)
+    try:
+        hide_post(conn, post["hash"])
+    finally:
+        conn.close()
+    code = _show(data_dir, repost["hash"][:12])
+    assert code == 1
+    assert "repost's original is blocked, muted, or hidden" in capsys.readouterr().err
+
+
+def test_tan_show_missing_store_is_an_error_and_creates_nothing(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    assert not config.social_db_path.exists()
+    code = _run_tan_show(tmp_path, "ab" * 32)
+    assert code == 1
+    assert "no Tan store" in capsys.readouterr().err
+    assert not config.social_db_path.exists()
+
+
+def test_tan_show_leaves_store_and_identity_untouched(tmp_path, capsys):
+    _, post, _ = _seed_tan_post(tmp_path)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    db_stat = config.social_db_path.stat()
+    id_stat = config.identity_path.stat()
+    assert _run_tan_show(tmp_path, post["hash"][:12]) == 0
+    capsys.readouterr()
+    after_db = config.social_db_path.stat()
+    after_id = config.identity_path.stat()
+    assert (after_db.st_mtime_ns, after_db.st_mode) == (
+        db_stat.st_mtime_ns,
+        db_stat.st_mode,
+    )
+    assert (after_id.st_mtime_ns, after_id.st_mode) == (
+        id_stat.st_mtime_ns,
+        id_stat.st_mode,
+    )
+
+
+def test_tan_show_hidden_post_flagged(tmp_path, capsys):
+    from tau.tangents.tan import hide_post, init_db
+
+    _, post, _ = _seed_tan_post(tmp_path)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    conn = init_db(config.social_db_path)
+    try:
+        hide_post(conn, post["hash"])
+    finally:
+        conn.close()
+
+    assert _run_tan_show(tmp_path, post["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "saved: no, pinned: no, hidden: yes" in out
+
+    assert _run_tan_show(tmp_path, post["hash"][:12], "--json") == 0
+    payload = json.loads(capsys.readouterr().out)["post"]
+    assert payload["hidden"] is True
+
+
+def test_tan_show_preview_states(tmp_path, capsys):
+    from tau.tangents.tan import (
+        create_post,
+        create_quote,
+        create_reply,
+        hide_post,
+        init_db,
+    )
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    carol = RNS.Identity()
+    now = time.time()
+    conn = init_db(config.social_db_path)
+    try:
+        hidden_parent = create_post(
+            conn, alice, "secret words", name="alice", now=now
+        )
+        reply = create_reply(
+            conn, carol, hidden_parent["hash"], "shh", name="carol", now=now
+        )
+        hide_post(conn, hidden_parent["hash"])
+        fading = create_post(
+            conn, alice, "going soon", name="alice", now=now, expires_at=now + 3600
+        )
+        quote = create_quote(conn, carol, fading["hash"], "noted", name="carol", now=now)
+        conn.execute(
+            "UPDATE posts SET expires_at = ? WHERE hash = ?", (now - 10, fading["hash"])
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _run_tan_show(tmp_path, reply["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "in reply to a hidden post" in out
+    assert "secret words" not in out
+
+    assert _run_tan_show(tmp_path, quote["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "quoting an expired post" in out
+    assert "going soon" not in out
+
+
+def test_tan_show_preview_hidden_by_kind(tmp_path, capsys):
+    # A preview whose kind the owner's display rules hide is redacted
+    # before either output path runs: its text must not leak through
+    # a visible reply.
+    from tau.tangents.rules import Ruleset, save_ruleset
+    from tau.tangents.tan import create_post, create_reply, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    carol = RNS.Identity()
+    now = time.time()
+    conn = init_db(config.social_db_path)
+    try:
+        parent = create_post(
+            conn, alice, "secret parent words", name="alice", now=now
+        )
+        reply = create_reply(
+            conn, carol, parent["hash"], "visible reply", name="carol", now=now
+        )
+    finally:
+        conn.close()
+    save_ruleset(config.tan_rules_path, Ruleset(kinds=frozenset({"reply"})))
+
+    assert _run_tan_show(tmp_path, reply["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "in reply to a hidden post" in out
+    assert "secret parent words" not in out
+
+    assert _run_tan_show(tmp_path, reply["hash"][:12], "--json") == 0
+    payload = json.loads(capsys.readouterr().out)["post"]
+    assert payload["reply_to"]["text"] == ""
+    assert payload["reply_to"]["hidden"] is True
+
+
+def test_tan_show_quote_of_hidden_kind_reply(tmp_path, capsys):
+    # A quote of a reply is redacted when the display rules hide
+    # replies: the preview carries its real kind (not a "post"
+    # default), and its text must not leak in either output mode.
+    from tau.tangents.rules import Ruleset, save_ruleset
+    from tau.tangents.tan import (
+        create_post,
+        create_quote,
+        create_reply,
+        init_db,
+    )
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    carol = RNS.Identity()
+    now = time.time()
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(
+            conn, alice, "original thought", name="alice", now=now
+        )
+        reply = create_reply(
+            conn, bob, post["hash"], "secret reply words", name="bob", now=now
+        )
+        quote = create_quote(
+            conn, carol, reply["hash"], "quoting the reply", name="carol", now=now
+        )
+    finally:
+        conn.close()
+    save_ruleset(
+        config.tan_rules_path, Ruleset(kinds=frozenset({"post", "quote"}))
+    )
+
+    assert _run_tan_show(tmp_path, quote["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "quoting a hidden post" in out
+    assert "secret reply words" not in out
+
+    assert _run_tan_show(tmp_path, quote["hash"][:12], "--json") == 0
+    payload = json.loads(capsys.readouterr().out)["post"]
+    assert payload["quoted"]["kind"] == "reply"
+    assert payload["quoted"]["text"] == ""
+    assert payload["quoted"]["hidden"] is True
+
+
+def test_tan_show_expired_replies_excluded_from_count(tmp_path, capsys):
+    from tau.tangents.tan import create_post, create_reply, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    carol = RNS.Identity()
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(conn, alice, "count me", name="alice", now=1000)
+        create_reply(conn, carol, post["hash"], "live one", name="carol", now=1001)
+        create_reply(
+            conn,
+            carol,
+            post["hash"],
+            "fading one",
+            name="carol",
+            now=1001,
+            expires_at=1002,
+        )
+    finally:
+        conn.close()
+
+    assert _run_tan_show(tmp_path, post["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "replies: 1" in out
+
+
+def test_tan_show_hidden_engagement_stripped_by_rules(tmp_path, capsys):
+    from tau.tangents.rules import Ruleset, save_ruleset
+    from tau.tangents.tan import create_reaction, init_db
+
+    _, post, _ = _seed_tan_post(tmp_path)
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="bob")
+    bob = load_identity(config.identity_path)
+    conn = init_db(config.social_db_path)
+    try:
+        create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1004)
+    finally:
+        conn.close()
+    save_ruleset(config.tan_rules_path, Ruleset(kinds=frozenset({"post"})))
+
+    assert _run_tan_show(tmp_path, post["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "likes:" not in out
+    assert "reposts:" not in out
+    assert "quotes:" not in out
+    assert "replies: 0" in out
+
+    assert _run_tan_show(tmp_path, post["hash"][:12], "--json") == 0
+    payload = json.loads(capsys.readouterr().out)["post"]
+    assert "likes" not in payload
+    assert "reposts" not in payload
+    assert "quotes" not in payload
+
+
 def test_tan_share_sends_attributed_text(tmp_path, capsys, monkeypatch):
     _, post, _ = _seed_tan_post(tmp_path)
     code = _run_share(tmp_path, monkeypatch, ["--to", "bob", post["hash"][:12]])

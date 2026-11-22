@@ -2882,17 +2882,28 @@ def ancestry_hidden(
     """Whether a reply hangs beneath a deleted or blocked ancestor.
 
     Walks the same ancestor chain as :func:`thread`, :func:`likers`,
-    :func:`reposters` and :func:`quoters`, without raising.
+    :func:`reposters` and :func:`quoters`, without raising.  A parent
+    whose row is gone still hides the subtree when a linked delete
+    entry proves it was purged, and an expired ancestor hides it the
+    same way — the thread climb refuses both, so this check must too.
     """
     current = post
     seen_ancestors = {current["hash"]}
     while current.get("kind") == KIND_REPLY and current.get("target"):
         parent = get_post(conn, str(current["target"]))
-        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+        if parent is None:
+            if _delete_entry_exists(conn, str(current["target"])):
+                # The parent was purged when its author deleted it; the
+                # tombstone still hides the subtree.
+                return True
+            break
+        if parent.get("kind") not in TIMELINE_KINDS:
             break
         if parent["hash"] in seen_ancestors:
             break
         if _is_deleted(conn, parent) or parent["author"] in excluded:
+            return True
+        if is_expired(parent):
             return True
         seen_ancestors.add(parent["hash"])
         current = parent
@@ -3493,6 +3504,7 @@ def annotate_replies(
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
+            "kind": parent["kind"],
             "text": (
                 ""
                 if is_deleted or is_muted or is_expired_parent or is_hidden
@@ -3665,6 +3677,7 @@ def annotate_quotes(
                 "hash": parent["hash"],
                 "author": "",
                 "name": "",
+                "kind": parent["kind"],
                 "text": "",
                 "deleted": is_deleted,
                 "blocked": True,
@@ -3682,6 +3695,7 @@ def annotate_quotes(
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
+            "kind": parent["kind"],
             "text": (
                 ""
                 if is_deleted or is_muted or is_expired_parent or is_hidden
@@ -3812,6 +3826,7 @@ def annotate_reposts(
             "hash": original["hash"],
             "author": original["author"],
             "name": original["name"],
+            "kind": original["kind"],
             "text": "" if is_deleted or is_expired_original else original["text"],
             "deleted": is_deleted,
         }
