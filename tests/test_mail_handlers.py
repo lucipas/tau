@@ -2206,6 +2206,89 @@ def test_queued_dm_reaction_rides_sealed_relay(tmp_path):
     assert author_node.inbox.reactions_for("m-1")[0]["reaction"] == "👍"
 
 
+def test_relayed_dm_reaction_survives_seen_marker_failure(tmp_path, monkeypatch):
+    """A failed seen-marker write does not abort a relayed reaction.
+
+    The reaction is already durable in the inbox when its seen marker
+    is written, so an OSError from mark_seen must be logged and the
+    delivery completed (and published) — not escape the held-mail
+    sweep and leave the envelope held.
+    """
+    (tmp_path / "reactor").mkdir()
+    (tmp_path / "author").mkdir()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+
+    reacted = []
+    author_node = make_node(tmp_path / "author")
+    author_node.identity = author
+    author_node.destination = SimpleNamespace(
+        hexhash=author_hash, hash=destination_hash(author),
+    )
+    author_node.on_reaction = reacted.append
+    reactor_node = make_node(tmp_path / "reactor")
+    reactor_node.identity = reactor
+    reactor_node.destination = SimpleNamespace(
+        hexhash=reactor_hash, hash=destination_hash(reactor),
+    )
+    reactor_node.reticulum = object()  # started enough to queue
+    holder = reactor_node.registry.upsert(
+        bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder"
+    )
+    reactor_node.registry.upsert(
+        destination_hash(author), author.get_public_key(), name="alice"
+    )
+
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=reactor.get_public_key(),
+        message_id="m-1",
+        text="hello",
+        sent_at=100.0,
+    )
+    assert reactor_node._deliver_collected(open_message(reactor, blob)) is True
+
+    author_node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    reactor_node._request = unreachable
+    response = reactor_node.send_reaction(author_hash, "m-1", "👍")
+    assert response["queued"] is True
+    entry = reactor_node.mailbox.outbox_list()[0]
+
+    calls, fake_request = _recorded_request()
+    reactor_node._request = fake_request
+    assert reactor_node._deposit_entry(holder, entry, timeout=5) is True
+    stored = parse_mail_store(calls[0][2])
+    leg = open_message(author, stored["blob"])
+
+    def failing_mark_seen(message_id, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(author_node.mailbox, "mark_seen", failing_mark_seen)
+    assert author_node._deliver_collected(leg) is True
+    stored_reactions = author_node.inbox.reactions_for("m-1")
+    assert len(stored_reactions) == 1
+    assert stored_reactions[0]["reaction"] == "👍"
+    assert len(reacted) == 1
+    assert reacted[0]["reaction"] == "👍"
+
+
 def test_queued_dm_reaction_clear_rides_sealed_relay(tmp_path):
     """A queued DM reaction clear deposits as a reaction leg too.
 
