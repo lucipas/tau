@@ -3890,6 +3890,668 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "alice" in out
 
 
+def _seed_search_data(tmp_path, capsys):
+    """A node with DM history, a sent DM, a group post and a channel.
+
+    Timestamps order the hits: the channel message is stamped with the
+    real clock (newest), then the group post (24), the sent DM (23)
+    and the received DM (22).
+    """
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "the bridge is up",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-3",
+        }
+    )
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": sender_hash.hex(),
+            "text": "my bridge note",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "s-1",
+            "direction": "out",
+        }
+    )
+    group = _seed_group_with_carol(data_dir, own_hash)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "cd" * 16,
+            "text": "bridge crew meetup",
+            "sent_at": 14.0,
+            "received_at": 24.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+        }
+    )
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    assert (
+        cli.main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "bridge repairs tonight",
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli.main(
+            [
+                "channel",
+                "send",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "general",
+                "unrelated",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()  # drain the join/send output before the search
+    return data_dir, sender_hash
+
+
+def test_search_merges_sources_newest_first(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(["search", "--data-dir", str(data_dir), "bridge"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "unrelated" not in out
+    assert "first hello" not in out
+    assert "Channel #general" in out
+    assert "Group weekend" in out
+    assert "DM with alice" in out
+    assert out.index("bridge repairs tonight") < out.index("bridge crew meetup")
+    assert out.index("bridge crew meetup") < out.index("my bridge note")
+    assert out.index("my bridge note") < out.index("the bridge is up")
+
+
+def test_search_json_marks_source_per_hit(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--json", "--data-dir", str(data_dir), "bridge"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["query"] == "bridge"
+    assert payload["count"] == 4
+    sources = [item["source"] for item in payload["messages"]]
+    assert sources == ["channel", "group", "dm", "dm"]
+    channel_hit = payload["messages"][0]
+    assert channel_hit["channel"] == "general"
+
+
+def test_search_limit_caps_merged_list(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--json", "--data-dir", str(data_dir), "--limit", "2", "bridge"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert [item["text"] for item in payload["messages"]] == [
+        "bridge repairs tonight",
+        "bridge crew meetup",
+    ]
+
+
+def test_search_peer_scope_only_dm(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--data-dir", str(data_dir), "--peer", "alice", "bridge"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    # Both directions of the DM thread match; channel and group do not.
+    assert "the bridge is up" in out
+    assert "my bridge note" in out
+    assert "bridge repairs tonight" not in out
+    assert "bridge crew meetup" not in out
+
+
+def test_search_group_scope_only_group(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--data-dir", str(data_dir), "--group", "weekend", "bridge"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "bridge crew meetup" in out
+    assert "the bridge is up" not in out
+    assert "bridge repairs tonight" not in out
+
+
+def test_search_channel_scope_only_channel(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(
+        ["search", "--data-dir", str(data_dir), "--channel", "general", "bridge"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "bridge repairs tonight" in out
+    assert "the bridge is up" not in out
+    assert "bridge crew meetup" not in out
+
+    code = cli.main(
+        ["search", "--data-dir", str(data_dir), "--channel", "nope", "bridge"]
+    )
+    assert code == 0
+    assert "No messages in #nope matching 'bridge'." in capsys.readouterr().out
+
+
+def test_search_blocked_sender_hides_received_keeps_outbound(tmp_path, capsys):
+    data_dir, sender_hash = _seed_search_data(tmp_path, capsys)
+
+    def _search_text():
+        code = cli.main(["search", "--data-dir", str(data_dir), "bridge"])
+        assert code == 0
+        return capsys.readouterr().out
+
+    # Blocking the sender hides the received DM, not the sent one.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": [sender_hash.hex()]}), encoding="utf-8"
+    )
+    out = _search_text()
+    assert "the bridge is up" not in out
+    assert "my bridge note" in out
+    assert "bridge repairs tonight" in out
+
+    # An unreadable list hides received hits (fail closed) but keeps
+    # sent ones, the same rule `tau pinned` applies — and this node's
+    # own channel posts are sent ones, so they stay visible too.
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    out = _search_text()
+    assert "the bridge is up" not in out
+    assert "my bridge note" in out
+    assert "bridge repairs tonight" in out
+
+
+def test_search_padded_query_matches_every_source(tmp_path, capsys):
+    # The query is trimmed once: a padded search matches the same
+    # text in DMs, groups and channels alike.
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(["search", "--data-dir", str(data_dir), " bridge "])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "the bridge is up" in out
+    assert "my bridge note" in out
+    assert "bridge crew meetup" in out
+    assert "bridge repairs tonight" in out
+
+
+def test_search_corrupt_blocklist_keeps_own_channel_hides_received(
+    tmp_path, capsys
+):
+    # With an unreadable block-list, received channel mail stays
+    # hidden (fail closed) but this node's own channel posts stay
+    # visible, the same rule the DM branch applies.
+    from tau.channels import create_message, init_db as init_channel_db
+
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "bridge from a peer",
+            name="alice",
+            now=1000,
+        )
+    finally:
+        conn.close()
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    code = cli.main(["search", "--data-dir", str(data_dir), "bridge"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "bridge repairs tonight" in out
+    assert "bridge from a peer" not in out
+    assert "the bridge is up" not in out
+    assert "my bridge note" in out
+
+
+def test_search_hides_non_member_group_reaction(tmp_path, capsys):
+    # A stored reaction from a non-member never prints on a group
+    # message in search either — the same roster filter `tau
+    # messages` applies.  Seeding mirrors
+    # test_messages_hides_non_member_group_reaction.
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    member = RNS.Identity()
+    member_hash = destination_hash(member)
+    outsider = RNS.Identity()
+    outsider_hash = destination_hash(outsider)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.upsert(member_hash, member.get_public_key(), name="carol", now=100.0)
+    registry.upsert(
+        outsider_hash, outsider.get_public_key(), name="mallory", now=100.0
+    )
+    registry.save()
+    groups = GroupStore(config.groups_path)
+    members = [sender_hash.hex(), member_hash.hex()]
+    group_id = derive_group_id(sender_hash.hex(), "crew", members)
+    assert groups.record(
+        group_id,
+        "crew",
+        members,
+        creator=sender_hash.hex(),
+        sender=sender_hash.hex(),
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew hello",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-g1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": outsider_hash.hex(),
+            "from": "mallory",
+            "reaction": "👎",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": member_hash.hex(),
+            "from": "carol",
+            "reaction": "👍",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-2",
+        }
+    )
+    code = cli.main(["search", "--data-dir", str(data_dir), "crew hello"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "crew hello" in out
+    assert "👍 carol" in out
+    assert "👎" not in out
+    assert "mallory" not in out
+
+
+def test_search_channel_poll_excludes_expired_votes(tmp_path, capsys):
+    # A vote history hides (expired here) must never count toward a
+    # poll's tally in search.
+    from tau.channels import create_message, init_db as init_channel_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        poll = create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "which day saturday?",
+            name="alice",
+            now=1000,
+            poll_options=["Saturday", "Sunday"],
+        )
+        target = {"author": poll["author"], "sent_at": poll["created_at"]}
+        create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "voted: Saturday",
+            name="bob",
+            now=1001,
+            poll_vote={"target": target, "option": 0},
+        )
+        create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "voted: Saturday",
+            name="carol",
+            now=1000,
+            expires_at=1001,
+            poll_vote={"target": target, "option": 0},
+        )
+    finally:
+        conn.close()
+    capsys.readouterr()
+    code = cli.main(
+        [
+            "search",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--json",
+            "saturday",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    poll_out = payload["messages"][0]["poll"]
+    assert poll_out["counts"] == [1, 0]
+    assert poll_out["total"] == 1
+
+
+def test_search_channel_poll_tally_hides_received_votes_when_blocklist_unreadable(
+    tmp_path, capsys
+):
+    # An unreadable block list keeps this node's own poll in search,
+    # but its tally must count only this node's votes: a received
+    # vote never affects the counts or leaks voter metadata.
+    from tau.channels import create_message, init_db as init_channel_db
+
+    data_dir, poll = _seed_channel_poll_conversation(tmp_path)
+    capsys.readouterr()
+    prefix = poll["hash"][:8]
+    code = cli.main(
+        [
+            "channel",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+            "Saturday",
+        ]
+    )
+    assert code == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    own_hash = destination_hash(load_identity(config.identity_path)).hex()
+    target = {"author": poll["author"], "sent_at": poll["created_at"]}
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "voted: Sunday",
+            name="mallory",
+            now=time.time(),
+            poll_vote={"target": target, "option": 1},
+        )
+    finally:
+        conn.close()
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+    code = cli.main(
+        [
+            "search",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--json",
+            "day",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    poll_out = payload["messages"][0]["poll"]
+    assert poll_out["counts"] == [1, 0]
+    assert poll_out["total"] == 1
+    assert poll_out["my_vote"] == 0
+    assert [voter["author"] for voter in poll_out["voters"]] == [own_hash]
+
+
+def test_search_unreadable_blocklist_keeps_older_own_post_behind_newer_peer_matches(
+    tmp_path, capsys
+):
+    # With an unreadable block list, newer peer matches must not fill
+    # the channel limit and hide an older matching own post: the
+    # search restricts to this node's posts before the limit applies.
+    from tau.channels import create_message, init_db as init_channel_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    own = load_identity(config.identity_path)
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        create_message(
+            conn, own, "general", "bridge note from me", name="bob", now=1000
+        )
+        for n in range(3):
+            create_message(
+                conn,
+                RNS.Identity(),
+                "general",
+                f"bridge note {n}",
+                name="peer",
+                now=1001 + n,
+            )
+    finally:
+        conn.close()
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+    code = cli.main(
+        [
+            "search",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--limit",
+            "2",
+            "bridge",
+        ]
+    )
+    assert code == 0
+    assert "bridge note from me" in capsys.readouterr().out
+
+
+def test_search_channel_reply_hides_retracted_parent(tmp_path, capsys):
+    # A reply whose parent history hides (retracted here) carries no
+    # quote: the parent's text never resurfaces in search output.
+    # The retraction row is planted beside the held message row, the
+    # state a sync can deliver — `create_retraction` itself deletes
+    # the row, so it cannot produce this state.
+    import time
+
+    from tau.channels import (
+        create_message,
+        hash_retraction,
+        init_db as init_channel_db,
+    )
+    from tau.protocol import APP_NAME, ASPECT
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        parent = create_message(
+            conn,
+            alice,
+            "general",
+            "meet at the park",
+            name="alice",
+            now=1000,
+        )
+        create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "saturday reply",
+            name="bob",
+            now=1002,
+            reply_to=parent["hash"],
+        )
+        body = {
+            "v": 1,
+            "kind": "channel-retract",
+            "channel": "general",
+            "hash": parent["hash"],
+            "author": RNS.Destination.hash(alice, APP_NAME, ASPECT).hex(),
+            "key": alice.get_public_key().hex(),
+            "created_at": 1003.0,
+        }
+        notice = dict(body)
+        notice["sig"] = alice.sign(bytes.fromhex(hash_retraction(body))).hex()
+        conn.execute(
+            "INSERT INTO retractions(hash, channel, author, key, created_at,"
+            " received_at, sig) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (
+                notice["hash"],
+                notice["channel"],
+                notice["author"],
+                notice["key"],
+                notice["created_at"],
+                time.time(),
+                notice["sig"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    capsys.readouterr()
+    code = cli.main(
+        [
+            "search",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--json",
+            "saturday",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert "reply_parent" not in payload["messages"][0]
+
+
+def test_search_corrupt_blocklist_quotes_only_own_parents(tmp_path, capsys):
+    # With an unreadable block-list, a reply's quote must come from
+    # this node: a received parent cannot be vetted, so the reply
+    # prints without its quote — the same fail-closed rule the hits
+    # themselves follow.
+    from tau.channels import create_message, init_db as init_channel_db
+    from tau.identity import load_identity
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        parent = create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "meet at the park",
+            name="alice",
+            now=1000,
+        )
+        create_message(
+            conn,
+            load_identity(config.identity_path),
+            "general",
+            "saturday reply",
+            name="bob",
+            now=1002,
+            reply_to=parent["hash"],
+        )
+    finally:
+        conn.close()
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+    code = cli.main(
+        [
+            "search",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--json",
+            "saturday",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert "reply_parent" not in payload["messages"][0]
+
+
+def test_search_empty_query_and_no_match(tmp_path, capsys):
+    data_dir, _ = _seed_search_data(tmp_path, capsys)
+    code = cli.main(["search", "--data-dir", str(data_dir), "   "])
+    assert code == 2
+    assert "must not be empty" in capsys.readouterr().err
+
+    code = cli.main(["search", "--data-dir", str(data_dir), "nope"])
+    assert code == 0
+    assert "No messages matching 'nope'." in capsys.readouterr().out
+
+
+def test_parser_search_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["search", "hello"])
+    assert args.query == "hello"
+    assert args.limit == 20
+    assert args.peer is None
+    assert args.group is None
+    assert args.channel is None
+    assert args.func == cli.cmd_search
+
+    args = parser.parse_args(["search", "--peer", "alice", "--limit", "5", "hello"])
+    assert args.peer == "alice"
+    assert args.limit == 5
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["search", "--peer", "alice", "--group", "x", "hello"])
+
+
 def test_quote_line_prefers_logical_reference_over_foreign_leg_id(tmp_path):
     """A group reply that carries the logical reference resolves
     against this node's own copy even when the reply names another

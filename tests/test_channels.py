@@ -422,12 +422,149 @@ def test_search_respects_limit_and_excluded_authors(identities, tmp_path):
     ] == ["mesh three", "mesh one"]
 
 
+def test_search_restricts_to_only_authors_before_limit(identities, tmp_path):
+    # Restricting to one author applies before the limit, so newer
+    # matches from other authors can never crowd an older matching
+    # post from the kept author out of the results.
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "mesh one", name="alice", now=1000)
+    create_message(conn, bob, "general", "mesh two", name="bob", now=1001)
+    create_message(conn, bob, "general", "mesh three", name="bob", now=1002)
+
+    assert [
+        item["text"]
+        for item in search_channel_messages(
+            conn, "general", "mesh", limit=2, only_authors=[author_of(alice)]
+        )
+    ] == ["mesh one"]
+    assert (
+        search_channel_messages(conn, "general", "mesh", only_authors=[]) == []
+    )
+
+
+def test_search_returns_more_than_history_page(identities, tmp_path):
+    # A search limit above the history page size is honoured up to
+    # the store bound — the page size must never silently truncate a
+    # search.
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    for n in range(55):
+        create_message(
+            conn, alice, "general", f"mesh note {n}", name="alice", now=1000 + n
+        )
+    assert len(search_channel_messages(conn, "general", "mesh", limit=100)) == 55
+
+
+def test_search_excludes_poll_votes_before_limit(identities, tmp_path):
+    # Poll votes and closes are not chat: they are dropped before the
+    # limit, so a run of newer votes can never crowd the matching
+    # chat message out of the results.
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    poll = create_message(
+        conn,
+        alice,
+        "general",
+        "which day?",
+        name="alice",
+        now=1000,
+        poll_options=["Saturday", "Sunday"],
+    )
+    target = {"author": poll["author"], "sent_at": poll["created_at"]}
+    for n in range(3):
+        create_message(
+            conn,
+            bob,
+            "general",
+            "voted: Saturday",
+            name="bob",
+            now=1002 + n,
+            poll_vote={"target": target, "option": 0},
+        )
+    create_message(
+        conn, alice, "general", "saturday works for me", name="alice", now=1001
+    )
+    assert [
+        item["text"]
+        for item in search_channel_messages(conn, "general", "saturday", limit=2)
+    ] == ["saturday works for me"]
+
+
 def test_search_rejects_empty_query(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "channels.sqlite3")
     create_message(conn, alice, "general", "hello", name="alice", now=1000)
     with pytest.raises(ChannelError, match="must not be empty"):
         search_channel_messages(conn, "general", "   ")
+
+
+def test_search_hides_expired_and_retracted_messages(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "live bridge note", name="alice", now=1000)
+    # Expired long ago (created at 1000, expired at 1001, real now is
+    # far later), so history — and search — must never show it.
+    create_message(
+        conn,
+        alice,
+        "general",
+        "expired bridge note",
+        name="alice",
+        now=1000,
+        expires_at=1001,
+    )
+    # A retraction notice standing against a held copy: hand-sign the
+    # author's notice (the way the forged-notice test builds one) and
+    # plant its row beside the message row, the state a sync can
+    # deliver — `create_retraction` itself deletes the row, so it
+    # cannot produce this state.
+    doomed = create_message(
+        conn, alice, "general", "retracted bridge note", name="alice", now=1002
+    )
+    body = {
+        "v": 1,
+        "kind": "channel-retract",
+        "channel": "general",
+        "hash": doomed["hash"],
+        "author": author_of(alice),
+        "key": alice.get_public_key().hex(),
+        "created_at": 1003.0,
+    }
+    notice = dict(body)
+    notice["sig"] = alice.sign(bytes.fromhex(hash_retraction(body))).hex()
+    conn.execute(
+        "INSERT INTO retractions(hash, channel, author, key, created_at,"
+        " received_at, sig) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        (
+            notice["hash"],
+            notice["channel"],
+            notice["author"],
+            notice["key"],
+            notice["created_at"],
+            time.time(),
+            notice["sig"],
+        ),
+    )
+    conn.commit()
+
+    assert [
+        item["text"] for item in search_channel_messages(conn, "general", "bridge")
+    ] == ["live bridge note"]
+
+
+def test_search_matches_edited_text_not_original(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    message = create_message(
+        conn, alice, "general", "original bridge text", name="alice", now=1000
+    )
+    create_edit(conn, alice, "general", message["hash"], "repaired span text", now=1001)
+
+    assert [
+        item["text"] for item in search_channel_messages(conn, "general", "span")
+    ] == ["repaired span text"]
+    assert search_channel_messages(conn, "general", "bridge") == []
 
 
 # -- replies -----------------------------------------------------------------
