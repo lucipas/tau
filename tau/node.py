@@ -6157,6 +6157,7 @@ class TauNode:
         target_id: str,
         group_id: str,
         target_sent_at: Optional[float],
+        target_author: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
         """Drop this node's own copies of a retracted group send.
 
@@ -6172,6 +6173,50 @@ class TauNode:
         local_errors: List[str] = []
         removed: Optional[Dict[str, Any]] = None
         try:
+            own_hash = self.destination_hexhash
+        except NodeError:  # pragma: no cover - a started node has one
+            own_hash = ""
+        if target_author and own_hash and target_author != own_hash:
+            # A moderator retract: the target is this node's received
+            # copy of another member's message, not a send of its own.
+            # Delete that copy and record no sent-group marker — this
+            # node sent nothing to cancel.
+            moderated: Optional[Dict[str, Any]] = None
+            try:
+                resolved = self.inbox.resolve(target_id)
+            except ValueError:
+                resolved = None
+            if (
+                resolved is not None
+                and resolved.get("direction") == "in"
+                and resolved.get("group") == group_id
+                and resolved.get("destination") == target_author
+            ):
+                moderated = resolved
+            elif isinstance(target_sent_at, (int, float)) and not isinstance(
+                target_sent_at, bool
+            ):
+                moderated = self.inbox.find_group_message(
+                    group_id, target_author, float(target_sent_at)
+                )
+            if moderated is not None:
+                try:
+                    removed = self.inbox.delete_authorized(
+                        str(moderated["id"]),
+                        direction="in",
+                        destination=target_author,
+                    )
+                except InboxError as exc:
+                    if not str(exc).startswith("unknown message"):
+                        log.warning("Could not delete moderated copy: %s", exc)
+                        local_errors.append(f"inbox copy not deleted: {exc}")
+            if removed is not None and self.on_retract is not None:
+                try:
+                    self.on_retract(removed)
+                except Exception:  # pragma: no cover - console callback
+                    log.warning("on_retract callback failed", exc_info=True)
+            return removed, local_errors
+        try:
             record = self.inbox.resolve(target_id)
         except ValueError:
             record = None
@@ -6185,20 +6230,10 @@ class TauNode:
             leg_ids = list(record.get("leg_ids") or [])
         if not leg_ids:
             leg_ids = [target_id]
-        if own_record:
-            # Only this node's own sent record for this group names
-            # the send: resolve() matches the wire id alone, so after
-            # the sent copy is pruned it can return an inbound record
-            # instead — deleting that would drop a received message.
-            try:
-                removed = self.inbox.delete(str(record["id"]))
-            except InboxError as exc:
-                if str(exc).startswith("unknown message"):
-                    removed = None
-                else:
-                    log.warning("Could not delete sent group copy: %s", exc)
-                    local_errors.append(f"inbox copy not deleted: {exc}")
         try:
+            # The inbox record goes last: it is the only persisted
+            # list of this send's leg ids, so a retry that found it
+            # gone could not discard the remaining sent records.
             for leg_id in leg_ids:
                 self.mailbox.discard_sent(str(leg_id))
             if (
@@ -6211,6 +6246,19 @@ class TauNode:
         except Exception as exc:
             log.warning("Could not drop sent group records: %s", exc)
             local_errors.append(f"sent records not dropped: {exc}")
+        if own_record and not local_errors:
+            # Only this node's own sent record for this group names
+            # the send: resolve() matches the wire id alone, so after
+            # the sent copy is pruned it can return an inbound record
+            # instead — deleting that would drop a received message.
+            try:
+                removed = self.inbox.delete(str(record["id"]))
+            except InboxError as exc:
+                if str(exc).startswith("unknown message"):
+                    removed = None
+                else:
+                    log.warning("Could not delete sent group copy: %s", exc)
+                    local_errors.append(f"inbox copy not deleted: {exc}")
         if removed is not None and self.on_retract is not None:
             try:
                 self.on_retract(removed)
@@ -7189,7 +7237,7 @@ class TauNode:
                 )
             return False
         try:
-            self._request(
+            response = self._request(
                 peer, REQUEST_RETRACT, payload_bytes, timeout, deadline=deadline
             )
         except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
@@ -7241,6 +7289,32 @@ class TauNode:
                     entry.id,
                 )
             return False
+        if getattr(entry, "group_id", None) is not None and not (
+            response.get("group_retract")
+        ):
+            # An older member answers ok without understanding the
+            # group context: it kept its copy, so the leg is not
+            # delivered.  Like the live fan-out, that is a final
+            # refusal — drop the leg and keep the sender's copies.
+            log.warning(
+                "Dropping queued retract %s: member runs a version "
+                "without group retract",
+                entry.id,
+            )
+            try:
+                self._remove_queued_version(
+                    entry.id,
+                    text=entry.text,
+                    edited_at=getattr(entry, "edited_at", None),
+                    timeout=_remaining(deadline),
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not drop queued retract %s: mailbox lock busy; "
+                    "leaving it for a later round",
+                    entry.id,
+                )
+            return False
         # Confirmed: the peer deleted their copy (or already had it
         # gone).  A cleanup step that cannot be persisted leaves the
         # leg queued for a later round instead of dropping it: the
@@ -7289,6 +7363,7 @@ class TauNode:
                         target_id,
                         entry.group_id,
                         retract.get("target_sent_at"),
+                        target_author=retract.get("target_author"),
                     )
                 )
                 if local_errors:
@@ -9244,6 +9319,7 @@ class TauNode:
         # recheck must see a drop made by another process before
         # anything lands.
         removed = None
+        cancel_sent_at: Optional[float] = None
         with self.mailbox.transaction(), self.inbox.transaction():
             if held_id is not None and not self.mailbox.is_held(
                 held_id, to=held_to
@@ -9435,6 +9511,12 @@ class TauNode:
                     f"could not persist relayed retraction for "
                     f"{local_id}: {exc}"
                 ) from exc
+            if is_moderated and stored.get("direction") == "out":
+                # The moderated post is this node's own send: its
+                # queued legs would still deliver it to members who
+                # were offline, so they are cancelled after the
+                # transaction, exactly as the direct retract does.
+                cancel_sent_at = float(target_sent_at)
             try:
                 self.mailbox.mark_seen(seen_key)
             except OSError as exc:
@@ -9451,6 +9533,18 @@ class TauNode:
                     seen_key,
                     exc,
                 )
+        if cancel_sent_at is not None:
+            # Cancel this node's still-queued original legs for the
+            # moderated post, and record the sent-group marker, as the
+            # direct retract does: otherwise the sweep could still send
+            # the removed post to members who were offline.
+            for entry in self.mailbox.outbox_list():
+                if (
+                    entry.group_id == group_id
+                    and entry.wire_sent_at == cancel_sent_at
+                ):
+                    self.mailbox.remove_outbox(entry.id)
+            self.mailbox.record_sent_group_retraction(group_id, cancel_sent_at)
         # The retract is recorded; a failed fan-out only means the
         # live console missed this update, exactly as on the direct
         # path — the console reseeds from the inbox.
@@ -12831,13 +12925,20 @@ class TauNode:
                         budget,
                     ),
                 )
-                response = self._request(
-                    peer,
-                    REQUEST_RETRACT,
-                    payload_bytes,
-                    _remaining(deadline) or 0.0,
-                    deadline=deadline,
-                )
+                try:
+                    response = self._request(
+                        peer,
+                        REQUEST_RETRACT,
+                        payload_bytes,
+                        _remaining(deadline) or 0.0,
+                        deadline=deadline,
+                    )
+                except PeerRejectedError as exc:
+                    if getattr(exc, "code", None) == "storage_failed":
+                        # Transient: the peer could not read or persist
+                        # its inbox this time, so the leg may be queued.
+                        raise NodeError(str(exc)) from exc
+                    raise
                 if not response.get("group_retract"):
                     # An older member answers ok without understanding the
                     # group context: it kept its copy, so the leg is not
@@ -12862,17 +12963,22 @@ class TauNode:
                         "rtt": response.get("_rtt"),
                     }
                 )
-            except (NotAllowedError, NotAMemberError) as exc:
-                # The member is online and explicitly refused; a
-                # refused retract is final and is never queued.
+            except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
+                # The member is online and explicitly refused or
+                # rejected the retract; a refusal is final and is
+                # never queued.
+                if isinstance(exc, NotAllowedError):
+                    error = "not_allowed"
+                elif isinstance(exc, NotAMemberError):
+                    error = "not_a_member"
+                else:
+                    error = str(exc)
                 results.append(
                     {
                         "to": member,
                         "to_name": peer.display_name if peer is not None else "",
                         "ok": False,
-                        "error": "not_allowed"
-                        if isinstance(exc, NotAllowedError)
-                        else "not_a_member",
+                        "error": error,
                         "id": retract_id,
                     }
                 )
