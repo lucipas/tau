@@ -930,15 +930,8 @@ class OutboxEntry:
         reaction = clean_queued_reaction(raw.get("reaction"))
         # A corrupt retract drops the payload but keeps kind
         # "retract", so the entry is dropped at delivery instead of
-        # ever sending its display text as chat.  That only holds
-        # while the stored kind itself is intact: when the kind is
-        # also corrupt or missing, the fallback above would turn the
-        # entry into plain chat — so a record that still carries a
-        # retract field keeps kind "retract" regardless, and the
-        # delivery path drops it as unusable.
+        # ever sending its display text as chat.
         retract = clean_queued_retract(raw.get("retract"))
-        if retract is None and isinstance(raw.get("retract"), dict):
-            kind = "retract"
         # A corrupt pin on an already-queued entry must not make the
         # outbox unreadable; the message still delivers, just without it.
         location = clean_location(raw.get("location"))

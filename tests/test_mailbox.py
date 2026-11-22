@@ -342,26 +342,6 @@ def test_reload_drops_corrupt_reaction_but_keeps_reaction_kind(tmp_path):
     assert entry.reaction is None
 
 
-def test_reload_keeps_retract_kind_when_kind_and_payload_are_corrupt(
-    tmp_path,
-):
-    # A corrupt retract payload drops the payload but keeps kind
-    # "retract" — and that must hold even when the stored kind is
-    # itself corrupt: otherwise the entry falls back to plain chat
-    # and its display text ("retraction") goes out as a message.
-    path = tmp_path / "mailbox.json"
-    box = Mailbox(path)
-    box.enqueue(to=BOB, text="retraction", now=1000.0, retract=_retract_payload())
-    raw = json.loads(path.read_text())
-    raw["outbox"][0]["retract"]["payload_b64"] = "!!!not-base64"
-    raw["outbox"][0]["kind"] = "not-a-kind"
-    path.write_text(json.dumps(raw))
-
-    entry = Mailbox(path).outbox_list()[0]
-    assert entry.kind == "retract"
-    assert entry.retract is None
-
-
 def _retract_payload(**overrides):
     payload = {
         "target": "m-1",

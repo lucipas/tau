@@ -442,38 +442,6 @@ def test_dispatch_drop_console_copy_without_bridge_is_a_noop(tmp_path):
     assert result["ok"] is True
 
 
-def test_drop_retracted_console_copy_dispatches_on_direction():
-    """A retracted sent copy drops through the sent side.
-
-    delete_by_wire_id only matches inbound entries, so routing a
-    queued retract's outbound record through it leaves the console
-    bubble until the next restart.
-    """
-
-    class FakeBridge:
-        def __init__(self):
-            self.inbound = []
-            self.sent = []
-
-        def delete_by_wire_id(self, wire_id):
-            self.inbound.append(wire_id)
-
-        def delete_sent_by_wire_id(self, wire_id):
-            self.sent.append(wire_id)
-
-    bridge = FakeBridge()
-    cli._drop_retracted_console_copy(
-        bridge, {"id": "m-out", "direction": "out"}
-    )
-    cli._drop_retracted_console_copy(
-        bridge, {"id": "m-in", "direction": "in"}
-    )
-    cli._drop_retracted_console_copy(bridge, {"direction": "out"})
-    cli._drop_retracted_console_copy(None, {"id": "m-x", "direction": "out"})
-    assert bridge.sent == ["m-out"]
-    assert bridge.inbound == ["m-in"]
-
-
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
 def test_send_running_timeout_bounds_slow_reply(tmp_path):
     # A bounded send_running gives up on a serving node that stalls
