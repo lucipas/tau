@@ -361,6 +361,27 @@ def _is_hex(value: str) -> bool:
     return True
 
 
+def _clean_group_renamed_from(raw: Any) -> Optional[List[str]]:
+    """A stored group lineage: 32-hex ids, lowercased, deduped.
+
+    Returns ``None`` for a missing, empty or wholly corrupt value, so
+    callers fall back to the live group record instead.
+    """
+    if not isinstance(raw, list):
+        return None
+    cleaned: List[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or len(entry) != 32:
+            continue
+        lowered = entry.lower()
+        if lowered in cleaned:
+            continue
+        if not _is_hex(lowered):
+            continue
+        cleaned.append(lowered)
+    return cleaned or None
+
+
 def clean_queued_edit(raw: Any) -> Optional[Dict[str, Any]]:
     """Validate one queued edit, or ``None`` when it is unusable.
 
@@ -597,6 +618,12 @@ class OutboxEntry:
     # it, so the leg stays valid even after the live group record has
     # rotated to a new id.  ``None`` means none was recorded.
     group_roster_attestation: Optional[Dict[str, Any]] = None
+    # The rename lineage bound to this leg's own group id: a retry or
+    # sealed relay copy re-sends it, so the leg still retires the
+    # predecessor even after the live group record has rotated to a
+    # new id (see #703).  ``None`` means the leg predates the field —
+    # the live record is consulted instead.
+    group_renamed_from: Optional[List[str]] = None
     # Sender-set expiry of the message itself, if any.  Distinct from
     # ``expires_at`` (when the queue entry itself expires): a relayed
     # copy is sealed with this deadline so the recipient purges the
@@ -769,6 +796,8 @@ class OutboxEntry:
                 payload["group"]["roster_attestation"] = dict(
                     self.group_roster_attestation
                 )
+            if self.group_renamed_from is not None:
+                payload["group"]["renamed_from"] = list(self.group_renamed_from)
         if self.in_reply_to is not None:
             payload["in_reply_to"] = dict(self.in_reply_to)
         if self.location is not None:
@@ -828,6 +857,7 @@ class OutboxEntry:
         group_creator = ""
         group_members: List[str] = []
         group_roster_attestation: Optional[Dict[str, Any]] = None
+        group_renamed_from: Optional[List[str]] = None
         if isinstance(group_raw, dict):
             candidate_id = group_raw.get("id")
             candidate_creator = group_raw.get("creator")
@@ -857,6 +887,9 @@ class OutboxEntry:
                     raw_attestation = group_raw.get("roster_attestation")
                     if isinstance(raw_attestation, dict):
                         group_roster_attestation = dict(raw_attestation)
+                    group_renamed_from = _clean_group_renamed_from(
+                        group_raw.get("renamed_from")
+                    )
         message_expires_at = raw.get("message_expires_at")
         if isinstance(message_expires_at, bool) or not isinstance(
             message_expires_at, (int, float)
@@ -987,6 +1020,7 @@ class OutboxEntry:
             group_creator=group_creator,
             group_members=group_members,
             group_roster_attestation=group_roster_attestation,
+            group_renamed_from=group_renamed_from,
             message_expires_at=message_expires_at,
             send_after=send_after,
             sent_at=sent_at,
@@ -1914,6 +1948,7 @@ class Mailbox:
         group_creator = ""
         group_members: List[str] = []
         group_roster_attestation: Optional[Dict[str, Any]] = None
+        group_renamed_from: Optional[List[str]] = None
         if group is not None:
             candidate_id = group.get("id")
             candidate_creator = group.get("creator")
@@ -1945,6 +1980,9 @@ class Mailbox:
             raw_attestation = group.get("roster_attestation")
             if isinstance(raw_attestation, dict):
                 group_roster_attestation = dict(raw_attestation)
+            group_renamed_from = _clean_group_renamed_from(
+                group.get("renamed_from")
+            )
         if expires_at is not None:
             if isinstance(expires_at, bool) or not isinstance(
                 expires_at, (int, float)
@@ -2047,6 +2085,7 @@ class Mailbox:
                 group_creator=group_creator,
                 group_members=group_members,
                 group_roster_attestation=group_roster_attestation,
+                group_renamed_from=group_renamed_from,
                 message_expires_at=expires_at,
                 send_after=send_after_value,
                 sent_at=sent_at_value,

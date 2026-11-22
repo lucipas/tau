@@ -3101,6 +3101,8 @@ class TauNode:
         *,
         added: Sequence[str] = (),
         removed: Sequence[str] = (),
+        timeout: float = 5.0,
+        discover_timeout: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Announce a roster change to the group's new roster.
 
@@ -3115,14 +3117,19 @@ class TauNode:
         once (the successor names the predecessor in its lineage,
         see :meth:`tau.groups.GroupStore._apply_roster_change`).
 
-        *added* / *removed* are display names.  The announcement is
-        best-effort: the roster change already happened, so a send
-        failure is logged and an empty result returned instead of
-        failing the command — and members learn the new roster from
-        the next message instead.  The timeout is short on purpose:
+        *added* / *removed* are display names.  Returns the
+        per-member send results (each ``{"delivered": True}``,
+        ``{"queued": True}``, or an ``{"ok": False, "error": ...}``
+        failure), unwrapped from :meth:`send_group_message`'s
+        summary dict.  The announcement is best-effort: the roster
+        change already happened, so a send failure is logged and an
+        empty result returned instead of failing the command — and
+        members learn the new roster from the next message instead.
+        *timeout* is the per-leg budget and is short on purpose:
         an unreachable member gets a queued leg that delivers on
-        retry.  Returns the per-member send results, or ``[]`` when
-        nothing was announced.
+        retry, so a roster command never waits out a full discovery
+        window per offline member.  *discover_timeout* caps the
+        per-leg peer lookup the same way.
         """
         added = [name for name in added if name]
         removed = [name for name in removed if name]
@@ -3137,16 +3144,25 @@ class TauNode:
                 f"{', '.join(removed)} {verb} removed from {group['name']}."
             )
         try:
-            return self.send_group_message(
-                group, " ".join(sentences), timeout=10.0
+            summary = self.send_group_message(
+                group,
+                " ".join(sentences),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
             )
         except Exception:  # pragma: no cover - delivery is best-effort
+            # Log the name, never any slice of the id: a secret
+            # group's id is opaque, and even a prefix of it must not
+            # reach the logs (see #699).
             log.warning(
-                "Could not announce roster change to %s",
-                group["id"][:8],
+                "Could not announce roster change to group %r",
+                group["name"],
                 exc_info=True,
             )
             return []
+        if isinstance(summary, dict):
+            return list(summary.get("results") or [])
+        return list(summary or [])
 
     def list_join_requests(
         self, group_name: Optional[str] = None
@@ -7394,8 +7410,16 @@ class TauNode:
                         "roster_attestation"
                     )
                 ),
+                # The lineage bound to the leg's own id wins, for the
+                # same reason: after a rotation the live record no
+                # longer carries it, and a retry without it cannot
+                # retire the predecessor (see #703).
                 renamed_from=(
-                    (self.groups.get(fresh.group_id) or {}).get("renamed_from")
+                    fresh.group_renamed_from
+                    if fresh.group_renamed_from is not None
+                    else (self.groups.get(fresh.group_id) or {}).get(
+                        "renamed_from"
+                    )
                     or None
                 ),
                 in_reply_to=fresh.in_reply_to,
@@ -8026,10 +8050,14 @@ class TauNode:
                 # The lineage rides in the sealed envelope, so an
                 # offline member that receives this copy through
                 # store-and-forward retires the predecessor exactly
-                # as a direct recipient would; the current record is
-                # read at deposit time, like the direct re-send path.
+                # as a direct recipient would; the lineage bound to
+                # the leg's own id wins, like the attestation above —
+                # after a rotation the live record no longer carries
+                # it (see #703).
                 "renamed_from": (
-                    (self.groups.get(fresh.group_id) or {}).get(
+                    fresh.group_renamed_from
+                    if fresh.group_renamed_from is not None
+                    else (self.groups.get(fresh.group_id) or {}).get(
                         "renamed_from"
                     )
                     or None
@@ -10375,6 +10403,10 @@ class TauNode:
             "members": list(group["members"]),
             # Bound to this id: a queued leg keeps it after a rotation.
             "roster_attestation": group.get("roster_attestation"),
+            # Bound to this id too: a queued leg keeps the lineage
+            # after a rotation, so its retry still retires the
+            # predecessor (see #703).
+            "renamed_from": group.get("renamed_from"),
         }
         # Leg ids that were delivered or queued (never a refused leg:
         # its id reached nobody, so nobody can quote it).

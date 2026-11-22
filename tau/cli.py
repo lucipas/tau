@@ -19787,15 +19787,21 @@ def _print_roster_announcement(
     :meth:`tau.node.TauNode.announce_roster_change`; an empty list
     means nothing was announced (the send failed, or the roster did
     not change), so members still learn the new roster from the next
-    message when *changed*.
+    message when *changed*.  A leg is delivered when it carries
+    ``delivered``, queued when it carries ``queued``, and failed
+    otherwise — a failed leg is reported, never silently dropped
+    from the counts.
     """
     if announcement:
-        delivered = sum(1 for result in announcement if result.get("ok"))
-        queued = sum(1 for result in announcement if result.get("queued"))
-        print(
-            "Roster change announced to the group"
-            f" ({delivered} delivered, {queued} queued)."
+        delivered = sum(
+            1 for result in announcement if result.get("delivered")
         )
+        queued = sum(1 for result in announcement if result.get("queued"))
+        failed = len(announcement) - delivered - queued
+        summary = f" ({delivered} delivered, {queued} queued"
+        if failed:
+            summary += f", {failed} failed"
+        print("Roster change announced to the group" + summary + ").")
     elif changed:
         print("Members learn the new roster from the next message sent to it.")
 
@@ -19882,6 +19888,7 @@ def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
             new_group,
             added=changed_names if adding else (),
             removed=() if adding else changed_names,
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
         )
     finally:
         node.stop()
@@ -19975,7 +19982,9 @@ def cmd_group_ban(args: argparse.Namespace) -> int:
         # and needs no announcement.
         if new_group["id"] != previous_id:
             announcement = node.announce_roster_change(
-                new_group, removed=[peer.display_name]
+                new_group,
+                removed=[peer.display_name],
+                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             )
     finally:
         node.stop()

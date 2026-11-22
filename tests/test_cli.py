@@ -1594,12 +1594,14 @@ class _FakeBanNode:
     def stop(self):
         self.started = False
 
-    def announce_roster_change(self, group, *, added=(), removed=()):
+    def announce_roster_change(
+        self, group, *, added=(), removed=(), timeout=5.0, discover_timeout=None
+    ):
         self.announcements.append(
             {"group": group, "added": list(added), "removed": list(removed)}
         )
         return [
-            {"to": member, "ok": True}
+            {"to": member, "delivered": True}
             for member in group["members"]
             if member != self.destination_hexhash
         ]
@@ -1708,6 +1710,26 @@ def test_group_ban_unban_banned(tmp_path, capsys, monkeypatch):
     # Banning the creator is refused.
     assert cli.main([*base, own_hash]) == 1
     assert "cannot ban the creator" in capsys.readouterr().err
+
+
+def test_print_roster_announcement_counts_delivered_queued_failed(capsys):
+    cli._print_roster_announcement(
+        [
+            {"to": "aa" * 16, "delivered": True},
+            {"to": "bb" * 16, "queued": True},
+            {"to": "cc" * 16, "ok": False, "error": "refused"},
+        ],
+        changed=True,
+    )
+    assert (
+        "Roster change announced to the group"
+        " (1 delivered, 1 queued, 1 failed)."
+        in capsys.readouterr().out
+    )
+    cli._print_roster_announcement([], changed=True)
+    assert "Members learn the new roster" in capsys.readouterr().out
+    cli._print_roster_announcement([], changed=False)
+    assert capsys.readouterr().out == ""
 
 
 def test_group_remove_member_announces_roster_change(tmp_path, capsys, monkeypatch):

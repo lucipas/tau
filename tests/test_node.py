@@ -1631,6 +1631,48 @@ def test_deliver_entry_skips_queued_post_when_group_goes_announcements_only(
     assert skipped.next_attempt_at > time.time()
 
 
+def test_queued_group_leg_keeps_lineage_after_rotation(tmp_path, monkeypatch):
+    from tau.mailbox import OutboxEntry
+    from tau.protocol import derive_group_id, parse_group_message
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    old_id = derive_group_id(
+        alice.hexhash, "old-crew", list(group["members"])
+    )
+    entry = node.mailbox.enqueue(
+        to=bob.destination_hash,
+        text="queued hello",
+        message_id="lineage-leg-1",
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": list(group["members"]),
+            "renamed_from": [old_id],
+        },
+        sent_at=100.0,
+    )
+    # The lineage is bound to the leg at enqueue time and survives a
+    # save/reload of the outbox.
+    assert entry.group_renamed_from == [old_id]
+    assert (
+        OutboxEntry.from_dict(entry.to_dict()).group_renamed_from == [old_id]
+    )
+    # The group rotates away before the retry: the live record is gone.
+    assert node.groups.delete(group["id"]) is True
+    payloads = []
+
+    def _capture(*args, **kwargs):
+        payloads.append(args[2])
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", _capture)
+    snapshot = node.mailbox.get_outbox("lineage-leg-1")
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is True
+    assert len(payloads) == 1
+    assert parse_group_message(payloads[0])["renamed_from"] == [old_id]
+
+
 def test_skip_paces_restricted_leg_once_per_sweep(tmp_path, monkeypatch):
     node, group, alice, bob = _group_reaction_node(tmp_path)
     _group_leg_entry(node, group, bob, text="queued hello", leg_id="bob-leg-1")

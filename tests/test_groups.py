@@ -5966,12 +5966,14 @@ class _FakeGroupNode:
     def stop(self):
         self.started = False
 
-    def announce_roster_change(self, group, *, added=(), removed=()):
+    def announce_roster_change(
+        self, group, *, added=(), removed=(), timeout=5.0, discover_timeout=None
+    ):
         self.announcements.append(
             {"group": group, "added": list(added), "removed": list(removed)}
         )
         return [
-            {"to": member, "ok": True}
+            {"to": member, "delivered": True}
             for member in group["members"]
             if member != self.destination_hexhash
         ]

@@ -1,6 +1,7 @@
 """Group invite links + request-to-join (issue #466)."""
 
 import base64
+import logging
 import time
 import types
 
@@ -536,8 +537,11 @@ def test_announce_roster_change_sends_to_new_roster(tmp_path, monkeypatch):
     sent = []
 
     def _capture(group_arg, text, **kwargs):
-        sent.append((group_arg, text))
-        return [{"to": bob.hexhash, "ok": True}]
+        sent.append((group_arg, text, kwargs))
+        return {
+            "ok": True,
+            "results": [{"to": bob.hexhash, "delivered": True}],
+        }
 
     monkeypatch.setattr(node, "send_group_message", _capture)
     results = node.announce_roster_change(new_group, removed=["carol"])
@@ -545,7 +549,11 @@ def test_announce_roster_change_sends_to_new_roster(tmp_path, monkeypatch):
     assert sent[0][0]["id"] == new_group["id"]
     assert "carol" in sent[0][1]
     assert "removed" in sent[0][1]
-    assert results == [{"to": bob.hexhash, "ok": True}]
+    # The per-leg budget is short on purpose: unreachable members
+    # queue instead of burning a full discovery window each.
+    assert sent[0][2].get("timeout") == 5.0
+    # The summary dict is unwrapped to the per-member results.
+    assert results == [{"to": bob.hexhash, "delivered": True}]
 
 
 def test_announce_roster_change_names_adds_and_removes(tmp_path, monkeypatch):
@@ -564,7 +572,7 @@ def test_announce_roster_change_names_adds_and_removes(tmp_path, monkeypatch):
         node,
         "send_group_message",
         lambda group_arg, text, **kwargs: sent.append((group_arg, text))
-        or [],
+        or {"ok": True, "results": []},
     )
     assert (
         node.announce_roster_change(
@@ -605,6 +613,27 @@ def test_announce_roster_change_failure_is_best_effort(tmp_path, monkeypatch):
         ),
     )
     assert node.announce_roster_change(group, removed=["carol"]) == []
+
+
+def test_announce_roster_change_failure_logs_name_not_secret_id(
+    tmp_path, monkeypatch, caplog
+):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    group = _secret_group(node, identity, own_hash, bob)
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("no route to member")
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger="tau.node"):
+        assert node.announce_roster_change(group, removed=["bob"]) == []
+    # The failure log names the group, never any slice of its opaque id.
+    assert group["id"] not in caplog.text
+    assert group["id"][:8] not in caplog.text
+    assert "crew" in caplog.text
 
 
 def test_approve_join_request_refuses_banned_peer(tmp_path, monkeypatch):
