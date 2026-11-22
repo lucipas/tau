@@ -7994,7 +7994,11 @@ class TauNode:
         nothing.  When the original arrives already expired, the
         stored leg expires with it: it is removed transactionally
         rather than stamped with a past expiry the inbox would keep
-        listing until a later purge.  A failed persist raises
+        listing until a later purge.  Only a stored record that
+        actually carries an edit is ever removed, and only by exact
+        id — a plain original re-delivered with a past expiry, or a
+        sender-chosen prefix of another message's id, removes
+        nothing.  A failed persist raises
         :class:`DeliveryDeferredError` so the envelope is retried
         instead of acknowledged with unrestored metadata.
         """
@@ -8017,28 +8021,21 @@ class TauNode:
             and float(expires_at) <= time.time()
         ):
             # The original expired before it arrived: the stored leg
-            # is the same message, so it expires with it.  Only this
-            # node's own DM from this sender is ever removed.
+            # is the same message, so it expires with it.  The inbox
+            # method removes only an exact-id record that actually
+            # carries an edit and belongs to this sender, all inside
+            # one transaction — a plain original re-delivered with a
+            # past expiry, or a sender-chosen prefix of another
+            # message's id, removes nothing.
             try:
-                record = self.inbox.resolve(message_id)
-            except ValueError:
-                return
-            if (
-                record.get("kind") == "group"
-                or record.get("direction") != "in"
-                or (record.get("destination") or "") != sender
-            ):
-                return
-            try:
-                self.inbox.delete(message_id)
+                self.inbox.remove_expired_relayed_leg(
+                    message_id, direction="in", destination=sender
+                )
             except InboxPersistError as exc:
                 raise DeliveryDeferredError(
                     "could not remove expired relayed message "
                     f"{message_id}: {exc}"
                 ) from exc
-            except ValueError:
-                # Gone already (a concurrent delete or retract).
-                return
             return
         try:
             self.inbox.restore_original_metadata(

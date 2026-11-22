@@ -2184,6 +2184,97 @@ def test_relayed_dm_edit_leg_removed_when_original_expired(
         recipient_node.inbox.resolve("m-1")
 
 
+def test_relayed_dm_expired_duplicate_keeps_plain_original(tmp_path):
+    """An expired duplicate must not delete an ordinary stored DM.
+
+    A sender can re-seal any id they already used with a past expiry;
+    the expired branch removes only a record that actually carries an
+    edit, so a plain stored original survives the re-delivery.
+    """
+    (tmp_path / "recipient").mkdir()
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=recipient_hash, hash=destination_hash(recipient),
+    )
+
+    original = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="hello",
+        sent_at=100.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, original)) is True
+    assert recipient_node.inbox.resolve("m-1")["text"] == "hello"
+
+    expired_copy = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="hello",
+        sent_at=100.0,
+        expires_at=time.time() - 60,
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, expired_copy))
+        is False
+    )
+    assert recipient_node.inbox.resolve("m-1")["text"] == "hello"
+
+
+def test_relayed_dm_expired_short_id_keeps_other_message(tmp_path):
+    """A sender-chosen prefix id must not delete a different DM.
+
+    Wire ids are sender-chosen, so an expired duplicate whose id is a
+    unique prefix of a stored DM's id must match nothing: the removal
+    is exact-id only.
+    """
+    (tmp_path / "recipient").mkdir()
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=recipient_hash, hash=destination_hash(recipient),
+    )
+
+    stored_id = "ab" * 16
+    stored = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id=stored_id,
+        text="keep me",
+        sent_at=100.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, stored)) is True
+    assert recipient_node.inbox.resolve(stored_id)["text"] == "keep me"
+
+    prefix_copy = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="ab" * 8,
+        text="forged",
+        sent_at=100.0,
+        expires_at=time.time() - 60,
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, prefix_copy))
+        is False
+    )
+    assert recipient_node.inbox.resolve(stored_id)["text"] == "keep me"
+
+
 def test_relayed_dm_edit_applies_after_seen_eviction(tmp_path):
     """An edit leg still applies when the seen marker is gone.
 

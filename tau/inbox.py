@@ -1377,6 +1377,63 @@ class Inbox:
                 ) from exc
         return dict(target)
 
+    def remove_expired_relayed_leg(
+        self, message_id: str, *, direction: str, destination: str
+    ) -> Optional[Dict[str, Any]]:
+        """Remove a stored edited leg whose original arrived expired.
+
+        A relayed edit leg that beats its original stores as the
+        message itself; when the original arrives later with its
+        expiry already past, the leg expires with it and is removed
+        rather than stamped with a past expiry the inbox would keep
+        listing.  Only a record that actually carries an edit
+        (``edited_at`` set) is ever removed: a plain stored original
+        re-delivered with a past expiry is the sender reusing an id,
+        and it must survive.  The id matches exactly — a sender-chosen
+        prefix of another message's id matches nothing — and the
+        leg-marker and ownership checks run inside the same
+        transaction as the removal, so the record cannot change
+        between authorization and deletion.
+
+        Returns the removed record, or ``None`` when no stored message
+        has that id, it carries no edit, or it is not the caller's DM.
+        A failed persist raises :class:`InboxPersistError` so the
+        caller can retry the delivery instead of dropping the only
+        copy of the original.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            raise InboxError("message id must not be empty")
+        with self._transaction():
+            target = None
+            for entry in self._messages:
+                if entry.get("id") == message_id:
+                    target = entry
+                    break
+            if target is None:
+                return None
+            if target.get("edited_at") is None:
+                return None
+            if target.get("kind") == "group":
+                return None
+            if target.get("direction") != direction:
+                return None
+            if (target.get("destination") or "") != destination:
+                return None
+            previous = self._messages
+            self._messages = [
+                entry for entry in self._messages if entry is not target
+            ]
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                self._messages = previous
+                raise InboxPersistError(
+                    "could not persist inbox; expired relayed leg was "
+                    f"not removed: {exc}"
+                ) from exc
+        return dict(target)
+
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.
 
