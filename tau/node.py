@@ -7991,7 +7991,10 @@ class TauNode:
         authoritative, so merge it onto the stored record while the
         edited text and ``edited_at`` stand.  A plain stored original
         already has its own metadata, so a duplicate copy changes
-        nothing.  A failed persist raises
+        nothing.  When the original arrives already expired, the
+        stored leg expires with it: it is removed transactionally
+        rather than stamped with a past expiry the inbox would keep
+        listing until a later purge.  A failed persist raises
         :class:`DeliveryDeferredError` so the envelope is retried
         instead of acknowledged with unrestored metadata.
         """
@@ -8007,11 +8010,41 @@ class TauNode:
         sent_at = message.get("sent_at")
         if not isinstance(sent_at, (int, float)) or isinstance(sent_at, bool):
             return
+        expires_at = message.get("expires_at")
+        if (
+            isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and float(expires_at) <= time.time()
+        ):
+            # The original expired before it arrived: the stored leg
+            # is the same message, so it expires with it.  Only this
+            # node's own DM from this sender is ever removed.
+            try:
+                record = self.inbox.resolve(message_id)
+            except ValueError:
+                return
+            if (
+                record.get("kind") == "group"
+                or record.get("direction") != "in"
+                or (record.get("destination") or "") != sender
+            ):
+                return
+            try:
+                self.inbox.delete(message_id)
+            except InboxPersistError as exc:
+                raise DeliveryDeferredError(
+                    "could not remove expired relayed message "
+                    f"{message_id}: {exc}"
+                ) from exc
+            except ValueError:
+                # Gone already (a concurrent delete or retract).
+                return
+            return
         try:
             self.inbox.restore_original_metadata(
                 message_id,
                 sent_at=float(sent_at),
-                expires_at=message.get("expires_at"),
+                expires_at=expires_at,
                 in_reply_to=message.get("in_reply_to"),
                 location=message.get("location"),
                 beacon=message.get("beacon"),

@@ -1007,7 +1007,7 @@ class Inbox:
             except OSError as exc:
                 # Roll back so this instance matches what is still on disk.
                 self._messages = previous
-                raise InboxError(
+                raise InboxPersistError(
                     f"could not persist inbox; message was not deleted: {exc}"
                 ) from exc
         return dict(removed)

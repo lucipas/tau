@@ -2101,7 +2101,7 @@ def test_relayed_dm_edit_leg_lands_before_original(tmp_path):
         message_id="m-1",
         text="typo here",
         sent_at=100.0,
-        expires_at=1000.0,
+        expires_at=2000000000.0,
         in_reply_to={"id": "parent-1"},
         location={"lat": 1.5, "lon": 2.5},
     )
@@ -2115,10 +2115,73 @@ def test_relayed_dm_edit_leg_lands_before_original(tmp_path):
     # The late original is a duplicate, but its metadata is
     # authoritative: the stored leg kept the edit's send time and none
     # of the original's expiry, reply link, or location until now.
+    # (The expiry must be in the future: an already-expired original
+    # removes the stored leg instead — see the next test.)
     assert record["sent_at"] == 100.0
-    assert record["expires_at"] == 1000.0
+    assert record["expires_at"] == 2000000000.0
     assert record["in_reply_to"] == {"id": "parent-1", "excerpt": None}
     assert record["location"] == {"lat": 1.5, "lon": 2.5}
+
+
+def test_relayed_dm_edit_leg_removed_when_original_expired(
+    tmp_path, monkeypatch
+):
+    """A leg whose original arrives expired goes away with it.
+
+    Stamping a past expiry onto the stored leg would leave an expired
+    message listed until a later purge, so the late original removes
+    the leg transactionally instead.  A failed persist defers the
+    delivery, so the envelope is retried rather than acknowledged
+    with the leg still listed.
+    """
+    (tmp_path / "recipient").mkdir()
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=recipient_hash, hash=destination_hash(recipient),
+    )
+
+    leg = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="fixed here",
+        sent_at=110.0,
+        edited_at=110.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, leg)) is True
+    assert recipient_node.inbox.resolve("m-1")["text"] == "fixed here"
+
+    expired = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="typo here",
+        sent_at=100.0,
+        expires_at=time.time() - 60,
+    )
+
+    def _failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(recipient_node.inbox, "_save", _failing_save)
+    with pytest.raises(DeliveryDeferredError):
+        recipient_node._deliver_collected(open_message(recipient, expired))
+    assert recipient_node.inbox.resolve("m-1")["text"] == "fixed here"
+
+    monkeypatch.undo()
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, expired))
+        is False
+    )
+    with pytest.raises(ValueError):
+        recipient_node.inbox.resolve("m-1")
 
 
 def test_relayed_dm_edit_applies_after_seen_eviction(tmp_path):
