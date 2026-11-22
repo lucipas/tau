@@ -2878,24 +2878,97 @@ class TauNode:
             **result,
         )
 
-    def _resolve_invite_group_id(self, group_id: str) -> Optional[str]:
-        """The name of the group an id-keyed invite token names.
+    def _invite_id_evidence(
+        self, group_id: str, *, aliases: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """What an id-keyed invite token named when it was minted.
 
-        A secret group's token carries its opaque id, not its name,
-        so the creator resolves it locally: the current group, or
-        the retired record a roster change or rename left behind —
-        a token minted before the rotation still names the group.
-        Returns ``None`` when no group (live or retired) carries
-        the id, so verification fails the same way as for an
-        unknown name.
+        The live group says so directly; a retired id is evidenced
+        by its retired record; and when that record has been evicted
+        from the capped retired cache, by the mint-time alias in the
+        invite store.  Returns ``{"name", "creator", "created_at"}``
+        or ``None`` when the id names nothing known.
         """
+        group_id = group_id.lower()
         group = self.groups.get(group_id)
         if group is not None:
-            return group["name"]
+            return {
+                "name": group.get("name"),
+                "creator": group.get("creator"),
+                "created_at": group.get("created_at"),
+            }
         retired = self.groups.get_retired(group_id)
         if retired is not None:
-            return retired["name"]
+            return {
+                "name": retired.get("name"),
+                "creator": retired.get("creator"),
+                "created_at": retired.get("created_at"),
+            }
+        alias = None
+        if isinstance(aliases, dict):
+            alias = aliases.get(group_id)
+        if not isinstance(alias, dict):
+            return None
+        return {
+            "name": alias.get("name"),
+            "creator": alias.get("creator"),
+            "created_at": alias.get("created_at"),
+        }
+
+    def _invite_group_for_id(
+        self, group_id: str, *, aliases: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """The live group an id-keyed invite token names, or ``None``.
+
+        A secret group's token carries its opaque id, not its name.
+        The id names the live group directly, or — when a roster
+        change or rename retired it — its successor: a rename
+        successor carries the id in its rename lineage, and a
+        roster-rotation successor keeps the retired record's name,
+        creator and birth time.  A group that merely reused the
+        name matches none of those, so an old link can never admit
+        its holder to an unrelated group.
+        """
+        group_id = group_id.lower()
+        group = self.groups.get(group_id)
+        if group is not None:
+            return group
+        evidence = self._invite_id_evidence(group_id, aliases=aliases)
+        if evidence is None:
+            return None
+        name = evidence.get("name")
+        creator = evidence.get("creator")
+        created_at = evidence.get("created_at")
+        if not isinstance(name, str) or not name:
+            return None
+        for candidate in self.groups.list_groups():
+            if group_id in [
+                str(entry).lower()
+                for entry in (candidate.get("renamed_from") or [])
+            ]:
+                return candidate
+            if (
+                candidate.get("name") == name
+                and candidate.get("creator") == creator
+                and candidate.get("created_at") == created_at
+            ):
+                return candidate
         return None
+
+    def _resolve_invite_group_id(
+        self, group_id: str, *, aliases: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """The name an id-keyed invite token was minted for.
+
+        This is the mint-time name the invite store is keyed by —
+        not the group's current name, which a rename may have
+        changed — so the mode/generation check reads the right
+        record.  The live group itself is resolved separately
+        (see :meth:`_invite_group_for_id`).
+        """
+        evidence = self._invite_id_evidence(group_id, aliases=aliases)
+        name = evidence.get("name") if evidence is not None else None
+        return name if isinstance(name, str) and name else None
 
     def _process_join_request(
         self,
@@ -2918,21 +2991,36 @@ class TauNode:
         if self.identity is None:
             raise InviteError("node has no identity")
         invites = load_invites(self.config.invites_path)
+        aliases = invites.get("aliases")
+        if not isinstance(aliases, dict):
+            aliases = None
         invite = verify_invite_link(
             link_text,
             identity=self.identity,
             invites=invites,
-            resolve_group_id=self._resolve_invite_group_id,
+            resolve_group_id=lambda gid: self._resolve_invite_group_id(
+                gid, aliases=aliases
+            ),
         )
         own_hash = self.destination_hexhash
-        # The token names the group — by name, or by opaque id for
-        # a secret group, resolved to the name above.  A derived id
-        # retires on the first join, so resolve the name to the
-        # current roster on every join.
-        try:
-            group = self.groups.find(invite["group"])
-        except ValueError as exc:
-            raise InviteError("invite is not valid for this group") from exc
+        # An id token names its group by opaque id: resolve the
+        # live group (or its verified successor) directly, never
+        # by bare name — a name a later group reused must not
+        # catch the link.  A name token resolves by name instead:
+        # the id derives from the roster, so the first join
+        # already retires the id it was minted for — resolve the
+        # name to the current roster on every join.
+        if invite.get("group_id") is not None:
+            group = self._invite_group_for_id(
+                invite["group_id"], aliases=aliases
+            )
+            if group is None:
+                raise InviteError("invite is not valid for this group")
+        else:
+            try:
+                group = self.groups.find(invite["group"])
+            except ValueError as exc:
+                raise InviteError("invite is not valid for this group") from exc
         if (
             group is None
             or not group.get("local")

@@ -29,7 +29,11 @@ token, so anyone holding the link learns nothing about the group.
 The creator resolves the id to the group locally — a current id,
 or a retired one via the store's retired record — and the
 mode/generation check still uses the name-keyed store, so revoke
-semantics are unchanged.
+semantics are unchanged.  Minting also records an alias (the id
+plus the group's name, creator and birth time) in the invite
+store, so the id still resolves after the group store evicts the
+retired record; a revoke drops the group's aliases with its
+generation bump.
 
 The join itself is a direct message with kind
 ``group-join-request`` whose text is the invite link, sent to the
@@ -139,6 +143,23 @@ def _clean_timestamp(value: Any, label: str) -> float:
     if cleaned != cleaned or cleaned in (float("inf"), float("-inf")):
         raise InviteError(f"invite {label} must be finite")
     return cleaned
+
+
+def invite_token_group_label(token: Dict[str, Any]) -> str:
+    """The group a token names, for display in a queued-join reply.
+
+    A name-keyed token names the group; an id-keyed token (secret
+    group) has no name, so the opaque id is reported instead — a
+    handler that reads ``token["group"]`` unconditionally raises
+    ``KeyError`` on an id token after the request was queued.
+    """
+    group = token.get("group")
+    if isinstance(group, str) and group:
+        return group
+    group_id = token.get("group_id")
+    if isinstance(group_id, str) and group_id:
+        return group_id
+    return ""
 
 
 def mint_invite_token(
@@ -324,15 +345,41 @@ def verify_invite_link(
 # ---------------------------------------------------------------------------
 
 
+def _clean_aliases(data: Any) -> Dict[str, Dict[str, Any]]:
+    """The id-to-group aliases of an invite store, cleaned.
+
+    An alias records what an id-keyed token named when it was
+    minted — the group's name, creator and birth time — so the
+    creator can still resolve the id after the group store evicts
+    the retired record the id used to resolve through (the retired
+    cache is capped; the invite record is not).  A missing map
+    means no id token was ever minted.
+    """
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise InviteError("invites file aliases must be an object")
+    aliases: Dict[str, Dict[str, Any]] = {}
+    for group_id, record in data.items():
+        if not isinstance(record, dict):
+            raise InviteError("invite alias must be an object")
+        aliases[_clean_hash(group_id, "group_id")] = {
+            "name": _clean_group_name(record.get("name")),
+            "creator": _clean_hash(record.get("creator"), "creator"),
+            "created_at": _clean_timestamp(record.get("created_at"), "created_at"),
+        }
+    return aliases
+
+
 def load_invites(path: Optional[Union[str, Path]]) -> Dict[str, Any]:
     """Load the invite store at *path*; a missing file means none."""
     if path is None:
-        return {"groups": {}}
+        return {"groups": {}, "aliases": {}}
     target = Path(path).expanduser()
     try:
         target.stat()
     except FileNotFoundError:
-        return {"groups": {}}
+        return {"groups": {}, "aliases": {}}
     except OSError as exc:
         raise InviteError(f"could not read invites {target}: {exc}") from exc
     try:
@@ -358,13 +405,16 @@ def load_invites(path: Optional[Union[str, Path]]) -> Dict[str, Any]:
                 else None
             ),
         }
-    return {"groups": groups}
+    return {"groups": groups, "aliases": _clean_aliases(data.get("aliases"))}
 
 
 def save_invites(path: Union[str, Path], invites: Dict[str, Any]) -> Path:
     """Persist *invites* to *path* as JSON (mode 0600)."""
     target = Path(path).expanduser()
-    document = {"groups": invites.get("groups", {})}
+    document = {
+        "groups": invites.get("groups", {}),
+        "aliases": invites.get("aliases", {}),
+    }
     return atomic_write_json(target, document, mode=INVITES_FILE_MODE)
 
 
@@ -410,6 +460,7 @@ def mint_invite(
     creator_hash: str,
     mode: str = DEFAULT_INVITE_MODE,
     group_id: Optional[str] = None,
+    group_created_at: Optional[float] = None,
 ) -> str:
     """Mint and record an invite link for *group_name*.
 
@@ -423,9 +474,17 @@ def mint_invite(
     *group_id* mints a token for a secret group instead: the token
     carries the opaque id and no name, while the record still
     lives under the name (the store is local state, never shared).
+    An id token also records an alias — the id plus the group's
+    name, creator and birth time (*group_created_at*, required
+    with *group_id*) — so the id still resolves after the group
+    store evicts the retired record it used to resolve through.
     """
     group_name = _clean_group_name(group_name)
     mode = _clean_mode(mode)
+    if group_id is not None and group_created_at is None:
+        raise InviteError(
+            "an id-keyed invite needs the group's created_at for its alias"
+        )
     with invites_lock(path):
         invites = load_invites(path)
         record = invites["groups"].get(group_name.casefold())
@@ -442,6 +501,15 @@ def mint_invite(
             mode=mode,
             generation=generation,
         )
+        if group_id is not None:
+            aliases = invites.setdefault("aliases", {})
+            aliases[_clean_hash(group_id, "group_id")] = {
+                "name": group_name,
+                "creator": _clean_hash(creator_hash, "creator"),
+                "created_at": _clean_timestamp(
+                    group_created_at, "created_at"
+                ),
+            }
         invites["groups"][group_name.casefold()] = {
             "mode": mode,
             "generation": generation,
@@ -456,7 +524,9 @@ def revoke_invites(path: Union[str, Path], *, group_name: str) -> int:
 
     Bumps the stored generation; tokens carrying an older one no
     longer verify.  The stored link is dropped with it, so nothing
-    keeps advertising a token that no longer verifies.  Returns the
+    keeps advertising a token that no longer verifies — and the
+    group's id aliases go too, so a revoked id link cannot still
+    resolve after its retired record is evicted.  Returns the
     new generation.
     """
     group_name = _clean_group_name(group_name)
@@ -478,6 +548,16 @@ def revoke_invites(path: Union[str, Path], *, group_name: str) -> int:
             "mode": mode,
             "generation": generation,
         }
+        aliases = invites.get("aliases")
+        if isinstance(aliases, dict):
+            for alias_id in [
+                group_id
+                for group_id, alias in aliases.items()
+                if isinstance(alias, dict)
+                and isinstance(alias.get("name"), str)
+                and alias["name"].casefold() == group_name.casefold()
+            ]:
+                del aliases[alias_id]
         save_invites(path, invites)
     return generation
 

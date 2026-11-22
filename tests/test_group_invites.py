@@ -11,6 +11,7 @@ from tau.config import TauConfig
 from tau.group_invites import (
     InviteError,
     invite_status,
+    invite_token_group_label,
     list_join_requests,
     load_invites,
     mint_invite,
@@ -173,6 +174,7 @@ def test_revoke_invalidates_id_token(tmp_path):
         creator_hash=own_hash,
         mode="open",
         group_id=group_id,
+        group_created_at=1000.0,
     )
     invites = load_invites(node.config.invites_path)
     assert verify_invite_link(
@@ -286,6 +288,65 @@ def test_revoke_invalidates_older_tokens(tmp_path):
     assert verify_invite_link(
         fresh, identity=identity, invites=load_invites(node.config.invites_path)
     )["generation"] == 1
+
+
+def test_invite_token_group_label():
+    identity = RNS.Identity()
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    name_link = mint_invite_token(
+        identity, group_name="crew", creator_hash=own_hash
+    )
+    id_link = mint_invite_token(
+        identity, group_id="ab" * 16, creator_hash=own_hash
+    )
+    assert invite_token_group_label(parse_invite_link(name_link)) == "crew"
+    assert (
+        invite_token_group_label(parse_invite_link(id_link)) == "ab" * 16
+    )
+
+
+def test_mint_invite_records_alias_and_revoke_drops_it(tmp_path):
+    node, identity, own_hash = _invite_node(tmp_path)
+    group_id = "ab" * 16
+    mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name="crew",
+        creator_hash=own_hash,
+        mode="open",
+        group_id=group_id,
+        group_created_at=1000.0,
+    )
+    invites = load_invites(node.config.invites_path)
+    assert invites["aliases"][group_id] == {
+        "name": "crew",
+        "creator": own_hash,
+        "created_at": 1000.0,
+    }
+    # A name-keyed mint records no alias.
+    mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name="other",
+        creator_hash=own_hash,
+        mode="open",
+    )
+    assert set(load_invites(node.config.invites_path)["aliases"]) == {
+        group_id
+    }
+    revoke_invites(node.config.invites_path, group_name="crew")
+    assert load_invites(node.config.invites_path)["aliases"] == {}
+    # And an id token without a birth time cannot be minted: the
+    # alias it would need has nothing to record.
+    with pytest.raises(InviteError):
+        mint_invite(
+            node.config.invites_path,
+            identity,
+            group_name="crew",
+            creator_hash=own_hash,
+            mode="open",
+            group_id="cd" * 16,
+        )
 
 
 def test_mint_stores_link_for_status_and_revoke_drops_it(tmp_path):
@@ -598,6 +659,7 @@ def test_secret_group_join_via_id_link(tmp_path, monkeypatch):
         creator_hash=own_hash,
         mode="open",
         group_id=group["id"],
+        group_created_at=group["created_at"],
     )
     # The minted link names the group by id only — no name anywhere.
     token = parse_invite_link(link)
@@ -630,6 +692,110 @@ def test_secret_group_join_via_id_link(tmp_path, monkeypatch):
     assert not node.mailbox.is_seen("m-1")
 
 
+def test_id_link_admits_to_renamed_group_not_name_reuse(
+    tmp_path, monkeypatch
+):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    carol_identity, carol = _peer_identity(JOINER)
+    node.registry.upsert(
+        carol.destination_hash, carol.public_key, name=JOINER, now=1.0
+    )
+    group = _secret_group(node, identity, own_hash, bob)
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group["name"],
+        creator_hash=own_hash,
+        mode="open",
+        group_id=group["id"],
+        group_created_at=group["created_at"],
+    )
+    # Rename the secret group, freeing its name, then create an
+    # unrelated group under the old name.
+    node.groups.rename(
+        group["id"], "team", created_by=own_hash, identity=identity
+    )
+    node.groups.create("crew", [own_hash, bob.hexhash], created_by=own_hash)
+    monkeypatch.setattr(node, "send_group_message", lambda *a, **k: None)
+    response = decode(
+        node._handle_message(
+            "/tau/message",
+            encode_message(link, kind="group-join-request", message_id="m-1"),
+            b"req-1",
+            carol_identity,
+            1000.0,
+        )
+    )
+    assert response["ok"] is True
+    assert response["status"] == "added"
+    # The joiner lands in the renamed group — the join itself
+    # rotates the id again, so the name and birth time (not the
+    # pre-join id) prove the lineage — not the group that reused
+    # the old name.
+    assert response["group"]["name"] == "team"
+    assert carol.hexhash in response["group"]["members"]
+    joined = node.groups.get(response["group"]["id"])
+    assert joined is not None
+    assert joined["created_at"] == group["created_at"]
+    assert carol.hexhash not in node.groups.find("crew")["members"]
+
+
+def test_id_link_survives_retired_record_eviction(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    _, dave = _peer_identity("dave")
+    carol_identity, carol = _peer_identity(JOINER)
+    node.registry.upsert(
+        carol.destination_hash, carol.public_key, name=JOINER, now=1.0
+    )
+    # The retired cache is capped; shrink the cap so unrelated
+    # rotations evict the link's retired record in this test.
+    monkeypatch.setattr("tau.groups.MAX_RETIRED_GROUPS", 2)
+    group = _secret_group(node, identity, own_hash, bob)
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group["name"],
+        creator_hash=own_hash,
+        mode="open",
+        group_id=group["id"],
+        group_created_at=group["created_at"],
+    )
+    # A roster change retires the id the link names.
+    node.groups.update_members(
+        group["id"],
+        [own_hash, bob.hexhash, dave.hexhash],
+        created_by=own_hash,
+        identity=identity,
+    )
+    assert node.groups.get_retired(group["id"]) is not None
+    # Three unrelated rotations push the retired record out.
+    for name in ("u1", "u2", "u3"):
+        other = node.groups.create(
+            name, [own_hash, bob.hexhash], created_by=own_hash
+        )
+        node.groups.update_members(
+            other["id"],
+            [own_hash, dave.hexhash],
+            created_by=own_hash,
+        )
+    assert node.groups.get_retired(group["id"]) is None
+    monkeypatch.setattr(node, "send_group_message", lambda *a, **k: None)
+    response = decode(
+        node._handle_message(
+            "/tau/message",
+            encode_message(link, kind="group-join-request", message_id="m-1"),
+            b"req-1",
+            carol_identity,
+            1000.0,
+        )
+    )
+    assert response["ok"] is True
+    assert response["status"] == "added"
+    assert carol.hexhash in response["group"]["members"]
+
+
 def test_id_link_survives_roster_rotation(tmp_path, monkeypatch):
     node, identity, own_hash = _invite_node(tmp_path)
     _, bob = _peer_identity("bob")
@@ -646,6 +812,7 @@ def test_id_link_survives_roster_rotation(tmp_path, monkeypatch):
         creator_hash=own_hash,
         mode="open",
         group_id=group["id"],
+        group_created_at=group["created_at"],
     )
     # A roster change rotates the secret group's id before Carol
     # ever uses the link: the token names the retired id.

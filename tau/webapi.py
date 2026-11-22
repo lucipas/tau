@@ -406,6 +406,7 @@ from .group_invites import (
     JOIN_REQUEST_KIND,
     InviteError,
     invite_status,
+    invite_token_group_label,
     list_join_requests,
     mint_invite,
     parse_invite_link,
@@ -5550,6 +5551,9 @@ class WebBridge:
                 # A secret group's link names the group by its
                 # opaque id, never by name.
                 group_id=found["id"] if found.get("secret") else None,
+                group_created_at=(
+                    found.get("created_at") if found.get("secret") else None
+                ),
             )
         except InviteError as exc:
             raise ValueError(str(exc)) from exc
@@ -5619,7 +5623,10 @@ class WebBridge:
             isinstance(response.get("id"), str)
             and response["id"] not in queued_before
         ):
-            return {"status": "queued", "group": token["group"]}
+            return {
+                "status": "queued",
+                "group": invite_token_group_label(token),
+            }
         if not response.get("ok"):
             error = response.get("error") or {}
             message = (

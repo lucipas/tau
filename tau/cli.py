@@ -154,6 +154,7 @@ from .group_invites import (
     JOIN_REQUEST_KIND,
     InviteError,
     invite_status,
+    invite_token_group_label,
     mint_invite,
     parse_invite_link,
     revoke_invites,
@@ -20132,6 +20133,9 @@ def cmd_group_invite(args: argparse.Namespace) -> int:
         # never by name — anyone holding it learns nothing about
         # the group.
         group_id=group["id"] if group.get("secret") else None,
+        group_created_at=(
+            group.get("created_at") if group.get("secret") else None
+        ),
     )
     stored = invite_status(config.invites_path, group_name=group["name"])
     if _json_mode(args):
@@ -20201,7 +20205,10 @@ def cmd_group_join(args: argparse.Namespace) -> int:
     result = results[0]
     if result.get("queued"):
         if _json_mode(args):
-            _emit({"status": "queued", "group": token["group"]}, True)
+            _emit(
+                {"status": "queued", "group": invite_token_group_label(token)},
+                True,
+            )
             return _EXIT_OK
         print(
             "Join request queued — the creator was unreachable."
