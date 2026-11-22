@@ -1210,6 +1210,7 @@ unlinked, and stall sync at the gap.
   Members learn a group from the first message sent to it, and the console
   is read-only for groups — composing from the console comes later.
   Manage groups with `tau group create NAME --peer ...`, `tau group list`,
+  `tau group show GROUP` (full id, creator, members, bans, flags),
   `tau group send GROUP TEXT`, `tau group add-member` / `remove-member`,
   `tau group ban` / `unban` / `banned` (creator only; a banned peer cannot
   be re-added or approved through a join request),

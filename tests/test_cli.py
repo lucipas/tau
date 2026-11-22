@@ -1561,6 +1561,17 @@ def test_parser_group_ban_arguments():
     assert banned.group == "weekend"
 
 
+def test_parser_group_show_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["group", "show", "weekend"])
+    assert args.group_command == "show"
+    assert args.func is cli.cmd_group_show
+    assert args.group == "weekend"
+
+    args = parser.parse_args(["group", "show", "weekend", "--json"])
+    assert args.func is cli.cmd_group_show
+
+
 class _FakeBanNode:
     """Stub TauNode for `tau group ban`: real stores, no Reticulum."""
 
@@ -1684,6 +1695,135 @@ def test_group_ban_unban_banned(tmp_path, capsys, monkeypatch):
     # Banning the creator is refused.
     assert cli.main([*base, own_hash]) == 1
     assert "cannot ban the creator" in capsys.readouterr().err
+
+
+def test_group_show_text_json_and_errors(tmp_path, capsys, monkeypatch):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    group = _seed_group_with_carol(data_dir, own_hash)
+
+    # Text output names the full id, the creator, and every member.
+    assert cli.main(["group", "show", "--data-dir", str(data_dir), "weekend"]) == 0
+    out = capsys.readouterr().out
+    assert f"weekend ({group['id']})" in out
+    assert "created:" in out
+    assert f"by {own_hash[:8]} ({own_hash[:8]})" in out
+    assert f"({own_hash[:8]}) [creator]" in out
+    assert "carol (cdcdcdcd)" in out
+    assert "banned: none" in out
+    assert "flags:" not in out
+
+    # The id prefix resolves the same group.
+    assert (
+        cli.main(["group", "show", "--data-dir", str(data_dir), group["id"][:8]])
+        == 0
+    )
+    assert f"weekend ({group['id']})" in capsys.readouterr().out
+
+    # JSON mode carries the same details as one object.
+    assert (
+        cli.main(["group", "show", "--data-dir", str(data_dir), "weekend", "--json"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    shown = payload["group"]
+    assert shown["id"] == group["id"]
+    assert shown["name"] == "weekend"
+    assert shown["created_by"] == own_hash
+    assert shown["created_by_name"] == own_hash[:8]
+    # Members come back in stored order (sorted by hash, so the own
+    # hash's position varies run to run) — compare as a set.
+    assert sorted(member["name"] for member in shown["members"]) == sorted(
+        ["carol", own_hash[:8], "efefefef"]
+    )
+    assert shown["banned"] == []
+    assert shown["ignored"] is False
+    assert shown["pinned"] is False
+
+    # A ban, an ignore, and a pin all surface on the next show. Banning
+    # mints a successor group, so re-read the stored id first.
+    monkeypatch.setattr(cli, "TauNode", _FakeBanNode)
+    assert (
+        cli.main(["group", "ban", "--data-dir", str(data_dir), "weekend", "carol"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["group", "ignore", "--data-dir", str(data_dir), "weekend"]) == 0
+    capsys.readouterr()
+    assert (
+        cli.main(
+            ["pin-conversation", "--data-dir", str(data_dir), "--group", "weekend"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    successor = GroupStore(data_dir / "groups.json").list_groups()[0]
+    assert cli.main(["group", "show", "--data-dir", str(data_dir), "weekend"]) == 0
+    out = capsys.readouterr().out
+    assert f"weekend ({successor['id']})" in out
+    assert "banned (1):" in out
+    assert "carol (cdcdcdcd)" in out
+    assert "ignored: yes" in out
+    assert "pinned: yes" in out
+
+    assert (
+        cli.main(
+            ["group", "show", "--data-dir", str(data_dir), "weekend", "--json"]
+        )
+        == 0
+    )
+    shown = json.loads(capsys.readouterr().out)["group"]
+    assert shown["id"] == successor["id"]
+    assert shown["banned"] == [{"hash": "cd" * 16, "name": "carol"}]
+    assert shown["ignored"] is True
+    assert shown["pinned"] is True
+
+    # Unknown and ambiguous groups error like the other group commands.
+    assert cli.main(["group", "show", "--data-dir", str(data_dir), "nope"]) == 1
+    assert "unknown group" in capsys.readouterr().err
+
+
+def test_group_show_unknown_date_and_creator(tmp_path, capsys):
+    """A legacy group (no creator) with an unformattable date shows unknown.
+
+    Regression test for the Qodo Fixer findings on #679: the stored
+    ``created_at`` can be out of range for ``datetime.fromtimestamp``,
+    and records written before the creator field existed normalize
+    the creator to "" — neither may crash the show or print empty.
+    """
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    _seed_group_with_carol(data_dir, own_hash)
+
+    # Plant the legacy record directly in the store file: drop both
+    # creator keys and push the timestamp out of formatting range.
+    path = data_dir / "groups.json"
+    raw = json.loads(path.read_text())
+    assert len(raw["groups"]) == 1
+    raw["groups"][0].pop("creator", None)
+    raw["groups"][0].pop("created_by", None)
+    raw["groups"][0]["created_at"] = 1e20
+    path.write_text(json.dumps(raw))
+
+    assert cli.main(["group", "show", "--data-dir", str(data_dir), "weekend"]) == 0
+    out = capsys.readouterr().out
+    assert "created: unknown by unknown" in out
+    assert "[creator]" not in out
+    assert "announcements-only: no" in out
+    assert "ignored: no" in out
+    assert "pinned: no" in out
+
+    assert (
+        cli.main(["group", "show", "--data-dir", str(data_dir), "weekend", "--json"])
+        == 0
+    )
+    shown = json.loads(capsys.readouterr().out)["group"]
+    assert shown["created_by"] == ""
+    assert shown["created_by_name"] == "unknown"
 
 
 def test_status_text_output(tmp_path, capsys):

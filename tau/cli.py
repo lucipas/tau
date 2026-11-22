@@ -2662,6 +2662,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_list.set_defaults(func=cmd_group_list)
 
+    group_show = group_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show one group's details (creator, members, banned peers)",
+    )
+    group_show.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_show.set_defaults(func=cmd_group_show)
+
     group_delete = group_sub.add_parser(
         "delete",
         parents=[common],
@@ -18590,6 +18600,74 @@ def cmd_group_list(args: argparse.Namespace) -> int:
         print(f"{group['name']} ({group['id'][:8]}) — {names}{ignored_suffix}{pinned_suffix}{announcements_suffix}")
         if group.get("topic"):
             print(f"  topic: {group['topic']}")
+    return _EXIT_OK
+
+
+def cmd_group_show(args: argparse.Namespace) -> int:
+    """Show one group's full details: creator, members, bans, flags.
+
+    Read-only: the group store and peer registry are read from disk,
+    no node is started and nothing is sent.
+    """
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    registry = PeerRegistry(config.peers_path)
+    described = _describe_group(group, registry)
+    # Legacy groups carry no creator (records written before the field
+    # existed normalize it to ""): they read as unknown, never empty.
+    creator_hash = group.get("created_by") or ""
+    creator = registry.get(creator_hash) if creator_hash else None
+    creator_name = (
+        creator.display_name
+        if creator is not None
+        else (creator_hash[:8] if creator_hash else "unknown")
+    )
+    banned = _describe_banned(group, registry)
+    ignored = group["id"] in load_ignored_group_ids(config.ignored_groups_path)
+    # A group reads as pinned when any id in its rename lineage is
+    # pinned, like a mute — the pin follows the conversation, not the id.
+    pinned = bool(group_lineage(group) & load_pinned_set(config.pinned_path, "group"))
+    if _json_mode(args):
+        payload = dict(described)
+        payload["created_by_name"] = creator_name
+        payload["banned"] = banned
+        payload["ignored"] = ignored
+        payload["pinned"] = pinned
+        _emit({"group": payload}, True)
+        return _EXIT_OK
+    try:
+        created = datetime.fromtimestamp(float(group["created_at"])).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+    except (OverflowError, OSError, ValueError):
+        # Non-finite or out-of-range stored timestamps cannot be formatted.
+        created = "unknown"
+    print(f"{group['name']} ({group['id']})")
+    if creator_hash:
+        print(f"  created: {created} by {creator_name} ({creator_hash[:8]})")
+    else:
+        print(f"  created: {created} by {creator_name}")
+    if group.get("topic"):
+        print(f"  topic: {group['topic']}")
+    print(f"  announcements-only: {'yes' if group.get('announcements_only') else 'no'}")
+    print(f"  members ({len(described['members'])}):")
+    for member in described["members"]:
+        creator_suffix = (
+            " [creator]" if creator_hash and member["hash"] == creator_hash else ""
+        )
+        print(f"    {member['name']} ({member['hash'][:8]}){creator_suffix}")
+    if banned:
+        print(f"  banned ({len(banned)}):")
+        for entry in banned:
+            print(f"    {entry['name']} ({entry['hash'][:8]})")
+    else:
+        print("  banned: none")
+    print(f"  ignored: {'yes' if ignored else 'no'}")
+    print(f"  pinned: {'yes' if pinned else 'no'}")
     return _EXIT_OK
 
 
