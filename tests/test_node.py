@@ -3383,19 +3383,22 @@ def test_deliver_queued_edit_drops_unusable_payload(tmp_path, monkeypatch):
     assert node.inbox.resolve("m-1")["text"] == "typo here"
 
 
-def test_queued_edit_is_never_deposited(tmp_path, monkeypatch):
-    node, peer = _edit_node(tmp_path)
-    _seed_sent_dm(node, peer)
+def test_queued_group_edit_is_never_deposited(tmp_path, monkeypatch):
+    node, group, alice, bob, entries = _queue_group_edit(tmp_path, monkeypatch)
+    calls = []
 
-    def unreachable(*args, **kwargs):
-        raise NodeError("no route to peer")
+    def recorded(*args, **kwargs):
+        calls.append(args)
+        return {"ok": True}
 
-    monkeypatch.setattr(node, "_request", unreachable)
-    node.send_edit("alice", "m-1", "fixed here")
-    entry = node.mailbox.outbox_list()[0]
-    # No sealed copy is ever left with a holder for an edit.
-    assert node._deposit_entry(peer, entry, 1.0) is False
-    assert len(node.mailbox.outbox_list()) == 1
+    monkeypatch.setattr(node, "_request", recorded)
+    # No sealed copy is ever left with a holder for a group edit:
+    # legs carry a different wire id per member, so no single sealed
+    # copy names every member's copy.
+    assert node._deposit_entry(alice, entries[0], 1.0) is False
+    assert node._deposit_entry(bob, entries[1], 1.0) is False
+    assert calls == []
+    assert len(node.mailbox.outbox_list()) == 2
 
 
 def test_deliver_queued_group_edit_cancels_siblings_on_refusal(
