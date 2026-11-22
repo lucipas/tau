@@ -7934,7 +7934,11 @@ class TauNode:
         return received
 
     def _apply_relayed_dm_reaction(
-        self, message: Dict[str, Any]
+        self,
+        message: Dict[str, Any],
+        *,
+        held_id: Optional[str] = None,
+        held_to: Optional[bytes] = None,
     ) -> bool:
         """Apply a relayed reaction leg to the DM it names.
 
