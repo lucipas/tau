@@ -18679,6 +18679,8 @@ class _WebHandler(BaseHTTPRequestHandler):
 
     def _cors_headers(self) -> None:
         origin = self.headers.get("Origin")
+        if origin:
+            origin = origin.replace("\r", "").replace("\n", "").strip()
         if origin and _is_local_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
