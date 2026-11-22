@@ -489,6 +489,7 @@ Global options may appear before or after the command:
 | `tau channel join NAME` | Join a public channel by name |
 | `tau channel leave NAME` | Leave a channel (cached messages are kept) |
 | `tau channel list` | List joined channels with cached message and unread counts |
+| `tau channel show NAME` | Show one channel's topic, counts, and last message (a left channel shows its cached messages with `joined: no`) |
 | `tau channel send NAME TEXT` | Send a signed message to a joined channel (`--reply-to HASH` replies to a message; `--expire 30s` makes it a disappearing message, purged from members' stores after the duration; a per-channel default from `tau disappearing --channel` fills the expiry in when no `--expire` is passed) |
 | `tau channel send NAME TEXT --delay 5m` | Queue a message to publish later (a serving node with --channels sends it) |
 | `tau channel scheduled [NAME]` | List queued channel messages and polls, soonest first |
