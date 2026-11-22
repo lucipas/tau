@@ -692,7 +692,7 @@ def test_secret_group_join_via_id_link(tmp_path, monkeypatch):
     assert not node.mailbox.is_seen("m-1")
 
 
-def test_id_link_admits_to_renamed_group_not_name_reuse(
+def test_id_link_dies_on_rename_and_revoke_under_new_name(
     tmp_path, monkeypatch
 ):
     node, identity, own_hash = _invite_node(tmp_path)
@@ -713,32 +713,65 @@ def test_id_link_admits_to_renamed_group_not_name_reuse(
     )
     # Rename the secret group, freeing its name, then create an
     # unrelated group under the old name.
-    node.groups.rename(
+    renamed = node.groups.rename(
         group["id"], "team", created_by=own_hash, identity=identity
     )
     node.groups.create("crew", [own_hash, bob.hexhash], created_by=own_hash)
     monkeypatch.setattr(node, "send_group_message", lambda *a, **k: None)
+
+    def attempt(message_id):
+        return decode(
+            node._handle_message(
+                "/tau/message",
+                encode_message(
+                    link, kind="group-join-request", message_id=message_id
+                ),
+                b"req-1",
+                carol_identity,
+                1000.0,
+            )
+        )
+
+    # A rename invalidates outstanding invites, exactly like a
+    # name token: the old link joins neither the renamed group
+    # nor the group that reused the old name.
+    response = attempt("m-1")
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_invite"
+    assert carol.hexhash not in node.groups.find("crew")["members"]
+    assert carol.hexhash not in node.groups.get(renamed["id"])["members"]
+    # Revoking under the new name leaves it rejected too — the
+    # revoke bumps only the new name's record, so the refusal
+    # must come from the rename itself, not the generation.
+    revoke_invites(node.config.invites_path, group_name="team")
+    response = attempt("m-2")
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_invite"
+    # A fresh link minted after the rename works.
+    fresh = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name="team",
+        creator_hash=own_hash,
+        mode="open",
+        group_id=renamed["id"],
+        group_created_at=renamed["created_at"],
+    )
     response = decode(
         node._handle_message(
             "/tau/message",
-            encode_message(link, kind="group-join-request", message_id="m-1"),
-            b"req-1",
+            encode_message(
+                fresh, kind="group-join-request", message_id="m-3"
+            ),
+            b"req-3",
             carol_identity,
-            1000.0,
+            1001.0,
         )
     )
     assert response["ok"] is True
     assert response["status"] == "added"
-    # The joiner lands in the renamed group — the join itself
-    # rotates the id again, so the name and birth time (not the
-    # pre-join id) prove the lineage — not the group that reused
-    # the old name.
     assert response["group"]["name"] == "team"
     assert carol.hexhash in response["group"]["members"]
-    joined = node.groups.get(response["group"]["id"])
-    assert joined is not None
-    assert joined["created_at"] == group["created_at"]
-    assert carol.hexhash not in node.groups.find("crew")["members"]
 
 
 def test_id_link_survives_retired_record_eviction(tmp_path, monkeypatch):

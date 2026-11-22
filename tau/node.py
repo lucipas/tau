@@ -3016,6 +3016,14 @@ class TauNode:
             )
             if group is None:
                 raise InviteError("invite is not valid for this group")
+            if group["name"].casefold() != (invite.get("group") or "").casefold():
+                # A rename invalidates outstanding invites, exactly
+                # like a name token: the token was minted for the
+                # old name, and revoking under the new name bumps
+                # only the new name's record — so the check has to
+                # happen here, on the resolved group, or the old
+                # token would keep joining the renamed group.
+                raise InviteError("invite is not valid for this group")
         else:
             try:
                 group = self.groups.find(invite["group"])

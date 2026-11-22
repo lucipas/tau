@@ -29,11 +29,15 @@ token, so anyone holding the link learns nothing about the group.
 The creator resolves the id to the group locally — a current id,
 or a retired one via the store's retired record — and the
 mode/generation check still uses the name-keyed store, so revoke
-semantics are unchanged.  Minting also records an alias (the id
-plus the group's name, creator and birth time) in the invite
-store, so the id still resolves after the group store evicts the
-retired record; a revoke drops the group's aliases with its
-generation bump.
+semantics are unchanged.  A rename still invalidates an id token,
+exactly like a name token: the join is refused when the resolved
+group's current name differs from the name the token was minted
+for, so revoking under the new name cannot leave the old token
+usable against the renamed group.  Minting also records an alias
+(the id plus the group's name, creator and birth time) in the
+invite store, so the id still resolves after the group store
+evicts the retired record; a revoke drops the group's aliases
+with its generation bump.
 
 The join itself is a direct message with kind
 ``group-join-request`` whose text is the invite link, sent to the
