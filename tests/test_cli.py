@@ -1786,6 +1786,46 @@ def test_group_show_text_json_and_errors(tmp_path, capsys, monkeypatch):
     assert "unknown group" in capsys.readouterr().err
 
 
+def test_group_show_unknown_date_and_creator(tmp_path, capsys):
+    """A legacy group (no creator) with an unformattable date shows unknown.
+
+    Regression test for the Qodo Fixer findings on #679: the stored
+    ``created_at`` can be out of range for ``datetime.fromtimestamp``,
+    and records written before the creator field existed normalize
+    the creator to "" — neither may crash the show or print empty.
+    """
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    _seed_group_with_carol(data_dir, own_hash)
+
+    # Plant the legacy record directly in the store file: drop both
+    # creator keys and push the timestamp out of formatting range.
+    path = data_dir / "groups.json"
+    raw = json.loads(path.read_text())
+    assert len(raw["groups"]) == 1
+    raw["groups"][0].pop("creator", None)
+    raw["groups"][0].pop("created_by", None)
+    raw["groups"][0]["created_at"] = 1e20
+    path.write_text(json.dumps(raw))
+
+    assert cli.main(["group", "show", "--data-dir", str(data_dir), "weekend"]) == 0
+    out = capsys.readouterr().out
+    assert "created: unknown by unknown" in out
+    assert "[creator]" not in out
+    assert "announcements-only: no" in out
+    assert "ignored: no" in out
+    assert "pinned: no" in out
+
+    assert (
+        cli.main(["group", "show", "--data-dir", str(data_dir), "weekend", "--json"])
+        == 0
+    )
+    shown = json.loads(capsys.readouterr().out)["group"]
+    assert shown["created_by"] == ""
+    assert shown["created_by_name"] == "unknown"
+
+
 def test_status_text_output(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     code = cli.main(["status", "--data-dir", str(data_dir)])
@@ -13524,4 +13564,3 @@ def test_channel_poll_delay_rejects_bad_combinations(tmp_path, capsys):
     )
     assert code == 2
     assert "a poll needs 2-8 options" in capsys.readouterr().err
-a poll needs 2-8 options" in capsys.readouterr().err

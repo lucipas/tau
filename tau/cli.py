@@ -18617,9 +18617,14 @@ def cmd_group_show(args: argparse.Namespace) -> int:
         raise NodeError(str(exc)) from exc
     registry = PeerRegistry(config.peers_path)
     described = _describe_group(group, registry)
-    creator = registry.get(group["created_by"])
+    # Legacy groups carry no creator (records written before the field
+    # existed normalize it to ""): they read as unknown, never empty.
+    creator_hash = group.get("created_by") or ""
+    creator = registry.get(creator_hash) if creator_hash else None
     creator_name = (
-        creator.display_name if creator is not None else group["created_by"][:8]
+        creator.display_name
+        if creator is not None
+        else (creator_hash[:8] if creator_hash else "unknown")
     )
     banned = _describe_banned(group, registry)
     ignored = group["id"] in load_ignored_group_ids(config.ignored_groups_path)
