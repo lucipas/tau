@@ -1327,6 +1327,11 @@ class GroupStore:
             if existing is not None:
                 if existing["members"] != candidate["members"]:
                     return None
+                if existing["creator"] != candidate["creator"]:
+                    # The pinned id names its creator: a leg claiming a
+                    # different creator for it is a forgery, and must
+                    # not be judged creator-authorized against the claim.
+                    return None
             elif candidate["id"] in self._retired or self.is_left(
                 candidate["id"]
             ):
@@ -1404,14 +1409,11 @@ class GroupStore:
                         and sent_at < other["roster_sent_at"]
                     ]
                     if stale_for:
-                        # Log only the id prefix: a secret group's id
-                        # is its opaque token, and a full id in a log
-                        # would hand it to anyone who reads the log.
                         log.info(
                             "Stale creator message for group %s: sent "
                             "before the successor roster was learned; "
                             "pinning alongside instead of replacing it",
-                            group_id[:8],
+                            group_id,
                         )
                         superseded = [
                             other
@@ -1527,7 +1529,7 @@ class GroupStore:
                 if learned - len(replaced) >= MAX_LEARNED_GROUPS:
                     log.info(
                         "Refusing to pin group %s: learned-group limit reached",
-                        group_id[:8],
+                        group_id,
                     )
                     return None
             snapshot = self._snapshot()
@@ -1602,6 +1604,18 @@ class GroupStore:
                             updates["announcements_sent_at"] = (
                                 announcements_sent_at
                             )
+                if (
+                    existing.get("roster_attestation") is None
+                    and candidate.get("roster_attestation") is not None
+                ):
+                    # First attestation seen for this id pins it: a
+                    # later leg carrying a different signature for
+                    # the same roster does not replace it.  Applied
+                    # before the merge below so it is actually stored.
+                    updates["roster_attestation"] = candidate[
+                        "roster_attestation"
+                    ]
+                    updates["secret"] = True
                 if updates:
                     self._groups[existing["id"]] = {**existing, **updates}
                     refreshed = True
@@ -1624,17 +1638,6 @@ class GroupStore:
                             "renamed_from": merged,
                         }
                         refreshed = True
-                if (
-                    existing.get("roster_attestation") is None
-                    and candidate.get("roster_attestation") is not None
-                ):
-                    # First attestation seen for this id pins it: a
-                    # later leg carrying a different signature for
-                    # the same roster does not replace it.
-                    updates["roster_attestation"] = candidate[
-                        "roster_attestation"
-                    ]
-                    updates["secret"] = True
                 if replaced or refreshed:
                     try:
                         self._save()
