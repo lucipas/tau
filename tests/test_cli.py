@@ -5542,6 +5542,141 @@ def test_messages_show_sent_group_poll_and_unknown_send_time(tmp_path, capsys):
     assert shown["poll"]["total"] == 1
 
 
+def test_messages_show_blocked_muted_quiet_hours_and_file(tmp_path, capsys):
+    """Qodo re-review findings on #687: blocked, muted, quiet-hours, file.
+
+    A blocked sender's message is refused in both modes while a sent
+    message to the same peer still shows; muting and quiet hours clear
+    the unread flag the way the listing does; a file shows its full
+    checksum and its reactions exactly once.
+    """
+    from datetime import datetime, timedelta
+
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": sender_hash.hex(),
+            "text": "my reply",
+            "sent_at": 15.0,
+            "received_at": 25.0,
+            "id": "s-9",
+            "direction": "out",
+        }
+    )
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "name": "photo.jpg",
+            "size": 1234,
+            "sha256": "ab" * 32,
+            "path": str(tmp_path / "photo.jpg"),
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "f-1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "f-1",
+            "destination": sender_hash.hex(),
+            "from": "alice",
+            "reaction": "❤️",
+            "sent_at": 24.0,
+            "received_at": 24.0,
+            "id": "r-9",
+        }
+    )
+
+    # A file shows its full checksum and its reactions, once each.
+    assert cli.main(["messages", "show", "f-1", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "ab" * 32 in out
+    assert out.count("❤️ alice") == 1
+    assert "file: photo.jpg (1234 bytes" in out
+    assert (
+        cli.main(["messages", "show", "f-1", "--data-dir", str(data_dir), "--json"])
+        == 0
+    )
+    shown = json.loads(capsys.readouterr().out)["message"]
+    assert shown["sha256"] == "ab" * 32
+    assert shown["reactions"][0]["reaction"] == "❤️"
+
+    # Muting the conversation clears the unread flag, in text and JSON.
+    assert cli.main(["mute", "--peer", "alice", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+    assert cli.main(["messages", "show", "m-1", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "state: muted" in out
+    assert "unread" not in out
+    assert (
+        cli.main(["messages", "show", "m-1", "--data-dir", str(data_dir), "--json"])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["message"]["unread"] is False
+
+    # Quiet hours silence the badge the same way: unmute first so the
+    # window is the only suppression in play.
+    assert (
+        cli.main(["mute", "--peer", "alice", "--off", "--data-dir", str(data_dir)])
+        == 0
+    )
+    capsys.readouterr()
+    now = datetime.now()
+    start = (now - timedelta(hours=1)).strftime("%H:%M")
+    end = (now + timedelta(hours=1)).strftime("%H:%M")
+    assert (
+        cli.main(
+            [
+                "quiet-hours",
+                "set",
+                "--start",
+                start,
+                "--end",
+                end,
+                "--data-dir",
+                str(data_dir),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(["messages", "show", "m-2", "--data-dir", str(data_dir), "--json"])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["message"]["unread"] is False
+
+    # Blocking the sender refuses a received message in both modes,
+    # while a sent message to the same peer still shows.
+    assert cli.main(["quiet-hours", "off", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+    assert cli.main(["block", "alice", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+    assert cli.main(["messages", "show", "m-1", "--data-dir", str(data_dir)]) == 1
+    assert "blocked peer" in capsys.readouterr().err
+    assert (
+        cli.main(["messages", "show", "m-1", "--data-dir", str(data_dir), "--json"])
+        == 1
+    )
+    assert "blocked peer" in capsys.readouterr().err
+    assert cli.main(["messages", "show", "s-9", "--data-dir", str(data_dir)]) == 0
+    assert "my reply" in capsys.readouterr().out
+
+    # An unreadable blocklist fails closed for received messages too.
+    assert cli.main(["unblock", "alice", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+    (data_dir / "blocklist.json").write_text("{not json")
+    assert cli.main(["messages", "show", "m-1", "--data-dir", str(data_dir)]) == 1
+    assert "blocklist" in capsys.readouterr().err
+    assert cli.main(["messages", "show", "s-9", "--data-dir", str(data_dir)]) == 0
+    assert "my reply" in capsys.readouterr().out
+
+
 def test_parser_messages_show_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["messages", "show", "m-1"])

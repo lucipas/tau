@@ -16776,10 +16776,15 @@ def cmd_messages_show(args: argparse.Namespace) -> int:
     # the listing hides them; an unreadable block-list hides every
     # received message.  Sent messages are never filtered by sender.
     blocked = load_blocked_set(config.blocklist_path)
-    if entry.get("direction") != "out" and (
-        blocked is None or entry.get("destination") in blocked
-    ):
-        raise NodeError(f"no message matches {args.target!r}")
+    if entry.get("direction") != "out":
+        sender = str(entry.get("destination") or "")
+        if blocked is None:
+            raise NodeError(
+                "cannot show a received message while the blocklist"
+                " cannot be read"
+            )
+        if sender in blocked:
+            raise NodeError("cannot show a message from a blocked peer")
     # Conversation state the listing applies before it derives unread
     # flags: a corrupt mutes file fails open (unmuted, with a warning),
     # and quiet hours silence every conversation at once.
