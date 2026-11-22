@@ -2097,6 +2097,68 @@ def test_seal_and_open_keep_kind():
     assert message["kind"] == "ping"
 
 
+def test_seal_message_rejects_reaction_without_token():
+    """A reaction dict without a token must not seal as a clear.
+
+    clean_reaction turns an absent token into "" (a retraction), so
+    sealing {"reaction_id": ...} with no token would emit a leg that
+    clears the sender's reaction.
+    """
+    sender, recipient = make_identity_pair()
+    with pytest.raises(MailboxError):
+        seal_message(
+            sender,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="msg-no-token",
+            text="👍",
+            sent_at=4242.0,
+            kind="reaction",
+            reaction={"reaction_id": "r-1"},
+        )
+
+
+def test_seal_message_keeps_explicit_empty_reaction_token():
+    """An explicit empty token is still a valid clear, not an error."""
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-clear",
+        text="reaction cleared",
+        sent_at=4242.0,
+        kind="reaction",
+        reaction={"token": "", "reaction_id": "r-1"},
+    )
+    message = open_message(recipient, blob)
+    assert message["reaction"] == {"token": "", "reaction_id": "r-1"}
+
+
+def test_validated_sealed_message_drops_reaction_without_token():
+    """A leg with a reaction id but no token drops the reaction field.
+
+    The message itself still validates — only the malformed reaction
+    payload is dropped, never the message.
+    """
+    from tau.mailbox import _validated_sealed_message
+
+    payload = {
+        "id": "m-1",
+        "from": "aa" * 16,
+        "from_name": "alice",
+        "text": "👍",
+        "sent_at": 4242.0,
+        "reaction": {"reaction_id": "r-1"},
+    }
+    assert "reaction" not in _validated_sealed_message(payload)
+    payload["reaction"] = {"token": "", "reaction_id": "r-1"}
+    assert _validated_sealed_message(payload)["reaction"] == {
+        "token": "",
+        "reaction_id": "r-1",
+    }
+
+
 def test_seal_and_open_carries_location():
     sender, recipient = make_identity_pair()
     pin = {"lat": 34.05, "lon": -83.88, "name": "Rock Springs Park"}
