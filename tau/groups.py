@@ -1332,6 +1332,12 @@ class GroupStore:
                     # different creator for it is a forgery, and must
                     # not be judged creator-authorized against the claim.
                     return None
+                if existing["name"] != candidate["name"]:
+                    # The pinned id binds its name by attestation: a leg
+                    # claiming a different name for it is a forgery (or
+                    # a creator bug), and merging it would silently drop
+                    # the leg's name.
+                    return None
             elif candidate["id"] in self._retired or self.is_left(
                 candidate["id"]
             ):
@@ -1409,11 +1415,14 @@ class GroupStore:
                         and sent_at < other["roster_sent_at"]
                     ]
                     if stale_for:
+                        # Log only the id prefix: a secret group's id
+                        # is its opaque token, and a full id in a log
+                        # would hand it to anyone who reads the log.
                         log.info(
                             "Stale creator message for group %s: sent "
                             "before the successor roster was learned; "
                             "pinning alongside instead of replacing it",
-                            group_id,
+                            group_id[:8],
                         )
                         superseded = [
                             other
@@ -1529,7 +1538,7 @@ class GroupStore:
                 if learned - len(replaced) >= MAX_LEARNED_GROUPS:
                     log.info(
                         "Refusing to pin group %s: learned-group limit reached",
-                        group_id,
+                        group_id[:8],
                     )
                     return None
             snapshot = self._snapshot()
