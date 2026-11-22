@@ -829,7 +829,7 @@ def test_two_nodes_exchange_public_profiles(tmp_path: Path) -> None:
             )
         )
         assert "mesh tinkerer" in output
-        assert "https://example.com" in output
+        assert "link: https://example.com" in output
         assert "version: 1" in output
     finally:
         stop_process(alice)
