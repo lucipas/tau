@@ -18,6 +18,7 @@ from tau.node import (
     NotAllowedError,
     NotAMemberError,
     PeerRefusedError,
+    PeerRejectedError,
     TauNode,
     _AnnounceHandler,
 )
@@ -907,6 +908,22 @@ def test_send_retraction_refusal_is_not_queued(tmp_path, monkeypatch):
     assert node.inbox.resolve("m-1")["text"] == "hello"
 
 
+def test_send_retraction_rejection_is_not_queued(tmp_path, monkeypatch):
+    node, _ = _retract_node(tmp_path)
+
+    def rejected(*args, **kwargs):
+        raise PeerRejectedError("peer rejected the request: not_sender")
+
+    monkeypatch.setattr(node, "_request", rejected)
+    with pytest.raises(PeerRejectedError):
+        node.send_retraction("alice", "m-1")
+    # A peer rejection (not_sender, not_supported, invalid_retraction,
+    # storage_failed) is final, like a refusal: the retract must not
+    # be queued for a sweep that would only re-send it until its TTL.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "hello"
+
+
 def test_deliver_queued_retract_drops_refused_leg(tmp_path, monkeypatch):
     node, peer = _retract_node(tmp_path)
 
@@ -924,6 +941,28 @@ def test_deliver_queued_retract_drops_refused_leg(tmp_path, monkeypatch):
     assert node._deliver_entry(peer, entry, 1.0) is False
     # A refusal is final: the leg is dropped, not held until its TTL —
     # and the sender's own copy stays, since the retract never landed.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "hello"
+
+
+def test_deliver_queued_retract_drops_rejected_leg(tmp_path, monkeypatch):
+    node, peer = _retract_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_retraction("alice", "m-1")
+    entry = node.mailbox.outbox_list()[0]
+
+    def rejected(*args, **kwargs):
+        raise PeerRejectedError("peer rejected the request: not_sender")
+
+    monkeypatch.setattr(node, "_request", rejected)
+    assert node._deliver_entry(peer, entry, 1.0) is False
+    # A peer rejection is final: the leg is dropped, not retried until
+    # its TTL — and the sender's own copy stays, since the retract
+    # never landed.
     assert node.mailbox.outbox_list() == []
     assert node.inbox.resolve("m-1")["text"] == "hello"
 

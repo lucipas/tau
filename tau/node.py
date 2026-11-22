@@ -6918,8 +6918,8 @@ class TauNode:
             self._request(
                 peer, REQUEST_RETRACT, payload_bytes, timeout, deadline=deadline
             )
-        except (PeerRefusedError, NotAMemberError) as exc:
-            # A refusal is final: the peer will not take this
+        except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
+            # A refusal or rejection is final: the peer will not take this
             # retract (or no longer counts this node as a member), so
             # stop retrying rather than holding the leg until its TTL.
             log.warning("Dropping queued retract %s: %s", entry.id, exc)
@@ -11788,8 +11788,9 @@ class TauNode:
         retracts stay direct-only.  The sender's own local copies are
         removed when the retract is delivered, not at queue time, so
         the sender's history only ever loses a message that actually
-        landed.  An explicit refusal (allow-list, block-list) is final
-        and is never queued.
+        landed.  An explicit refusal (allow-list, block-list) or a
+        peer rejection (not_sender, not_supported, invalid_retraction,
+        storage_failed) is final and is never queued.
         """
         target_id = message_id.strip() if isinstance(message_id, str) else ""
         if not target_id or len(target_id) > 64:
@@ -11808,13 +11809,14 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             response = self._request(peer, REQUEST_RETRACT, payload_bytes, timeout)
-        except (PeerRefusedError, NotAMemberError):
-            # An explicit refusal (allow-list, block-list) is final:
-            # queueing it would deliver to a peer that already said
-            # no.  Not-a-member is final here too: the receiver can
-            # return it for a retract naming a group message whose
-            # roster excludes this node, and the sweep would only
-            # drop the queued leg as a refusal anyway.
+        except (PeerRefusedError, NotAMemberError, PeerRejectedError):
+            # An explicit refusal (allow-list, block-list) or a peer
+            # rejection (not_sender, not_supported, invalid_retraction,
+            # storage_failed) is final: queueing it would deliver to
+            # a peer that already said no.  Not-a-member is final here
+            # too: the receiver can return it for a retract naming a
+            # group message whose roster excludes this node, and the
+            # sweep would only drop the queued leg as a refusal anyway.
             raise
         except NodeError:
             if not queue or not self.started:
