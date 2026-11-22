@@ -7377,18 +7377,42 @@ class TauNode:
             # target's id, the replacement text and the edit's signed
             # send time, so the recipient applies it exactly like a
             # direct edit — no pre-signed edit bytes ride the relay.
-        if getattr(fresh, "reaction", None) is not None or (
+        reaction = getattr(fresh, "reaction", None)
+        is_reaction = reaction is not None or (
             getattr(fresh, "kind", None) == "reaction"
-        ):
-            # Reactions ride direct delivery only in v1: the sealed
-            # path is text-shaped, and a holder cannot carry a
-            # pre-signed reaction — so no sealed copy is ever left.
-            log.info(
-                "Skipping deposit of queued reaction %s: reactions are "
-                "not sealed for holders",
-                entry.id,
-            )
-            return False
+        )
+        if is_reaction:
+            if fresh.group_id is not None or (
+                isinstance(reaction, dict)
+                and reaction.get("target_author") is not None
+            ):
+                # Group reactions still ride direct delivery only:
+                # legs carry a different wire id per member, so no
+                # single sealed copy names every member's copy (see
+                # _handle_reaction) — a sealed leg naming the
+                # reactor's id would match nothing on any member.
+                log.info(
+                    "Skipping deposit of queued group reaction %s: group "
+                    "reactions are not sealed for holders",
+                    entry.id,
+                )
+                return False
+            if not isinstance(reaction, dict):
+                # Kind "reaction" but the payload did not survive
+                # storage: there is no target to seal a leg for, and
+                # sealing the display text would land as chat.
+                log.info(
+                    "Skipping deposit of queued reaction %s: no reaction "
+                    "target",
+                    entry.id,
+                )
+                return False
+            # A DM reaction deposits as a reaction leg of the target
+            # message (see the seal below): the envelope carries the
+            # target's id, the token, the signed reaction id and the
+            # signed send time, so the recipient applies it exactly
+            # like a direct reaction — no pre-signed /tau/react bytes
+            # ride the relay.
         if fresh.group_id is not None:
             # Do not leave a sealed copy with a holder for a member
             # post queued before the group went announcements-only:
@@ -7489,11 +7513,24 @@ class TauNode:
         # the edit's signed time — because the recipient judges it by
         # edited_at, not by kind.  The holder-level id below stays the
         # outbox entry id, so ack/dedupe at the holder is unchanged.
+        # A DM reaction seals the same way, as a reaction leg of the
+        # target message: the envelope carries the target's id, kind
+        # "reaction", the token, the signed reaction id and the signed
+        # send time — no pre-signed /tau/react bytes ride the relay,
+        # the envelope's own signature is the proof of who reacted.
         sealed_id = fresh.id
         sealed_kind = getattr(fresh, "kind", None)
+        sealed_reaction = None
         if is_edit:
             sealed_id = edit["target"]
             sealed_kind = None
+        if is_reaction:
+            sealed_id = reaction["target"]
+            sealed_kind = "reaction"
+            sealed_reaction = {
+                "token": reaction["token"],
+                "reaction_id": reaction["reaction_id"],
+            }
         try:
             blob = seal_message(
                 self.identity,
@@ -7509,6 +7546,7 @@ class TauNode:
                 beacon=fresh.beacon,
                 kind=sealed_kind,
                 edited_at=fresh.edited_at,
+                reaction=sealed_reaction,
                 poll_options=fresh.poll_options,
                 poll_vote=fresh.poll_vote,
                 poll_close=fresh.poll_close,
@@ -7882,6 +7920,109 @@ class TauNode:
             self.mailbox.drop_held(envelope.id, to=self.destination.hash)
         return received
 
+    def _apply_relayed_dm_reaction(
+        self, message: Dict[str, Any]
+    ) -> bool:
+        """Apply a relayed reaction leg to the DM it names.
+
+        The leg's id is the target message's id (see
+        :meth:`_deposit_entry`), and its ``reaction`` field carries
+        the token and the signed reaction id.  The sealed envelope's
+        own signature proves who reacted — the same authentication a
+        relayed message's sender gets — so no separate ``/tau/react``
+        signature is re-verified here.  Latest per reactor wins, as
+        on the direct path (:meth:`Inbox.record_reaction`): a stale
+        leg never rewinds a newer reaction or retraction, and a
+        duplicate leg is dropped on its seen key.  A reaction whose
+        target has not arrived yet is still stored, so it surfaces
+        when the target lands.  Returns True when the reaction landed
+        (the delivery counts as received, and the console is told via
+        ``on_reaction`` exactly like a direct reaction); False when
+        the leg is stale, a duplicate, expired, malformed, or names a
+        group message — the copy is resolved either way, so the holder
+        can drop it.  Raises :class:`DeliveryDeferredError` when the
+        reaction could not be persisted, so the holder keeps its copy
+        for a later retry instead of dropping a reaction the
+        recipient never got.
+        """
+        sender = message.get("from") if isinstance(message.get("from"), str) else ""
+        reaction = message.get("reaction")
+        if not isinstance(reaction, dict):
+            # A leg with no reaction payload names nothing to apply.
+            return False
+        token = reaction.get("token")
+        reaction_id = reaction.get("reaction_id")
+        if (
+            not isinstance(token, str)
+            or not isinstance(reaction_id, str)
+            or not reaction_id
+        ):
+            return False
+        expires_at = message.get("expires_at")
+        if expires_at is not None and (
+            not isinstance(expires_at, (int, float))
+            or isinstance(expires_at, bool)
+            or float(expires_at) <= time.time()
+        ):
+            # An expired leg never applies.
+            return False
+        sent_at = message.get("sent_at")
+        if not isinstance(sent_at, (int, float)) or isinstance(sent_at, bool):
+            return False
+        # A retried or relayed reaction replays with the same id; the
+        # direct path dedupes on the same key (see _handle_reaction).
+        seen_key = f"reaction:{sender}:{reaction_id}"
+        if self.mailbox.is_seen(seen_key):
+            return False
+        target_id = message.get("id")
+        if not isinstance(target_id, str) or not target_id:
+            return False
+        try:
+            resolved = self.inbox.resolve(target_id)
+        except ValueError:
+            resolved = None
+        if resolved is not None and resolved.get("kind") == "group":
+            # A DM reaction leg naming a group message is foreign: a
+            # group reaction needs the signed group context and the
+            # roster check the direct path runs, and the leg carries
+            # neither — so it is refused, never stored.
+            return False
+        record = {
+            "target": target_id,
+            "reaction": token,
+            "from": message.get("from_name", ""),
+            "destination": sender,
+            "sent_at": float(sent_at),
+            "received_at": time.time(),
+            "id": reaction_id,
+        }
+        try:
+            stored = self.inbox.record_reaction(record)
+        except OSError as exc:
+            # The reaction never landed: defer instead of resolving
+            # the leg, so the holder keeps its copy and a later sweep
+            # retries it — resolving here would drop the only copy of
+            # a reaction the recipient never got.
+            raise DeliveryDeferredError(
+                f"could not persist relayed reaction for {target_id}: {exc}"
+            ) from exc
+        if stored is None and token:
+            # Stale: a newer reaction from this reactor already
+            # stands, and the merge dropped this one — the copy is
+            # resolved either way.  (A retraction returns None too,
+            # but it applied; only a non-empty token losing means
+            # stale.  A stale retraction is indistinguishable from an
+            # applied one, so it counts as received — the inbox merge
+            # is authoritative and the console merges the same way,
+            # so nothing visible changes either way.)
+            return False
+        # The reaction is recorded; a failed fan-out only means the
+        # live console missed this update, exactly as on the direct
+        # path — the console reseeds from the inbox.
+        self._publish_reaction(record)
+        self.mailbox.mark_seen(seen_key)
+        return True
+
     def _apply_relayed_dm_edit(
         self, message: Dict[str, Any], edited_at: float
     ) -> bool:
@@ -8121,6 +8262,14 @@ class TauNode:
                 sender or "unknown",
             )
             return False
+        if message.get("kind") == "reaction":
+            # A relayed reaction leg: a queued DM reaction the
+            # sender's sweep deposited with a holder (see
+            # _deposit_entry).  It names the reacted-to message, so
+            # it is applied, never stored as chat — the target is a
+            # message this node sent, so it is not in the seen set
+            # the branch below checks.
+            return self._apply_relayed_dm_reaction(message)
         if self.mailbox.is_seen(message["id"]) or self._stored_dm_edit_target(
             message
         ):
@@ -10540,7 +10689,10 @@ class TauNode:
         cannot be reached is stored in the local outbox instead of
         being lost: the returned dict has ``queued: True`` and the
         reaction id, and the mail sweep delivers the same pre-signed
-        bytes when the peer is heard from again.  The local reaction
+        bytes when the peer is heard from again.  A queued DM
+        reaction also rides the sealed relay: the sweep deposits a
+        reaction leg with a holder, so an offline peer gets it from a
+        holder; group reactions stay direct-only.  The local reaction
         is recorded when the reaction is delivered, not at queue time,
         so the reactor's own copy only ever shows a reaction that
         actually landed.  An explicit refusal (allow-list, block-list)
