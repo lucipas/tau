@@ -3039,6 +3039,110 @@ def test_relayed_group_retract_refuses_non_author(tmp_path):
     assert recipient_node.inbox.resolve("leg-bob")["text"] == "crew hello"
 
 
+def test_relayed_group_retract_moderator_cancels_legs_on_retry(tmp_path):
+    """A failed cancellation defers the relayed moderator retract.
+
+    The creator's sealed retract reaches the author while a leg of
+    that post is still queued for an offline member.  If removing
+    the leg fails, the delivery raises DeliveryDeferredError and the
+    retract is not marked seen — so the held copy is retried instead
+    of dropped — and the retry, whose sent record is already gone,
+    still cancels the queued leg and records the sent-group marker.
+    """
+    (tmp_path / "author").mkdir()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    third = RNS.Identity()
+    third_hash = destination_hash(third).hex()
+    members = [author_hash, creator_hash, third_hash]
+
+    node = make_node(tmp_path / "author")
+    node.identity = author
+    node.destination = SimpleNamespace(
+        hexhash=author_hash, hash=destination_hash(author),
+    )
+    group_id = _pinned_group(node, members=members, creator=creator_hash)
+    group_context = {
+        "id": group_id,
+        "name": "crew",
+        "creator": creator_hash,
+        "members": list(members),
+    }
+    # The author's own sent copy of the moderated post, and a
+    # still-queued leg of it for the third member.
+    node.inbox.append(
+        {
+            "from": "author",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "leg_ids": ["m-10", "m-11"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.enqueue(
+        to=bytes.fromhex(third_hash),
+        text="crew hello",
+        message_id="m-11",
+        group=group_context,
+        sent_at=100.0,
+    )
+    assert node.mailbox.get_outbox("m-11") is not None
+
+    leg = seal_message(
+        creator,
+        sender_name="creator",
+        recipient_public_key=author.get_public_key(),
+        message_id="creator-leg-1",
+        text="retraction",
+        sent_at=200.0,
+        kind="retract",
+        group=group_context,
+        retract={
+            "retract_id": "moderator-retract-1",
+            "target_author": author_hash,
+            "target_sent_at": 100.0,
+        },
+    )
+    message = open_message(author, leg)
+    seen_key = f"retract:{creator_hash}:moderator-retract-1"
+
+    # Fail the cancellation: the delivery defers, the retract is not
+    # marked seen, and the queued leg stays for the retry.
+    real_remove = node.mailbox.remove_outbox
+
+    def failing_remove(message_id, **kwargs):
+        raise OSError("disk full")
+
+    node.mailbox.remove_outbox = failing_remove
+    try:
+        with pytest.raises(DeliveryDeferredError):
+            node._deliver_collected(message)
+    finally:
+        node.mailbox.remove_outbox = real_remove
+    assert node.mailbox.get_outbox("m-11") is not None
+    assert node.mailbox.is_seen(seen_key) is False
+    assert node.mailbox.is_sent_group_retracted(group_id, 100.0) is False
+    # The sent copy was already deleted before the cancellation
+    # failed — the retry must handle the already-deleted record.
+    with pytest.raises(ValueError):
+        node.inbox.resolve("m-10")
+
+    # The retry cancels the queued leg and records the marker.
+    assert node._deliver_collected(message) is True
+    assert node.mailbox.get_outbox("m-11") is None
+    assert node.mailbox.is_sent_group_retracted(group_id, 100.0) is True
+    assert node.mailbox.is_seen(seen_key) is True
+
+
 def test_relayed_dm_edit_leg_lands_before_original(tmp_path):
     """An edited leg that beats its original still lands correctly.
 

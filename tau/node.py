@@ -9235,6 +9235,34 @@ class TauNode:
                 log.warning("on_retract callback failed", exc_info=True)
         return True
 
+    def _cancel_queued_group_send(
+        self, group_id: str, sent_at: float
+    ) -> None:
+        """Cancel this node's still-queued legs for one group send.
+
+        Removes every outbox leg for ``(group_id, sent_at)`` and
+        records the sent-group retraction marker, so a later sweep
+        cannot deliver the retracted post to members who were
+        offline.  Raises :class:`DeliveryDeferredError` when the
+        cancellation could not be persisted: the caller must then
+        leave the retract unmarked-seen, so a retry finishes the
+        cancellation instead of dropping the only copy of a
+        retract whose legs are still queued.
+        """
+        try:
+            for entry in self.mailbox.outbox_list():
+                if (
+                    entry.group_id == group_id
+                    and entry.wire_sent_at == sent_at
+                ):
+                    self.mailbox.remove_outbox(entry.id)
+            self.mailbox.record_sent_group_retraction(group_id, sent_at)
+        except Exception as exc:
+            raise DeliveryDeferredError(
+                f"could not cancel queued legs for group send "
+                f"{group_id[:8]}:{sent_at}: {exc}"
+            ) from exc
+
     def _apply_relayed_group_retract(
         self,
         message: Dict[str, Any],
@@ -9319,7 +9347,6 @@ class TauNode:
         # recheck must see a drop made by another process before
         # anything lands.
         removed = None
-        cancel_sent_at: Optional[float] = None
         with self.mailbox.transaction(), self.inbox.transaction():
             if held_id is not None and not self.mailbox.is_held(
                 held_id, to=held_to
@@ -9418,6 +9445,18 @@ class TauNode:
                         f"could not record relayed retraction for "
                         f"{target_id}: {exc}"
                     ) from exc
+                if moderator and target_author == own_hash:
+                    # The retracted post is this node's own send and
+                    # its sent record is already gone — a direct
+                    # retract, or an earlier relayed attempt that
+                    # deleted the copy before its cancellation
+                    # failed.  Cancel the still-queued legs here, so
+                    # a retry after a failed cancellation finishes
+                    # the job instead of returning with the legs
+                    # still deliverable.
+                    self._cancel_queued_group_send(
+                        group_id, float(target_sent_at)
+                    )
                 try:
                     self.mailbox.mark_seen(seen_key)
                 except OSError as exc:
@@ -9514,9 +9553,14 @@ class TauNode:
             if is_moderated and stored.get("direction") == "out":
                 # The moderated post is this node's own send: its
                 # queued legs would still deliver it to members who
-                # were offline, so they are cancelled after the
-                # transaction, exactly as the direct retract does.
-                cancel_sent_at = float(target_sent_at)
+                # were offline, so cancel them before the retract is
+                # marked seen — a failed cancellation defers the
+                # delivery (see _cancel_queued_group_send) instead
+                # of leaving the legs deliverable after the retract
+                # is already seen.
+                self._cancel_queued_group_send(
+                    group_id, float(target_sent_at)
+                )
             try:
                 self.mailbox.mark_seen(seen_key)
             except OSError as exc:
@@ -9533,18 +9577,6 @@ class TauNode:
                     seen_key,
                     exc,
                 )
-        if cancel_sent_at is not None:
-            # Cancel this node's still-queued original legs for the
-            # moderated post, and record the sent-group marker, as the
-            # direct retract does: otherwise the sweep could still send
-            # the removed post to members who were offline.
-            for entry in self.mailbox.outbox_list():
-                if (
-                    entry.group_id == group_id
-                    and entry.wire_sent_at == cancel_sent_at
-                ):
-                    self.mailbox.remove_outbox(entry.id)
-            self.mailbox.record_sent_group_retraction(group_id, cancel_sent_at)
         # The retract is recorded; a failed fan-out only means the
         # live console missed this update, exactly as on the direct
         # path — the console reseeds from the inbox.
