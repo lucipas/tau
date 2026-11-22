@@ -154,6 +154,7 @@ from .group_invites import (
     JOIN_REQUEST_KIND,
     InviteError,
     invite_status,
+    invite_token_group_label,
     mint_invite,
     parse_invite_link,
     revoke_invites,
@@ -20128,6 +20129,13 @@ def cmd_group_invite(args: argparse.Namespace) -> int:
         group_name=group["name"],
         creator_hash=own_hash,
         mode=mode,
+        # A secret group's link names the group by its opaque id,
+        # never by name — anyone holding it learns nothing about
+        # the group.
+        group_id=group["id"] if group.get("secret") else None,
+        group_created_at=(
+            group.get("created_at") if group.get("secret") else None
+        ),
     )
     stored = invite_status(config.invites_path, group_name=group["name"])
     if _json_mode(args):
@@ -20143,6 +20151,8 @@ def cmd_group_invite(args: argparse.Namespace) -> int:
         return _EXIT_OK
     print(f"invite link for {group['name']} ({group['id'][:8]}), {mode} group:")
     print(link)
+    if group.get("secret"):
+        print("The link names the group by its opaque id, not by name.")
     if mode == "closed":
         print("Invitees ask to join; review them with `tau group requests`.")
     else:
@@ -20195,7 +20205,10 @@ def cmd_group_join(args: argparse.Namespace) -> int:
     result = results[0]
     if result.get("queued"):
         if _json_mode(args):
-            _emit({"status": "queued", "group": token["group"]}, True)
+            _emit(
+                {"status": "queued", "group": invite_token_group_label(token)},
+                True,
+            )
             return _EXIT_OK
         print(
             "Join request queued — the creator was unreachable."

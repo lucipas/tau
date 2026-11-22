@@ -18139,6 +18139,37 @@ def test_group_join_endpoint_joins_from_link(bridge, node, monkeypatch, tmp_path
     assert "field 'link'" in payload["error"]["message"]
 
 
+def test_group_join_endpoint_queued_id_link_reports_id(bridge, node, monkeypatch, tmp_path):
+    from tau.group_invites import mint_invite
+    from tau.identity import destination_hash
+
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    own_hash = _seed_own_identity(node)
+    # An id-keyed link for a secret group: the queued reply must
+    # report the opaque id, not raise on the missing group name.
+    link = mint_invite(
+        tmp_path / "invites.json",
+        creator,
+        group_name="remote-crew",
+        creator_hash=creator_hash,
+        mode="open",
+        group_id="cd" * 16,
+        group_created_at=1000.0,
+    )
+
+    def fake_send(target, text, **kwargs):
+        return {"queued": True, "id": "mail-new-1"}
+
+    monkeypatch.setattr(node, "send_message", fake_send)
+    status, _, payload = _json(
+        bridge, "/api/groups/join", method="POST", body={"link": link}
+    )
+    assert status == 200
+    assert payload["status"] == "queued"
+    assert payload["group"] == "cd" * 16
+
+
 def test_join_request_endpoints_validate_fields(bridge, node):
     status, _, payload = _json(
         bridge,
