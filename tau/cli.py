@@ -16203,6 +16203,18 @@ def _message_peer_label(registry: PeerRegistry, entry: Dict[str, Any]) -> str:
     return f"from {name}"
 
 
+def _print_entry_reactions(registry: PeerRegistry, entry: Dict[str, Any]) -> None:
+    """Print one line per reaction on a stored message, reactor named."""
+    for reaction in entry.get("reactions") or []:
+        reactor = registry.get(str(reaction.get("destination") or ""))
+        reactor_name = (
+            reactor.display_name
+            if reactor is not None
+            else str(reaction.get("from") or "unknown")
+        )
+        print(f"  {reaction.get('reaction')} {reactor_name}")
+
+
 def _print_message_entry(
     inbox: Inbox,
     registry: PeerRegistry,
@@ -16265,12 +16277,17 @@ def _print_message_entry(
         )
         if forwarded_from is not None:
             print(f"  forwarded from {forwarded_from['name']}")
+        sha = str(entry.get("sha256") or "")
+        # The show view names the whole stored checksum for an integrity
+        # comparison; a listing keeps the abbreviated one.
+        shown_sha = sha if full_id else short_hash(sha, 12)
         print(
             f"  file: {entry.get('name')} "
             f"({entry.get('size')} bytes, "
-            f"sha256 {short_hash(str(entry.get('sha256') or ''), 12)})"
+            f"sha256 {shown_sha})"
         )
         print(f"  saved to {entry.get('path')}")
+        _print_entry_reactions(registry, entry)
         return
     quote = _quote_line(inbox, registry, entry, blocked=blocked, own_hash=own_hash)
     if quote is not None:
@@ -16316,14 +16333,7 @@ def _print_message_entry(
         total = poll.get("total", 0)
         closed = " (closed)" if poll.get("closed") else ""
         print(f"  {total} voter(s) total{closed}")
-    for reaction in entry.get("reactions") or []:
-        reactor = registry.get(str(reaction.get("destination") or ""))
-        reactor_name = (
-            reactor.display_name
-            if reactor is not None
-            else str(reaction.get("from") or "unknown")
-        )
-        print(f"  {reaction.get('reaction')} {reactor_name}")
+    _print_entry_reactions(registry, entry)
     entry_expires_at = entry.get("expires_at")
     if isinstance(entry_expires_at, (int, float)) and float(entry_expires_at) > time.time():
         print(f"  disappears in {_ago(float(entry_expires_at) - time.time())}")
@@ -16762,6 +16772,23 @@ def cmd_messages_show(args: argparse.Namespace) -> int:
         entry = inbox.resolve(args.target)
     except (ValueError, InboxError) as exc:
         raise NodeError(str(exc)) from exc
+    # Blocked senders' stored messages stay hidden here too, exactly as
+    # the listing hides them; an unreadable block-list hides every
+    # received message.  Sent messages are never filtered by sender.
+    blocked = load_blocked_set(config.blocklist_path)
+    if entry.get("direction") != "out" and (
+        blocked is None or entry.get("destination") in blocked
+    ):
+        raise NodeError(f"no message matches {args.target!r}")
+    # Conversation state the listing applies before it derives unread
+    # flags: a corrupt mutes file fails open (unmuted, with a warning),
+    # and quiet hours silence every conversation at once.
+    muted_peers = muted_peers_for(config.muted_path)
+    muted_groups = expand_muted_groups(
+        muted_groups_for(config.muted_path),
+        GroupStore(config.groups_path).list_groups(),
+    )
+    quiet = quiet_hours_active(config.quiet_hours_path)
     # The listing's derived view carries the unread flag and the
     # reaction list; the raw record does not.  Resolve first so a
     # prefix or leg id names the message, then take that record's
@@ -16770,7 +16797,13 @@ def cmd_messages_show(args: argparse.Namespace) -> int:
     view = next(
         (
             item
-            for item in inbox.list_messages(limit=None, direction=None)
+            for item in inbox.list_messages(
+                limit=None,
+                direction=None,
+                exclude_dm_from=muted_peers,
+                exclude_group=muted_groups,
+                quiet=quiet,
+            )
             if item.get("id") == entry.get("id")
         ),
         None,
@@ -16810,14 +16843,6 @@ def cmd_messages_show(args: argparse.Namespace) -> int:
         # list follows, and the warning surfaces the corruption.
         log.warning("Starred-message list is unusable (%s); showing unsaved", exc)
         saved = False
-    # Conversation state, mirroring the listing's own lookups: a
-    # corrupt mutes file fails open (unmuted, with a warning), never
-    # breaking the show.
-    muted_peers = muted_peers_for(config.muted_path)
-    muted_groups = expand_muted_groups(
-        muted_groups_for(config.muted_path),
-        GroupStore(config.groups_path).list_groups(),
-    )
     is_group = shown.get("kind") == "group"
     if is_group:
         group_id = str(shown.get("group") or "")
@@ -16840,7 +16865,6 @@ def cmd_messages_show(args: argparse.Namespace) -> int:
             payload["archived"] = archived
         _emit({"message": payload}, True)
         return _EXIT_OK
-    blocked = load_blocked_set(config.blocklist_path)
     _print_message_entry(
         inbox, registry, shown, blocked=blocked, own_hash=own_hash, full_id=True
     )
