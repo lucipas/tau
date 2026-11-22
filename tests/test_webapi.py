@@ -14278,6 +14278,7 @@ def test_tan_reply_via_api(tmp_path):
             "hash": post["hash"],
             "author": post["author"],
             "name": "tester",
+            "kind": "post",
             "text": "api thread starter",
             "deleted": False,
             "edited": False,
@@ -14534,6 +14535,7 @@ def test_tan_quote_via_api(tmp_path):
             "hash": post["hash"],
             "author": post["author"],
             "name": "tester",
+            "kind": "post",
             "text": "api quotable",
             "deleted": False,
         }

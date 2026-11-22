@@ -6112,6 +6112,7 @@ def test_repost_chains_verifies_and_annotates(identities, tmp_path):
         "hash": post["hash"],
         "author": post["author"],
         "name": "alice",
+        "kind": "post",
         "text": "original thought",
         "deleted": False,
     }
@@ -6241,6 +6242,7 @@ def test_repost_of_expired_original_blanks_the_text(identities, tmp_path):
         "hash": post["hash"],
         "author": post["author"],
         "name": "alice",
+        "kind": "post",
         "text": "",
         "deleted": False,
         "expired": True,
@@ -6496,6 +6498,7 @@ def test_quote_chains_verifies_and_annotates(identities, tmp_path):
         "hash": post["hash"],
         "author": post["author"],
         "name": "alice",
+        "kind": "post",
         "text": "original thought",
         "deleted": False,
     }
@@ -6730,6 +6733,7 @@ def test_quote_of_blocked_post_renders_redacted(identities, tmp_path):
         "hash": post["hash"],
         "author": "",
         "name": "",
+        "kind": "post",
         "text": "",
         "deleted": False,
         "blocked": True,
