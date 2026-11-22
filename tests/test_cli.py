@@ -12805,7 +12805,13 @@ class _FakeRetractNode:
         self.started = False
 
     def send_retraction(
-        self, target, message_id, *, timeout=20.0, discover_timeout=None
+        self,
+        target,
+        message_id,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        queue=True,
     ):
         self.sent.append((target, message_id))
         return {"ok": True, "target": message_id, "deleted": True, "id": "r-1"}
@@ -12848,7 +12854,13 @@ def test_retract_reports_when_the_peer_had_no_copy(
 
     class _NoCopyNode(_FakeRetractNode):
         def send_retraction(
-            self, target, message_id, *, timeout=20.0, discover_timeout=None
+            self,
+            target,
+            message_id,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            queue=True,
         ):
             self.sent.append((target, message_id))
             return {"ok": True, "target": message_id, "deleted": False, "id": "r-1"}
@@ -13589,7 +13601,7 @@ def test_retract_refuses_a_queued_message(tmp_path, capsys, monkeypatch):
     assert _FakeRetractNode.instances == []
 
 
-def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
+def test_retract_reports_a_failed_retract(tmp_path, capsys, monkeypatch):
     data_dir, recipient_hash = _seed_sent_message(tmp_path)
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
     Mailbox(config.mailbox_path).record_sent(
@@ -13598,7 +13610,13 @@ def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
 
     class _OfflineNode(_FakeRetractNode):
         def send_retraction(
-            self, target, message_id, *, timeout=20.0, discover_timeout=None
+            self,
+            target,
+            message_id,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            queue=True,
         ):
             raise cli.NodeError("no path to peer")
 
@@ -13609,11 +13627,54 @@ def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
     assert code == cli._EXIT_ERROR
     err = capsys.readouterr().err
     assert "could not deliver retract" in err
-    assert "online" in err
     # The failed retract leaves the local sent copy in place.
     inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
     assert len(inbox.list_messages(direction="out")) == 1
     assert len(Mailbox(config.mailbox_path).sent_list()) == 1
+
+
+def test_retract_queues_for_offline_peer(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
+
+    class _QueuedNode(_FakeRetractNode):
+        def send_retraction(
+            self,
+            target,
+            message_id,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            queue=True,
+        ):
+            assert queue is True
+            self.sent.append((target, message_id))
+            return {
+                "ok": False,
+                "queued": True,
+                "target": message_id,
+                "id": "x-1",
+                "queued_id": "q-1",
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _QueuedNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-9"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "queued" in out
+    assert "reachable" in out
+    # The queued retract leaves the local copies in place until the
+    # sweep delivers it: the sender's history only ever loses a
+    # message that actually landed.
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    assert len(inbox.list_messages(direction="out")) == 1
+    assert len(Mailbox(config.mailbox_path).sent_list()) == 1
+    assert Mailbox(config.mailbox_path).is_sent_retracted("m-9") is False
 
 
 class _FakeGroupStore:

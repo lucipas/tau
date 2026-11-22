@@ -1197,6 +1197,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
+    retract.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the retract when the peer is offline",
+    )
     retract.set_defaults(func=cmd_retract)
 
     vote = subparsers.add_parser(
@@ -12075,8 +12080,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def on_retract(record: Dict[str, Any]) -> None:
             # The node already deleted the inbox record; drop the
             # console's own copy so a retracted DM leaves the feed
-            # and never comes back after a restart.
-            bridge.delete_by_wire_id(str(record.get("id") or ""))
+            # and never comes back after a restart.  A queued retract
+            # deletes this node's own sent copy, so the dispatch
+            # (inbound vs sent) lives in _drop_retracted_console_copy.
+            _drop_retracted_console_copy(bridge, record)
 
         node.on_retract = on_retract
     # The data-directory lock is the more specific guard, so probe it
@@ -13999,6 +14006,7 @@ def _retract_local_message(
     message_id: str,
     timeout: float = 20.0,
     discover_timeout: Optional[float] = None,
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Retract one DM on the running node, for the local send server."""
     return node.send_retraction(
@@ -14006,6 +14014,7 @@ def _retract_local_message(
         message_id,
         timeout=float(timeout),
         discover_timeout=discover_timeout,
+        queue=bool(queue),
     )
 
 
@@ -14197,6 +14206,31 @@ def _dispatch_local_send(
     if op == "group_send":
         return _send_group_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
+
+
+def _drop_retracted_console_copy(bridge: Any, record: Any) -> None:
+    """Drop the serving console's entry for one retracted DM.
+
+    The node already deleted the inbox record; this drops the
+    console's own copy so a retracted DM leaves the feed and never
+    comes back after a restart.  A record this node sent goes
+    through the sent side — ``delete_by_wire_id`` only matches
+    inbound entries, so a queued retract's outbound bubble would
+    otherwise stay until the next restart.  Best-effort: a console
+    that cannot drop its copy leaves the retract itself untouched.
+    """
+    if bridge is None:
+        return
+    wire_id = str(record.get("id") or "") if isinstance(record, dict) else ""
+    if not wire_id:
+        return
+    try:
+        if record.get("direction") == "out":
+            bridge.delete_sent_by_wire_id(wire_id)
+        else:
+            bridge.delete_by_wire_id(wire_id)
+    except Exception:  # pragma: no cover - console callback
+        log.warning("could not drop retracted message from console", exc_info=True)
 
 
 def _drop_sent_console_copy(bridge: Any, message_id: Any) -> None:
@@ -14454,6 +14488,7 @@ def _retract_via_running_node(
     *,
     timeout: float,
     discover_timeout: Optional[float],
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Retract through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -14467,6 +14502,7 @@ def _retract_via_running_node(
             message_id=message_id,
             timeout=timeout,
             discover_timeout=discover_timeout,
+            queue=queue,
         )
     except LocalIPCUnavailable as exc:
         raise NodeError(
@@ -22842,6 +22878,7 @@ def cmd_retract(args: argparse.Namespace) -> int:
         )
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    queue = not getattr(args, "no_queue", False)
     via_running_node = _send_routes_via_running_node(config)
     if via_running_node:
         # A serving node owns the data directory: retract through it
@@ -22855,15 +22892,13 @@ def cmd_retract(args: argparse.Namespace) -> int:
                 str(target["id"]),
                 timeout=timeout,
                 discover_timeout=discover_timeout,
+                queue=queue,
             )
         except NodeError as exc:
-            # Retracts ride the live link only in v1 — there is no
-            # outbox queue for them yet — so an unreachable peer is a
-            # plain failure, not a silent queue.
-            raise NodeError(
-                f"could not deliver retract: {exc} "
-                "(retracts need the peer online in v1)"
-            ) from exc
+            # With queueing on, a transport failure returns a queued
+            # result instead of raising; only a refusal or a
+            # --no-queue failure reaches here.
+            raise NodeError(f"could not deliver retract: {exc}") from exc
     else:
         node = TauNode(config, name=config.name)
         node.start()
@@ -22874,17 +22909,39 @@ def cmd_retract(args: argparse.Namespace) -> int:
                     str(target["id"]),
                     timeout=timeout,
                     discover_timeout=discover_timeout,
+                    queue=queue,
                 )
             except NodeError as exc:
-                # Retracts ride the live link only in v1 — there is no
-                # outbox queue for them yet — so an unreachable peer is a
-                # plain failure, not a silent queue.
-                raise NodeError(
-                    f"could not deliver retract: {exc} "
-                    "(retracts need the peer online in v1)"
-                ) from exc
+                # With queueing on, a transport failure returns a queued
+                # result instead of raising; only a refusal or a
+                # --no-queue failure reaches here.
+                raise NodeError(f"could not deliver retract: {exc}") from exc
         finally:
             node.stop()
+
+    if response.get("queued"):
+        # The retract is stored, not delivered: the local copies stay
+        # until the sweep delivers it, so the sender's history only
+        # ever loses a message that actually landed.
+        peer = registry.get(recipient)
+        name = peer.display_name if peer is not None else short_hash(recipient)
+        if _json_mode(args):
+            _emit(
+                {
+                    "target": target["id"],
+                    "to": recipient,
+                    "to_name": name,
+                    "queued": True,
+                    "id": response.get("id"),
+                    "queued_id": response.get("queued_id"),
+                },
+                True,
+            )
+        else:
+            print(
+                f"retraction queued — will deliver when {name} is reachable"
+            )
+        return _EXIT_OK
 
     # The peer confirmed (or already had it gone): drop this node's own
     # sent copy too, so the message is gone on both sides.  A local

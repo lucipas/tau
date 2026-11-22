@@ -875,7 +875,26 @@ identity and verified by the receiver against the link identity, like a
 reaction, and the receiver only deletes a message the caller actually
 sent: a retract from anyone else fails with `not_sender`, and a retract
 for an id the receiver never held answers ok with nothing deleted, so
-retries are safe. A retract also leaves a marker keyed by (sender,
+retries are safe. A retract to an offline peer is queued instead of
+failing: it is stored in the outbox and the mail sweep delivers the
+same pre-signed bytes when the peer is heard from again, on the same
+backoff and 7-day TTL as a queued message. The sender's own copies go
+on delivery, not at queue time, so your history only ever loses a
+message that actually landed, and `tau retract --no-queue` keeps the
+old fail-fast behavior. An explicit refusal (allow-list, block-list,
+not-a-member) is final and is never queued. Queued DM retracts ride
+the sealed relay too: the sweep deposits one as a retract leg of the
+target message, so an offline peer gets it from a holder; group
+retracts still ride direct delivery only, and no retract is sealed
+into a bundle or sent over LXMF. Two limits of the relay path: a
+retract the peer collects from a holder has no acknowledgement back
+to the sender, so the sender's own copies and the queued leg stay
+until the peer connects directly and confirms, or the leg expires —
+the recipient's copy is gone, but the sender's history keeps the
+message until then. And relayed retracts need the recipient on this
+version or newer: an older peer has no retract branch and stores the
+leg's display text as a chat message under the target id. A retract
+also leaves a marker keyed by (sender,
 message id) that lives for the message's delivery lifetime (7 days),
 unless the marker cap is reached first — at the cap the
 earliest-expiry markers are evicted, even unexpired ones — so a

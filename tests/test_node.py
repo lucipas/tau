@@ -804,6 +804,130 @@ def test_send_reaction_refusal_is_not_queued(tmp_path, monkeypatch):
     assert node.inbox.reactions_for("m-1") == []
 
 
+def _retract_node(tmp_path):
+    """A node with a signing identity, started enough to queue, and one sent DM."""
+    import types
+
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    node.identity = identity
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    node.destination = types.SimpleNamespace(hexhash=own_hash)
+    node.reticulum = object()  # started enough to queue
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    node.inbox.append(
+        {
+            "from": "tester",
+            "destination": peer.hexhash,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+    return node, peer
+
+
+def test_send_retraction_queues_for_offline_peer(tmp_path, monkeypatch):
+    from tau.protocol import REQUEST_RETRACT, parse_retract
+
+    node, peer = _retract_node(tmp_path)
+    retracted = []
+    node.on_retract = retracted.append
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_retraction("alice", "m-1")
+
+    assert response["queued"] is True
+    assert response["id"]
+    assert response["target"] == "m-1"
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "retract"
+    assert entry.to == peer.destination_hash
+    assert entry.retract["target"] == "m-1"
+    assert entry.retract["retract_id"] == response["id"]
+    # The sender's own copy stays until the retract delivers.
+    assert node.inbox.resolve("m-1")["text"] == "hello"
+    assert retracted == []
+    # The retry re-sends the identical signed bytes.
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        sent["payload"] = payload
+        assert path == REQUEST_RETRACT
+        return {"ok": True, "deleted": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(peer, entry, 1.0) is True
+    payload = parse_retract(sent["payload"])
+    assert payload["target"] == "m-1"
+    assert payload["id"] == response["id"]
+    assert node.mailbox.outbox_list() == []
+    # Delivery drops the sender's own copies too, and records the
+    # sent-retraction marker so the console drops its copy as well.
+    with pytest.raises(ValueError):
+        node.inbox.resolve("m-1")
+    assert node.mailbox.is_sent_retracted("m-1")
+    assert len(retracted) == 1
+    assert retracted[0]["id"] == "m-1"
+
+
+def test_send_retraction_no_queue_raises_for_offline_peer(tmp_path, monkeypatch):
+    node, _ = _retract_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    with pytest.raises(NodeError, match="no route to peer"):
+        node.send_retraction("alice", "m-1", queue=False)
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "hello"
+
+
+def test_send_retraction_refusal_is_not_queued(tmp_path, monkeypatch):
+    node, _ = _retract_node(tmp_path)
+
+    def denied(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", denied)
+    with pytest.raises(NotAllowedError):
+        node.send_retraction("alice", "m-1")
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "hello"
+
+
+def test_deliver_queued_retract_drops_refused_leg(tmp_path, monkeypatch):
+    node, peer = _retract_node(tmp_path)
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    node.send_retraction("alice", "m-1")
+    entry = node.mailbox.outbox_list()[0]
+
+    def refused(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", refused)
+    assert node._deliver_entry(peer, entry, 1.0) is False
+    # A refusal is final: the leg is dropped, not held until its TTL —
+    # and the sender's own copy stays, since the retract never landed.
+    assert node.mailbox.outbox_list() == []
+    assert node.inbox.resolve("m-1")["text"] == "hello"
+
+
 def test_send_reaction_not_a_member_is_not_queued(tmp_path, monkeypatch):
     node, _ = _reaction_node(tmp_path)
 
