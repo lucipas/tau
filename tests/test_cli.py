@@ -9293,11 +9293,11 @@ def test_channel_show_text_json_and_errors(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "#general" in out
     assert "joined: yes" in out
-    assert "topic: none" in out
+    assert "topic: no topic set" in out
     assert "messages: 0 cached messages, 0 unread" in out
     assert "pinned messages: 0 messages" in out
     assert "conversation pinned: no" in out
-    assert "last message: none" in out
+    assert "last message: no messages yet" in out
 
     # Two messages from a peer, a topic, and a pin on the first.
     conn = init_channel_db(data_dir / "channels.sqlite3")
@@ -9319,6 +9319,7 @@ def test_channel_show_text_json_and_errors(tmp_path, capsys):
     assert "last message:" in out
     assert "bob" in out
     assert "second hello" in out
+    assert "ago:" in out
 
     assert _run_channel(tmp_path, "show", "general", "--json") == 0
     payload = json.loads(capsys.readouterr().out)["channel"]
@@ -9344,6 +9345,65 @@ def test_channel_show_text_json_and_errors(tmp_path, capsys):
     code = _run_channel(tmp_path, "show", "never-joined")
     assert code == 2
     assert "unknown channel" in capsys.readouterr().err
+
+
+def test_channel_show_pages_past_blocked_messages(tmp_path, capsys):
+    # Qodo #681 finding 1: the newest page must not be the whole
+    # story — fifty blocked messages on top must not hide the one
+    # older visible message behind them.
+    from tau.channels import create_message, init_db as init_channel_db
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+    conn = init_channel_db(data_dir / "channels.sqlite3")
+    try:
+        carol = RNS.Identity()
+        create_message(conn, carol, "general", "still here", name="carol")
+        bob = RNS.Identity()
+        for index in range(50):
+            create_message(conn, bob, "general", f"noise {index}", name="bob")
+    finally:
+        conn.close()
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    save_blocklist(
+        config.blocklist_path,
+        BlockList(blocked=frozenset({destination_hash(bob).hex()})),
+    )
+    assert _run_channel(tmp_path, "show", "general") == 0
+    out = capsys.readouterr().out
+    assert "still here" in out
+    assert "noise" not in out
+
+
+def test_channel_show_left_topic_only_channel_with_blocked_setter(
+    tmp_path, capsys
+):
+    # Qodo #681 finding 3: a left channel with a topic but no
+    # messages still exists even when the topic setter is blocked —
+    # the stored topic row, not the filtered view, decides.
+    from tau.channels import create_topic, init_db as init_channel_db
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+    conn = init_channel_db(data_dir / "channels.sqlite3")
+    try:
+        bob = RNS.Identity()
+        create_topic(conn, bob, "general", "weekly planning")
+    finally:
+        conn.close()
+    assert _run_channel(tmp_path, "leave", "general") == 0
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    save_blocklist(
+        config.blocklist_path,
+        BlockList(blocked=frozenset({destination_hash(bob).hex()})),
+    )
+    assert _run_channel(tmp_path, "show", "general") == 0
+    out = capsys.readouterr().out
+    assert "joined: no" in out
+    assert "topic: no topic set" in out
 
 
 def _seed_channel_poll_conversation(tmp_path):
