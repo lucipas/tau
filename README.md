@@ -1226,7 +1226,10 @@ unlinked, and stall sync at the gap.
   The group id is derived from the creator, name and roster, so a roster
   cannot be forked under an existing id; a peer can still invent a fresh
   group that includes you, gated by the DM allow-list like a direct message.
-  Members learn a group from the first message sent to it, and the console
+  A secret group (`tau group create NAME --peer ... --secret`) gets an opaque
+  random id instead, bound to its name and roster by a creator-signed roster
+  attestation that members verify and pin on first sight — same anti-fork
+  rule, without the id committing to the roster. Members learn a group from the first message sent to it, and the console
   is read-only for groups — composing from the console comes later.
   Manage groups with `tau group create NAME --peer ...`, `tau group list`,
   `tau group show GROUP` (full id, creator, members, bans, flags),

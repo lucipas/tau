@@ -37,7 +37,10 @@ from tau.protocol import (
     encode,
     encode_group_message,
     generate_group_id,
+    mint_roster_attestation,
     parse_group_message,
+    roster_attestation_matches,
+    verify_roster_attestation,
 )
 
 OWN_HASH = "ab" * 16
@@ -2823,6 +2826,240 @@ def test_group_store_survives_reload_and_drops_corrupt(tmp_path):
     assert [item["id"] for item in reloaded.list_groups()] == [group["id"]]
 
 
+# -- secret groups (#697) -----------------------------------------------------
+
+
+def _secret_store_fixture(tmp_path):
+    """A store holding a secret group created by a fresh identity."""
+    creator = RNS.Identity()
+    member = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    member_hash = destination_hash(member).hex()
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create(
+        "weekend",
+        [creator_hash, member_hash],
+        created_by=creator_hash,
+        secret=True,
+        identity=creator,
+    )
+    return store, creator, member, creator_hash, member_hash, group
+
+
+def test_group_store_create_secret_mints_opaque_id(tmp_path):
+    store, creator, _, creator_hash, member_hash, group = _secret_store_fixture(
+        tmp_path
+    )
+    members = sorted([creator_hash, member_hash])
+    assert group["secret"] is True
+    assert group["id"] != derive_group_id(creator_hash, "weekend", members)
+    assert verify_roster_attestation(group["roster_attestation"]) is not None
+    assert roster_attestation_matches(
+        group["roster_attestation"],
+        group_id=group["id"],
+        name="weekend",
+        creator=creator_hash,
+        members=members,
+    )
+    # A second secret group is a different group: no id can be re-derived.
+    other = store.create(
+        "weekend",
+        [creator_hash, member_hash],
+        created_by=creator_hash,
+        secret=True,
+        identity=creator,
+    )
+    assert other["id"] != group["id"]
+    assert other["secret"] is True
+    # Legacy groups are untouched by the secret path.
+    legacy = store.create(
+        "weekend", [creator_hash, member_hash], created_by=creator_hash
+    )
+    assert legacy["id"] == derive_group_id(creator_hash, "weekend", members)
+    assert legacy["secret"] is False
+    assert legacy["roster_attestation"] is None
+
+
+def test_group_store_create_secret_needs_creator_identity(tmp_path):
+    creator = RNS.Identity()
+    member = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    member_hash = destination_hash(member).hex()
+    store = GroupStore(tmp_path / "groups.json")
+    with pytest.raises(ValueError, match="needs the creator identity"):
+        store.create(
+            "weekend",
+            [creator_hash, member_hash],
+            created_by=creator_hash,
+            secret=True,
+        )
+    with pytest.raises(ValueError, match="invalid group"):
+        store.create(
+            "weekend",
+            [creator_hash, member_hash],
+            created_by=creator_hash,
+            secret=True,
+            identity=member,
+        )
+
+
+def test_group_store_secret_survives_reload(tmp_path):
+    store, _, _, _, _, group = _secret_store_fixture(tmp_path)
+    reloaded = GroupStore(tmp_path / "groups.json")
+    again = reloaded.get(group["id"])
+    assert again is not None
+    assert again["secret"] is True
+    assert again["roster_attestation"] == group["roster_attestation"]
+    assert again["members"] == group["members"]
+
+
+def test_group_store_secret_update_members_rotates_id(tmp_path):
+    store, creator, _, creator_hash, member_hash, group = _secret_store_fixture(
+        tmp_path
+    )
+    third = RNS.Identity()
+    third_hash = destination_hash(third).hex()
+    with pytest.raises(ValueError, match="needs the creator identity"):
+        store.update_members(
+            group["id"],
+            [creator_hash, member_hash, third_hash],
+            created_by=creator_hash,
+        )
+    grown = store.update_members(
+        group["id"],
+        [creator_hash, member_hash, third_hash],
+        created_by=creator_hash,
+        identity=creator,
+    )
+    assert grown["id"] != group["id"]
+    assert grown["secret"] is True
+    assert grown["members"] == sorted([creator_hash, member_hash, third_hash])
+    assert roster_attestation_matches(
+        grown["roster_attestation"],
+        group_id=grown["id"],
+        name="weekend",
+        creator=creator_hash,
+        members=grown["members"],
+    )
+    assert store.get(group["id"]) is None
+    # The same roster again is a no-op: the id and attestation stay.
+    assert (
+        store.update_members(
+            grown["id"],
+            [third_hash, creator_hash, member_hash],
+            created_by=creator_hash,
+            identity=creator,
+        )
+        == grown
+    )
+
+
+def test_group_store_secret_rename_rotates_id(tmp_path):
+    store, creator, _, creator_hash, _, group = _secret_store_fixture(tmp_path)
+    with pytest.raises(ValueError, match="needs the creator identity"):
+        store.rename(group["id"], "renamed", created_by=creator_hash)
+    renamed = store.rename(
+        group["id"], "renamed", created_by=creator_hash, identity=creator
+    )
+    assert renamed["id"] != group["id"]
+    assert renamed["name"] == "renamed"
+    assert renamed["secret"] is True
+    assert roster_attestation_matches(
+        renamed["roster_attestation"],
+        group_id=renamed["id"],
+        name="renamed",
+        creator=creator_hash,
+        members=renamed["members"],
+    )
+    assert store.get(group["id"]) is None
+    # Renaming to the same name is a no-op.
+    assert (
+        store.rename(
+            renamed["id"], "renamed", created_by=creator_hash, identity=creator
+        )
+        == renamed
+    )
+
+
+def test_group_store_secret_ban_rotates_id(tmp_path):
+    store, creator, _, creator_hash, member_hash, group = _secret_store_fixture(
+        tmp_path
+    )
+    third = RNS.Identity()
+    third_hash = destination_hash(third).hex()
+    grown = store.update_members(
+        group["id"],
+        [creator_hash, member_hash, third_hash],
+        created_by=creator_hash,
+        identity=creator,
+    )
+    with pytest.raises(ValueError, match="needs the creator identity"):
+        store.ban(grown["id"], third_hash, created_by=creator_hash)
+    banned = store.ban(
+        grown["id"], third_hash, created_by=creator_hash, identity=creator
+    )
+    assert banned["id"] != grown["id"]
+    assert banned["secret"] is True
+    assert banned["members"] == sorted([creator_hash, member_hash])
+    assert third_hash in (banned["banned"] or [])
+
+
+def test_group_store_record_pins_secret_attestation(tmp_path):
+    _, creator, member, creator_hash, member_hash, group = _secret_store_fixture(
+        tmp_path
+    )
+    members = sorted([creator_hash, member_hash])
+    store = GroupStore(tmp_path / "learned.json")
+    pinned = store.record(
+        group["id"],
+        "weekend",
+        members,
+        creator=creator_hash,
+        sender=creator_hash,
+        sent_at=100.0,
+        roster_attestation=group["roster_attestation"],
+    )
+    assert pinned is not None
+    assert pinned["secret"] is True
+    assert pinned["roster_attestation"] == group["roster_attestation"]
+    # A forked roster for the same id is refused, even with a valid
+    # attestation minted for the forked roster: the pin wins.
+    forked_attestation = mint_roster_attestation(
+        creator,
+        group_id=group["id"],
+        name="weekend",
+        creator=creator_hash,
+        members=sorted([creator_hash, "12" * 16]),
+    )
+    assert (
+        store.record(
+            group["id"],
+            "weekend",
+            sorted([creator_hash, "12" * 16]),
+            creator=creator_hash,
+            sender=creator_hash,
+            sent_at=101.0,
+            roster_attestation=forked_attestation,
+        )
+        is None
+    )
+    # A tampered attestation pins nothing.
+    assert (
+        store.record(
+            generate_group_id(),
+            "weekend",
+            members,
+            creator=creator_hash,
+            sender=creator_hash,
+            sent_at=102.0,
+            roster_attestation=dict(
+                group["roster_attestation"], name="other"
+            ),
+        )
+        is None
+    )
+
+
 # -- handler ----------------------------------------------------------------
 
 
@@ -2861,6 +3098,143 @@ def test_group_message_delivered_and_group_pinned(tmp_path):
     assert pinned is not None and pinned["members"] == sorted(members)
     assert pinned["name"] == "weekend"
     assert pinned["creator"] == sender_hash
+
+
+def _secret_handler_fixture(tmp_path):
+    """A node plus a secret group it belongs to (as OWN_HASH)."""
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = sorted([OWN_HASH, creator_hash, member_hash])
+    group_id = generate_group_id()
+    attestation = mint_roster_attestation(
+        creator,
+        group_id=group_id,
+        name="weekend",
+        creator=creator_hash,
+        members=members,
+    )
+    return node, received, creator, member, creator_hash, member_hash, members, group_id, attestation
+
+
+def _secret_leg(node, sender, text, *, message_id, group_id, group_name,
+                creator_hash, members, attestation, sent_at=123.0):
+    return call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            text,
+            message_id=message_id,
+            group_id=group_id,
+            group_name=group_name,
+            creator=creator_hash,
+            members=members,
+            sent_at=sent_at,
+            roster_attestation=attestation,
+        ),
+        remote_identity=sender,
+    )
+
+
+def test_secret_group_message_delivered_and_group_pinned(tmp_path):
+    (node, received, creator, member, creator_hash, member_hash,
+     members, group_id, attestation) = _secret_handler_fixture(tmp_path)
+    response = _secret_leg(
+        node, member, "hi all",
+        message_id="gm-secret-1",
+        group_id=group_id,
+        group_name="weekend",
+        creator_hash=creator_hash,
+        members=members,
+        attestation=attestation,
+    )
+    assert response["ok"] is True
+    assert response["group"] == group_id
+    assert len(received) == 1
+    assert received[0]["kind"] == "group"
+    assert received[0]["group"] == group_id
+    pinned = node.groups.get(group_id)
+    assert pinned is not None
+    assert pinned["secret"] is True
+    assert pinned["members"] == members
+    assert pinned["roster_attestation"] == attestation
+    # A member cannot fork the opaque id onto a different roster:
+    # the attestation binds the original one, so the leg is refused
+    # and nothing new is pinned.  The fork keeps the creator and this
+    # node on the roster, so only the attestation can catch it.
+    forked = sorted([OWN_HASH, creator_hash, "12" * 16])
+    response = call_handler(
+        node._handle_group_message,
+        encode(
+            {
+                "type": "group_message",
+                "v": 1,
+                "text": "forked roster",
+                "group": group_id,
+                "group_name": "weekend",
+                "creator": creator_hash,
+                "members": forked,
+                "sent_at": 124.0,
+                "id": "gm-secret-fork",
+                "roster_attestation": attestation,
+            }
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is False
+    assert len(received) == 1
+    assert node.groups.get(group_id)["members"] == members
+
+
+def test_secret_group_message_without_attestation_rejected(tmp_path):
+    (node, received, creator, member, creator_hash, member_hash,
+     members, group_id, attestation) = _secret_handler_fixture(tmp_path)
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "hi all",
+            message_id="gm-secret-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=creator_hash,
+            members=members,
+        ),
+        remote_identity=member,
+    )
+    assert response["ok"] is False
+    assert received == []
+    assert node.groups.get(group_id) is None
+
+
+def test_secret_group_relayed_message_delivered(tmp_path):
+    (node, received, creator, member, creator_hash, member_hash,
+     members, group_id, attestation) = _secret_handler_fixture(tmp_path)
+    node.identity = RNS.Identity()
+    blob = seal_message(
+        member,
+        sender_name="member",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="gm-secret-relayed",
+        text="via a holder",
+        sent_at=130.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": creator_hash,
+            "members": members,
+            "roster_attestation": attestation,
+        },
+    )
+    message = open_message(node.identity, blob)
+    assert message["group"]["roster_attestation"] == attestation
+    assert node._deliver_collected(message) is True
+    stored = node.inbox.list_messages(group=group_id)
+    assert len(stored) == 1
+    assert stored[0]["text"] == "via a holder"
+    pinned = node.groups.get(group_id)
+    assert pinned is not None
+    assert pinned["secret"] is True
+    assert pinned["roster_attestation"] == attestation
 
 
 def test_group_message_from_member_dropped_when_announcements_only(tmp_path):

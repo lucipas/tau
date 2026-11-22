@@ -5639,6 +5639,7 @@ class WebBridge:
                 creator=group.get("creator", ""),
                 sender=group.get("creator", ""),
                 sent_at=time.time(),
+                roster_attestation=group.get("roster_attestation"),
             )
             described = (
                 self._describe_group(pinned) if pinned is not None else group
@@ -11309,6 +11310,7 @@ class WebBridge:
             "created_at": group["created_at"],
             "topic": group.get("topic", ""),
             "announcements_only": bool(group.get("announcements_only", False)),
+            "secret": bool(group.get("secret", False)),
             # A group reads as pinned when any id in its rename
             # lineage is pinned, like a mute — the pin follows the
             # conversation across a rename.
@@ -11799,7 +11801,7 @@ class WebBridge:
                     raise ValueError("cannot remove the creator from the group")
                 roster.remove(resolved)
         new_group = self.node.groups.update_members(
-            group["id"], roster, created_by=own_hash
+            group["id"], roster, created_by=own_hash, identity=self.node.identity
         )
         return {
             "group": self._describe_group(new_group),
@@ -11858,7 +11860,7 @@ class WebBridge:
                 raise ValueError(f"unknown peer: {peer.strip()}")
             resolved = found.destination_hash.hex()
         new_group = self.node.groups.ban(
-            group["id"], resolved, created_by=own_hash
+            group["id"], resolved, created_by=own_hash, identity=self.node.identity
         )
         return {
             "group": self._describe_group(new_group),
@@ -11956,7 +11958,7 @@ class WebBridge:
         if not group["local"] or group["creator"] != own_hash:
             raise ValueError("only the creator can rename a group")
         new_group = self.node.groups.rename(
-            group["id"], name.strip(), created_by=own_hash
+            group["id"], name.strip(), created_by=own_hash, identity=self.node.identity
         )
         return {
             "group": self._describe_group(new_group),

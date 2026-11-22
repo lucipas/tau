@@ -82,9 +82,14 @@ from .protocol import (
     MAX_GROUP_TOPIC_LENGTH,
     MIN_GROUP_MEMBERS,
     ProtocolError,
+    _clean_member_list,
     clean_group_topic,
     derive_group_id,
+    generate_group_id,
+    mint_roster_attestation,
+    roster_attestation_matches,
     sanitize_group_name,
+    verify_roster_attestation,
 )
 from .util import atomic_write_json, read_json
 
@@ -164,7 +169,26 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
             return None
         creator = creator.lower()
     name = sanitize_group_name(raw.get("name"))
-    if creator:
+    # A secret group carries a creator-signed roster attestation
+    # instead of a derived id (see tau.protocol.mint_roster_attestation):
+    # the attestation must verify and bind this id, name and roster,
+    # and it replaces the derivation check below.  A record with a
+    # broken or mismatched attestation is corrupt (or hand-edited) and
+    # is dropped, exactly like one whose id does not derive.
+    attestation = None
+    raw_attestation = raw.get("roster_attestation")
+    if raw_attestation is not None:
+        attestation = verify_roster_attestation(raw_attestation)
+        if attestation is None or not roster_attestation_matches(
+            attestation,
+            group_id=group_id,
+            name=name,
+            creator=creator,
+            members=cleaned,
+        ):
+            return None
+    secret = attestation is not None
+    if creator and not secret:
         if creator not in cleaned:
             return None
         try:
@@ -175,6 +199,8 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
             # The id must commit to the roster; a stored record that
             # does not verify is corrupt (or hand-edited) and is dropped.
             return None
+    elif creator and creator not in cleaned:
+        return None
     created_at = raw.get("created_at")
     try:
         created_at = float(created_at) if created_at is not None else time.time()
@@ -273,6 +299,8 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         "creator": creator,
         "created_by": creator,
         "local": bool(raw.get("local", False)),
+        "secret": secret,
+        "roster_attestation": attestation,
         "roster_sent_at": roster_sent_at,
         "topic": clean_group_topic(raw.get("topic")),
         "topic_sent_at": topic_sent_at,
@@ -518,8 +546,29 @@ class GroupStore:
                         handle.seek(0)
                         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
+    def _mint_opaque_id(self) -> str:
+        """Mint a random group id no stored or retired group uses.
+
+        A secret group's id is opaque — it must not collide with a
+        live group (that would merge two rosters) or a retired one
+        (that would resurrect it).  Random 128-bit ids make a
+        collision negligible; the loop only guards the pathological
+        case.
+        """
+        for _ in range(8):
+            group_id = generate_group_id()
+            if group_id not in self._groups and group_id not in self._retired:
+                return group_id
+        raise ValueError("could not mint a fresh group id")
+
     def create(
-        self, name: str, members: List[str], *, created_by: str = ""
+        self,
+        name: str,
+        members: List[str],
+        *,
+        created_by: str = "",
+        secret: bool = False,
+        identity: Any = None,
     ) -> Dict[str, Any]:
         """Create a group and persist it.
 
@@ -528,11 +577,40 @@ class GroupStore:
         :class:`ValueError` when the group is invalid or the local cap
         is reached, and :class:`OSError` when the write fails (the
         in-memory store is left as it was on disk).
+
+        ``secret`` mints a secret group instead: the id is an opaque
+        random token that reveals nothing about the creator, name or
+        roster, bound to them by a creator-signed roster attestation
+        (see :func:`tau.protocol.mint_roster_attestation`).  It needs
+        the creator's *identity* to sign with, and the signer must be
+        the creator — a secret group created twice is two groups, since
+        no id can be re-derived.  Roster changes and renames mint a
+        fresh opaque id plus a fresh attestation, exactly like the
+        derived successor a roster change makes today.
         """
-        try:
-            group_id = derive_group_id(created_by, name, members)
-        except ProtocolError as exc:
-            raise ValueError(f"invalid group: {exc}") from exc
+        attestation = None
+        if secret:
+            if identity is None:
+                raise ValueError(
+                    "a secret group needs the creator identity to sign "
+                    "its roster attestation"
+                )
+            group_id = self._mint_opaque_id()
+            try:
+                attestation = mint_roster_attestation(
+                    identity,
+                    group_id=group_id,
+                    name=name,
+                    creator=created_by,
+                    members=members,
+                )
+            except ProtocolError as exc:
+                raise ValueError(f"invalid group: {exc}") from exc
+        else:
+            try:
+                group_id = derive_group_id(created_by, name, members)
+            except ProtocolError as exc:
+                raise ValueError(f"invalid group: {exc}") from exc
         group = _valid_group(
             {
                 "id": group_id,
@@ -542,6 +620,8 @@ class GroupStore:
                 "creator": created_by,
                 "created_by": created_by,
                 "local": True,
+                "secret": secret,
+                "roster_attestation": attestation,
             }
         )
         if group is None:  # pragma: no cover - create() validates first
@@ -602,6 +682,7 @@ class GroupStore:
         *,
         created_by: str,
         banned: List[str],
+        identity: Any = None,
     ) -> Dict[str, Any]:
         """Swap a group for its roster successor inside a held transaction.
 
@@ -611,14 +692,50 @@ class GroupStore:
         lineage, and the ban list.  When the roster is unchanged the
         call is a no-op — except a changed ban list, which is saved
         onto the same id, so banning a peer who is not a member needs
-        no successor at all.
+        no successor at all.  A secret group's successor gets a fresh
+        opaque id plus a fresh roster attestation (it needs the
+        creator's *identity* to sign with); a legacy group's successor
+        id derives as before.
         """
-        try:
-            new_id = derive_group_id(
-                existing["creator"], existing["name"], members
-            )
-        except ProtocolError as exc:
-            raise ValueError(f"invalid group: {exc}") from exc
+        secret = bool(existing.get("secret"))
+        if secret:
+            if identity is None:
+                raise ValueError(
+                    "a secret group needs the creator identity to sign "
+                    "its successor's roster attestation"
+                )
+            try:
+                roster_unchanged = sorted(
+                    _clean_member_list(members)
+                ) == list(existing["members"])
+            except ProtocolError:
+                roster_unchanged = False
+            if roster_unchanged:
+                # An unchanged roster is a no-op, exactly like the
+                # derived-id path below: keep the id and attestation,
+                # so a ban-list-only change needs no successor.
+                new_id = existing["id"]
+                attestation = existing.get("roster_attestation")
+            else:
+                new_id = self._mint_opaque_id()
+                try:
+                    attestation = mint_roster_attestation(
+                        identity,
+                        group_id=new_id,
+                        name=existing["name"],
+                        creator=existing["creator"],
+                        members=members,
+                    )
+                except ProtocolError as exc:
+                    raise ValueError(f"invalid group: {exc}") from exc
+        else:
+            attestation = None
+            try:
+                new_id = derive_group_id(
+                    existing["creator"], existing["name"], members
+                )
+            except ProtocolError as exc:
+                raise ValueError(f"invalid group: {exc}") from exc
         if new_id == existing["id"]:
             if banned == list(existing.get("banned") or []):
                 return dict(existing)
@@ -650,6 +767,8 @@ class GroupStore:
                 "announcements_sent_at": existing.get("announcements_sent_at"),
                 "renamed_from": existing.get("renamed_from") or [],
                 "banned": banned,
+                "secret": secret,
+                "roster_attestation": attestation,
             }
         )
         if candidate is None:
@@ -676,6 +795,7 @@ class GroupStore:
         *,
         created_by: str,
         banned: Optional[List[str]] = None,
+        identity: Any = None,
     ) -> Dict[str, Any]:
         """Replace the roster of a group this node created.
 
@@ -686,7 +806,10 @@ class GroupStore:
         cannot leave both groups or neither.  The old id is retired
         (persisted): a removed peer cannot restore the retired roster
         by replaying an old group message, and the retirement is lifted
-        if the roster is ever changed back to it.
+        if the roster is ever changed back to it.  A secret group's
+        successor gets a fresh opaque id plus a fresh roster
+        attestation, so it needs the creator's *identity* to sign
+        with; a legacy group's successor needs none.
 
         ``banned`` replaces the group's ban list; when omitted the
         existing list carries into the successor, so a roster change
@@ -716,12 +839,16 @@ class GroupStore:
                         f" {existing['name']!r}: that peer is banned"
                     )
             return self._apply_roster_change(
-                existing, members, created_by=created_by, banned=new_banned
+                existing,
+                members,
+                created_by=created_by,
+                banned=new_banned,
+                identity=identity,
             )
         # pragma: no cover - _apply_roster_change always returns
 
     def ban(
-        self, group_id: str, member_hash: str, *, created_by: str
+        self, group_id: str, member_hash: str, *, created_by: str, identity: Any = None
     ) -> Dict[str, Any]:
         """Ban a peer from a group this node created.
 
@@ -770,7 +897,11 @@ class GroupStore:
             if cleaned not in banned:
                 banned.append(cleaned)
             return self._apply_roster_change(
-                existing, members, created_by=created_by, banned=banned
+                existing,
+                members,
+                created_by=created_by,
+                banned=banned,
+                identity=identity,
             )
         # pragma: no cover - _apply_roster_change always returns
 
@@ -899,7 +1030,7 @@ class GroupStore:
         return dict(self._groups[group_id.lower()])
 
     def rename(
-        self, group_id: str, new_name: str, *, created_by: str
+        self, group_id: str, new_name: str, *, created_by: str, identity: Any = None
     ) -> Dict[str, Any]:
         """Rename a group this node created.
 
@@ -913,6 +1044,9 @@ class GroupStore:
         the name is ever changed back to it.  The new name is
         sanitized exactly as :func:`tau.protocol.sanitize_group_name`
         sanitizes it at creation, so a blank name becomes ``"group"``.
+        A secret group's successor gets a fresh opaque id plus a fresh
+        roster attestation for the new name, so it needs the creator's
+        *identity* to sign with.
 
         Raises :class:`ValueError` when the group is unknown or was
         not created by this node, and :class:`OSError` when the write
@@ -925,16 +1059,38 @@ class GroupStore:
             if not existing["local"] or existing["creator"] != created_by.lower():
                 raise ValueError("only the creator can rename a group")
             name = sanitize_group_name(new_name)
-            try:
-                new_id = derive_group_id(
-                    existing["creator"], name, existing["members"]
-                )
-            except ProtocolError as exc:
-                raise ValueError(f"invalid group: {exc}") from exc
-            if new_id == existing["id"]:
-                return dict(existing)
-            if new_id in self._groups:  # pragma: no cover - hash collision
-                raise ValueError("group id already exists with another roster")
+            secret = bool(existing.get("secret"))
+            if secret:
+                if name == existing["name"]:
+                    return dict(existing)
+                if identity is None:
+                    raise ValueError(
+                        "a secret group needs the creator identity to sign "
+                        "its successor's roster attestation"
+                    )
+                new_id = self._mint_opaque_id()
+                try:
+                    attestation = mint_roster_attestation(
+                        identity,
+                        group_id=new_id,
+                        name=name,
+                        creator=existing["creator"],
+                        members=existing["members"],
+                    )
+                except ProtocolError as exc:
+                    raise ValueError(f"invalid group: {exc}") from exc
+            else:
+                attestation = None
+                try:
+                    new_id = derive_group_id(
+                        existing["creator"], name, existing["members"]
+                    )
+                except ProtocolError as exc:
+                    raise ValueError(f"invalid group: {exc}") from exc
+                if new_id == existing["id"]:
+                    return dict(existing)
+                if new_id in self._groups:  # pragma: no cover - hash collision
+                    raise ValueError("group id already exists with another roster")
             candidate = _valid_group(
                 {
                     "id": new_id,
@@ -973,6 +1129,8 @@ class GroupStore:
                             if pred != new_id
                         ]
                     )[:MAX_RENAME_LINEAGE],
+                    "secret": secret,
+                    "roster_attestation": attestation,
                 }
             )
             if candidate is None:
@@ -1006,13 +1164,16 @@ class GroupStore:
         announcements_only: Optional[bool] = None,
         announcements_sent_at: Optional[float] = None,
         renamed_from: Optional[List[str]] = None,
+        roster_attestation: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
 
-        The id must derive from the creator, name and roster, so a
-        message carrying a different roster for the same id returns
-        ``None`` — a changed roster means a new group, and a member
-        cannot fork an id onto a recipient that has not seen it.  A
+        The id must derive from the creator, name and roster — or, for
+        a secret group, carry a creator-signed roster attestation that
+        binds them (see :func:`tau.protocol.verify_roster_attestation`)
+        — so a message carrying a different roster for the same id
+        returns ``None``: a changed roster means a new group, and a
+        member cannot fork an id onto a recipient that has not seen it.  A
         learned group is also refused when the learned cap is full
         (delete a group to make room); locally created groups are never
         evicted to make room for one.  A roster the creator retired
@@ -1129,6 +1290,7 @@ class GroupStore:
                 "created_by": creator,
                 "local": False,
                 "renamed_from": list(renamed_from or [])[:MAX_RENAME_LINEAGE],
+                "roster_attestation": roster_attestation,
             }
         )
         if candidate is None:
@@ -1164,6 +1326,11 @@ class GroupStore:
             restored = False
             if existing is not None:
                 if existing["members"] != candidate["members"]:
+                    return None
+                if existing["creator"] != candidate["creator"]:
+                    # The pinned id names its creator: a leg claiming a
+                    # different creator for it is a forgery, and must
+                    # not be judged creator-authorized against the claim.
                     return None
             elif candidate["id"] in self._retired or self.is_left(
                 candidate["id"]
@@ -1437,6 +1604,18 @@ class GroupStore:
                             updates["announcements_sent_at"] = (
                                 announcements_sent_at
                             )
+                if (
+                    existing.get("roster_attestation") is None
+                    and candidate.get("roster_attestation") is not None
+                ):
+                    # First attestation seen for this id pins it: a
+                    # later leg carrying a different signature for
+                    # the same roster does not replace it.  Applied
+                    # before the merge below so it is actually stored.
+                    updates["roster_attestation"] = candidate[
+                        "roster_attestation"
+                    ]
+                    updates["secret"] = True
                 if updates:
                     self._groups[existing["id"]] = {**existing, **updates}
                     refreshed = True

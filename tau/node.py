@@ -223,7 +223,10 @@ from .protocol import (
     retract_unsigned_bytes,
     response_error,
     response_ok,
+    roster_attestation_matches,
     sanitize_file_name,
+    sanitize_group_name,
+    verify_roster_attestation,
 )
 
 log = logging.getLogger(__name__)
@@ -238,12 +241,18 @@ def _budget(timeout: float, deadline: Optional[float]) -> float:
 
 def _invite_group_summary(group: Dict[str, Any]) -> Dict[str, Any]:
     """The group record a join-request reply carries to the requester."""
-    return {
+    summary: Dict[str, Any] = {
         "id": group["id"],
         "name": group["name"],
         "members": list(group["members"]),
         "creator": group.get("creator", ""),
     }
+    if group.get("roster_attestation") is not None:
+        # A secret group's joiner pins the group from this reply, so
+        # the attestation must ride along — without it the joiner's
+        # record() cannot verify the opaque id.
+        summary["roster_attestation"] = group["roster_attestation"]
+    return summary
 
 
 def _past(deadline: Optional[float]) -> bool:
@@ -2916,7 +2925,10 @@ class TauNode:
             members = list(group["members"]) + [caller_hash]
             try:
                 new_group = self.groups.update_members(
-                    group["id"], members, created_by=own_hash
+                    group["id"],
+                    members,
+                    created_by=own_hash,
+                    identity=self.identity,
                 )
             except ValueError as exc:
                 raise InviteError(str(exc)) from exc
@@ -3012,7 +3024,7 @@ class TauNode:
             raise ValueError("no pending join request from that peer")
         members = list(group["members"]) + [peer_hash]
         new_group = self.groups.update_members(
-            group["id"], members, created_by=own_hash
+            group["id"], members, created_by=own_hash, identity=self.identity
         )
         peer = self.registry.get(peer_hash)
         name = peer.display_name if peer is not None else peer_hash[:8]
@@ -3055,12 +3067,20 @@ class TauNode:
         Returns the pinned group record, or ``None`` when the message
         must be rejected: the sender is not on the roster, this node is
         not on the roster, the id does not derive from the creator,
-        name and roster, or the roster disagrees with the one already
-        pinned for the group id (a changed roster means a new group).
+        name and roster — or, for a secret group, does not carry a
+        creator-signed roster attestation binding them — or the roster
+        disagrees with the one already pinned for the group id (a
+        changed roster means a new group).
         The sender is authenticated by the link identity (direct) or by
         the sealed envelope's signature (relayed), never by the payload;
-        the id derivation is what binds the roster to the id, so a
-        member cannot fork an id onto a recipient that has not seen it.
+        the id derivation (or the attestation, for a secret group) is
+        what binds the roster to the id, so a member cannot fork an id
+        onto a recipient that has not seen it.  A secret leg's
+        attestation is verified here, not only in
+        :func:`tau.protocol.parse_group_message`, because a relayed leg
+        arrives as a sealed envelope and never passes through the
+        parser — and the pinned attestation is what later legs are
+        judged against.
         The sender is also passed through, so a successor roster only
         replaces a learned group when the creator themself sent it —
         the creator field is only a claim, and any member could
@@ -3076,14 +3096,28 @@ class TauNode:
         if sender_hash not in members or own_hash not in members:
             return None
         creator = group.get("creator") or ""
-        try:
-            if derive_group_id(creator, group.get("name") or "group", members) != group["id"]:
+        group_name = sanitize_group_name(group.get("name"))
+        raw_attestation = group.get("roster_attestation")
+        attestation = None
+        if raw_attestation is not None:
+            attestation = verify_roster_attestation(raw_attestation)
+            if attestation is None or not roster_attestation_matches(
+                attestation,
+                group_id=group["id"],
+                name=group_name,
+                creator=creator,
+                members=members,
+            ):
                 return None
-        except (ProtocolError, ValueError):
-            return None
+        else:
+            try:
+                if derive_group_id(creator, group_name, members) != group["id"]:
+                    return None
+            except (ProtocolError, ValueError):
+                return None
         return self.groups.record(
             group["id"],
-            group.get("name") or "group",
+            group_name,
             members,
             creator=creator,
             sender=sender_hash or "",
@@ -3093,6 +3127,7 @@ class TauNode:
             announcements_only=group.get("announcements_only"),
             announcements_sent_at=announcements_sent_at,
             renamed_from=group.get("renamed_from"),
+            roster_attestation=attestation,
         )
 
     def _handle_group_message(
@@ -3179,6 +3214,7 @@ class TauNode:
                 "topic": message.get("group_topic"),
                 "announcements_only": message.get("group_announcements_only"),
                 "renamed_from": message.get("renamed_from") or [],
+                "roster_attestation": message.get("roster_attestation"),
             },
             sent_at=message.get("sent_at"),
             topic_sent_at=message.get("group_topic_sent_at"),
@@ -7174,6 +7210,15 @@ class TauNode:
                 group_name=fresh.group_name,
                 creator=fresh.group_creator,
                 members=fresh.group_members,
+                # The attestation bound to the leg's own id wins: after
+                # a rotation the live record no longer carries it.
+                roster_attestation=(
+                    fresh.group_roster_attestation
+                    if fresh.group_roster_attestation is not None
+                    else (self.groups.get(fresh.group_id) or {}).get(
+                        "roster_attestation"
+                    )
+                ),
                 renamed_from=(
                     (self.groups.get(fresh.group_id) or {}).get("renamed_from")
                     or None
@@ -7791,6 +7836,18 @@ class TauNode:
                 "name": fresh.group_name,
                 "creator": fresh.group_creator,
                 "members": fresh.group_members,
+                # The roster attestation rides in the sealed envelope,
+                # so an offline member that receives this copy through
+                # store-and-forward can verify a secret group exactly
+                # as a direct recipient would; the current record is
+                # read at deposit time, like the direct re-send path.
+                "roster_attestation": (
+                    fresh.group_roster_attestation
+                    if fresh.group_roster_attestation is not None
+                    else (self.groups.get(fresh.group_id) or {}).get(
+                        "roster_attestation"
+                    )
+                ),
                 # The lineage rides in the sealed envelope, so an
                 # offline member that receives this copy through
                 # store-and-forward retires the predecessor exactly
@@ -10141,6 +10198,8 @@ class TauNode:
             "name": group["name"],
             "creator": creator,
             "members": list(group["members"]),
+            # Bound to this id: a queued leg keeps it after a rotation.
+            "roster_attestation": group.get("roster_attestation"),
         }
         # Leg ids that were delivered or queued (never a refused leg:
         # its id reached nobody, so nobody can quote it).
@@ -10164,6 +10223,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                roster_attestation=group.get("roster_attestation"),
                 group_topic=group.get("topic", ""),
                 group_topic_sent_at=group.get("topic_sent_at"),
                 group_announcements_only=group.get("announcements_only", False),
@@ -10284,6 +10344,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                roster_attestation=group.get("roster_attestation"),
                 group_topic=group.get("topic", ""),
                 group_topic_sent_at=group.get("topic_sent_at"),
                 group_announcements_only=group.get("announcements_only", False),
