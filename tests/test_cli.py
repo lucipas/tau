@@ -9265,6 +9265,87 @@ def test_parser_channel_poll_vote_close_poll():
     assert args.func is cli.cmd_channel_close_poll
 
 
+def test_parser_channel_show_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["channel", "show", "general"])
+    assert args.func is cli.cmd_channel_show
+    assert args.channel == "general"
+    assert getattr(args, "json_output", False) is False
+    args = parser.parse_args(["channel", "show", "general", "--json"])
+    assert args.func is cli.cmd_channel_show
+    assert args.json_output is True
+
+
+def test_channel_show_text_json_and_errors(tmp_path, capsys):
+    from tau.channels import (
+        create_message,
+        create_topic,
+        init_db as init_channel_db,
+        pin_message,
+    )
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    assert _run_channel(tmp_path, "join", "general") == 0
+    capsys.readouterr()
+
+    # Empty channel: joined, nothing stored yet.
+    assert _run_channel(tmp_path, "show", "general") == 0
+    out = capsys.readouterr().out
+    assert "#general" in out
+    assert "joined: yes" in out
+    assert "topic: none" in out
+    assert "messages: 0 cached messages, 0 unread" in out
+    assert "pinned messages: 0 messages" in out
+    assert "conversation pinned: no" in out
+    assert "last message: none" in out
+
+    # Two messages from a peer, a topic, and a pin on the first.
+    conn = init_channel_db(data_dir / "channels.sqlite3")
+    try:
+        bob = RNS.Identity()
+        first = create_message(conn, bob, "general", "first hello", name="bob")
+        create_message(conn, bob, "general", "second hello", name="bob")
+        create_topic(conn, bob, "general", "weekly planning")
+        pin_message(conn, "general", first["hash"])
+    finally:
+        conn.close()
+
+    assert _run_channel(tmp_path, "show", "general") == 0
+    out = capsys.readouterr().out
+    assert "topic: weekly planning" in out
+    assert "set by" in out
+    assert "messages: 2 cached messages, 2 unread" in out
+    assert "pinned messages: 1 message" in out
+    assert "last message:" in out
+    assert "bob" in out
+    assert "second hello" in out
+
+    assert _run_channel(tmp_path, "show", "general", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)["channel"]
+    assert payload["channel"] == "general"
+    assert payload["joined"] is True
+    assert payload["messages"] == 2
+    assert payload["unread"] == 2
+    assert payload["pinned"] is False
+    assert payload["pinned_messages"] == 1
+    assert payload["topic"]["topic"] == "weekly planning"
+    assert payload["last_message"]["text"] == "second hello"
+    assert payload["last_message"]["name"] == "bob"
+
+    # A left channel still shows its cached messages, joined: no.
+    assert _run_channel(tmp_path, "leave", "general") == 0
+    capsys.readouterr()
+    assert _run_channel(tmp_path, "show", "general") == 0
+    out = capsys.readouterr().out
+    assert "joined: no" in out
+    assert "messages: 2 cached messages" in out
+    assert "second hello" in out
+
+    code = _run_channel(tmp_path, "show", "never-joined")
+    assert code == 2
+    assert "unknown channel" in capsys.readouterr().err
+
+
 def _seed_channel_poll_conversation(tmp_path):
     """One node joined to #general with a posted channel poll."""
     from tau.channels import channel_history, init_db as init_channel_db

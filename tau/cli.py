@@ -4581,6 +4581,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channel_list.set_defaults(func=cmd_channel_list)
 
+    channel_show = channel_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show one channel's topic, counts, and last message",
+    )
+    channel_show.add_argument("channel", metavar="NAME", help="channel to show")
+    channel_show.set_defaults(func=cmd_channel_show)
+
     channel_send = channel_sub.add_parser(
         "send",
         parents=[common],
@@ -9612,6 +9620,129 @@ def cmd_channel_list(args: argparse.Namespace) -> int:
             f"#{membership['channel']} — {count} cached {noun}{unread_suffix}, "
             f"joined {_ago(time.time() - membership['joined_at'])} ago"
             f"{pinned_suffix}"
+        )
+    return _EXIT_OK
+
+
+def cmd_channel_show(args: argparse.Namespace) -> int:
+    """Show one channel's full details: topic, counts, last message.
+
+    Read-only: the channel store is read from disk, no node is
+    started and nothing is sent.  A channel that was left still
+    shows its cached messages with ``joined: no``.
+    """
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        name = clean_channel_name(args.channel)
+    except ChannelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    app = ChannelApp(config, _tan_identity(config), name=config.name)
+    membership = next(
+        (item for item in app.memberships() if item["channel"] == name), None
+    )
+    topic = app.topic(name)
+    # The count is the same raw stored-row count `channel list`
+    # reports, so a left channel (membership gone, cache kept) reads
+    # the same number it showed while joined.
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE channel = ?", (name,)
+        ).fetchone()
+        message_count = int(row[0]) if row is not None else 0
+    finally:
+        conn.close()
+    if membership is None and message_count == 0 and topic is None:
+        print(f"error: unknown channel: {args.channel!r}", file=sys.stderr)
+        return 2
+    unread = app.unread_counts().get(name, 0)
+    pinned = name in load_pinned_set(config.pinned_path, "channel")
+    pinned_messages = app.pins(name)
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        # The block-list failed closed: hide the last message, like
+        # the timeline does, instead of showing one we cannot vet.
+        recent: List[Dict[str, Any]] = []
+    else:
+        recent = [
+            message
+            for message in app.history(name, limit=50)
+            if str(message.get("author", "")) not in blocked
+        ]
+    # Votes and closes are not chat: they ride as messages so peers
+    # can tally them, but they never stand in as the last message.
+    last = next(
+        (
+            message
+            for message in recent
+            if not is_channel_poll_vote(message)
+            and not is_channel_poll_close(message)
+        ),
+        None,
+    )
+    if json_output:
+        _emit(
+            {
+                "channel": {
+                    "channel": name,
+                    "joined": membership is not None,
+                    "joined_at": (
+                        membership["joined_at"] if membership else None
+                    ),
+                    "messages": message_count,
+                    "unread": unread,
+                    "pinned": pinned,
+                    "pinned_messages": len(pinned_messages),
+                    "topic": topic,
+                    "last_message": last,
+                }
+            },
+            True,
+        )
+        return _EXIT_OK
+    registry = PeerRegistry(config.peers_path)
+    print(f"#{name}")
+    if membership is not None:
+        print(
+            f"  joined: yes "
+            f"({_ago(time.time() - membership['joined_at'])} ago)"
+        )
+    else:
+        print("  joined: no (cached messages kept)")
+    if topic is not None:
+        author_hash = str(topic.get("author") or "")
+        author = registry.get(author_hash) if author_hash else None
+        author_name = (
+            author.display_name
+            if author is not None
+            else (author_hash[:8] if author_hash else "unknown")
+        )
+        try:
+            updated = _ago(time.time() - float(topic["updated_at"]))
+        except (OverflowError, OSError, ValueError, TypeError, KeyError):
+            # Non-finite or out-of-range stored timestamps cannot age.
+            updated = "unknown"
+        print(f"  topic: {topic['topic']}")
+        print(f"    set by {author_name} ({author_hash[:8]}), {updated} ago")
+    else:
+        print("  topic: none")
+    noun = "message" if message_count == 1 else "messages"
+    print(f"  messages: {message_count} cached {noun}, {unread} unread")
+    pin_noun = "message" if len(pinned_messages) == 1 else "messages"
+    print(f"  pinned messages: {len(pinned_messages)} {pin_noun}")
+    print(f"  conversation pinned: {'yes' if pinned else 'no'}")
+    if last is None:
+        print("  last message: none")
+    else:
+        author_hash = str(last.get("author") or "")
+        author_name = last.get("name") or "anonymous"
+        first_line = str(last.get("text") or "").splitlines()
+        excerpt = first_line[0] if first_line else ""
+        print(
+            f"  last message: [{_stamp(last.get('created_at'))}] "
+            f"{author_name} ({short_hash(author_hash)}): {excerpt}"
         )
     return _EXIT_OK
 
