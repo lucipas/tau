@@ -522,6 +522,91 @@ def test_closed_group_join_queues_request(tmp_path, monkeypatch):
         node.approve_join_request(group["name"], carol.hexhash)
 
 
+# --- node: roster-change announcements --------------------------------------
+
+
+def test_announce_roster_change_sends_to_new_roster(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    _, carol = _peer_identity("carol")
+    group = _group(node, own_hash, bob, carol)
+    new_group = node.groups.update_members(
+        group["id"], [own_hash, bob.hexhash], created_by=own_hash
+    )
+    sent = []
+
+    def _capture(group_arg, text, **kwargs):
+        sent.append((group_arg, text))
+        return [{"to": bob.hexhash, "ok": True}]
+
+    monkeypatch.setattr(node, "send_group_message", _capture)
+    results = node.announce_roster_change(new_group, removed=["carol"])
+    assert len(sent) == 1
+    assert sent[0][0]["id"] == new_group["id"]
+    assert "carol" in sent[0][1]
+    assert "removed" in sent[0][1]
+    assert results == [{"to": bob.hexhash, "ok": True}]
+
+
+def test_announce_roster_change_names_adds_and_removes(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    _, carol = _peer_identity("carol")
+    _, dave = _peer_identity("dave")
+    group = _group(node, own_hash, bob, carol)
+    new_group = node.groups.update_members(
+        group["id"],
+        [own_hash, bob.hexhash, dave.hexhash],
+        created_by=own_hash,
+    )
+    sent = []
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda group_arg, text, **kwargs: sent.append((group_arg, text))
+        or [],
+    )
+    assert (
+        node.announce_roster_change(
+            new_group, added=["dave"], removed=["carol"]
+        )
+        == []
+    )
+    assert len(sent) == 1
+    assert sent[0][0]["id"] == new_group["id"]
+    assert "dave" in sent[0][1] and "joined" in sent[0][1]
+    assert "carol" in sent[0][1] and "removed" in sent[0][1]
+
+
+def test_announce_roster_change_noop_without_changes(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    group = _group(node, own_hash, bob)
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("no announcement without a change")
+        ),
+    )
+    assert node.announce_roster_change(group) == []
+    assert node.announce_roster_change(group, added=[], removed=[]) == []
+
+
+def test_announce_roster_change_failure_is_best_effort(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    group = _group(node, own_hash, bob)
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("no route to member")
+        ),
+    )
+    assert node.announce_roster_change(group, removed=["carol"]) == []
+
+
 def test_approve_join_request_refuses_banned_peer(tmp_path, monkeypatch):
     node, identity, own_hash = _invite_node(tmp_path)
     _, bob = _peer_identity("bob")

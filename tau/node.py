@@ -3095,6 +3095,59 @@ class TauNode:
         )
         thread.start()
 
+    def announce_roster_change(
+        self,
+        group: Dict[str, Any],
+        *,
+        added: Sequence[str] = (),
+        removed: Sequence[str] = (),
+    ) -> List[Dict[str, Any]]:
+        """Announce a roster change to the group's new roster.
+
+        The creator rotates the group id on a roster change (#697),
+        but the remaining members only learn the successor from the
+        next message sent to it — until then a removed member can
+        keep posting to the old id and have those messages accepted,
+        because every member still holds the old roster.  This
+        announcement is a group message to the new roster, the same
+        vehicle as the join welcome: receiving it pins the successor
+        and retires the predecessor on every remaining member at
+        once (the successor names the predecessor in its lineage,
+        see :meth:`tau.groups.GroupStore._apply_roster_change`).
+
+        *added* / *removed* are display names.  The announcement is
+        best-effort: the roster change already happened, so a send
+        failure is logged and an empty result returned instead of
+        failing the command — and members learn the new roster from
+        the next message instead.  The timeout is short on purpose:
+        an unreachable member gets a queued leg that delivers on
+        retry.  Returns the per-member send results, or ``[]`` when
+        nothing was announced.
+        """
+        added = [name for name in added if name]
+        removed = [name for name in removed if name]
+        if not added and not removed:
+            return []
+        sentences = []
+        if added:
+            sentences.append(f"{', '.join(added)} joined {group['name']}.")
+        if removed:
+            verb = "was" if len(removed) == 1 else "were"
+            sentences.append(
+                f"{', '.join(removed)} {verb} removed from {group['name']}."
+            )
+        try:
+            return self.send_group_message(
+                group, " ".join(sentences), timeout=10.0
+            )
+        except Exception:  # pragma: no cover - delivery is best-effort
+            log.warning(
+                "Could not announce roster change to %s",
+                group["id"][:8],
+                exc_info=True,
+            )
+            return []
+
     def list_join_requests(
         self, group_name: Optional[str] = None
     ) -> List[Dict[str, Any]]:

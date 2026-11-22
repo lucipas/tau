@@ -1586,12 +1586,23 @@ class _FakeBanNode:
         identity = load_identity(config.identity_path)
         self.destination_hexhash = destination_hash(identity).hex()
         self.started = False
+        self.announcements = []
 
     def start(self, **kwargs):
         self.started = True
 
     def stop(self):
         self.started = False
+
+    def announce_roster_change(self, group, *, added=(), removed=()):
+        self.announcements.append(
+            {"group": group, "added": list(added), "removed": list(removed)}
+        )
+        return [
+            {"to": member, "ok": True}
+            for member in group["members"]
+            if member != self.destination_hexhash
+        ]
 
     def resolve_peer(self, target, timeout=10.0):
         peer = self.registry.resolve(target)
@@ -1635,12 +1646,14 @@ def test_group_ban_unban_banned(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "banned carol from group weekend" in out
     assert "cannot be re-added" in out
+    assert "Roster change announced to the group (1 delivered, 0 queued)" in out
     banned_group = GroupStore(data_dir / "groups.json").get(group["id"])
     assert banned_group is None  # the roster change minted a successor
     stored = GroupStore(data_dir / "groups.json").list_groups()
     assert len(stored) == 1
     assert sorted(stored[0]["members"]) == sorted([own_hash, "ef" * 16])
     assert stored[0]["banned"] == ["cd" * 16]
+    assert stored[0]["renamed_from"] == [group["id"]]
 
     assert cli.main(["group", "banned", "--data-dir", str(data_dir), "weekend"]) == 0
     out = capsys.readouterr().out
@@ -1695,6 +1708,39 @@ def test_group_ban_unban_banned(tmp_path, capsys, monkeypatch):
     # Banning the creator is refused.
     assert cli.main([*base, own_hash]) == 1
     assert "cannot ban the creator" in capsys.readouterr().err
+
+
+def test_group_remove_member_announces_roster_change(tmp_path, capsys, monkeypatch):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    group = _seed_group_with_carol(data_dir, own_hash)
+
+    monkeypatch.setattr(cli, "TauNode", _FakeBanNode)
+    assert (
+        cli.main(
+            [
+                "group",
+                "remove-member",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "--peer",
+                "carol",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "carol removed from group weekend" in out
+    assert "Roster change announced to the group (1 delivered, 0 queued)" in out
+    assert "Members learn the new roster" not in out
+    stored = GroupStore(data_dir / "groups.json").list_groups()
+    assert len(stored) == 1
+    assert sorted(stored[0]["members"]) == sorted([own_hash, "ef" * 16])
+    assert stored[0]["renamed_from"] == [group["id"]]
 
 
 def test_group_show_text_json_and_errors(tmp_path, capsys, monkeypatch):

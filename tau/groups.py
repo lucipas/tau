@@ -688,8 +688,10 @@ class GroupStore:
 
         The caller holds :meth:`_transaction` and has already checked
         that this node created the group.  A roster change is the same
-        group continuing: the successor keeps the topic, the rename
-        lineage, and the ban list.  When the roster is unchanged the
+        group continuing: the successor keeps the topic, the ban list,
+        and the rename lineage — plus the predecessor id at its head,
+        so a member learning the successor retires the old roster
+        (see #703).  When the roster is unchanged the
         call is a no-op — except a changed ban list, which is saved
         onto the same id, so banning a peer who is not a member needs
         no successor at all.  A secret group's successor gets a fresh
@@ -765,7 +767,24 @@ class GroupStore:
                 "topic_sent_at": existing.get("topic_sent_at"),
                 "announcements_only": existing.get("announcements_only", False),
                 "announcements_sent_at": existing.get("announcements_sent_at"),
-                "renamed_from": existing.get("renamed_from") or [],
+                # The successor also names its predecessor, newest
+                # first, exactly like a rename does: a member that
+                # learns the successor from a creator message retires
+                # the predecessor, so a removed member cannot restore
+                # the old roster by sending under the old id — without
+                # this the predecessor is only deleted, and one old
+                # message re-pins it (see #703).  The lineage never
+                # names the successor itself, and it is capped so
+                # repeated roster changes can never make the group
+                # unsendable (see MAX_RENAME_LINEAGE).
+                "renamed_from": (
+                    [existing["id"]]
+                    + [
+                        pred
+                        for pred in (existing.get("renamed_from") or [])
+                        if pred != new_id
+                    ]
+                )[:MAX_RENAME_LINEAGE],
                 "banned": banned,
                 "secret": secret,
                 "roster_attestation": attestation,
