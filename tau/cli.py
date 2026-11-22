@@ -22614,7 +22614,8 @@ def _retract_group_message(
             {
                 "target": target["id"],
                 "group": group_id,
-                "ok": bool(response.get("ok")),
+                "ok": not failed,
+                "queued": len(queued),
                 "cancelled_queued": response.get("cancelled_queued") or [],
                 "results": results,
                 "id": response.get("id"),
