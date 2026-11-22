@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -1822,6 +1823,55 @@ def test_group_store_record_stale_creator_message_does_not_replace_successor(
     assert len(store) == 2
 
 
+def test_group_store_stale_creator_log_shows_name_not_id(tmp_path, caplog):
+    """The stale-creator log line never carries a group id.
+
+    A secret group's id is its opaque token, so the log carries the
+    human-readable name instead — not the id, and not even a prefix
+    of it, which CodeQL still flags as clear-text logging of the
+    secret.
+    """
+    store = GroupStore(tmp_path / "groups.json")
+    old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
+    store.record(
+        old_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+    )
+    new_id = derive_group_id(
+        OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH, OWN_HASH]
+    )
+    store.record(
+        new_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH, OWN_HASH],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=200.0,
+    )
+    with caplog.at_level(logging.INFO, logger="tau.groups"):
+        store.record(
+            old_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=150.0,
+        )
+    stale = [
+        record
+        for record in caplog.records
+        if "Stale creator message" in record.getMessage()
+    ]
+    assert len(stale) == 1
+    assert "weekend" in stale[0].getMessage()
+    assert old_id not in stale[0].getMessage()
+    assert old_id[:8] not in stale[0].getMessage()
+
+
 def test_group_store_record_creator_restore_replaces_successor(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
@@ -2911,6 +2961,41 @@ def test_group_store_secret_survives_reload(tmp_path):
     assert again["secret"] is True
     assert again["roster_attestation"] == group["roster_attestation"]
     assert again["members"] == group["members"]
+
+
+def test_group_store_record_rejects_conflicting_name_leg(tmp_path):
+    """A verified leg for the same secret id but a different name is refused.
+
+    The attestation binds id + name + creator + roster, so a leg whose
+    attestation verifies for another name must not merge silently into
+    the pinned record (dropping the leg's name). Only the creator
+    signing two attestations for one id with different names can
+    produce one, which the rename path never does — but the guard
+    belongs next to the roster and creator checks.
+    """
+    store, creator, _, creator_hash, member_hash, group = _secret_store_fixture(
+        tmp_path
+    )
+    members = sorted([creator_hash, member_hash])
+    attestation = mint_roster_attestation(
+        creator,
+        group_id=group["id"],
+        name="other-name",
+        creator=creator_hash,
+        members=members,
+    )
+    assert (
+        store.record(
+            group["id"],
+            "other-name",
+            members,
+            creator=creator_hash,
+            sender=creator_hash,
+            roster_attestation=attestation,
+        )
+        is None
+    )
+    assert store.get(group["id"])["name"] == "weekend"
 
 
 def test_group_store_secret_update_members_rotates_id(tmp_path):
