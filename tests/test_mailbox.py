@@ -342,6 +342,110 @@ def test_reload_drops_corrupt_reaction_but_keeps_reaction_kind(tmp_path):
     assert entry.reaction is None
 
 
+def _retract_payload(**overrides):
+    payload = {
+        "target": "m-1",
+        "retract_id": "x-1",
+        "sent_at": 1000.0,
+        "payload_b64": base64.b64encode(b"signed-retract-bytes").decode("ascii"),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_enqueue_retract_entry_round_trips(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(
+        to=BOB,
+        text="retraction",
+        to_name="bob",
+        now=1000.0,
+        retract=_retract_payload(),
+    )
+    assert entry.kind == "retract"
+    assert entry.retract["target"] == "m-1"
+    assert entry.retract["retract_id"] == "x-1"
+    assert entry.retract["payload_b64"] == _retract_payload()["payload_b64"]
+
+    reloaded = Mailbox(path)
+    again = reloaded.outbox_list()[0]
+    assert again.kind == "retract"
+    assert again.retract == entry.retract
+
+
+def test_enqueue_retract_forces_retract_kind(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB, text="retraction", kind="chat", retract=_retract_payload()
+    )
+    assert entry.kind == "retract"
+
+
+def test_enqueue_retract_rejects_invalid_payload(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError):
+        box.enqueue(to=BOB, text="retraction", retract={"target": "m-1"})
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="retraction",
+            retract=_retract_payload(payload_b64="!!!not-base64"),
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="retraction",
+            retract=_retract_payload(sent_at=float("nan")),
+        )
+
+
+def test_enqueue_retract_rejects_combined_fields(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="retraction",
+            retract=_retract_payload(),
+            poll_options=["a", "b"],
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="retraction",
+            retract=_retract_payload(),
+            location={"lat": 1.0, "lon": 2.0},
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="retraction",
+            retract=_retract_payload(),
+            group={
+                "id": "ab" * 16,
+                "name": "crew",
+                "creator": "ab" * 16,
+                "members": ["ab" * 16],
+            },
+        )
+
+
+def test_reload_drops_corrupt_retract_but_keeps_retract_kind(tmp_path):
+    # A hand-edited or corrupt payload must never turn the entry into
+    # a text message: the kind stays "retract" so delivery drops it
+    # instead of sending the display text as chat.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="retraction", now=1000.0, retract=_retract_payload())
+    raw = json.loads(path.read_text())
+    raw["outbox"][0]["retract"]["payload_b64"] = "!!!not-base64"
+    path.write_text(json.dumps(raw))
+
+    entry = Mailbox(path).outbox_list()[0]
+    assert entry.kind == "retract"
+    assert entry.retract is None
+
+
 
 def test_outbox_entry_without_kind_loads_as_chat(tmp_path):
     path = tmp_path / "mailbox.json"
@@ -2156,6 +2260,62 @@ def test_validated_sealed_message_drops_reaction_without_token():
     assert _validated_sealed_message(payload)["reaction"] == {
         "token": "",
         "reaction_id": "r-1",
+    }
+
+
+def test_seal_and_open_carries_retract():
+    """A retract leg seals and opens with its retract id."""
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="retraction",
+        sent_at=4242.0,
+        kind="retract",
+        retract={"retract_id": "x-1"},
+    )
+    message = open_message(recipient, blob)
+    assert message["kind"] == "retract"
+    assert message["retract"] == {"retract_id": "x-1"}
+
+
+def test_seal_message_rejects_retract_without_id():
+    sender, recipient = make_identity_pair()
+    with pytest.raises(MailboxError):
+        seal_message(
+            sender,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="m-1",
+            text="retraction",
+            sent_at=4242.0,
+            kind="retract",
+            retract={},
+        )
+
+
+def test_validated_sealed_message_drops_retract_without_id():
+    """A leg with a malformed retract drops the retract field.
+
+    The message itself still validates — only the malformed retract
+    payload is dropped, never the message.
+    """
+    from tau.mailbox import _validated_sealed_message
+
+    payload = {
+        "id": "m-1",
+        "from": "aa" * 16,
+        "from_name": "alice",
+        "text": "retraction",
+        "sent_at": 4242.0,
+        "retract": {},
+    }
+    assert "retract" not in _validated_sealed_message(payload)
+    payload["retract"] = {"retract_id": "x-1"}
+    assert _validated_sealed_message(payload)["retract"] == {
+        "retract_id": "x-1",
     }
 
 

@@ -18475,6 +18475,37 @@ def test_retract_message_endpoint_retracts_and_removes_local_copies(
     assert retracted_events[0]["message_id"] == 1
 
 
+def test_retract_message_endpoint_queues_for_offline_peer(bridge, node):
+    _sent_console_entry(bridge, node)
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        return {
+            "ok": False,
+            "queued": True,
+            "target": message_id,
+            "id": "retract-1",
+            "queued_id": "q-1",
+        }
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "queued": True,
+        "retracted": {"id": 1, "wire_id": "wire-1"},
+        "id": "retract-1",
+        "queued_id": "q-1",
+    }
+    # The queued retract leaves the local copies in place until the
+    # sweep delivers it: the bubble stays for now.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [1]
+    assert node.inbox.export_document()["messages"] != []
+
+
 def test_retract_message_endpoint_reports_peer_without_a_copy(bridge, node):
     _sent_console_entry(bridge, node)
 

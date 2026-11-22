@@ -1197,6 +1197,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
+    retract.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the retract when the peer is offline",
+    )
     retract.set_defaults(func=cmd_retract)
 
     vote = subparsers.add_parser(
@@ -13999,6 +14004,7 @@ def _retract_local_message(
     message_id: str,
     timeout: float = 20.0,
     discover_timeout: Optional[float] = None,
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Retract one DM on the running node, for the local send server."""
     return node.send_retraction(
@@ -14006,6 +14012,7 @@ def _retract_local_message(
         message_id,
         timeout=float(timeout),
         discover_timeout=discover_timeout,
+        queue=bool(queue),
     )
 
 
@@ -14454,6 +14461,7 @@ def _retract_via_running_node(
     *,
     timeout: float,
     discover_timeout: Optional[float],
+    queue: bool = True,
 ) -> Dict[str, Any]:
     """Retract through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -14467,6 +14475,7 @@ def _retract_via_running_node(
             message_id=message_id,
             timeout=timeout,
             discover_timeout=discover_timeout,
+            queue=queue,
         )
     except LocalIPCUnavailable as exc:
         raise NodeError(
@@ -22842,6 +22851,7 @@ def cmd_retract(args: argparse.Namespace) -> int:
         )
     timeout = float(getattr(args, "timeout", 20.0))
     discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    queue = not getattr(args, "no_queue", False)
     via_running_node = _send_routes_via_running_node(config)
     if via_running_node:
         # A serving node owns the data directory: retract through it
@@ -22855,15 +22865,13 @@ def cmd_retract(args: argparse.Namespace) -> int:
                 str(target["id"]),
                 timeout=timeout,
                 discover_timeout=discover_timeout,
+                queue=queue,
             )
         except NodeError as exc:
-            # Retracts ride the live link only in v1 — there is no
-            # outbox queue for them yet — so an unreachable peer is a
-            # plain failure, not a silent queue.
-            raise NodeError(
-                f"could not deliver retract: {exc} "
-                "(retracts need the peer online in v1)"
-            ) from exc
+            # With queueing on, a transport failure returns a queued
+            # result instead of raising; only a refusal or a
+            # --no-queue failure reaches here.
+            raise NodeError(f"could not deliver retract: {exc}") from exc
     else:
         node = TauNode(config, name=config.name)
         node.start()
@@ -22874,17 +22882,39 @@ def cmd_retract(args: argparse.Namespace) -> int:
                     str(target["id"]),
                     timeout=timeout,
                     discover_timeout=discover_timeout,
+                    queue=queue,
                 )
             except NodeError as exc:
-                # Retracts ride the live link only in v1 — there is no
-                # outbox queue for them yet — so an unreachable peer is a
-                # plain failure, not a silent queue.
-                raise NodeError(
-                    f"could not deliver retract: {exc} "
-                    "(retracts need the peer online in v1)"
-                ) from exc
+                # With queueing on, a transport failure returns a queued
+                # result instead of raising; only a refusal or a
+                # --no-queue failure reaches here.
+                raise NodeError(f"could not deliver retract: {exc}") from exc
         finally:
             node.stop()
+
+    if response.get("queued"):
+        # The retract is stored, not delivered: the local copies stay
+        # until the sweep delivers it, so the sender's history only
+        # ever loses a message that actually landed.
+        peer = registry.get(recipient)
+        name = peer.display_name if peer is not None else short_hash(recipient)
+        if _json_mode(args):
+            _emit(
+                {
+                    "target": target["id"],
+                    "to": recipient,
+                    "to_name": name,
+                    "queued": True,
+                    "id": response.get("id"),
+                    "queued_id": response.get("queued_id"),
+                },
+                True,
+            )
+        else:
+            print(
+                f"retraction queued — will deliver when {name} is reachable"
+            )
+        return _EXIT_OK
 
     # The peer confirmed (or already had it gone): drop this node's own
     # sent copy too, so the message is gone on both sides.  A local

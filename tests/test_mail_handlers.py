@@ -2390,6 +2390,209 @@ def test_queued_dm_reaction_clear_rides_sealed_relay(tmp_path):
     assert author_node.inbox.reactions_for("m-1") == []
 
 
+def test_queued_dm_retract_rides_sealed_relay(tmp_path):
+    """A queued DM retract deposits as a retract leg of the target.
+
+    The author's sweep leaves a sealed copy with a holder; the
+    offline recipient fetches it and their copy is deleted exactly
+    like a direct retract — while a duplicate leg, a retract that
+    arrives before its original, and an expired leg are dropped.
+    """
+    (tmp_path / "author").mkdir()
+    (tmp_path / "recipient").mkdir()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+
+    retracted = []
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=recipient_hash, hash=destination_hash(recipient),
+    )
+    recipient_node.on_retract = retracted.append
+    author_node = make_node(tmp_path / "author")
+    author_node.identity = author
+    author_node.destination = SimpleNamespace(
+        hexhash=author_hash, hash=destination_hash(author),
+    )
+    author_node.reticulum = object()  # started enough to queue
+    holder = author_node.registry.upsert(
+        bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder"
+    )
+    author_node.registry.upsert(
+        destination_hash(recipient), recipient.get_public_key(), name="bob"
+    )
+
+    # The original DM, as the recipient first saw it: sealed to them,
+    # delivered through the relay.
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="hello",
+        sent_at=100.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, blob)) is True
+    assert recipient_node.inbox.resolve("m-1")["text"] == "hello"
+
+    # The author's own sent copy, then a retract while the peer is offline.
+    author_node.inbox.append(
+        {
+            "from": "holder",
+            "destination": recipient_hash,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    author_node._request = unreachable
+    response = author_node.send_retraction(recipient_hash, "m-1")
+    assert response["queued"] is True
+    entry = author_node.mailbox.outbox_list()[0]
+    assert entry.kind == "retract"
+    # The sender's own copy stays until the retract delivers.
+    assert author_node.inbox.resolve("m-1")["text"] == "hello"
+
+    calls, fake_request = _recorded_request()
+    author_node._request = fake_request
+    assert author_node._deposit_entry(holder, entry, timeout=5) is True
+    assert len(calls) == 1
+    stored = parse_mail_store(calls[0][2])
+    # The holder-level id stays the outbox entry id...
+    assert stored["id"] == entry.id
+    leg = open_message(recipient, stored["blob"])
+    # ...while the sealed leg names the target message.
+    assert leg["id"] == "m-1"
+    assert leg["text"] == "retraction"
+    assert leg["kind"] == "retract"
+    assert leg["retract"] == {
+        "retract_id": entry.retract["retract_id"],
+    }
+    assert leg["sent_at"] == entry.retract["sent_at"]
+
+    assert recipient_node._deliver_collected(leg) is True
+    with pytest.raises(ValueError):
+        recipient_node.inbox.resolve("m-1")
+    assert len(retracted) == 1
+    assert retracted[0]["id"] == "m-1"
+
+    # A duplicate leg — the same retract id replayed — is dropped.
+    assert recipient_node._deliver_collected(leg) is False
+    assert len(retracted) == 1
+
+    # A retract that arrives before its original still records its
+    # marker, so the original arriving later loses to it.
+    early = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-2",
+        text="retraction",
+        sent_at=200.0,
+        kind="retract",
+        retract={"retract_id": "early-retract"},
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, early)) is True
+    )
+    original = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-2",
+        text="too late",
+        sent_at=100.0,
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, original))
+        is False
+    )
+    with pytest.raises(ValueError):
+        recipient_node.inbox.resolve("m-2")
+
+    # An expired leg never applies.
+    blob3 = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-3",
+        text="still here",
+        sent_at=100.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, blob3)) is True
+    expired = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-3",
+        text="retraction",
+        sent_at=200.0,
+        expires_at=100.0,
+        kind="retract",
+        retract={"retract_id": "expired-retract"},
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, expired))
+        is False
+    )
+    assert recipient_node.inbox.resolve("m-3")["text"] == "still here"
+
+
+def test_queued_group_retract_is_never_deposited(tmp_path):
+    """A retract entry carrying group context never seals for a holder.
+
+    Group retracts are never queued, so such an entry can only come
+    from a hand-edited outbox — but the deposit still refuses it
+    instead of sealing a leg no member could resolve.
+    """
+    (tmp_path / "author").mkdir()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    recipient = RNS.Identity()
+
+    author_node = make_node(tmp_path / "author")
+    author_node.identity = author
+    author_node.destination = SimpleNamespace(
+        hexhash=author_hash, hash=destination_hash(author),
+    )
+    author_node.reticulum = object()  # started enough to queue
+    holder = author_node.registry.upsert(
+        bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder"
+    )
+    author_node.registry.upsert(
+        destination_hash(recipient), recipient.get_public_key(), name="bob"
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    author_node._request = unreachable
+    response = author_node.send_retraction(
+        destination_hash(recipient).hex(), "m-1"
+    )
+    assert response["queued"] is True
+    entry = author_node.mailbox.outbox_list()[0]
+    # A hand-edited outbox gains group context after queueing; save it
+    # so the deposit's fresh read (which reloads from disk) sees it.
+    # The creator and roster must be well-formed, or the reload drops
+    # the group context along with the edit.
+    entry.group_id = "ab" * 16
+    entry.group_creator = "cd" * 16
+    entry.group_members = ["cd" * 16]
+    assert author_node.mailbox.save() is True
+    assert author_node._deposit_entry(holder, entry, timeout=5) is False
+    assert author_node.mailbox.outbox_list()[0].kind == "retract"
+
+
 def test_relayed_dm_edit_leg_lands_before_original(tmp_path):
     """An edited leg that beats its original still lands correctly.
 

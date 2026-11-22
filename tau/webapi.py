@@ -7873,8 +7873,11 @@ class WebBridge:
         route is stamped on the console entry when delivery is
         confirmed (and falls back to the mailbox sent record for older
         entries), so it survives the sent record being evicted.
-        Retracts ride the live link only, so an unreachable peer is a
-        failure, not a silent queue.
+        An unreachable peer queues the retract instead of failing:
+        the call returns ``queued`` and the local copies stay until
+        the sweep delivers it (see
+        :meth:`TauNode._deliver_queued_retract`), so the console keeps
+        showing the message until the retract actually lands.
 
         Ordering keeps every failure retryable from the console: the
         retract goes first, so a failed retract never erases the local
@@ -7958,6 +7961,26 @@ class WebBridge:
                     "reach that copy yet"
                 )
         response = self.node.send_retraction(peer, wire_id, timeout=timeout)
+        if response.get("queued"):
+            # The retract is stored, not delivered: the local copies
+            # stay until the sweep delivers it, and the serving node
+            # drops them then (see _deliver_queued_retract), so the
+            # console keeps showing the message until the retract
+            # actually lands.
+            return {
+                "ok": True,
+                "queued": True,
+                "retracted": {
+                    "id": target,
+                    "wire_id": wire_id,
+                },
+                "id": response.get("id")
+                if isinstance(response.get("id"), str)
+                else None,
+                "queued_id": response.get("queued_id")
+                if isinstance(response.get("queued_id"), str)
+                else None,
+            }
         inbox = getattr(self.node, "inbox", None)
         if inbox is not None:
             try:
