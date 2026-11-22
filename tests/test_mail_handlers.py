@@ -2101,12 +2101,145 @@ def test_relayed_dm_edit_leg_lands_before_original(tmp_path):
         message_id="m-1",
         text="typo here",
         sent_at=100.0,
+        expires_at=1000.0,
+        in_reply_to={"id": "parent-1"},
+        location={"lat": 1.5, "lon": 2.5},
     )
     assert (
         recipient_node._deliver_collected(open_message(recipient, original))
         is False
     )
-    assert recipient_node.inbox.resolve("m-1")["text"] == "fixed here"
+    record = recipient_node.inbox.resolve("m-1")
+    assert record["text"] == "fixed here"
+    assert record["edited_at"] == 110.0
+    # The late original is a duplicate, but its metadata is
+    # authoritative: the stored leg kept the edit's send time and none
+    # of the original's expiry, reply link, or location until now.
+    assert record["sent_at"] == 100.0
+    assert record["expires_at"] == 1000.0
+    assert record["in_reply_to"] == {"id": "parent-1", "excerpt": None}
+    assert record["location"] == {"lat": 1.5, "lon": 2.5}
+
+
+def test_relayed_dm_edit_applies_after_seen_eviction(tmp_path):
+    """An edit leg still applies when the seen marker is gone.
+
+    The seen set is capped and evicts old ids, so a stored DM can
+    outlive its marker.  Without the stored-record check the leg
+    would fall through to the store path and land as a second copy
+    of the message instead of editing the one already there.
+    """
+    (tmp_path / "recipient").mkdir()
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+
+    edited = []
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=recipient_hash, hash=destination_hash(recipient),
+    )
+    recipient_node.on_edit = edited.append
+
+    original = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="typo here",
+        sent_at=100.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, original)) is True
+    assert recipient_node.mailbox.is_seen("m-1") is True
+    # Simulate the seen set evicting the id while the inbox keeps it.
+    del recipient_node.mailbox._seen["m-1"]
+    assert recipient_node.mailbox.is_seen("m-1") is False
+
+    leg = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="fixed here",
+        sent_at=110.0,
+        edited_at=110.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, leg)) is True
+    stored = [
+        entry
+        for entry in recipient_node.inbox.list_messages(
+            limit=None, direction=None
+        )
+        if entry.get("id") == "m-1"
+    ]
+    assert len(stored) == 1
+    assert stored[0]["text"] == "fixed here"
+    assert stored[0]["edited_at"] == 110.0
+    assert len(edited) == 1
+    assert edited[0]["target"] == "m-1"
+
+
+def test_relayed_dm_edit_defers_when_inbox_save_fails(
+    tmp_path, monkeypatch
+):
+    """A relayed edit whose persist fails is retried, not resolved.
+
+    When the inbox write fails the leg must not count as delivered:
+    resolving it would let the holder drop the only copy of an edit
+    the recipient never got.  A later sweep retries it instead.
+    """
+    (tmp_path / "recipient").mkdir()
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+
+    edited = []
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=recipient_hash, hash=destination_hash(recipient),
+    )
+    recipient_node.on_edit = edited.append
+
+    original = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="typo here",
+        sent_at=100.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, original)) is True
+
+    leg = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="fixed here",
+        sent_at=110.0,
+        edited_at=110.0,
+    )
+
+    def _failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(recipient_node.inbox, "_save", _failing_save)
+    with pytest.raises(DeliveryDeferredError):
+        recipient_node._deliver_collected(open_message(recipient, leg))
+    record = recipient_node.inbox.resolve("m-1")
+    assert record["text"] == "typo here"
+    assert record.get("edited_at") is None
+    assert edited == []
+
+    # Once the persist works again the same leg applies normally.
+    monkeypatch.undo()
+    assert recipient_node._deliver_collected(open_message(recipient, leg)) is True
+    record = recipient_node.inbox.resolve("m-1")
+    assert record["text"] == "fixed here"
+    assert record["edited_at"] == 110.0
+    assert len(edited) == 1
 
 
 def test_group_reaction_not_reconciled_for_non_member(tmp_path):

@@ -91,6 +91,14 @@ class InboxError(ValueError):
     """Raised when an inbox lookup or delete fails."""
 
 
+class InboxPersistError(InboxError):
+    """Raised when an inbox write could not be saved to disk.
+
+    Distinct from a final refusal: the write did not land, so the
+    caller may retry it later.
+    """
+
+
 def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored record, or ``None`` when it is unusable.
 
@@ -1264,8 +1272,108 @@ class Inbox:
                     target.pop("edited_at", None)
                 else:
                     target["edited_at"] = previous_edited_at
-                raise InboxError(
+                raise InboxPersistError(
                     f"could not persist inbox; message was not edited: {exc}"
+                ) from exc
+        return dict(target)
+
+    def restore_original_metadata(
+        self,
+        message_id: str,
+        *,
+        sent_at: float,
+        expires_at: Optional[float] = None,
+        in_reply_to: Optional[str] = None,
+        location: Optional[Dict[str, Any]] = None,
+        beacon: Optional[Dict[str, Any]] = None,
+        poll_options: Optional[Any] = None,
+        poll_vote: Optional[str] = None,
+        poll_close: Optional[bool] = None,
+        kind: Optional[str] = None,
+        direction: Optional[str] = None,
+        destination: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Restore an edited leg's original metadata from its original.
+
+        A relayed edit leg that beats its original stores as the
+        message itself, with the edit's send time and none of the
+        original's expiry, reply link, location, or poll state.  When
+        the original arrives later it is a duplicate — but its
+        metadata is authoritative, so this merges it onto the stored
+        record while keeping the edited text and ``edited_at``.  The
+        merge applies only to a record that already carries an edit
+        (``edited_at`` set): a plain stored original already has its
+        own metadata, so a duplicate copy changes nothing.
+
+        Returns the updated record, or ``None`` when no stored message
+        has that id, it is not the caller's DM, it carries no edit, or
+        every field already matches.  A failed persist raises
+        :class:`InboxPersistError` so the caller can retry the
+        delivery instead of dropping the only copy of the original.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            raise InboxError("message id must not be empty")
+        fields: Dict[str, Any] = {
+            "sent_at": sent_at,
+            "expires_at": expires_at,
+            "in_reply_to": in_reply_to,
+            "location": location,
+            "beacon": beacon,
+            "poll_options": poll_options,
+            "poll_vote": poll_vote,
+            "poll_close": poll_close,
+        }
+        if kind is not None:
+            fields["kind"] = kind
+        with self._transaction():
+            target = None
+            for entry in self._messages:
+                if entry.get("id") == message_id:
+                    target = entry
+                    break
+            if target is None:
+                return None
+            if target.get("edited_at") is None:
+                return None
+            if direction is not None or destination is not None:
+                # Re-check ownership inside the transaction: a snapshot
+                # taken by the caller can be stale under a racing edit.
+                if target.get("kind") == "group":
+                    return None
+                if direction is not None and target.get("direction") != direction:
+                    return None
+                if destination is not None and (
+                    target.get("destination") or ""
+                ) != destination:
+                    return None
+            previous: Dict[str, Any] = {}
+            changed = False
+            for key, value in fields.items():
+                if target.get(key) == value:
+                    continue
+                # A None value means the original carries no such
+                # metadata: drop the key rather than storing None,
+                # matching how the record is built on first store.
+                previous[key] = target.get(key)
+                if value is None:
+                    target.pop(key, None)
+                else:
+                    target[key] = value
+                changed = True
+            if not changed:
+                return None
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                for key, value in previous.items():
+                    if value is None:
+                        target.pop(key, None)
+                    else:
+                        target[key] = value
+                raise InboxPersistError(
+                    "could not persist inbox; original metadata was "
+                    f"not restored: {exc}"
                 ) from exc
         return dict(target)
 

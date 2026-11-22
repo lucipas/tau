@@ -85,7 +85,7 @@ from .follows import (
     load_local_follow_list,
     verify_follow_list,
 )
-from .inbox import Inbox, InboxError
+from .inbox import Inbox, InboxError, InboxPersistError
 from .instance_lock import (
     InstanceAlreadyRunning,
     InstanceLock,
@@ -7896,7 +7896,10 @@ class TauNode:
         (the delivery counts as received, and the console is told via
         ``on_edit`` exactly like a direct edit); False when the leg is
         stale, foreign, or names a record that is gone — the copy is
-        resolved either way, so the holder can drop it.
+        resolved either way, so the holder can drop it.  Raises
+        :class:`DeliveryDeferredError` when the edit could not be
+        persisted, so the holder keeps its copy for a later retry
+        instead of dropping an edit the recipient never got.
         """
         sender = message.get("from") if isinstance(message.get("from"), str) else ""
         try:
@@ -7923,6 +7926,14 @@ class TauNode:
                 destination=sender,
                 newer_than_existing=True,
             )
+        except InboxPersistError as exc:
+            # The edit never landed: defer instead of resolving the
+            # leg, so the holder keeps its copy and a later sweep
+            # retries it — resolving here would drop the only copy
+            # of an edit the recipient never got.
+            raise DeliveryDeferredError(
+                f"could not persist relayed edit for {message['id']}: {exc}"
+            ) from exc
         except InboxError:
             # A file record has no text to edit: the leg is resolved.
             return False
@@ -7944,6 +7955,77 @@ class TauNode:
             except Exception:  # pragma: no cover - console callback
                 log.warning("on_edit callback failed", exc_info=True)
         return True
+
+    def _stored_dm_edit_target(self, message: Dict[str, Any]) -> bool:
+        """True when the inbox already holds the DM a relayed copy revises.
+
+        The seen set is capped and evicts old ids, so a stored DM can
+        outlive its seen marker: an edit leg for it would otherwise
+        fall through to the store path and land as a second copy of
+        the message.  Only an inbound DM from the copy's own sender
+        counts — group records and sent copies never do.
+        """
+        message_id = message.get("id")
+        if not isinstance(message_id, str) or not message_id:
+            return False
+        sender = message.get("from") if isinstance(message.get("from"), str) else ""
+        try:
+            record = self.inbox.resolve(message_id)
+        except ValueError:
+            return False
+        return (
+            record.get("kind") != "group"
+            and record.get("direction") == "in"
+            and (record.get("destination") or "") == sender
+        )
+
+    def _restore_relayed_original_metadata(
+        self, message: Dict[str, Any]
+    ) -> None:
+        """Restore a leg-stored message's original metadata, if it needs it.
+
+        An edited leg that beats its original stores as the message
+        itself, with the edit's send time and none of the original's
+        expiry, reply link, location, or poll state.  When the
+        original arrives later it is a duplicate — but its metadata is
+        authoritative, so merge it onto the stored record while the
+        edited text and ``edited_at`` stand.  A plain stored original
+        already has its own metadata, so a duplicate copy changes
+        nothing.  A failed persist raises
+        :class:`DeliveryDeferredError` so the envelope is retried
+        instead of acknowledged with unrestored metadata.
+        """
+        if message.get("group") is not None:
+            return
+        if message.get("edited_at") is not None:
+            # A leg, not the original: the edit path above owns it.
+            return
+        message_id = message.get("id")
+        if not isinstance(message_id, str) or not message_id:
+            return
+        sender = message.get("from") if isinstance(message.get("from"), str) else ""
+        sent_at = message.get("sent_at")
+        if not isinstance(sent_at, (int, float)) or isinstance(sent_at, bool):
+            return
+        try:
+            self.inbox.restore_original_metadata(
+                message_id,
+                sent_at=float(sent_at),
+                expires_at=message.get("expires_at"),
+                in_reply_to=message.get("in_reply_to"),
+                location=message.get("location"),
+                beacon=message.get("beacon"),
+                poll_options=message.get("poll_options"),
+                poll_vote=message.get("poll_vote"),
+                poll_close=message.get("poll_close"),
+                kind=message.get("kind") or None,
+                direction="in",
+                destination=sender,
+            )
+        except InboxPersistError as exc:
+            raise DeliveryDeferredError(
+                f"could not restore original metadata for {message_id}: {exc}"
+            ) from exc
 
     def _deliver_collected(
         self,
@@ -8009,7 +8091,9 @@ class TauNode:
                 sender or "unknown",
             )
             return False
-        if self.mailbox.is_seen(message["id"]):
+        if self.mailbox.is_seen(message["id"]) or self._stored_dm_edit_target(
+            message
+        ):
             # An already-seen id carrying a newer edit time is an
             # edited leg of a DM: a queued edit the sender's sweep
             # deposited with a holder (see _deposit_entry).  Only the
@@ -8018,7 +8102,12 @@ class TauNode:
             # An expired leg never applies.  A leg whose original has
             # not arrived yet is not seen at all, so it stores as the
             # message itself (with the edit time as its edited_at);
-            # the original arriving later drops as its duplicate.
+            # the original arriving later is a duplicate, but its
+            # metadata is restored onto the stored leg first (see
+            # _restore_relayed_original_metadata).  A stored DM can
+            # also outlive its seen marker (the seen set evicts old
+            # ids), so the stored-record check above keeps its legs
+            # from landing as second copies.
             if message.get("group") is None:
                 edited_at = message.get("edited_at")
                 expires_at = message.get("expires_at")
@@ -8037,6 +8126,7 @@ class TauNode:
                     return self._apply_relayed_dm_edit(
                         message, float(edited_at)
                     )
+                self._restore_relayed_original_metadata(message)
             return False
         expires_at = message.get("expires_at")
         if expires_at is not None and expires_at <= time.time():
