@@ -2288,6 +2288,16 @@ def test_relayed_dm_reaction_survives_seen_marker_failure(tmp_path, monkeypatch)
     assert len(reacted) == 1
     assert reacted[0]["reaction"] == "👍"
 
+    # The same leg again, its marker still absent: a replay of the
+    # already-stored reaction resolves without rewriting the record
+    # or publishing a duplicate update.
+    first_received_at = stored_reactions[0]["received_at"]
+    assert author_node._deliver_collected(leg) is False
+    stored_reactions = author_node.inbox.reactions_for("m-1")
+    assert len(stored_reactions) == 1
+    assert stored_reactions[0]["received_at"] == first_received_at
+    assert len(reacted) == 1
+
 
 def test_queued_dm_reaction_clear_rides_sealed_relay(tmp_path):
     """A queued DM reaction clear deposits as a reaction leg too.
