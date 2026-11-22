@@ -12080,8 +12080,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def on_retract(record: Dict[str, Any]) -> None:
             # The node already deleted the inbox record; drop the
             # console's own copy so a retracted DM leaves the feed
-            # and never comes back after a restart.
-            bridge.delete_by_wire_id(str(record.get("id") or ""))
+            # and never comes back after a restart.  A queued retract
+            # deletes this node's own sent copy, so the dispatch
+            # (inbound vs sent) lives in _drop_retracted_console_copy.
+            _drop_retracted_console_copy(bridge, record)
 
         node.on_retract = on_retract
     # The data-directory lock is the more specific guard, so probe it
@@ -14204,6 +14206,31 @@ def _dispatch_local_send(
     if op == "group_send":
         return _send_group_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
+
+
+def _drop_retracted_console_copy(bridge: Any, record: Any) -> None:
+    """Drop the serving console's entry for one retracted DM.
+
+    The node already deleted the inbox record; this drops the
+    console's own copy so a retracted DM leaves the feed and never
+    comes back after a restart.  A record this node sent goes
+    through the sent side — ``delete_by_wire_id`` only matches
+    inbound entries, so a queued retract's outbound bubble would
+    otherwise stay until the next restart.  Best-effort: a console
+    that cannot drop its copy leaves the retract itself untouched.
+    """
+    if bridge is None:
+        return
+    wire_id = str(record.get("id") or "") if isinstance(record, dict) else ""
+    if not wire_id:
+        return
+    try:
+        if record.get("direction") == "out":
+            bridge.delete_sent_by_wire_id(wire_id)
+        else:
+            bridge.delete_by_wire_id(wire_id)
+    except Exception:  # pragma: no cover - console callback
+        log.warning("could not drop retracted message from console", exc_info=True)
 
 
 def _drop_sent_console_copy(bridge: Any, message_id: Any) -> None:

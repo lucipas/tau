@@ -122,6 +122,12 @@ export default function ChatSection() {
     text: string;
     key: string;
   } | null>(null);
+  // Same scoping as the queued-edit notice: a queued-retract notice
+  // belongs to one conversation and must not leak into another.
+  const [retractNotice, setRetractNotice] = useState<{
+    text: string;
+    key: string;
+  } | null>(null);
   const [showOutbox, setShowOutbox] = useState(false);
   const [showBroadcasts, setShowBroadcasts] = useState(false);
   const [searchActive, setSearchActive] = useState(false);
@@ -549,7 +555,25 @@ export default function ChatSection() {
           void run("Delete failed", () => deleteMessage(message.id));
           break;
         case "retract":
-          void run("Retract failed", () => retractMessage(message.id));
+          // A queued retract is accepted but not yet delivered: the
+          // message stays visible until the outbox delivers it, and
+          // a second Retract reuses the queued entry instead of
+          // storing a duplicate leg — so say so, like a queued edit.
+          void (async () => {
+            let queued = false;
+            const ok = await run("Retract failed", async () => {
+              const response = (await retractMessage(message.id)) as {
+                queued?: boolean;
+              } | null;
+              queued = response?.queued === true;
+            });
+            if (ok && queued && selected) {
+              setRetractNotice({
+                text: "Retraction queued — the peer is offline. It goes out when they are reachable, and the message stays visible until then.",
+                key: selected.key,
+              });
+            }
+          })();
           break;
         case "pin":
           void run("Pin failed", () => (message.pinned ? unpinMessage(message.id) : pinMessage(message.id)));
@@ -780,6 +804,14 @@ export default function ChatSection() {
           <p role="status" className="border-b border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300">
             {editNotice.text}
             <button type="button" onClick={() => setEditNotice(null)} className="ml-2 underline">
+              Dismiss
+            </button>
+          </p>
+        )}
+        {retractNotice && selected && retractNotice.key === selected.key && (
+          <p role="status" className="border-b border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300">
+            {retractNotice.text}
+            <button type="button" onClick={() => setRetractNotice(null)} className="ml-2 underline">
               Dismiss
             </button>
           </p>

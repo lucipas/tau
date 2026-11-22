@@ -2547,6 +2547,120 @@ def test_queued_dm_retract_rides_sealed_relay(tmp_path):
     assert recipient_node.inbox.resolve("m-3")["text"] == "still here"
 
 
+def test_retract_to_offline_peer_dedupes_queued_legs(tmp_path):
+    """A second retract of the same message reuses the queued leg.
+
+    Repeated Retract while the peer is offline must not store a
+    duplicate leg under a new signed retract id (see finding 8):
+    the second call reports the already-queued entry instead.
+    """
+    (tmp_path / "author").mkdir()
+    author = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+    author_node = make_node(tmp_path / "author")
+    author_node.identity = author
+    author_node.destination = SimpleNamespace(
+        hexhash=destination_hash(author).hex(), hash=destination_hash(author),
+    )
+    author_node.reticulum = object()  # started enough to queue
+    author_node.registry.upsert(
+        destination_hash(recipient), recipient.get_public_key(), name="bob"
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    author_node._request = unreachable
+    first = author_node.send_retraction(recipient_hash, "m-1")
+    assert first["queued"] is True
+    second = author_node.send_retraction(recipient_hash, "m-1")
+    assert second["queued"] is True
+    assert second["queued_id"] == first["queued_id"]
+    assert second["id"] == first["id"]
+    retracts = [
+        entry
+        for entry in author_node.mailbox.outbox_list()
+        if entry.kind == "retract"
+    ]
+    assert len(retracts) == 1
+
+
+def test_relayed_dm_retract_treats_prefix_target_as_unknown(
+    tmp_path, monkeypatch
+):
+    """A relayed retract naming a unique prefix deletes nothing.
+
+    inbox.resolve matches unique prefixes, but delete_authorized
+    needs an exact id: without the exact-id check the leg records a
+    confirmed marker and reports success while the received message
+    stays in place.  The prefix leg must land as an unknown-target
+    marker (unconfirmed), so a flood of unknown markers can evict
+    it and a later full-id leg still deletes the copy.
+    """
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 2)
+    (tmp_path / "recipient").mkdir()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    recipient = RNS.Identity()
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-abcdef",
+        text="hello",
+        sent_at=100.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, blob)) is True
+    assert recipient_node.inbox.resolve("msg-abcdef")["text"] == "hello"
+
+    prefix_leg = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-abc",
+        text="retraction",
+        sent_at=200.0,
+        kind="retract",
+        retract={"retract_id": "prefix-retract"},
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, prefix_leg))
+        is True
+    )
+    # The copy is still there: the leg named a prefix, not the id.
+    assert recipient_node.inbox.resolve("msg-abcdef")["text"] == "hello"
+    # ...and its marker is unconfirmed, so a flood evicts it.
+    other_hash = destination_hash(RNS.Identity()).hex()
+    for target in ("junk-1", "junk-2", "junk-3"):
+        recipient_node.mailbox.record_retraction(other_hash, target)
+    assert recipient_node.mailbox.is_retracted(author_hash, "msg-abc") is False
+    # A later leg naming the full id still deletes the copy.
+    full_leg = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-abcdef",
+        text="retraction",
+        sent_at=300.0,
+        kind="retract",
+        retract={"retract_id": "full-retract"},
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, full_leg))
+        is True
+    )
+    with pytest.raises(ValueError):
+        recipient_node.inbox.resolve("msg-abcdef")
+
+
 def test_queued_group_retract_is_never_deposited(tmp_path):
     """A retract entry carrying group context never seals for a holder.
 
