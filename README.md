@@ -961,8 +961,7 @@ cancelled aborts the whole edit instead: its sibling legs are cancelled
 with it, so a partial fan-out never rewrites the sender's own copies.
 A newer edit of the same message supersedes a still-queued one. Refusals never queue (allow-list,
 block-list, not a member), and `tau edit --no-queue` keeps the fail-fast
-behaviour. Queued edits ride direct delivery only: no sealed-relay copy,
-no bundle export, no LXMF. A peer running a version that predates edits
+behaviour. Queued DM edits ride the sealed relay too: the sweep deposits one as an edited leg of the original message, so an offline peer gets it from a holder; group edits still ride direct delivery only, and no edit is sealed into a bundle or sent over LXMF. A peer running a version that predates edits
 rejects the unknown path, so an edit to an old peer fails instead of
 silently succeeding.
 

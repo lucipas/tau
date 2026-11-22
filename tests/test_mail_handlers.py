@@ -1933,6 +1933,182 @@ def test_queued_group_leg_relay_copy_carries_shared_send_time(tmp_path):
     assert shown[0]["id"] == "react-1"
 
 
+def test_queued_dm_edit_rides_sealed_relay(tmp_path):
+    """A queued DM edit deposits as an edited leg of the original.
+
+    The sender's sweep leaves a sealed copy with a holder; the
+    offline recipient fetches it and the original's text is replaced
+    in place, exactly like a direct edit — while a stale edit and an
+    edit from anyone but the author are dropped.
+    """
+    (tmp_path / "sender").mkdir()
+    (tmp_path / "recipient").mkdir()
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+
+    edited = []
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=recipient_hash, hash=destination_hash(recipient),
+    )
+    recipient_node.on_edit = edited.append
+    sender_node = make_node(tmp_path / "sender")
+    sender_node.identity = sender
+    sender_node.destination = SimpleNamespace(
+        hexhash=sender_hash, hash=destination_hash(sender),
+    )
+    sender_node.reticulum = object()  # started enough to queue
+    holder = sender_node.registry.upsert(
+        bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder"
+    )
+    sender_node.registry.upsert(
+        destination_hash(recipient), recipient.get_public_key(), name="bob"
+    )
+
+    # The original DM, as the recipient first saw it: sealed to them,
+    # delivered through the relay.
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="typo here",
+        sent_at=100.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, blob)) is True
+    assert recipient_node.inbox.resolve("m-1")["text"] == "typo here"
+
+    # The sender's own sent copy, then an edit while the peer is offline.
+    sender_node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+    sender_node.mailbox.record_sent(
+        "m-1", to=destination_hash(recipient), text="typo here"
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    sender_node._request = unreachable
+    response = sender_node.send_edit(recipient_hash, "m-1", "fixed here")
+    assert response["queued"] is True
+    entry = sender_node.mailbox.outbox_list()[0]
+    assert entry.kind == "edit"
+
+    calls, fake_request = _recorded_request()
+    sender_node._request = fake_request
+    assert sender_node._deposit_entry(holder, entry, timeout=5) is True
+    assert len(calls) == 1
+    stored = parse_mail_store(calls[0][2])
+    # The holder-level id stays the outbox entry id...
+    assert stored["id"] == entry.id
+    leg = open_message(recipient, stored["blob"])
+    # ...while the sealed leg names the original message.
+    assert leg["id"] == "m-1"
+    assert leg["text"] == "fixed here"
+    assert leg["kind"] == "chat"
+    assert leg["edited_at"] == entry.edit["sent_at"]
+
+    assert recipient_node._deliver_collected(leg) is True
+    record = recipient_node.inbox.resolve("m-1")
+    assert record["text"] == "fixed here"
+    assert record["edited_at"] == entry.edit["sent_at"]
+    assert len(edited) == 1
+    assert edited[0]["target"] == "m-1"
+    assert edited[0]["text"] == "fixed here"
+
+    # A stale edit — an older edit time than the one already applied —
+    # is dropped, never rewinding the newer text.
+    stale = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="older fix",
+        sent_at=90.0,
+        edited_at=entry.edit["sent_at"] - 10,
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, stale)) is False
+    )
+    assert recipient_node.inbox.resolve("m-1")["text"] == "fixed here"
+
+    # An edit from anyone but the message's author is dropped too.
+    stranger = RNS.Identity()
+    foreign = seal_message(
+        stranger,
+        sender_name="mallory",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="forged fix",
+        sent_at=200.0,
+        edited_at=entry.edit["sent_at"] + 10,
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, foreign))
+        is False
+    )
+    assert recipient_node.inbox.resolve("m-1")["text"] == "fixed here"
+
+
+def test_relayed_dm_edit_leg_lands_before_original(tmp_path):
+    """An edited leg that beats its original still lands correctly.
+
+    The leg stores as the message itself (with the edit time as its
+    edited_at); the original arriving later drops as its duplicate,
+    so the reader never sees the pre-edit text.
+    """
+    (tmp_path / "recipient").mkdir()
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=recipient_hash, hash=destination_hash(recipient),
+    )
+
+    leg = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="fixed here",
+        sent_at=110.0,
+        edited_at=110.0,
+    )
+    assert recipient_node._deliver_collected(open_message(recipient, leg)) is True
+    record = recipient_node.inbox.resolve("m-1")
+    assert record["text"] == "fixed here"
+    assert record["edited_at"] == 110.0
+
+    original = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="m-1",
+        text="typo here",
+        sent_at=100.0,
+    )
+    assert (
+        recipient_node._deliver_collected(open_message(recipient, original))
+        is False
+    )
+    assert recipient_node.inbox.resolve("m-1")["text"] == "fixed here"
+
+
 def test_group_reaction_not_reconciled_for_non_member(tmp_path):
     # The same late arrival, but the reactor is not on the roster the
     # message pins: the reaction stays stranded under the foreign id

@@ -6394,8 +6394,12 @@ class TauNode:
         have refused.  A member running a version without group edits
         is the same kind of permanent failure.  A transport failure
         records an attempt and leaves the leg queued for the next
-        sweep.  Edits ride direct delivery only — there is no LXMF or
-        sealed-relay path for them in v1.
+        sweep.  A DM edit also rides the sealed relay: the sweep
+        deposits it as an edited leg of the original message (see
+        _deposit_entry), so an offline peer still gets it from a
+        holder.  A group edit rides direct delivery only — there is
+        no LXMF or sealed-relay path for it, and no edit is sealed
+        into a bundle.
         """
         edit = getattr(entry, "edit", None)
         if not isinstance(edit, dict):
@@ -7342,18 +7346,37 @@ class TauNode:
                     return False
         except TimeoutError:
             return False
-        if getattr(fresh, "edit", None) is not None or (
-            getattr(fresh, "kind", None) == "edit"
-        ):
-            # Edits ride direct delivery only in v1: the sealed path is
-            # text-shaped, and a holder cannot carry a pre-signed edit
-            # — so no sealed copy is ever left.
-            log.info(
-                "Skipping deposit of queued edit %s: edits are not "
-                "sealed for holders",
-                entry.id,
-            )
-            return False
+        edit = getattr(fresh, "edit", None)
+        is_edit = edit is not None or getattr(fresh, "kind", None) == "edit"
+        if is_edit:
+            if fresh.group_id is not None or (
+                isinstance(edit, dict) and edit.get("target_author") is not None
+            ):
+                # Group edits still ride direct delivery only: legs
+                # carry a different wire id per member, so no single
+                # sealed copy names every member's copy (see
+                # _handle_dm_edit) — a sealed leg naming the sender's
+                # id would match nothing on any member.
+                log.info(
+                    "Skipping deposit of queued group edit %s: group "
+                    "edits are not sealed for holders",
+                    entry.id,
+                )
+                return False
+            if not isinstance(edit, dict):
+                # Kind "edit" but the payload did not survive storage:
+                # there is no target to seal a leg for, and sealing
+                # the display text would land as chat.
+                log.info(
+                    "Skipping deposit of queued edit %s: no edit target",
+                    entry.id,
+                )
+                return False
+            # A DM edit deposits as an edited leg of the original
+            # message (see the seal below): the envelope carries the
+            # target's id, the replacement text and the edit's signed
+            # send time, so the recipient applies it exactly like a
+            # direct edit — no pre-signed edit bytes ride the relay.
         if getattr(fresh, "reaction", None) is not None or (
             getattr(fresh, "kind", None) == "reaction"
         ):
@@ -7458,12 +7481,25 @@ class TauNode:
                     sealed_group["announcements_only"],
                     sealed_group["announcements_sent_at"],
                 ) = announcements
+        # A DM edit seals as an edited leg of the original message:
+        # the envelope carries the target's id, so the recipient's
+        # seen-check meets the original and applies the new text
+        # instead of storing a second message (see _deliver_collected).
+        # It reads as the edited message itself — kind text, sent at
+        # the edit's signed time — because the recipient judges it by
+        # edited_at, not by kind.  The holder-level id below stays the
+        # outbox entry id, so ack/dedupe at the holder is unchanged.
+        sealed_id = fresh.id
+        sealed_kind = getattr(fresh, "kind", None)
+        if is_edit:
+            sealed_id = edit["target"]
+            sealed_kind = None
         try:
             blob = seal_message(
                 self.identity,
                 sender_name=self.name,
                 recipient_public_key=recipient.public_key,
-                message_id=fresh.id,
+                message_id=sealed_id,
                 text=fresh.text,
                 sent_at=fresh.wire_sent_at,
                 group=sealed_group,
@@ -7471,7 +7507,7 @@ class TauNode:
                 in_reply_to=fresh.in_reply_to,
                 location=fresh.location,
                 beacon=fresh.beacon,
-                kind=getattr(fresh, "kind", None),
+                kind=sealed_kind,
                 edited_at=fresh.edited_at,
                 poll_options=fresh.poll_options,
                 poll_vote=fresh.poll_vote,
@@ -7846,6 +7882,69 @@ class TauNode:
             self.mailbox.drop_held(envelope.id, to=self.destination.hash)
         return received
 
+    def _apply_relayed_dm_edit(
+        self, message: Dict[str, Any], edited_at: float
+    ) -> bool:
+        """Apply a relayed edited leg to the DM it revises.
+
+        The leg's id is the original message's id (see
+        :meth:`_deposit_entry`), so the copy it revises is already
+        stored.  Only the message's own author may rewrite it, and
+        only a newer edit applies — the direct-path rules in
+        :meth:`_handle_dm_edit`, enforced again atomically by
+        :meth:`Inbox.apply_edit`.  Returns True when the edit landed
+        (the delivery counts as received, and the console is told via
+        ``on_edit`` exactly like a direct edit); False when the leg is
+        stale, foreign, or names a record that is gone — the copy is
+        resolved either way, so the holder can drop it.
+        """
+        sender = message.get("from") if isinstance(message.get("from"), str) else ""
+        try:
+            record = self.inbox.resolve(message["id"])
+        except ValueError:
+            record = None
+        if record is None:
+            # The original went away between the seen-check and the
+            # lookup (a concurrent delete or retract): nothing to
+            # rewrite, and the leg is resolved.
+            return False
+        if (
+            record.get("kind") == "group"
+            or record.get("direction") != "in"
+            or (record.get("destination") or "") != sender
+        ):
+            return False
+        try:
+            applied = self.inbox.apply_edit(
+                message["id"],
+                message.get("text", ""),
+                edited_at=edited_at,
+                direction="in",
+                destination=sender,
+                newer_than_existing=True,
+            )
+        except InboxError:
+            # A file record has no text to edit: the leg is resolved.
+            return False
+        if applied is None:
+            # Stale (an older edit lost to a newer one) or the record
+            # went away mid-apply: resolved either way.
+            return False
+        if self.on_edit is not None:
+            try:
+                self.on_edit(
+                    {
+                        "target": message["id"],
+                        "text": applied.get("text", ""),
+                        "edited_at": edited_at,
+                        "from": message.get("from_name", ""),
+                        "destination": sender,
+                    }
+                )
+            except Exception:  # pragma: no cover - console callback
+                log.warning("on_edit callback failed", exc_info=True)
+        return True
+
     def _deliver_collected(
         self,
         message: Dict[str, Any],
@@ -7911,6 +8010,33 @@ class TauNode:
             )
             return False
         if self.mailbox.is_seen(message["id"]):
+            # An already-seen id carrying a newer edit time is an
+            # edited leg of a DM: a queued edit the sender's sweep
+            # deposited with a holder (see _deposit_entry).  Only the
+            # message's own author may rewrite it, and only a newer
+            # edit applies — the direct-path rules in _handle_dm_edit.
+            # An expired leg never applies.  A leg whose original has
+            # not arrived yet is not seen at all, so it stores as the
+            # message itself (with the edit time as its edited_at);
+            # the original arriving later drops as its duplicate.
+            if message.get("group") is None:
+                edited_at = message.get("edited_at")
+                expires_at = message.get("expires_at")
+                if (
+                    isinstance(edited_at, (int, float))
+                    and not isinstance(edited_at, bool)
+                    and (
+                        expires_at is None
+                        or (
+                            isinstance(expires_at, (int, float))
+                            and not isinstance(expires_at, bool)
+                            and float(expires_at) > time.time()
+                        )
+                    )
+                ):
+                    return self._apply_relayed_dm_edit(
+                        message, float(edited_at)
+                    )
             return False
         expires_at = message.get("expires_at")
         if expires_at is not None and expires_at <= time.time():
