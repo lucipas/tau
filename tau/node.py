@@ -8028,6 +8028,31 @@ class TauNode:
                 if resolved is not None and isinstance(resolved.get("id"), str)
                 else target_id
             )
+            # A replay of a reaction already stored — same target,
+            # reactor, reaction id and send time — arrives when its
+            # seen marker never landed (the marker write failed on
+            # the first delivery).  Resolve it without touching the
+            # stored record: re-merging would rewrite received_at
+            # and publish a duplicate update for the same reaction.
+            for stored in self.inbox.all_reactions():
+                if (
+                    stored.get("target") == canonical_target
+                    and stored.get("destination") == sender
+                    and stored.get("id") == reaction_id
+                    and float(stored.get("sent_at") or 0.0) == float(sent_at)
+                ):
+                    try:
+                        self.mailbox.mark_seen(seen_key)
+                    except OSError as exc:
+                        # The marker stays missing, but the replay is
+                        # resolved either way — the next copy is
+                        # dropped here again, not re-published.
+                        log.warning(
+                            "Could not mark relayed reaction %s seen: %s",
+                            seen_key,
+                            exc,
+                        )
+                    return False
             record = {
                 "target": canonical_target,
                 "reaction": token,
