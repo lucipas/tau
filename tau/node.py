@@ -3095,6 +3095,76 @@ class TauNode:
         )
         thread.start()
 
+    def announce_roster_change(
+        self,
+        group: Dict[str, Any],
+        *,
+        added: Sequence[str] = (),
+        removed: Sequence[str] = (),
+        timeout: float = 5.0,
+        discover_timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Announce a roster change to the group's new roster.
+
+        The creator rotates the group id on a roster change (#697),
+        but the remaining members only learn the successor from the
+        next message sent to it — until then a removed member can
+        keep posting to the old id and have those messages accepted,
+        because every member still holds the old roster.  This
+        announcement is a group message to the new roster, the same
+        vehicle as the join welcome: receiving it pins the successor
+        and retires the predecessor on every remaining member at
+        once (the successor names the predecessor in its lineage,
+        see :meth:`tau.groups.GroupStore._apply_roster_change`).
+
+        *added* / *removed* are display names.  Returns the
+        per-member send results (each ``{"delivered": True}``,
+        ``{"queued": True}``, or an ``{"ok": False, "error": ...}``
+        failure), unwrapped from :meth:`send_group_message`'s
+        summary dict.  The announcement is best-effort: the roster
+        change already happened, so a send failure is logged and an
+        empty result returned instead of failing the command — and
+        members learn the new roster from the next message instead.
+        *timeout* is the per-leg budget and is short on purpose:
+        an unreachable member gets a queued leg that delivers on
+        retry, so a roster command never waits out a full discovery
+        window per offline member.  *discover_timeout* caps the
+        per-leg peer lookup the same way.
+        """
+        added = [name for name in added if name]
+        removed = [name for name in removed if name]
+        if not added and not removed:
+            return []
+        sentences = []
+        if added:
+            sentences.append(f"{', '.join(added)} joined {group['name']}.")
+        if removed:
+            verb = "was" if len(removed) == 1 else "were"
+            sentences.append(
+                f"{', '.join(removed)} {verb} removed from {group['name']}."
+            )
+        try:
+            summary = self.send_group_message(
+                group,
+                " ".join(sentences),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except Exception:  # pragma: no cover - delivery is best-effort
+            # Log nothing from the group record: the record carries
+            # the opaque id, and CodeQL treats any field of it as
+            # sensitive — logging the name did not clear the alert
+            # either (see #699, whose name-logging alerts are still
+            # open on main). A static message is the only safe log.
+            log.warning(
+                "Could not announce roster change to a group",
+                exc_info=True,
+            )
+            return []
+        if isinstance(summary, dict):
+            return list(summary.get("results") or [])
+        return list(summary or [])
+
     def list_join_requests(
         self, group_name: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -7341,8 +7411,16 @@ class TauNode:
                         "roster_attestation"
                     )
                 ),
+                # The lineage bound to the leg's own id wins, for the
+                # same reason: after a rotation the live record no
+                # longer carries it, and a retry without it cannot
+                # retire the predecessor (see #703).
                 renamed_from=(
-                    (self.groups.get(fresh.group_id) or {}).get("renamed_from")
+                    fresh.group_renamed_from
+                    if fresh.group_renamed_from is not None
+                    else (self.groups.get(fresh.group_id) or {}).get(
+                        "renamed_from"
+                    )
                     or None
                 ),
                 in_reply_to=fresh.in_reply_to,
@@ -7973,10 +8051,14 @@ class TauNode:
                 # The lineage rides in the sealed envelope, so an
                 # offline member that receives this copy through
                 # store-and-forward retires the predecessor exactly
-                # as a direct recipient would; the current record is
-                # read at deposit time, like the direct re-send path.
+                # as a direct recipient would; the lineage bound to
+                # the leg's own id wins, like the attestation above —
+                # after a rotation the live record no longer carries
+                # it (see #703).
                 "renamed_from": (
-                    (self.groups.get(fresh.group_id) or {}).get(
+                    fresh.group_renamed_from
+                    if fresh.group_renamed_from is not None
+                    else (self.groups.get(fresh.group_id) or {}).get(
                         "renamed_from"
                     )
                     or None
@@ -10322,6 +10404,10 @@ class TauNode:
             "members": list(group["members"]),
             # Bound to this id: a queued leg keeps it after a rotation.
             "roster_attestation": group.get("roster_attestation"),
+            # Bound to this id too: a queued leg keeps the lineage
+            # after a rotation, so its retry still retires the
+            # predecessor (see #703).
+            "renamed_from": group.get("renamed_from"),
         }
         # Leg ids that were delivered or queued (never a refused leg:
         # its id reached nobody, so nobody can quote it).
@@ -10710,11 +10796,14 @@ class TauNode:
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
+                # Log no leg data: the member hash and the outbox id
+                # both read as sensitive to CodeQL here (the leg's
+                # entry carries the group's lineage), so a static
+                # message is the only safe log — the queued leg is
+                # visible in the outbox listing.
                 log.info(
-                    "Member %s is unreachable; queued group message %s "
+                    "A member is unreachable; queued a group message "
                     "in the outbox",
-                    member,
-                    entry.id,
                 )
                 results.append(
                     {

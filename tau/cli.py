@@ -19778,16 +19778,60 @@ def _roster_hash(target: Any, members: List[str]) -> Optional[str]:
     return cleaned
 
 
+def _summarize_roster_announcement(
+    announcement: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Count a roster-change announcement's per-member results.
+
+    A leg is delivered when it carries ``delivered``, queued when it
+    carries ``queued``, and failed otherwise — a failed leg is
+    reported, never silently dropped from the counts. All zeros means
+    nothing was announced (the send failed, or the roster did not
+    change).
+    """
+    delivered = sum(1 for result in announcement if result.get("delivered"))
+    queued = sum(1 for result in announcement if result.get("queued"))
+    failed = len(announcement) - delivered - queued
+    return {"delivered": delivered, "queued": queued, "failed": failed}
+
+
+def _print_roster_announcement(
+    announcement: List[Dict[str, Any]], *, changed: bool
+) -> None:
+    """Summarise a roster-change announcement, or fall back to the old note.
+
+    *announcement* is the per-member send results from
+    :meth:`tau.node.TauNode.announce_roster_change`; an empty list
+    means nothing was announced (the send failed, or the roster did
+    not change), so members still learn the new roster from the next
+    message when *changed*.
+    """
+    if announcement:
+        counts = _summarize_roster_announcement(announcement)
+        summary = (
+            f" ({counts['delivered']} delivered, {counts['queued']} queued"
+        )
+        if counts["failed"]:
+            summary += f", {counts['failed']} failed"
+        print("Roster change announced to the group" + summary + ").")
+    elif changed:
+        print("Members learn the new roster from the next message sent to it.")
+
+
 def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
     """Add peers to, or remove peers from, a group this node created.
 
     The id derives from the roster, so the change is a successor group
     (same name, new id); the store swaps the old record for the new one
-    in a single transaction.
+    in a single transaction.  The change is then announced to the new
+    roster, so every remaining member pins the successor and retires
+    the predecessor at once instead of learning it from the next
+    message (see #703).
     """
     config = _make_config(args)
     node = TauNode(config, name=config.name)
     node.start()
+    announcement: List[Dict[str, Any]] = []
     try:
         own_hash = node.destination_hexhash
         group = node.groups.find(args.group)
@@ -19848,12 +19892,29 @@ def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
             created_by=own_hash,
             identity=getattr(node, "identity", None),
         )
+        # Announce while the node is still running: the announcement
+        # is a group message to the new roster, and a queued leg
+        # delivers on retry when a member is unreachable.
+        changed_names = [peer.display_name for peer in peers]
+        announcement = node.announce_roster_change(
+            new_group,
+            added=changed_names if adding else (),
+            removed=() if adding else changed_names,
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
     finally:
         node.stop()
 
     described = _describe_group(new_group, node.registry)
     if _json_mode(args):
-        _emit({"group": described, "previous_id": group["id"]}, True)
+        _emit(
+            {
+                "group": described,
+                "previous_id": group["id"],
+                "announcement": _summarize_roster_announcement(announcement),
+            },
+            True,
+        )
         return _EXIT_OK
     action = "added to" if adding else "removed from"
     names = ", ".join(peer.display_name for peer in peers)
@@ -19863,7 +19924,7 @@ def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
     )
     for member in described["members"]:
         print(f"  {member['name']} ({member['hash'][:8]})")
-    print("Members learn the new roster from the next message sent to it.")
+    _print_roster_announcement(announcement, changed=True)
     return _EXIT_OK
 
 
@@ -19924,6 +19985,7 @@ def cmd_group_ban(args: argparse.Namespace) -> int:
                 timeout=float(getattr(args, "discover_timeout", 10.0)),
             )
         previous_id = group["id"]
+        announcement: List[Dict[str, Any]] = []
         try:
             new_group = node.groups.ban(
                 group["id"],
@@ -19933,6 +19995,16 @@ def cmd_group_ban(args: argparse.Namespace) -> int:
             )
         except ValueError as exc:
             raise NodeError(str(exc)) from exc
+        # A ban that removes a member from the roster rotates the id,
+        # so announce it to the new roster while the node is still
+        # running (see #703); banning a non-member changes no roster
+        # and needs no announcement.
+        if new_group["id"] != previous_id:
+            announcement = node.announce_roster_change(
+                new_group,
+                removed=[peer.display_name],
+                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
     finally:
         node.stop()
 
@@ -19944,6 +20016,7 @@ def cmd_group_ban(args: argparse.Namespace) -> int:
                 "group": described,
                 "banned": banned_entries,
                 "previous_id": previous_id,
+                "announcement": _summarize_roster_announcement(announcement),
             },
             True,
         )
@@ -19960,6 +20033,9 @@ def cmd_group_ban(args: argparse.Namespace) -> int:
         )
     print("They cannot be re-added or approved through a join request.")
     print("Lift it with `tau group unban`.")
+    _print_roster_announcement(
+        announcement, changed=previous_id != new_group["id"]
+    )
     return _EXIT_OK
 
 

@@ -633,6 +633,23 @@ def test_group_store_update_members_adds_and_removes(tmp_path):
     assert len(store) == 1
 
 
+def test_group_store_update_members_names_roster_predecessor(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    # The successor names its predecessor, like a rename does: a
+    # member learning the successor retires the old roster instead
+    # of only deleting it (see #703).
+    assert grown["renamed_from"] == [group["id"]]
+    shrunk = store.update_members(
+        grown["id"], [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    assert shrunk["id"] == group["id"]
+    assert shrunk["renamed_from"] == [grown["id"]]
+
+
 def test_group_store_set_topic(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
@@ -2271,6 +2288,50 @@ def test_group_store_record_retires_rename_predecessors(tmp_path):
     )
 
 
+def test_group_store_record_retires_roster_predecessor(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    old_id = derive_group_id(OTHER_HASH, "weekend", members)
+    store.record(
+        old_id,
+        "weekend",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+    )
+    # A creator-authorized roster successor naming its predecessor
+    # retires the old roster: the announcement a member receives
+    # for the successor is what makes a removal stick (see #703).
+    new_members = [OWN_HASH, OTHER_HASH]
+    new_id = derive_group_id(OTHER_HASH, "weekend", new_members)
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=200.0,
+        renamed_from=[old_id],
+    )
+    assert successor is not None
+    assert store.get(old_id) is None
+    assert store.get_retired(old_id) is not None
+    # A removed member cannot restore the old roster by replaying
+    # a message under the old id.
+    assert (
+        store.record(
+            old_id,
+            "weekend",
+            members,
+            creator=OTHER_HASH,
+            sender=THIRD_HASH,
+            sent_at=300.0,
+        )
+        is None
+    )
+
+
 def test_group_store_record_keeps_predecessor_without_creator(tmp_path):
     store, members, old_id, new_id = _learned_group_ids(tmp_path)
     # A member-carried successor pins alongside: the lineage is only a
@@ -3037,6 +3098,24 @@ def test_group_store_secret_update_members_rotates_id(tmp_path):
         )
         == grown
     )
+
+
+def test_group_store_secret_update_members_names_predecessor(tmp_path):
+    store, creator, _, creator_hash, member_hash, group = _secret_store_fixture(
+        tmp_path
+    )
+    third = RNS.Identity()
+    third_hash = destination_hash(third).hex()
+    grown = store.update_members(
+        group["id"],
+        [creator_hash, member_hash, third_hash],
+        created_by=creator_hash,
+        identity=creator,
+    )
+    # A secret group's successor names its predecessor too, so the
+    # announcement retires the old roster for its members (see #703).
+    assert grown["renamed_from"] == [group["id"]]
+    assert grown["secret"] is True
 
 
 def test_group_store_secret_rename_rotates_id(tmp_path):
@@ -5875,6 +5954,7 @@ class _FakeGroupNode:
         self.groups = GroupStore(config.groups_path)
         self.registry = PeerRegistry(config.peers_path)
         self.started = False
+        self.announcements = []
 
     @property
     def destination_hexhash(self):
@@ -5885,6 +5965,18 @@ class _FakeGroupNode:
 
     def stop(self):
         self.started = False
+
+    def announce_roster_change(
+        self, group, *, added=(), removed=(), timeout=5.0, discover_timeout=None
+    ):
+        self.announcements.append(
+            {"group": group, "added": list(added), "removed": list(removed)}
+        )
+        return [
+            {"to": member, "delivered": True}
+            for member in group["members"]
+            if member != self.destination_hexhash
+        ]
 
     def resolve_peer(self, target, timeout=10.0):
         peer = self.registry.resolve(target)

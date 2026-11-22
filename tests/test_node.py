@@ -989,6 +989,31 @@ def test_send_group_reaction_queues_unreachable_legs(tmp_path, monkeypatch):
     assert len(node.inbox.reactions_for("m-1")) == 1
 
 
+def test_send_group_message_queued_leg_logs_no_member_or_leg_id(
+    tmp_path, monkeypatch, caplog
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NodeError("no route to peer")
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    with caplog.at_level(logging.INFO, logger="tau.node"):
+        response = node.send_group_message("crew", "hello")
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[bob.hexhash].get("queued") is True
+    # The queued-leg log carries no leg data: neither the member hash
+    # nor the outbox id — CodeQL reads both as sensitive on this path
+    # (see #704).
+    queued_id = by_to[bob.hexhash].get("id")
+    assert bob.hexhash not in caplog.text
+    assert queued_id not in caplog.text
+    assert "queued a group message in the outbox" in caplog.text
+
+
 def test_deliver_queued_reaction_drops_refused_leg(tmp_path, monkeypatch):
     node, peer = _reaction_node(tmp_path)
 
@@ -1629,6 +1654,48 @@ def test_deliver_entry_skips_queued_post_when_group_goes_announcements_only(
     assert skipped.attempts == 1
     assert skipped.next_attempt_at is not None
     assert skipped.next_attempt_at > time.time()
+
+
+def test_queued_group_leg_keeps_lineage_after_rotation(tmp_path, monkeypatch):
+    from tau.mailbox import OutboxEntry
+    from tau.protocol import derive_group_id, parse_group_message
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    old_id = derive_group_id(
+        alice.hexhash, "old-crew", list(group["members"])
+    )
+    entry = node.mailbox.enqueue(
+        to=bob.destination_hash,
+        text="queued hello",
+        message_id="lineage-leg-1",
+        group={
+            "id": group["id"],
+            "name": group["name"],
+            "creator": group["creator"],
+            "members": list(group["members"]),
+            "renamed_from": [old_id],
+        },
+        sent_at=100.0,
+    )
+    # The lineage is bound to the leg at enqueue time and survives a
+    # save/reload of the outbox.
+    assert entry.group_renamed_from == [old_id]
+    assert (
+        OutboxEntry.from_dict(entry.to_dict()).group_renamed_from == [old_id]
+    )
+    # The group rotates away before the retry: the live record is gone.
+    assert node.groups.delete(group["id"]) is True
+    payloads = []
+
+    def _capture(*args, **kwargs):
+        payloads.append(args[2])
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", _capture)
+    snapshot = node.mailbox.get_outbox("lineage-leg-1")
+    assert node._deliver_entry(bob, snapshot, timeout=1.0) is True
+    assert len(payloads) == 1
+    assert parse_group_message(payloads[0])["renamed_from"] == [old_id]
 
 
 def test_skip_paces_restricted_leg_once_per_sweep(tmp_path, monkeypatch):

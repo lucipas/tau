@@ -1,6 +1,7 @@
 """Group invite links + request-to-join (issue #466)."""
 
 import base64
+import logging
 import time
 import types
 
@@ -520,6 +521,122 @@ def test_closed_group_join_queues_request(tmp_path, monkeypatch):
     # Approving twice fails: there is no pending request any more.
     with pytest.raises(ValueError, match="no pending join request"):
         node.approve_join_request(group["name"], carol.hexhash)
+
+
+# --- node: roster-change announcements --------------------------------------
+
+
+def test_announce_roster_change_sends_to_new_roster(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    _, carol = _peer_identity("carol")
+    group = _group(node, own_hash, bob, carol)
+    new_group = node.groups.update_members(
+        group["id"], [own_hash, bob.hexhash], created_by=own_hash
+    )
+    sent = []
+
+    def _capture(group_arg, text, **kwargs):
+        sent.append((group_arg, text, kwargs))
+        return {
+            "ok": True,
+            "results": [{"to": bob.hexhash, "delivered": True}],
+        }
+
+    monkeypatch.setattr(node, "send_group_message", _capture)
+    results = node.announce_roster_change(new_group, removed=["carol"])
+    assert len(sent) == 1
+    assert sent[0][0]["id"] == new_group["id"]
+    assert "carol" in sent[0][1]
+    assert "removed" in sent[0][1]
+    # The per-leg budget is short on purpose: unreachable members
+    # queue instead of burning a full discovery window each.
+    assert sent[0][2].get("timeout") == 5.0
+    # The summary dict is unwrapped to the per-member results.
+    assert results == [{"to": bob.hexhash, "delivered": True}]
+
+
+def test_announce_roster_change_names_adds_and_removes(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    _, carol = _peer_identity("carol")
+    _, dave = _peer_identity("dave")
+    group = _group(node, own_hash, bob, carol)
+    new_group = node.groups.update_members(
+        group["id"],
+        [own_hash, bob.hexhash, dave.hexhash],
+        created_by=own_hash,
+    )
+    sent = []
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda group_arg, text, **kwargs: sent.append((group_arg, text))
+        or {"ok": True, "results": []},
+    )
+    assert (
+        node.announce_roster_change(
+            new_group, added=["dave"], removed=["carol"]
+        )
+        == []
+    )
+    assert len(sent) == 1
+    assert sent[0][0]["id"] == new_group["id"]
+    assert "dave" in sent[0][1] and "joined" in sent[0][1]
+    assert "carol" in sent[0][1] and "removed" in sent[0][1]
+
+
+def test_announce_roster_change_noop_without_changes(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    group = _group(node, own_hash, bob)
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("no announcement without a change")
+        ),
+    )
+    assert node.announce_roster_change(group) == []
+    assert node.announce_roster_change(group, added=[], removed=[]) == []
+
+
+def test_announce_roster_change_failure_is_best_effort(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    group = _group(node, own_hash, bob)
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("no route to member")
+        ),
+    )
+    assert node.announce_roster_change(group, removed=["carol"]) == []
+
+
+def test_announce_roster_change_failure_logs_no_group_data(
+    tmp_path, monkeypatch, caplog
+):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    group = _secret_group(node, identity, own_hash, bob)
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("no route to member")
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger="tau.node"):
+        assert node.announce_roster_change(group, removed=["bob"]) == []
+    # The failure log carries nothing from the group record: not the
+    # id, not a prefix of it, and not even the name — CodeQL treats
+    # any field of the record as sensitive (see #699/#704).
+    assert group["id"] not in caplog.text
+    assert group["id"][:8] not in caplog.text
+    assert "crew" not in caplog.text
+    assert "Could not announce roster change to a group" in caplog.text
 
 
 def test_approve_join_request_refuses_banned_peer(tmp_path, monkeypatch):
