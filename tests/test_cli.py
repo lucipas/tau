@@ -1765,6 +1765,72 @@ def test_group_remove_member_announces_roster_change(tmp_path, capsys, monkeypat
     assert stored[0]["renamed_from"] == [group["id"]]
 
 
+def test_group_remove_member_json_carries_announcement_summary(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    _seed_group_with_carol(data_dir, own_hash)
+
+    monkeypatch.setattr(cli, "TauNode", _FakeBanNode)
+    assert (
+        cli.main(
+            [
+                "group",
+                "remove-member",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "--peer",
+                "carol",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    # JSON callers get the same announcement outcome the text mode
+    # prints, so a member never told about the removal goes reported
+    # (see #704).
+    assert payload["announcement"] == {
+        "delivered": 1,
+        "queued": 0,
+        "failed": 0,
+    }
+
+
+def test_group_ban_json_carries_announcement_summary(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    _seed_group_with_carol(data_dir, own_hash)
+
+    monkeypatch.setattr(cli, "TauNode", _FakeBanNode)
+    assert (
+        cli.main(
+            [
+                "group",
+                "ban",
+                "--data-dir",
+                str(data_dir),
+                "weekend",
+                "carol",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["announcement"] == {
+        "delivered": 1,
+        "queued": 0,
+        "failed": 0,
+    }
+
+
 def test_group_show_text_json_and_errors(tmp_path, capsys, monkeypatch):
     from tau.groups import GroupStore
 

@@ -989,6 +989,31 @@ def test_send_group_reaction_queues_unreachable_legs(tmp_path, monkeypatch):
     assert len(node.inbox.reactions_for("m-1")) == 1
 
 
+def test_send_group_message_queued_leg_logs_no_member_or_leg_id(
+    tmp_path, monkeypatch, caplog
+):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NodeError("no route to peer")
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    with caplog.at_level(logging.INFO, logger="tau.node"):
+        response = node.send_group_message("crew", "hello")
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[bob.hexhash].get("queued") is True
+    # The queued-leg log carries no leg data: neither the member hash
+    # nor the outbox id — CodeQL reads both as sensitive on this path
+    # (see #704).
+    queued_id = by_to[bob.hexhash].get("id")
+    assert bob.hexhash not in caplog.text
+    assert queued_id not in caplog.text
+    assert "queued a group message in the outbox" in caplog.text
+
+
 def test_deliver_queued_reaction_drops_refused_leg(tmp_path, monkeypatch):
     node, peer = _reaction_node(tmp_path)
 

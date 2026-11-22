@@ -615,7 +615,7 @@ def test_announce_roster_change_failure_is_best_effort(tmp_path, monkeypatch):
     assert node.announce_roster_change(group, removed=["carol"]) == []
 
 
-def test_announce_roster_change_failure_logs_name_not_secret_id(
+def test_announce_roster_change_failure_logs_no_group_data(
     tmp_path, monkeypatch, caplog
 ):
     node, identity, own_hash = _invite_node(tmp_path)
@@ -630,10 +630,13 @@ def test_announce_roster_change_failure_logs_name_not_secret_id(
     )
     with caplog.at_level(logging.WARNING, logger="tau.node"):
         assert node.announce_roster_change(group, removed=["bob"]) == []
-    # The failure log names the group, never any slice of its opaque id.
+    # The failure log carries nothing from the group record: not the
+    # id, not a prefix of it, and not even the name — CodeQL treats
+    # any field of the record as sensitive (see #699/#704).
     assert group["id"] not in caplog.text
     assert group["id"][:8] not in caplog.text
-    assert "crew" in caplog.text
+    assert "crew" not in caplog.text
+    assert "Could not announce roster change to a group" in caplog.text
 
 
 def test_approve_join_request_refuses_banned_peer(tmp_path, monkeypatch):

@@ -3151,12 +3151,13 @@ class TauNode:
                 discover_timeout=discover_timeout,
             )
         except Exception:  # pragma: no cover - delivery is best-effort
-            # Log the name, never any slice of the id: a secret
-            # group's id is opaque, and even a prefix of it must not
-            # reach the logs (see #699).
+            # Log nothing from the group record: the record carries
+            # the opaque id, and CodeQL treats any field of it as
+            # sensitive — logging the name did not clear the alert
+            # either (see #699, whose name-logging alerts are still
+            # open on main). A static message is the only safe log.
             log.warning(
-                "Could not announce roster change to group %r",
-                group["name"],
+                "Could not announce roster change to a group",
                 exc_info=True,
             )
             return []
@@ -10795,11 +10796,14 @@ class TauNode:
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
+                # Log no leg data: the member hash and the outbox id
+                # both read as sensitive to CodeQL here (the leg's
+                # entry carries the group's lineage), so a static
+                # message is the only safe log — the queued leg is
+                # visible in the outbox listing.
                 log.info(
-                    "Member %s is unreachable; queued group message %s "
+                    "A member is unreachable; queued a group message "
                     "in the outbox",
-                    member,
-                    entry.id,
                 )
                 results.append(
                     {

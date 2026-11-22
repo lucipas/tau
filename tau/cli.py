@@ -19778,6 +19778,23 @@ def _roster_hash(target: Any, members: List[str]) -> Optional[str]:
     return cleaned
 
 
+def _summarize_roster_announcement(
+    announcement: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Count a roster-change announcement's per-member results.
+
+    A leg is delivered when it carries ``delivered``, queued when it
+    carries ``queued``, and failed otherwise — a failed leg is
+    reported, never silently dropped from the counts. All zeros means
+    nothing was announced (the send failed, or the roster did not
+    change).
+    """
+    delivered = sum(1 for result in announcement if result.get("delivered"))
+    queued = sum(1 for result in announcement if result.get("queued"))
+    failed = len(announcement) - delivered - queued
+    return {"delivered": delivered, "queued": queued, "failed": failed}
+
+
 def _print_roster_announcement(
     announcement: List[Dict[str, Any]], *, changed: bool
 ) -> None:
@@ -19787,20 +19804,15 @@ def _print_roster_announcement(
     :meth:`tau.node.TauNode.announce_roster_change`; an empty list
     means nothing was announced (the send failed, or the roster did
     not change), so members still learn the new roster from the next
-    message when *changed*.  A leg is delivered when it carries
-    ``delivered``, queued when it carries ``queued``, and failed
-    otherwise — a failed leg is reported, never silently dropped
-    from the counts.
+    message when *changed*.
     """
     if announcement:
-        delivered = sum(
-            1 for result in announcement if result.get("delivered")
+        counts = _summarize_roster_announcement(announcement)
+        summary = (
+            f" ({counts['delivered']} delivered, {counts['queued']} queued"
         )
-        queued = sum(1 for result in announcement if result.get("queued"))
-        failed = len(announcement) - delivered - queued
-        summary = f" ({delivered} delivered, {queued} queued"
-        if failed:
-            summary += f", {failed} failed"
+        if counts["failed"]:
+            summary += f", {counts['failed']} failed"
         print("Roster change announced to the group" + summary + ").")
     elif changed:
         print("Members learn the new roster from the next message sent to it.")
@@ -19895,7 +19907,14 @@ def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
 
     described = _describe_group(new_group, node.registry)
     if _json_mode(args):
-        _emit({"group": described, "previous_id": group["id"]}, True)
+        _emit(
+            {
+                "group": described,
+                "previous_id": group["id"],
+                "announcement": _summarize_roster_announcement(announcement),
+            },
+            True,
+        )
         return _EXIT_OK
     action = "added to" if adding else "removed from"
     names = ", ".join(peer.display_name for peer in peers)
@@ -19997,6 +20016,7 @@ def cmd_group_ban(args: argparse.Namespace) -> int:
                 "group": described,
                 "banned": banned_entries,
                 "previous_id": previous_id,
+                "announcement": _summarize_roster_announcement(announcement),
             },
             True,
         )
