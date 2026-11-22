@@ -846,8 +846,7 @@ queued message. The local copy is recorded on delivery, not at queue
 time, so your own reaction only ever shows once it has landed, and
 `tau react --no-queue` keeps the old fail-fast behavior. An explicit
 refusal (allow-list, block-list, not-a-member) is final and is never
-queued. Reactions ride direct delivery only: a holder cannot carry
-one, and a queued reaction is never sealed into a bundle. A reaction
+queued. Queued DM reactions ride the sealed relay too: the sweep deposits one as a reaction leg of the target message, so an offline peer gets it from a holder; group reactions still ride direct delivery only, and no reaction is sealed into a bundle or sent over LXMF. A reaction
 whose target this node has never seen is still stored (the target
 may arrive later over a relay), but it is only rendered under a message the
 inbox actually holds.

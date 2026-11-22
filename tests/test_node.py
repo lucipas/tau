@@ -1028,18 +1028,33 @@ def test_send_reaction_full_outbox_raises_node_error(tmp_path, monkeypatch):
     assert node.mailbox.outbox_list() == []
 
 
-def test_queued_reaction_is_never_deposited(tmp_path, monkeypatch):
-    node, peer = _reaction_node(tmp_path)
+def test_queued_group_reaction_is_never_deposited(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
 
     def unreachable(*args, **kwargs):
         raise NodeError("no route to peer")
 
     monkeypatch.setattr(node, "_request", unreachable)
-    node.send_reaction("alice", "m-1", "👍")
-    entry = node.mailbox.outbox_list()[0]
-    # No sealed copy is ever left with a holder for a reaction.
-    assert node._deposit_entry(peer, entry, 1.0) is False
-    assert len(node.mailbox.outbox_list()) == 1
+    node.send_group_reaction("crew", "m-1", "👍")
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 2
+    assert all(entry.kind == "reaction" for entry in entries)
+
+    calls = []
+
+    def recorded(*args, **kwargs):
+        calls.append(args)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", recorded)
+    # No sealed copy is ever left with a holder for a group reaction:
+    # legs carry a different wire id per member, so no single sealed
+    # copy names every member's copy.
+    assert node._deposit_entry(alice, entries[0], 1.0) is False
+    assert node._deposit_entry(bob, entries[1], 1.0) is False
+    assert calls == []
+    assert len(node.mailbox.outbox_list()) == 2
 
 
 def _typing_node(tmp_path):

@@ -2062,6 +2062,241 @@ def test_queued_dm_edit_rides_sealed_relay(tmp_path):
     assert recipient_node.inbox.resolve("m-1")["text"] == "fixed here"
 
 
+def test_queued_dm_reaction_rides_sealed_relay(tmp_path):
+    """A queued DM reaction deposits as a reaction leg of the target.
+
+    The reactor's sweep leaves a sealed copy with a holder; the
+    offline author fetches it and the reaction lands under their sent
+    message exactly like a direct reaction — while a stale reaction,
+    a duplicate leg and an expired leg are dropped.
+    """
+    (tmp_path / "reactor").mkdir()
+    (tmp_path / "author").mkdir()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+
+    reacted = []
+    author_node = make_node(tmp_path / "author")
+    author_node.identity = author
+    author_node.destination = SimpleNamespace(
+        hexhash=author_hash, hash=destination_hash(author),
+    )
+    author_node.on_reaction = reacted.append
+    reactor_node = make_node(tmp_path / "reactor")
+    reactor_node.identity = reactor
+    reactor_node.destination = SimpleNamespace(
+        hexhash=reactor_hash, hash=destination_hash(reactor),
+    )
+    reactor_node.reticulum = object()  # started enough to queue
+    holder = reactor_node.registry.upsert(
+        bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder"
+    )
+    reactor_node.registry.upsert(
+        destination_hash(author), author.get_public_key(), name="alice"
+    )
+
+    # The original DM, as the reactor first saw it: sealed to them,
+    # delivered through the relay.
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=reactor.get_public_key(),
+        message_id="m-1",
+        text="hello",
+        sent_at=100.0,
+    )
+    assert reactor_node._deliver_collected(open_message(reactor, blob)) is True
+    assert reactor_node.inbox.resolve("m-1")["text"] == "hello"
+
+    # The author's own sent copy, then a reaction while the peer is offline.
+    author_node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    reactor_node._request = unreachable
+    response = reactor_node.send_reaction(author_hash, "m-1", "👍")
+    assert response["queued"] is True
+    entry = reactor_node.mailbox.outbox_list()[0]
+    assert entry.kind == "reaction"
+
+    calls, fake_request = _recorded_request()
+    reactor_node._request = fake_request
+    assert reactor_node._deposit_entry(holder, entry, timeout=5) is True
+    assert len(calls) == 1
+    stored = parse_mail_store(calls[0][2])
+    # The holder-level id stays the outbox entry id...
+    assert stored["id"] == entry.id
+    leg = open_message(author, stored["blob"])
+    # ...while the sealed leg names the target message.
+    assert leg["id"] == "m-1"
+    assert leg["text"] == "👍"
+    assert leg["kind"] == "reaction"
+    assert leg["reaction"] == {
+        "token": "👍",
+        "reaction_id": entry.reaction["reaction_id"],
+    }
+    assert leg["sent_at"] == entry.reaction["sent_at"]
+
+    assert author_node._deliver_collected(leg) is True
+    stored_reactions = author_node.inbox.reactions_for("m-1")
+    assert len(stored_reactions) == 1
+    assert stored_reactions[0]["reaction"] == "👍"
+    assert stored_reactions[0]["destination"] == reactor_hash
+    assert stored_reactions[0]["id"] == entry.reaction["reaction_id"]
+    assert len(reacted) == 1
+    assert reacted[0]["target"] == "m-1"
+    assert reacted[0]["reaction"] == "👍"
+
+    # A duplicate leg — the same reaction id replayed — is dropped.
+    assert author_node._deliver_collected(leg) is False
+    assert len(author_node.inbox.reactions_for("m-1")) == 1
+    assert len(reacted) == 1
+
+    # A stale reaction — an older send time than the one already
+    # applied — is dropped, never rewinding the newer reaction.
+    stale = seal_message(
+        reactor,
+        sender_name="bob",
+        recipient_public_key=author.get_public_key(),
+        message_id="m-1",
+        text="❤️",
+        sent_at=entry.reaction["sent_at"] - 10,
+        kind="reaction",
+        reaction={
+            "token": "❤️",
+            "reaction_id": "older-reaction",
+        },
+    )
+    assert (
+        author_node._deliver_collected(open_message(author, stale)) is False
+    )
+    assert author_node.inbox.reactions_for("m-1")[0]["reaction"] == "👍"
+
+    # An expired leg never applies.
+    expired = seal_message(
+        reactor,
+        sender_name="bob",
+        recipient_public_key=author.get_public_key(),
+        message_id="m-1",
+        text="😮",
+        sent_at=entry.reaction["sent_at"] + 10,
+        expires_at=100.0,
+        kind="reaction",
+        reaction={
+            "token": "😮",
+            "reaction_id": "newer-reaction",
+        },
+    )
+    assert (
+        author_node._deliver_collected(open_message(author, expired)) is False
+    )
+    assert author_node.inbox.reactions_for("m-1")[0]["reaction"] == "👍"
+
+
+def test_queued_dm_reaction_clear_rides_sealed_relay(tmp_path):
+    """A queued DM reaction clear deposits as a reaction leg too.
+
+    The reactor reacts, then clears while the author is offline; the
+    clear leg removes the stored reaction exactly like a direct
+    clear — and a stale reaction after the clear never resurrects it.
+    """
+    (tmp_path / "reactor").mkdir()
+    (tmp_path / "author").mkdir()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+
+    author_node = make_node(tmp_path / "author")
+    author_node.identity = author
+    author_node.destination = SimpleNamespace(
+        hexhash=author_hash, hash=destination_hash(author),
+    )
+    reactor_node = make_node(tmp_path / "reactor")
+    reactor_node.identity = reactor
+    reactor_node.destination = SimpleNamespace(
+        hexhash=destination_hash(reactor).hex(),
+        hash=destination_hash(reactor),
+    )
+    reactor_node.reticulum = object()  # started enough to queue
+    holder = reactor_node.registry.upsert(
+        bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder"
+    )
+    reactor_node.registry.upsert(
+        destination_hash(author), author.get_public_key(), name="alice"
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    reactor_node._request = unreachable
+    response = reactor_node.send_reaction(author_hash, "m-1", "👍")
+    assert response["queued"] is True
+    entry = reactor_node.mailbox.outbox_list()[0]
+
+    calls, fake_request = _recorded_request()
+    reactor_node._request = fake_request
+    assert reactor_node._deposit_entry(holder, entry, timeout=5) is True
+    leg = open_message(author, parse_mail_store(calls[0][2])["blob"])
+    assert author_node._deliver_collected(leg) is True
+    assert len(author_node.inbox.reactions_for("m-1")) == 1
+
+    # The clear, queued while the author is still offline.
+    reactor_node._request = unreachable
+    response = reactor_node.send_reaction(author_hash, "m-1", "")
+    assert response["queued"] is True
+    assert response["cleared"] is True
+    clear_entry = [
+        item
+        for item in reactor_node.mailbox.outbox_list()
+        if item.reaction is not None and item.reaction.get("token") == ""
+    ][0]
+
+    calls, fake_request = _recorded_request()
+    reactor_node._request = fake_request
+    assert reactor_node._deposit_entry(holder, clear_entry, timeout=5) is True
+    clear_leg = open_message(author, parse_mail_store(calls[0][2])["blob"])
+    assert clear_leg["kind"] == "reaction"
+    assert clear_leg["reaction"]["token"] == ""
+    assert author_node._deliver_collected(clear_leg) is True
+    assert author_node.inbox.reactions_for("m-1") == []
+
+    # Replaying the original reaction leg is a duplicate now.
+    assert author_node._deliver_collected(leg) is False
+    assert author_node.inbox.reactions_for("m-1") == []
+
+    # A stale reaction — older than the clear — never resurrects it.
+    stale = seal_message(
+        reactor,
+        sender_name="bob",
+        recipient_public_key=author.get_public_key(),
+        message_id="m-1",
+        text="❤️",
+        sent_at=clear_entry.reaction["sent_at"] - 10,
+        kind="reaction",
+        reaction={
+            "token": "❤️",
+            "reaction_id": "older-reaction",
+        },
+    )
+    assert (
+        author_node._deliver_collected(open_message(author, stale)) is False
+    )
+    assert author_node.inbox.reactions_for("m-1") == []
+
+
 def test_relayed_dm_edit_leg_lands_before_original(tmp_path):
     """An edited leg that beats its original still lands correctly.
 

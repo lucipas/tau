@@ -75,6 +75,7 @@ from .protocol import (
     clean_group_topic,
     clean_in_reply_to,
     clean_location,
+    clean_reaction,
     decode,
     encode,
     generate_message_id,
@@ -3510,6 +3511,7 @@ def seal_message(
     beacon: Optional[Dict[str, Any]] = None,
     kind: Optional[str] = None,
     edited_at: Optional[float] = None,
+    reaction: Optional[Dict[str, Any]] = None,
     poll_options: Optional[List[str]] = None,
     poll_vote: Optional[Dict[str, Any]] = None,
     poll_close: Optional[Dict[str, Any]] = None,
@@ -3539,6 +3541,13 @@ def seal_message(
     exactly like a direct one — without them a member's queued vote
     to an announcements-only group arrives as a plain post and the
     recipient drops it.
+    ``reaction`` (``{\"token\", \"reaction_id\"}``) marks the envelope
+    as a reaction leg of the message named by ``message_id``: the
+    token, the signed reaction id and the signed send time (``sent_at``)
+    travel inside the same signed envelope, so a relayed reaction
+    still applies exactly like a direct one — the recipient keys
+    dedupe and ordering on the reaction id and send time, and the
+    envelope's own signature proves who reacted.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -3666,6 +3675,23 @@ def seal_message(
         if not math.isfinite(edited_at_value):
             raise MailboxError("edited_at must be a finite number")
         inner["edited_at"] = edited_at_value
+    if reaction is not None:
+        if not isinstance(reaction, dict):
+            raise MailboxError("reaction must be a dict")
+        reaction_id = reaction.get("reaction_id")
+        if (
+            not isinstance(reaction_id, str)
+            or not reaction_id
+            or len(reaction_id) > 64
+        ):
+            raise MailboxError(
+                "reaction id must be a 1-64 character string"
+            )
+        try:
+            token = clean_reaction(reaction.get("token"))
+        except ProtocolError as exc:
+            raise MailboxError(f"invalid reaction token: {exc}") from exc
+        inner["reaction"] = {"token": token, "reaction_id": reaction_id}
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         inner["in_reply_to"] = reply_to
@@ -3960,6 +3986,25 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         result["poll_vote"] = sealed_vote
     if sealed_close is not None:
         result["poll_close"] = sealed_close
+    # A reaction leg rides the same way: without the token and the
+    # signed reaction id the recipient could not apply it, and the
+    # leg would read as chat.  Malformed reaction data drops the
+    # field, never the message — the delivery path refuses a leg
+    # with no reaction payload.
+    reaction_raw = payload.get("reaction")
+    if isinstance(reaction_raw, dict):
+        reaction_id = reaction_raw.get("reaction_id")
+        try:
+            token = clean_reaction(reaction_raw.get("token"))
+        except ProtocolError:
+            token = None
+        if (
+            isinstance(reaction_id, str)
+            and reaction_id
+            and len(reaction_id) <= 64
+            and token is not None
+        ):
+            result["reaction"] = {"token": token, "reaction_id": reaction_id}
     group_raw = payload.get("group")
     if group_raw is not None:
         if not isinstance(group_raw, dict):
