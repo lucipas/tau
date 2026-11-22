@@ -12,7 +12,7 @@ import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.mailbox import MailboxError, open_message, seal_message
-from tau.node import DeliveryDeferredError, NodeError, TauNode
+from tau.node import DeliveryDeferredError, NodeError, PeerRejectedError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
     ProtocolError,
@@ -2584,6 +2584,121 @@ def test_retract_to_offline_peer_dedupes_queued_legs(tmp_path):
         if entry.kind == "retract"
     ]
     assert len(retracts) == 1
+
+
+def test_retract_storage_failure_queues_but_permanent_rejection_does_not(
+    tmp_path,
+):
+    """storage_failed is transient; not_sender is final.
+
+    A peer that could not persist the retract this time gets a retry
+    through the outbox; a peer that says the caller is not the sender
+    never will, so the retract raises instead of queueing.
+    """
+    (tmp_path / "author").mkdir()
+    author = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+    author_node = make_node(tmp_path / "author")
+    author_node.identity = author
+    author_node.destination = SimpleNamespace(
+        hexhash=destination_hash(author).hex(), hash=destination_hash(author),
+    )
+    author_node.reticulum = object()  # started enough to queue
+    author_node.registry.upsert(
+        destination_hash(recipient), recipient.get_public_key(), name="bob"
+    )
+
+    def storage_failed(*args, **kwargs):
+        raise PeerRejectedError(
+            "peer rejected the request: could not record retraction",
+            code="storage_failed",
+        )
+
+    author_node._request = storage_failed
+    response = author_node.send_retraction(recipient_hash, "m-1")
+    assert response["queued"] is True
+
+    def not_sender(*args, **kwargs):
+        raise PeerRejectedError(
+            "peer rejected the request: not the sender", code="not_sender"
+        )
+
+    author_node._request = not_sender
+    with pytest.raises(PeerRejectedError):
+        author_node.send_retraction(recipient_hash, "m-2")
+    retracts = [
+        entry
+        for entry in author_node.mailbox.outbox_list()
+        if entry.kind == "retract"
+    ]
+    assert len(retracts) == 1
+    assert retracts[0].retract["target"] == "m-1"
+
+
+def test_queued_retract_retries_on_storage_failure(tmp_path):
+    """A queued retract survives a storage failure, not a rejection.
+
+    The sweep re-sends the leg after a transient storage failure
+    (attempt recorded, entry kept); a permanent rejection drops it.
+    """
+    (tmp_path / "author").mkdir()
+    author = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+    author_node = make_node(tmp_path / "author")
+    author_node.identity = author
+    author_node.destination = SimpleNamespace(
+        hexhash=destination_hash(author).hex(), hash=destination_hash(author),
+    )
+    author_node.reticulum = object()  # started enough to queue
+    peer = author_node.registry.upsert(
+        destination_hash(recipient), recipient.get_public_key(), name="bob"
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    author_node._request = unreachable
+    first = author_node.send_retraction(recipient_hash, "m-1")
+    assert first["queued"] is True
+    entry = [
+        item
+        for item in author_node.mailbox.outbox_list()
+        if item.kind == "retract"
+    ][0]
+
+    def storage_failed(*args, **kwargs):
+        raise PeerRejectedError(
+            "peer rejected the request: could not record retraction",
+            code="storage_failed",
+        )
+
+    author_node._request = storage_failed
+    assert author_node._deliver_queued_retract(peer, entry, timeout=5) is False
+    remaining = [
+        item
+        for item in author_node.mailbox.outbox_list()
+        if item.kind == "retract"
+    ]
+    assert len(remaining) == 1
+    assert remaining[0].attempts == 1
+
+    def not_sender(*args, **kwargs):
+        raise PeerRejectedError(
+            "peer rejected the request: not the sender", code="not_sender"
+        )
+
+    author_node._request = not_sender
+    assert (
+        author_node._deliver_queued_retract(peer, remaining[0], timeout=5)
+        is False
+    )
+    assert [
+        item
+        for item in author_node.mailbox.outbox_list()
+        if item.kind == "retract"
+    ] == []
 
 
 def test_relayed_dm_retract_treats_prefix_target_as_unknown(

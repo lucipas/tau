@@ -474,8 +474,15 @@ class PeerRejectedError(NodeError):
 
     The peer received the request and rejected it (for example an
     invalid edit or a storage failure), which is not a transport
-    failure: such a rejection must not be queued for retry.
+    failure: such a rejection must not be queued for retry — except
+    ``storage_failed``, which is transient: the peer could not read
+    its inbox or persist the record this time, so callers that retry
+    transient failures check :attr:`code` for it.
     """
+
+    def __init__(self, message: str, *, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class DeliveryDeferredError(NodeError):
@@ -6922,6 +6929,24 @@ class TauNode:
                 peer, REQUEST_RETRACT, payload_bytes, timeout, deadline=deadline
             )
         except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
+            if (
+                isinstance(exc, PeerRejectedError)
+                and getattr(exc, "code", None) == "storage_failed"
+            ):
+                # Transient: the peer could not persist the retract
+                # this time — record an attempt and keep the leg for
+                # the next sweep instead of dropping it.
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error=str(exc), timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
             # A refusal or rejection is final: the peer will not take
             # this retract (or no longer counts this node as a member),
             # so stop retrying rather than holding the leg until its TTL.
@@ -11854,7 +11879,18 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            response = self._request(peer, REQUEST_RETRACT, payload_bytes, timeout)
+            try:
+                response = self._request(
+                    peer, REQUEST_RETRACT, payload_bytes, timeout
+                )
+            except PeerRejectedError as exc:
+                if getattr(exc, "code", None) == "storage_failed":
+                    # The peer could not read its inbox or persist
+                    # the marker this time — a transient failure, not
+                    # a refusal: queue the retract like a transport
+                    # failure instead of dropping it as final.
+                    raise NodeError(str(exc)) from exc
+                raise
         except (PeerRefusedError, NotAMemberError, PeerRejectedError):
             # An explicit refusal (allow-list, block-list) or a peer
             # rejection (not the sender, a file, an invalid retract)
@@ -13728,7 +13764,10 @@ class TauNode:
                 raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
-            raise PeerRejectedError(f"peer rejected the request: {message}")
+            raise PeerRejectedError(
+                f"peer rejected the request: {message}",
+                code=error.get("code") if isinstance(error.get("code"), str) else None,
+            )
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
         return decoded
