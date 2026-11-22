@@ -18634,19 +18634,25 @@ def cmd_group_show(args: argparse.Namespace) -> int:
         payload["pinned"] = pinned
         _emit({"group": payload}, True)
         return _EXIT_OK
-    created = datetime.fromtimestamp(float(group["created_at"])).strftime(
-        "%Y-%m-%d %H:%M"
-    )
+    try:
+        created = datetime.fromtimestamp(float(group["created_at"])).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+    except (OverflowError, OSError, ValueError):
+        # Non-finite or out-of-range stored timestamps cannot be formatted.
+        created = "unknown"
     print(f"{group['name']} ({group['id']})")
-    print(f"  created: {created} by {creator_name} ({group['created_by'][:8]})")
+    if creator_hash:
+        print(f"  created: {created} by {creator_name} ({creator_hash[:8]})")
+    else:
+        print(f"  created: {created} by {creator_name}")
     if group.get("topic"):
         print(f"  topic: {group['topic']}")
-    if group.get("announcements_only"):
-        print("  announcements-only")
+    print(f"  announcements-only: {'yes' if group.get('announcements_only') else 'no'}")
     print(f"  members ({len(described['members'])}):")
     for member in described["members"]:
         creator_suffix = (
-            " [creator]" if member["hash"] == group["created_by"] else ""
+            " [creator]" if creator_hash and member["hash"] == creator_hash else ""
         )
         print(f"    {member['name']} ({member['hash'][:8]}){creator_suffix}")
     if banned:
@@ -18655,13 +18661,8 @@ def cmd_group_show(args: argparse.Namespace) -> int:
             print(f"    {entry['name']} ({entry['hash'][:8]})")
     else:
         print("  banned: none")
-    flags = []
-    if ignored:
-        flags.append("ignored")
-    if pinned:
-        flags.append("pinned")
-    if flags:
-        print(f"  flags: {', '.join(flags)}")
+    print(f"  ignored: {'yes' if ignored else 'no'}")
+    print(f"  pinned: {'yes' if pinned else 'no'}")
     return _EXIT_OK
 
 

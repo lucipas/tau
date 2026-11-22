@@ -1766,7 +1766,8 @@ def test_group_show_text_json_and_errors(tmp_path, capsys, monkeypatch):
     assert f"weekend ({successor['id']})" in out
     assert "banned (1):" in out
     assert "carol (cdcdcdcd)" in out
-    assert "flags: ignored, pinned" in out
+    assert "ignored: yes" in out
+    assert "pinned: yes" in out
 
     assert (
         cli.main(
@@ -13523,3 +13524,4 @@ def test_channel_poll_delay_rejects_bad_combinations(tmp_path, capsys):
     )
     assert code == 2
     assert "a poll needs 2-8 options" in capsys.readouterr().err
+a poll needs 2-8 options" in capsys.readouterr().err
