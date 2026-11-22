@@ -91,6 +91,14 @@ class InboxError(ValueError):
     """Raised when an inbox lookup or delete fails."""
 
 
+class InboxPersistError(InboxError):
+    """Raised when an inbox write could not be saved to disk.
+
+    Distinct from a final refusal: the write did not land, so the
+    caller may retry it later.
+    """
+
+
 def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored record, or ``None`` when it is unusable.
 

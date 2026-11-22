@@ -85,7 +85,7 @@ from .follows import (
     load_local_follow_list,
     verify_follow_list,
 )
-from .inbox import Inbox, InboxError
+from .inbox import Inbox, InboxError, InboxPersistError
 from .instance_lock import (
     InstanceAlreadyRunning,
     InstanceLock,
@@ -8009,7 +8009,9 @@ class TauNode:
                 sender or "unknown",
             )
             return False
-        if self.mailbox.is_seen(message["id"]):
+        if self.mailbox.is_seen(message["id"]) or self._stored_dm_edit_target(
+            message
+        ):
             # An already-seen id carrying a newer edit time is an
             # edited leg of a DM: a queued edit the sender's sweep
             # deposited with a holder (see _deposit_entry).  Only the
@@ -12780,6 +12782,26 @@ class TauNode:
                 # it is still the peer's explicit refusal, not transport.
                 raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
+                raise NotAMemberError(f"peer rejected the request: {message}")
+            raise PeerRejectedError(f"peer rejected the request: {message}")
+        if isinstance(state.get("rtt"), (int, float)):
+            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+ == "not_a_member":
+                raise NotAMemberError(f"peer rejected the request: {message}")
+            raise PeerRejectedError(f"peer rejected the request: {message}")
+        if isinstance(state.get("rtt"), (int, float)):
+            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+is still the peer's explicit refusal, not transport.
+                raise PeerRefusedError(f"peer rejected the request: {message}")
+            if error.get("code") == "not_a_member":
+                raise NotAMemberError(f"peer rejected the request: {message}")
+            raise PeerRejectedError(f"peer rejected the request: {message}")
+        if isinstance(state.get("rtt"), (int, float)):
+            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+ == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
             raise PeerRejectedError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
