@@ -4277,6 +4277,116 @@ def test_search_channel_poll_excludes_expired_votes(tmp_path, capsys):
     assert poll_out["total"] == 1
 
 
+def test_search_channel_poll_tally_hides_received_votes_when_blocklist_unreadable(
+    tmp_path, capsys
+):
+    # An unreadable block list keeps this node's own poll in search,
+    # but its tally must count only this node's votes: a received
+    # vote never affects the counts or leaks voter metadata.
+    from tau.channels import create_message, init_db as init_channel_db
+
+    data_dir, poll = _seed_channel_poll_conversation(tmp_path)
+    capsys.readouterr()
+    prefix = poll["hash"][:8]
+    code = cli.main(
+        [
+            "channel",
+            "vote",
+            "--data-dir",
+            str(data_dir),
+            "--no-publish",
+            "general",
+            prefix,
+            "Saturday",
+        ]
+    )
+    assert code == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="alice")
+    own_hash = destination_hash(load_identity(config.identity_path)).hex()
+    target = {"author": poll["author"], "sent_at": poll["created_at"]}
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        create_message(
+            conn,
+            RNS.Identity(),
+            "general",
+            "voted: Sunday",
+            name="mallory",
+            now=time.time(),
+            poll_vote={"target": target, "option": 1},
+        )
+    finally:
+        conn.close()
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+    code = cli.main(
+        [
+            "search",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--json",
+            "day",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    poll_out = payload["messages"][0]["poll"]
+    assert poll_out["counts"] == [1, 0]
+    assert poll_out["total"] == 1
+    assert poll_out["my_vote"] == 0
+    assert [voter["author"] for voter in poll_out["voters"]] == [own_hash]
+
+
+def test_search_unreadable_blocklist_keeps_older_own_post_behind_newer_peer_matches(
+    tmp_path, capsys
+):
+    # With an unreadable block list, newer peer matches must not fill
+    # the channel limit and hide an older matching own post: the
+    # search restricts to this node's posts before the limit applies.
+    from tau.channels import create_message, init_db as init_channel_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()
+    assert cli.main(["channel", "join", "--data-dir", str(data_dir), "general"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    own = load_identity(config.identity_path)
+    conn = init_channel_db(config.channels_db_path)
+    try:
+        create_message(
+            conn, own, "general", "bridge note from me", name="bob", now=1000
+        )
+        for n in range(3):
+            create_message(
+                conn,
+                RNS.Identity(),
+                "general",
+                f"bridge note {n}",
+                name="peer",
+                now=1001 + n,
+            )
+    finally:
+        conn.close()
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+    code = cli.main(
+        [
+            "search",
+            "--data-dir",
+            str(data_dir),
+            "--channel",
+            "general",
+            "--limit",
+            "2",
+            "bridge",
+        ]
+    )
+    assert code == 0
+    assert "bridge note from me" in capsys.readouterr().out
+
+
 def test_search_channel_reply_hides_retracted_parent(tmp_path, capsys):
     # A reply whose parent history hides (retracted here) carries no
     # quote: the parent's text never resurfaces in search output.

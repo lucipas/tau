@@ -422,6 +422,27 @@ def test_search_respects_limit_and_excluded_authors(identities, tmp_path):
     ] == ["mesh three", "mesh one"]
 
 
+def test_search_restricts_to_only_authors_before_limit(identities, tmp_path):
+    # Restricting to one author applies before the limit, so newer
+    # matches from other authors can never crowd an older matching
+    # post from the kept author out of the results.
+    alice, bob = identities
+    conn = init_db(tmp_path / "channels.sqlite3")
+    create_message(conn, alice, "general", "mesh one", name="alice", now=1000)
+    create_message(conn, bob, "general", "mesh two", name="bob", now=1001)
+    create_message(conn, bob, "general", "mesh three", name="bob", now=1002)
+
+    assert [
+        item["text"]
+        for item in search_channel_messages(
+            conn, "general", "mesh", limit=2, only_authors=[author_of(alice)]
+        )
+    ] == ["mesh one"]
+    assert (
+        search_channel_messages(conn, "general", "mesh", only_authors=[]) == []
+    )
+
+
 def test_search_returns_more_than_history_page(identities, tmp_path):
     # A search limit above the history page size is honoured up to
     # the store bound — the page size must never silently truncate a

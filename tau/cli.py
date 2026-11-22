@@ -10154,6 +10154,11 @@ def cmd_search(args: argparse.Namespace) -> int:
                 query,
                 limit=int(limit) if limit is not None else DEFAULT_CHANNEL_LIMIT,
                 exclude_authors=blocked,
+                # The list cannot be read: restrict the search to
+                # this node's posts before the limit applies, so
+                # newer peer matches cannot crowd an older own post
+                # out of the results.
+                only_authors={own_hash} if blocked is None else None,
             )
             if blocked is None:
                 # The list cannot be read, so received mail stays
@@ -15802,9 +15807,11 @@ def _attach_channel_poll_tallies(
     displayed page left out still count, but a vote history hides
     (expired or retracted) never does — so the history is re-read
     for the channel involved.  Blocked authors are left out of the
-    tally history, so their votes never count.  Entries are the
-    copies :meth:`ChannelApp.history` returns, so attaching here
-    never touches the stored records.
+    tally history, so their votes never count.  When the list cannot
+    be read (*blocked* is None), only this node's records count, so
+    a hidden sender's vote never leaks into a retained own poll's
+    tally.  Entries are the copies :meth:`ChannelApp.history` returns,
+    so attaching here never touches the stored records.
     """
     channels = {
         str(entry.get("channel"))
@@ -15815,7 +15822,17 @@ def _attach_channel_poll_tallies(
         return
     for channel in sorted(channels):
         history = app.visible_history(channel)
-        if blocked is not None:
+        if blocked is None:
+            # The list cannot be read: tallies count only this
+            # node's records, so a hidden sender's vote never
+            # affects the counts or leaks voter metadata — the
+            # same fail-closed rule the retained hits follow.
+            history = [
+                record
+                for record in history
+                if str(record.get("author", "")) == (own_hash or "")
+            ]
+        elif blocked:
             history = [
                 record
                 for record in history

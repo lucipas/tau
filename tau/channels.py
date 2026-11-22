@@ -2596,6 +2596,7 @@ def search_channel_messages(
     *,
     limit: int = DEFAULT_CHANNEL_LIMIT,
     exclude_authors: Optional[Sequence[str]] = None,
+    only_authors: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Search stored messages in *channel* by keyword, newest first.
 
@@ -2610,7 +2611,10 @@ def search_channel_messages(
     requests.
 
     *exclude_authors* hides messages from those authors, the same way
-    history hides them; an empty query raises :class:`ChannelError`.
+    history hides them; *only_authors*, when given, restricts matches
+    to those authors before the limit applies, so a caller that keeps
+    only one author's posts never loses an older match behind newer
+    ones it drops.  An empty query raises :class:`ChannelError`.
     Expired and retracted messages are gone from search, exactly as
     they are from history, and an edited message is matched on its
     latest text — search shows what history shows.  Poll votes and
@@ -2632,6 +2636,13 @@ def search_channel_messages(
         placeholders = ", ".join("?" for _ in excluded)
         clauses.append(f"author NOT IN ({placeholders})")
         params.extend(excluded)
+    if only_authors is not None:
+        only = [author for author in only_authors if author]
+        if not only:
+            return []
+        placeholders = ", ".join("?" for _ in only)
+        clauses.append(f"author IN ({placeholders})")
+        params.extend(only)
     # An expired message is gone from search even before the store
     # purges it, and a retracted one too — the same clauses
     # channel_history_page applies, so search never resurrects
@@ -3235,12 +3246,18 @@ class ChannelApp:
         *,
         limit: int = DEFAULT_CHANNEL_LIMIT,
         exclude_authors: Optional[Sequence[str]] = None,
+        only_authors: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Stored messages in *channel* matching *query*, newest first."""
         conn = self.connect()
         try:
             return search_channel_messages(
-                conn, channel, query, limit=limit, exclude_authors=exclude_authors
+                conn,
+                channel,
+                query,
+                limit=limit,
+                exclude_authors=exclude_authors,
+                only_authors=only_authors,
             )
         finally:
             conn.close()
