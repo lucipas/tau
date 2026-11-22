@@ -396,13 +396,11 @@ from .channels import (
     AmbiguousDigestError,
     ChannelApp,
     ChannelError,
-    channel_history_page,
     clean_channel_name,
     create_edit as create_channel_edit,
     create_message as create_channel_message,
     create_reaction as create_channel_reaction,
     get_message as get_channel_message,
-    get_topic as get_channel_topic,
     get_visible_message as get_visible_channel_message,
     HASH_HEX_LENGTH,
     init_db as init_channel_db,
@@ -9654,18 +9652,29 @@ def cmd_channel_show(args: argparse.Namespace) -> int:
             "SELECT COUNT(*) FROM messages WHERE channel = ?", (name,)
         ).fetchone()
         message_count = int(row[0]) if row is not None else 0
-        # A topic from a blocked setter — or an unreadable block-list
-        # — is hidden from display by app.topic(), but the stored row
-        # still proves the channel exists; check it, not the view.
-        topic_exists = get_channel_topic(conn, name) is not None
+        # A stored topic row proves the channel exists even when the
+        # topic itself is hidden (blocked setter, unreadable blocklist).
+        topic_row = conn.execute(
+            "SELECT 1 FROM topics WHERE channel = ?", (name,)
+        ).fetchone()
+        has_topic_row = topic_row is not None
+        if membership is None and message_count == 0 and not has_topic_row:
+            print(f"error: unknown channel: {args.channel!r}", file=sys.stderr)
+            return 2
+        unread = app.unread_counts().get(name, 0)
+        pinned = name in load_pinned_set(config.pinned_path, "channel")
+        pinned_messages = app.pins(name)
         blocked = load_blocked_set(config.blocklist_path)
-        # Page newest-first until the first visible chat message: a
-        # page full of blocked authors, poll votes, or closes must
-        # not hide an older message behind it.
-        last = None
+        # Votes and closes are not chat: they ride as messages so peers
+        # can tally them, but they never stand in as the last message.
+        # Page newest-first until a visible chat message turns up, so
+        # blocked authors and poll records cannot push it off the page.
+        last: Optional[Dict[str, Any]] = None
         if blocked is not None:
-            before = None
-            before_hash = None
+            # When the block-list failed closed, the last message is
+            # hidden, like the timeline does, rather than shown unvetted.
+            before: Optional[float] = None
+            before_hash: Optional[str] = None
             while last is None:
                 page, has_more = channel_history_page(
                     conn,
@@ -9673,33 +9682,23 @@ def cmd_channel_show(args: argparse.Namespace) -> int:
                     limit=50,
                     before=before,
                     before_hash=before_hash,
-                    exclude_authors=sorted(blocked),
                 )
-                if not page:
-                    break
                 for message in page:
-                    # Votes and closes are not chat: they ride as
-                    # messages so peers can tally them, but they
-                    # never stand in as the last message.
+                    if str(message.get("author", "")) in blocked:
+                        continue
                     if is_channel_poll_vote(message) or is_channel_poll_close(
                         message
                     ):
                         continue
                     last = message
                     break
-                if not has_more:
+                if last is not None or not has_more or not page:
                     break
                 tail = page[-1]
-                before = tail.get("created_at")
-                before_hash = tail.get("hash")
+                before = tail["created_at"]
+                before_hash = tail["hash"]
     finally:
         conn.close()
-    if membership is None and message_count == 0 and not topic_exists:
-        print(f"error: unknown channel: {args.channel!r}", file=sys.stderr)
-        return 2
-    unread = app.unread_counts().get(name, 0)
-    pinned = name in load_pinned_set(config.pinned_path, "channel")
-    pinned_messages = app.pins(name)
     if json_output:
         _emit(
             {
@@ -9745,7 +9744,7 @@ def cmd_channel_show(args: argparse.Namespace) -> int:
         print(f"  topic: {topic['topic']}")
         print(f"    set by {author_name} ({author_hash[:8]}), {updated} ago")
     else:
-        print("  topic: no topic set")
+        print("  topic: none")
     noun = "message" if message_count == 1 else "messages"
     print(f"  messages: {message_count} cached {noun}, {unread} unread")
     pin_noun = "message" if len(pinned_messages) == 1 else "messages"
@@ -9759,13 +9758,13 @@ def cmd_channel_show(args: argparse.Namespace) -> int:
         first_line = str(last.get("text") or "").splitlines()
         excerpt = first_line[0] if first_line else ""
         try:
-            age = _ago(time.time() - float(last["created_at"]))
+            last_age = _ago(time.time() - float(last["created_at"]))
         except (OverflowError, OSError, ValueError, TypeError, KeyError):
             # Non-finite or out-of-range stored timestamps cannot age.
-            age = "unknown"
+            last_age = "unknown"
         print(
-            f"  last message: {author_name} ({short_hash(author_hash)}), "
-            f"{age} ago: {excerpt}"
+            f"  last message: {last_age} ago "
+            f"{author_name} ({short_hash(author_hash)}): {excerpt}"
         )
     return _EXIT_OK
 
