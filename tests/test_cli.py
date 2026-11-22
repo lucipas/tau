@@ -5407,6 +5407,149 @@ def test_messages_delete_json_and_errors(tmp_path, capsys):
     assert payload["deleted"]["text"] == "first hello"
 
 
+def test_messages_show_text_json_and_errors(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    # A long id proves prefix resolution; a reaction proves the
+    # reactor names render.
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "third hello\nsecond line",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "a1b2c3d4e5f6",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-1",
+            "destination": sender_hash.hex(),
+            "from": "alice",
+            "reaction": "👍",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-1",
+        }
+    )
+
+    # Text output names the full id, the sender, both times, the
+    # whole text, the reaction, and the unread state.
+    assert cli.main(["messages", "show", "m-1", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "#m-1" in out
+    assert "alice" in out
+    assert "first hello" in out
+    assert "sent: 1970-01-01 00:00" in out
+    assert "👍 alice" in out
+    assert "state: unread" in out
+
+    # A unique prefix resolves the same message, and the full text
+    # renders across lines.
+    assert cli.main(["messages", "show", "a1b2c3", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "#a1b2c3d4e5f6" in out
+    assert "third hello" in out
+    assert "second line" in out
+
+    # JSON mode carries the record plus its reactions and flags.
+    assert (
+        cli.main(["messages", "show", "m-1", "--data-dir", str(data_dir), "--json"])
+        == 0
+    )
+    shown = json.loads(capsys.readouterr().out)["message"]
+    assert shown["id"] == "m-1"
+    assert shown["text"] == "first hello"
+    assert shown["reactions"] == [
+        {
+            "target": "m-1",
+            "destination": sender_hash.hex(),
+            "from": "alice",
+            "reaction": "👍",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-1",
+        }
+    ]
+    assert shown["unread"] is True
+    assert shown["saved"] is False
+    assert shown["muted"] is False
+    assert shown["archived"] is False
+
+    # Showing is read-only: the unread count is unchanged.
+    assert cli.main(["messages", "--count", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["total"] == 3
+
+    # Pinning and starring surface in the state line on the next show.
+    assert cli.main(["pin", "--data-dir", str(data_dir), "m-1"]) == 0
+    capsys.readouterr()
+    assert cli.main(["save", "--peer", "alice", "--data-dir", str(data_dir), "m-1"]) == 0
+    capsys.readouterr()
+    assert cli.main(["messages", "show", "m-1", "--data-dir", str(data_dir)]) == 0
+    assert "state: unread, pinned, saved" in capsys.readouterr().out
+
+    # Unknown and ambiguous refs error like the other message commands.
+    assert cli.main(["messages", "show", "nope", "--data-dir", str(data_dir)]) == 1
+    assert "unknown message" in capsys.readouterr().err
+    assert cli.main(["messages", "show", "m-", "--data-dir", str(data_dir)]) == 1
+    assert "2 messages match prefix" in capsys.readouterr().err
+
+
+def test_messages_show_sent_group_poll_and_unknown_send_time(tmp_path, capsys):
+    data_dir, peer_hash = _seed_dm_poll_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": peer_hash,
+            "text": "my answer",
+            "sent_at": 0.0,
+            "received_at": 25.0,
+            "id": "s-9",
+            "direction": "out",
+        }
+    )
+
+    # A sent message reads as from you, is never unread, and a zero
+    # send time reads as unknown instead of the epoch.
+    assert cli.main(["messages", "show", "s-9", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "you → alice" in out
+    assert "my answer" in out
+    assert "sent: unknown" in out
+    assert "state: none" in out
+
+    # A poll shows its question, tally, and total — the vote record
+    # itself stays hidden from the tally view.
+    assert cli.main(["messages", "show", "pppp", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "which day?" in out
+    assert "1. Saturday — 1 vote(s)" in out
+    assert "2. Sunday — 0 vote(s)" in out
+    assert "1 voter(s) total" in out
+
+    # JSON mode carries the tally on the poll record.
+    assert (
+        cli.main(["messages", "show", "pppp", "--data-dir", str(data_dir), "--json"])
+        == 0
+    )
+    shown = json.loads(capsys.readouterr().out)["message"]
+    assert shown["poll"]["options"] == ["Saturday", "Sunday"]
+    assert shown["poll"]["counts"] == [1, 0]
+    assert shown["poll"]["total"] == 1
+
+
+def test_parser_messages_show_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "show", "m-1"])
+    assert args.command == "messages"
+    assert args.target == "m-1"
+    assert args.func is cli.cmd_messages_show
+
+
 def test_parser_messages_prune_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["messages", "prune", "--older-than", "90d"])

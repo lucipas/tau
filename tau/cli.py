@@ -2499,6 +2499,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages_delete.set_defaults(func=cmd_messages_delete)
 
+    messages_show = messages_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show one stored message's full details",
+    )
+    messages_show.add_argument(
+        "target", metavar="ID", help="message id or unique id prefix"
+    )
+    messages_show.set_defaults(func=cmd_messages_show)
+
     messages_unread = messages_sub.add_parser(
         "unread",
         parents=[common],
@@ -15538,6 +15548,23 @@ def _format_message_time(timestamp: float) -> str:
         return "unknown time"
 
 
+def _format_optional_time(timestamp: Any) -> str:
+    """A stored timestamp for the show view, or ``"unknown"`` when absent.
+
+    A zero send time means the sender's clock was unusable (the inbox
+    normalizes a non-finite ``sent_at`` to 0.0 instead of dropping the
+    record), so it reads as unknown rather than 1970-01-01 — the
+    epoch is never a real send time here.
+    """
+    try:
+        value = float(timestamp)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
+    if value <= 0:
+        return "unknown"
+    return _format_message_time(value)
+
+
 def _resolve_inbox_peer(
     inbox: Inbox,
     registry: PeerRegistry,
@@ -16183,6 +16210,7 @@ def _print_message_entry(
     *,
     blocked: Optional[Any],
     own_hash: Optional[str],
+    full_id: bool = False,
 ) -> None:
     """Print one stored message the way `tau messages` does.
 
@@ -16190,6 +16218,9 @@ def _print_message_entry(
     reads the same in both listings.  A message this node sent is
     shown as from you, to its recipient; a received one as from its
     sender.  Pinned entries carry a 📌 marker, like the ● unread one.
+    With *full_id* the header names the whole id instead of the
+    8-character prefix the listing uses — the show view, where the
+    id is the thing being inspected.
     """
     destination = str(entry.get("destination") or "")
     peer = registry.get(destination)
@@ -16209,12 +16240,14 @@ def _print_message_entry(
     pin_marker = "📌 " if entry.get("pinned") else ""
     # The short id is what `tau react` takes: without it the
     # listing gives the user no way to name a message to react to.
+    # The show view names the whole id instead — the id is the thing
+    # being inspected there, and a prefix is ambiguous to copy.
     message_id = entry.get("id")
-    id_suffix = (
-        f" #{_safe_id_prefix(str(message_id))}"
-        if isinstance(message_id, str) and message_id
-        else ""
-    )
+    if isinstance(message_id, str) and message_id:
+        shown_id = message_id if full_id else _safe_id_prefix(message_id)
+        id_suffix = f" #{shown_id}"
+    else:
+        id_suffix = ""
     group_suffix = ""
     if entry.get("kind") == "group":
         group_suffix = f" in {entry.get('group_name') or 'group'}"
@@ -16710,6 +16743,137 @@ def cmd_messages_delete(args: argparse.Namespace) -> int:
             " theirs, and sealed copies already held by relays are"
             " unaffected."
         )
+    return _EXIT_OK
+
+
+def cmd_messages_show(args: argparse.Namespace) -> int:
+    """Show one stored message's full details: sender, times, text, reactions, poll, state.
+
+    Read-only: resolving the message never advances the read cursor
+    and never sends read receipts, like `tau messages --search` and
+    `tau pinned`.  A retracted message is already gone from the inbox
+    — the retract path deletes the stored record — so it reads as
+    unknown here, never as a surviving message.
+    """
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entry = inbox.resolve(args.target)
+    except (ValueError, InboxError) as exc:
+        raise NodeError(str(exc)) from exc
+    # The listing's derived view carries the unread flag and the
+    # reaction list; the raw record does not.  Resolve first so a
+    # prefix or leg id names the message, then take that record's
+    # derived view — a stored record always lists, so a missing view
+    # falls back to the raw record with reactions read directly.
+    view = next(
+        (
+            item
+            for item in inbox.list_messages(limit=None, direction=None)
+            if item.get("id") == entry.get("id")
+        ),
+        None,
+    )
+    shown = dict(view) if view is not None else dict(entry)
+    if not shown.get("reactions"):
+        shown["reactions"] = inbox.reactions_for(str(entry.get("id") or ""))
+    if shown.get("kind") == "group" and shown.get("reactions"):
+        # A stored reaction from a non-member must never be displayed,
+        # even when cleanup left it in the inbox — the same filter the
+        # listing applies before anything prints.
+        rosters = pinned_rosters(
+            GroupStore(config.groups_path),
+            {str(shown.get("group"))},
+        )
+        shown["reactions"] = visible_reactions(
+            shown["reactions"], rosters.get(str(shown.get("group")))
+        )
+    own_hash = _own_destination_hash(config)
+    if is_group_poll(shown):
+        _attach_group_poll_tallies(inbox, [shown], own_hash)
+    elif is_dm_poll(shown):
+        _attach_dm_poll_tallies(inbox, [shown], own_hash)
+    saved_kind = "group" if shown.get("kind") == "group" else "peer"
+    saved_scope = (
+        str(shown.get("group") or "")
+        if saved_kind == "group"
+        else str(shown.get("destination") or "")
+    )
+    try:
+        saved = load_saved_messages(config.saved_messages_path).is_saved(
+            saved_kind, saved_scope, shown.get("id")
+        )
+    except SavedMessagesError as exc:
+        # A corrupt star list must not fail the show: the message
+        # reads as unsaved, the same fail-open rule the ignored-groups
+        # list follows, and the warning surfaces the corruption.
+        log.warning("Starred-message list is unusable (%s); showing unsaved", exc)
+        saved = False
+    # Conversation state, mirroring the listing's own lookups: a
+    # corrupt mutes file fails open (unmuted, with a warning), never
+    # breaking the show.
+    muted_peers = muted_peers_for(config.muted_path)
+    muted_groups = expand_muted_groups(
+        muted_groups_for(config.muted_path),
+        GroupStore(config.groups_path).list_groups(),
+    )
+    is_group = shown.get("kind") == "group"
+    if is_group:
+        group_id = str(shown.get("group") or "")
+        conversation_muted = group_id in muted_groups
+        ignored = group_id in load_ignored_group_ids(config.ignored_groups_path)
+        archived = False
+    else:
+        destination = str(shown.get("destination") or "")
+        conversation_muted = destination in muted_peers
+        ignored = False
+        archived = destination in load_archived_set(config.archived_path)
+    if _json_mode(args):
+        payload = dict(shown)
+        payload["unread"] = bool(shown.get("unread")) and shown.get("direction") != "out"
+        payload["saved"] = saved
+        payload["muted"] = conversation_muted
+        if is_group:
+            payload["ignored"] = ignored
+        else:
+            payload["archived"] = archived
+        _emit({"message": payload}, True)
+        return _EXIT_OK
+    blocked = load_blocked_set(config.blocklist_path)
+    _print_message_entry(
+        inbox, registry, shown, blocked=blocked, own_hash=own_hash, full_id=True
+    )
+    print(f"  sent: {_format_optional_time(shown.get('sent_at'))}")
+    if shown.get("read_at") is not None:
+        print(f"  read: {_format_optional_time(shown.get('read_at'))}")
+    if shown.get("receipt_sent_at") is not None:
+        print(f"  receipt sent: {_format_optional_time(shown.get('receipt_sent_at'))}")
+    if shown.get("edited_at") is not None:
+        print(f"  edited: {_format_optional_time(shown.get('edited_at'))}")
+    state: List[str] = []
+    if shown.get("unread") and shown.get("direction") != "out":
+        state.append("unread")
+    if shown.get("pinned"):
+        state.append("pinned")
+    if saved:
+        state.append("saved")
+    if shown.get("relayed"):
+        state.append("relayed")
+    if conversation_muted:
+        state.append("muted")
+    if archived:
+        state.append("archived")
+    if ignored:
+        state.append("ignored")
+    expires_at = shown.get("expires_at")
+    if (
+        isinstance(expires_at, (int, float))
+        and not isinstance(expires_at, bool)
+        and float(expires_at) <= time.time()
+    ):
+        state.append("expired")
+    print(f"  state: {', '.join(state) if state else 'none'}")
     return _EXIT_OK
 
 
