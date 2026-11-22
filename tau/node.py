@@ -8057,7 +8057,22 @@ class TauNode:
                 # is authoritative and the console merges the same way,
                 # so nothing visible changes either way.)
                 return False
-            self.mailbox.mark_seen(seen_key)
+            try:
+                self.mailbox.mark_seen(seen_key)
+            except OSError as exc:
+                # The reaction is already durable in the inbox and
+                # inbox merging dedupes a retry, so a failed marker
+                # must not abort the held-mail sweep: log it and
+                # complete the delivery (and the publish below)
+                # instead.  A duplicate copy of this leg is then
+                # re-processed rather than dropped on its seen key,
+                # but the merge drops it as stale, so nothing is
+                # lost or double-counted.
+                log.warning(
+                    "Could not mark relayed reaction %s seen: %s",
+                    seen_key,
+                    exc,
+                )
         # The reaction is recorded; a failed fan-out only means the
         # live console missed this update, exactly as on the direct
         # path — the console reseeds from the inbox.
