@@ -524,10 +524,10 @@ def clean_queued_retract(raw: Any) -> Optional[Dict[str, Any]]:
     re-sends verbatim: the target wire id, the signed retract id and
     send time, and the signed bytes as base64.  A corrupt value drops
     the retract — the entry keeps kind "retract" and ``_deliver_entry``
-    drops it instead of ever sending the display text as chat.
-    Retracts are DM-only: group retracts are never queued (see
-    :meth:`TauNode.send_group_retraction`), so there is no group
-    context to carry.
+    drops it instead of ever sending the display text as chat.  A
+    group retract also carries the group context (author and send time
+    of the retracted copy), so a sealed relay copy names the copy the
+    recipient holds even though wire ids differ per leg.
     """
     if not isinstance(raw, dict):
         return None
@@ -553,12 +553,36 @@ def clean_queued_retract(raw: Any) -> Optional[Dict[str, Any]]:
         base64.b64decode(payload_b64, validate=True)
     except Exception:
         return None
-    return {
+    target_author = raw.get("target_author")
+    if target_author is not None and (
+        not isinstance(target_author, str)
+        or len(target_author) != 32
+        or not _is_hex(target_author)
+    ):
+        return None
+    target_sent_at = raw.get("target_sent_at")
+    if target_sent_at is not None:
+        if isinstance(target_sent_at, bool) or not isinstance(
+            target_sent_at, (int, float)
+        ):
+            return None
+        try:
+            target_sent_at = float(target_sent_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(target_sent_at):
+            return None
+    cleaned: Dict[str, Any] = {
         "target": target,
         "retract_id": retract_id,
         "sent_at": sent_at,
         "payload_b64": payload_b64,
     }
+    if target_author is not None:
+        cleaned["target_author"] = target_author.lower()
+    if target_sent_at is not None:
+        cleaned["target_sent_at"] = target_sent_at
+    return cleaned
 
 
 class MailboxError(RuntimeError):
@@ -1870,11 +1894,6 @@ class Mailbox:
                 raise MailboxError(
                     "a queued retract cannot carry poll, location, "
                     "beacon or reply fields"
-                )
-            if group is not None:
-                raise MailboxError(
-                    "a queued retract cannot carry group context: "
-                    "group retracts are never queued"
                 )
         clean_options: Optional[List[str]] = None
         if poll_options is not None:
@@ -3674,7 +3693,10 @@ def seal_message(
     and the signed send time (``sent_at``) travel inside the same
     signed envelope, so a relayed retract still applies exactly like
     a direct one — the recipient keys dedupe on the retract id, and
-    the envelope's own signature proves who retracted.
+    the envelope's own signature proves who retracted.  A group
+    retract also carries ``target_author`` / ``target_sent_at``: the
+    recipient resolves its own leg copy from that context, since the
+    target id alone only matches the author's sent record.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -3856,7 +3878,42 @@ def seal_message(
             raise MailboxError(
                 "retract id must be a 1-64 character string"
             )
-        inner["retract"] = {"retract_id": retract_id}
+        sealed_retract: Dict[str, Any] = {"retract_id": retract_id}
+        # The group context names the retracted copy: group legs carry
+        # a different wire id per member, so the target id alone only
+        # matches the author's sent record — the recipient resolves its
+        # own copy from the author and shared send time instead.
+        target_author = retract.get("target_author")
+        if target_author is not None:
+            if (
+                not isinstance(target_author, str)
+                or len(target_author) != 32
+                or not _is_hex(target_author)
+            ):
+                raise MailboxError(
+                    "retract target author must be a 32-hex hash"
+                )
+            sealed_retract["target_author"] = target_author.lower()
+        target_sent_at = retract.get("target_sent_at")
+        if target_sent_at is not None:
+            if isinstance(target_sent_at, bool) or not isinstance(
+                target_sent_at, (int, float)
+            ):
+                raise MailboxError(
+                    "retract target send time must be a number"
+                )
+            try:
+                target_sent_at = float(target_sent_at)
+            except (OverflowError, ValueError) as exc:
+                raise MailboxError(
+                    "retract target send time must be a number"
+                ) from exc
+            if not math.isfinite(target_sent_at):
+                raise MailboxError(
+                    "retract target send time must be finite"
+                )
+            sealed_retract["target_sent_at"] = target_sent_at
+        inner["retract"] = sealed_retract
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         inner["in_reply_to"] = reply_to
@@ -4180,7 +4237,11 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     # A retract leg rides the same way: without the signed retract id
     # the recipient could not dedupe it, and the leg would read as
     # chat.  Malformed retract data drops the field, never the message
-    # — the delivery path refuses a leg with no retract payload.
+    # — the delivery path refuses a leg with no retract payload.  A
+    # group retract also carries the author and shared send time of
+    # the retracted copy, so the recipient resolves its own leg copy;
+    # malformed context drops just those fields, and the leg is then
+    # refused for lack of anything to resolve by.
     retract_raw = payload.get("retract")
     if isinstance(retract_raw, dict):
         retract_id = retract_raw.get("retract_id")
@@ -4189,7 +4250,31 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
             and retract_id
             and len(retract_id) <= 64
         ):
-            result["retract"] = {"retract_id": retract_id}
+            sealed_retract: Dict[str, Any] = {"retract_id": retract_id}
+            target_author = retract_raw.get("target_author")
+            if (
+                isinstance(target_author, str)
+                and len(target_author) == 32
+                and _is_hex(target_author)
+            ):
+                sealed_retract["target_author"] = target_author.lower()
+            target_sent_at = retract_raw.get("target_sent_at")
+            if isinstance(target_sent_at, bool) or not isinstance(
+                target_sent_at, (int, float)
+            ):
+                target_sent_at = None
+            else:
+                try:
+                    target_sent_at = float(target_sent_at)
+                except (OverflowError, ValueError):
+                    target_sent_at = None
+                if target_sent_at is not None and not math.isfinite(
+                    target_sent_at
+                ):
+                    target_sent_at = None
+            if target_sent_at is not None:
+                sealed_retract["target_sent_at"] = target_sent_at
+            result["retract"] = sealed_retract
     group_raw = payload.get("group")
     if group_raw is not None:
         if not isinstance(group_raw, dict):

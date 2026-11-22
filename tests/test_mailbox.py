@@ -436,11 +436,57 @@ def test_enqueue_retract_rejects_combined_fields(tmp_path):
             retract=_retract_payload(),
             location={"lat": 1.0, "lon": 2.0},
         )
+
+
+def test_enqueue_group_retract_round_trips(tmp_path):
+    # A group retract carries its group context plus the author and
+    # send time of the retracted copy, so a sealed relay copy names
+    # the copy the recipient holds even though wire ids differ per leg.
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="retraction",
+        retract=_retract_payload(
+            target_author="ab" * 16, target_sent_at=100.0
+        ),
+        group={
+            "id": "ab" * 16,
+            "name": "crew",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16],
+        },
+    )
+    assert entry.kind == "retract"
+    assert entry.group_id == "ab" * 16
+    assert entry.retract["target_author"] == "ab" * 16
+    assert entry.retract["target_sent_at"] == 100.0
+
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    again = reloaded.outbox_list()[0]
+    assert again.kind == "retract"
+    assert again.group_id == "ab" * 16
+    assert again.retract == entry.retract
+
+
+def test_enqueue_group_retract_rejects_bad_group_context(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
     with pytest.raises(MailboxError):
         box.enqueue(
             to=BOB,
             text="retraction",
-            retract=_retract_payload(),
+            retract=_retract_payload(target_author="not-a-hash"),
+            group={
+                "id": "ab" * 16,
+                "name": "crew",
+                "creator": "ab" * 16,
+                "members": ["ab" * 16],
+            },
+        )
+    with pytest.raises(MailboxError):
+        box.enqueue(
+            to=BOB,
+            text="retraction",
+            retract=_retract_payload(target_sent_at=float("nan")),
             group={
                 "id": "ab" * 16,
                 "name": "crew",
@@ -2313,6 +2359,59 @@ def test_seal_message_rejects_retract_without_id():
             sent_at=4242.0,
             kind="retract",
             retract={},
+        )
+
+
+def test_seal_message_carries_group_retract_context():
+    # A sealed group retract names the retracted copy by its author
+    # and shared send time, so the recipient resolves its own leg
+    # even though the target id only matches the author's sent record.
+    from tau.mailbox import open_message
+
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="leg-author",
+        text="retraction",
+        sent_at=4242.0,
+        group={
+            "id": "ab" * 16,
+            "name": "crew",
+            "creator": "cd" * 16,
+            "members": ["ab" * 16, "cd" * 16],
+        },
+        kind="retract",
+        retract={
+            "retract_id": "r-1",
+            "target_author": "ab" * 16,
+            "target_sent_at": 100.0,
+        },
+    )
+    leg = open_message(recipient, blob)
+    assert leg["id"] == "leg-author"
+    assert leg["kind"] == "retract"
+    assert leg["retract"] == {
+        "retract_id": "r-1",
+        "target_author": "ab" * 16,
+        "target_sent_at": 100.0,
+    }
+    assert leg["group"]["id"] == "ab" * 16
+    with pytest.raises(MailboxError):
+        seal_message(
+            sender,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="leg-author",
+            text="retraction",
+            sent_at=4242.0,
+            kind="retract",
+            retract={
+                "retract_id": "r-1",
+                "target_author": "not-a-hash",
+                "target_sent_at": 100.0,
+            },
         )
 
 

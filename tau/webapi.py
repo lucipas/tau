@@ -8154,7 +8154,12 @@ class WebBridge:
             target_sent_at=float(sent_at),
         )
         results = response.get("results") or []
-        failed = [result for result in results if not result.get("delivered")]
+        failed = [
+            result
+            for result in results
+            if not result.get("delivered") and not result.get("queued")
+        ]
+        queued = [result for result in results if result.get("queued")]
         if failed:
             # Keep the local copies: the failed members still hold the
             # message, and the legs carry the send time a retry needs.
@@ -8168,6 +8173,29 @@ class WebBridge:
                 )
                 + "; retry the retract when they are online"
             )
+        if queued:
+            # Queued legs keep the local copies: the sweep drops them
+            # once the fan-out completes (see
+            # TauNode._deliver_queued_retract), and until then the
+            # retract stays retryable.  The retract itself is stored,
+            # not failed — report the per-leg results and no removed
+            # entries, so the console keeps the bubbles.
+            delivered = [
+                result for result in results if result.get("delivered")
+            ]
+            return {
+                "ok": True,
+                "retracted": {"id": target, "wire_id": target_wire_id},
+                "retracted_ids": [],
+                "deleted": bool(delivered)
+                and all(result.get("deleted") for result in delivered),
+                "results": results,
+                "cancelled_queued": response.get("cancelled_queued") or [],
+                "group": group_id,
+                "id": response.get("id")
+                if isinstance(response.get("id"), str)
+                else None,
+            }
         # Every member received the retract: drop this node's own
         # copies too.  The node stores one inbox record for the whole
         # send (its id is the first leg id, the rest in leg_ids), so

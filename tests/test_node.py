@@ -2521,6 +2521,166 @@ def test_send_group_retraction_cancels_queued_legs(tmp_path, monkeypatch):
     assert set(calls) == {alice.hexhash, bob.hexhash}
 
 
+def test_send_group_retraction_queues_unreachable_leg(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NodeError("no route to peer")
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+
+    assert response["ok"] is False
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    bob_result = by_to[bob.hexhash]
+    assert bob_result.get("queued") is True
+    assert bob_result.get("delivered") is None
+    assert bob_result.get("queued_id")
+    assert bob_result["id"] == response["id"]
+    # The queued leg is one outbox entry with the group context and
+    # the same pre-signed bytes the live legs carried.
+    entries = node.mailbox.outbox_list()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "retract"
+    assert entry.to == bob.destination_hash
+    assert entry.group_id == group["id"]
+    assert entry.group_name == "crew"
+    assert entry.group_creator == group["creator"]
+    assert entry.group_members == group["members"]
+    assert entry.retract["target"] == "leg-1"
+    assert entry.retract["retract_id"] == response["id"]
+    assert entry.retract["target_author"] == node.destination.hexhash
+    assert entry.retract["target_sent_at"] == 100.0
+    assert entry.retract["payload_b64"]
+    assert entry.id == bob_result["queued_id"]
+
+
+def test_send_group_retraction_dedupes_queued_legs(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def unreachable(peer_arg, path, payload, timeout, deadline=None):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+
+    first = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    second = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+
+    # Both members are unreachable, so both legs queue on the first
+    # call; the second call reports the already-queued legs instead
+    # of storing duplicates under new retract ids.
+    assert len(node.mailbox.outbox_list()) == 2
+    by_to = {r["to"]: r for r in second["results"]}
+    assert by_to[bob.hexhash].get("queued") is True
+    first_by_to = {r["to"]: r for r in first["results"]}
+    assert (
+        by_to[bob.hexhash]["queued_id"]
+        == first_by_to[bob.hexhash]["queued_id"]
+    )
+    assert by_to[bob.hexhash]["id"] == first_by_to[bob.hexhash]["id"]
+
+
+def test_send_group_retraction_no_queue_reports_failure(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def unreachable(peer_arg, path, payload, timeout, deadline=None):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+
+    response = node.send_group_retraction(
+        "crew", "leg-1", target_sent_at=100.0, queue=False
+    )
+
+    assert response["ok"] is False
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[bob.hexhash].get("queued") is None
+    assert by_to[bob.hexhash].get("error") == "no route to peer"
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_retraction_refusal_is_never_queued(tmp_path, monkeypatch):
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NotAllowedError("peer rejected the request: not allowed")
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[bob.hexhash].get("error") == "not_allowed"
+    assert by_to[bob.hexhash].get("queued") is None
+    assert node.mailbox.outbox_list() == []
+
+
+def test_deliver_queued_group_retract_drops_local_copies_on_last_leg(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import REQUEST_RETRACT
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+
+    def unreachable(peer_arg, path, payload, timeout, deadline=None):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    assert response["ok"] is False
+    entries = {e.to_hex: e for e in node.mailbox.outbox_list()}
+    assert set(entries) == {alice.hexhash, bob.hexhash}
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        assert path == REQUEST_RETRACT
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    # The first leg delivers, but the fan-out is not complete: the
+    # local copies stay until the last queued leg lands.
+    assert node._deliver_entry(alice, entries[alice.hexhash], 1.0) is True
+    assert node.inbox.resolve("leg-1")["text"] == "crew hello"
+    assert len(node.mailbox.outbox_list()) == 1
+    # The last leg completes the fan-out: the local copies go now.
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is True
+    with pytest.raises(ValueError):
+        node.inbox.resolve("leg-1")
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is True
+
+
 def test_send_group_retraction_rejects_unknown_and_solo_groups(tmp_path):
     node, group, _, _ = _group_reaction_node(tmp_path)
     with pytest.raises(ValueError, match="unknown group"):
