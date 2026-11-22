@@ -473,6 +473,7 @@ Global options may appear before or after the command:
 | `tau tan lists show NAME` | Show a list's members |
 | `tau tan lists delete NAME` | Delete a list (follows and posts are untouched) |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
+| `tau tan show POST` | Show one post's full details (verification, counts, viewer state) |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan top` | Show the most-liked stored posts, best first |
 | `tau tan mentions` | Show replies to your own posts |
