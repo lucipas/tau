@@ -7210,8 +7210,12 @@ class TauNode:
                 group_name=fresh.group_name,
                 creator=fresh.group_creator,
                 members=fresh.group_members,
+                # The attestation bound to the leg's own id wins: after
+                # a rotation the live record no longer carries it.
                 roster_attestation=(
-                    (self.groups.get(fresh.group_id) or {}).get(
+                    fresh.group_roster_attestation
+                    if fresh.group_roster_attestation is not None
+                    else (self.groups.get(fresh.group_id) or {}).get(
                         "roster_attestation"
                     )
                 ),
@@ -7838,7 +7842,9 @@ class TauNode:
                 # as a direct recipient would; the current record is
                 # read at deposit time, like the direct re-send path.
                 "roster_attestation": (
-                    (self.groups.get(fresh.group_id) or {}).get(
+                    fresh.group_roster_attestation
+                    if fresh.group_roster_attestation is not None
+                    else (self.groups.get(fresh.group_id) or {}).get(
                         "roster_attestation"
                     )
                 ),
@@ -10192,6 +10198,8 @@ class TauNode:
             "name": group["name"],
             "creator": creator,
             "members": list(group["members"]),
+            # Bound to this id: a queued leg keeps it after a rotation.
+            "roster_attestation": group.get("roster_attestation"),
         }
         # Leg ids that were delivered or queued (never a refused leg:
         # its id reached nobody, so nobody can quote it).

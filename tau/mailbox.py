@@ -592,6 +592,11 @@ class OutboxEntry:
     group_name: str = ""
     group_creator: str = ""
     group_members: List[str] = field(default_factory=list)
+    # The roster attestation bound to this leg's original group id,
+    # name, creator and roster.  A retry or sealed relay copy re-sends
+    # it, so the leg stays valid even after the live group record has
+    # rotated to a new id.  ``None`` means none was recorded.
+    group_roster_attestation: Optional[Dict[str, Any]] = None
     # Sender-set expiry of the message itself, if any.  Distinct from
     # ``expires_at`` (when the queue entry itself expires): a relayed
     # copy is sealed with this deadline so the recipient purges the
@@ -760,6 +765,10 @@ class OutboxEntry:
                 "creator": self.group_creator,
                 "members": list(self.group_members),
             }
+            if self.group_roster_attestation is not None:
+                payload["group"]["roster_attestation"] = dict(
+                    self.group_roster_attestation
+                )
         if self.in_reply_to is not None:
             payload["in_reply_to"] = dict(self.in_reply_to)
         if self.location is not None:
@@ -818,6 +827,7 @@ class OutboxEntry:
         group_name = ""
         group_creator = ""
         group_members: List[str] = []
+        group_roster_attestation: Optional[Dict[str, Any]] = None
         if isinstance(group_raw, dict):
             candidate_id = group_raw.get("id")
             candidate_creator = group_raw.get("creator")
@@ -844,6 +854,9 @@ class OutboxEntry:
                     group_name = sanitize_group_name(group_raw.get("name"))
                     group_creator = candidate_creator.lower()
                     group_members = [m.lower() for m in candidate_members]
+                    raw_attestation = group_raw.get("roster_attestation")
+                    if isinstance(raw_attestation, dict):
+                        group_roster_attestation = dict(raw_attestation)
         message_expires_at = raw.get("message_expires_at")
         if isinstance(message_expires_at, bool) or not isinstance(
             message_expires_at, (int, float)
@@ -973,6 +986,7 @@ class OutboxEntry:
             group_name=group_name,
             group_creator=group_creator,
             group_members=group_members,
+            group_roster_attestation=group_roster_attestation,
             message_expires_at=message_expires_at,
             send_after=send_after,
             sent_at=sent_at,
@@ -1899,6 +1913,7 @@ class Mailbox:
         group_name = ""
         group_creator = ""
         group_members: List[str] = []
+        group_roster_attestation: Optional[Dict[str, Any]] = None
         if group is not None:
             candidate_id = group.get("id")
             candidate_creator = group.get("creator")
@@ -1927,6 +1942,9 @@ class Mailbox:
             group_name = sanitize_group_name(group.get("name"))
             group_creator = candidate_creator.lower()
             group_members = [m.lower() for m in candidate_members]
+            raw_attestation = group.get("roster_attestation")
+            if isinstance(raw_attestation, dict):
+                group_roster_attestation = dict(raw_attestation)
         if expires_at is not None:
             if isinstance(expires_at, bool) or not isinstance(
                 expires_at, (int, float)
@@ -2028,6 +2046,7 @@ class Mailbox:
                 group_name=group_name,
                 group_creator=group_creator,
                 group_members=group_members,
+                group_roster_attestation=group_roster_attestation,
                 message_expires_at=expires_at,
                 send_after=send_after_value,
                 sent_at=sent_at_value,
