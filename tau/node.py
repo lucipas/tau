@@ -6116,6 +6116,29 @@ class TauNode:
                 siblings.append(candidate)
         return siblings
 
+    def _block_retract_cleanup(self, retract: Dict[str, Any]) -> None:
+        """Durably block local cleanup for a retract whose fan-out failed.
+
+        A leg of the retract was finally refused, rejected, unusable,
+        or expired, so a member still holds the message: when the last
+        queued leg delivers, the sweep must not drop the sender's
+        local copies merely because no sibling legs remain queued
+        (see :meth:`_deliver_queued_retract`). The marker lives in the
+        mailbox, so it survives across sweep rounds; a write failure
+        is logged, never raised — the drop itself already happened.
+        """
+        retract_id = retract.get("retract_id")
+        if not isinstance(retract_id, str) or not retract_id:
+            return
+        try:
+            self.mailbox.record_retract_cleanup_blocked(retract_id)
+        except Exception as exc:
+            log.warning(
+                "Could not record blocked retract cleanup for %s: %s",
+                retract_id,
+                exc,
+            )
+
     def _queued_retract_siblings(
         self,
         retract_id: str,
@@ -7198,6 +7221,7 @@ class TauNode:
                 "its target author or send time",
                 entry.id,
             )
+            dropped = True
             try:
                 self._remove_queued_version(
                     entry.id,
@@ -7206,11 +7230,16 @@ class TauNode:
                     timeout=_remaining(deadline),
                 )
             except TimeoutError:
+                dropped = False
                 log.debug(
                     "Could not drop unusable queued group retract %s: "
                     "mailbox lock busy; leaving it for a later round",
                     entry.id,
                 )
+            if dropped:
+                # A leg that can never deliver ends the fan-out the
+                # same way a refusal does (see _block_retract_cleanup).
+                self._block_retract_cleanup(retract)
             return False
         try:
             payload_bytes = base64.b64decode(
@@ -7222,6 +7251,7 @@ class TauNode:
                 "valid base64",
                 entry.id,
             )
+            dropped = True
             try:
                 self._remove_queued_version(
                     entry.id,
@@ -7230,11 +7260,16 @@ class TauNode:
                     timeout=_remaining(deadline),
                 )
             except TimeoutError:
+                dropped = False
                 log.debug(
                     "Could not drop unusable queued retract %s: mailbox "
                     "lock busy; leaving it for a later round",
                     entry.id,
                 )
+            if dropped and getattr(entry, "group_id", None) is not None:
+                # A leg that can never deliver ends the fan-out the
+                # same way a refusal does (see _block_retract_cleanup).
+                self._block_retract_cleanup(retract)
             return False
         try:
             response = self._request(
@@ -7263,6 +7298,7 @@ class TauNode:
             # this retract (or no longer counts this node as a member),
             # so stop retrying rather than holding the leg until its TTL.
             log.warning("Dropping queued retract %s: %s", entry.id, exc)
+            dropped = True
             try:
                 self._remove_queued_version(
                     entry.id,
@@ -7271,11 +7307,17 @@ class TauNode:
                     timeout=_remaining(deadline),
                 )
             except TimeoutError:
+                dropped = False
                 log.debug(
                     "Could not drop refused queued retract %s: mailbox "
                     "lock busy; leaving it for a later round",
                     entry.id,
                 )
+            if dropped and getattr(entry, "group_id", None) is not None:
+                # The fan-out can never complete now: this member
+                # keeps the message, so a later leg must not drop the
+                # sender's local copies (see _block_retract_cleanup).
+                self._block_retract_cleanup(retract)
             return False
         except NodeError as exc:
             try:
@@ -7301,6 +7343,7 @@ class TauNode:
                 "without group retract",
                 entry.id,
             )
+            dropped = True
             try:
                 self._remove_queued_version(
                     entry.id,
@@ -7309,11 +7352,15 @@ class TauNode:
                     timeout=_remaining(deadline),
                 )
             except TimeoutError:
+                dropped = False
                 log.debug(
                     "Could not drop queued retract %s: mailbox lock busy; "
                     "leaving it for a later round",
                     entry.id,
                 )
+            if dropped:
+                # The fan-out can never complete now (see above).
+                self._block_retract_cleanup(retract)
             return False
         # Confirmed: the peer deleted their copy (or already had it
         # gone).  A cleanup step that cannot be persisted leaves the
@@ -7358,14 +7405,32 @@ class TauNode:
                     )
                 return False
             if not siblings:
-                removed, local_errors = (
-                    self._record_sent_group_retract_locally(
-                        target_id,
-                        entry.group_id,
-                        retract.get("target_sent_at"),
-                        target_author=retract.get("target_author"),
+                if self.mailbox.is_retract_cleanup_blocked(
+                    retract.get("retract_id") or ""
+                ):
+                    # A sibling leg was finally refused, rejected, or
+                    # expired, so a member still holds the message:
+                    # the local copies stay, so the retract stays
+                    # retryable — the delivered leg itself still goes,
+                    # it landed. A refused sibling is not a queued one,
+                    # so "no siblings" alone must never authorize the
+                    # cleanup (see _block_retract_cleanup).
+                    log.warning(
+                        "Delivered queued retract %s but a sibling leg "
+                        "failed finally; keeping the local copies",
+                        entry.id,
                     )
-                )
+                    removed = None
+                    local_errors = []
+                else:
+                    removed, local_errors = (
+                        self._record_sent_group_retract_locally(
+                            target_id,
+                            entry.group_id,
+                            retract.get("target_sent_at"),
+                            target_author=retract.get("target_author"),
+                        )
+                    )
                 if local_errors:
                     log.warning(
                         "Delivered queued retract %s but the local copies "
@@ -13122,6 +13187,17 @@ class TauNode:
                     }
                 )
         all_ok = all(result.get("delivered") for result in results)
+        if any(
+            not result.get("delivered") and not result.get("queued")
+            for result in results
+        ):
+            # A leg failed finally (refused, rejected, an older member
+            # without group retract, or it could not be queued): the
+            # fan-out can never complete, so the sweep must not drop
+            # the sender's local copies when the queued legs land —
+            # record it durably now, while the live results are still
+            # in hand (see _deliver_queued_retract).
+            self._block_retract_cleanup({"retract_id": retract_id})
         return {
             "ok": all_ok,
             "v": PROTOCOL_VERSION,
