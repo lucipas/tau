@@ -1823,11 +1823,13 @@ def test_group_store_record_stale_creator_message_does_not_replace_successor(
     assert len(store) == 2
 
 
-def test_group_store_stale_creator_log_shows_id_prefix_only(tmp_path, caplog):
-    """The stale-creator log line never carries a full group id.
+def test_group_store_stale_creator_log_shows_name_not_id(tmp_path, caplog):
+    """The stale-creator log line never carries a group id.
 
-    A secret group's id is its opaque token, so the log must carry
-    only the 8-char prefix the rest of the codebase uses.
+    A secret group's id is its opaque token, so the log carries the
+    human-readable name instead — not the id, and not even a prefix
+    of it, which CodeQL still flags as clear-text logging of the
+    secret.
     """
     store = GroupStore(tmp_path / "groups.json")
     old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
@@ -1865,8 +1867,9 @@ def test_group_store_stale_creator_log_shows_id_prefix_only(tmp_path, caplog):
         if "Stale creator message" in record.getMessage()
     ]
     assert len(stale) == 1
-    assert old_id[:8] in stale[0].getMessage()
+    assert "weekend" in stale[0].getMessage()
     assert old_id not in stale[0].getMessage()
+    assert old_id[:8] not in stale[0].getMessage()
 
 
 def test_group_store_record_creator_restore_replaces_successor(tmp_path):
