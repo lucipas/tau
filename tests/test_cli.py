@@ -11459,6 +11459,53 @@ def test_tan_show_preview_hidden_by_kind(tmp_path, capsys):
     assert payload["reply_to"]["hidden"] is True
 
 
+def test_tan_show_quote_of_hidden_kind_reply(tmp_path, capsys):
+    # A quote of a reply is redacted when the display rules hide
+    # replies: the preview carries its real kind (not a "post"
+    # default), and its text must not leak in either output mode.
+    from tau.tangents.rules import Ruleset, save_ruleset
+    from tau.tangents.tan import (
+        create_post,
+        create_quote,
+        create_reply,
+        init_db,
+    )
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    carol = RNS.Identity()
+    now = time.time()
+    conn = init_db(config.social_db_path)
+    try:
+        post = create_post(
+            conn, alice, "original thought", name="alice", now=now
+        )
+        reply = create_reply(
+            conn, bob, post["hash"], "secret reply words", name="bob", now=now
+        )
+        quote = create_quote(
+            conn, carol, reply["hash"], "quoting the reply", name="carol", now=now
+        )
+    finally:
+        conn.close()
+    save_ruleset(
+        config.tan_rules_path, Ruleset(kinds=frozenset({"post", "quote"}))
+    )
+
+    assert _run_tan_show(tmp_path, quote["hash"][:12]) == 0
+    out = capsys.readouterr().out
+    assert "quoting a hidden post" in out
+    assert "secret reply words" not in out
+
+    assert _run_tan_show(tmp_path, quote["hash"][:12], "--json") == 0
+    payload = json.loads(capsys.readouterr().out)["post"]
+    assert payload["quoted"]["kind"] == "reply"
+    assert payload["quoted"]["text"] == ""
+    assert payload["quoted"]["hidden"] is True
+
+
 def test_tan_show_expired_replies_excluded_from_count(tmp_path, capsys):
     from tau.tangents.tan import create_post, create_reply, init_db
 

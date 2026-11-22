@@ -5774,6 +5774,7 @@ def test_reply_chains_verifies_and_annotates(identities, tmp_path):
         "hash": post["hash"],
         "author": post["author"],
         "name": "alice",
+        "kind": "post",
         "text": "original thought",
         "deleted": False,
         "edited": False,

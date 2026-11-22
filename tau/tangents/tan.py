@@ -3504,6 +3504,7 @@ def annotate_replies(
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
+            "kind": parent["kind"],
             "text": (
                 ""
                 if is_deleted or is_muted or is_expired_parent or is_hidden
@@ -3676,6 +3677,7 @@ def annotate_quotes(
                 "hash": parent["hash"],
                 "author": "",
                 "name": "",
+                "kind": parent["kind"],
                 "text": "",
                 "deleted": is_deleted,
                 "blocked": True,
@@ -3693,6 +3695,7 @@ def annotate_quotes(
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
+            "kind": parent["kind"],
             "text": (
                 ""
                 if is_deleted or is_muted or is_expired_parent or is_hidden
@@ -3823,6 +3826,7 @@ def annotate_reposts(
             "hash": original["hash"],
             "author": original["author"],
             "name": original["name"],
+            "kind": original["kind"],
             "text": "" if is_deleted or is_expired_original else original["text"],
             "deleted": is_deleted,
         }

@@ -8494,14 +8494,15 @@ def cmd_tan_show(args: argparse.Namespace) -> int:
     # Previews inherit the same display rules: a referenced post whose
     # kind the owner does not display is redacted before either output
     # path runs, so its text cannot leak through a visible reply,
-    # repost or quote.
+    # repost or quote.  A preview without a kind is redacted too — its
+    # kind cannot be proven displayed.
     for preview_key in ("reply_to", "repost_of", "quoted"):
         preview = post.get(preview_key)
-        if isinstance(preview, dict) and not display_ruleset.displays(
-            str(preview.get("kind") or "post")
-        ):
-            preview["text"] = ""
-            preview["hidden"] = True
+        if isinstance(preview, dict):
+            kind = preview.get("kind")
+            if kind is None or not display_ruleset.displays(str(kind)):
+                preview["text"] = ""
+                preview["hidden"] = True
     post["verification"] = verification
     post["replies"] = replies
     post["author_muted"] = author_muted
