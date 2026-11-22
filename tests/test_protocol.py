@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 
+import RNS
 import pytest
 
 from tau import protocol
+from tau.identity import destination_hash
 from tau.protocol import (
     ANNOUNCE_MAX_BYTES,
     MAX_MESSAGE_CHARS,
@@ -19,7 +22,9 @@ from tau.protocol import (
     encode_group_message,
     encode_message,
     excerpt_hash,
+    generate_group_id,
     location_maps_url,
+    mint_roster_attestation,
     normalize_message,
     parse_announce,
     parse_group_message,
@@ -27,8 +32,10 @@ from tau.protocol import (
     parse_message,
     response_error,
     response_ok,
+    roster_attestation_matches,
     sanitize_name,
     short_hash,
+    verify_roster_attestation,
 )
 
 
@@ -430,6 +437,163 @@ def test_group_message_rejects_malformed_reply():
                     "creator": members[0],
                     "members": members,
                     "in_reply_to": {"id": "a" * 32, "excerpt": "zz"},
+                }
+            )
+        )
+
+
+# -- secret groups: roster attestations (#697) ------------------------------
+
+
+def _secret_group_fixture():
+    """A secret group: opaque id, creator-signed roster attestation."""
+    creator = RNS.Identity()
+    member = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    member_hash = destination_hash(member).hex()
+    members = sorted([creator_hash, member_hash])
+    group_id = generate_group_id()
+    attestation = mint_roster_attestation(
+        creator,
+        group_id=group_id,
+        name="weekend",
+        creator=creator_hash,
+        members=members,
+    )
+    return creator, member, creator_hash, member_hash, members, group_id, attestation
+
+
+def test_roster_attestation_roundtrip_verifies():
+    _, _, creator_hash, _, members, group_id, attestation = _secret_group_fixture()
+    verified = verify_roster_attestation(attestation)
+    assert verified == attestation
+    assert roster_attestation_matches(
+        verified,
+        group_id=group_id,
+        name="weekend",
+        creator=creator_hash,
+        members=members,
+    )
+    # The opaque id does not derive from the roster.
+    assert group_id != derive_group_id(creator_hash, "weekend", members)
+
+
+def test_roster_attestation_rejects_tampered_roster():
+    _, _, _, _, _, _, attestation = _secret_group_fixture()
+    tampered = dict(attestation)
+    tampered["members"] = sorted([attestation["members"][0], "12" * 16])
+    assert verify_roster_attestation(tampered) is None
+    tampered_name = dict(attestation, name="other")
+    assert verify_roster_attestation(tampered_name) is None
+
+
+def test_roster_attestation_rejects_wrong_creator_key():
+    _, other, _, _, _, _, attestation = _secret_group_fixture()
+    wrong_key = dict(attestation, creator_key=other.get_public_key().hex())
+    assert verify_roster_attestation(wrong_key) is None
+
+
+def test_roster_attestation_rejects_forged_signature():
+    _, other, _, _, _, _, attestation = _secret_group_fixture()
+    unsigned = {k: v for k, v in attestation.items() if k != "sig"}
+    forged_sig = base64.b64encode(other.sign(encode(unsigned))).decode("ascii")
+    forged = dict(unsigned, sig=forged_sig)
+    assert verify_roster_attestation(forged) is None
+    # Minting with an identity that is not the creator is refused.
+    _, _, creator_hash, _, members, group_id, _ = _secret_group_fixture()
+    with pytest.raises(ProtocolError):
+        mint_roster_attestation(
+            other,
+            group_id=group_id,
+            name="weekend",
+            creator=creator_hash,
+            members=members,
+        )
+
+
+def test_secret_group_message_roundtrip_with_attestation():
+    _, _, creator_hash, _, members, group_id, attestation = _secret_group_fixture()
+    data = encode_group_message(
+        "hi all",
+        message_id="gm-secret-1",
+        group_id=group_id,
+        group_name="weekend",
+        creator=creator_hash,
+        members=members,
+        roster_attestation=attestation,
+    )
+    parsed = parse_group_message(data)
+    assert parsed["text"] == "hi all"
+    assert parsed["group"] == group_id
+    assert parsed["roster_attestation"] == attestation
+
+
+def test_secret_group_message_rejects_without_attestation():
+    # An opaque id cannot derive, so a leg without its attestation is
+    # rejected at parse time instead of pinning an unverifiable group.
+    _, _, creator_hash, _, members, group_id, _ = _secret_group_fixture()
+    with pytest.raises(ProtocolError, match="does not match"):
+        parse_group_message(
+            encode_group_message(
+                "hi all",
+                message_id="gm-secret-2",
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+            )
+        )
+
+
+def test_secret_group_message_rejects_mismatched_attestation():
+    _, _, creator_hash, _, members, group_id, attestation = _secret_group_fixture()
+    # The attestation binds the original roster: a leg carrying a
+    # different roster under the same id is a fork, and is rejected —
+    # at encode time, and at parse time for a hand-crafted payload
+    # that bypasses the encoder.
+    forked = sorted([creator_hash, "12" * 16])
+    with pytest.raises(ProtocolError, match="does not verify"):
+        encode_group_message(
+            "forked roster",
+            message_id="gm-secret-3",
+            group_id=group_id,
+            group_name="weekend",
+            creator=creator_hash,
+            members=forked,
+            roster_attestation=attestation,
+        )
+    with pytest.raises(ProtocolError, match="does not verify"):
+        parse_group_message(
+            encode(
+                {
+                    "type": "group_message",
+                    "v": 1,
+                    "text": "forked roster",
+                    "group": group_id,
+                    "group_name": "weekend",
+                    "creator": creator_hash,
+                    "members": forked,
+                    "sent_at": 1.0,
+                    "id": "gm-secret-3b",
+                    "roster_attestation": attestation,
+                }
+            )
+        )
+    # A garbage attestation field is rejected, not silently dropped.
+    with pytest.raises(ProtocolError, match="does not verify"):
+        parse_group_message(
+            encode(
+                {
+                    "type": "group_message",
+                    "v": 1,
+                    "text": "hi",
+                    "group": group_id,
+                    "group_name": "weekend",
+                    "creator": creator_hash,
+                    "members": members,
+                    "sent_at": 1.0,
+                    "id": "gm-secret-4",
+                    "roster_attestation": {"v": 1},
                 }
             )
         )

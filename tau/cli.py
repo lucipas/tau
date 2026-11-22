@@ -2679,6 +2679,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
+    group_create.add_argument(
+        "--secret",
+        action="store_true",
+        help="create a secret group: an opaque random id bound to the "
+        "roster by a creator-signed attestation, instead of an id "
+        "derived from the creator, name and roster",
+    )
     group_create.set_defaults(func=cmd_group_create)
 
     group_list = group_sub.add_parser(
@@ -19198,6 +19205,7 @@ def _describe_group(
         "created_by": group["created_by"],
         "topic": group.get("topic", ""),
         "announcements_only": bool(group.get("announcements_only", False)),
+        "secret": bool(group.get("secret", False)),
     }
 
 
@@ -19220,7 +19228,11 @@ def cmd_group_create(args: argparse.Namespace) -> int:
         if len(members) < 2:
             raise NodeError("a group needs at least one other peer")
         group = node.groups.create(
-            getattr(args, "group_name"), members, created_by=own_hash
+            getattr(args, "group_name"),
+            members,
+            created_by=own_hash,
+            secret=bool(getattr(args, "secret", False)),
+            identity=getattr(node, "identity", None),
         )
     finally:
         node.stop()
@@ -19830,7 +19842,10 @@ def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
                     )
                 members.remove(peer.hexhash)
         new_group = node.groups.update_members(
-            group["id"], members, created_by=own_hash
+            group["id"],
+            members,
+            created_by=own_hash,
+            identity=getattr(node, "identity", None),
         )
     finally:
         node.stop()
@@ -19910,7 +19925,10 @@ def cmd_group_ban(args: argparse.Namespace) -> int:
         previous_id = group["id"]
         try:
             new_group = node.groups.ban(
-                group["id"], peer.hexhash, created_by=own_hash
+                group["id"],
+                peer.hexhash,
+                created_by=own_hash,
+                identity=getattr(node, "identity", None),
             )
         except ValueError as exc:
             raise NodeError(str(exc)) from exc
@@ -20204,6 +20222,7 @@ def cmd_group_join(args: argparse.Namespace) -> int:
             creator=group.get("creator", ""),
             sender=group.get("creator", ""),
             sent_at=time.time(),
+            roster_attestation=group.get("roster_attestation"),
         )
         if _json_mode(args):
             pinned = store.get(group["id"])
@@ -20518,7 +20537,10 @@ def cmd_group_rename(args: argparse.Namespace) -> int:
         if not group["local"] or group["creator"] != own_hash:
             raise NodeError("only the creator can rename a group")
         new_group = node.groups.rename(
-            group["id"], args.new_name, created_by=own_hash
+            group["id"],
+            args.new_name,
+            created_by=own_hash,
+            identity=getattr(node, "identity", None),
         )
     finally:
         node.stop()

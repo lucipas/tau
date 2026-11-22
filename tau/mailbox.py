@@ -82,8 +82,10 @@ from .protocol import (
     kind_from_wire,
     normalize_message,
     normalize_message_kind,
+    roster_attestation_matches,
     sanitize_group_name,
     sanitize_name,
+    verify_roster_attestation,
 )
 from .util import atomic_write_json, read_json
 
@@ -3718,6 +3720,24 @@ def seal_message(
                 raise MailboxError("group context renamed_from repeats a group id")
             sealed_group["renamed_from"] = cleaned
         inner["group"] = sealed_group
+        # The roster attestation rides inside the signed envelope, so
+        # a relayed leg of a secret group verifies exactly like a
+        # direct one.  A present attestation must verify and match the
+        # sealed group, or the message is refused to seal.
+        raw_attestation = group.get("roster_attestation")
+        if raw_attestation is not None:
+            attestation = verify_roster_attestation(raw_attestation)
+            if attestation is None or not roster_attestation_matches(
+                attestation,
+                group_id=sealed_group["id"],
+                name=sealed_group["name"],
+                creator=sealed_group["creator"],
+                members=sealed_group["members"],
+            ):
+                raise MailboxError(
+                    "roster attestation does not verify for this group"
+                )
+            inner["group"]["roster_attestation"] = attestation
         # The topic is covered by the signature.  Present "" is an
         # explicit clear; absent means the sender predates topics.
         group_topic = group.get("topic")
@@ -4201,6 +4221,25 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
             sealed_group["renamed_from"] = cleaned
         result["group"] = sealed_group
+        # The roster attestation rides in the sealed envelope, so a
+        # relayed leg of a secret group verifies exactly like a direct
+        # one.  A present attestation must verify and match the sealed
+        # group, or the envelope is refused — a sealed leg with a
+        # broken binding must not reach the acceptance path.
+        raw_attestation = group_raw.get("roster_attestation")
+        if raw_attestation is not None:
+            attestation = verify_roster_attestation(raw_attestation)
+            if attestation is None or not roster_attestation_matches(
+                attestation,
+                group_id=sealed_group["id"],
+                name=sealed_group["name"],
+                creator=sealed_group["creator"],
+                members=sealed_group["members"],
+            ):
+                raise MailboxError(
+                    "sealed message roster attestation is invalid"
+                )
+            result["group"]["roster_attestation"] = attestation
         # The topic rides in the sealed envelope with its own set time,
         # so a relayed copy is judged exactly like a direct one.  A
         # present "" is an explicit clear; absent means the sender

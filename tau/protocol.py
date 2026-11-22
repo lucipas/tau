@@ -27,6 +27,7 @@ or buggy peer must not be able to make us buffer large amounts of data.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import math
@@ -398,6 +399,162 @@ def sanitize_group_name(name: Any, fallback: str = "group") -> str:
 MAX_GROUP_TOPIC_LENGTH = 140
 
 
+# Secret groups (#471): a roster attestation binds an opaque group id to
+# its name and roster when the id itself cannot — the creator signs the
+# canonical ``{group, name, creator, members}`` tuple with their identity,
+# and the attestation carries the creator's public key, so any recipient
+# can verify it without prior knowledge of the creator: the key must
+# hash to the claimed creator destination, and the signature must verify
+# over the sorted roster.  A recipient pins the first attestation seen
+# for an id and rejects legs whose roster or name disagrees with it, so
+# the attestation restores the anti-fork property derivation used to
+# give (see :func:`derive_group_id`): only the creator can bind a
+# roster to an id, and a member cannot fork an id onto a recipient that
+# has not seen it.  The wire field is ``roster_attestation`` on a
+# ``group_message`` payload, and the same dict rides in the sealed
+# envelope's group block for relayed legs.
+ROSTER_ATTESTATION_TYPE = "roster-attestation"
+
+
+def mint_roster_attestation(
+    identity: RNS.Identity,
+    *,
+    group_id: str,
+    name: str,
+    creator: str,
+    members: List[str],
+) -> Dict[str, Any]:
+    """Sign a roster attestation for a secret group (see above).
+
+    Raises :class:`ProtocolError` when the inputs are invalid, the
+    signer is not the claimed creator, or the identity cannot sign.
+    """
+    if identity is None:
+        raise ProtocolError("roster attestation needs an identity")
+    try:
+        group = _clean_hexhash(group_id, "group")
+        creator = _clean_hexhash(creator, "creator")
+        members = sorted(_clean_member_list(members))
+    except ProtocolError as exc:
+        raise ProtocolError(f"invalid roster attestation: {exc}") from exc
+    if creator not in members:
+        raise ProtocolError("group creator must be a member of the group")
+    creator_key = identity.get_public_key()
+    if creator_key is None or len(creator_key) != 64:
+        raise ProtocolError("creator identity has no public key to attest with")
+    if RNS.Destination.hash(identity, APP_NAME, ASPECT).hex() != creator:
+        raise ProtocolError(
+            "roster attestation must be signed by the group creator"
+        )
+    unsigned = {
+        "v": 1,
+        "type": ROSTER_ATTESTATION_TYPE,
+        "group": group,
+        "name": sanitize_group_name(name),
+        "creator": creator,
+        "creator_key": creator_key.hex(),
+        "members": members,
+    }
+    signature = identity.sign(encode(unsigned))
+    if signature is None:  # pragma: no cover - identity without private keys
+        raise ProtocolError("creator identity cannot sign")
+    return {
+        **unsigned,
+        "sig": base64.b64encode(signature).decode("ascii"),
+    }
+
+
+def verify_roster_attestation(raw: Any) -> Optional[Dict[str, Any]]:
+    """Verify a roster attestation; the cleaned dict, or ``None``.
+
+    The attestation is self-contained: the carried public key must
+    hash to the claimed creator destination, and the signature must
+    verify over the canonical unsigned payload.  Anything malformed,
+    mismatched or forged returns ``None`` instead of raising, so
+    callers can decide whether a bad attestation rejects the message
+    or drops the field.
+    """
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("v") != 1 or raw.get("type") != ROSTER_ATTESTATION_TYPE:
+        return None
+    try:
+        group = _clean_hexhash(raw.get("group"), "group")
+        creator = _clean_hexhash(raw.get("creator"), "creator")
+        members = sorted(_clean_member_list(raw.get("members")))
+    except ProtocolError:
+        return None
+    name = sanitize_group_name(raw.get("name"))
+    if creator not in members:
+        return None
+    creator_key = raw.get("creator_key")
+    if not isinstance(creator_key, str) or len(creator_key) != 128:
+        return None
+    try:
+        key_bytes = bytes.fromhex(creator_key)
+    except ValueError:
+        return None
+    signature_text = raw.get("sig")
+    if not isinstance(signature_text, str) or not signature_text:
+        return None
+    try:
+        signature = base64.b64decode(signature_text, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    # Load the carried key into a keyless identity: RNS 1.4.1's
+    # ``load_public_key`` returns ``None`` even on success, so the
+    # hash is the version-tolerant success signal (see
+    # :func:`tau.identity.load_public_key`).
+    creator_identity = RNS.Identity(create_keys=False)
+    loaded = creator_identity.load_public_key(key_bytes)
+    if loaded is False or creator_identity.hash is None:
+        return None
+    if (
+        RNS.Destination.hash(creator_identity, APP_NAME, ASPECT).hex()
+        != creator
+    ):
+        return None
+    unsigned = {
+        "v": 1,
+        "type": ROSTER_ATTESTATION_TYPE,
+        "group": group,
+        "name": name,
+        "creator": creator,
+        "creator_key": creator_key.lower(),
+        "members": members,
+    }
+    try:
+        verified = creator_identity.validate(signature, encode(unsigned))
+    except Exception:
+        return None
+    if not verified:
+        return None
+    return {**unsigned, "sig": signature_text}
+
+
+def roster_attestation_matches(
+    attestation: Dict[str, Any],
+    *,
+    group_id: str,
+    name: str,
+    creator: str,
+    members: List[str],
+) -> bool:
+    """True when a verified attestation binds this id, name and roster."""
+    try:
+        group = _clean_hexhash(group_id, "group")
+        creator = _clean_hexhash(creator, "creator")
+        members = sorted(_clean_member_list(members))
+    except ProtocolError:
+        return False
+    return (
+        attestation.get("group") == group
+        and attestation.get("name") == sanitize_group_name(name)
+        and attestation.get("creator") == creator
+        and attestation.get("members") == members
+    )
+
+
 def clean_group_topic(value: Any) -> str:
     """Normalise a group topic: short printable single-line text.
 
@@ -472,6 +629,7 @@ def encode_group_message(
     poll_close: Optional[Dict[str, Any]] = None,
     location: Optional[Dict[str, Any]] = None,
     beacon: Optional[Dict[str, Any]] = None,
+    roster_attestation: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -480,7 +638,11 @@ def encode_group_message(
     recipient that has never seen the group can learn and pin it.  The
     group id is derived from the creator, name and roster (see
     :func:`derive_group_id`), so the roster a message carries must match
-    the id it claims.  ``group_topic`` rides along when given (``""``
+    the id it claims.  ``roster_attestation`` carries the creator-signed
+    binding instead, for a secret group whose id is opaque (see
+    :func:`mint_roster_attestation`): it must verify and match the
+    group, name, creator and roster, or the message is refused to
+    encode.  ``group_topic`` rides along when given (``""``
     clears it); ``None`` omits it, for senders that predate topics.
     ``group_topic_sent_at`` is the time the topic was set on the
     sender's clock, so the recipient judges the topic by its own
@@ -554,6 +716,19 @@ def encode_group_message(
         "creator": _clean_hexhash(creator, "creator"),
         "members": _clean_member_list(members),
     }
+    if roster_attestation is not None:
+        attestation = verify_roster_attestation(roster_attestation)
+        if attestation is None or not roster_attestation_matches(
+            attestation,
+            group_id=group_id,
+            name=group_name,
+            creator=creator,
+            members=members,
+        ):
+            raise ProtocolError(
+                "roster attestation does not verify for this group"
+            )
+        payload["roster_attestation"] = attestation
     if group_topic is not None:
         payload["group_topic"] = clean_group_topic(group_topic)
     if group_topic_sent_at is not None:
@@ -635,7 +810,27 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
     members = _clean_member_list(payload.get("members"))
     if creator not in members:
         raise ProtocolError("group creator must be a member of the group")
-    if derive_group_id(creator, group_name, members) != group:
+    raw_attestation = payload.get("roster_attestation")
+    attestation = None
+    if raw_attestation is not None:
+        # A secret group's id is opaque, so the creator-signed roster
+        # attestation binds the roster to the id instead of the
+        # derivation below.  A present attestation must verify and
+        # match the leg, or the message is rejected — a sender that
+        # attaches a broken binding is buggy or malicious, and a leg
+        # without one cannot verify an opaque id at all.
+        attestation = verify_roster_attestation(raw_attestation)
+        if attestation is None or not roster_attestation_matches(
+            attestation,
+            group_id=group,
+            name=group_name,
+            creator=creator,
+            members=members,
+        ):
+            raise ProtocolError(
+                "roster attestation does not verify for this group"
+            )
+    elif derive_group_id(creator, group_name, members) != group:
         raise ProtocolError("group id does not match its creator and roster")
     raw_topic = payload.get("group_topic")
     # ``None`` — the field absent, or non-text — means the sender
@@ -720,6 +915,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "group_name": group_name,
         "creator": creator,
         "members": members,
+        "roster_attestation": attestation,
         "group_topic": topic,
         "group_topic_sent_at": topic_sent_at,
         "group_announcements_only": announcements_only,
