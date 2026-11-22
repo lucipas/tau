@@ -774,6 +774,51 @@ def test_id_link_dies_on_rename_and_revoke_under_new_name(
     assert carol.hexhash in response["group"]["members"]
 
 
+def test_id_link_dies_on_case_only_rename(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    carol_identity, carol = _peer_identity(JOINER)
+    node.registry.upsert(bob.destination_hash, bob.public_key, name="bob", now=1.0)
+    node.registry.upsert(
+        carol.destination_hash, carol.public_key, name=JOINER, now=1.0
+    )
+    group = node.groups.create(
+        "Crew",
+        [own_hash, bob.hexhash],
+        created_by=own_hash,
+        secret=True,
+        identity=identity,
+    )
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group["name"],
+        creator_hash=own_hash,
+        mode="open",
+        group_id=group["id"],
+        group_created_at=group["created_at"],
+    )
+    # A case-only rename is a real rename: it rotates the id, so the
+    # old link must die even though the names match case-insensitively.
+    renamed = node.groups.rename(
+        group["id"], "crew", created_by=own_hash, identity=identity
+    )
+    assert renamed["id"] != group["id"]
+    monkeypatch.setattr(node, "send_group_message", lambda *a, **k: None)
+    response = decode(
+        node._handle_message(
+            "/tau/message",
+            encode_message(link, kind="group-join-request", message_id="m-1"),
+            b"req-1",
+            carol_identity,
+            1000.0,
+        )
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_invite"
+    assert carol.hexhash not in node.groups.get(renamed["id"])["members"]
+
+
 def test_id_link_survives_retired_record_eviction(tmp_path, monkeypatch):
     node, identity, own_hash = _invite_node(tmp_path)
     _, bob = _peer_identity("bob")
