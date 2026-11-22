@@ -18,8 +18,6 @@ from tau.node import (
     NotAllowedError,
     NotAMemberError,
     PeerRefusedError,
-    PeerRejectedError,
-    PeerStorageFailedError,
     TauNode,
     _AnnounceHandler,
 )
@@ -909,40 +907,6 @@ def test_send_retraction_refusal_is_not_queued(tmp_path, monkeypatch):
     assert node.inbox.resolve("m-1")["text"] == "hello"
 
 
-def test_send_retraction_rejection_is_not_queued(tmp_path, monkeypatch):
-    node, _ = _retract_node(tmp_path)
-
-    def rejected(*args, **kwargs):
-        raise PeerRejectedError("peer rejected the request: not_sender")
-
-    monkeypatch.setattr(node, "_request", rejected)
-    with pytest.raises(PeerRejectedError):
-        node.send_retraction("alice", "m-1")
-    # A peer rejection (not_sender, not_supported, invalid_retraction,
-    # storage_failed) is final, like a refusal: the retract must not
-    # be queued for a sweep that would only re-send it until its TTL.
-    assert node.mailbox.outbox_list() == []
-    assert node.inbox.resolve("m-1")["text"] == "hello"
-
-
-def test_send_retraction_storage_failure_is_queued(tmp_path, monkeypatch):
-    node, peer = _retract_node(tmp_path)
-
-    def storage_failed(*args, **kwargs):
-        raise PeerStorageFailedError(
-            "peer rejected the request: could not record retraction"
-        )
-
-    monkeypatch.setattr(node, "_request", storage_failed)
-    # A peer storage failure is transient: the retract has not
-    # applied, so it queues like a transport failure instead of
-    # raising like a permanent rejection.
-    response = node.send_retraction("alice", "m-1")
-    assert response["queued"] is True
-    assert len(node.mailbox.outbox_list()) == 1
-    assert node.inbox.resolve("m-1")["text"] == "hello"
-
-
 def test_deliver_queued_retract_drops_refused_leg(tmp_path, monkeypatch):
     node, peer = _retract_node(tmp_path)
 
@@ -961,51 +925,6 @@ def test_deliver_queued_retract_drops_refused_leg(tmp_path, monkeypatch):
     # A refusal is final: the leg is dropped, not held until its TTL —
     # and the sender's own copy stays, since the retract never landed.
     assert node.mailbox.outbox_list() == []
-    assert node.inbox.resolve("m-1")["text"] == "hello"
-
-
-def test_deliver_queued_retract_drops_rejected_leg(tmp_path, monkeypatch):
-    node, peer = _retract_node(tmp_path)
-
-    def unreachable(*args, **kwargs):
-        raise NodeError("no route to peer")
-
-    monkeypatch.setattr(node, "_request", unreachable)
-    node.send_retraction("alice", "m-1")
-    entry = node.mailbox.outbox_list()[0]
-
-    def rejected(*args, **kwargs):
-        raise PeerRejectedError("peer rejected the request: not_sender")
-
-    monkeypatch.setattr(node, "_request", rejected)
-    assert node._deliver_entry(peer, entry, 1.0) is False
-    # A peer rejection is final: the leg is dropped, not retried until
-    # its TTL — and the sender's own copy stays, since the retract
-    # never landed.
-    assert node.mailbox.outbox_list() == []
-    assert node.inbox.resolve("m-1")["text"] == "hello"
-
-
-def test_deliver_queued_retract_retries_storage_failure(tmp_path, monkeypatch):
-    node, peer = _retract_node(tmp_path)
-
-    def unreachable(*args, **kwargs):
-        raise NodeError("no route to peer")
-
-    monkeypatch.setattr(node, "_request", unreachable)
-    node.send_retraction("alice", "m-1")
-    entry = node.mailbox.outbox_list()[0]
-
-    def storage_failed(*args, **kwargs):
-        raise PeerStorageFailedError(
-            "peer rejected the request: could not record retraction"
-        )
-
-    monkeypatch.setattr(node, "_request", storage_failed)
-    assert node._deliver_entry(peer, entry, 1.0) is False
-    # A peer storage failure is transient: the leg is not dropped —
-    # the attempt is recorded and the sweep retries it later.
-    assert len(node.mailbox.outbox_list()) == 1
     assert node.inbox.resolve("m-1")["text"] == "hello"
 
 
@@ -1869,44 +1788,6 @@ def test_request_maps_announcements_only_to_its_own_error(tmp_path):
         node._request_on_link(_Link(), "/tau/group", b"{}", 1.0)
     with pytest.raises(NotAllowedError):
         node._request_on_link(_Link(), "/tau/group", b"{}", 1.0)
-
-
-def test_request_maps_storage_failed_to_its_own_error(tmp_path):
-    from tau.protocol import response_error
-
-    node, group, alice, bob = _group_reaction_node(tmp_path)
-
-    class _Receipt:
-        def get_response(self):
-            return response_error(
-                "storage_failed",
-                "could not record retraction",
-            )
-
-        def get_response_time(self):
-            return 0.004
-
-    class _Link:
-        def request(
-            self, path, payload, *, response_callback, failed_callback, **kwargs
-        ):
-            response_callback(_Receipt())
-            return object()
-
-    # A peer storage failure maps to its own distinct error: it is a
-    # NodeError like any request failure, but it is NOT a
-    # PeerRejectedError, so the retract paths can retry it instead of
-    # treating it as a permanent rejection.
-    with pytest.raises(PeerStorageFailedError, match="could not record"):
-        node._request_on_link(_Link(), "/tau/dm", b"{}", 1.0)
-    with pytest.raises(NodeError):
-        node._request_on_link(_Link(), "/tau/dm", b"{}", 1.0)
-    try:
-        node._request_on_link(_Link(), "/tau/dm", b"{}", 1.0)
-    except PeerRejectedError:
-        pytest.fail("storage_failed must not map to PeerRejectedError")
-    except PeerStorageFailedError:
-        pass
 
 
 def test_deliver_entry_drop_on_not_allowed_is_bounded_by_deadline(

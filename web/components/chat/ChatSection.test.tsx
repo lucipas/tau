@@ -135,6 +135,8 @@ function stubFetch() {
         };
       } else if (url.includes("/api/messages/edit")) {
         payload = { ok: true, queued: true };
+      } else if (url.includes("/api/messages/retract")) {
+        payload = { ok: true, queued: true };
       }
       return {
         ok: true,
@@ -376,6 +378,50 @@ describe("ChatSection queued edit notice", () => {
     // …and switching back shows it again — it belongs to Alice's chat.
     switchTo(PEER_HASH);
     await waitFor(() => expect(screen.getByText(/Edit queued/)).toBeTruthy());
+  });
+});
+
+describe("ChatSection queued retract notice", () => {
+  const BOB_HASH = "b".repeat(32);
+
+  function renderTwoPeers() {
+    window.location.hash = `#chat?peer=${PEER_HASH}`;
+    render(
+      <TauContext.Provider
+        value={fakeTau({
+          peers: [
+            makePeer({ destination: PEER_HASH, name: "Alice" }),
+            makePeer({ destination: BOB_HASH, name: "Bob" }),
+          ],
+          messages: [
+            makeMessage({ id: 1, peer: PEER_HASH, direction: "out", text: "hello" }),
+            makeMessage({ id: 2, peer: BOB_HASH, direction: "in", text: "hi" }),
+          ],
+        })}
+      >
+        <ChatSection />
+      </TauContext.Provider>,
+    );
+  }
+
+  function switchTo(peerHash: string) {
+    window.location.hash = `#chat?peer=${peerHash}`;
+    fireEvent(window, new Event("hashchange"));
+  }
+
+  it("shows the notice only in the conversation it was queued from", async () => {
+    renderTwoPeers();
+    // Open the message menu and retract our own sent message.
+    fireEvent.click(screen.getByLabelText("Actions for message 1"));
+    fireEvent.click(screen.getByRole("button", { name: "Retract" }));
+    // The retract queues (peer offline): the notice shows in Alice's chat.
+    await waitFor(() => expect(screen.getByText(/Retraction queued/)).toBeTruthy());
+    // Switching to Bob's chat hides it…
+    switchTo(BOB_HASH);
+    await waitFor(() => expect(screen.queryByText(/Retraction queued/)).toBeNull());
+    // …and switching back shows it again — it belongs to Alice's chat.
+    switchTo(PEER_HASH);
+    await waitFor(() => expect(screen.getByText(/Retraction queued/)).toBeTruthy());
   });
 });
 

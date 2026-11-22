@@ -473,24 +473,16 @@ class PeerRejectedError(NodeError):
     """Raised when a peer answers a request with an explicit error code.
 
     The peer received the request and rejected it (for example an
-    invalid edit), which is not a transport failure: such a rejection
-    must not be queued for retry.  A peer storage failure is not one
-    of these: see :class:`PeerStorageFailedError`.
+    invalid edit or a storage failure), which is not a transport
+    failure: such a rejection must not be queued for retry — except
+    ``storage_failed``, which is transient: the peer could not read
+    its inbox or persist the record this time, so callers that retry
+    transient failures check :attr:`code` for it.
     """
 
-
-class PeerStorageFailedError(NodeError):
-    """Raised when a peer answers a request with error code storage_failed.
-
-    The peer received the request but could not persist it — for
-    example it could not read its inbox or record the retraction
-    marker.  That is a transient failure, not a final rejection: the
-    operation has not applied, so callers that queue on a transport
-    failure must queue (or retry) this too.  Distinct from
-    :class:`PeerRejectedError` so the retract paths can tell a
-    retryable storage failure apart from a permanent rejection
-    (not_sender, not_supported, invalid_retraction).
-    """
+    def __init__(self, message: str, *, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class DeliveryDeferredError(NodeError):
@@ -6461,17 +6453,10 @@ class TauNode:
             response = self._request(
                 peer, REQUEST_DM_EDIT, payload_bytes, timeout, deadline=deadline
             )
-        except (
-            PeerRefusedError,
-            NotAMemberError,
-            PeerRejectedError,
-            PeerStorageFailedError,
-        ) as exc:
+        except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
             # A refusal or rejection is final: the peer will not take
             # this edit, so stop retrying rather than holding the leg
-            # until its TTL.  A peer storage failure stays final here
-            # too (pre-existing behavior for edits; only the retract
-            # paths retry it).
+            # until its TTL.
             log.warning("Dropping queued edit %s: %s", entry.id, exc)
             if entry.group_id is not None:
                 self._drop_failed_group_edit_leg(
@@ -6857,14 +6842,17 @@ class TauNode:
         are dropped, the sent-retraction marker is recorded, and a
         serving console is told to drop its copy — exactly what a
         live retract does after it succeeds — so the message is gone
-        on both sides.  A local cleanup that cannot be persisted is
-        logged, not fatal: the peer already deleted their copy, and
-        the sender can retract again by hand.
+        on both sides.  A local cleanup that cannot be persisted
+        leaves the leg queued for a later round: the peer already
+        deleted their copy, and a retried delivery answers deleted
+        False while the bookkeeping is attempted again — dropping
+        the leg instead would leave the console entry to reappear
+        after a restart with no retry left.
 
-        An explicit refusal is final: the leg is dropped instead of
-        held until its TTL, exactly like a refused queued message.
-        A transport failure records an attempt and leaves the leg
-        queued for the next sweep.
+        An explicit refusal or rejection is final: the leg is dropped
+        instead of held until its TTL, exactly like a refused queued
+        message.  A transport failure records an attempt and leaves
+        the leg queued for the next sweep.
         """
         retract = getattr(entry, "retract", None)
         if not isinstance(retract, dict):
@@ -6941,12 +6929,27 @@ class TauNode:
                 peer, REQUEST_RETRACT, payload_bytes, timeout, deadline=deadline
             )
         except (PeerRefusedError, NotAMemberError, PeerRejectedError) as exc:
-            # A refusal or rejection is final: the peer will not take this
-            # retract (or no longer counts this node as a member), so
-            # stop retrying rather than holding the leg until its TTL.
-            # A peer storage failure is not final — it raises
-            # PeerStorageFailedError, which falls through to the retry
-            # branch below instead of dropping the leg.
+            if (
+                isinstance(exc, PeerRejectedError)
+                and getattr(exc, "code", None) == "storage_failed"
+            ):
+                # Transient: the peer could not persist the retract
+                # this time — record an attempt and keep the leg for
+                # the next sweep instead of dropping it.
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error=str(exc), timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
+            # A refusal or rejection is final: the peer will not take
+            # this retract (or no longer counts this node as a member),
+            # so stop retrying rather than holding the leg until its TTL.
             log.warning("Dropping queued retract %s: %s", entry.id, exc)
             try:
                 self._remove_queued_version(
@@ -6976,9 +6979,10 @@ class TauNode:
             return False
         # Confirmed: the peer deleted their copy (or already had it
         # gone), so this node's own sent copy goes too.  A cleanup
-        # that cannot be persisted is logged and the leg still drops:
-        # the peer's copy is already gone, and the sender can retract
-        # again by hand.
+        # step that cannot be persisted leaves the leg queued for a
+        # later round instead of dropping it: the peer's copy is
+        # already gone, and a retried delivery answers deleted False
+        # while the bookkeeping is attempted again.
         target_id = retract["target"]
         removed = None
         try:
@@ -6988,25 +6992,47 @@ class TauNode:
         except InboxError as exc:
             log.warning(
                 "Delivered queued retract %s but the local copy could "
-                "not be deleted: %s",
+                "not be deleted: %s; leaving the leg queued",
                 entry.id,
                 exc,
             )
+            try:
+                self.mailbox.record_attempt(
+                    entry.id, error=str(exc), timeout=_remaining(deadline)
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not record failed delivery attempt for %s: "
+                    "mailbox lock busy",
+                    entry.id,
+                )
+            return False
+        if removed is not None and self.on_retract is not None:
+            try:
+                self.on_retract(removed)
+            except Exception:  # pragma: no cover - console callback
+                log.warning("on_retract callback failed", exc_info=True)
         try:
             self.mailbox.discard_sent(target_id)
             self.mailbox.record_sent_retraction(target_id)
         except Exception as exc:
             log.warning(
                 "Delivered queued retract %s but the sent record could "
-                "not be dropped: %s",
+                "not be dropped: %s; leaving the leg queued",
                 entry.id,
                 exc,
             )
-        if removed is not None and self.on_retract is not None:
             try:
-                self.on_retract(removed)
-            except Exception:  # pragma: no cover - console callback
-                log.warning("on_retract callback failed", exc_info=True)
+                self.mailbox.record_attempt(
+                    entry.id, error=str(exc), timeout=_remaining(deadline)
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not record failed delivery attempt for %s: "
+                    "mailbox lock busy",
+                    entry.id,
+                )
+            return False
         self._delivered_ids.append(entry.id)
         try:
             self.mailbox.record_delivered(
@@ -8325,6 +8351,13 @@ class TauNode:
                 resolved = self.inbox.resolve(target_id)
             except ValueError:
                 resolved = None
+            if resolved is not None and resolved.get("id") != target_id:
+                # The match must be exact: resolve also matches unique
+                # prefixes, and a short target must never delete a
+                # different message from the same sender — the direct
+                # path treats a prefix match as an unknown target, so
+                # this one does too.
+                resolved = None
             if resolved is not None and resolved.get("kind") == "group":
                 # A DM reaction leg naming a group message is foreign: a
                 # group reaction needs the signed group context and the
@@ -8675,6 +8708,16 @@ class TauNode:
                 resolved = self.inbox.resolve(target_id)
             except ValueError:
                 resolved = None
+            if resolved is not None and resolved.get("id") != target_id:
+                # The match must be exact: resolve also matches unique
+                # prefixes, and a short target must never authorize (or
+                # claim to delete) a different message from the same
+                # sender — the direct path treats a prefix match as an
+                # unknown target, so this one does too.  Without this,
+                # the marker below is recorded and success reported
+                # while delete_authorized (exact id only) leaves the
+                # received message in place.
+                resolved = None
             if resolved is not None and resolved.get("kind") == "group":
                 # A DM retract leg naming a group message is foreign: a
                 # group retract needs the signed group context and the
@@ -8699,13 +8742,16 @@ class TauNode:
             # Record the marker before deleting the copy: if it cannot be
             # persisted, nothing is deleted and the retract is deferred.
             # (A refused retract records nothing: the message stays, so it
-            # must stay deliverable.)  The marker is confirmed: the
-            # retract was honoured against a stored copy — or against no
-            # copy at all, in which case a copy arriving later still
-            # loses to it — so a flood of unknown-ID markers must not
-            # evict it at the cap.
+            # must stay deliverable.)  The marker is confirmed only when
+            # it deleted a stored copy — an unknown target guards an id
+            # the node never held, so it goes in the unconfirmed pool
+            # exactly as the direct path records it, or a flood of
+            # unknown-ID retracts could evict a confirmed marker
+            # protecting a real deletion.
             try:
-                self._record_retraction(sender, target_id, confirmed=True)
+                self._record_retraction(
+                    sender, target_id, confirmed=resolved is not None
+                )
             except Exception as exc:
                 raise DeliveryDeferredError(
                     f"could not record relayed retraction for {target_id}: {exc}"
@@ -11814,10 +11860,8 @@ class TauNode:
         removed when the retract is delivered, not at queue time, so
         the sender's history only ever loses a message that actually
         landed.  An explicit refusal (allow-list, block-list) or a
-        peer rejection (not_sender, not_supported, invalid_retraction)
-        is final and is never queued.  A peer storage failure is
-        transient — the retract has not applied — so it queues like
-        a transport failure.
+        peer rejection (not the sender, a file, an invalid retract)
+        is final and is never queued.
         """
         target_id = message_id.strip() if isinstance(message_id, str) else ""
         if not target_id or len(target_id) > 64:
@@ -11835,17 +11879,26 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            response = self._request(peer, REQUEST_RETRACT, payload_bytes, timeout)
+            try:
+                response = self._request(
+                    peer, REQUEST_RETRACT, payload_bytes, timeout
+                )
+            except PeerRejectedError as exc:
+                if getattr(exc, "code", None) == "storage_failed":
+                    # The peer could not read its inbox or persist
+                    # the marker this time — a transient failure, not
+                    # a refusal: queue the retract like a transport
+                    # failure instead of dropping it as final.
+                    raise NodeError(str(exc)) from exc
+                raise
         except (PeerRefusedError, NotAMemberError, PeerRejectedError):
             # An explicit refusal (allow-list, block-list) or a peer
-            # rejection (not_sender, not_supported, invalid_retraction)
+            # rejection (not the sender, a file, an invalid retract)
             # is final: queueing it would deliver to a peer that
-            # already said no.  A peer storage failure is not final —
-            # it raises PeerStorageFailedError, which falls through to
-            # the queue branch below.  Not-a-member is final here
-            # too: the receiver can return it for a retract naming a
-            # group message whose roster excludes this node, and the
-            # sweep would only drop the queued leg as a refusal anyway.
+            # already said no.  Not-a-member is final here too: the
+            # receiver can return it for a retract naming a group
+            # message whose roster excludes this node, and the sweep
+            # would only drop the queued leg as a refusal anyway.
             raise
         except NodeError:
             if not queue or not self.started:
@@ -11857,6 +11910,36 @@ class TauNode:
             )
             if dest_hash is None or self._is_self(dest_hash):
                 raise
+            try:
+                existing = next(
+                    (
+                        item
+                        for item in self.mailbox.outbox_list()
+                        if item.kind == "retract"
+                        and isinstance(item.retract, dict)
+                        and item.retract.get("target") == target_id
+                        and item.to == dest_hash
+                        and item.expires_at > time.time()
+                    ),
+                    None,
+                )
+            except TimeoutError:
+                # The mailbox lock is busy: the enqueue below either
+                # takes it or raises as it did before the dedupe
+                # check, so a busy lock never turns into a duplicate.
+                existing = None
+            if existing is not None:
+                # A retract for this message is already queued: a
+                # second one would only re-delete the same message
+                # under a new id, so report the queued one instead of
+                # storing a duplicate leg.
+                return {
+                    "ok": False,
+                    "queued": True,
+                    "target": target_id,
+                    "id": existing.retract["retract_id"],
+                    "queued_id": existing.id,
+                }
             try:
                 entry = self.mailbox.enqueue(
                     to=dest_hash,
@@ -12426,14 +12509,10 @@ class TauNode:
                 NotAMemberError,
                 PeerRefusedError,
                 PeerRejectedError,
-                PeerStorageFailedError,
             ) as exc:
                 # The member is online and explicitly refused or
                 # rejected the edit; an edit has no outbox to queue
                 # into for that, so the leg is reported as failed.
-                # A peer storage failure stays final here too
-                # (pre-existing behavior for edits; only the retract
-                # paths retry it).
                 if isinstance(exc, NotAllowedError):
                     refusal = "not_allowed"
                 elif isinstance(exc, NotAMemberError):
@@ -12669,12 +12748,10 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             response = self._request(peer, REQUEST_DM_EDIT, payload_bytes, timeout)
-        except (PeerRefusedError, NotAMemberError, PeerRejectedError, PeerStorageFailedError):
+        except (PeerRefusedError, NotAMemberError, PeerRejectedError):
             # An explicit refusal (allow-list, block-list, not a member)
             # or a peer rejection is final: queueing it would deliver
-            # to a peer that already said no.  A peer storage failure
-            # stays final here too (pre-existing behavior for edits;
-            # only the retract paths retry it).
+            # to a peer that already said no.
             raise
         except NodeError:
             if not queue or not self.started:
@@ -13687,13 +13764,10 @@ class TauNode:
                 raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
-            if error.get("code") == "storage_failed":
-                # Transient, not a rejection: the peer could not
-                # persist the request, so it has not applied.
-                raise PeerStorageFailedError(
-                    f"peer rejected the request: {message}"
-                )
-            raise PeerRejectedError(f"peer rejected the request: {message}")
+            raise PeerRejectedError(
+                f"peer rejected the request: {message}",
+                code=error.get("code") if isinstance(error.get("code"), str) else None,
+            )
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
         return decoded

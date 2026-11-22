@@ -886,7 +886,15 @@ not-a-member) is final and is never queued. Queued DM retracts ride
 the sealed relay too: the sweep deposits one as a retract leg of the
 target message, so an offline peer gets it from a holder; group
 retracts still ride direct delivery only, and no retract is sealed
-into a bundle or sent over LXMF. A retract also leaves a marker keyed by (sender,
+into a bundle or sent over LXMF. Two limits of the relay path: a
+retract the peer collects from a holder has no acknowledgement back
+to the sender, so the sender's own copies and the queued leg stay
+until the peer connects directly and confirms, or the leg expires —
+the recipient's copy is gone, but the sender's history keeps the
+message until then. And relayed retracts need the recipient on this
+version or newer: an older peer has no retract branch and stores the
+leg's display text as a chat message under the target id. A retract
+also leaves a marker keyed by (sender,
 message id) that lives for the message's delivery lifetime (7 days),
 unless the marker cap is reached first — at the cap the
 earliest-expiry markers are evicted, even unexpired ones — so a
