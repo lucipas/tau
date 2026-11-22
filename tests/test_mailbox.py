@@ -2073,6 +2073,76 @@ def test_sent_group_retraction_markers_persist_and_expire(tmp_path):
     assert reloaded.is_sent_group_retracted(group, 100.0) is False
 
 
+def test_retract_cleanup_blocked_markers_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    assert box.is_retract_cleanup_blocked("retract-1") is False
+
+    recorded_at = time.time()
+    box.record_retract_cleanup_blocked("retract-1", now=recorded_at)
+    assert box.is_retract_cleanup_blocked("retract-1") is True
+    # Keyed by retract id alone: another retract is unaffected.
+    assert box.is_retract_cleanup_blocked("retract-2") is False
+
+    # The marker survives a reload, and lifts once its retention ends.
+    reloaded = Mailbox(path)
+    assert reloaded.is_retract_cleanup_blocked("retract-1") is True
+    assert (
+        reloaded.is_retract_cleanup_blocked(
+            "retract-1", now=recorded_at + SENT_RETRACTED_RETENTION - 1
+        )
+        is True
+    )
+    assert (
+        reloaded.is_retract_cleanup_blocked(
+            "retract-1", now=recorded_at + SENT_RETRACTED_RETENTION
+        )
+        is False
+    )
+
+    removed = reloaded.prune(now=recorded_at + SENT_RETRACTED_RETENTION)
+    assert reloaded.is_retract_cleanup_blocked("retract-1") is False
+
+
+def test_prune_blocks_cleanup_for_expired_group_retract_leg(tmp_path):
+    # An expired leg of a queued group retract blocks the fan-out's
+    # local cleanup, exactly like a refused leg: the member never got
+    # the retract, so the sender's copies must survive even after the
+    # surviving legs deliver.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    now = time.time()
+    box.enqueue(
+        to=bytes.fromhex("cd" * 16),
+        text="retraction",
+        message_id="leg-bob",
+        group={
+            "id": "cc" * 16,
+            "name": "crew",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16],
+        },
+        sent_at=now - 100,
+        now=now,
+        expires_at=now + 10,
+        retract={
+            "target": "leg-1",
+            "retract_id": "retract-1",
+            "sent_at": now - 100,
+            "target_author": "ab" * 16,
+            "target_sent_at": 100.0,
+            "payload_b64": "AAAA",
+        },
+    )
+    entry = box.get_outbox("leg-bob")
+    assert entry is not None
+    # Past the leg's expiry, prune drops it — and records the block.
+    removed = box.prune(now=now + 11)
+    assert removed["outbox"] == 1
+    assert box.get_outbox("leg-bob") is None
+    assert box.is_retract_cleanup_blocked("retract-1") is True
+
+
 def test_group_retraction_markers_are_capped(tmp_path, monkeypatch):
     monkeypatch.setattr(mailbox_module, "MAX_GROUP_RETRACTED", 2)
     box = Mailbox(tmp_path / "mailbox.json")

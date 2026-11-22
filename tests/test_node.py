@@ -18,6 +18,7 @@ from tau.node import (
     NotAllowedError,
     NotAMemberError,
     PeerRefusedError,
+    PeerRejectedError,
     TauNode,
     _AnnounceHandler,
 )
@@ -2679,6 +2680,158 @@ def test_deliver_queued_group_retract_drops_local_copies_on_last_leg(
     assert node.mailbox.outbox_list() == []
     assert node.mailbox.sent_list() == []
     assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is True
+
+
+def test_deliver_queued_group_retract_refused_sibling_keeps_local_copies(
+    tmp_path, monkeypatch
+):
+    # Qodo Warning on PR #706: the sweep dropped the sender's local
+    # copies once no sibling legs remained queued — but a refused leg
+    # is gone from the outbox without delivering, so "no siblings"
+    # did not mean the fan-out completed. A refused sibling blocks
+    # the cleanup durably: the last delivered leg still leaves the
+    # outbox, but the local copies stay for a retry.
+    from tau.protocol import REQUEST_RETRACT
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+
+    def unreachable(peer_arg, path, payload, timeout, deadline=None):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    assert response["ok"] is False
+    entries = {e.to_hex: e for e in node.mailbox.outbox_list()}
+    assert set(entries) == {alice.hexhash, bob.hexhash}
+
+    def refuse_bob(peer_arg, path, payload, timeout, deadline=None):
+        assert path == REQUEST_RETRACT
+        if peer_arg.hexhash == bob.hexhash:
+            raise NotAllowedError("peer rejected the request: not allowed")
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", refuse_bob)
+    # Bob's leg is refused: it drops, the cleanup is blocked, and the
+    # local copy is still there.
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is False
+    assert node.mailbox.is_retract_cleanup_blocked(response["id"]) is True
+    assert node.inbox.resolve("leg-1")["text"] == "crew hello"
+    # Alice's leg delivers — the last queued leg — but the fan-out
+    # never completed, so the local copies stay.
+    assert node._deliver_entry(alice, entries[alice.hexhash], 1.0) is True
+    assert node.inbox.resolve("leg-1")["text"] == "crew hello"
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is False
+
+
+def test_send_group_retraction_failed_leg_blocks_sweep_cleanup(
+    tmp_path, monkeypatch
+):
+    # The same block, recorded on the live path: Bob refuses while
+    # Alice is unreachable, so Alice's leg is queued — and when it
+    # later delivers, the sweep must not drop the local copies, since
+    # Bob still holds the message.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+
+    def mixed(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NotAllowedError("peer rejected the request: not allowed")
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", mixed)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    assert response["ok"] is False
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[bob.hexhash].get("error") == "not_allowed"
+    assert by_to[alice.hexhash].get("queued") is True
+    assert node.mailbox.is_retract_cleanup_blocked(response["id"]) is True
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    [entry] = node.mailbox.outbox_list()
+    assert node._deliver_entry(alice, entry, 1.0) is True
+    assert node.inbox.resolve("leg-1")["text"] == "crew hello"
+    assert node.mailbox.is_sent_group_retracted(group["id"], 100.0) is False
+
+
+def test_send_group_retraction_peer_rejection_is_final(tmp_path, monkeypatch):
+    # A peer rejection (not the sender, an invalid retract) is final
+    # on the live fan-out, exactly like a refusal — never queued —
+    # while a storage failure stays transient and queues the leg.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+
+    def rejected(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise PeerRejectedError(
+                "peer rejected the request: not the sender",
+                code="not_sender",
+            )
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", rejected)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[bob.hexhash].get("error") == (
+        "peer rejected the request: not the sender"
+    )
+    assert by_to[bob.hexhash].get("queued") is None
+    assert node.mailbox.outbox_list() == []
+
+    def storage_failed(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise PeerRejectedError(
+                "peer rejected the request: could not record retraction",
+                code="storage_failed",
+            )
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", storage_failed)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[bob.hexhash].get("queued") is True
 
 
 def test_send_group_retraction_rejects_unknown_and_solo_groups(tmp_path):

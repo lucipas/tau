@@ -154,6 +154,7 @@ SENT_RETENTION = 30 * 24 * 60 * 60
 SENT_RETRACTED_RETENTION = SENT_RETENTION
 MAX_SENT_RETRACTED = 1024
 MAX_SENT_GROUP_RETRACTED = 1024
+MAX_RETRACT_CLEANUP_BLOCKED = 1024
 
 
 def _retraction_key(sender_hash: str, message_id: str) -> str:
@@ -1312,6 +1313,14 @@ class Mailbox:
         # always names this node's own message.
         self._sent_retracted: Dict[str, float] = {}
         self._sent_group_retracted: Dict[str, float] = {}
+        # Retract ids whose fan-out can never complete: a leg of the
+        # retract was finally refused, rejected, or expired, so a
+        # member still holds the message and the sender's local copies
+        # must survive even after the last queued leg delivers (see
+        # TauNode._deliver_queued_retract). Keyed by retract id, with
+        # the same retention as the sent-retraction markers — long
+        # enough to outlive any queued leg of the same retract.
+        self._retract_cleanup_blocked: Dict[str, float] = {}
         if self.path is not None:
             self.load()
 
@@ -1431,6 +1440,7 @@ class Mailbox:
             self._group_retracted_unknown = state["group_retracted_unknown"]
             self._sent_retracted = state["sent_retracted"]
             self._sent_group_retracted = state["sent_group_retracted"]
+            self._retract_cleanup_blocked = state["retract_cleanup_blocked"]
             self._group_pending_edits = state["group_pending_edits"]
             self._pending_local_edits = state["pending_local_edits"]
             self._aborted_local_edits = state["aborted_local_edits"]
@@ -1590,6 +1600,10 @@ class Mailbox:
             raw.get("sent_group_retracted"),
             retention=SENT_RETRACTED_RETENTION,
         )
+        retract_cleanup_blocked = _parse_retraction_markers(
+            raw.get("retract_cleanup_blocked"),
+            retention=SENT_RETRACTED_RETENTION,
+        )
         group_pending_edits = _parse_pending_edit_markers(
             raw.get("group_pending_edits")
         )
@@ -1697,6 +1711,7 @@ class Mailbox:
             "group_retracted_unknown": group_retracted_unknown,
             "sent_retracted": sent_retracted,
             "sent_group_retracted": sent_group_retracted,
+            "retract_cleanup_blocked": retract_cleanup_blocked,
             "group_pending_edits": group_pending_edits,
             "pending_local_edits": pending_local_edits,
             "aborted_local_edits": aborted_local_edits,
@@ -1731,6 +1746,7 @@ class Mailbox:
                 ),
                 "sent_retracted": dict(self._sent_retracted),
                 "sent_group_retracted": dict(self._sent_group_retracted),
+                "retract_cleanup_blocked": dict(self._retract_cleanup_blocked),
                 "group_pending_edits": {
                     key: dict(marker)
                     for key, marker in self._group_pending_edits.items()
@@ -3428,6 +3444,49 @@ class Mailbox:
             )
             del self._sent_group_retracted[oldest[0]]
 
+    def record_retract_cleanup_blocked(
+        self, retract_id: str, *, now: Optional[float] = None
+    ) -> None:
+        """Remember that a group retract's fan-out can never complete.
+
+        A leg of the retract was finally refused, rejected, or expired,
+        so a member still holds the message: the sender's local copies
+        must survive even after the last queued leg delivers (see
+        :meth:`tau.node.TauNode._deliver_queued_retract`). Recording the
+        same retract again refreshes the marker.
+        """
+        timestamp = now if now is not None else time.time()
+        with self._transaction():
+            self._retract_cleanup_blocked[retract_id] = (
+                timestamp + SENT_RETRACTED_RETENTION
+            )
+            self._evict_retract_cleanup_blocked()
+            self.save()
+
+    def is_retract_cleanup_blocked(
+        self, retract_id: str, *, now: Optional[float] = None
+    ) -> bool:
+        """True while a live cleanup-blocked marker covers this retract.
+
+        An expired marker reads as absent even before :meth:`prune`
+        sweeps it away.
+        """
+        with self._lock:
+            timestamp = now if now is not None else time.time()
+            until = self._retract_cleanup_blocked.get(retract_id)
+            return until is not None and timestamp < until
+
+    def _evict_retract_cleanup_blocked(self) -> None:
+        """Drop earliest-expiry cleanup-blocked markers until the pool fits.
+
+        Call with the transaction held.
+        """
+        while len(self._retract_cleanup_blocked) > MAX_RETRACT_CLEANUP_BLOCKED:
+            oldest = min(
+                self._retract_cleanup_blocked.items(), key=lambda kv: kv[1]
+            )
+            del self._retract_cleanup_blocked[oldest[0]]
+
     # -- pending fetch acknowledgements --------------------------------------
 
     def add_pending_acks(self, holder_hexhash: str, message_ids: List[str]) -> None:
@@ -3501,6 +3560,30 @@ class Mailbox:
                 if (entry := self._outbox.get(key)) is not None
                 and entry.group_edit_id is not None
             }
+            # An expired leg of a queued group retract blocks the
+            # fan-out's local cleanup: the member never got the
+            # retract, so the sender's copies must survive even after
+            # the surviving legs deliver (see
+            # TauNode._deliver_queued_retract). The marker is written
+            # inline, before the dead legs are deleted below — prune
+            # saves at the end, since dead_outbox is non-empty
+            # whenever a leg expired.
+            for key in dead_outbox:
+                entry = self._outbox.get(key)
+                if entry is None or entry.kind != "retract":
+                    continue
+                if getattr(entry, "group_id", None) is None:
+                    continue
+                retract = getattr(entry, "retract", None)
+                if not isinstance(retract, dict):
+                    continue
+                retract_id = retract.get("retract_id")
+                if not isinstance(retract_id, str) or not retract_id:
+                    continue
+                self._retract_cleanup_blocked[retract_id] = (
+                    timestamp + SENT_RETRACTED_RETENTION
+                )
+            self._evict_retract_cleanup_blocked()
             for key in dead_outbox:
                 del self._outbox[key]
             # An expired leg aborts its edit: a deferred local apply
@@ -3599,6 +3682,13 @@ class Mailbox:
             ]
             for key in dead_aborted_local_edits:
                 del self._aborted_local_edits[key]
+            dead_retract_cleanup_blocked = [
+                key
+                for key, until in self._retract_cleanup_blocked.items()
+                if until <= timestamp
+            ]
+            for key in dead_retract_cleanup_blocked:
+                del self._retract_cleanup_blocked[key]
             if (
                 dead_outbox
                 or dead_held
@@ -3614,6 +3704,7 @@ class Mailbox:
                 or dead_sent_group_retracted
                 or dead_group_pending_edits
                 or dead_aborted_local_edits
+                or dead_retract_cleanup_blocked
             ):
                 self.save()
             return {
