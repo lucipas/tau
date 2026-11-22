@@ -5547,6 +5547,9 @@ class WebBridge:
                     if mode is not None
                     else (stored["mode"] if stored is not None else "open")
                 ),
+                # A secret group's link names the group by its
+                # opaque id, never by name.
+                group_id=found["id"] if found.get("secret") else None,
             )
         except InviteError as exc:
             raise ValueError(str(exc)) from exc

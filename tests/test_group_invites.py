@@ -60,6 +60,138 @@ def _group(node, own_hash, *others):
 
 
 # --- token mint / parse / verify -------------------------------------------
+# (id-keyed tokens for secret groups first, then name-keyed tokens)
+
+
+def _secret_group(node, identity, own_hash, *others):
+    return node.groups.create(
+        "crew",
+        [own_hash, *[peer.hexhash for peer in others]],
+        created_by=own_hash,
+        secret=True,
+        identity=identity,
+    )
+
+
+def test_id_token_round_trip_carries_no_name():
+    identity = RNS.Identity()
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    group_id = "ab" * 16
+    link = mint_invite_token(
+        identity, group_id=group_id, creator_hash=own_hash, mode="closed"
+    )
+    assert link.startswith("tau://invite/")
+    token = parse_invite_link(link)
+    assert token["group_id"] == group_id
+    assert "group" not in token
+    # The group name appears nowhere in the token at all.
+    assert b"crew" not in base64.urlsafe_b64decode(
+        link[len("tau://invite/") :]
+    )
+    verified = verify_invite_link(
+        link,
+        identity=identity,
+        invites={"groups": {"crew": {"mode": "closed", "generation": 0}}},
+        resolve_group_id=lambda gid: "crew" if gid == group_id else None,
+    )
+    assert verified["group"] == "crew"
+    assert verified["group_id"] == group_id
+    assert verified["mode"] == "closed"
+
+
+def test_mint_token_needs_exactly_one_group_handle():
+    identity = RNS.Identity()
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    with pytest.raises(InviteError):
+        mint_invite_token(identity, creator_hash=own_hash)
+    with pytest.raises(InviteError):
+        mint_invite_token(
+            identity,
+            group_name="crew",
+            group_id="ab" * 16,
+            creator_hash=own_hash,
+        )
+
+
+def test_parse_rejects_token_with_both_or_neither_group_fields():
+    identity = RNS.Identity()
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    for extra in ({"group": "crew", "group_id": "ab" * 16}, {}):
+        payload = {
+            "v": 1,
+            "type": "group-invite",
+            "creator": own_hash,
+            "mode": "open",
+            "generation": 0,
+            "issued_at": 1000.0,
+            **extra,
+        }
+        signature = identity.sign(encode(payload))
+        token = dict(payload)
+        token["sig"] = base64.b64encode(signature).decode("ascii")
+        link = "tau://invite/" + base64.urlsafe_b64encode(
+            encode(token)
+        ).decode("ascii")
+        with pytest.raises(InviteError):
+            parse_invite_link(link)
+    # A malformed group id fails too.
+    with pytest.raises(InviteError):
+        mint_invite_token(
+            identity, group_id="not-an-id", creator_hash=own_hash
+        )
+
+
+def test_verify_id_token_needs_resolver():
+    identity = RNS.Identity()
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    group_id = "ab" * 16
+    link = mint_invite_token(
+        identity, group_id=group_id, creator_hash=own_hash, mode="open"
+    )
+    invites = {"groups": {"crew": {"mode": "open", "generation": 0}}}
+    # Without a resolver there is nothing to check the stored
+    # mode/generation against.
+    with pytest.raises(InviteError):
+        verify_invite_link(link, identity=identity, invites=invites)
+    # And a resolver that knows no such id fails the same way.
+    with pytest.raises(InviteError):
+        verify_invite_link(
+            link,
+            identity=identity,
+            invites=invites,
+            resolve_group_id=lambda gid: None,
+        )
+
+
+def test_revoke_invalidates_id_token(tmp_path):
+    node, identity, own_hash = _invite_node(tmp_path)
+    group_id = "ab" * 16
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name="crew",
+        creator_hash=own_hash,
+        mode="open",
+        group_id=group_id,
+    )
+    invites = load_invites(node.config.invites_path)
+    assert verify_invite_link(
+        link,
+        identity=identity,
+        invites=invites,
+        resolve_group_id=lambda gid: "crew" if gid == group_id else None,
+    )["group_id"] == group_id
+    revoke_invites(node.config.invites_path, group_name="crew")
+    with pytest.raises(InviteError):
+        verify_invite_link(
+            link,
+            identity=identity,
+            invites=load_invites(node.config.invites_path),
+            resolve_group_id=lambda gid: "crew" if gid == group_id else None,
+        )
+
+
+# --- name-keyed tokens ------------------------------------------------------
 
 
 def test_mint_parse_verify_round_trip():
@@ -445,3 +577,95 @@ def test_relayed_join_request_is_decided_not_stored(tmp_path, monkeypatch):
         carol.hexhash in g["members"] for g in node.groups.list_groups()
     )
     assert not node.mailbox.is_seen("m-1")
+
+
+# --- secret groups: id-keyed invite links ----------------------------------
+
+
+def test_secret_group_join_via_id_link(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    carol_identity, carol = _peer_identity(JOINER)
+    node.registry.upsert(bob.destination_hash, bob.public_key, name="bob", now=1.0)
+    node.registry.upsert(
+        carol.destination_hash, carol.public_key, name=JOINER, now=1.0
+    )
+    group = _secret_group(node, identity, own_hash, bob)
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group["name"],
+        creator_hash=own_hash,
+        mode="open",
+        group_id=group["id"],
+    )
+    # The minted link names the group by id only — no name anywhere.
+    token = parse_invite_link(link)
+    assert token["group_id"] == group["id"]
+    assert "group" not in token
+    welcomes = []
+    monkeypatch.setattr(
+        node,
+        "send_group_message",
+        lambda group_arg, text, **kwargs: welcomes.append((group_arg, text)),
+    )
+    response = decode(
+        node._handle_message(
+            "/tau/message",
+            encode_message(link, kind="group-join-request", message_id="m-1"),
+            b"req-1",
+            carol_identity,
+            1000.0,
+        )
+    )
+    assert response["ok"] is True
+    assert response["status"] == "added"
+    assert carol.hexhash in response["group"]["members"]
+    # The successor is still a secret group with a fresh opaque id.
+    successor = node.groups.get(response["group"]["id"])
+    assert successor is not None
+    assert successor.get("secret") is True
+    assert successor["id"] != group["id"]
+    assert len(welcomes) == 1
+    assert not node.mailbox.is_seen("m-1")
+
+
+def test_id_link_survives_roster_rotation(tmp_path, monkeypatch):
+    node, identity, own_hash = _invite_node(tmp_path)
+    _, bob = _peer_identity("bob")
+    _, dave = _peer_identity("dave")
+    carol_identity, carol = _peer_identity(JOINER)
+    node.registry.upsert(
+        carol.destination_hash, carol.public_key, name=JOINER, now=1.0
+    )
+    group = _secret_group(node, identity, own_hash, bob)
+    link = mint_invite(
+        node.config.invites_path,
+        identity,
+        group_name=group["name"],
+        creator_hash=own_hash,
+        mode="open",
+        group_id=group["id"],
+    )
+    # A roster change rotates the secret group's id before Carol
+    # ever uses the link: the token names the retired id.
+    node.groups.update_members(
+        group["id"],
+        [own_hash, bob.hexhash, dave.hexhash],
+        created_by=own_hash,
+        identity=identity,
+    )
+    assert node.groups.get(group["id"]) is None
+    monkeypatch.setattr(node, "send_group_message", lambda *a, **k: None)
+    response = decode(
+        node._handle_message(
+            "/tau/message",
+            encode_message(link, kind="group-join-request", message_id="m-1"),
+            b"req-1",
+            carol_identity,
+            1000.0,
+        )
+    )
+    assert response["ok"] is True
+    assert response["status"] == "added"
+    assert carol.hexhash in response["group"]["members"]

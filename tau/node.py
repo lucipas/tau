@@ -2878,6 +2878,25 @@ class TauNode:
             **result,
         )
 
+    def _resolve_invite_group_id(self, group_id: str) -> Optional[str]:
+        """The name of the group an id-keyed invite token names.
+
+        A secret group's token carries its opaque id, not its name,
+        so the creator resolves it locally: the current group, or
+        the retired record a roster change or rename left behind —
+        a token minted before the rotation still names the group.
+        Returns ``None`` when no group (live or retired) carries
+        the id, so verification fails the same way as for an
+        unknown name.
+        """
+        group = self.groups.get(group_id)
+        if group is not None:
+            return group["name"]
+        retired = self.groups.get_retired(group_id)
+        if retired is not None:
+            return retired["name"]
+        return None
+
     def _process_join_request(
         self,
         link_text: Any,
@@ -2900,12 +2919,16 @@ class TauNode:
             raise InviteError("node has no identity")
         invites = load_invites(self.config.invites_path)
         invite = verify_invite_link(
-            link_text, identity=self.identity, invites=invites
+            link_text,
+            identity=self.identity,
+            invites=invites,
+            resolve_group_id=self._resolve_invite_group_id,
         )
         own_hash = self.destination_hexhash
-        # The token names the group: the id derives from the roster,
-        # so the first join already retires the id it was minted for.
-        # Resolve the name to the current roster on every join.
+        # The token names the group — by name, or by opaque id for
+        # a secret group, resolved to the name above.  A derived id
+        # retires on the first join, so resolve the name to the
+        # current roster on every join.
         try:
             group = self.groups.find(invite["group"])
         except ValueError as exc:

@@ -23,6 +23,14 @@ renaming a group invalidates its outstanding invites (mint a fresh
 one after a rename).  The invite and join-request stores are keyed
 the same way, so pending requests survive roster changes too.
 
+A secret group's token instead names the group by its opaque id
+(see :func:`mint_invite_token`): the name never appears in the
+token, so anyone holding the link learns nothing about the group.
+The creator resolves the id to the group locally — a current id,
+or a retired one via the store's retired record — and the
+mode/generation check still uses the name-keyed store, so revoke
+semantics are unchanged.
+
 The join itself is a direct message with kind
 ``group-join-request`` whose text is the invite link, sent to the
 creator's destination hash (which the link carries).  The creator's
@@ -55,7 +63,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 import RNS
 
@@ -136,23 +144,31 @@ def _clean_timestamp(value: Any, label: str) -> float:
 def mint_invite_token(
     identity: RNS.Identity,
     *,
-    group_name: str,
+    group_name: Optional[str] = None,
+    group_id: Optional[str] = None,
     creator_hash: str,
     mode: str = DEFAULT_INVITE_MODE,
     generation: int = 0,
     issued_at: Optional[float] = None,
 ) -> str:
-    """Mint a signed invite link for *group_name*.
+    """Mint a signed invite link for a group.
 
     The payload is signed with the creator's identity, so only the
     creator can mint a token anyone will honour.  *generation* is
     the invite generation the token belongs to; bumping it (see
     :func:`revoke_invites`) invalidates every token minted before.
+    Exactly one of *group_name* and *group_id* names the group: a
+    name for an ordinary group, an opaque id for a secret group —
+    the id token carries no name, so anyone holding the link learns
+    nothing about the group it opens.
     """
-    payload = {
+    if (group_name is None) == (group_id is None):
+        raise InviteError(
+            "invite token needs exactly one of group_name and group_id"
+        )
+    payload: Dict[str, Any] = {
         "v": 1,
         "type": "group-invite",
-        "group": _clean_group_name(group_name),
         "creator": _clean_hash(creator_hash, "creator"),
         "mode": _clean_mode(mode),
         "generation": _clean_generation(generation),
@@ -160,6 +176,10 @@ def mint_invite_token(
             time.time() if issued_at is None else issued_at, "issued_at"
         ),
     }
+    if group_name is not None:
+        payload["group"] = _clean_group_name(group_name)
+    else:
+        payload["group_id"] = _clean_hash(group_id, "group_id")
     signature = identity.sign(encode(payload))
     if signature is None:  # pragma: no cover - identity without private keys
         raise InviteError("creator identity cannot sign")
@@ -198,8 +218,20 @@ def parse_invite_link(link: Any) -> Dict[str, Any]:
     if token.get("v") != 1:
         raise InviteError("unsupported invite token version")
     # Validate the shape now so a malformed token fails the same way
-    # everywhere instead of halfway through verification.
-    _clean_group_name(token.get("group"))
+    # everywhere instead of halfway through verification.  Exactly
+    # one of "group" (a name) and "group_id" (an opaque id, for a
+    # secret group) names the group — a token carrying both, or
+    # neither, is malformed.
+    has_name = token.get("group") is not None
+    has_id = token.get("group_id") is not None
+    if has_name == has_id:
+        raise InviteError(
+            "invite token needs exactly one of group and group_id"
+        )
+    if has_name:
+        _clean_group_name(token.get("group"))
+    else:
+        _clean_hash(token.get("group_id"), "group_id")
     _clean_hash(token.get("creator"), "creator")
     _clean_mode(token.get("mode"))
     _clean_generation(token.get("generation"))
@@ -219,6 +251,7 @@ def verify_invite_link(
     *,
     identity: RNS.Identity,
     invites: Dict[str, Any],
+    resolve_group_id: Optional[Callable[[str], Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Verify an invite link against this node's identity and store.
 
@@ -228,6 +261,16 @@ def verify_invite_link(
     generation check.  Returns the token payload on success.
     Every failure raises the same :class:`InviteError`, so a caller
     that reports it cannot leak which check failed.
+
+    A token for a secret group carries the opaque group id instead
+    of the name: *resolve_group_id* maps that id to the group's
+    name, so the mode/generation check still reads the name-keyed
+    store.  The resolver is the caller's local group store (a
+    current id, or a retired one via the retired record); without
+    one an id token cannot verify.  The returned dict carries both
+    ``"group"`` (the name, ``None`` only when the token itself was
+    rejected) and ``"group_id"`` (the id, or ``None`` for a
+    name-keyed token).
     """
     token = parse_invite_link(link)
     own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
@@ -241,13 +284,23 @@ def verify_invite_link(
         raise InviteError(f"could not verify invite: {exc}") from exc
     if not verified:
         raise InviteError("invite signature does not verify")
+    group_name = token.get("group")
+    group_id = token.get("group_id")
+    if group_id is not None:
+        # The token names no group by name: resolve the id locally
+        # instead, so the name never appears in the token itself.
+        if resolve_group_id is None:
+            raise InviteError("invite is not valid for this group")
+        group_name = resolve_group_id(_clean_hash(group_id, "group_id"))
+        if group_name is None:
+            raise InviteError("invite is not valid for this group")
     record = None
     if isinstance(invites, dict):
         groups = invites.get("groups")
         if isinstance(groups, dict):
             # Store keys are casefolded names (group lookup is
             # case-insensitive, see GroupStore.find).
-            record = groups.get(token["group"].casefold())
+            record = groups.get(group_name.casefold())
     if not isinstance(record, dict):
         raise InviteError("invite is not valid for this group")
     if _clean_mode(record.get("mode")) != token["mode"]:
@@ -255,7 +308,10 @@ def verify_invite_link(
     if _clean_generation(record.get("generation")) != token["generation"]:
         raise InviteError("invite is not valid for this group")
     return {
-        "group": token["group"],
+        "group": group_name,
+        "group_id": (
+            _clean_hash(group_id, "group_id") if group_id is not None else None
+        ),
         "creator": token["creator"],
         "mode": token["mode"],
         "generation": token["generation"],
@@ -353,6 +409,7 @@ def mint_invite(
     group_name: str,
     creator_hash: str,
     mode: str = DEFAULT_INVITE_MODE,
+    group_id: Optional[str] = None,
 ) -> str:
     """Mint and record an invite link for *group_name*.
 
@@ -363,6 +420,9 @@ def mint_invite(
     survives the roster changes that retire the group's id.  The
     minted link itself is stored too, so the console can show the
     current link without minting a fresh token on every view.
+    *group_id* mints a token for a secret group instead: the token
+    carries the opaque id and no name, while the record still
+    lives under the name (the store is local state, never shared).
     """
     group_name = _clean_group_name(group_name)
     mode = _clean_mode(mode)
@@ -376,7 +436,8 @@ def mint_invite(
         )
         link = mint_invite_token(
             identity,
-            group_name=group_name,
+            group_name=group_name if group_id is None else None,
+            group_id=group_id,
             creator_hash=creator_hash,
             mode=mode,
             generation=generation,
