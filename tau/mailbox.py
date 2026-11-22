@@ -3687,8 +3687,15 @@ def seal_message(
             raise MailboxError(
                 "reaction id must be a 1-64 character string"
             )
+        if "token" not in reaction or not isinstance(reaction["token"], str):
+            # An absent token must not become an empty-token clear:
+            # clean_reaction turns None into "" (a retraction), so a
+            # reaction dict without a token would seal as a leg that
+            # clears the sender's reaction.  An explicit "" stays a
+            # valid clear — it is a string, so it passes this check.
+            raise MailboxError("reaction token must be a string")
         try:
-            token = clean_reaction(reaction.get("token"))
+            token = clean_reaction(reaction["token"])
         except ProtocolError as exc:
             raise MailboxError(f"invalid reaction token: {exc}") from exc
         inner["reaction"] = {"token": token, "reaction_id": reaction_id}
@@ -3994,10 +4001,17 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     reaction_raw = payload.get("reaction")
     if isinstance(reaction_raw, dict):
         reaction_id = reaction_raw.get("reaction_id")
-        try:
-            token = clean_reaction(reaction_raw.get("token"))
-        except ProtocolError:
-            token = None
+        # An absent token must not become an empty-token clear:
+        # clean_reaction turns None into "" (a retraction), so a leg
+        # carrying an id without a token would clear the sender's
+        # reaction instead of dropping its reaction payload.  An
+        # explicit "" stays a valid clear — it is a string.
+        token = None
+        if "token" in reaction_raw and isinstance(reaction_raw["token"], str):
+            try:
+                token = clean_reaction(reaction_raw["token"])
+            except ProtocolError:
+                token = None
         if (
             isinstance(reaction_id, str)
             and reaction_id
