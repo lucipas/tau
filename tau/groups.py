@@ -1864,6 +1864,43 @@ class GroupStore:
                 ids.append(pred["id"] if pred is not None else str(pred_id).lower())
             return ids
 
+    def successor(self, group_id: str) -> Optional[Dict[str, Any]]:
+        """The live group continuing *group_id*, or ``None``.
+
+        The id itself when it is still live; otherwise the live group
+        whose rename lineage names it, falling back to the retired
+        record's name, creator and creation time — the same two-step
+        lookup invite resolution uses, because a roster-change
+        successor carries the predecessor's lineage forward without
+        naming it (see :meth:`_apply_roster_change`).  Reloads from
+        disk first, so a roster change in another process is seen.
+        ``None`` means no live successor is known: the group may have
+        been deleted, or its successor never learned — callers must
+        fail open on it, never treat it as a removal.
+        """
+        with self._transaction():
+            wanted = str(group_id).lower()
+            live = self._groups.get(wanted)
+            if live is not None:
+                return dict(live)
+            for candidate in self._groups.values():
+                if wanted in [
+                    str(entry).lower()
+                    for entry in (candidate.get("renamed_from") or [])
+                ]:
+                    return dict(candidate)
+            retired = self._retired_groups.get(wanted)
+            if retired is not None:
+                for candidate in self._groups.values():
+                    if (
+                        candidate.get("name") == retired.get("name")
+                        and candidate.get("creator") == retired.get("creator")
+                        and candidate.get("created_at")
+                        == retired.get("created_at")
+                    ):
+                        return dict(candidate)
+            return None
+
     def find(self, query: str) -> Optional[Dict[str, Any]]:
         """Resolve a group by id, id prefix, or exact name.
 
