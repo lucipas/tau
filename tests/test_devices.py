@@ -755,6 +755,76 @@ def test_devices_redeem_retry_reimports_missing_history(tmp_path, capsys):
     assert "already redeemed" in capsys.readouterr().err
 
 
+def test_devices_redeem_retry_refused_when_inbox_full(tmp_path, capsys):
+    # Qodo Warning on PR #739: a missing snapshot record that the
+    # capacity-preserving import cannot store must not keep the bundle
+    # retryable — each replay would "succeed" without importing it.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_history(node_a)
+    capsys.readouterr()
+
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(bundle_path),
+                "--data-dir",
+                str(node_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["history"]["imported"] == 3
+
+    # Lose one snapshot record, then fill the inbox to its cap: the
+    # retry has nothing it could store, so the bundle is spent.
+    inbox_b = Inbox(node_b / "inbox.json")
+    inbox_b.delete("msg-1")
+    fill = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {
+                "id": f"fill-{i}",
+                "destination": "aa" * 32,
+                "text": f"fill {i}",
+            }
+            for i in range(499)
+        ],
+    }
+    assert Inbox(node_b / "inbox.json").import_messages(fill)["imported"] == 499
+    # 500 received (one group record + 499 fill) plus one sent record.
+    assert len(Inbox(node_b / "inbox.json")) == 501
+
+    code = cli.main(
+        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
+
 def test_devices_pair_redeem_skips_retracted_history(tmp_path, capsys):
     # A message the sender retracted after the bundle was minted must
     # not be resurrected by the stale snapshot: the redeem passes this

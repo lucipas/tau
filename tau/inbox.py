@@ -2504,6 +2504,12 @@ class Inbox:
         with the edited text when the marker is newer than the
         record's own edit time: an export made before the edit must
         not resurrect the old text.
+
+        With ``keep_existing`` given, an entry that would push its
+        direction past the retention cap is skipped instead of stored,
+        so the retention pass can never evict a record that was already
+        in the inbox — and when only some of the new records fit, the
+        newest ones win the free slots (snapshots arrive oldest-first).
         """
         if not isinstance(document, dict):
             raise ValueError("export file must contain a JSON object")
@@ -2533,19 +2539,26 @@ class Inbox:
             for item in self._messages:
                 direction = item.get("direction")
                 used[direction] = used.get(direction, 0) + 1
-            for entry in entries:
+            # Classify first: validation, dedupe and retraction decide
+            # per entry whether it is a candidate at all.  Capacity is
+            # decided afterwards, per direction, so that when only some
+            # of the candidates fit, the newest ones win the free slots
+            # instead of the oldest ones (snapshots arrive oldest-first).
+            # Errors are keyed by entry index so the returned list
+            # stays in document order across the two phases.
+            errors_by_index: Dict[int, Dict[str, Any]] = {}
+            candidates: List[Tuple[int, Dict[str, Any], Any]] = []
+            for index, entry in enumerate(entries):
                 record = _valid_record(entry)
                 if record is None:
                     ref = None
                     if isinstance(entry, dict) and entry.get("id") is not None:
                         ref = str(entry.get("id"))
                     skipped += 1
-                    errors.append(
-                        {
-                            "id": ref,
-                            "error": _record_error(entry) or "invalid inbox record",
-                        }
-                    )
+                    errors_by_index[index] = {
+                        "id": ref,
+                        "error": _record_error(entry) or "invalid inbox record",
+                    }
                     continue
                 if (
                     pending_group_edit is not None
@@ -2615,30 +2628,43 @@ class Inbox:
                     # destination is the recipient, not the sender, so
                     # they cannot match a marker for this message.
                     skipped += 1
-                    errors.append(
-                        {
-                            "id": record["id"],
-                            "error": "message was retracted by its sender",
-                        }
-                    )
+                    errors_by_index[index] = {
+                        "id": record["id"],
+                        "error": "message was retracted by its sender",
+                    }
                     continue
-                direction = record.get("direction")
-                if keep_existing and used.get(direction, 0) >= direction_capacity(
-                    direction
-                ):
-                    skipped += 1
-                    errors.append(
-                        {
-                            "id": record.get("id"),
-                            "error": "inbox is full; newer messages were kept",
-                        }
-                    )
-                    continue
-                used[direction] = used.get(direction, 0) + 1
                 seen.add(key)
+                candidates.append((index, record, key))
+            if keep_existing:
+                by_direction: Dict[
+                    Any, List[Tuple[int, Dict[str, Any], Any]]
+                ] = {}
+                for candidate in candidates:
+                    by_direction.setdefault(
+                        candidate[1].get("direction"), []
+                    ).append(candidate)
+                survivors: List[Tuple[int, Dict[str, Any], Any]] = []
+                for direction, group in by_direction.items():
+                    free = direction_capacity(direction) - used.get(direction, 0)
+                    if free < 0:
+                        free = 0
+                    if len(group) > free:
+                        for index, record, _key in group[: len(group) - free]:
+                            skipped += 1
+                            errors_by_index[index] = {
+                                "id": record.get("id"),
+                                "error": "inbox is full; newer messages were kept",
+                            }
+                        group = group[len(group) - free :]
+                    survivors.extend(group)
+                candidates = sorted(survivors, key=lambda item: item[0])
+            for _index, record, _key in candidates:
+                direction = record.get("direction")
+                used[direction] = used.get(direction, 0) + 1
                 self._messages.append(record)
                 added.append(record)
                 imported += 1
+            errors = [errors_by_index[i] for i in sorted(errors_by_index)]
             self._messages = _retain(self._messages)
             _number_sequence(self._messages)
             if not self._save():
