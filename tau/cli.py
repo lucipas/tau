@@ -143,6 +143,7 @@ from .dm_requests import (
 )
 from .devices import (
     DEFAULT_PAIRING_TTL_SECONDS,
+    MAX_PAIRING_BUNDLE_BYTES,
     MAX_PAIRING_TTL_SECONDS,
     DeviceRegistry,
     DevicesError,
@@ -13795,11 +13796,19 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
             f"pairing bundle already exists at {target}; pass --force to overwrite it"
         )
     bundle = build_pairing_bundle(identity, ttl_seconds=float(args.ttl))
-    atomic_write_json(target, bundle, mode=0o600)
+    # Record the offer before publishing the file: if the registry is
+    # unreadable or cannot be saved, the command fails without leaving
+    # a redeemable bundle that `tau devices list` cannot show.
     registry = DeviceRegistry(config.devices_path)
     registry.record_issued(
-        bundle["token"], bundle["created_at"], bundle["expires_at"]
+        bundle["token"],
+        bundle["created_at"],
+        bundle["expires_at"],
+        primary=bundle["primary"],
     )
+    # restrict_parent=False: the bundle may go into a caller-chosen
+    # folder whose permissions must not change.  The file itself is 0600.
+    atomic_write_json(target, bundle, mode=0o600, restrict_parent=False)
     expires = datetime.fromtimestamp(bundle["expires_at"]).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -13834,6 +13843,12 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
     if _same_path(source, config.identity_path):
         raise NodeError(f"{source} is already this node's identity file")
     try:
+        size = source.stat().st_size
+    except OSError as exc:
+        raise NodeError(f"could not read pairing bundle: {exc}") from exc
+    if size > MAX_PAIRING_BUNDLE_BYTES:
+        raise NodeError("pairing bundle is too large to be valid")
+    try:
         raw = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise NodeError(f"not a valid pairing bundle: {exc}") from exc
@@ -13864,16 +13879,18 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
-            save_identity(identity, config.identity_path)
+            # Record the redeemed token BEFORE installing the identity:
+            # if recording fails the old identity stays in place, and an
+            # installed identity always has its single-use marker.
             try:
-                registry.record_redeemed(bundle["token"], bundle["primary"])
+                registry.record_redeemed(
+                    bundle["token"], bundle["primary"], bundle["expires_at"]
+                )
             except OSError as exc:
-                # The identity is already installed; the pairing
-                # record is bookkeeping, so say so rather than
-                # reporting the redeem as failed.
                 raise NodeError(
-                    f"could not record pairing ({exc}); identity was installed"
+                    f"could not record pairing ({exc}); identity not replaced"
                 ) from exc
+            save_identity(identity, config.identity_path)
     finally:
         lock.release()
     payload = {
@@ -13903,13 +13920,23 @@ def cmd_devices_list(args: argparse.Namespace) -> int:
     config = _make_config(args)
     identity = load_identity(config.identity_path)
     registry = DeviceRegistry(config.devices_path)
-    offers = registry.issued_offers()
+    destination = (
+        destination_hash(identity).hex() if identity is not None else None
+    )
+    # Registry records belong to the identity they were made under.  If
+    # `tau id import --force` replaced it, hide the old records rather
+    # than attribute them to the new identity.
+    offers = [
+        entry
+        for entry in registry.issued_offers()
+        if destination is not None and entry.get("primary") == destination
+    ]
     paired_from = registry.paired_from
+    if paired_from is not None and paired_from["primary"] != destination:
+        paired_from = None
     payload = {
         "identity": identity.hexhash if identity is not None else None,
-        "destination": (
-            destination_hash(identity).hex() if identity is not None else None
-        ),
+        "destination": destination,
         "paired_from": paired_from,
         "issued_offers": offers,
     }

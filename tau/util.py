@@ -77,9 +77,16 @@ def atomic_write_text(
     )
 
 
-def atomic_write_json(path: PathLike, obj: Any, mode: Optional[int] = None) -> Path:
+def atomic_write_json(
+    path: PathLike,
+    obj: Any,
+    mode: Optional[int] = None,
+    restrict_parent: bool = True,
+) -> Path:
     payload = json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False)
-    return atomic_write_text(path, payload + "\n", mode=mode)
+    return atomic_write_text(
+        path, payload + "\n", mode=mode, restrict_parent=restrict_parent
+    )
 
 
 def read_json(path: PathLike, default: Any = None) -> Any:
