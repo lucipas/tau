@@ -4093,6 +4093,7 @@ def test_id_import_registry_save_failure_aborts_replacement(
     assert code == 1
     assert "identity not replaced" in capsys.readouterr().err
     assert _id_destination(node_a, capsys) == destination_a
+    assert PeerRegistry(config_a.peers_path).get("bob").is_verified
 
 
 def test_id_import_registry_reset_failure_restores_identity(
@@ -4135,7 +4136,6 @@ def test_id_import_registry_reset_failure_restores_identity(
     assert code != 0
     assert _id_destination(node_a, capsys) == destination_a
     assert destination_a != destination_b
-    assert PeerRegistry(config_a.peers_path).get("bob").is_verified
 
 
 def test_parser_messages_arguments():
