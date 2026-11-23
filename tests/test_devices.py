@@ -478,6 +478,68 @@ def test_devices_pair_corrupt_reload_keeps_previous_bundle(
     )
 
 
+def test_devices_pair_interrupt_during_replace_removes_staging(
+    tmp_path, capsys, monkeypatch
+):
+    # An interrupt during the final os.replace must clean up the
+    # staged bundle like any other failure there: the window is one
+    # syscall, but a KeyboardInterrupt bypasses an OSError-only
+    # handler and leaves the private identity in a hidden staging
+    # file (see #724).  The previous bundle stays byte-identical
+    # and redeemable.  The patch raises only for the final replace
+    # (destination is the bundle target): the registry's own atomic
+    # write inside record_issued() also uses os.replace, and an
+    # interrupt there is already covered by the recording cleanup.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    original = bundle_path.read_bytes()
+    capsys.readouterr()
+
+    real_replace = os.replace
+
+    def _interrupted_replace(src, dst):
+        if os.fspath(dst) == str(bundle_path):
+            raise KeyboardInterrupt("interrupted during replace (test)")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _interrupted_replace)
+    code = cli.main(
+        [
+            "devices",
+            "pair",
+            "--to",
+            str(bundle_path),
+            "--data-dir",
+            str(node_a),
+            "--force",
+        ]
+    )
+    assert code == cli._EXIT_INTERRUPTED
+    assert bundle_path.read_bytes() == original
+    assert list(tmp_path.glob(".pairing.json.*.tmp")) == []
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(tmp_path / "b"),
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+
 def test_devices_pair_without_identity_returns_error(tmp_path, capsys):
     code = cli.main(
         [

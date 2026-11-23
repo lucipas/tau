@@ -13982,11 +13982,13 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
         raise
     try:
         os.replace(staging, target)
-    except OSError:
+    except BaseException:
         # The offer is recorded but the new bundle never landed: the
         # old bundle is still at the target and still redeemable, so
         # drop the staged file and report the failure rather than
-        # leaving a second copy behind.
+        # leaving a second copy behind.  BaseException, not OSError:
+        # an interrupt during the one-syscall replace must clean up
+        # the staged private identity too (see #724).
         staging.unlink(missing_ok=True)
         raise
     expires = datetime.fromtimestamp(bundle["expires_at"]).strftime(
