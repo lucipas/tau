@@ -14107,6 +14107,14 @@ def _recover_stranded_pairing(
     paired = registry.paired_from
     if paired is not None and paired.get("token") == entry["token"]:
         return False
+    # A different-token pairing completed at or after this redemption
+    # belongs to a later successful redeem, not the stranded one: the
+    # pending reset must not erase it or its issued offers.
+    paired_at = paired.get("paired_at") if paired is not None else None
+    redeemed_at = entry.get("redeemed_at")
+    if paired_at is not None and redeemed_at is not None:
+        if float(paired_at) >= float(redeemed_at):
+            return False
     # The identity-change reset is complete only when the redeem that
     # needed it has cleared its pending marker (the reset clears it
     # atomically).  If the reset already ran, offers issued since must
