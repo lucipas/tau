@@ -321,6 +321,9 @@ class DeviceRegistry:
                     "expires_at": _clean_time(
                         entry.get("expires_at"), "expires_at"
                     ),
+                    # Records written before the pending marker existed
+                    # count as completed, so they are never replayed.
+                    "paired": entry.get("paired") is not False,
                 }
             )
         return cleaned
@@ -388,6 +391,14 @@ class DeviceRegistry:
     def is_redeemed(self, token: str) -> bool:
         return any(entry["token"] == token.lower() for entry in self._redeemed)
 
+    def redeemed_entry(self, token: str) -> Optional[Dict[str, Any]]:
+        """Return a copy of the redeemed-token record for *token*, if any."""
+        wanted = token.lower()
+        for entry in self._redeemed:
+            if entry["token"] == wanted:
+                return dict(entry)
+        return None
+
     def issued_offers(self, *, now: Optional[float] = None) -> List[Dict[str, Any]]:
         """Offers this node minted that have not expired yet."""
         moment = time.time() if now is None else float(now)
@@ -446,6 +457,10 @@ class DeviceRegistry:
                     "primary": _clean_hex(primary, "primary"),
                     "redeemed_at": moment,
                     "expires_at": float(expires_at),
+                    # Pending until the pairing is recorded after the
+                    # identity install; a retry may complete only a
+                    # pending record (see #718).
+                    "paired": False,
                 }
             )
 
@@ -494,4 +509,5 @@ class DeviceRegistry:
             self._redeemed = [
                 entry for entry in self._redeemed if entry["expires_at"] > moment
             ]
+            self._paired_from = None
             self._paired_from = None

@@ -14078,13 +14078,25 @@ def _recover_stranded_pairing(
     """
     try:
         installed = load_identity(config.identity_path)
-    except Exception:
-        return False
+    except (OSError, IdentityError) as exc:
+        raise NodeError(
+            f"could not inspect the installed identity at {config.identity_path} "
+            f"to recover the pairing ({exc})"
+        ) from exc
     if installed is None:
         return False
     if installed.get_public_key() != identity.get_public_key():
         return False
     if registry.paired_from is not None:
+        return False
+    # Only a token whose pairing record is still pending qualifies.  A
+    # completed pairing stays completed even if an identity swap has
+    # since cleared the pairing record, so it cannot be replayed.
+    entry = registry.redeemed_entry(bundle["token"])
+    if entry is None or entry.get("paired", True):
+        return False
+    # The token must have been redeemed for this bundle's primary.
+    if entry["primary"] != str(bundle["primary"]).lower():
         return False
     try:
         registry.record_paired_from(bundle["token"], bundle["primary"])
