@@ -1265,6 +1265,84 @@ def test_devices_redeem_failed_reset_restores_identity_symlink(
     assert _destination(node_b, capsys) == _destination(node_a, capsys)
 
 
+def test_devices_redeem_failed_reset_keeps_symlink_target_at_staging_path(
+    tmp_path, capsys, monkeypatch
+):
+    # The rollback stages the restored link beside the identity: when
+    # the old symlink itself points at ``identity.restore-tmp``, that
+    # path is the live identity's target, not scratch space — a failed
+    # reset must restore the link without deleting the target file.
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    destination_b = _destination(node_b, capsys)
+    # Bob's identity lives in the file the old fixed staging name
+    # would have pointed at.
+    target = node_b / "identity.restore-tmp"
+    identity_path = node_b / "identity"
+    target.write_bytes(identity_path.read_bytes())
+    original = target.read_bytes()
+    identity_path.unlink()
+    identity_path.symlink_to(target)
+    assert _destination(node_b, capsys) == destination_b
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    original_reset = DeviceRegistry.reset
+    calls = {"n": 0}
+
+    def _fail_first_reset(self, *, now=None, keep_offers_owned_by=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise DevicesError("disk full")
+        return original_reset(self, now=now, keep_offers_owned_by=keep_offers_owned_by)
+
+    monkeypatch.setattr(DeviceRegistry, "reset", _fail_first_reset)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "disk full" in capsys.readouterr().err
+    # The rollback restored the symlink itself, and the target file
+    # the link points at still holds Bob's identity bytes.
+    assert identity_path.is_symlink()
+    assert os.readlink(identity_path) == str(target)
+    assert target.read_bytes() == original
+    assert _destination(node_b, capsys) == destination_b
+    # The failed attempt left no redeemed-token record behind: the
+    # same bundle redeems cleanly on retry.
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--force",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert _destination(node_b, capsys) == _destination(node_a, capsys)
+
+
 def test_devices_redeem_failed_reset_restores_dangling_identity_symlink(
     tmp_path, capsys, monkeypatch
 ):

@@ -13834,12 +13834,35 @@ def _install_identity_and_reset(
                 # identity, then atomically swap it in, so the identity
                 # path is never absent (an interruption must not make
                 # startup think the identity is missing).
-                tmp_link = config.identity_path.with_name(
-                    config.identity_path.name + ".restore-tmp"
-                )
-                if os.path.lexists(tmp_link):
-                    tmp_link.unlink()
-                os.symlink(link_target, tmp_link)
+                # The staging name is unique and created exclusively
+                # (mkstemp): never unlink a pre-existing entry at a
+                # fixed staging path — that entry could be the old
+                # symlink's own target (when the identity points at
+                # ``identity.restore-tmp``) or an unrelated file, and
+                # deleting it would destroy the identity bytes the
+                # rollback is restoring a link to.  Only a staging
+                # link this attempt created is ever cleaned up.
+                tmp_link = None
+                for _attempt in range(100):
+                    fd, staging_name = tempfile.mkstemp(
+                        dir=str(config.identity_path.parent),
+                        prefix=f".{config.identity_path.name}.restore-",
+                        suffix=".tmp",
+                    )
+                    os.close(fd)
+                    candidate = Path(staging_name)
+                    candidate.unlink()
+                    try:
+                        os.symlink(link_target, candidate)
+                    except FileExistsError:
+                        continue
+                    tmp_link = candidate
+                    break
+                if tmp_link is None:
+                    raise OSError(
+                        "could not allocate a staging path to restore "
+                        f"the identity symlink at {config.identity_path}"
+                    )
                 try:
                     os.replace(tmp_link, config.identity_path)
                 except OSError:
