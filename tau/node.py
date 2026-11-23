@@ -5947,6 +5947,7 @@ class TauNode:
         edited_at: Optional[float],
         timeout: Optional[float] = None,
         block_retract_id: Optional[str] = None,
+        discard_sent: bool = False,
     ) -> bool:
         """Remove the queued entry only if it still carries this version.
 
@@ -5955,6 +5956,10 @@ class TauNode:
         recipient has not seen yet.  Returns False when the entry is
         gone or a replacement landed; the caller leaves the replacement
         queued for a later round.
+
+        With ``discard_sent`` set, the leg's sent record is forgotten
+        in the same save as the removal, so a failed save leaves both
+        for a later attempt instead of stranding the record.
 
         With ``block_retract_id`` set, the leg is being dropped
         finally, not delivered: the cleanup-blocked marker for that
@@ -5973,7 +5978,9 @@ class TauNode:
                 self.mailbox._record_retract_cleanup_blocked_locked(
                     block_retract_id
                 )
-            return self.mailbox.remove_outbox(message_id)
+            return self.mailbox.remove_outbox(
+                message_id, discard_sent=discard_sent
+            )
 
     def _queued_group_recipient_removed(
         self, group_id: str, recipient_hexhash: str
@@ -7858,11 +7865,12 @@ class TauNode:
                         entry.id,
                     )
                     try:
-                        dropped = self._remove_queued_version(
+                        self._remove_queued_version(
                             entry.id,
                             text=fresh.text,
                             edited_at=fresh.edited_at,
                             timeout=_remaining(deadline),
+                            discard_sent=True,
                         )
                     except (TimeoutError, OSError):
                         log.debug(
@@ -7873,16 +7881,6 @@ class TauNode:
                             entry.id,
                         )
                         return False
-                    if dropped:
-                        try:
-                            self.mailbox.discard_sent(entry.id)
-                        except OSError:
-                            log.debug(
-                                "Could not forget the sent record for "
-                                "queued group message %s to a removed "
-                                "member",
-                                entry.id,
-                            )
                     return False
         send_text = fresh.text
         send_edited_at = fresh.edited_at

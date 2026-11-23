@@ -3336,6 +3336,36 @@ def test_deposit_refuses_sealed_copy_for_removed_member(tmp_path, monkeypatch):
     assert (carol.hexhash, REQUEST_MAIL_STORE) in calls
 
 
+def test_sweep_drop_for_removed_member_survives_failed_save(
+    tmp_path, monkeypatch
+):
+    # Qodo Informational on PR #708: the removal path deleted the leg
+    # before discarding its sent record, so a failure in that second
+    # step stranded the sent record with no leg left to retry — the
+    # undelivered post lingered in sent history. The leg and its sent
+    # record now leave in one save, so a failing discard step cannot
+    # strand the record: it is never a separate step.
+    node, group, own_hash, alice, bob, carol = _group_creator_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    entries = _queue_crew_post(node, group, alice, bob)
+    node.groups.update_members(
+        group["id"], [own_hash, alice.hexhash], created_by=own_hash
+    )
+
+    def failing_discard(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(node.mailbox, "discard_sent", failing_discard)
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is False
+    # Both are gone from disk: the single save removed the leg and its
+    # sent record together, and no stale record is left behind for a
+    # retry that can never come — the leg is already gone.
+    stored = json.loads(node.mailbox.path.read_text())
+    assert not any(e["id"] == "leg-bob" for e in stored["outbox"])
+    assert "leg-bob" not in stored["sent"]
+    assert [e["id"] for e in node.mailbox.sent_list()] == ["leg-alice"]
+
+
 def test_moderator_retract_cancels_legs_and_late_legs_still_drop(
     tmp_path, monkeypatch
 ):
