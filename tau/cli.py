@@ -13922,7 +13922,10 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
     expires.
     """
     config = _make_config(args)
-    config.prepare()
+    # Only the data directory (which holds the instance-lock file) is
+    # needed here; preparing the Reticulum config dir would touch
+    # unrelated state.
+    ensure_dir(config.data_dir)
     # Hold the instance lock across loading the identity, minting
     # and publishing the bundle, and recording the offer: without
     # it, a `tau id import --force` between the bundle creation and
