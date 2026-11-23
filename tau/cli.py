@@ -14071,10 +14071,10 @@ def _recover_stranded_pairing(
     Returns True when the token was redeemed for the identity now
     installed but no pairing is recorded yet, and the record has
     now been written.  Returns False for a plain replay: a different
-    identity is installed, or a pairing is already recorded (for
-    this bundle or a later one).  Raises NodeError when the record
-    still cannot be written, so the retry reports the failure
-    instead of silently leaving the status missing.
+    identity is installed, or a pairing is already recorded for
+    this bundle.  Raises NodeError when the record still cannot be
+    written, so the retry reports the failure instead of silently
+    leaving the status missing.
     """
     try:
         installed = load_identity(config.identity_path)
@@ -14087,8 +14087,6 @@ def _recover_stranded_pairing(
         return False
     if installed.get_public_key() != identity.get_public_key():
         return False
-    if registry.paired_from is not None:
-        return False
     # Only a token whose pairing record is still pending qualifies.  A
     # completed pairing stays completed even if an identity swap has
     # since cleared the pairing record, so it cannot be replayed.
@@ -14097,6 +14095,17 @@ def _recover_stranded_pairing(
         return False
     # The token must have been redeemed for this bundle's primary.
     if entry["primary"] != str(bundle["primary"]).lower():
+        return False
+    # A pairing recorded for THIS bundle means the pairing completed.
+    # Anything else predates this redemption: a failed reset plus a
+    # failed identity rollback can leave the previous identity's
+    # pairing recorded alongside the replacement identity (see #718),
+    # and the retry must be allowed to clear it via the pending
+    # reset below instead of being rejected as already redeemed.  A
+    # pairing recorded after the failed attempt is for a different
+    # identity, which the key check above already rejects.
+    paired = registry.paired_from
+    if paired is not None and paired.get("token") == entry["token"]:
         return False
     # The identity-change reset is complete only when the redeem that
     # needed it has cleared its pending marker (the reset clears it
