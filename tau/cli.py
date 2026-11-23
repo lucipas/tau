@@ -14298,6 +14298,11 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
                     # first attempt, so no verifications were
                     # cleared by this retry.
                     verifications_cleared = 0
+                elif _history_retry_allowed(config, registry, identity, bundle):
+                    # The pairing completed on an earlier attempt, so
+                    # only its history import needs retrying below.
+                    # The identity install and reset are not repeated.
+                    verifications_cleared = 0
                 else:
                     raise NodeError(
                         "pairing bundle was already redeemed on this node"
@@ -25186,6 +25191,11 @@ def _cmd_messages_sent(
                 state = f"read {_format_message_time(float(entry['read_at'] or 0))}"
             else:
                 state = entry["state"]
+            print(f"[{when}] to {name} — {state}")
+        for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+ state = entry["state"]
             print(f"[{when}] to {name} — {state}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
