@@ -844,6 +844,165 @@ def test_devices_redeem_retry_after_failed_identity_write(
     assert _destination(node_b, capsys) == _destination(node_a, capsys)
 
 
+def test_devices_redeem_snapshot_failure_keeps_bundle_retryable(
+    tmp_path, capsys, monkeypatch
+):
+    # The rollback snapshot is taken before the token is recorded:
+    # if the old identity cannot be read, the redeem fails while
+    # the bundle is still unredeemed, so it can be retried (see #716).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    destination_b = _destination(node_b, capsys)
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    real_snapshot = cli._snapshot_previous_identity
+    calls = {"n": 0}
+
+    def _flaky_snapshot(config):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("cannot read identity")
+        return real_snapshot(config)
+
+    monkeypatch.setattr(cli, "_snapshot_previous_identity", _flaky_snapshot)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "cannot read identity" in capsys.readouterr().err
+    assert _destination(node_b, capsys) == destination_b
+    # No token was recorded: the same bundle redeems on retry.
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--force",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert _destination(node_b, capsys) == _destination(node_a, capsys)
+
+
+def test_devices_redeem_failed_restore_keeps_token(
+    tmp_path, capsys, monkeypatch
+):
+    # Identity write succeeded, the pairing reset failed, and the
+    # rollback restore failed too: the replacement identity stays
+    # installed and the token must be kept — releasing it would let
+    # the same bundle be redeemed again (see #716).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    def _fail_reset(self, *, now=None):
+        raise OSError("disk full")
+
+    def _fail_restore(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli.DeviceRegistry, "reset", _fail_reset)
+    monkeypatch.setattr(cli, "atomic_write_bytes", _fail_restore)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "disk full" in capsys.readouterr().err
+    # The new identity stayed installed (the restore failed), so the
+    # bundle must still be refused as already redeemed.
+    assert _destination(node_b, capsys) == _destination(node_a, capsys)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+
+
+def test_devices_import_corrupt_registry_rolls_back_identity(
+    tmp_path, capsys, monkeypatch
+):
+    # A DevicesError from the post-install reset (corrupt registry
+    # on reload) must roll the identity back, not leave the
+    # replacement installed alongside the old pairing state (see #716).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "carol")
+    capsys.readouterr()
+    destination_a = _destination(node_a, capsys)
+    backup = tmp_path / "carol.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_b), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    def _fail_reset(self, *, now=None):
+        raise DevicesError("device registry corrupt")
+
+    monkeypatch.setattr(cli.DeviceRegistry, "reset", _fail_reset)
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_a),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "corrupt" in capsys.readouterr().err
+    assert _destination(node_a, capsys) == destination_a
+
+
 def test_devices_redeem_rejects_oversize_bundle_file(tmp_path, capsys):
     bundle_path = tmp_path / "pairing.json"
     bundle_path.write_bytes(b"x" * (MAX_PAIRING_BUNDLE_BYTES + 1))
