@@ -2666,17 +2666,3 @@ class Inbox:
     def __len__(self) -> int:
         with self._lock:
             return len(self._messages)
-ller
-                # would mirror nothing.
-                kept = {id(item) for item in self._messages}
-                inserted.extend(item for item in added if id(item) in kept)
-        return {
-            "imported": imported,
-            "present": present,
-            "skipped": skipped,
-            "errors": errors,
-        }
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._messages)
