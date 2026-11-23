@@ -81,6 +81,7 @@ def atomic_write_json(
     path: PathLike,
     obj: Any,
     mode: Optional[int] = None,
+    *,
     restrict_parent: bool = True,
 ) -> Path:
     payload = json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False)

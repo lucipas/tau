@@ -13700,6 +13700,9 @@ def cmd_id_import(args: argparse.Namespace) -> int:
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
+            _reset_devices_for_identity_change(
+                config, DeviceRegistry(config.devices_path), identity
+            )
             save_identity(identity, config.identity_path)
     finally:
         lock.release()
@@ -13767,6 +13770,35 @@ def _clear_verifications_for_identity_change(
     return cleared
 
 
+def _reset_devices_for_identity_change(
+    config: TauConfig, registry: DeviceRegistry, identity: Any
+) -> bool:
+    """Drop pairing records when a new identity replaces the old one.
+
+    Issued offers and redeemed tokens belong to the identity that was
+    installed when they were recorded: after an identity replacement
+    they would otherwise be reported as the new identity's pairing.
+    A restore of the same identity keeps them, and a node with no
+    identity yet has nothing to drop.  An unreadable old identity
+    counts as different — records of unknown provenance must not be
+    attributed to the replacement.  Returns True when the registry
+    was reset.
+    """
+    if not config.identity_path.exists():
+        return False
+    try:
+        old_identity = load_identity(config.identity_path)
+        old_key = (
+            old_identity.get_public_key() if old_identity is not None else None
+        )
+    except Exception:
+        old_key = None
+    if old_key is not None and old_key == identity.get_public_key():
+        return False
+    registry.reset()
+    return True
+
+
 def cmd_devices_pair(args: argparse.Namespace) -> int:
     """Mint a pairing bundle for a second device (slice 1 of #469, #713).
 
@@ -13796,19 +13828,23 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
             f"pairing bundle already exists at {target}; pass --force to overwrite it"
         )
     bundle = build_pairing_bundle(identity, ttl_seconds=float(args.ttl))
-    # Record the offer before publishing the file: if the registry is
-    # unreadable or cannot be saved, the command fails without leaving
-    # a redeemable bundle that `tau devices list` cannot show.
+    # Load the registry before publishing the bundle: a corrupt
+    # registry must fail the command while no file exists, not leave a
+    # redeemable bundle on disk that `tau devices list` cannot see.
     registry = DeviceRegistry(config.devices_path)
-    registry.record_issued(
-        bundle["token"],
-        bundle["created_at"],
-        bundle["expires_at"],
-        primary=bundle["primary"],
-    )
-    # restrict_parent=False: the bundle may go into a caller-chosen
-    # folder whose permissions must not change.  The file itself is 0600.
+    # The bundle goes into a caller-selected folder: never change that
+    # folder's permissions, only the bundle file itself is private —
+    # the same rule `tau id export` applies.
     atomic_write_json(target, bundle, mode=0o600, restrict_parent=False)
+    try:
+        registry.record_issued(
+            bundle["token"], bundle["created_at"], bundle["expires_at"]
+        )
+    except OSError:
+        # The command failed, so the bundle must not stay behind as
+        # an untracked redeemable offer.
+        target.unlink(missing_ok=True)
+        raise
     expires = datetime.fromtimestamp(bundle["expires_at"]).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -13845,9 +13881,12 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
     try:
         size = source.stat().st_size
     except OSError as exc:
-        raise NodeError(f"could not read pairing bundle: {exc}") from exc
+        raise NodeError(f"not a valid pairing bundle: {exc}") from exc
     if size > MAX_PAIRING_BUNDLE_BYTES:
-        raise NodeError("pairing bundle is too large to be valid")
+        raise NodeError(
+            f"pairing bundle is too large ({size} bytes, "
+            f"over {MAX_PAIRING_BUNDLE_BYTES})"
+        )
     try:
         raw = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -13879,18 +13918,28 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
-            # Record the redeemed token BEFORE installing the identity:
-            # if recording fails the old identity stays in place, and an
-            # installed identity always has its single-use marker.
-            try:
-                registry.record_redeemed(
-                    bundle["token"], bundle["primary"], bundle["expires_at"]
-                )
-            except OSError as exc:
-                raise NodeError(
-                    f"could not record pairing ({exc}); identity not replaced"
-                ) from exc
+            _reset_devices_for_identity_change(config, registry, identity)
+            # Record the token BEFORE installing the identity: if the
+            # record fails, the old identity stays in place and the
+            # bundle can be minted fresh — the reverse order would
+            # leave an installed identity with no redeemed-token
+            # record, so a later --force redeem would accept the same
+            # bundle again (see #714).  The pairing itself is only
+            # recorded after the install succeeds, so a failed install
+            # never claims a pairing that did not happen.
+            registry.record_redeemed(
+                bundle["token"], bundle["primary"], bundle["expires_at"]
+            )
             save_identity(identity, config.identity_path)
+            try:
+                registry.record_paired_from(bundle["token"], bundle["primary"])
+            except OSError as exc:
+                # The identity is already installed; the pairing
+                # record is bookkeeping, so say so rather than
+                # reporting the redeem as failed.
+                raise NodeError(
+                    f"could not record pairing ({exc}); identity was installed"
+                ) from exc
     finally:
         lock.release()
     payload = {
@@ -13920,23 +13969,13 @@ def cmd_devices_list(args: argparse.Namespace) -> int:
     config = _make_config(args)
     identity = load_identity(config.identity_path)
     registry = DeviceRegistry(config.devices_path)
-    destination = (
-        destination_hash(identity).hex() if identity is not None else None
-    )
-    # Registry records belong to the identity they were made under.  If
-    # `tau id import --force` replaced it, hide the old records rather
-    # than attribute them to the new identity.
-    offers = [
-        entry
-        for entry in registry.issued_offers()
-        if destination is not None and entry.get("primary") == destination
-    ]
+    offers = registry.issued_offers()
     paired_from = registry.paired_from
-    if paired_from is not None and paired_from["primary"] != destination:
-        paired_from = None
     payload = {
         "identity": identity.hexhash if identity is not None else None,
-        "destination": destination,
+        "destination": (
+            destination_hash(identity).hex() if identity is not None else None
+        ),
         "paired_from": paired_from,
         "issued_offers": offers,
     }

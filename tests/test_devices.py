@@ -12,6 +12,7 @@ import RNS
 from tau import cli
 from tau.devices import (
     DEFAULT_PAIRING_TTL_SECONDS,
+    MAX_PAIRING_BUNDLE_BYTES,
     MAX_PAIRING_TTL_SECONDS,
     DeviceRegistry,
     DevicesError,
@@ -120,6 +121,17 @@ def test_pairing_bundle_malformed_rejected():
         verify_pairing_bundle(unsigned, now=1100.0)
 
 
+def test_pairing_bundle_oversize_identity_rejected():
+    # A hostile bundle must be refused before its identity field is
+    # decoded or written to a temporary file (see #714).
+    identity = _identity()
+    bundle = build_pairing_bundle(identity, now=1000.0)
+    with pytest.raises(DevicesError, match="too large"):
+        verify_pairing_bundle(
+            _tampered(bundle, "identity", "A" * 70000), now=1100.0
+        )
+
+
 def test_registry_records_issued_and_redeemed(tmp_path):
     path = tmp_path / "devices.json"
     registry = DeviceRegistry(path)
@@ -129,8 +141,12 @@ def test_registry_records_issued_and_redeemed(tmp_path):
     offers = registry.issued_offers(now=1100.0)
     assert len(offers) == 1 and offers[0]["token"] == "a" * 32
     assert not registry.is_redeemed("a" * 32)
-    registry.record_redeemed("a" * 32, "b" * 32, now=1200.0)
+    registry.record_redeemed("a" * 32, "b" * 32, 4600.0, now=1200.0)
     assert registry.is_redeemed("a" * 32)
+    # The token alone is not a pairing: the pairing is only recorded
+    # once the identity is installed.
+    assert registry.paired_from is None
+    registry.record_paired_from("a" * 32, "b" * 32, now=1200.0)
     assert registry.paired_from == {
         "primary": "b" * 32,
         "token": "a" * 32,
@@ -141,6 +157,49 @@ def test_registry_records_issued_and_redeemed(tmp_path):
     assert reloaded.is_redeemed("a" * 32)
     assert reloaded.paired_from == registry.paired_from
     assert len(reloaded.issued_offers(now=1100.0)) == 1
+
+
+def test_registry_prunes_only_expired_redeemed(tmp_path):
+    # 105 distinct bundles redeemed inside one validity window: the
+    # first must still be recorded — capping the list would let it
+    # pass the replay check again (see #714).
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    for index in range(105):
+        registry.record_redeemed(
+            f"{index:032x}", "b" * 32, 4600.0, now=1200.0
+        )
+    assert all(
+        registry.is_redeemed(f"{index:032x}") for index in range(105)
+    )
+    # Once the window ends the expired tokens are pruned.
+    registry.record_redeemed("c" * 32, "b" * 32, 9000.0, now=5000.0)
+    assert not registry.is_redeemed("0" * 32)
+    assert registry.is_redeemed("c" * 32)
+
+
+def test_registry_keeps_every_unexpired_offer(tmp_path):
+    # 33 offers minted while the earlier ones are still valid: the
+    # oldest must still be listed (see #714).
+    import time
+
+    now = time.time()
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    for index in range(33):
+        registry.record_issued(f"{index:032x}", now, now + 3600.0)
+    offers = registry.issued_offers(now=now + 60.0)
+    assert len(offers) == 33
+    assert offers[0]["token"] == "0" * 32
+
+
+def test_registry_reset_drops_pairing_records(tmp_path):
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.record_issued("a" * 32, 1000.0, 4600.0)
+    registry.record_redeemed("a" * 32, "b" * 32, 4600.0, now=1200.0)
+    registry.record_paired_from("a" * 32, "b" * 32, now=1200.0)
+    registry.reset()
+    assert registry.issued_offers(now=1100.0) == []
+    assert not registry.is_redeemed("a" * 32)
+    assert registry.paired_from is None
 
 
 def test_registry_prunes_expired_offers(tmp_path):
@@ -389,3 +448,225 @@ def test_devices_redeem_rejects_expired_bundle(tmp_path, capsys):
     )
     assert code == 1
     assert "expired" in capsys.readouterr().err
+
+
+def test_devices_pair_corrupt_registry_writes_no_bundle(tmp_path, capsys):
+    # A corrupt registry must fail the command before any bundle file
+    # exists — not leave a redeemable bundle `devices list` cannot
+    # see (see #714).
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    (node / "devices.json").write_text("{not json", encoding="utf-8")
+    bundle_path = tmp_path / "pairing.json"
+    code = cli.main(
+        ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node)]
+    )
+    assert code == 1
+    assert "corrupt" in capsys.readouterr().err
+    assert not bundle_path.exists()
+
+
+def test_devices_pair_preserves_parent_permissions(tmp_path, capsys):
+    # The bundle goes into a caller-selected folder: the folder keeps
+    # its permissions, only the bundle file itself is private — the
+    # same rule `tau id export` applies (see #714).
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o755)
+    bundle_path = shared / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node)]
+        )
+        == 0
+    )
+    assert stat.S_IMODE(os.stat(shared).st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(bundle_path).st_mode) == 0o600
+
+
+def test_devices_redeem_records_token_before_install(
+    tmp_path, capsys, monkeypatch
+):
+    # If recording the token fails, the old identity must stay in
+    # place: the reverse order would install an identity with no
+    # redeemed-token record (see #714).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    destination_b = _destination(node_b, capsys)
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    def _failing_record(self, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(DeviceRegistry, "record_redeemed", _failing_record)
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "disk full" in capsys.readouterr().err
+    assert _destination(node_b, capsys) == destination_b
+
+
+def test_devices_list_after_identity_replace_resets_records(tmp_path, capsys):
+    # Pairing records belong to the installed identity: replacing it
+    # with an unrelated one must not leave the old pairing listed
+    # under the new identity (see #714).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["devices", "list", "--data-dir", str(node_a)]) == 0
+    assert "pairing offers issued: 1" in capsys.readouterr().out
+
+    backup = tmp_path / "bob.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_b), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "id",
+                "import",
+                "--from",
+                str(backup),
+                "--data-dir",
+                str(node_a),
+                "--force",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["devices", "list", "--data-dir", str(node_a)]) == 0
+    out = capsys.readouterr().out
+    assert "no pairing offers issued" in out
+    assert "paired from:" not in out
+
+
+def test_devices_redeem_force_resets_previous_records(tmp_path, capsys):
+    # A forced redeem that swaps the identity drops the old node's
+    # issued offers, then records the new pairing (see #714).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    capsys.readouterr()
+    bundle_a = tmp_path / "pairing-a.json"
+    bundle_b = tmp_path / "pairing-b.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_a), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_b), "--data-dir", str(node_b)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_b),
+                "--data-dir",
+                str(node_a),
+                "--force",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["paired_from"] == _destination(node_b, capsys)
+    assert cli.main(["devices", "list", "--data-dir", str(node_a)]) == 0
+    out = capsys.readouterr().out
+    assert "no pairing offers issued" in out
+    assert "paired from:" in out
+
+
+def test_devices_redeem_rejects_oversize_bundle_file(tmp_path, capsys):
+    bundle_path = tmp_path / "pairing.json"
+    bundle_path.write_bytes(b"x" * (MAX_PAIRING_BUNDLE_BYTES + 1))
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(tmp_path / "b"),
+        ]
+    )
+    assert code == 1
+    assert "too large" in capsys.readouterr().err
+
+
+def test_backup_preserves_device_registry(tmp_path, capsys):
+    # A restore must keep the redeemed-token record: otherwise an
+    # unexpired, previously redeemed bundle would pass the replay
+    # check on the restored node (see #714).
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(
+            ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_b)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    node_c = tmp_path / "c"
+    assert (
+        cli.main(["restore", str(archive), "--data-dir", str(node_c), "--json"]) == 0
+    )
+    capsys.readouterr()
+    assert (node_c / "devices.json").is_file()
+    code = cli.main(
+        ["devices", "redeem", "--from", str(bundle_path), "--data-dir", str(node_c)]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err

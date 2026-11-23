@@ -57,12 +57,15 @@ PAIRING_BUNDLE_TYPE = "tau-pairing"
 PAIRING_BUNDLE_VERSION = 1
 DEFAULT_PAIRING_TTL_SECONDS = 3600
 MAX_PAIRING_TTL_SECONDS = 86400
+# A serialized identity is a few kilobytes; anything near this bound
+# is a malformed or hostile bundle, rejected before it is decoded or
+# written to a temporary file (see #714).
+MAX_PAIRING_IDENTITY_B64_LENGTH = 65536
+# A pairing bundle file is a few kilobytes of JSON; a larger file is
+# not a bundle, and reading it unbounded would let a hostile file
+# exhaust memory before verification (see #714).
+MAX_PAIRING_BUNDLE_BYTES = 1024 * 1024
 DEVICES_FILE_MODE = 0o600
-MAX_ISSUED_OFFERS = 32
-# Bounds on untrusted bundle input, checked before decoding or writing
-# anything to disk.  A real identity is a few hundred base64 characters.
-MAX_PAIRING_BUNDLE_BYTES = 64 * 1024
-MAX_PAIRING_IDENTITY_CHARS = 4096
 
 
 class DevicesError(ValueError):
@@ -200,7 +203,7 @@ def verify_pairing_bundle(
     identity_text = raw.get("identity")
     if not isinstance(identity_text, str) or not identity_text:
         raise DevicesError("pairing bundle has no identity")
-    if len(identity_text) > MAX_PAIRING_IDENTITY_CHARS:
+    if len(identity_text) > MAX_PAIRING_IDENTITY_B64_LENGTH:
         raise DevicesError("pairing bundle identity is too large")
     try:
         identity_bytes = base64.b64decode(identity_text, validate=True)
@@ -289,17 +292,11 @@ class DeviceRegistry:
         for entry in raw:
             if not isinstance(entry, dict):
                 raise DevicesError("device registry issued offer must be an object")
-            primary = entry.get("primary")
             cleaned.append(
                 {
                     "token": _clean_hex(entry.get("token"), "token"),
                     "created_at": _clean_time(entry.get("created_at"), "created_at"),
                     "expires_at": _clean_time(entry.get("expires_at"), "expires_at"),
-                    # The destination of the identity that minted the
-                    # offer; None for records written before it was kept.
-                    "primary": (
-                        _clean_hex(primary, "primary") if primary is not None else None
-                    ),
                 }
             )
         return cleaned
@@ -314,19 +311,15 @@ class DeviceRegistry:
         for entry in raw:
             if not isinstance(entry, dict):
                 raise DevicesError("device registry redeemed token must be an object")
-            redeemed_at = _clean_time(entry.get("redeemed_at"), "redeemed_at")
-            expires_at = entry.get("expires_at")
             cleaned.append(
                 {
                     "token": _clean_hex(entry.get("token"), "token"),
                     "primary": _clean_hex(entry.get("primary"), "primary"),
-                    "redeemed_at": redeemed_at,
-                    # Records without an expiry are kept for the longest
-                    # possible bundle lifetime, so they are never pruned early.
-                    "expires_at": (
-                        _clean_time(expires_at, "expires_at")
-                        if expires_at is not None
-                        else redeemed_at + MAX_PAIRING_TTL_SECONDS
+                    "redeemed_at": _clean_time(
+                        entry.get("redeemed_at"), "redeemed_at"
+                    ),
+                    "expires_at": _clean_time(
+                        entry.get("expires_at"), "expires_at"
                     ),
                 }
             )
@@ -405,16 +398,15 @@ class DeviceRegistry:
         return dict(self._paired_from) if self._paired_from is not None else None
 
     def record_issued(
-        self,
-        token: str,
-        created_at: float,
-        expires_at: float,
-        primary: Optional[str] = None,
+        self, token: str, created_at: float, expires_at: float
     ) -> None:
         """Remember an offer this node minted; expired ones are pruned.
 
-        *primary* is the destination of the identity that minted the
-        offer, so listing can hide offers from a replaced identity.
+        Every unexpired offer is kept, however many there are: capping
+        the list would silently drop a still-redeemable offer from
+        ``tau devices list`` (see #714).  Offers are rare human
+        actions and each record is a few dozen bytes, so the list
+        cannot grow without bound in practice.
         """
         with self._transaction():
             moment = time.time()
@@ -426,33 +418,24 @@ class DeviceRegistry:
                     "token": _clean_hex(token, "token"),
                     "created_at": float(created_at),
                     "expires_at": float(expires_at),
-                    "primary": _clean_hex(primary, "primary") if primary else None,
                 }
             )
-            self._issued = self._issued[-MAX_ISSUED_OFFERS:]
 
     def record_redeemed(
-        self,
-        token: str,
-        primary: str,
-        expires_at: Optional[float] = None,
-        *,
-        now: Optional[float] = None,
+        self, token: str, primary: str, expires_at: float, *, now: Optional[float] = None
     ) -> None:
-        """Remember a redeemed token and the pairing it created.
+        """Remember a redeemed token, so the bundle cannot be reused.
 
-        A redeemed token is kept until its bundle expires, so it stays
-        single-use for its whole validity window.  Only expired records
-        are pruned; there is no count cap that could evict a live token.
+        Only expired tokens are pruned: the token's own expiry bounds
+        the record's life, so a token redeemed inside its validity
+        window stays recorded until that window ends — capping the
+        list would let an early bundle pass the replay check again
+        (see #714).  This records the token only; the pairing itself
+        is recorded separately by :meth:`record_paired_from` after
+        the identity is installed, so a failed install never claims
+        a pairing that did not happen.
         """
         moment = time.time() if now is None else float(now)
-        # Without an explicit expiry, keep the record for the longest
-        # possible bundle lifetime.
-        expiry = (
-            float(expires_at)
-            if expires_at is not None
-            else moment + MAX_PAIRING_TTL_SECONDS
-        )
         with self._transaction():
             self._redeemed = [
                 entry for entry in self._redeemed if entry["expires_at"] > moment
@@ -462,11 +445,31 @@ class DeviceRegistry:
                     "token": _clean_hex(token, "token"),
                     "primary": _clean_hex(primary, "primary"),
                     "redeemed_at": moment,
-                    "expires_at": expiry,
+                    "expires_at": float(expires_at),
                 }
             )
+
+    def record_paired_from(
+        self, token: str, primary: str, *, now: Optional[float] = None
+    ) -> None:
+        """Remember that this node paired from *primary* with *token*."""
+        moment = time.time() if now is None else float(now)
+        with self._transaction():
             self._paired_from = {
                 "primary": _clean_hex(primary, "primary"),
                 "token": _clean_hex(token, "token"),
                 "paired_at": moment,
             }
+
+    def reset(self) -> None:
+        """Drop every pairing record: the installed identity changed.
+
+        Issued offers and redeemed tokens belong to the identity that
+        was installed when they were recorded.  After an identity
+        replacement they would otherwise be reported as the new
+        identity's pairing, so a swap resets the registry (see #714).
+        """
+        with self._transaction():
+            self._issued = []
+            self._redeemed = []
+            self._paired_from = None

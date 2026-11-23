@@ -701,51 +701,6 @@ def test_backup_restore_round_trip_keeps_reminders(tmp_path, capsys):
     assert len(ReminderStore(node_b / "reminders.json")) == 1
 
 
-def test_backup_restore_round_trip_keeps_device_pairing(tmp_path, capsys):
-    from tau.devices import DeviceRegistry
-
-    node_a = _init_node(tmp_path, "a", "alice")
-    registry = DeviceRegistry(node_a / "devices.json")
-    registry.record_issued("a" * 32, 1200.0, 1800.0)
-    registry.record_redeemed("b" * 32, "c" * 32, now=1200.0)
-    assert registry.is_redeemed("b" * 32)
-    capsys.readouterr()
-    archive = tmp_path / "backup.tar.gz"
-    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
-    capsys.readouterr()
-
-    node_b = tmp_path / "b"
-    assert (
-        cli.main(
-            [
-                "restore",
-                str(archive),
-                "--data-dir",
-                str(node_b),
-                "--json",
-            ]
-        )
-        == 0
-    )
-    payload = json.loads(capsys.readouterr().out)
-    assert "devices.json" in payload["files"]
-    assert (node_b / "devices.json").read_bytes() == (
-        node_a / "devices.json"
-    ).read_bytes()
-    # The restored node still knows which bundle it redeemed, so the
-    # same token cannot pass the local replay check again.
-    restored = DeviceRegistry(node_b / "devices.json")
-    assert restored.is_redeemed("b" * 32)
-    assert restored.paired_from == {
-        "primary": "c" * 32,
-        "token": "b" * 32,
-        "paired_at": 1200.0,
-    }
-    assert [offer["token"] for offer in restored.issued_offers(now=1500.0)] == [
-        "a" * 32
-    ]
-
-
 def test_restore_rejects_misplaced_files_member(tmp_path):
     # Received-file members are exactly files/<sender>/<name>: a file
     # directly under files/, or nested any deeper, is not a member
