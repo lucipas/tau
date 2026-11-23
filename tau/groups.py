@@ -1977,21 +1977,27 @@ class GroupStore:
             # both earlier lookups missed.  The walk is bounded by
             # the retired store, and a visited set stops a cycle (a
             # rename back to an earlier name can re-link an id).
+            # The predecessor index is built once per lookup: live
+            # records first, so a live successor wins a tie, and
+            # only same-creator records — rescanning both lists at
+            # every step made a lookup near the 150-record
+            # retirement limit examine tens of thousands of
+            # candidates while the store lock is held (Qodo Warning
+            # on PR #712).
+            by_predecessor: Dict[str, Dict[str, Any]] = {}
+            for candidate in list(self._groups.values()) + list(
+                self._retired_groups.values()
+            ):
+                if (candidate.get("creator") or "") != creator:
+                    continue
+                for entry in candidate.get("renamed_from") or []:
+                    key = str(entry).lower()
+                    if key not in by_predecessor:
+                        by_predecessor[key] = candidate
             seen = {wanted}
             current = wanted
             while True:
-                nxt = None
-                for candidate in list(self._groups.values()) + list(
-                    self._retired_groups.values()
-                ):
-                    if (candidate.get("creator") or "") != creator:
-                        continue
-                    if current in [
-                        str(entry).lower()
-                        for entry in (candidate.get("renamed_from") or [])
-                    ]:
-                        nxt = candidate
-                        break
+                nxt = by_predecessor.get(current)
                 if nxt is None:
                     break
                 nxt_id = str(nxt["id"]).lower()
