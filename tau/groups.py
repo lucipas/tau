@@ -1864,6 +1864,59 @@ class GroupStore:
                 ids.append(pred["id"] if pred is not None else str(pred_id).lower())
             return ids
 
+    def successor(self, group_id: str) -> Optional[Dict[str, Any]]:
+        """The live group continuing *group_id*, or ``None``.
+
+        The id itself when it is still live; otherwise the live group
+        whose rename lineage names it, falling back to the retired
+        record's creator and creation time.  A lineage candidate only
+        counts when its creator matches the id's own creator — from
+        the retired record, or the creator evidence kept when it was
+        retired — so a member's unrelated group cannot claim this id
+        as its predecessor and hijack the lookup.  Reloads from disk
+        first, so a roster change in another process is seen.
+        ``None`` means no live successor is known: the group may have
+        been deleted, or its successor never learned — callers must
+        fail open on it, never treat it as a removal.  Two tails
+        stay open: a rename changes the name, so the fallback matches
+        on creator and creation time only (both are carried into every
+        successor), and a retired record evicted after many roster
+        changes leaves only the lineage scan, whose creator evidence
+        survives eviction.
+        """
+        with self._transaction():
+            wanted = str(group_id).lower()
+            live = self._groups.get(wanted)
+            if live is not None:
+                return dict(live)
+            retired = self._retired_groups.get(wanted)
+            creator = ""
+            if retired is not None:
+                creator = retired.get("creator") or ""
+            if not creator:
+                creator = self._lineage_creators.get(wanted) or ""
+            if not creator:
+                # No surviving evidence of who this id belonged to:
+                # no candidate can be verified, so the lookup misses
+                # rather than trusting a lineage claim.
+                return None
+            for candidate in self._groups.values():
+                if wanted in [
+                    str(entry).lower()
+                    for entry in (candidate.get("renamed_from") or [])
+                ]:
+                    if (candidate.get("creator") or "") == creator:
+                        return dict(candidate)
+            if retired is not None:
+                for candidate in self._groups.values():
+                    if (
+                        candidate.get("creator") == retired.get("creator")
+                        and candidate.get("created_at")
+                        == retired.get("created_at")
+                    ):
+                        return dict(candidate)
+            return None
+
     def find(self, query: str) -> Optional[Dict[str, Any]]:
         """Resolve a group by id, id prefix, or exact name.
 

@@ -650,6 +650,89 @@ def test_group_store_update_members_names_roster_predecessor(tmp_path):
     assert shrunk["renamed_from"] == [grown["id"]]
 
 
+def test_group_store_successor_finds_live_and_roster_successor(tmp_path):
+    # Issue #707: the sweep resolves a queued leg's group id to its
+    # live successor before deciding whether the recipient is still a
+    # member.  A live id is its own successor; a retired one resolves
+    # through the rename lineage to the latest roster.
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert store.successor(group["id"]) == group
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert store.successor(group["id"]) == grown
+    assert store.successor(grown["id"]) == grown
+    shrunk = store.update_members(
+        grown["id"], [OWN_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert store.successor(group["id"]) == shrunk
+    assert store.successor(grown["id"]) == shrunk
+    assert store.successor(generate_group_id()) is None
+
+
+def test_group_store_successor_falls_back_after_lineage_cap(tmp_path):
+    # Forty roster changes push the first id off the 32-entry lineage,
+    # but the retired record's name/creator/created-at — roster changes
+    # keep all three — still finds the live successor.
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH]
+    current = store.create("weekend", members, created_by=OWN_HASH)
+    first_id = current["id"]
+    for i in range(1, 41):
+        # A different third member each time: forty distinct rosters,
+        # so the lineage grows past its 32-entry cap.
+        extra = f"{i:02x}" * 16
+        current = store.update_members(
+            current["id"],
+            [OWN_HASH, OTHER_HASH, extra],
+            created_by=OWN_HASH,
+        )
+    assert first_id not in current["renamed_from"]
+    assert store.successor(first_id) == current
+
+
+def test_group_store_successor_falls_back_after_rename_lineage_cap(tmp_path):
+    # Forty renames push the first id off the 32-entry lineage and
+    # change the name, but creator + creation time — both carried into
+    # every successor — still find it. (Qodo Warning on PR #708: the
+    # name-based fallback could not resolve an id renamed past the cap.)
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    current = store.create("place-0", members, created_by=OWN_HASH)
+    first_id = current["id"]
+    for i in range(1, 41):
+        current = store.rename(current["id"], f"place-{i}", created_by=OWN_HASH)
+    assert first_id not in current["renamed_from"]
+    assert current["name"] == "place-40"
+    assert store.successor(first_id) == current
+
+
+def test_group_store_successor_ignores_foreign_lineage_claim(tmp_path):
+    # Qodo Critical on PR #708: successor() accepted the first live
+    # group naming the id in renamed_from without checking the
+    # creator, so a member's unrelated group could claim the
+    # predecessor and hijack the lookup. Only a same-creator
+    # candidate counts: the foreign group is planted before the
+    # genuine successor, so it is encountered first in the scan.
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    foreign = store.record(
+        derive_group_id(STRANGER_HASH, "other", [STRANGER_HASH, THIRD_HASH]),
+        "other",
+        [STRANGER_HASH, THIRD_HASH],
+        creator=STRANGER_HASH,
+        sender=STRANGER_HASH,
+        renamed_from=[group["id"]],
+    )
+    assert foreign is not None
+    assert foreign["renamed_from"] == [group["id"]]
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert store.successor(group["id"]) == grown
+
+
 def test_group_store_set_topic(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)

@@ -555,6 +555,32 @@ def _group_reaction_node(tmp_path):
     return node, group, alice, bob
 
 
+def _group_creator_node(tmp_path):
+    """A node that created its own crew group (so it can change the roster)."""
+    import types
+
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    node.identity = identity
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    # A bare destination stand-in: only the hexhash is consulted, and
+    # building a live RNS destination needs a running Reticulum.
+    node.destination = types.SimpleNamespace(hexhash=own_hash)
+    alice = make_peer("alice")
+    bob = make_peer("bob")
+    carol = make_peer("carol")
+    for peer in (alice, bob, carol):
+        node.registry.upsert(
+            peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+        )
+    group = node.groups.create(
+        "crew",
+        [own_hash, alice.hexhash, bob.hexhash],
+        created_by=own_hash,
+    )
+    return node, group, own_hash, alice, bob, carol
+
+
 def test_send_group_reaction_fans_out_one_signed_payload(tmp_path, monkeypatch):
     import base64
 
@@ -3130,6 +3156,214 @@ def test_sweep_drops_group_leg_whose_send_was_retracted(tmp_path, monkeypatch):
     assert node._deliver_entry(alice, entry, 1.0) is False
     assert node.mailbox.outbox_list() == []
     assert node.mailbox.sent_list() == []
+
+
+def _queue_crew_post(node, group, alice, bob):
+    """Queue one crew post leg to alice and bob, like a fanned-out send.
+
+    Enqueued directly (rather than via ``send_group_message``) so no
+    background flush thread can race the sweep calls under test.
+    """
+    group_kwargs = {
+        "id": group["id"],
+        "name": group["name"],
+        "creator": group["creator"],
+        "members": group["members"],
+    }
+    entries = {}
+    for peer, leg_id in ((alice, "leg-alice"), (bob, "leg-bob")):
+        entry = node.mailbox.enqueue(
+            to=peer.destination_hash,
+            text="hello crew",
+            message_id=leg_id,
+            group=group_kwargs,
+            sent_at=100.0,
+        )
+        node.mailbox.record_sent(
+            leg_id, to=peer.destination_hash, text="hello crew"
+        )
+        entries[peer.hexhash] = entry
+    return entries
+
+
+def test_sweep_drops_queued_group_post_for_removed_member(
+    tmp_path, monkeypatch
+):
+    # Issue #707: a member removed after a group post was queued must
+    # not receive it — the sweep drops the leg instead of delivering
+    # it, and forgets its sent record. The remaining member's leg
+    # still delivers.
+    node, group, own_hash, alice, bob, carol = _group_creator_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    entries = _queue_crew_post(node, group, alice, bob)
+    assert set(entries) == {alice.hexhash, bob.hexhash}
+    successor = node.groups.update_members(
+        group["id"], [own_hash, alice.hexhash], created_by=own_hash
+    )
+    assert bob.hexhash not in successor["members"]
+
+    calls = []
+
+    def must_not_send(peer_arg, path, payload, timeout, deadline=None):
+        calls.append(peer_arg.hexhash)
+        raise NodeError("a removed member's leg must never be sent")
+
+    monkeypatch.setattr(node, "_request", must_not_send)
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is False
+    assert calls == []
+    assert node.mailbox.get_outbox(entries[bob.hexhash].id) is None
+    assert [e["id"] for e in node.mailbox.sent_list()] == ["leg-alice"]
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        return {"ok": True, "received_at": 123.0, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(alice, entries[alice.hexhash], 1.0) is True
+    assert node.mailbox.outbox_list() == []
+
+
+def test_sweep_delivers_queued_group_post_after_member_readded(
+    tmp_path, monkeypatch
+):
+    # The check reads the live roster, so a member removed and then
+    # re-added before the sweep runs is a member again: the queued leg
+    # delivers instead of dropping.
+    node, group, own_hash, alice, bob, carol = _group_creator_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    entries = _queue_crew_post(node, group, alice, bob)
+    successor = node.groups.update_members(
+        group["id"], [own_hash, alice.hexhash], created_by=own_hash
+    )
+    restored = node.groups.update_members(
+        successor["id"],
+        [own_hash, alice.hexhash, bob.hexhash],
+        created_by=own_hash,
+    )
+    assert restored["id"] == group["id"]
+    assert bob.hexhash in restored["members"]
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        return {"ok": True, "received_at": 123.0, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is True
+    assert node.mailbox.get_outbox(entries[bob.hexhash].id) is None
+
+
+def test_sweep_keeps_queued_group_retract_for_removed_member(
+    tmp_path, monkeypatch
+):
+    # Issue #707: retracts are exempt — they act on content the
+    # removed member already holds, and dropping one would leave the
+    # copy visible. A retract leg queued before the removal still
+    # delivers to the removed member.
+    from tau.protocol import REQUEST_RETRACT
+
+    node, group, own_hash, alice, bob, carol = _group_creator_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "sent_at": 100.0,
+            "received_at": 110.0,
+            "id": "leg-1",
+            "direction": "out",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "crew",
+            "leg_ids": ["leg-1"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "leg-1", to=alice.destination_hash, text="crew hello"
+    )
+
+    def unreachable(peer_arg, path, payload, timeout, deadline=None):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    # No background flush: it would deliver the queued retract legs
+    # itself and race the direct sweep call below.
+    monkeypatch.setattr(node, "flush_outbox", lambda *a, **k: None)
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+    assert response["ok"] is False
+    entries = {e.to_hex: e for e in node.mailbox.outbox_list()}
+    assert set(entries) == {alice.hexhash, bob.hexhash}
+    node.groups.update_members(
+        group["id"], [own_hash, alice.hexhash], created_by=own_hash
+    )
+
+    calls = []
+
+    def reachable(peer_arg, path, payload, timeout, deadline=None):
+        calls.append((peer_arg.hexhash, path))
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is True
+    assert (bob.hexhash, REQUEST_RETRACT) in calls
+    assert node.mailbox.get_outbox(entries[bob.hexhash].id) is None
+
+
+def test_deposit_refuses_sealed_copy_for_removed_member(tmp_path, monkeypatch):
+    # Issue #707: the sealed-relay deposit path refuses to seal a fresh
+    # copy for a removed member, while a remaining member's leg still
+    # deposits with a holder.
+    from tau.protocol import REQUEST_MAIL_STORE
+
+    node, group, own_hash, alice, bob, carol = _group_creator_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    entries = _queue_crew_post(node, group, alice, bob)
+    node.groups.update_members(
+        group["id"], [own_hash, alice.hexhash], created_by=own_hash
+    )
+
+    calls = []
+
+    def record_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append((peer_arg.hexhash, path))
+        return {"ok": True, "stored": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", record_request)
+    assert node._deposit_entry(carol, entries[bob.hexhash], 1.0) is False
+    assert calls == []
+    # The leg stays queued: the sweep's delivery pass drops it.
+    assert node.mailbox.get_outbox(entries[bob.hexhash].id) is not None
+    assert node._deposit_entry(carol, entries[alice.hexhash], 1.0) is True
+    assert (carol.hexhash, REQUEST_MAIL_STORE) in calls
+
+
+def test_sweep_drop_for_removed_member_survives_failed_save(
+    tmp_path, monkeypatch
+):
+    # Qodo Informational on PR #708: the removal path deleted the leg
+    # before discarding its sent record, so a failure in that second
+    # step stranded the sent record with no leg left to retry — the
+    # undelivered post lingered in sent history. The leg and its sent
+    # record now leave in one save, so a failing discard step cannot
+    # strand the record: it is never a separate step.
+    node, group, own_hash, alice, bob, carol = _group_creator_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    entries = _queue_crew_post(node, group, alice, bob)
+    node.groups.update_members(
+        group["id"], [own_hash, alice.hexhash], created_by=own_hash
+    )
+
+    def failing_discard(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(node.mailbox, "discard_sent", failing_discard)
+    assert node._deliver_entry(bob, entries[bob.hexhash], 1.0) is False
+    # Both are gone from disk: the single save removed the leg and its
+    # sent record together, and no stale record is left behind for a
+    # retry that can never come — the leg is already gone.
+    stored = json.loads(node.mailbox.path.read_text())
+    assert not any(e["id"] == "leg-bob" for e in stored["outbox"])
+    assert "leg-bob" not in stored["sent"]
+    assert [e["id"] for e in node.mailbox.sent_list()] == ["leg-alice"]
 
 
 def test_moderator_retract_cancels_legs_and_late_legs_still_drop(

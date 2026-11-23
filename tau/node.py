@@ -5947,6 +5947,7 @@ class TauNode:
         edited_at: Optional[float],
         timeout: Optional[float] = None,
         block_retract_id: Optional[str] = None,
+        discard_sent: bool = False,
     ) -> bool:
         """Remove the queued entry only if it still carries this version.
 
@@ -5955,6 +5956,10 @@ class TauNode:
         recipient has not seen yet.  Returns False when the entry is
         gone or a replacement landed; the caller leaves the replacement
         queued for a later round.
+
+        With ``discard_sent`` set, the leg's sent record is forgotten
+        in the same save as the removal, so a failed save leaves both
+        for a later attempt instead of stranding the record.
 
         With ``block_retract_id`` set, the leg is being dropped
         finally, not delivered: the cleanup-blocked marker for that
@@ -5973,7 +5978,33 @@ class TauNode:
                 self.mailbox._record_retract_cleanup_blocked_locked(
                     block_retract_id
                 )
-            return self.mailbox.remove_outbox(message_id)
+            return self.mailbox.remove_outbox(
+                message_id, discard_sent=discard_sent
+            )
+
+    def _queued_group_recipient_removed(
+        self, group_id: str, recipient_hexhash: str
+    ) -> bool:
+        """True when *recipient* is positively no longer a member of
+        the live group continuing *group_id*.
+
+        A roster change retires the old id, so the leg's own roster
+        still names the removed member — only the live successor's
+        roster tells the truth.  Fail open: an unknown group, a
+        successor that cannot be found, or a store read that fails
+        means the leg delivers as today; only a positively-known
+        removal drops a leg, never a lookup miss.
+        """
+        try:
+            successor = self.groups.successor(group_id)
+        except OSError:
+            return False
+        if successor is None:
+            return False
+        members = [
+            str(member).lower() for member in (successor.get("members") or [])
+        ]
+        return str(recipient_hexhash).lower() not in members
 
     def _current_group_topic(
         self, group_id: Optional[str]
@@ -7815,6 +7846,42 @@ class TauNode:
                             entry.id,
                         )
                 return False
+            if fresh.poll_vote is None and fresh.poll_close is None:
+                # This recipient was removed from the group after the
+                # leg was queued: the roster change retired the leg's
+                # id, but the leg's own roster still names them, so
+                # only the live successor's roster tells the truth.
+                # Drop the leg instead of delivering a post to someone
+                # no longer in the group, and forget its sent record
+                # so it does not linger as an undelivered message.
+                # Votes and poll closes are not posts — they act on a
+                # poll the member already holds — so they still go out.
+                if self._queued_group_recipient_removed(
+                    fresh.group_id, peer.hexhash
+                ):
+                    log.info(
+                        "Dropping queued group message %s: its recipient "
+                        "is no longer a member of the group",
+                        entry.id,
+                    )
+                    try:
+                        self._remove_queued_version(
+                            entry.id,
+                            text=fresh.text,
+                            edited_at=fresh.edited_at,
+                            timeout=_remaining(deadline),
+                            discard_sent=True,
+                        )
+                    except (TimeoutError, OSError):
+                        log.debug(
+                            "Could not drop queued group message %s for "
+                            "a removed member: mailbox lock busy or the "
+                            "removal could not be saved; leaving it for "
+                            "a later round",
+                            entry.id,
+                        )
+                        return False
+                    return False
         send_text = fresh.text
         send_edited_at = fresh.edited_at
         if fresh.group_id is not None:
@@ -8443,6 +8510,27 @@ class TauNode:
                             entry.id,
                         )
                 return False
+        if (
+            fresh.group_id is not None
+            and not is_retract
+            and fresh.poll_vote is None
+            and fresh.poll_close is None
+            and self._queued_group_recipient_removed(
+                fresh.group_id, fresh.to_hex
+            )
+        ):
+            # The recipient was removed from the group after this leg
+            # was queued: do not seal a fresh copy for a holder to hand
+            # them.  The leg stays queued — the sweep's delivery pass
+            # drops it — so this only refuses the deposit, it never
+            # deletes anything.  No attempt is recorded: the leg is
+            # about to be dropped, not held for a later lift.
+            log.info(
+                "Skipping deposit of queued group message %s: its recipient "
+                "is no longer a member of the group",
+                entry.id,
+            )
+            return False
         if self.identity is None:
             return False
         recipient = self.registry.get(entry.to)

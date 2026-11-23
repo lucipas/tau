@@ -2273,8 +2273,14 @@ class Mailbox:
         *,
         timeout: Optional[float] = None,
         abort_group_edit: bool = False,
+        discard_sent: bool = False,
     ) -> bool:
         """Remove one queued entry; True when it was present.
+
+        With *discard_sent*, the sent record for the same id is
+        forgotten in the same save as the removal, so a failed save
+        leaves both the leg and its record for a later attempt instead
+        of stranding the record with no leg to retry.
 
         With *abort_group_edit*, removing one leg of a queued group
         edit also removes its sibling legs: the edit can no longer
@@ -2289,6 +2295,8 @@ class Mailbox:
             if entry is None:
                 return False
             del self._outbox[message_id]
+            if discard_sent:
+                self._sent.pop(message_id, None)
             siblings: List[str] = []
             edit_id = entry.group_edit_id
             if abort_group_edit and edit_id is not None:
