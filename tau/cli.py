@@ -13922,79 +13922,111 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
     expires.
     """
     config = _make_config(args)
-    identity = load_identity(config.identity_path)
-    if identity is None:
-        raise NodeError(
-            f"no identity at {config.identity_path}; run `tau init` first"
-        )
-    target = Path(args.to).expanduser()
-    if _same_path(target, config.identity_path):
-        raise NodeError(
-            f"cannot write a pairing bundle to the identity itself ({target})"
-        )
-    if target.is_dir():
-        raise NodeError(f"pairing bundle path {target} is a directory")
-    # lexists, not exists: a dangling symlink at the target counts as
-    # an existing bundle and must not be silently replaced without
-    # --force — the same rule `tau id export` applies.
-    if os.path.lexists(target) and not getattr(args, "force", False):
-        raise NodeError(
-            f"pairing bundle already exists at {target}; pass --force to overwrite it"
-        )
-    bundle = build_pairing_bundle(identity, ttl_seconds=float(args.ttl))
-    # Load the registry before publishing the bundle: a corrupt
-    # registry must fail the command while no file exists, not leave a
-    # redeemable bundle on disk that `tau devices list` cannot see.
-    registry = DeviceRegistry(config.devices_path)
-    # The bundle goes into a caller-selected folder: never change that
-    # folder's permissions, only the bundle file itself is private —
-    # the same rule `tau id export` applies.
-    #
-    # Stage the new bundle beside the target and only replace the
-    # target once the offer is recorded.  Writing straight to the
-    # target first destroys a previous bundle when --force overwrites
-    # one and the registry write then fails: the unlink in the
-    # failure path removes the only remaining copy (see #717).  Until
-    # the replacement is finalised the old target is untouched, so a
-    # failed recording removes only the staged file.
-    # The staging name is random and created exclusively (mkstemp), so
-    # another user cannot pre-create a path that blocks the write in a
-    # shared folder.
-    ensure_dir(target.parent, restrict_existing=False)
-    fd, staging_name = tempfile.mkstemp(
-        dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
-    )
-    staging = Path(staging_name)
+    # Only the data directory (which holds the instance-lock file) is
+    # needed here; preparing the Reticulum config dir would touch
+    # unrelated state.
+    ensure_dir(config.data_dir)
+    # Hold the instance lock across loading the identity, minting
+    # and publishing the bundle, and recording the offer: without
+    # it, a `tau id import --force` between the bundle creation and
+    # record_issued() lands the old identity's offer in the
+    # replacement identity's registry (see #715).  Lock order
+    # (instance, then identity) matches `tau id import`, which
+    # takes the instance lock before loading or creating its
+    # identity — the same discipline `tau serve` itself follows.
+    # Note the instance lock is a no-op on a platform with neither
+    # fcntl nor msvcrt, the same limitation `tau serve` itself accepts.
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False)
-                + "\n"
+        lock.acquire()
+    except InstanceAlreadyRunning:
+        # The holder need not be a serving node: a backup holds the
+        # same lock while it archives, so report the conflict as
+        # another tau process using the data directory rather than
+        # telling the user to stop a node that may not be running.
+        holder = instance_lock_holder(config.instance_lock_path)
+        detail = f" (pid {holder})" if holder not in (None, -1) else ""
+        raise NodeError(
+            "cannot mint a pairing bundle: data directory "
+            f"{config.data_dir} is in use by another tau process"
+            f"{detail}; wait for it to finish or stop it first"
+        ) from None
+    try:
+        identity = load_identity(config.identity_path)
+        if identity is None:
+            raise NodeError(
+                f"no identity at {config.identity_path}; run `tau init` first"
             )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(staging, 0o600)
-        registry.record_issued(
-            bundle["token"], bundle["created_at"], bundle["expires_at"]
+        target = Path(args.to).expanduser()
+        if _same_path(target, config.identity_path):
+            raise NodeError(
+                f"cannot write a pairing bundle to the identity itself ({target})"
+            )
+        if target.is_dir():
+            raise NodeError(f"pairing bundle path {target} is a directory")
+        # lexists, not exists: a dangling symlink at the target counts as
+        # an existing bundle and must not be silently replaced without
+        # --force — the same rule `tau id export` applies.
+        if os.path.lexists(target) and not getattr(args, "force", False):
+            raise NodeError(
+                f"pairing bundle already exists at {target}; pass --force to overwrite it"
+            )
+        bundle = build_pairing_bundle(identity, ttl_seconds=float(args.ttl))
+        # Load the registry before publishing the bundle: a corrupt
+        # registry must fail the command while no file exists, not leave a
+        # redeemable bundle on disk that `tau devices list` cannot see.
+        registry = DeviceRegistry(config.devices_path)
+        # The bundle goes into a caller-selected folder: never change that
+        # folder's permissions, only the bundle file itself is private —
+        # the same rule `tau id export` applies.
+        #
+        # Stage the new bundle beside the target and only replace the
+        # target once the offer is recorded.  Writing straight to the
+        # target first destroys a previous bundle when --force overwrites
+        # one and the registry write then fails: the unlink in the
+        # failure path removes the only remaining copy (see #717).  Until
+        # the replacement is finalised the old target is untouched, so a
+        # failed recording removes only the staged file.
+        # The staging name is random and created exclusively (mkstemp), so
+        # another user cannot pre-create a path that blocks the write in a
+        # shared folder.
+        ensure_dir(target.parent, restrict_existing=False)
+        fd, staging_name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
         )
-    except BaseException:
-        # The command failed, so the bundle must not stay behind as
-        # an untracked redeemable offer — this covers OSError and
-        # DevicesError alike.  Only the staged file goes: the previous
-        # bundle at the target is still the live one.
-        staging.unlink(missing_ok=True)
-        raise
-    try:
-        os.replace(staging, target)
-    except BaseException:
-        # The offer is recorded but the new bundle never landed: the
-        # old bundle is still at the target and still redeemable, so
-        # drop the staged file and report the failure rather than
-        # leaving a second copy behind.  BaseException, not OSError:
-        # an interrupt during the one-syscall replace must clean up
-        # the staged private identity too (see #724).
-        staging.unlink(missing_ok=True)
-        raise
+        staging = Path(staging_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False)
+                    + "\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(staging, 0o600)
+            registry.record_issued(
+                bundle["token"], bundle["created_at"], bundle["expires_at"]
+            )
+        except BaseException:
+            # The command failed, so the bundle must not stay behind as
+            # an untracked redeemable offer — this covers OSError and
+            # DevicesError alike.  Only the staged file goes: the previous
+            # bundle at the target is still the live one.
+            staging.unlink(missing_ok=True)
+            raise
+        try:
+            os.replace(staging, target)
+        except BaseException:
+            # The offer is recorded but the new bundle never landed: the
+            # old bundle is still at the target and still redeemable, so
+            # drop the staged file and report the failure rather than
+            # leaving a second copy behind.  BaseException, not OSError:
+            # an interrupt during the one-syscall replace must clean up
+            # the staged private identity too (see #724).
+            staging.unlink(missing_ok=True)
+            raise
+    finally:
+        lock.release()
     expires = datetime.fromtimestamp(bundle["expires_at"]).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
