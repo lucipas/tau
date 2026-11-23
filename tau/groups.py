@@ -133,6 +133,23 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         bytes.fromhex(group_id)
     except ValueError:
         return None
+    # The family id links a group to its successors across renames and
+    # roster changes (see GroupStore.successor): a random 128-bit token
+    # minted at creation, carried into every successor.  A record that
+    # predates family ids — or carries a corrupt one — simply has none:
+    # the successor lookup then fails open for it instead of trusting
+    # the creation timestamp, which two groups can share.
+    family_id = raw.get("family_id")
+    if family_id is not None:
+        if not isinstance(family_id, str) or len(family_id) != 32:
+            family_id = None
+        else:
+            try:
+                bytes.fromhex(family_id)
+            except ValueError:
+                family_id = None
+            else:
+                family_id = family_id.lower()
     members = raw.get("members")
     if not isinstance(members, list):
         return None
@@ -296,6 +313,7 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         "name": name,
         "members": cleaned,
         "created_at": created_at,
+        "family_id": family_id,
         "creator": creator,
         "created_by": creator,
         "local": bool(raw.get("local", False)),
@@ -617,6 +635,7 @@ class GroupStore:
                 "name": name,
                 "members": members,
                 "created_at": time.time(),
+                "family_id": generate_group_id(),
                 "creator": created_by,
                 "created_by": created_by,
                 "local": True,
@@ -751,12 +770,20 @@ class GroupStore:
             return dict(self._groups[existing["id"]])
         if new_id in self._groups:  # pragma: no cover - hash collision
             raise ValueError("group id already exists with another roster")
+        # The successor continues the same group family: it inherits
+        # the predecessor's family id, minted here when the predecessor
+        # predates family ids, so the successor lookup can still tell
+        # it apart from an unrelated group created in the same clock
+        # tick.  The retired copy is stamped with the same id, so the
+        # fallback can match them.
+        family_id = existing.get("family_id") or generate_group_id()
         candidate = _valid_group(
             {
                 "id": new_id,
                 "name": existing["name"],
                 "members": members,
                 "created_at": existing["created_at"],
+                "family_id": family_id,
                 "creator": existing["creator"],
                 "created_by": existing["creator"],
                 "local": True,
@@ -795,7 +822,7 @@ class GroupStore:
         snapshot = self._snapshot()
         del self._groups[existing["id"]]
         self._groups[new_id] = candidate
-        self._retire(existing)
+        self._retire({**existing, "family_id": family_id})
         if new_id in self._retired:
             # The roster is live again (a member re-added restores
             # the original roster), so it must not stay retired.
@@ -1110,12 +1137,20 @@ class GroupStore:
                     return dict(existing)
                 if new_id in self._groups:  # pragma: no cover - hash collision
                     raise ValueError("group id already exists with another roster")
+            # The successor continues the same group family: it
+            # inherits the predecessor's family id, minted here when
+            # the predecessor predates family ids, so the successor
+            # lookup can still tell it apart from an unrelated group
+            # created in the same clock tick.  The retired copy is
+            # stamped with the same id, so the fallback can match them.
+            family_id = existing.get("family_id") or generate_group_id()
             candidate = _valid_group(
                 {
                     "id": new_id,
                     "name": name,
                     "members": existing["members"],
                     "created_at": existing["created_at"],
+                    "family_id": family_id,
                     "creator": existing["creator"],
                     "created_by": existing["creator"],
                     "local": True,
@@ -1157,7 +1192,7 @@ class GroupStore:
             snapshot = self._snapshot()
             del self._groups[existing["id"]]
             self._groups[new_id] = candidate
-            self._retire(existing)
+            self._retire({**existing, "family_id": family_id})
             if new_id in self._retired:
                 # The name is live again (renamed back to it), so the
                 # old id must not stay retired.
@@ -1869,20 +1904,24 @@ class GroupStore:
 
         The id itself when it is still live; otherwise the live group
         whose rename lineage names it, falling back to the retired
-        record's creator and creation time.  A lineage candidate only
-        counts when its creator matches the id's own creator — from
-        the retired record, or the creator evidence kept when it was
-        retired — so a member's unrelated group cannot claim this id
-        as its predecessor and hijack the lookup.  Reloads from disk
-        first, so a roster change in another process is seen.
-        ``None`` means no live successor is known: the group may have
-        been deleted, or its successor never learned — callers must
-        fail open on it, never treat it as a removal.  Two tails
-        stay open: a rename changes the name, so the fallback matches
-        on creator and creation time only (both are carried into every
-        successor), and a retired record evicted after many roster
-        changes leaves only the lineage scan, whose creator evidence
-        survives eviction.
+        record's family id.  A lineage candidate only counts when its
+        creator matches the id's own creator — from the retired
+        record, or the creator evidence kept when it was retired — so
+        a member's unrelated group cannot claim this id as its
+        predecessor and hijack the lookup.  The fallback needs the
+        same creator match plus the same family id, a random token
+        minted at creation and carried into every successor: the
+        creation timestamp it replaces is not unique — two groups
+        from one creator can share a clock tick — and matching on it
+        could return an unrelated group whose roster excludes a
+        still-current recipient.  Reloads from disk first, so a
+        roster change in another process is seen.  ``None`` means no
+        live successor is known: the group may have been deleted, its
+        successor never learned, or its record may predate family
+        ids — callers must fail open on it, never treat it as a
+        removal.  A retired record evicted after many roster changes
+        leaves only the lineage scan, whose creator evidence survives
+        eviction.
         """
         with self._transaction():
             wanted = str(group_id).lower()
@@ -1908,13 +1947,14 @@ class GroupStore:
                     if (candidate.get("creator") or "") == creator:
                         return dict(candidate)
             if retired is not None:
-                for candidate in self._groups.values():
-                    if (
-                        candidate.get("creator") == retired.get("creator")
-                        and candidate.get("created_at")
-                        == retired.get("created_at")
-                    ):
-                        return dict(candidate)
+                family_id = retired.get("family_id")
+                if family_id:
+                    for candidate in self._groups.values():
+                        if (
+                            candidate.get("family_id") == family_id
+                            and (candidate.get("creator") or "") == creator
+                        ):
+                            return dict(candidate)
             return None
 
     def find(self, query: str) -> Optional[Dict[str, Any]]:
