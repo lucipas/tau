@@ -301,7 +301,7 @@ from .protocol import (
     sanitize_name,
     short_hash,
 )
-from .util import atomic_write_bytes, atomic_write_json, atomic_write_text
+from .util import atomic_write_bytes, atomic_write_text, ensure_dir
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
@@ -13953,17 +13953,31 @@ def cmd_devices_pair(args: argparse.Namespace) -> int:
     # failure path removes the only remaining copy (see #717).  Until
     # the replacement is finalised the old target is untouched, so a
     # failed recording removes only the staged file.
-    staging = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    atomic_write_json(staging, bundle, mode=0o600, restrict_parent=False)
+    # The staging name is random and created exclusively (mkstemp), so
+    # another user cannot pre-create a path that blocks the write in a
+    # shared folder.
+    ensure_dir(target.parent, restrict_existing=False)
+    fd, staging_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+    )
+    staging = Path(staging_name)
     try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False)
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(staging, 0o600)
         registry.record_issued(
             bundle["token"], bundle["created_at"], bundle["expires_at"]
         )
-    except OSError:
+    except BaseException:
         # The command failed, so the bundle must not stay behind as
-        # an untracked redeemable offer — but only the staged file
-        # goes: the previous bundle at the target is still the live
-        # one.
+        # an untracked redeemable offer — this covers OSError and
+        # DevicesError alike.  Only the staged file goes: the previous
+        # bundle at the target is still the live one.
         staging.unlink(missing_ok=True)
         raise
     try:
