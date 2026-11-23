@@ -324,6 +324,7 @@ class DeviceRegistry:
                     # Records written before the pending marker existed
                     # count as completed, so they are never replayed.
                     "paired": entry.get("paired") is not False,
+                    "reset_pending": entry.get("reset_pending") is True,
                 }
             )
         return cleaned
@@ -433,7 +434,13 @@ class DeviceRegistry:
             )
 
     def record_redeemed(
-        self, token: str, primary: str, expires_at: float, *, now: Optional[float] = None
+        self,
+        token: str,
+        primary: str,
+        expires_at: float,
+        *,
+        now: Optional[float] = None,
+        reset_pending: bool = False,
     ) -> None:
         """Remember a redeemed token, so the bundle cannot be reused.
 
@@ -461,6 +468,10 @@ class DeviceRegistry:
                     # identity install; a retry may complete only a
                     # pending record (see #718).
                     "paired": False,
+                    # True while the identity-change reset this redeem
+                    # needs has not yet been applied; cleared atomically
+                    # by reset() so a retry never repeats it (see #718).
+                    "reset_pending": bool(reset_pending),
                 }
             )
 
@@ -481,12 +492,18 @@ class DeviceRegistry:
     ) -> None:
         """Remember that this node paired from *primary* with *token*."""
         moment = time.time() if now is None else float(now)
+        cleaned_token = _clean_hex(token, "token")
         with self._transaction():
             self._paired_from = {
                 "primary": _clean_hex(primary, "primary"),
-                "token": _clean_hex(token, "token"),
+                "token": cleaned_token,
                 "paired_at": moment,
             }
+            # The pairing is complete: a later retry must not treat
+            # this token as pending again (see #718).
+            for entry in self._redeemed:
+                if entry["token"] == cleaned_token:
+                    entry["paired"] = True
 
     def reset(self, *, now: Optional[float] = None) -> None:
         """Drop the pairing records tied to the replaced identity.
@@ -509,5 +526,9 @@ class DeviceRegistry:
             self._redeemed = [
                 entry for entry in self._redeemed if entry["expires_at"] > moment
             ]
-            self._paired_from = None
+            # The reset is applied: no redeem still owes one.  Cleared in
+            # the same transaction so a retry never repeats it and drops
+            # offers issued after this reset (see #718).
+            for entry in self._redeemed:
+                entry["reset_pending"] = False
             self._paired_from = None
