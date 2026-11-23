@@ -14154,18 +14154,24 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
         raise NodeError(f"no pairing bundle at {source}")
     if _same_path(source, config.identity_path):
         raise NodeError(f"{source} is already this node's identity file")
+    # Read through one bounded handle: a stat-then-read lets the file
+    # grow (or its path be replaced) between the size check and the
+    # read, loading far more than the cap before parsing rejects it
+    # (see #719).  Reading MAX + 1 bytes detects an oversize bundle
+    # without ever loading more than the cap plus one byte.
     try:
-        size = source.stat().st_size
+        with source.open("rb") as handle:
+            data = handle.read(MAX_PAIRING_BUNDLE_BYTES + 1)
     except OSError as exc:
         raise NodeError(f"not a valid pairing bundle: {exc}") from exc
-    if size > MAX_PAIRING_BUNDLE_BYTES:
+    if len(data) > MAX_PAIRING_BUNDLE_BYTES:
         raise NodeError(
-            f"pairing bundle is too large ({size} bytes, "
-            f"over {MAX_PAIRING_BUNDLE_BYTES})"
+            "pairing bundle is too large "
+            f"(over {MAX_PAIRING_BUNDLE_BYTES} bytes)"
         )
     try:
-        raw = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        raw = json.loads(data.decode("utf-8"))
+    except ValueError as exc:
         raise NodeError(f"not a valid pairing bundle: {exc}") from exc
     identity, bundle = verify_pairing_bundle(raw)
     config.prepare()

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
+from pathlib import Path
 
 import pytest
 import RNS
@@ -1760,6 +1762,39 @@ def test_devices_import_corrupt_registry_rolls_back_identity(
 def test_devices_redeem_rejects_oversize_bundle_file(tmp_path, capsys):
     bundle_path = tmp_path / "pairing.json"
     bundle_path.write_bytes(b"x" * (MAX_PAIRING_BUNDLE_BYTES + 1))
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(tmp_path / "b"),
+        ]
+    )
+    assert code == 1
+    assert "too large" in capsys.readouterr().err
+
+
+def test_devices_redeem_rejects_bundle_that_grows_after_stat(
+    tmp_path, capsys, monkeypatch
+):
+    # A bundle that is under the cap when stat runs but grows before
+    # the read must still be refused (see #719): the redeem reads
+    # through one bounded handle instead of trusting an earlier stat,
+    # so the read itself — not the stat — enforces the cap.
+    bundle_path = tmp_path / "pairing.json"
+    bundle_path.write_bytes(b"{}")
+    real_open = Path.open
+
+    def _growing_open(self, *args, **kwargs):
+        handle = real_open(self, *args, **kwargs)
+        if self == bundle_path:
+            handle.close()
+            return io.BytesIO(b"x" * (MAX_PAIRING_BUNDLE_BYTES + 1))
+        return handle
+
+    monkeypatch.setattr(Path, "open", _growing_open)
     code = cli.main(
         [
             "devices",
