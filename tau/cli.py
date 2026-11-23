@@ -13829,11 +13829,23 @@ def _install_identity_and_reset(
                 # un-link a shared identity, and a dangling link
                 # must not be mistaken for an absent identity and
                 # removed.  The install already replaced the link
-                # with a regular file (or failed before doing so),
-                # so remove whatever is there first.
-                if os.path.lexists(config.identity_path):
-                    config.identity_path.unlink()
-                os.symlink(link_target, config.identity_path)
+                # with a regular file (or failed before doing so).
+                # Build the link at a temporary path next to the
+                # identity, then atomically swap it in, so the identity
+                # path is never absent (an interruption must not make
+                # startup think the identity is missing).
+                tmp_link = config.identity_path.with_name(
+                    config.identity_path.name + ".restore-tmp"
+                )
+                if os.path.lexists(tmp_link):
+                    tmp_link.unlink()
+                os.symlink(link_target, tmp_link)
+                try:
+                    os.replace(tmp_link, config.identity_path)
+                except OSError:
+                    if os.path.lexists(tmp_link):
+                        tmp_link.unlink()
+                    raise
                 restored = True
             elif not had_previous:
                 if config.identity_path.exists():
