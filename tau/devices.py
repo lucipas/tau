@@ -461,15 +461,25 @@ class DeviceRegistry:
                 "paired_at": moment,
             }
 
-    def reset(self) -> None:
-        """Drop every pairing record: the installed identity changed.
+    def reset(self, *, now: Optional[float] = None) -> None:
+        """Drop the pairing records tied to the replaced identity.
 
-        Issued offers and redeemed tokens belong to the identity that
-        was installed when they were recorded.  After an identity
+        Issued offers and the pairing itself belong to the identity
+        that was installed when they were recorded.  After an identity
         replacement they would otherwise be reported as the new
-        identity's pairing, so a swap resets the registry (see #714).
+        identity's pairing, so a swap resets them (see #714).
+
+        Redeemed tokens are NOT dropped: they are what enforces
+        single-use, and a token redeemed under the old identity is
+        still a live bundle for up to 24 hours — clearing the list
+        would let the same bundle be redeemed again with ``--force``
+        after the swap (see #716).  Only expired tokens are pruned,
+        the same rule :meth:`record_redeemed` applies.
         """
+        moment = time.time() if now is None else float(now)
         with self._transaction():
             self._issued = []
-            self._redeemed = []
+            self._redeemed = [
+                entry for entry in self._redeemed if entry["expires_at"] > moment
+            ]
             self._paired_from = None

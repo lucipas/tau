@@ -191,14 +191,21 @@ def test_registry_keeps_every_unexpired_offer(tmp_path):
     assert offers[0]["token"] == "0" * 32
 
 
-def test_registry_reset_drops_pairing_records(tmp_path):
+def test_registry_reset_keeps_redeemed_tokens(tmp_path):
+    # An identity swap drops the old identity's offers and pairing,
+    # but a redeemed token stays recorded until its own window ends:
+    # the bundle is still live for up to 24 hours, and clearing the
+    # list would let it be redeemed again with --force (see #716).
+    # Only expired tokens are pruned.
     registry = DeviceRegistry(tmp_path / "devices.json")
     registry.record_issued("a" * 32, 1000.0, 4600.0)
     registry.record_redeemed("a" * 32, "b" * 32, 4600.0, now=1200.0)
+    registry.record_redeemed("c" * 32, "b" * 32, 1300.0, now=1200.0)
     registry.record_paired_from("a" * 32, "b" * 32, now=1200.0)
-    registry.reset()
+    registry.reset(now=2000.0)
     assert registry.issued_offers(now=1100.0) == []
-    assert not registry.is_redeemed("a" * 32)
+    assert registry.is_redeemed("a" * 32)
+    assert not registry.is_redeemed("c" * 32)
     assert registry.paired_from is None
 
 
@@ -613,6 +620,162 @@ def test_devices_redeem_force_resets_previous_records(tmp_path, capsys):
     assert cli.main(["devices", "list", "--data-dir", str(node_a)]) == 0
     out = capsys.readouterr().out
     assert "no pairing offers issued" in out
+    assert "paired from:" in out
+
+
+def test_devices_redeem_refused_after_identity_swap(tmp_path, capsys):
+    # A bundle redeemed under one identity must stay single-use
+    # after that identity is swapped out: the reset drops the old
+    # pairing, not the redeemed-token record (see #716).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    node_c = _init_node(tmp_path, "c", "carol")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--force",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    backup = tmp_path / "carol.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_c), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "id",
+                "import",
+                "--from",
+                str(backup),
+                "--data-dir",
+                str(node_b),
+                "--force",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    destination_carol = _destination(node_c, capsys)
+    assert _destination(node_b, capsys) == destination_carol
+    code = cli.main(
+        [
+            "devices",
+            "redeem",
+            "--from",
+            str(bundle_path),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "already redeemed" in capsys.readouterr().err
+    assert _destination(node_b, capsys) == destination_carol
+
+
+def test_devices_import_failure_keeps_pairing_records(
+    tmp_path, capsys, monkeypatch
+):
+    # The reset is staged until the new identity is installed: if
+    # the identity write fails, the old node's offers and pairing
+    # must still be listed (see #716).
+    node_a = _init_node(tmp_path, "a", "alice")
+    node_b = _init_node(tmp_path, "b", "bob")
+    node_c = _init_node(tmp_path, "c", "carol")
+    capsys.readouterr()
+    bundle_path = tmp_path / "pairing.json"
+    assert (
+        cli.main(
+            ["devices", "pair", "--to", str(bundle_path), "--data-dir", str(node_a)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "devices",
+                "redeem",
+                "--from",
+                str(bundle_path),
+                "--data-dir",
+                str(node_b),
+                "--force",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    second_bundle = tmp_path / "pairing-b.json"
+    assert (
+        cli.main(
+            [
+                "devices",
+                "pair",
+                "--to",
+                str(second_bundle),
+                "--data-dir",
+                str(node_b),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    backup = tmp_path / "carol.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_c), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    destination_alice = _destination(node_b, capsys)
+
+    def _failing_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "save_identity", _failing_save)
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_b),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "disk full" in capsys.readouterr().err
+    # The old identity is still installed and its pairing records
+    # survived the failed swap.
+    assert _destination(node_b, capsys) == destination_alice
+    assert cli.main(["devices", "list", "--data-dir", str(node_b)]) == 0
+    out = capsys.readouterr().out
+    assert "pairing offers issued: 1" in out
     assert "paired from:" in out
 
 

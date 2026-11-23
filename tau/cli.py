@@ -13700,10 +13700,15 @@ def cmd_id_import(args: argparse.Namespace) -> int:
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
-            _reset_devices_for_identity_change(
-                config, DeviceRegistry(config.devices_path), identity
-            )
+            # Decide the reset while the old identity is still on
+            # disk, but apply it only after the new identity is
+            # installed: a failed write must leave the old pairing
+            # records intact (see #716).
+            registry = DeviceRegistry(config.devices_path)
+            reset_devices = _devices_reset_needed(config, identity)
             save_identity(identity, config.identity_path)
+            if reset_devices:
+                registry.reset()
     finally:
         lock.release()
     payload = {
@@ -13770,19 +13775,21 @@ def _clear_verifications_for_identity_change(
     return cleared
 
 
-def _reset_devices_for_identity_change(
-    config: TauConfig, registry: DeviceRegistry, identity: Any
-) -> bool:
-    """Drop pairing records when a new identity replaces the old one.
+def _devices_reset_needed(config: TauConfig, identity: Any) -> bool:
+    """Decide whether an identity change drops the pairing records.
 
-    Issued offers and redeemed tokens belong to the identity that was
-    installed when they were recorded: after an identity replacement
-    they would otherwise be reported as the new identity's pairing.
-    A restore of the same identity keeps them, and a node with no
-    identity yet has nothing to drop.  An unreadable old identity
-    counts as different — records of unknown provenance must not be
-    attributed to the replacement.  Returns True when the registry
-    was reset.
+    Issued offers and the pairing itself belong to the identity that
+    was installed when they were recorded: after an identity
+    replacement they would otherwise be reported as the new
+    identity's pairing.  A restore of the same identity keeps them,
+    and a node with no identity yet has nothing to drop.  An
+    unreadable old identity counts as different — records of unknown
+    provenance must not be attributed to the replacement.
+
+    This only decides: the caller applies ``DeviceRegistry.reset()``
+    after ``save_identity`` succeeds, so a failed identity write
+    leaves the old records intact (see #716).  Returns True when the
+    registry must be reset.
     """
     if not config.identity_path.exists():
         return False
@@ -13795,7 +13802,6 @@ def _reset_devices_for_identity_change(
         old_key = None
     if old_key is not None and old_key == identity.get_public_key():
         return False
-    registry.reset()
     return True
 
 
@@ -13918,7 +13924,12 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
             verifications_cleared = _clear_verifications_for_identity_change(
                 config, identity
             )
-            _reset_devices_for_identity_change(config, registry, identity)
+            # Decide the reset while the old identity is still on
+            # disk, but apply it only after the new identity is
+            # installed: a failed write must leave the old pairing
+            # records intact (see #716).  The reset keeps redeemed
+            # tokens, so the token recorded just below survives it.
+            reset_devices = _devices_reset_needed(config, identity)
             # Record the token BEFORE installing the identity: if the
             # record fails, the old identity stays in place and the
             # bundle can be minted fresh — the reverse order would
@@ -13931,6 +13942,8 @@ def cmd_devices_redeem(args: argparse.Namespace) -> int:
                 bundle["token"], bundle["primary"], bundle["expires_at"]
             )
             save_identity(identity, config.identity_path)
+            if reset_devices:
+                registry.reset()
             try:
                 registry.record_paired_from(bundle["token"], bundle["primary"])
             except OSError as exc:
